@@ -4,18 +4,29 @@
  * Implements {@link GitHubClient} from `src/types.ts` and adds the four
  * stabilize-phase methods (`listCheckRuns`, `getCheckRunLogs`,
  * `listReviews`, `listReviewComments`) the Wave 4 conversations and CI
- * loops need. Built on `@octokit/core` with a {@link GitHubAuth}
+ * loops need. Those four extensions live behind
+ * {@link StabilizeGitHubClient}, an additive interface exported from this
+ * module; the Wave 1 {@link GitHubClient} contract in `src/types.ts`
+ * stays frozen. Built on `@octokit/core` with a {@link GitHubAuth}
  * strategy injected: every request resolves an installation token via
  * `getInstallationToken` immediately before the call so token rotation
  * is automatic.
  *
- * **Rate-limit awareness.** `Retry-After` (secondary rate limit) and
- * `X-RateLimit-Reset` (primary rate limit) are honored: when GitHub
- * answers `429` or `403` with one of those headers, the client sleeps
- * the indicated duration and retries the request **once**. A second
- * failure propagates. 5xx responses propagate immediately — they
- * indicate transient GitHub trouble that the supervisor's higher-level
- * retry policy handles.
+ * **Rate-limit awareness.** The retry policy intentionally fires only
+ * when GitHub gave us a clear rate-limit signal (see ADR-010):
+ *
+ * - `Retry-After` present (any 4xx) — sleep that duration, retry once.
+ * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` (any 4xx)
+ *   — sleep until the reset, retry once.
+ * - `429` with neither header — sleep
+ *   {@link DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS} and retry once;
+ *   the `429` itself is the rate-limit signal.
+ * - `403` with neither header — propagate immediately. A 403 without
+ *   rate-limit headers is a permission/scope error, not a quota event,
+ *   and retrying just adds latency before the same failure surfaces.
+ *
+ * 5xx responses propagate immediately — they indicate transient GitHub
+ * trouble that the supervisor's higher-level retry policy handles.
  *
  * **Test seam.** `Octokit` exposes a `request: { fetch }` option;
  * `tests/unit/github_client_test.ts` injects a scripted fake fetch so
@@ -128,6 +139,75 @@ export interface PullRequestReviewComment {
 }
 
 // ---------------------------------------------------------------------------
+// Stabilize-phase additive interface
+// ---------------------------------------------------------------------------
+
+/**
+ * Stabilize-phase extension of {@link GitHubClient}.
+ *
+ * The W1 `GitHubClient` contract in `src/types.ts` is intentionally
+ * minimal — every interface there is the surface every Wave 2 branch
+ * builds in parallel and consumer waves cannot cheaply reshape it.
+ * The four methods Wave 4's stabilize loop needs (per-check-run reads
+ * for the CI phase, review/comment reads for the conversations phase)
+ * are additive, so we expose them on a separate interface that
+ * **extends** `GitHubClient` instead. Consumers (Wave 4's supervisor,
+ * the in-memory double `tests/helpers/in_memory_github_client.ts`)
+ * depend on this interface rather than the concrete
+ * {@link GitHubClientImpl} class.
+ *
+ * @example
+ * ```ts
+ * function startStabilizeLoop(client: StabilizeGitHubClient) {
+ *   // Type-checked access to both W1 + W4 methods.
+ * }
+ * ```
+ */
+export interface StabilizeGitHubClient extends GitHubClient {
+  /**
+   * List individual check runs (Checks API) attached to `sha`.
+   *
+   * @param repo Target repository.
+   * @param sha Commit SHA.
+   * @returns The check runs in GitHub's natural order.
+   */
+  listCheckRuns(
+    repo: RepoFullName,
+    sha: string,
+  ): Promise<readonly CheckRunSummary[]>;
+  /**
+   * Fetch the raw logs ZIP for a single check run, as bytes.
+   *
+   * @param repo Target repository.
+   * @param checkRunId Check-run id from {@link StabilizeGitHubClient.listCheckRuns}.
+   * @returns The ZIP bytes.
+   */
+  getCheckRunLogs(repo: RepoFullName, checkRunId: number): Promise<Uint8Array>;
+  /**
+   * List submitted reviews on a pull request, in submission order.
+   *
+   * @param repo Target repository.
+   * @param pullRequestNumber Pull-request number.
+   * @returns Reviews in their submission order.
+   */
+  listReviews(
+    repo: RepoFullName,
+    pullRequestNumber: IssueNumber,
+  ): Promise<readonly PullRequestReview[]>;
+  /**
+   * List inline review comments on a pull request, in creation order.
+   *
+   * @param repo Target repository.
+   * @param pullRequestNumber Pull-request number.
+   * @returns Inline review comments in their creation order.
+   */
+  listReviewComments(
+    repo: RepoFullName,
+    pullRequestNumber: IssueNumber,
+  ): Promise<readonly PullRequestReviewComment[]>;
+}
+
+// ---------------------------------------------------------------------------
 // Options surface
 // ---------------------------------------------------------------------------
 
@@ -190,18 +270,20 @@ export interface GitHubClientOptions {
 export const DEFAULT_MAX_RETRY_SLEEP_MILLISECONDS = 5 * 60 * 1_000;
 
 /**
- * Default fallback sleep when GitHub flagged us with `429`/`403` but
- * supplied no `Retry-After` or `X-RateLimit-Reset` header. One second
- * is conservative — enough to clear a transient burst without serializing
- * the supervisor on every retry.
+ * Default fallback sleep when GitHub answered `429` with no rate-limit
+ * headers (the status itself is the signal). One second is conservative
+ * — enough to clear a transient burst without serializing the supervisor
+ * on every retry. `403` does not use this fallback; without rate-limit
+ * headers a `403` is treated as a permission error and propagates. See
+ * ADR-010.
  */
 export const DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS = 1_000;
 
 /**
- * HTTP status codes that trigger a single rate-limit-aware retry. `429`
- * is GitHub's secondary rate-limit signal; `403` is the primary one when
- * the remaining quota is exhausted (also expressed via
- * `X-RateLimit-Remaining: 0`).
+ * HTTP status codes that may trigger the single rate-limit-aware retry.
+ * `429` is GitHub's secondary rate-limit signal; `403` is the primary
+ * one **only** when paired with `X-RateLimit-Remaining: 0` (see ADR-010
+ * for why a header-less 403 propagates instead of retrying).
  */
 const RATE_LIMITED_STATUS_CODES: ReadonlySet<number> = new Set([403, 429]);
 
@@ -237,7 +319,7 @@ const DEFAULT_USER_AGENT = "makina-github-client/0.1";
  * const issue = await client.getIssue(makeRepoFullName("a/b"), makeIssueNumber(1));
  * ```
  */
-export class GitHubClientImpl implements GitHubClient {
+export class GitHubClientImpl implements StabilizeGitHubClient {
   private readonly auth: GitHubAuth;
   private readonly installationId: InstallationId;
   private readonly octokit: Octokit;
@@ -495,10 +577,17 @@ export class GitHubClientImpl implements GitHubClient {
   // -------------------------------------------------------------------------
 
   /**
-   * Issue an Octokit request and retry exactly once when GitHub answers
-   * `403` or `429` with a `Retry-After` or `X-RateLimit-Reset` header.
-   * 5xx responses propagate immediately; the supervisor's higher-level
-   * retry policy decides whether to back off or fail the task.
+   * Issue an Octokit request and retry exactly once when GitHub gave us a
+   * clear rate-limit signal (see ADR-010 for the full policy):
+   *
+   * - `Retry-After` header present (any 4xx).
+   * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` (any 4xx).
+   * - `429` with neither header — the status itself is the signal.
+   *
+   * A `403` with no rate-limit headers propagates immediately because it
+   * is a permission/scope error, not a quota event. 5xx propagates so
+   * the supervisor's higher-level retry policy can decide whether to
+   * back off.
    */
   private async requestWithRetry(
     route: string,
@@ -509,15 +598,16 @@ export class GitHubClientImpl implements GitHubClient {
     } catch (firstError) {
       if (!(firstError instanceof Error)) throw firstError;
       const status = readStatus(firstError);
-      const headers = readHeaders(firstError);
-      if (status !== undefined && RATE_LIMITED_STATUS_CODES.has(status)) {
-        const waitMilliseconds = this.computeRetrySleepMilliseconds(headers);
-        if (waitMilliseconds !== null) {
-          await this.sleepMilliseconds(waitMilliseconds);
-          return await this.executeRequest(route, parameters);
-        }
+      if (status === undefined || !RATE_LIMITED_STATUS_CODES.has(status)) {
+        throw firstError;
       }
-      throw firstError;
+      const headers = readHeaders(firstError);
+      const waitMilliseconds = this.computeRetrySleepMilliseconds(status, headers);
+      if (waitMilliseconds === null) {
+        throw firstError;
+      }
+      await this.sleepMilliseconds(waitMilliseconds);
+      return await this.executeRequest(route, parameters);
     }
   }
 
@@ -545,18 +635,24 @@ export class GitHubClientImpl implements GitHubClient {
 
   /**
    * Translate the rate-limit response headers into a sleep duration in
-   * milliseconds. Returns `null` when no header guidance applies — but
-   * always falls back to {@link DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS}
-   * for a 429/403 with no headers because GitHub does occasionally
-   * return one without either.
+   * milliseconds, or `null` when no retry should fire.
    *
-   * Honors:
+   * Honors (any rate-limited status):
    *
-   * - `Retry-After` (seconds, GitHub secondary rate limit)
+   * - `Retry-After` (seconds, GitHub secondary rate limit).
    * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset`
-   *   (Unix-seconds epoch, GitHub primary rate limit)
+   *   (Unix-seconds epoch, GitHub primary rate limit).
+   *
+   * If neither header applies, the status itself decides:
+   *
+   * - `429` falls back to {@link DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS}
+   *   (the status alone is a rate-limit signal).
+   * - Anything else returns `null` so the caller propagates without
+   *   retrying — a `403` with no rate-limit headers is a permission
+   *   error, not a quota event.
    */
   private computeRetrySleepMilliseconds(
+    status: number,
     headers: Record<string, string>,
   ): number | null {
     const retryAfter = headers[HEADER_RETRY_AFTER];
@@ -568,8 +664,8 @@ export class GitHubClientImpl implements GitHubClient {
     }
     const remainingRaw = headers[HEADER_RATE_LIMIT_REMAINING];
     const resetRaw = headers[HEADER_RATE_LIMIT_RESET];
-    if (resetRaw !== undefined) {
-      const remaining = remainingRaw === undefined ? 0 : Number.parseInt(remainingRaw, 10);
+    if (resetRaw !== undefined && remainingRaw !== undefined) {
+      const remaining = Number.parseInt(remainingRaw, 10);
       if (!Number.isNaN(remaining) && remaining <= 0) {
         const resetSeconds = Number.parseInt(resetRaw, 10);
         if (!Number.isNaN(resetSeconds)) {
@@ -578,14 +674,17 @@ export class GitHubClientImpl implements GitHubClient {
         }
       }
     }
-    // No header guidance — fall back to a small constant so we still
-    // retry once. Cap by the configured max so a future caller cannot
-    // make this larger than the configured retry ceiling.
-    return clamp(
-      DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS,
-      0,
-      this.maxRetrySleepMilliseconds,
-    );
+    if (status === 429) {
+      // 429 with no header guidance: status alone is the rate-limit
+      // signal, so fall back to a small constant. Cap by the configured
+      // max so a future caller cannot exceed the retry ceiling.
+      return clamp(
+        DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS,
+        0,
+        this.maxRetrySleepMilliseconds,
+      );
+    }
+    return null;
   }
 }
 

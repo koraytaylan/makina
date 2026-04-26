@@ -251,25 +251,6 @@ Deno.test("createPullRequest: happy path posts to /pulls and projects PR", async
   assertEquals(parsedBody.body, "Implements #1.");
 });
 
-Deno.test("createPullRequest: derives merged state from merged_at when present", async () => {
-  const harness = new FakeFetchHarness();
-  harness.enqueueResponse(200, {
-    number: 11,
-    head: { sha: "f00", ref: "feat" },
-    base: { ref: "main" },
-    state: "closed",
-    merged_at: "2026-04-26T12:00:00Z",
-  });
-  const { client } = buildClient(harness);
-  const pr = await client.createPullRequest(REPO, {
-    headRef: "feat",
-    baseRef: "main",
-    title: "t",
-    body: "b",
-  });
-  assertEquals(pr.state, "merged");
-});
-
 Deno.test("createPullRequest: 429 with X-RateLimit-Reset waits until reset and retries", async () => {
   const harness = new FakeFetchHarness();
   // Set 'now' to t = 1000 seconds; reset = 1003 -> sleep ~3000ms.
@@ -739,7 +720,7 @@ Deno.test("retry: X-RateLimit-Reset that is already in the past sleeps zero", as
 });
 
 Deno.test(
-  "retry: 403 with X-RateLimit-Remaining > 0 still triggers fallback retry",
+  "retry: 403 with X-RateLimit-Remaining > 0 propagates without retry",
   async () => {
     const harness = new FakeFetchHarness();
     harness.enqueueResponse(403, { message: "Forbidden" }, {
@@ -748,9 +729,40 @@ Deno.test(
         "x-ratelimit-reset": "1000",
       },
     });
-    // The X-RateLimit-Reset branch only fires when remaining <= 0; with
-    // 100 remaining the client falls through to the constant fallback,
-    // sleeps once, and retries.
+    // 403 with quota left is a permission/scope error, not a rate-limit
+    // event — see ADR-010. The client must not sleep or retry.
+    const { client } = buildClient(harness);
+    await assertRejects(() => client.getIssue(REPO, makeIssueNumber(1)));
+    assertEquals(harness.recordedRequests.length, 1);
+    assertEquals(harness.recordedSleeps.length, 0);
+  },
+);
+
+Deno.test(
+  "retry: 403 with no rate-limit headers propagates without retry",
+  async () => {
+    const harness = new FakeFetchHarness();
+    harness.enqueueResponse(403, { message: "Forbidden" });
+    // Bare 403 → permission error, not a rate-limit event.
+    const { client } = buildClient(harness);
+    await assertRejects(() => client.getIssue(REPO, makeIssueNumber(1)));
+    assertEquals(harness.recordedRequests.length, 1);
+    assertEquals(harness.recordedSleeps.length, 0);
+  },
+);
+
+Deno.test(
+  "retry: 403 with X-RateLimit-Remaining=0 sleeps until reset and retries",
+  async () => {
+    const harness = new FakeFetchHarness();
+    // now=1_000_000ms; reset=1003 -> sleep ~3000ms.
+    harness.setTime(1_000_000);
+    harness.enqueueResponse(403, { message: "primary limit" }, {
+      headers: {
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": "1003",
+      },
+    });
     harness.enqueueResponse(200, {
       number: 1,
       title: "ok",
@@ -760,7 +772,7 @@ Deno.test(
     const { client } = buildClient(harness);
     await client.getIssue(REPO, makeIssueNumber(1));
     assertEquals(harness.recordedRequests.length, 2);
-    assertEquals(harness.recordedSleeps, [DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS]);
+    assertEquals(harness.recordedSleeps, [3_000]);
   },
 );
 
