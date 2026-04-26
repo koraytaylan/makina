@@ -17,7 +17,7 @@
  *    silently dropped (no data loss without warning).
  */
 
-import { assertEquals, assertNotEquals, assertRejects } from "@std/assert";
+import { assertEquals, assertRejects } from "@std/assert";
 import { dirname, join } from "@std/path";
 import { exists } from "@std/fs";
 
@@ -259,6 +259,95 @@ Deno.test("loadAll surfaces a corrupt live file rather than silently dropping da
   }
 });
 
+Deno.test("loadAll rejects an array element that is not a Task object", async () => {
+  // Per-element validation exists so a corrupt or hand-edited store can't
+  // hand the supervisor garbage typed as `Task`. A primitive in the array
+  // must be rejected, not silently cast.
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    await Deno.mkdir(dirname(path), { recursive: true });
+    await Deno.writeTextFile(path, JSON.stringify(["not-a-task"]));
+    const persistence = createPersistence({ path });
+    await assertRejects(
+      () => persistence.loadAll(),
+      Error,
+      "is not a Task object",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("loadAll rejects an array element missing required Task fields", async () => {
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    await Deno.mkdir(dirname(path), { recursive: true });
+    await Deno.writeTextFile(path, JSON.stringify([{ id: "task_partial" }]));
+    const persistence = createPersistence({ path });
+    await assertRejects(
+      () => persistence.loadAll(),
+      Error,
+      "missing required field",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("loadAll rejects an element with the wrong type for a required field", async () => {
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    await Deno.mkdir(dirname(path), { recursive: true });
+    const malformed = {
+      id: "task_typed_wrong",
+      repo: "koraytaylan/makina",
+      issueNumber: "seven",
+      state: "INIT",
+      mergeMode: "squash",
+      model: "claude-sonnet-4-6",
+      iterationCount: 0,
+      createdAtIso: "2026-04-26T12:00:00.000Z",
+      updatedAtIso: "2026-04-26T12:00:00.000Z",
+    };
+    await Deno.writeTextFile(path, JSON.stringify([malformed]));
+    const persistence = createPersistence({ path });
+    await assertRejects(
+      () => persistence.loadAll(),
+      Error,
+      "issueNumber is not an integer",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("loadAll rejects an element with an unknown TaskState", async () => {
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    await Deno.mkdir(dirname(path), { recursive: true });
+    const malformed = {
+      id: "task_unknown_state",
+      repo: "koraytaylan/makina",
+      issueNumber: 7,
+      state: "GLITCHED",
+      mergeMode: "squash",
+      model: "claude-sonnet-4-6",
+      iterationCount: 0,
+      createdAtIso: "2026-04-26T12:00:00.000Z",
+      updatedAtIso: "2026-04-26T12:00:00.000Z",
+    };
+    await Deno.writeTextFile(path, JSON.stringify([malformed]));
+    const persistence = createPersistence({ path });
+    await assertRejects(
+      () => persistence.loadAll(),
+      Error,
+      "is not a TaskState",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 Deno.test("loadAll surfaces non-array root rather than silently coercing", async () => {
   const { path, cleanup } = await makeTempStorePath();
   try {
@@ -384,21 +473,66 @@ Deno.test("save persists every Task field including optional ones", async () => 
   }
 });
 
-Deno.test("save fsyncs the staged bytes before the rename commits", async () => {
-  // We cannot directly observe `fdatasync` from user space, but we can
-  // observe its postcondition: after `save` returns, an immediate read of
-  // the live file must surface the bytes we just wrote (no dirty-page
-  // deferred-flush window where another reader sees stale content).
+Deno.test("after save the live file holds the new bytes (read postcondition)", async () => {
+  // This pins the round-trip-via-disk invariant: after `save` resolves,
+  // an external `Deno.readTextFile` on the live path must surface the
+  // serialized payload. (We cannot observe `fdatasync` from user space —
+  // see the spy-based test below for that — but we can prove the rename
+  // landed and the bytes are JSON-decodable.)
   const { path, cleanup } = await makeTempStorePath();
   try {
     const persistence = createPersistence({ path });
-    const task = makeTask({ id: makeTaskId("task_fsync"), iterationCount: 99 });
+    const task = makeTask({ id: makeTaskId("task_postcondition"), iterationCount: 99 });
     await persistence.save(task);
     const raw = await Deno.readTextFile(path);
     const parsed = JSON.parse(raw) as readonly Task[];
     assertEquals(parsed.length, 1);
     assertEquals(parsed[0]?.iterationCount, 99);
   } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("save fsyncs the staged temp file and the parent directory", async () => {
+  // The page-cache-immediate-read trick won't catch a missing `syncData`,
+  // so we instrument `Deno.open` to record `syncData` invocations against
+  // each opened path. After one save we expect both the temp file
+  // (`<path>.tmp`) and the parent directory to have been synced.
+  const { path, cleanup } = await makeTempStorePath();
+  const originalOpen = Deno.open;
+  const synced: string[] = [];
+  // deno-lint-ignore no-explicit-any
+  (Deno as any).open = async (target: string | URL, options?: Deno.OpenOptions) => {
+    const file = await originalOpen(target as string, options);
+    const targetPath = typeof target === "string" ? target : target.pathname;
+    const originalSyncData = file.syncData.bind(file);
+    file.syncData = async () => {
+      synced.push(targetPath);
+      await originalSyncData();
+    };
+    return file;
+  };
+  try {
+    const persistence = createPersistence({ path });
+    await persistence.save(makeTask({ id: makeTaskId("task_fsync_spy") }));
+    // Both the staged temp file and the parent directory must have been
+    // syncData()'d. Without the parent-dir sync, a power loss after the
+    // rename could lose the directory entry update on POSIX filesystems.
+    const tempPath = `${path}.tmp`;
+    const parentDir = dirname(path);
+    assertEquals(
+      synced.includes(tempPath),
+      true,
+      `expected fsync on ${tempPath}, saw ${JSON.stringify(synced)}`,
+    );
+    assertEquals(
+      synced.includes(parentDir),
+      true,
+      `expected fsync on ${parentDir}, saw ${JSON.stringify(synced)}`,
+    );
+  } finally {
+    // deno-lint-ignore no-explicit-any
+    (Deno as any).open = originalOpen;
     await cleanup();
   }
 });
@@ -501,7 +635,8 @@ Deno.test("remove returns ordering from disk after subsequent saves (no stale sn
     assertEquals(tasks.map((t) => t.id), ["task_b", "task_c"]);
     // Tasks should round-trip equal even after the rewrite.
     assertEquals(tasks[0]?.id, "task_b");
-    assertNotEquals(tasks.find((t) => t.id === "task_a"), b);
+    // The removed record really is gone — not merely "not equal to b".
+    assertEquals(tasks.find((t) => t.id === "task_a"), undefined);
   } finally {
     await cleanup();
   }

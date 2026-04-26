@@ -13,13 +13,18 @@
  * either way.
  *
  * **Atomic write.** Every mutation rewrites the entire store using the
- * standard write-tmp + fsync + rename dance:
+ * standard write-tmp + fsync + rename + dir-fsync dance:
  *
  *  1. Serialize the current in-memory snapshot to JSON.
  *  2. Open `<path>.tmp` (truncating any leftover from a previous crash).
  *  3. Write the bytes, then `fdatasync` the file descriptor so the kernel
- *     flushes them to disk before the rename returns.
+ *     flushes them to disk before the rename.
  *  4. Atomically rename `<path>.tmp` over `<path>`.
+ *  5. Open the parent directory and `fdatasync` it so the new directory
+ *     entry (the post-rename name → inode mapping) is itself durable. On
+ *     POSIX filesystems the rename's metadata can otherwise live in the
+ *     directory's dirty page cache and be lost on power failure even after
+ *     the file's data has been flushed.
  *
  * Because POSIX rename(2) within a filesystem is atomic, an observer (a
  * concurrent `loadAll`, the next daemon restart, an operator with `cat`)
@@ -43,7 +48,7 @@
 import { dirname } from "@std/path";
 import { ensureDir } from "@std/fs";
 
-import { type Persistence, type Task, type TaskId } from "../types.ts";
+import { MERGE_MODES, type Persistence, type Task, TASK_STATES, type TaskId } from "../types.ts";
 
 /** Suffix appended to the live path to form the temp file used for atomic writes. */
 const TEMP_FILE_SUFFIX = ".tmp";
@@ -121,9 +126,12 @@ class AtomicJsonPersistence implements Persistence {
    *
    * @returns Frozen array of every task currently persisted, in the order
    *   the file holds them.
-   * @throws If the file exists but is not valid JSON or does not match the
-   *   expected array-of-tasks shape; this surfaces a corrupt store rather
-   *   than silently dropping data.
+   * @throws If the file exists but is not valid JSON, the root is not an
+   *   array, or any element is missing the required {@link Task} shape
+   *   (object with at minimum `id`, `repo`, `issueNumber`, `state`,
+   *   `mergeMode`, `model`, `iterationCount`, `createdAtIso`,
+   *   `updatedAtIso`); this surfaces a corrupt store rather than silently
+   *   handing the daemon malformed records typed as `Task`.
    */
   async loadAll(): Promise<readonly Task[]> {
     // Wait for any in-flight write so we never observe a partially serialized
@@ -159,7 +167,7 @@ class AtomicJsonPersistence implements Persistence {
         `persistence: ${this.livePath} root is not an array`,
       );
     }
-    return Object.freeze(parsed as Task[]);
+    return Object.freeze(parsed.map((entry, index) => coerceTask(entry, index, this.livePath)));
   }
 
   /**
@@ -273,7 +281,7 @@ class AtomicJsonPersistence implements Persistence {
         `persistence: ${this.livePath} root is not an array`,
       );
     }
-    return parsed as Task[];
+    return parsed.map((entry, index) => coerceTask(entry, index, this.livePath));
   }
 
   /**
@@ -281,11 +289,15 @@ class AtomicJsonPersistence implements Persistence {
    * `tasks`.
    *
    * Sequence: ensure parent → open `<path>.tmp` (truncate) → write JSON →
-   * `fdatasync` the file descriptor → close → rename over the live path.
-   * The rename is the commit point.
+   * `fdatasync` the file descriptor → close → rename over the live path →
+   * `fdatasync` the parent directory. The rename is the commit point and
+   * the parent-directory sync makes that commit durable across power loss
+   * — without it the new directory entry can live in the directory's
+   * dirty page cache and be lost even though the file's data is on disk.
    */
   private async writeAtomic(tasks: readonly Task[]): Promise<void> {
-    await ensureDir(dirname(this.livePath));
+    const parent = dirname(this.livePath);
+    await ensureDir(parent);
     const json = JSON.stringify(tasks, null, JSON_INDENT_SPACES);
     const bytes = new TextEncoder().encode(json);
     const file = await Deno.open(this.tempPath, {
@@ -300,6 +312,7 @@ class AtomicJsonPersistence implements Persistence {
       file.close();
     }
     await Deno.rename(this.tempPath, this.livePath);
+    await syncDirectory(parent);
   }
 }
 
@@ -349,4 +362,131 @@ async function writeAll(file: Deno.FsFile, bytes: Uint8Array): Promise<void> {
 /** Sentinel no-op used by the write chain to swallow unhandled rejections. */
 function noop(): void {
   // Intentionally empty.
+}
+
+/**
+ * Set of required {@link Task} field names checked by {@link coerceTask}.
+ *
+ * We deliberately enforce the persistence-relevant minimum — every field
+ * the supervisor reads at restore time must be present and well-typed.
+ * Optional fields (`prNumber`, `branchName`, `worktreePath`, `sessionId`,
+ * `lastReviewAtIso`, `stabilizePhase`, `terminalReason`) are not checked
+ * here; they are validated by the consumers that actually read them.
+ */
+const REQUIRED_TASK_FIELDS = [
+  "id",
+  "repo",
+  "issueNumber",
+  "state",
+  "mergeMode",
+  "model",
+  "iterationCount",
+  "createdAtIso",
+  "updatedAtIso",
+] as const satisfies readonly (keyof Task)[];
+
+/**
+ * Validate that `entry` matches the {@link Task} shape closely enough to
+ * be handed to the daemon as a `Task`.
+ *
+ * The check is intentionally narrow — we verify presence and primitive
+ * type of every required persistence field, plus the discriminant unions
+ * (`state`, `mergeMode`) that the supervisor switches on. We do not
+ * re-validate brand invariants (`makeTaskId` etc.); a value that survived
+ * a previous serialization must have already passed those.
+ *
+ * @throws If `entry` is not an object, is missing a required field, or
+ *   carries the wrong type for one. The error names the live path and
+ *   element index so an operator can locate the bad record with `jq`.
+ */
+function coerceTask(entry: unknown, index: number, livePath: string): Task {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error(
+      `persistence: ${livePath}[${index}] is not a Task object`,
+    );
+  }
+  const record = entry as Record<string, unknown>;
+  for (const field of REQUIRED_TASK_FIELDS) {
+    if (!(field in record)) {
+      throw new Error(
+        `persistence: ${livePath}[${index}] is missing required field "${field}"`,
+      );
+    }
+  }
+  if (typeof record.id !== "string" || record.id.length === 0) {
+    throw new Error(
+      `persistence: ${livePath}[${index}].id is not a non-empty string`,
+    );
+  }
+  if (typeof record.repo !== "string" || record.repo.length === 0) {
+    throw new Error(
+      `persistence: ${livePath}[${index}].repo is not a non-empty string`,
+    );
+  }
+  if (typeof record.issueNumber !== "number" || !Number.isInteger(record.issueNumber)) {
+    throw new Error(
+      `persistence: ${livePath}[${index}].issueNumber is not an integer`,
+    );
+  }
+  if (typeof record.iterationCount !== "number" || !Number.isInteger(record.iterationCount)) {
+    throw new Error(
+      `persistence: ${livePath}[${index}].iterationCount is not an integer`,
+    );
+  }
+  if (typeof record.model !== "string") {
+    throw new Error(
+      `persistence: ${livePath}[${index}].model is not a string`,
+    );
+  }
+  if (typeof record.createdAtIso !== "string") {
+    throw new Error(
+      `persistence: ${livePath}[${index}].createdAtIso is not a string`,
+    );
+  }
+  if (typeof record.updatedAtIso !== "string") {
+    throw new Error(
+      `persistence: ${livePath}[${index}].updatedAtIso is not a string`,
+    );
+  }
+  if (
+    typeof record.state !== "string" ||
+    !(TASK_STATES as readonly string[]).includes(record.state)
+  ) {
+    throw new Error(
+      `persistence: ${livePath}[${index}].state ${JSON.stringify(record.state)} is not a TaskState`,
+    );
+  }
+  if (
+    typeof record.mergeMode !== "string" ||
+    !(MERGE_MODES as readonly string[]).includes(record.mergeMode)
+  ) {
+    throw new Error(
+      `persistence: ${livePath}[${index}].mergeMode ${
+        JSON.stringify(record.mergeMode)
+      } is not a MergeMode`,
+    );
+  }
+  return record as unknown as Task;
+}
+
+/**
+ * `fdatasync` the directory at `path` so the most recent rename within it
+ * is durable across power loss.
+ *
+ * On POSIX filesystems a `rename(2)` updates the parent directory's
+ * dirty page cache; the entry is not durable until the directory itself
+ * is flushed. macOS, Linux ext4, XFS, and APFS all permit opening a
+ * directory read-only and calling `fdatasync` on the descriptor — Deno
+ * exposes that as `Deno.FsFile.syncData()`.
+ *
+ * Any IO failure is propagated; a half-durable rename is worse than no
+ * rename because callers think their write committed.
+ */
+async function syncDirectory(path: string): Promise<void> {
+  const dir = await Deno.open(path, { read: true });
+  try {
+    await dir.syncData();
+  } finally {
+    dir.close();
+  }
 }
