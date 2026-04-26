@@ -129,10 +129,12 @@ export function expandHome(path: string): string {
 }
 
 function resolveHome(): string {
-  const home = Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE");
+  // ADR-008 defers Windows: only POSIX `$HOME` is supported. WSL2 users
+  // have a `$HOME` like any other Linux env, so this still covers them.
+  const home = Deno.env.get("HOME");
   if (home === undefined || home.length === 0) {
     throw new Error(
-      "cannot expand ~/: neither $HOME nor %USERPROFILE% is set",
+      "cannot expand ~/: $HOME is not set",
     );
   }
   return home;

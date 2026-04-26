@@ -117,10 +117,29 @@ if (subcommand === "daemon") {
   Deno.addSignalListener("SIGINT", shutdown);
   Deno.addSignalListener("SIGTERM", shutdown);
 } else if (subcommand === "setup") {
-  // Until [W2-github-app-auth] lands the real implementation, the wizard
-  // uses a stub that surfaces a clear "not yet implemented" message if
-  // the user hits this in production. The wizard's tests inject their
-  // own client; this stub never runs in tests.
+  // The interactive wizard is fully implemented; what is **not** yet
+  // wired in this PR is the App-level GitHub client that lists reachable
+  // installations. That client lands with [W2-github-app-auth] (issue #4)
+  // and the wizard already accepts it via injection. To avoid a UX where
+  // the user types the App ID and key path only to hit a "not
+  // implemented" error mid-flow, the subcommand gates itself behind the
+  // `MAKINA_ALLOW_WIZARD_STUB=1` env var until #4 lands. Without the
+  // flag we exit immediately with a pointer; with the flag the wizard
+  // runs and the stub surfaces a clear failure on the discovery step.
+  const allowStub = Deno.env.get("MAKINA_ALLOW_WIZARD_STUB") === "1";
+  if (!allowStub) {
+    console.error(
+      "makina setup is not yet usable: the GitHub App client is wired in #4.",
+    );
+    console.error(
+      "Track issue #4 ([W2-github-app-auth]); set MAKINA_ALLOW_WIZARD_STUB=1 to dry-run the wizard.",
+    );
+    Deno.exit(2);
+  }
+  // Stub used only for the `MAKINA_ALLOW_WIZARD_STUB=1` dry-run path. It
+  // throws on the discovery step so contributors can exercise the
+  // prompts without a real App client; the wizard's own tests inject
+  // their own client and never touch this code.
   const stubClient: WizardGitHubClient = {
     getInstallations(): Promise<readonly WizardInstallation[]> {
       throw new Error(

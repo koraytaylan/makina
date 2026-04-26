@@ -230,7 +230,10 @@ Deno.test("expandHome: handles a $HOME with a trailing slash without producing /
   }
 });
 
-Deno.test("expandHome: throws when ~/ is used without a home directory", () => {
+Deno.test("expandHome: throws when ~/ is used without $HOME set", () => {
+  // Per ADR-008 (Windows out of scope) the loader only honors $HOME.
+  // The test scrubs USERPROFILE too so we'd notice if a future change
+  // accidentally re-introduced a Windows fallback.
   const previousHome = Deno.env.get("HOME");
   const previousProfile = Deno.env.get("USERPROFILE");
   Deno.env.delete("HOME");
@@ -247,13 +250,16 @@ Deno.test("expandHome: throws when ~/ is used without a home directory", () => {
   }
 });
 
-Deno.test("expandHome: falls back to USERPROFILE when HOME is unset", () => {
+Deno.test("expandHome: ignores USERPROFILE (ADR-008 — Windows out of scope)", () => {
+  // We do NOT promise %USERPROFILE% expansion. Setting it without HOME
+  // must still raise so we never accidentally start advertising native
+  // Windows behavior we don't actually support.
   const previousHome = Deno.env.get("HOME");
   const previousProfile = Deno.env.get("USERPROFILE");
   Deno.env.delete("HOME");
   Deno.env.set("USERPROFILE", "/Users/mock");
   try {
-    assertEquals(expandHome("~/foo"), "/Users/mock/foo");
+    assertThrows(() => expandHome("~/foo"), Error, "cannot expand");
   } finally {
     if (previousHome !== undefined) {
       Deno.env.set("HOME", previousHome);

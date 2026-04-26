@@ -385,8 +385,8 @@ function collectRepositoryChoices(
 ): readonly RepoChoice[] {
   // Flatten installation × repository into a single picker. If the same
   // repo appears under multiple installations the first one wins; the
-  // wizard logs a note rather than failing because that mostly happens
-  // when a personal install and an org install overlap.
+  // wizard silently deduplicates rather than failing because that mostly
+  // happens when a personal install and an org install overlap.
   const seen = new Set<string>();
   const choices: RepoChoice[] = [];
   for (const installation of installations) {
@@ -417,11 +417,11 @@ async function promptDefaultRepo(
 ): Promise<string> {
   await io.writeLine("");
   await io.writeLine("Reachable repositories:");
-  choices.forEach((choice, index) => {
+  for (const [index, choice] of choices.entries()) {
     // Wizard picker numbers are one-based — easier to type at a prompt.
     const label = `  ${index + 1}. ${choice.repo}`;
-    void io.writeLine(label);
-  });
+    await io.writeLine(label);
+  }
   await io.writeLine("");
   await io.writeLine(
     `Pick the default repository (1-${choices.length}). Slash commands without an explicit [owner/repo] target this one.`,
