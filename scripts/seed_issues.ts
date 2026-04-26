@@ -101,7 +101,7 @@ const issues: readonly IssueSpec[] = [
       outputs:
         "A working repo at https://github.com/koraytaylan/makina with green CI, a successful dry-run release artifact, all issues from this catalog created, and `develop` checked out as the integration branch.",
       acceptance: `- [ ] \`deno task ci\` is green on the initial commit.
-- [ ] Dry-run \`v0.0.0-rc.0\` release succeeds (notes + 4 binaries + \`SHASUMS256.txt\`) and is then deleted.
+- [ ] Dry-run \`v0.0.0-rc.0\` release succeeds (notes + 3 binaries + \`SHASUMS256.txt\`) and is then deleted.
 - [ ] \`gh issue list --limit 100\` returns 20 successor issues with the labels declared in this catalog.
 - [ ] Direct push to \`main\` is rejected by branch protection.
 - [ ] Direct push to \`develop\` is rejected by branch protection.
@@ -516,8 +516,8 @@ const issues: readonly IssueSpec[] = [
       files: "- (none — this is a release ceremony, not code)",
       inputs: "- Every Wave 4/5 issue closed",
       outputs:
-        "- A real GitHub release at https://github.com/koraytaylan/makina/releases/v0.1.0 with notes + 4 binaries + checksums.",
-      acceptance: `- [ ] Real GitHub release published with notes + 4 binaries + checksums.
+        "- A real GitHub release at https://github.com/koraytaylan/makina/releases/v0.1.0 with notes + 3 binaries + checksums.",
+      acceptance: `- [ ] Real GitHub release published with notes + 3 binaries + checksums.
 - [ ] \`makina --version\` against the published darwin-arm64 binary returns \`v0.1.0\`.
 - [ ] Happy-path verification scenario passes against a real issue on the sandbox repo.
 - [ ] The long-lived release-tracking issue (\`chore: release v0.1.0\`) is closed by the workflow.`,

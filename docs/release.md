@@ -28,8 +28,8 @@ That's it. `release.yml` will:
 1. Re-run `deno task ci` against the tagged commit.
 2. Generate the changelog with `git-cliff` (using `cliff.toml` and the Conventional Commits log
    between the previous tag and this one).
-3. Build standalone binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-   `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`.
+3. Build standalone binaries for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
+   `aarch64-unknown-linux-gnu`. (Intel macOS is intentionally not built — see ADR-008.)
 4. Compute SHA-256 checksums for each binary into `SHASUMS256.txt`.
 5. Publish a GitHub Release with the generated notes + the binaries + checksums.
 6. Print the release URL into the workflow run summary.
