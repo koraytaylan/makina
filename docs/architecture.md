@@ -1,6 +1,6 @@
 # Architecture
 
-> Wave 0 stub. Implemented progressively across Waves 2–4.
+> Wave 1 contracts in place; daemon and TUI bodies implemented progressively across Waves 2–4.
 
 ## Process model
 
@@ -37,6 +37,14 @@ Two cooperating processes communicate over a Unix domain socket using NDJSON:
 
 ## IPC protocol
 
-NDJSON envelopes `{ id, type, payload }` with zod schemas in `src/ipc/protocol.ts` (W1). Client →
-Daemon: `subscribe`, `unsubscribe`, `command`, `prompt`, `ping`. Daemon → Client: `event`, `ack`,
-`pong`.
+Length-prefixed framed envelopes `{ id, type, payload }` with zod schemas in `src/ipc/protocol.ts`
+(Wave 1). Each frame is `<decimal-length>\n<utf8-json>\n`; the trailing newline keeps the wire
+format human-readable for ad-hoc tooling. The framer lives in `src/ipc/codec.ts` and rejects
+malformed frames (oversize, partial, schema-mismatched, non-UTF8) with a typed `IpcCodecError`.
+Client → Daemon: `subscribe`, `unsubscribe`, `command`, `prompt`, `ping`. Daemon → Client: `event`,
+`ack`, `pong`.
+
+Consumers do not import zod directly: `src/ipc/protocol.ts` exposes typed interfaces and a
+`parseEnvelope(raw): ParseEnvelopeResult` function; the same idiom in `src/config/schema.ts` exposes
+`parseConfig`. This keeps the public API zod-free so `deno doc --lint` reflects the contract, not
+the validator implementation.
