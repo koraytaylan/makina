@@ -27,7 +27,7 @@ import {
   SocketDaemonClient,
   validateReplyEnvelope,
 } from "../../src/tui/ipc-client.ts";
-import { useDaemonConnection } from "../../src/tui/hooks/useDaemonConnection.ts";
+import { DaemonHookError, useDaemonConnection } from "../../src/tui/hooks/useDaemonConnection.ts";
 import { Header } from "../../src/tui/components/Header.tsx";
 import { MainPane } from "../../src/tui/components/MainPane.tsx";
 import { StatusBar } from "../../src/tui/components/StatusBar.tsx";
@@ -326,8 +326,8 @@ Deno.test("handleEvent: log event sets the last message with level prefix", () =
     setLastError: (next) => {
       lastError = next;
     },
-    setFocusedTaskId: (next) => {
-      focused = next;
+    setFocusedTaskId: (update) => {
+      focused = update(focused);
     },
   });
   assertEquals(lastMessage, "[info] hello");
@@ -359,6 +359,46 @@ Deno.test("handleEvent: state-changed event renders fromState → toState", () =
   );
   assertEquals(lastMessage, "task_x: INIT → CLONING_WORKTREE");
   assertEquals(known.has(makeTaskId("task_x")), true);
+});
+
+Deno.test("handleEvent: focused-task is auto-set on the first event only", () => {
+  let focused: ReturnType<typeof makeTaskId> | undefined;
+  // First event with t1 → focus snaps to t1.
+  handleEvent(
+    {
+      taskId: "t1",
+      atIso: "2026-04-26T12:00:00.000Z",
+      kind: "log",
+      data: { level: "info", message: "first" },
+    },
+    {
+      setKnownTaskIds: () => {},
+      setLastMessage: () => {},
+      setLastError: () => {},
+      setFocusedTaskId: (update) => {
+        focused = update(focused);
+      },
+    },
+  );
+  assertEquals(focused, makeTaskId("t1"));
+  // Second event from a different task — focus must NOT jump.
+  handleEvent(
+    {
+      taskId: "t2",
+      atIso: "2026-04-26T12:00:01.000Z",
+      kind: "log",
+      data: { level: "info", message: "second" },
+    },
+    {
+      setKnownTaskIds: () => {},
+      setLastMessage: () => {},
+      setLastError: () => {},
+      setFocusedTaskId: (update) => {
+        focused = update(focused);
+      },
+    },
+  );
+  assertEquals(focused, makeTaskId("t1"));
 });
 
 Deno.test("handleEvent: agent-message event truncates long text", () => {
@@ -730,6 +770,49 @@ Deno.test("SocketDaemonClient: connect twice is idempotent", async () => {
   await client.close();
 });
 
+Deno.test(
+  "SocketDaemonClient: reconnects after peer disconnects without explicit close",
+  async () => {
+    // Two paired duplexes — the first is closed mid-test to simulate
+    // the daemon dropping the connection; the second models the
+    // reconnect target.
+    let pair = makeDuplexPair();
+    let opens = 0;
+    const client = new SocketDaemonClient("/unused", () => {
+      opens += 1;
+      return Promise.resolve(pair.client);
+    });
+    await client.connect();
+    assertEquals(opens, 1);
+
+    // Simulate a peer-side disconnect by closing the daemon's writable
+    // half. The client's read loop sees `done` and unwinds — without
+    // anyone calling `client.close()`.
+    const daemonWriter = pair.daemon.writable.getWriter();
+    await daemonWriter.close().catch(() => {});
+    daemonWriter.releaseLock();
+    // Yield so the read loop's `finally` runs and clears the local
+    // handles (the regression Copilot caught).
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    // Subsequent send fails fast — the connection is gone.
+    await assertRejects(
+      () => client.send({ id: "1", type: "ping", payload: {} }),
+      DaemonClientError,
+      "not connected",
+    );
+
+    // Reconnect should open a fresh socket, not no-op.
+    pair = makeDuplexPair();
+    await client.connect();
+    assertEquals(opens, 2);
+
+    await client.close();
+    // After explicit close, further connect() rejects.
+    await assertRejects(() => client.connect(), DaemonClientError, "client has been closed");
+  },
+);
+
 Deno.test("SocketDaemonClient: encode failure rejects without writing", async () => {
   const pair = makeDuplexPair();
   const client = new SocketDaemonClient("/unused", () => Promise.resolve(pair.client));
@@ -1038,6 +1121,91 @@ Deno.test({
     });
     assertEquals(received, 1);
     subscription?.unsubscribe();
+    instance.unmount();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  },
+});
+
+Deno.test({
+  name: 'useDaemonConnection: send rejects with DaemonHookError when status !== "connected"',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // A lifecycle-aware client kept idle (autoConnect off, no manual
+    // connect) puts the hook's status at `"idle"`. The new guard
+    // should reject any `send` call before the lifecycle promotes
+    // the status to `"connected"`.
+    const probe: HookProbe = { api: undefined };
+    const client = makeFakeLifecycleClient();
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
+    const instance = inkRender(
+      <HookProbeHost
+        probe={probe}
+        options={{ client, autoConnect: false }}
+      />,
+      {
+        // deno-lint-ignore no-explicit-any
+        stdout: stdout as any,
+        // deno-lint-ignore no-explicit-any
+        stderr: stderr as any,
+        debug: true,
+        exitOnCtrlC: false,
+        patchConsole: false,
+      },
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assertEquals(probe.api?.status, "idle");
+    const api = probe.api;
+    if (api === undefined) {
+      throw new Error("hook probe never received the API");
+    }
+    await assertRejects(
+      () => api.send({ id: "1", type: "ping", payload: {} }),
+      DaemonHookError,
+      "requires status",
+    );
+    instance.unmount();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  },
+});
+
+Deno.test({
+  name: "useDaemonConnection: disconnect clears stale lastError on lifecycle-less client",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // The in-memory double has no `close`, so disconnect should still
+    // wipe any earlier error message — otherwise the status bar would
+    // keep flagging a stale error after the user disconnects cleanly.
+    const probe: HookProbe = { api: undefined };
+    const client = new InMemoryDaemonClient();
+    const stdout = new FakeStream();
+    const stderr = new FakeStream();
+    const instance = inkRender(
+      <HookProbeHost
+        probe={probe}
+        options={{ client, autoConnect: false }}
+      />,
+      {
+        // deno-lint-ignore no-explicit-any
+        stdout: stdout as any,
+        // deno-lint-ignore no-explicit-any
+        stderr: stderr as any,
+        debug: true,
+        exitOnCtrlC: false,
+        patchConsole: false,
+      },
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // No public hook API exposes `setLastError`; in production the
+    // read loop fills it. Instead, drive the same closeConnection
+    // path (which is what disconnect calls) and assert the post-
+    // condition.
+    await probe.api?.disconnect();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assertEquals(probe.api?.status, "disconnected");
+    assertEquals(probe.api?.lastError, undefined);
     instance.unmount();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   },

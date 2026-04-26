@@ -150,7 +150,22 @@ export class SocketDaemonClient implements DaemonClient {
   >();
   private readonly eventHandlers = new Set<(event: EventPayload) => void>();
   private readLoopPromise: Promise<void> | undefined;
+  /**
+   * Set by {@link SocketDaemonClient.close} so subsequent operations
+   * fail fast. Distinct from the read-loop terminating on its own (a
+   * peer disconnect): an unexpected end leaves `closed === false` so a
+   * caller can call {@link SocketDaemonClient.connect} again to
+   * recover, while an explicit `close()` is permanent.
+   */
   private closed = false;
+  /**
+   * Tracks whether the read loop is currently consuming frames. Goes
+   * `true` in {@link SocketDaemonClient.connect}, back to `false` in
+   * the read loop's `finally`, and lets `connect()` distinguish "I am
+   * already streaming" (no-op) from "the previous stream ended; open
+   * a fresh socket" (reconnect).
+   */
+  private streaming = false;
 
   /**
    * Construct a socket-backed client.
@@ -173,18 +188,36 @@ export class SocketDaemonClient implements DaemonClient {
   }
 
   /**
-   * Open the underlying connection and start the read loop. A
-   * second call before {@link SocketDaemonClient.close} is a no-op.
+   * Open the underlying connection and start the read loop.
    *
-   * @throws {DaemonClientError} If the socket cannot be opened.
+   * - A second call while the read loop is still consuming frames is
+   *   a no-op (the existing socket is reused).
+   * - A call after {@link SocketDaemonClient.close} rejects with a
+   *   {@link DaemonClientError} (an explicit close is permanent).
+   * - A call after the read loop ended on its own (peer disconnect)
+   *   reopens a fresh socket and restarts the read loop. This is the
+   *   recovery path the {@link useDaemonConnection} hook walks when a
+   *   reconnect button is pressed in Wave 3.
+   *
+   * @throws {DaemonClientError} If the client was explicitly closed
+   *   or if the underlying socket cannot be opened.
    */
   async connect(): Promise<void> {
-    if (this.connection !== undefined) {
+    if (this.streaming) {
+      // Already streaming — `connect()` is idempotent in this state.
       return;
     }
     if (this.closed) {
       throw new DaemonClientError("client has been closed");
     }
+    // Defensively clear any leftover handles from a previous read
+    // loop that ended on its own (peer disconnect). The loop's
+    // `finally` releases the locks for us; this just nulls the
+    // refs so the new opener can install fresh ones.
+    this.connection = undefined;
+    this.writer = undefined;
+    this.reader = undefined;
+    this.readLoopPromise = undefined;
     try {
       this.connection = await this.opener();
     } catch (error) {
@@ -195,6 +228,7 @@ export class SocketDaemonClient implements DaemonClient {
     }
     this.writer = this.connection.writable.getWriter();
     this.reader = this.connection.readable.getReader();
+    this.streaming = true;
     this.readLoopPromise = this.runReadLoop(this.reader);
   }
 
@@ -261,12 +295,18 @@ export class SocketDaemonClient implements DaemonClient {
   /**
    * Tear down the connection. Outstanding `send` promises reject with a
    * {@link DaemonClientError}; the read loop exits cleanly. Idempotent.
+   *
+   * Once called, the client is permanently dead — subsequent
+   * {@link SocketDaemonClient.connect} calls reject. To recover from a
+   * peer disconnect without losing the right to reconnect, let the
+   * read loop terminate on its own and then call `connect()` again.
    */
   async close(): Promise<void> {
     if (this.closed) {
       return;
     }
     this.closed = true;
+    this.streaming = false;
     const reason = new DaemonClientError("client closed before reply");
     for (const [id, slot] of this.pending) {
       slot.reject(reason);
@@ -379,9 +419,37 @@ export class SocketDaemonClient implements DaemonClient {
         this.failAllPending(reason);
       }
     } finally {
-      // If the stream ended without `close()` being called explicitly,
-      // mark the client closed so subsequent sends fail fast.
-      this.closed = true;
+      // The stream ended (peer disconnect or explicit `close()`).
+      // Tear down the local handles so a subsequent `connect()` opens
+      // fresh ones — without this the early-return at the top of
+      // `connect()` would treat the dead connection as still alive
+      // and silently no-op. `closed` is left untouched here: only
+      // `close()` should mark the client permanently dead.
+      this.streaming = false;
+      if (this.writer !== undefined) {
+        try {
+          this.writer.releaseLock();
+        } catch {
+          // Already released (close() ran in parallel).
+        }
+        this.writer = undefined;
+      }
+      if (this.reader !== undefined) {
+        try {
+          this.reader.releaseLock();
+        } catch {
+          // Already released.
+        }
+        this.reader = undefined;
+      }
+      if (this.connection !== undefined) {
+        try {
+          this.connection.close();
+        } catch {
+          // Already closed.
+        }
+        this.connection = undefined;
+      }
     }
   }
 

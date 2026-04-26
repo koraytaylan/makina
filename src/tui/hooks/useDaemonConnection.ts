@@ -54,6 +54,24 @@ export type DaemonConnectionStatus =
   | "error";
 
 /**
+ * Error raised by {@link useDaemonConnection}'s `send` when invoked
+ * before the lifecycle reaches `"connected"`. Surfaced as a rejection
+ * so callers can distinguish a hook-side guard from an underlying
+ * transport failure.
+ */
+export class DaemonHookError extends Error {
+  /**
+   * Construct a daemon-hook error.
+   *
+   * @param message Human-readable description of the violation.
+   */
+  constructor(message: string) {
+    super(message);
+    this.name = "DaemonHookError";
+  }
+}
+
+/**
  * The `connect`/`close` half of the {@link DaemonClient} surface that
  * `useDaemonConnection` calls when present. Both are optional so the
  * in-memory double (which is connected on construction) just satisfies
@@ -81,7 +99,11 @@ export interface DaemonConnectionApi {
    */
   readonly lastError: string | undefined;
   /**
-   * Send a request envelope. Rejects if `status !== "connected"`.
+   * Send a request envelope. Rejects with a {@link DaemonHookError} if
+   * `status !== "connected"` at call time; otherwise the call is
+   * forwarded to the underlying client and any transport-level error
+   * surfaces as the client's own rejection (typically a
+   * `DaemonClientError`).
    *
    * @param envelope The envelope to send.
    * @returns The daemon's reply.
@@ -167,7 +189,25 @@ export function useDaemonConnection(
     await closeConnection(clientRef.current, setStatus, setLastError);
   }, []);
 
+  // `statusRef` mirrors `status` so the stable `send` callback can
+  // enforce the "must be connected" guarantee without re-binding on
+  // every status change (which would defeat the stable-reference
+  // contract documented on `DaemonConnectionApi`).
+  const statusRef = useRef(status);
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
   const send = useCallback((envelope: MessageEnvelope): Promise<DaemonReply> => {
+    if (statusRef.current !== "connected") {
+      return Promise.reject(
+        new DaemonHookError(
+          `useDaemonConnection.send requires status === "connected"; got ${
+            JSON.stringify(statusRef.current)
+          }`,
+        ),
+      );
+    }
     return clientRef.current.send(envelope);
   }, []);
 
@@ -252,7 +292,14 @@ async function closeConnection(
   setLastError: Dispatch<SetStateAction<string | undefined>>,
 ): Promise<void> {
   if (client.close === undefined) {
+    // Mirror the success path of the lifecycle-aware branch below: a
+    // clean disconnect leaves no lingering error message even when
+    // the underlying client lacks a `close` to call (in-memory
+    // double, etc.). Without the reset, an earlier transition into
+    // `"error"` would still surface its message in the status bar
+    // after the caller asked to disconnect cleanly.
     setStatus("disconnected");
+    setLastError(undefined);
     return;
   }
   try {

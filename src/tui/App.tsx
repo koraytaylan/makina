@@ -143,6 +143,11 @@ export function App(props: AppProps): ReactElement {
  * indirection keeps the event handler easy to unit-test: the production
  * call site passes React `useState` setters, while tests pass plain
  * closures that capture into local variables.
+ *
+ * `setFocusedTaskId` accepts a functional updater so the handler can
+ * apply "auto-focus only when nothing is focused yet" without reading
+ * the current focused-task value out of band — the React setter and
+ * the test stubs both honor the closure-style update.
  */
 export interface EventSetters {
   /** Setter for the known-tasks set used by `MainPane`. */
@@ -153,8 +158,15 @@ export interface EventSetters {
   readonly setLastMessage: (next: string | undefined) => void;
   /** Setter for the most-recent error message rendered in the status bar. */
   readonly setLastError: (next: string | undefined) => void;
-  /** Setter for the focused task id rendered in the header. */
-  readonly setFocusedTaskId: (next: TaskId | undefined) => void;
+  /**
+   * Setter for the focused task id rendered in the header.
+   *
+   * Receives a functional updater so {@link handleEvent} can preserve
+   * an existing focus instead of clobbering it on every event.
+   */
+  readonly setFocusedTaskId: (
+    update: (previous: TaskId | undefined) => TaskId | undefined,
+  ) => void;
 }
 
 /**
@@ -182,8 +194,11 @@ export function handleEvent(event: EventPayload, setters: EventSetters): void {
     return next;
   });
   // Auto-focus the first task we hear about so the header's focus pill
-  // stops saying "no task focused" once events arrive.
-  setters.setFocusedTaskId(taskId);
+  // stops saying "no task focused" once events arrive. Subsequent
+  // events leave the focused task alone — Wave 3's task switcher will
+  // own focus changes — so the focus does not jump around as new
+  // tasks appear.
+  setters.setFocusedTaskId((previous) => previous ?? taskId);
   switch (event.kind) {
     case "log":
       setters.setLastMessage(`[${event.data.level}] ${event.data.message}`);
@@ -208,12 +223,20 @@ export function handleEvent(event: EventPayload, setters: EventSetters): void {
 }
 
 /**
- * Truncate `text` to `limit` graphemes, appending an ellipsis when
- * shortened. Used by {@link handleEvent} so a long agent message does
- * not overflow the status bar.
+ * Truncate `text` to at most `limit` UTF-16 code units, appending an
+ * ellipsis when shortened. Used by {@link handleEvent} so a long agent
+ * message does not overflow the status bar.
+ *
+ * The cut is by code units, not graphemes — a surrogate pair or a
+ * grapheme cluster that straddles the boundary will be split. The
+ * status bar consumes the result through Ink's text renderer, which
+ * tolerates a stray half-surrogate (it renders as the replacement
+ * character), so the render never crashes; the worst case is one
+ * malformed code point at the cut. Callers that need cluster-aware
+ * truncation should reach for `Intl.Segmenter` themselves.
  *
  * @param text The text to truncate.
- * @param limit The maximum length, in characters.
+ * @param limit The maximum length, in UTF-16 code units.
  * @returns The truncated string.
  */
 function truncate(text: string, limit: number): string {
