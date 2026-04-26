@@ -521,41 +521,39 @@ Deno.test("createGitHubAppAuth: returned object satisfies the W1 GitHubAuth inte
 // `@octokit/auth-app` perform any HTTP request — we cancel before the
 // install-token exchange ever fires.
 
-Deno.test("createGitHubAppAuth: default factory hooks the real @octokit/auth-app", async () => {
-  // Real @octokit/auth-app requires a parseable PEM at construction. A
-  // deliberately-malformed key proves the default factory was actually
-  // invoked: the call must throw a GitHubAppAuthError tagged
-  // `getInstallationToken` (the install-token call delegates JWT signing
-  // to the lazy auth() invocation, so the error surfaces there).
-  //
-  // Explicitly forbid outbound HTTP in this unit test. If library behavior
-  // changes and reaches the install-token exchange, the fetch stub will
-  // make that visible — the assertion below verifies the failure was a
-  // local JWT/private-key parse error, not a network call.
-  const originalFetch = globalThis.fetch;
-  const unexpectedNetworkMessage = "unexpected network call in unit test";
-  globalThis.fetch = (() => {
-    throw new Error(unexpectedNetworkMessage);
-  }) as typeof fetch;
-
-  try {
+Deno.test({
+  name: "createGitHubAppAuth: default factory hooks the real @octokit/auth-app",
+  // Sandbox this test so it cannot make a real network call even by
+  // accident. Per-test permissions are scoped to this test only — they do
+  // not affect other tests running in `--parallel` mode (no globals
+  // mutated). If `@octokit/auth-app` ever changes behavior and reaches the
+  // install-token exchange, Deno raises `PermissionDenied` and the
+  // assertion below catches that distinct failure mode.
+  permissions: { net: false },
+  async fn() {
+    // Real @octokit/auth-app requires a parseable PEM. A deliberately
+    // malformed key proves the default factory was actually wired up: the
+    // first `getInstallationToken` call must throw a GitHubAppAuthError
+    // tagged `getInstallationToken` because the install-token path
+    // delegates JWT signing to the lazy `auth()` invocation, and JWT
+    // signing fails on the bad PEM before any HTTP request is built.
     const auth = createGitHubAppAuth({
       appId: 1234,
       privateKey: "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n-----END RSA PRIVATE KEY-----",
-      installationId: 9876543,
     });
     const error = await assertRejects(
       () => auth.getInstallationToken(makeInstallationId(9876543)),
       GitHubAppAuthError,
     );
+    // PermissionDenied carries the literal phrase "Requires net access" in
+    // Deno 2.x — assert it is NOT present so a future library change that
+    // reaches `fetch` cannot silently pass this regression guard.
     assertNotEquals(
-      error.message.includes(unexpectedNetworkMessage),
+      error.message.includes("Requires net access"),
       true,
-      "expected the failure to be a local JWT/PEM parse error, not an outbound HTTP call",
+      "expected a local JWT/PEM parse error, not a network permission denial",
     );
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  },
 });
 
 Deno.test("createGitHubAppAuth: default clock falls back to Date.now()", async () => {

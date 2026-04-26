@@ -104,16 +104,20 @@ export interface CreateGitHubAppAuthOptions {
    */
   readonly privateKey: string;
   /**
-   * Installation id passed through to `createAppAuth`.
+   * Optional installation id forwarded to `createAppAuth` as a seed.
    *
-   * This value configures the underlying `@octokit/auth-app` strategy, but
-   * it is **not** a default for the {@link GitHubAuth.getInstallationToken}
-   * parameter: callers still pass an explicit {@link InstallationId} to
-   * each token request per the W1 contract. The single auth strategy is
-   * reused across installations rather than constructed afresh per token
-   * request.
+   * The authoritative {@link InstallationId} for every token request comes
+   * from the per-call argument to {@link GitHubAuth.getInstallationToken},
+   * not this option. The same `createGitHubAppAuth` instance is reused
+   * across all installations the daemon manages, so this seed is not
+   * required and is only kept for callers that wired a single-installation
+   * auth in early experiments. Prefer omitting it.
+   *
+   * If you do supply this value, it is passed through to `createAppAuth`
+   * but is **not** a fallback default for the
+   * {@link GitHubAuth.getInstallationToken} parameter.
    */
-  readonly installationId: number;
+  readonly installationId?: number;
   /**
    * Optional injection point for the auth strategy factory. Tests pass a
    * stub; production callers omit this and the real `@octokit/auth-app`
@@ -193,7 +197,6 @@ export class GitHubAppAuthError extends Error {
  * const auth = createGitHubAppAuth({
  *   appId: 1234,
  *   privateKey: await Deno.readTextFile("private-key.pem"),
- *   installationId: 9876543,
  * });
  * const token = await auth.getInstallationToken(makeInstallationId(9876543));
  * ```
@@ -207,7 +210,7 @@ export function createGitHubAppAuth(opts: CreateGitHubAppAuthOptions): GitHubAut
     authHook = strategy({
       appId: opts.appId,
       privateKey: opts.privateKey,
-      installationId: opts.installationId,
+      ...(opts.installationId === undefined ? {} : { installationId: opts.installationId }),
     });
   } catch (error) {
     throw new GitHubAppAuthError("createAppAuth", error);
