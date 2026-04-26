@@ -73,6 +73,8 @@ export class ConfigLoadError extends Error {
   readonly issues: readonly ConfigValidationIssue[];
 
   /**
+   * Construct a config-load error.
+   *
    * @param kind Failure mode discriminator.
    * @param resolvedPath The path the loader actually tried to read.
    * @param message Human-readable summary; rendered verbatim by the

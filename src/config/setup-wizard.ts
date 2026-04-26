@@ -119,6 +119,8 @@ export interface SetupWizardIo {
  */
 export class SetupWizardError extends Error {
   /**
+   * Construct a wizard error.
+   *
    * @param message Human-readable description of the failure.
    */
   constructor(message: string) {
@@ -205,18 +207,55 @@ export async function runSetupWizard(io: SetupWizardIo): Promise<Config> {
 }
 
 /**
- * Build the production-time {@link SetupWizardIo} backed by `Deno.stdin`,
- * `Deno.stdout`, and the supplied GitHub client.
+ * Minimal contract for an object that reads UTF-8 bytes from a source.
  *
- * Kept separate from {@link runSetupWizard} so tests never import a
- * stdin-touching helper; the `setup` subcommand assembles its `io`
- * here.
- *
- * @param githubClient The wizard-only GitHub client (typically backed by
- *   `src/github/app-auth.ts`).
- * @returns A live IO bundle suitable for {@link runSetupWizard}.
+ * Mirrors the shape of `Deno.stdin.read`. The wizard only needs the
+ * bytes-in interface so tests can swap in a buffer-backed reader.
  */
-export function createStdioWizardIo(
+export interface ByteReader {
+  /**
+   * Read up to `buffer.length` bytes into `buffer`. Returns the number
+   * of bytes read, or `null` at end-of-stream.
+   *
+   * @param buffer Destination buffer.
+   * @returns Bytes read, or `null` at EOF.
+   */
+  read(buffer: Uint8Array): Promise<number | null>;
+}
+
+/**
+ * Minimal contract for an object that writes UTF-8 bytes to a sink.
+ *
+ * Mirrors the shape of `Deno.stdout.write`. The wizard only needs the
+ * bytes-out interface so tests can swap in a buffer-backed writer.
+ */
+export interface ByteWriter {
+  /**
+   * Write the entire buffer. Returns the number of bytes written.
+   *
+   * @param buffer Bytes to write.
+   * @returns Bytes written.
+   */
+  write(buffer: Uint8Array): Promise<number>;
+}
+
+/**
+ * Build a {@link SetupWizardIo} backed by an arbitrary byte reader and
+ * writer. The reader is decoded as UTF-8 and split on `\n` (a trailing
+ * `\r` is stripped so Windows-style stdin Just Works). The writer
+ * receives `${text}\n` per call.
+ *
+ * Tests use this with `Deno.Buffer`-backed reader/writer pairs;
+ * production code goes through {@link createStdioWizardIo}.
+ *
+ * @param reader Byte source (typically `Deno.stdin`).
+ * @param writer Byte sink (typically `Deno.stdout`).
+ * @param githubClient Wizard-only GitHub client.
+ * @returns An IO bundle suitable for {@link runSetupWizard}.
+ */
+export function createWizardIo(
+  reader: ByteReader,
+  writer: ByteWriter,
   githubClient: WizardGitHubClient,
 ): SetupWizardIo {
   const decoder = new TextDecoder();
@@ -243,7 +282,7 @@ export function createStdioWizardIo(
         return remainder.endsWith("\r") ? remainder.slice(0, -1) : remainder;
       }
       const chunk = new Uint8Array(readChunkBytes);
-      const bytesRead = await Deno.stdin.read(chunk);
+      const bytesRead = await reader.read(chunk);
       if (bytesRead === null) {
         eof = true;
         continue;
@@ -253,10 +292,28 @@ export function createStdioWizardIo(
   };
 
   const writeLine: WriteLine = async (text: string) => {
-    await Deno.stdout.write(encoder.encode(`${text}\n`));
+    await writer.write(encoder.encode(`${text}\n`));
   };
 
   return { readLine, writeLine, githubClient };
+}
+
+/**
+ * Build the production-time {@link SetupWizardIo} backed by `Deno.stdin`,
+ * `Deno.stdout`, and the supplied GitHub client.
+ *
+ * Thin convenience wrapper around {@link createWizardIo}; the `setup`
+ * subcommand calls this and tests cover the underlying logic by
+ * passing in-memory readers/writers to {@link createWizardIo} directly.
+ *
+ * @param githubClient The wizard-only GitHub client (typically backed by
+ *   `src/github/app-auth.ts`).
+ * @returns A live IO bundle suitable for {@link runSetupWizard}.
+ */
+export function createStdioWizardIo(
+  githubClient: WizardGitHubClient,
+): SetupWizardIo {
+  return createWizardIo(Deno.stdin, Deno.stdout, githubClient);
 }
 
 // ---------------------------------------------------------------------------

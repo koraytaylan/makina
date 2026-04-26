@@ -16,6 +16,9 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 
 import { parseConfig } from "../../src/config/schema.ts";
 import {
+  type ByteReader,
+  type ByteWriter,
+  createWizardIo,
   runSetupWizard,
   SetupWizardError,
   type SetupWizardIo,
@@ -400,4 +403,109 @@ Deno.test("runSetupWizard: expands ~/ for the private-key existence check", asyn
   } finally {
     await Deno.remove(tempHome, { recursive: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// createWizardIo: line-buffered reader, CR-stripping, EOF handling
+// ---------------------------------------------------------------------------
+
+/**
+ * Buffer-backed {@link ByteReader} over a fixed UTF-8 string. The
+ * reader hands out one chunk per call so the line buffer's
+ * "concatenate across reads" path is exercised.
+ */
+class StringReader implements ByteReader {
+  private buffer: Uint8Array;
+  private offset = 0;
+  private readonly maxChunkBytes: number;
+
+  constructor(text: string, maxChunkBytes: number = 4) {
+    this.buffer = new TextEncoder().encode(text);
+    this.maxChunkBytes = maxChunkBytes;
+  }
+
+  read(out: Uint8Array): Promise<number | null> {
+    if (this.offset >= this.buffer.length) {
+      return Promise.resolve(null);
+    }
+    const remaining = this.buffer.length - this.offset;
+    const limit = Math.min(out.length, this.maxChunkBytes, remaining);
+    out.set(this.buffer.subarray(this.offset, this.offset + limit));
+    this.offset += limit;
+    return Promise.resolve(limit);
+  }
+}
+
+/** Capture-all {@link ByteWriter} for assertions. */
+class CapturingWriter implements ByteWriter {
+  readonly chunks: Uint8Array[] = [];
+
+  write(buffer: Uint8Array): Promise<number> {
+    this.chunks.push(new Uint8Array(buffer));
+    return Promise.resolve(buffer.length);
+  }
+
+  text(): string {
+    let total = 0;
+    for (const chunk of this.chunks) total += chunk.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return new TextDecoder().decode(out);
+  }
+}
+
+const dummyClient: WizardGitHubClient = {
+  getInstallations: () => Promise.resolve([]),
+};
+
+Deno.test("createWizardIo: reads multi-byte chunks and yields one line at a time", async () => {
+  const reader = new StringReader("alpha\nbeta\ngamma\n", 3);
+  const writer = new CapturingWriter();
+  const io = createWizardIo(reader, writer, dummyClient);
+  assertEquals(await io.readLine(), "alpha");
+  assertEquals(await io.readLine(), "beta");
+  assertEquals(await io.readLine(), "gamma");
+  assertEquals(await io.readLine(), null);
+});
+
+Deno.test("createWizardIo: strips a trailing carriage return", async () => {
+  const reader = new StringReader("alpha\r\nbeta\r\n", 4);
+  const io = createWizardIo(reader, new CapturingWriter(), dummyClient);
+  assertEquals(await io.readLine(), "alpha");
+  assertEquals(await io.readLine(), "beta");
+  assertEquals(await io.readLine(), null);
+});
+
+Deno.test("createWizardIo: yields a final line without a trailing newline", async () => {
+  const reader = new StringReader("alpha\nbeta", 8);
+  const io = createWizardIo(reader, new CapturingWriter(), dummyClient);
+  assertEquals(await io.readLine(), "alpha");
+  assertEquals(await io.readLine(), "beta");
+  assertEquals(await io.readLine(), null);
+});
+
+Deno.test("createWizardIo: yields a final CR-stripped line at EOF", async () => {
+  const reader = new StringReader("trailing\r", 16);
+  const io = createWizardIo(reader, new CapturingWriter(), dummyClient);
+  assertEquals(await io.readLine(), "trailing");
+  assertEquals(await io.readLine(), null);
+});
+
+Deno.test("createWizardIo: writeLine appends a newline per call", async () => {
+  const writer = new CapturingWriter();
+  const io = createWizardIo(new StringReader("", 1), writer, dummyClient);
+  await io.writeLine("hello");
+  await io.writeLine("world");
+  assertEquals(writer.text(), "hello\nworld\n");
+});
+
+Deno.test("createWizardIo: returns null repeatedly after EOF", async () => {
+  const reader = new StringReader("", 4);
+  const io = createWizardIo(reader, new CapturingWriter(), dummyClient);
+  assertEquals(await io.readLine(), null);
+  assertEquals(await io.readLine(), null);
 });

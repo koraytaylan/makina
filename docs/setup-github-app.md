@@ -1,6 +1,7 @@
 # Setting up the GitHub App
 
-> Wave 0 stub. Concrete steps will be revised when Wave 2's `setup` wizard lands.
+> Wave 2's `setup` wizard now drives steps 3.2 onwards. Steps 1 and 2 are still manual GitHub
+> Actions taken in your browser; the wizard handles everything after the App is installed.
 
 makina authenticates to GitHub as a GitHub App (rather than a personal access token). This is
 ADR-003: it gives us higher rate limits, fine-grained per-repo permissions, and a clean bot identity
@@ -32,6 +33,11 @@ On the App page → **Install App** → choose the account → choose specific r
 2. Run `makina setup`. Provide the App ID (top of the App page) and the private-key path. The wizard
    then queries the App's installations endpoint to discover which repos you can target and asks you
    to pick a default.
+
+The wizard validates the private-key path against the filesystem before calling GitHub, prints the
+list of reachable repositories with one-based numbers, and writes the resulting `config.json` to the
+platform-appropriate location (see `docs/configuration.md`). On EOF or invalid input the wizard
+exits with a one-line summary; rerun `makina setup` to start over.
 
 ## Copilot review
 
