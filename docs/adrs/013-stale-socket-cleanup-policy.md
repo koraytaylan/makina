@@ -1,4 +1,4 @@
-# ADR-010: Stale-socket cleanup policy for the daemon listener
+# ADR-013: Stale-socket cleanup policy for the daemon listener
 
 ## Status
 
