@@ -17,8 +17,14 @@ if (Deno.args.includes("--version")) {
   Deno.exit(0);
 }
 
-console.log("makina — agentic GitHub issue resolver");
-console.log("");
-console.log("Wave 1 skeleton. Most subcommands are not yet implemented.");
-console.log("Run `makina --version` to see the version.");
-console.log("See https://github.com/koraytaylan/makina for status.");
+const subcommand = Deno.args[0];
+if (subcommand === "daemon" || subcommand === "setup") {
+  // Owned by the `daemon` (#9) and `setup` (#3) Wave 2 branches; until
+  // they land here the command exits with a clear "not yet wired"
+  // notice rather than dropping into the TUI launch path.
+  console.log(`subcommand "${subcommand}" not yet wired in this branch.`);
+  Deno.exit(0);
+} else {
+  // Default branch → launch the Ink-based TUI.
+  await import("./src/tui/App.tsx").then((module) => module.launch());
+}

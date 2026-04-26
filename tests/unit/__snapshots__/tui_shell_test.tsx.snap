@@ -1,0 +1,71 @@
+export const snapshot = {};
+
+snapshot[`App: initial render against the in-memory double 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ makina v0.0.0-test                 connected                 no task focused │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│ No tasks yet — invoke /issue <repo>#<n> to start one.                        │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ready                                     Ctrl+C exit · / command palette (W3)"
+`;
+
+snapshot[`App: "1 task active" after a state-changed event 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ makina v0.0.0-test     connected      focus: task_2026-04-26T12-00-00_abc123 │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│ 1 task active.                                                               │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ task_2026-04-26T12-00-00_abc123: INIT →        Ctrl+C exit · / command palette
+ CLONING_WORKTREE                                (W3)"
+`;
+
+snapshot[`App: "disconnected" status is reflected in the header 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ makina v0.0.0-test    disconnected    focus: task_2026-04-26T12-00-00_abc123 │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│ No tasks yet — invoke /issue <repo>#<n> to start one.                        │
+│ Daemon disconnected.                                                         │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ready                                     Ctrl+C exit · / command palette (W3)"
+`;
+
+snapshot[`Header: connected status renders the green pill 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ makina v0.0.0-test                 connected                 no task focused │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`Header: error status surfaces the red pill 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ makina v0.0.0-test                    error                    focus: task_x │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`MainPane: empty state copy 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│ No tasks yet — invoke /issue <repo>#<n> to start one.                        │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`MainPane: pluralized task count 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│ 3 tasks active.                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`StatusBar: error message takes precedence over the info message 1`] = `" error: boom                               Ctrl+C exit · / command palette (W3)"`;
+
+snapshot[`StatusBar: default keybindings hint 1`] = `" ready                                     Ctrl+C exit · / command palette (W3)"`;

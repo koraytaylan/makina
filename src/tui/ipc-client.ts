@@ -1,0 +1,488 @@
+/**
+ * tui/ipc-client.ts — Unix-domain-socket IPC client used by the TUI.
+ *
+ * **Surface.** The exported {@link DaemonClient} interface intentionally
+ * mirrors the public surface of the in-process double in
+ * `tests/helpers/in_memory_daemon_client.ts` (`send` and `subscribeEvents`
+ * only — the test-only `simulateEvent`, `recordedSends`, and
+ * `setRequestHandler` are deliberately absent here). The TUI hooks code
+ * against the interface, never the concrete class, so swapping the real
+ * socket-backed client for the in-memory double in tests is a one-line
+ * change.
+ *
+ * **Wire format.** Each frame is `<decimal-length>\n<utf8-json>\n` per
+ * `src/ipc/codec.ts`. The codec handles framing; this module only deals in
+ * typed envelopes. Pushed `event` envelopes from the daemon are surfaced
+ * through the `subscribeEvents` callback in arrival order; reply envelopes
+ * (`pong` for `ping`, `ack` otherwise) are matched back to outstanding
+ * `send` calls by the envelope `id`.
+ *
+ * **Lifecycle.** Construct → {@link SocketDaemonClient.connect} → use
+ * `send`/`subscribeEvents` → {@link SocketDaemonClient.close}. `close()`
+ * tears down the socket and rejects every in-flight `send` so the caller
+ * never hangs waiting for a reply that will never arrive.
+ *
+ * @module
+ */
+
+import {
+  type AckPayload,
+  type EventPayload,
+  type MessageEnvelope,
+  parseEnvelope,
+  type PongPayload,
+} from "../ipc/protocol.ts";
+import { decode, encode, IpcCodecError } from "../ipc/codec.ts";
+
+/**
+ * Envelopes the daemon emits as a reply to a client request. `pong`
+ * answers `ping`; `ack` answers everything else.
+ *
+ * Mirrors the type defined in `tests/helpers/in_memory_daemon_client.ts`
+ * so consumers can be parametrized over the interface.
+ */
+export type DaemonReply =
+  | (Extract<MessageEnvelope, { type: "pong" }>)
+  | (Extract<MessageEnvelope, { type: "ack" }>);
+
+/**
+ * Subscription handle returned by
+ * {@link DaemonClient.subscribeEvents}. `unsubscribe()` is idempotent.
+ */
+export interface DaemonEventSubscription {
+  /** Stop forwarding events to this handler. */
+  unsubscribe(): void;
+}
+
+/**
+ * Public surface every daemon client (real socket-backed or in-memory
+ * test double) must implement.
+ *
+ * @example
+ * ```ts
+ * const client: DaemonClient = new SocketDaemonClient("/tmp/makina.sock");
+ * await client.connect();
+ * const reply = await client.send({ id: "1", type: "ping", payload: {} });
+ * ```
+ */
+export interface DaemonClient {
+  /**
+   * Send a request envelope and resolve with the daemon's reply.
+   *
+   * @param envelope The envelope to send. Must validate against the
+   *   {@link parseEnvelope} schema; an invalid envelope rejects without
+   *   touching the wire.
+   * @returns The reply envelope (`pong` for `ping`, `ack` otherwise).
+   */
+  send(envelope: MessageEnvelope): Promise<DaemonReply>;
+  /**
+   * Subscribe to event envelopes pushed by the daemon. The handler is
+   * invoked synchronously per event, in arrival order; throws inside
+   * `handler` are swallowed (they cannot poison the read loop).
+   *
+   * @param handler Callback invoked per event.
+   * @returns Subscription handle whose `unsubscribe()` stops further
+   *   deliveries.
+   */
+  subscribeEvents(handler: (event: EventPayload) => void): DaemonEventSubscription;
+}
+
+/**
+ * Error thrown by {@link SocketDaemonClient} when the underlying socket
+ * cannot be opened, the daemon disconnects mid-request, or a reply
+ * arrives that does not correspond to any outstanding `send`.
+ */
+export class DaemonClientError extends Error {
+  /**
+   * Construct a daemon-client error.
+   *
+   * @param message Human-readable description.
+   * @param cause Underlying error, when one exists.
+   */
+  constructor(
+    message: string,
+    /** Underlying cause, when applicable. */
+    public override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "DaemonClientError";
+  }
+}
+
+/**
+ * Minimal duplex transport surface the client needs. The real
+ * implementation uses `Deno.connect({ transport: "unix" })`; tests can
+ * inject any object that quacks like one.
+ */
+export interface DuplexConnection {
+  /** Readable byte stream from the peer. */
+  readonly readable: ReadableStream<Uint8Array>;
+  /** Writable byte stream to the peer. */
+  readonly writable: WritableStream<Uint8Array>;
+  /** Close both halves of the connection. */
+  close(): void;
+}
+
+/**
+ * Function that opens a {@link DuplexConnection}. Defaults to a
+ * `Deno.connect`-backed Unix-socket connector; exposed for test
+ * injection.
+ */
+export type ConnectionOpener = () => Promise<DuplexConnection>;
+
+/**
+ * Socket-backed {@link DaemonClient} implementation.
+ *
+ * Wave 2's daemon (issue #9) listens on a Unix-domain socket; this
+ * client opens that socket, encodes outgoing envelopes through
+ * {@link encode}, and decodes pushed envelopes through {@link decode}.
+ * Reply correlation is by envelope `id`.
+ */
+export class SocketDaemonClient implements DaemonClient {
+  private readonly socketPath: string;
+  private readonly opener: ConnectionOpener;
+  private connection: DuplexConnection | undefined;
+  private writer: WritableStreamDefaultWriter<Uint8Array> | undefined;
+  private reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  private readonly pending = new Map<
+    string,
+    { resolve: (reply: DaemonReply) => void; reject: (error: unknown) => void }
+  >();
+  private readonly eventHandlers = new Set<(event: EventPayload) => void>();
+  private readLoopPromise: Promise<void> | undefined;
+  private closed = false;
+
+  /**
+   * Construct a socket-backed client.
+   *
+   * @param socketPath Filesystem path of the Unix-domain socket the
+   *   daemon is listening on.
+   * @param opener Optional connection opener; defaults to
+   *   `Deno.connect({ transport: "unix", path: socketPath })`. Tests
+   *   inject this to drive the client without real socket I/O.
+   *
+   * @example
+   * ```ts
+   * const client = new SocketDaemonClient("/tmp/makina.sock");
+   * await client.connect();
+   * ```
+   */
+  constructor(socketPath: string, opener?: ConnectionOpener) {
+    this.socketPath = socketPath;
+    this.opener = opener ?? defaultUnixConnector(socketPath);
+  }
+
+  /**
+   * Open the underlying connection and start the read loop. A
+   * second call before {@link SocketDaemonClient.close} is a no-op.
+   *
+   * @throws {DaemonClientError} If the socket cannot be opened.
+   */
+  async connect(): Promise<void> {
+    if (this.connection !== undefined) {
+      return;
+    }
+    if (this.closed) {
+      throw new DaemonClientError("client has been closed");
+    }
+    try {
+      this.connection = await this.opener();
+    } catch (error) {
+      throw new DaemonClientError(
+        `failed to connect to daemon socket ${JSON.stringify(this.socketPath)}`,
+        error,
+      );
+    }
+    this.writer = this.connection.writable.getWriter();
+    this.reader = this.connection.readable.getReader();
+    this.readLoopPromise = this.runReadLoop(this.reader);
+  }
+
+  /**
+   * Send a request envelope and resolve with the daemon's reply.
+   *
+   * @param envelope The envelope to send.
+   * @returns The reply envelope (`pong` for `ping`, `ack` otherwise).
+   * @throws {DaemonClientError} If the client is not connected, the
+   *   envelope is malformed, or the connection terminates before a
+   *   reply arrives.
+   */
+  send(envelope: MessageEnvelope): Promise<DaemonReply> {
+    if (this.connection === undefined || this.writer === undefined) {
+      return Promise.reject(new DaemonClientError("not connected"));
+    }
+    if (this.closed) {
+      return Promise.reject(new DaemonClientError("client has been closed"));
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = encode(envelope);
+    } catch (error) {
+      return Promise.reject(
+        error instanceof IpcCodecError
+          ? new DaemonClientError(error.message, error)
+          : new DaemonClientError("failed to encode envelope", error),
+      );
+    }
+    if (this.pending.has(envelope.id)) {
+      return Promise.reject(
+        new DaemonClientError(`duplicate envelope id ${JSON.stringify(envelope.id)}`),
+      );
+    }
+    const reply = new Promise<DaemonReply>((resolve, reject) => {
+      this.pending.set(envelope.id, { resolve, reject });
+    });
+    this.writer.write(bytes).catch((error) => {
+      const slot = this.pending.get(envelope.id);
+      if (slot !== undefined) {
+        this.pending.delete(envelope.id);
+        slot.reject(new DaemonClientError("failed to write to daemon socket", error));
+      }
+    });
+    return reply;
+  }
+
+  /**
+   * Subscribe to event envelopes pushed by the daemon.
+   *
+   * @param handler Callback invoked synchronously per event.
+   * @returns Subscription handle whose `unsubscribe()` stops further
+   *   deliveries.
+   */
+  subscribeEvents(handler: (event: EventPayload) => void): DaemonEventSubscription {
+    this.eventHandlers.add(handler);
+    return {
+      unsubscribe: () => {
+        this.eventHandlers.delete(handler);
+      },
+    };
+  }
+
+  /**
+   * Tear down the connection. Outstanding `send` promises reject with a
+   * {@link DaemonClientError}; the read loop exits cleanly. Idempotent.
+   */
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    const reason = new DaemonClientError("client closed before reply");
+    for (const [id, slot] of this.pending) {
+      slot.reject(reason);
+      this.pending.delete(id);
+    }
+    if (this.writer !== undefined) {
+      // Fire-and-forget abort; awaiting can hang when the peer has
+      // gone away mid-write, and we have no use for the resolution.
+      // The slot rejection above already woke every consumer.
+      this.writer.abort(reason).catch(() => {});
+      try {
+        this.writer.releaseLock();
+      } catch {
+        // Already released.
+      }
+      this.writer = undefined;
+    }
+    // Cancel the reader so the read loop terminates promptly.
+    // Without the cancel the loop would keep waiting for the peer to
+    // close its writable, which can hang shutdown for the lifetime
+    // of the daemon process.
+    if (this.reader !== undefined) {
+      try {
+        await this.reader.cancel();
+      } catch {
+        // Already cancelled or terminated; nothing to do.
+      }
+      try {
+        this.reader.releaseLock();
+      } catch {
+        // Already released.
+      }
+      this.reader = undefined;
+    }
+    if (this.connection !== undefined) {
+      try {
+        this.connection.close();
+      } catch {
+        // Connection already closed.
+      }
+      this.connection = undefined;
+    }
+    if (this.readLoopPromise !== undefined) {
+      await this.readLoopPromise.catch(() => {});
+      this.readLoopPromise = undefined;
+    }
+  }
+
+  /**
+   * Decode envelopes off the read stream and dispatch them. Replies
+   * resolve outstanding `send` promises by id; events fan out to every
+   * subscriber.
+   *
+   * Uses the codec's stateful decoder by wrapping the owned reader in
+   * a fresh {@link ReadableStream} so we keep the framing logic in
+   * one place ({@link decode}) without giving up the ability to
+   * cancel the underlying reader from {@link SocketDaemonClient.close}.
+   *
+   * @param reader The owned reader for the peer's byte stream.
+   */
+  private async runReadLoop(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+    try {
+      // Re-expose the reader as a ReadableStream so `decode` can chunk
+      // through it normally. Cancelling the underlying reader (in
+      // `close`) makes this stream end, which in turn ends the
+      // for-await below.
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            const { value, done } = await reader.read();
+            if (done) {
+              controller.close();
+              return;
+            }
+            if (value !== undefined) {
+              controller.enqueue(value);
+            }
+          } catch (error) {
+            controller.error(error);
+          }
+        },
+        cancel: async (reason) => {
+          try {
+            await reader.cancel(reason);
+          } catch {
+            // Already cancelled.
+          }
+        },
+      });
+      for await (const envelope of decode(stream)) {
+        if (envelope.type === "event") {
+          this.dispatchEvent(envelope.payload);
+          continue;
+        }
+        if (envelope.type === "ack" || envelope.type === "pong") {
+          this.resolveReply(envelope as DaemonReply);
+          continue;
+        }
+        // Any other envelope type from the daemon is a protocol violation.
+        // Reject every outstanding send so the caller surfaces it.
+        this.failAllPending(
+          new DaemonClientError(`unexpected envelope type from daemon: ${envelope.type}`),
+        );
+      }
+    } catch (error) {
+      if (!this.closed) {
+        const reason = error instanceof Error
+          ? new DaemonClientError(error.message, error)
+          : new DaemonClientError(String(error));
+        this.failAllPending(reason);
+      }
+    } finally {
+      // If the stream ended without `close()` being called explicitly,
+      // mark the client closed so subsequent sends fail fast.
+      this.closed = true;
+    }
+  }
+
+  /**
+   * Resolve the pending `send` whose envelope id matches the reply.
+   *
+   * @param reply The decoded reply envelope.
+   */
+  private resolveReply(reply: DaemonReply): void {
+    const slot = this.pending.get(reply.id);
+    if (slot === undefined) {
+      // Unsolicited reply — protocol violation; surface to all pending.
+      this.failAllPending(
+        new DaemonClientError(`reply for unknown envelope id ${JSON.stringify(reply.id)}`),
+      );
+      return;
+    }
+    this.pending.delete(reply.id);
+    slot.resolve(reply);
+  }
+
+  /**
+   * Fan out a pushed `event` payload to every active subscriber.
+   * Handler exceptions are swallowed (they cannot poison the loop).
+   *
+   * @param event The pushed event payload.
+   */
+  private dispatchEvent(event: EventPayload): void {
+    for (const handler of this.eventHandlers) {
+      try {
+        handler(event);
+      } catch {
+        // Handler errors are not the read loop's problem.
+      }
+    }
+  }
+
+  /**
+   * Reject every in-flight `send` with `reason` and clear the slot map.
+   *
+   * @param reason The rejection cause.
+   */
+  private failAllPending(reason: DaemonClientError): void {
+    for (const [id, slot] of this.pending) {
+      slot.reject(reason);
+      this.pending.delete(id);
+    }
+  }
+}
+
+/**
+ * Build the default {@link ConnectionOpener} that opens a
+ * Unix-domain-socket connection to `socketPath` via `Deno.connect`.
+ *
+ * Factored out so {@link SocketDaemonClient} is constructible without
+ * granting `--allow-net` permission at module-evaluation time.
+ *
+ * @param socketPath The Unix-socket path.
+ * @returns A connector that opens the socket on demand.
+ */
+function defaultUnixConnector(socketPath: string): ConnectionOpener {
+  return async () => {
+    const conn = await Deno.connect({ transport: "unix", path: socketPath });
+    return {
+      readable: conn.readable,
+      writable: conn.writable,
+      close: () => {
+        try {
+          conn.close();
+        } catch {
+          // Already closed.
+        }
+      },
+    };
+  };
+}
+
+/**
+ * Helper for tests and the in-memory adapter: wrap the test double in
+ * the {@link parseEnvelope} round-trip the real socket-backed client
+ * does naturally. This guarantees a test that passes against the
+ * in-memory client also passes the wire validators.
+ *
+ * @param raw An arbitrary JSON value claiming to be a reply envelope.
+ * @returns The validated {@link DaemonReply}.
+ * @throws {DaemonClientError} If validation fails.
+ */
+export function validateReplyEnvelope(raw: unknown): DaemonReply {
+  const result = parseEnvelope(raw);
+  if (!result.success) {
+    throw new DaemonClientError(
+      `reply envelope failed validation: ${
+        result.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ")
+      }`,
+    );
+  }
+  if (result.data.type !== "ack" && result.data.type !== "pong") {
+    throw new DaemonClientError(`expected ack or pong; got ${result.data.type}`);
+  }
+  return result.data as DaemonReply;
+}
+
+/** Re-export so consumers can narrow on the reply payloads. */
+export type { AckPayload, EventPayload, PongPayload };
