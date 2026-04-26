@@ -15,7 +15,7 @@
  *  - Construction: invalid `bufferSize` values are rejected.
  */
 
-import { assertEquals, assertRejects, assertStrictEquals, assertThrows } from "@std/assert";
+import { assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
 import { delay } from "@std/async";
 
 import { createEventBus } from "../../src/daemon/event-bus.ts";
@@ -338,6 +338,103 @@ Deno.test("handler that throws does not poison the bus", async () => {
   subLate.unsubscribe();
 });
 
+Deno.test("async handler whose promise rejects is caught and logged (no unhandled rejection)", async () => {
+  const logger = recordingLogger();
+  const bus = createEventBus({ logger });
+  const id = makeTaskId("task_async_reject");
+  const goodSeen: TaskEvent[] = [];
+
+  // TypeScript allows passing an `async` function where `(event) => void`
+  // is expected (Promise<void> is assignable to void). The bus must
+  // detect the returned Promise and attach a `.catch` so the rejection
+  // is funneled through the same warn-and-continue path as sync throws.
+  const subAsync = bus.subscribe(
+    id,
+    (async (_event) => {
+      // The `await` makes the throw happen on a microtask boundary, which
+      // is the realistic shape of an async handler that does any I/O
+      // before failing. Without an `await`, lint's `require-await` would
+      // flag this — and the test would still pass thanks to the
+      // PromiseLike detection branch — but this is closer to what the
+      // bus is actually defending against.
+      await Promise.resolve();
+      throw new Error("async handler exploded");
+    }) as (event: TaskEvent) => void,
+  );
+  const subGood = bus.subscribe("*", (event) => goodSeen.push(event));
+
+  bus.publish(fakeEvent(id, "first"));
+  bus.publish(fakeEvent(id, "second"));
+
+  await flush();
+
+  // Sibling subscriber kept seeing events.
+  assertEquals(goodSeen.length, 2);
+  // One warn per rejection, carrying the rejection-specific phrase.
+  const rejectWarnings = logger.messages.filter((m) => m.includes("handler rejected"));
+  assertEquals(
+    rejectWarnings.length,
+    2,
+    `expected 2 rejection warnings, got ${rejectWarnings.length}: ${logger.messages.join(" | ")}`,
+  );
+  assertEquals(rejectWarnings[0]?.includes("async handler exploded"), true);
+
+  subAsync.unsubscribe();
+  subGood.unsubscribe();
+});
+
+Deno.test("async handler that resolves cleanly does not log a warning", async () => {
+  const logger = recordingLogger();
+  const bus = createEventBus({ logger });
+  const id = makeTaskId("task_async_ok");
+  const seen: TaskEvent[] = [];
+
+  const sub = bus.subscribe(
+    id,
+    (async (event) => {
+      await Promise.resolve();
+      seen.push(event);
+    }) as (event: TaskEvent) => void,
+  );
+
+  bus.publish(fakeEvent(id));
+  await flush();
+
+  assertEquals(seen.length, 1);
+  assertEquals(logger.messages.length, 0);
+
+  sub.unsubscribe();
+});
+
+Deno.test("handler returning a thenable that rejects is treated like an async handler", async () => {
+  const logger = recordingLogger();
+  const bus = createEventBus({ logger });
+  const id = makeTaskId("task_thenable");
+
+  // A bare thenable (not a real Promise) still trips the PromiseLike
+  // detection branch, exercising the duck-typed `then`-as-function check
+  // in `isPromiseLike` rather than the `instanceof Promise` shortcut.
+  const sub = bus.subscribe(
+    id,
+    (() => {
+      return {
+        then(_onFulfilled: unknown, onRejected: (reason: unknown) => void): void {
+          onRejected(new Error("thenable boom"));
+        },
+      };
+    }) as (event: TaskEvent) => void,
+  );
+
+  bus.publish(fakeEvent(id));
+  await flush();
+
+  const rejectWarnings = logger.messages.filter((m) => m.includes("handler rejected"));
+  assertEquals(rejectWarnings.length, 1);
+  assertEquals(rejectWarnings[0]?.includes("thenable boom"), true);
+
+  sub.unsubscribe();
+});
+
 Deno.test("handler that throws a non-Error is logged with String() coercion", async () => {
   const logger = recordingLogger();
   const bus = createEventBus({ logger });
@@ -488,22 +585,10 @@ Deno.test("publish after unsubscribe is a silent no-op (does not throw)", async 
   const seen: TaskEvent[] = [];
   const sub = bus.subscribe(id, (event) => seen.push(event));
   sub.unsubscribe();
-  // Publish-while-closed exercises the `if (closed) return` guard inside
-  // `enqueue` indirectly: although the outer subscribe layer removes the
-  // subscriber from the set on unsubscribe (so `publish` skips it), the
-  // inner guard is a defense in depth that we exercise here by holding a
-  // reference to the inner subscriber via a fresh subscribe call that is
-  // closed mid-publish via close().
+  // After unsubscribe, the subscriber is removed from the active set, so
+  // `publish` skips it. The handler must not run and the publish must
+  // not throw.
   bus.publish(fakeEvent(id));
   await flush();
   assertEquals(seen.length, 0);
-});
-
-// ---------------------------------------------------------------------------
-// Sanity: assertRejects re-export consumed (keeps the import meaningful in
-// the linter's eyes if tests evolve to test rejected promises explicitly).
-// ---------------------------------------------------------------------------
-
-Deno.test("assertRejects is reachable for future async error assertions", async () => {
-  await assertRejects(() => Promise.reject(new Error("x")), Error, "x");
 });

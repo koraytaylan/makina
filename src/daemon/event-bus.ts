@@ -23,13 +23,24 @@
  * `ReadableStream`-style queue so the publisher/consumer decoupling is
  * preserved and a misbehaving handler cannot poison sibling subscribers.
  *
- * **Wildcard fan-out.** A publish to `task:42` is delivered to every
- * subscriber whose target is either `task:42` (exact match on
- * {@link TaskEvent.taskId}) or `"*"` (every event regardless of task).
+ * **Wildcard fan-out.** A publish carrying {@link TaskEvent.taskId} `id`
+ * is delivered to every subscriber whose `target` is either the same
+ * {@link TaskId} `id` (exact match) or the literal wildcard `"*"` (every
+ * event regardless of task). `target` is always a {@link TaskId} value or
+ * `"*"`, never a `task:<id>` string — the `task:` prefix only appears in
+ * log messages emitted by the bus itself.
  *
  * **Handler safety.** A handler that throws is caught at the pump
  * boundary; the throw is logged at `warn` and the pump moves on to the
- * next event. The bus survives an arbitrarily-buggy subscriber.
+ * next event. The bus survives an arbitrarily-buggy subscriber. An
+ * `async` handler whose returned promise *rejects* is also caught — the
+ * pump detects the `PromiseLike` return and attaches a `.catch` so the
+ * rejection takes the same warn-and-continue path.
+ *
+ * The drop-on-overflow policy and the synchronous-callback contract are
+ * both load-bearing design choices captured in
+ * `docs/adrs/010-event-bus-backpressure-and-sync-callbacks.md`. Any change
+ * to either is a contract change and needs an ADR amendment.
  *
  * @module
  */
@@ -204,7 +215,23 @@ function createSubscriber(
         overflowing = false;
       }
       try {
-        handler(next.value);
+        // The contract type is `(event) => void`, but TypeScript still
+        // permits passing an `async` function (an `async () => void`
+        // returns `Promise<void>` which is assignable to `void`). A
+        // synchronous throw lands in this catch; a *rejected* Promise
+        // would otherwise become an unhandled rejection. We detect a
+        // PromiseLike return and attach a `.catch` so async handlers are
+        // isolated to the same warn-and-continue policy as sync ones.
+        const result = handler(next.value) as unknown;
+        if (isPromiseLike(result)) {
+          result.then(undefined, (caught: unknown) => {
+            logger.warn(
+              `event-bus subscriber handler rejected; bus continues. error=${
+                stringifyError(caught)
+              }`,
+            );
+          });
+        }
       } catch (caught) {
         logger.warn(
           `event-bus subscriber handler threw; bus continues. error=${stringifyError(caught)}`,
@@ -273,4 +300,12 @@ function stringifyError(caught: unknown): string {
     return `${caught.name}: ${caught.message}`;
   }
   return String(caught);
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
 }
