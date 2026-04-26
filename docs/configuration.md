@@ -1,6 +1,7 @@
 # Configuration
 
-> Wave 0 stub. The full reference lands with Wave 2's config loader.
+> Wave 1 freezes the typed shape (`src/config/schema.ts`); the loader (file IO, `~/` expansion,
+> error pretty-printing) lands with Wave 2.
 
 ## Location
 

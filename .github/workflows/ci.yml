@@ -65,17 +65,26 @@ jobs:
         # GitHub Actions on pull_request events; it is not user-controlled
         # input. We avoid `${{ github.* }}` expressions inside the run block
         # to keep the workflow safe from injection.
+        #
+        # Skip auto-generated merge / fixup / squash / revert subjects, the
+        # same exemption the .githooks/commit-msg hook uses locally.
+        # `--no-merges` strips the synthetic GitHub-Actions merge commit
+        # used by `pull_request` events.
         run: |
           set -euo pipefail
           PATTERN='^(feat|fix|docs|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .{1,72}$'
           git fetch origin "${GITHUB_BASE_REF}" --depth=50
-          subjects="$(git log --format=%s "origin/${GITHUB_BASE_REF}..HEAD")"
+          subjects="$(git log --no-merges --format=%s "origin/${GITHUB_BASE_REF}..HEAD")"
           if [ -z "${subjects}" ]; then
             echo "No new commits to validate."
             exit 0
           fi
           failed=0
           while IFS= read -r subject; do
+            case "${subject}" in
+              "fixup! "*|"squash! "*|"Revert "*)
+                continue ;;
+            esac
             if ! printf '%s\n' "${subject}" | grep -qE "${PATTERN}"; then
               echo "::error::Invalid commit subject: ${subject}"
               failed=1
