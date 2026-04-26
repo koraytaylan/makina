@@ -730,7 +730,7 @@ Deno.test(
       },
     });
     // 403 with quota left is a permission/scope error, not a rate-limit
-    // event — see ADR-010. The client must not sleep or retry.
+    // event — see ADR-011. The client must not sleep or retry.
     const { client } = buildClient(harness);
     await assertRejects(() => client.getIssue(REPO, makeIssueNumber(1)));
     assertEquals(harness.recordedRequests.length, 1);

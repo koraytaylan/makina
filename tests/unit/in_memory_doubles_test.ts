@@ -166,7 +166,7 @@ Deno.test("InMemoryGitHubClient: records every method invocation", async () => {
   assertEquals(calls[3]?.method, "mergePullRequest");
 });
 
-Deno.test("InMemoryGitHubClient: records the four stabilize-phase methods", async () => {
+Deno.test("InMemoryGitHubClient: records the stabilize-phase methods (getCombinedStatus + four extensions)", async () => {
   const client = new InMemoryGitHubClient();
   const repo = makeRepoFullName("a/b");
   client.queueGetCombinedStatus({

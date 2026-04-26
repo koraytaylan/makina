@@ -13,11 +13,11 @@
  * is automatic.
  *
  * **Rate-limit awareness.** The retry policy intentionally fires only
- * when GitHub gave us a clear rate-limit signal (see ADR-010):
+ * when GitHub gave us a clear rate-limit signal (see ADR-011):
  *
- * - `Retry-After` present (any 4xx) — sleep that duration, retry once.
- * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` (any 4xx)
- *   — sleep until the reset, retry once.
+ * - `Retry-After` present (any status) — sleep that duration, retry once.
+ * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` (any
+ *   status) — sleep until the reset, retry once.
  * - `429` with neither header — sleep
  *   {@link DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS} and retry once;
  *   the `429` itself is the rate-limit signal.
@@ -275,17 +275,9 @@ export const DEFAULT_MAX_RETRY_SLEEP_MILLISECONDS = 5 * 60 * 1_000;
  * — enough to clear a transient burst without serializing the supervisor
  * on every retry. `403` does not use this fallback; without rate-limit
  * headers a `403` is treated as a permission error and propagates. See
- * ADR-010.
+ * ADR-011.
  */
 export const DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS = 1_000;
-
-/**
- * HTTP status codes that may trigger the single rate-limit-aware retry.
- * `429` is GitHub's secondary rate-limit signal; `403` is the primary
- * one **only** when paired with `X-RateLimit-Remaining: 0` (see ADR-010
- * for why a header-less 403 propagates instead of retrying).
- */
-const RATE_LIMITED_STATUS_CODES: ReadonlySet<number> = new Set([403, 429]);
 
 const HEADER_RETRY_AFTER = "retry-after";
 const HEADER_RATE_LIMIT_REMAINING = "x-ratelimit-remaining";
@@ -578,16 +570,21 @@ export class GitHubClientImpl implements StabilizeGitHubClient {
 
   /**
    * Issue an Octokit request and retry exactly once when GitHub gave us a
-   * clear rate-limit signal (see ADR-010 for the full policy):
+   * clear rate-limit signal (see ADR-011 for the full policy):
    *
-   * - `Retry-After` header present (any 4xx).
-   * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` (any 4xx).
+   * - `Retry-After` header present (any status) — the secondary
+   *   rate-limit signal.
+   * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` (any
+   *   status) — the primary rate-limit signal.
    * - `429` with neither header — the status itself is the signal.
    *
-   * A `403` with no rate-limit headers propagates immediately because it
-   * is a permission/scope error, not a quota event. 5xx propagates so
-   * the supervisor's higher-level retry policy can decide whether to
-   * back off.
+   * The retry decision lives entirely in
+   * {@link GitHubClientImpl.computeRetrySleepMilliseconds}: it returns a
+   * sleep duration when one of the above conditions holds and `null`
+   * otherwise. A `403` with no rate-limit headers therefore propagates
+   * immediately (permission/scope error, not a quota event), and 5xx
+   * propagates so the supervisor's higher-level retry policy can decide
+   * whether to back off.
    */
   private async requestWithRetry(
     route: string,
@@ -598,7 +595,7 @@ export class GitHubClientImpl implements StabilizeGitHubClient {
     } catch (firstError) {
       if (!(firstError instanceof Error)) throw firstError;
       const status = readStatus(firstError);
-      if (status === undefined || !RATE_LIMITED_STATUS_CODES.has(status)) {
+      if (status === undefined) {
         throw firstError;
       }
       const headers = readHeaders(firstError);
@@ -635,9 +632,8 @@ export class GitHubClientImpl implements StabilizeGitHubClient {
 
   /**
    * Translate the rate-limit response headers into a sleep duration in
-   * milliseconds, or `null` when no retry should fire.
-   *
-   * Honors (any rate-limited status):
+   * milliseconds, or `null` when no retry should fire. Honors the
+   * header-driven signals regardless of HTTP status (see ADR-011):
    *
    * - `Retry-After` (seconds, GitHub secondary rate limit).
    * - `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset`

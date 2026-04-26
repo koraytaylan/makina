@@ -16,6 +16,7 @@
 
 import {
   type CombinedStatus,
+  type GitHubClient,
   type IssueDetails,
   type IssueNumber,
   type MergeMode,
@@ -28,6 +29,12 @@ import {
   type PullRequestReviewComment,
   type StabilizeGitHubClient,
 } from "../../src/github/client.ts";
+
+// `GitHubClient` is imported so the `{@inheritdoc GitHubClient.*}` JSDoc
+// tags below resolve under `deno doc --lint`. The type itself is not
+// referenced at runtime (the implemented contract is the wider
+// `StabilizeGitHubClient`), so we tag it as intentionally used.
+type _UseGitHubClient = GitHubClient;
 
 /** A scripted reply or thrown error. */
 export type ScriptedReply<TValue> =

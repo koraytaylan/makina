@@ -1,4 +1,4 @@
-# ADR-010: Header-driven retry policy for the GitHub client
+# ADR-011: Header-driven retry policy for the GitHub client
 
 ## Status
 
@@ -29,21 +29,32 @@ The first cut of the client retried _any_ `403`/`429`: when no header guidance w
 #29 (issue #5) flagged that this both contradicts the JSDoc on the function ("returns null when no
 header guidance applies") and inflates latency on the permission-error path.
 
+A second pass of that same review flagged a leftover contradiction: the prose said the retry should
+fire on a `Retry-After` header for any 4xx, but `requestWithRetry` still gated on
+`status ∈ {403, 429}` before consulting the headers. We resolved it the way the prose read:
+`requestWithRetry` no longer gates on status, and the header check itself is the gate.
+
 ## Decision
 
-The retry fires **only** on a clear rate-limit signal:
+The retry fires **only** on a clear rate-limit signal. The decision lives entirely in
+`computeRetrySleepMilliseconds(status, headers)`; `requestWithRetry` simply propagates when that
+function returns `null`. The signals it honors:
 
-1. `Retry-After` present (any 4xx) → sleep that many seconds, retry once.
-2. `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` present (any 4xx) → sleep until the
-   reset, retry once.
+1. `Retry-After` present (any HTTP status) → sleep that many seconds, retry once.
+2. `X-RateLimit-Remaining: 0` paired with `X-RateLimit-Reset` present (any HTTP status) → sleep
+   until the reset, retry once.
 3. `429` with neither header → fall back to `DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS` (1 s) and
    retry once. The `429` status alone is a rate-limit signal.
 4. `403` with neither header → propagate immediately. No sleep, no retry.
-5. Anything else (`5xx`, `404`, etc.) → propagate immediately.
+5. Anything else (`5xx`, `404`, etc.) with no rate-limit headers → propagate immediately.
 
 `computeRetrySleepMilliseconds` returns `number | null` for real now: `null` means "do not retry,"
 which `requestWithRetry` translates into a propagated error. The 1 s constant is cap-clamped by
 `maxRetrySleepMilliseconds` so a future caller cannot exceed the configured retry ceiling.
+
+Decoupling the retry decision from the status code costs us nothing in practice — GitHub only sets
+`Retry-After` / `X-RateLimit-Reset` on rate-limited responses — but it keeps the impl and the ADR
+saying the same thing in one place: "did GitHub tell us to wait?"
 
 Sleep durations are clamped from above by `maxRetrySleepMilliseconds` (default 5 minutes) so a
 runaway `Retry-After` cannot stall the supervisor for an hour. Negative deltas (a reset already in
