@@ -6,16 +6,26 @@
  * Wave 2 branches land:
  *
  * - `daemon` — long-running supervisor (#9), already on develop.
- * - `setup` — first-run GitHub-App configuration wizard (#3), still in
- *   review on `feature/w2-config-loader`. Until that lands, the
- *   subcommand prints a notice instead of falling through to the TUI.
+ * - `setup` — first-run GitHub-App configuration wizard (#3), this PR.
  * - default → launch the Ink TUI (#10).
  *
  * The version constant is the single source of truth in `src/constants.ts`.
  */
 
+import { ensureDir } from "@std/fs";
+import { dirname } from "@std/path";
+
 import { MAKINA_VERSION } from "./src/constants.ts";
+import { expandHome } from "./src/config/load.ts";
 import { startDaemon } from "./src/daemon/server.ts";
+import {
+  createStdioWizardIo,
+  defaultConfigPath,
+  runSetupWizard,
+  SetupWizardError,
+  type WizardGitHubClient,
+  type WizardInstallation,
+} from "./src/config/setup-wizard.ts";
 
 if (Deno.args.includes("--version")) {
   console.log(MAKINA_VERSION);
@@ -107,11 +117,31 @@ if (subcommand === "daemon") {
   Deno.addSignalListener("SIGINT", shutdown);
   Deno.addSignalListener("SIGTERM", shutdown);
 } else if (subcommand === "setup") {
-  // Owned by the `feature/w2-config-loader` branch (#3); still in review.
-  // Until it merges, the subcommand prints a notice instead of falling
-  // through to the TUI launch path.
-  console.log("`setup` subcommand is not yet wired on develop (tracked in #3).");
-  Deno.exit(0);
+  // Until [W2-github-app-auth] lands the real implementation, the wizard
+  // uses a stub that surfaces a clear "not yet implemented" message if
+  // the user hits this in production. The wizard's tests inject their
+  // own client; this stub never runs in tests.
+  const stubClient: WizardGitHubClient = {
+    getInstallations(): Promise<readonly WizardInstallation[]> {
+      throw new Error(
+        "Real GitHub App client is not yet wired. Track [W2-github-app-auth] (issue #4).",
+      );
+    },
+  };
+  try {
+    const config = await runSetupWizard(createStdioWizardIo(stubClient));
+    const targetPath = expandHome(defaultConfigPath());
+    await ensureDir(dirname(targetPath));
+    await Deno.writeTextFile(targetPath, `${JSON.stringify(config, null, 2)}\n`);
+    console.log(`Wrote ${targetPath}.`);
+    Deno.exit(0);
+  } catch (error) {
+    if (error instanceof SetupWizardError) {
+      console.error(`setup failed: ${error.message}`);
+      Deno.exit(1);
+    }
+    throw error;
+  }
 } else {
   // Default branch → launch the Ink-based TUI.
   await import("./src/tui/App.tsx").then((module) => module.launch());
