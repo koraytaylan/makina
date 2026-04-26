@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel in-progress runs for the same ref when a new one starts.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: deno task ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history is required so commit-message validation can diff
+          # against the base ref on pull requests.
+          fetch-depth: 0
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version-file: .dvmrc
+
+      - name: Cache Deno dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      - name: deno task ci
+        run: deno task ci
+
+      - name: Upload coverage report
+        if: always() && hashFiles('cov.lcov') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: cov.lcov
+          if-no-files-found: ignore
+
+  validate-commits:
+    name: Validate Conventional Commits
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate every commit subject
+        # GITHUB_BASE_REF is an auto-set environment variable provided by
+        # GitHub Actions on pull_request events; it is not user-controlled
+        # input. We avoid `${{ github.* }}` expressions inside the run block
+        # to keep the workflow safe from injection.
+        run: |
+          set -euo pipefail
+          PATTERN='^(feat|fix|docs|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .{1,72}$'
+          git fetch origin "${GITHUB_BASE_REF}" --depth=50
+          subjects="$(git log --format=%s "origin/${GITHUB_BASE_REF}..HEAD")"
+          if [ -z "${subjects}" ]; then
+            echo "No new commits to validate."
+            exit 0
+          fi
+          failed=0
+          while IFS= read -r subject; do
+            if ! printf '%s\n' "${subject}" | grep -qE "${PATTERN}"; then
+              echo "::error::Invalid commit subject: ${subject}"
+              failed=1
+            fi
+          done <<< "${subjects}"
+          if [ "${failed}" -ne 0 ]; then
+            echo ""
+            echo "Subjects must match: <type>[(<scope>)][!]: <subject>"
+            echo "See CONTRIBUTING.md for the full convention."
+            exit 1
+          fi
+          echo "All commit subjects valid."

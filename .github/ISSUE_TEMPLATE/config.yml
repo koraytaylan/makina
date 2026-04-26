@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Wave task
+    url: https://github.com/koraytaylan/makina/issues/new?template=wave-task.yml
+    about: A single actionable item from the plan's wave catalog.
+  - name: Bug report
+    url: https://github.com/koraytaylan/makina/issues/new?template=bug.yml
+    about: A defect in shipped behavior.

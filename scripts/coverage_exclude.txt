@@ -1,0 +1,10 @@
+# Files exempt from the coverage gate enforced by check_coverage.ts.
+# Each line is either a full repo-relative path or a basename. Comments
+# start with #. Add justifications inline so future maintainers (and code
+# reviewers) understand why a file is exempt.
+#
+# main.ts — Wave 0 stub. The only behavior is the `--version` short-circuit
+# used by the release pipeline's compile-smoke step. Wave 1 turns it into a
+# thin argv-dispatch shell over `src/`; the substantive logic lives in
+# `src/` modules that are fully covered.
+main.ts

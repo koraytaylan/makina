@@ -1,0 +1,134 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-rc.*"
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: ci gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version-file: .dvmrc
+      - name: deno task ci
+        run: deno task ci
+
+  changelog:
+    name: generate changelog
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release_body: ${{ steps.cliff.outputs.content }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run git-cliff
+        id: cliff
+        uses: orhun/git-cliff-action@v4
+        env:
+          # GITHUB_REF_NAME is an auto-set env var (the pushed tag here);
+          # we read it through env to avoid `${{ github.* }}` in run blocks.
+          OUTPUT: CHANGELOG.md
+        with:
+          config: cliff.toml
+          args: --tag ${{ github.ref_name }} --strip header --latest
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: ci
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version-file: .dvmrc
+      - name: Compile
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          OUT="dist/makina-${GITHUB_REF_NAME}-${TARGET}"
+          deno compile -A --target "${TARGET}" --output "${OUT}" main.ts
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: makina-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [changelog, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Compute checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shasum -a 256 makina-* > SHASUMS256.txt
+          cat SHASUMS256.txt
+      - name: Write release notes file
+        env:
+          NOTES: ${{ needs.changelog.outputs.release_body }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${NOTES}" > RELEASE_NOTES.md
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PRERELEASE_FLAG=""
+          case "${GITHUB_REF_NAME}" in
+            *-rc.*) PRERELEASE_FLAG="--prerelease" ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            ${PRERELEASE_FLAG} \
+            dist/makina-* dist/SHASUMS256.txt
+      - name: Surface release URL in workflow summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          URL="$(gh release view "${GITHUB_REF_NAME}" --json url --jq .url)"
+          {
+            echo "## Release published"
+            echo ""
+            echo "[${GITHUB_REF_NAME}](${URL})"
+          } >> "${GITHUB_STEP_SUMMARY}"

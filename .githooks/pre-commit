@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fast local gate run before every commit. The full quality gate
+# (coverage, compile smoke) runs in CI; this is the subset that fits
+# inside a couple of seconds so it does not get in the way.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+exec deno run -A scripts/pre_commit.ts

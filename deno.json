@@ -1,0 +1,56 @@
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "npm:react@18",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"],
+      "include": [
+        "no-throw-literal",
+        "no-eval",
+        "no-non-null-assertion",
+        "no-external-import"
+      ]
+    }
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "singleQuote": false
+  },
+  "tasks": {
+    "dev": "deno run -A --watch main.ts",
+    "daemon": "deno run -A main.ts daemon",
+    "setup": "deno run -A main.ts setup",
+    "test": "deno test -A --parallel",
+    "test:coverage": "rm -rf cov cov.lcov && deno test -A --parallel --coverage=cov && deno coverage cov --lcov --output=cov.lcov && deno run -A scripts/check_coverage.ts cov.lcov 80",
+    "doc:lint": "deno doc --lint main.ts src/",
+    "doc:html": "deno doc --html --name=makina --output=docs/api main.ts src/",
+    "build:smoke": "deno compile -A --output=/tmp/makina-smoke main.ts && /tmp/makina-smoke --version",
+    "ci": "deno fmt --check && deno lint && deno task doc:lint && deno check main.ts && deno task test:coverage && deno task build:smoke"
+  },
+  "imports": {
+    "ink": "npm:ink@5",
+    "react": "npm:react@18",
+    "@octokit/auth-app": "npm:@octokit/auth-app@7",
+    "@octokit/core": "npm:@octokit/core@5",
+    "@anthropic-ai/claude-agent-sdk": "npm:@anthropic-ai/claude-agent-sdk",
+    "zod": "npm:zod@3",
+    "@std/assert": "jsr:@std/assert@1",
+    "@std/path": "jsr:@std/path@1",
+    "@std/fs": "jsr:@std/fs@1",
+    "@std/encoding": "jsr:@std/encoding@1",
+    "@std/cli": "jsr:@std/cli@1",
+    "@std/log": "jsr:@std/log@0.224",
+    "@std/async": "jsr:@std/async@1",
+    "@std/jsonc": "jsr:@std/jsonc@1",
+    "@std/streams": "jsr:@std/streams@1",
+    "@std/testing": "jsr:@std/testing@1"
+  }
+}
