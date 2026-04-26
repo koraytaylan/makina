@@ -23,7 +23,7 @@ import { type DaemonClient, SocketDaemonClient } from "./ipc-client.ts";
 import { type ConnectionLifecycle, useDaemonConnection } from "./hooks/useDaemonConnection.ts";
 import type { EventPayload } from "../ipc/protocol.ts";
 import { makeTaskId, type TaskId } from "../types.ts";
-import { MAKINA_VERSION } from "../constants.ts";
+import { MAKINA_VERSION, STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS } from "../constants.ts";
 
 /**
  * Default Unix-socket path the daemon listens on.
@@ -209,7 +209,11 @@ export function handleEvent(event: EventPayload, setters: EventSetters): void {
       );
       break;
     case "agent-message":
-      setters.setLastMessage(`agent ${event.data.role}: ${truncate(event.data.text, 80)}`);
+      setters.setLastMessage(
+        `agent ${event.data.role}: ${
+          truncate(event.data.text, STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS)
+        }`,
+      );
       break;
     case "github-call":
       setters.setLastMessage(

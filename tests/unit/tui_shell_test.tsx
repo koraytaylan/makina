@@ -828,6 +828,42 @@ Deno.test("SocketDaemonClient: encode failure rejects without writing", async ()
   await client.close();
 });
 
+Deno.test(
+  "SocketDaemonClient: peer disconnect mid-request rejects pending sends",
+  async () => {
+    // Regression for the race Copilot caught at ipc-client.ts:413: when
+    // the read loop ends normally (peer EOF) instead of via an
+    // exception, the previous implementation left every entry in
+    // `pending` unresolved, hanging the caller forever. After the fix
+    // the read loop must drain `pending` with a "daemon disconnected"
+    // error before the local handles get torn down.
+    const pair = makeDuplexPair();
+    const client = new SocketDaemonClient("/unused", () => Promise.resolve(pair.client));
+    await client.connect();
+
+    // Issue a send that the daemon will never reply to. Capture the
+    // promise before the disconnect so the test can await its rejection.
+    const inflight = client.send({ id: "1", type: "ping", payload: {} });
+
+    // Simulate a peer-side clean disconnect: close the daemon's
+    // writable, which makes the client's read loop see `done` and
+    // unwind without throwing.
+    const daemonWriter = pair.daemon.writable.getWriter();
+    await daemonWriter.close().catch(() => {});
+    daemonWriter.releaseLock();
+
+    // The pending send must reject with the documented disconnect
+    // reason rather than hang.
+    await assertRejects(
+      () => inflight,
+      DaemonClientError,
+      "daemon disconnected before responding",
+    );
+
+    await client.close();
+  },
+);
+
 // ---------------------------------------------------------------------------
 // validateReplyEnvelope
 // ---------------------------------------------------------------------------

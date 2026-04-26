@@ -411,6 +411,16 @@ export class SocketDaemonClient implements DaemonClient {
           new DaemonClientError(`unexpected envelope type from daemon: ${envelope.type}`),
         );
       }
+      // Loop exited normally — the peer reached EOF without sending a
+      // reply for at least the still-pending ids. Fail those promises
+      // so callers do not hang waiting for a reply that will never
+      // arrive. `close()` already drains `pending` itself, so this is
+      // only meaningful for an unsolicited peer disconnect; it is a
+      // no-op when the read loop ends because of a deliberate
+      // `close()`.
+      if (!this.closed) {
+        this.failAllPending(new DaemonClientError("daemon disconnected before responding"));
+      }
     } catch (error) {
       if (!this.closed) {
         const reason = error instanceof Error
