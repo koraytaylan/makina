@@ -419,22 +419,117 @@ Deno.test("removeWorktree: recovers when the directory was rm'd out from under g
   }
 });
 
-Deno.test("removeWorktree: tolerates registrations outside the workspace root", async () => {
-  const rig = await makeRig();
-  const stray = await Deno.makeTempDir({ prefix: "makina-stray-" });
-  try {
-    // Pretend a previous run registered a worktree path that doesn't sit
-    // under our `worktrees/` root (e.g. a future relocation feature).
-    const taskId = makeTaskId("stray-task");
-    rig.manager.registerTaskId(taskId, stray);
-    await rig.manager.removeWorktree(taskId);
-    assert(!(await pathExists(stray)), "stray path removed");
-    assertEquals(rig.manager.worktreePathFor(taskId), undefined);
-  } finally {
-    // The stray path is already gone; only the workspace cleanup remains.
-    await rig.cleanup();
-  }
-});
+Deno.test(
+  "removeWorktree: refuses to delete registrations outside the worktrees root (path-traversal guard)",
+  async () => {
+    const rig = await makeRig();
+    const stray = await Deno.makeTempDir({ prefix: "makina-stray-" });
+    const sentinel = join(stray, "MUST_NOT_BE_DELETED");
+    await Deno.writeTextFile(sentinel, "evidence");
+    try {
+      // A corrupt persistence layer (or a malicious task record) hands us
+      // a path that escapes the configured workspace. The manager must
+      // refuse the recursive delete loudly and leave the registration in
+      // place so the operator can investigate, rather than silently wipe
+      // an arbitrary directory on disk.
+      const taskId = makeTaskId("stray-task");
+      rig.manager.registerTaskId(taskId, stray);
+      await assertRejects(
+        () => rig.manager.removeWorktree(taskId),
+        Error,
+        "not under the configured workspace",
+      );
+      // Critically, neither the stray dir nor its contents were touched.
+      assert(await pathExists(stray), "stray dir untouched");
+      assert(await pathExists(sentinel), "sentinel file untouched");
+      // The registration is preserved so a follow-up audit can find it.
+      assertEquals(rig.manager.worktreePathFor(taskId), stray);
+    } finally {
+      await Deno.remove(stray, { recursive: true });
+      await rig.cleanup();
+    }
+  },
+);
+
+Deno.test(
+  "removeWorktree: path-traversal guard blocks `..` segments and parent-dir registrations",
+  async () => {
+    // Regression coverage for the path-traversal vector flagged by review:
+    // `removeWorktree` previously did `Deno.remove(path, { recursive: true })`
+    // for *any* registered path when the bare clone was missing/unusable.
+    // A corrupt registration containing `..` (or simply pointing at the
+    // workspace itself) must not let the manager rm-rf its way out of the
+    // configured worktrees root.
+    const rig = await makeRig();
+    const outside = await Deno.makeTempDir({ prefix: "makina-outside-" });
+    const sentinel = join(outside, "DO_NOT_TOUCH");
+    await Deno.writeTextFile(sentinel, "evidence");
+    try {
+      // Case 1: a `..`-laced path that starts under worktreesRoot but
+      // climbs out via segment traversal.
+      const traversal = join(
+        rig.workspace,
+        "worktrees",
+        "octo__widgets",
+        "..",
+        "..",
+        "..",
+        // Attempt to land inside the temp-dir hierarchy alongside the workspace.
+        "outside-target",
+      );
+      const tA = makeTaskId("traversal-task");
+      rig.manager.registerTaskId(tA, traversal);
+      await assertRejects(
+        () => rig.manager.removeWorktree(tA),
+        Error,
+        "not under the configured workspace",
+      );
+
+      // Case 2: registration pointing at the workspace itself — a single
+      // `removeWorktree(taskId)` call would otherwise wipe everything
+      // makina is tracking.
+      const tB = makeTaskId("workspace-root");
+      rig.manager.registerTaskId(tB, rig.workspace);
+      await assertRejects(
+        () => rig.manager.removeWorktree(tB),
+        Error,
+        "not under the configured workspace",
+      );
+
+      // Case 3: registration pointing at the worktrees root *prefix* with
+      // no trailing separator (`<worktreesRoot>foo` rather than
+      // `<worktreesRoot>/foo`) — must not satisfy the prefix check.
+      const tC = makeTaskId("prefix-collision");
+      rig.manager.registerTaskId(
+        tC,
+        join(rig.workspace, "worktrees") + "-suffix",
+      );
+      await assertRejects(
+        () => rig.manager.removeWorktree(tC),
+        Error,
+        "not under the configured workspace",
+      );
+
+      // Case 4: an entirely arbitrary outside path.
+      const tD = makeTaskId("absolute-outside");
+      rig.manager.registerTaskId(tD, outside);
+      await assertRejects(
+        () => rig.manager.removeWorktree(tD),
+        Error,
+        "not under the configured workspace",
+      );
+
+      // None of the four attempts touched the outside hierarchy.
+      assert(await pathExists(outside), "outside dir untouched");
+      assert(await pathExists(sentinel), "sentinel untouched");
+      // Workspace itself is intact.
+      assert(await pathExists(rig.workspace), "workspace untouched");
+    } finally {
+      await Deno.remove(outside, { recursive: true });
+      await rig.cleanup();
+    }
+  },
+);
 
 Deno.test(
   "removeWorktree: cleans up when the bare clone has been deleted out from under us",

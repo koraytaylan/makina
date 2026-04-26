@@ -216,6 +216,14 @@ export function createWorktreeManager(
    * operation per bare clone is in flight at a time. Errors propagate
    * through the chain unchanged but do not poison subsequent calls — the
    * lock only awaits *settlement*, not success.
+   *
+   * Lock entries are removed from the map once the chain quiesces. We
+   * compare-and-swap on the stored sentinel: only the operation whose
+   * sentinel still occupies the slot at settlement time clears it. If a
+   * later caller chained on top, the slot belongs to that newer chain and
+   * must not be touched. This keeps `repoLocks` proportional to *active*
+   * repositories rather than the cumulative set ever seen — important for
+   * long-lived daemons that touch many repos.
    */
   function withRepoLock<T>(repoKey: string, work: () => Promise<T>): Promise<T> {
     const previous = repoLocks.get(repoKey) ?? Promise.resolve();
@@ -223,11 +231,20 @@ export function createWorktreeManager(
       .catch(() => undefined)
       .then(() => work());
     // Store the cleaned promise so a failure on one task doesn't leak
-    // into the next one's `await`.
-    repoLocks.set(
-      repoKey,
-      next.catch(() => undefined),
-    );
+    // into the next one's `await`. Capture the exact sentinel we install
+    // so the cleanup branch can verify nothing chained on top before it
+    // removes the entry.
+    const sentinel: Promise<unknown> = next.catch(() => undefined);
+    repoLocks.set(repoKey, sentinel);
+    sentinel.then(() => {
+      // Compare-and-swap: only delete if this chain is still the tail. A
+      // subsequent `withRepoLock(repoKey, …)` would have replaced the
+      // entry with its own sentinel, in which case ours is stale and
+      // there is nothing to clean up.
+      if (repoLocks.get(repoKey) === sentinel) {
+        repoLocks.delete(repoKey);
+      }
+    });
     return next;
   }
 
@@ -373,14 +390,30 @@ export function createWorktreeManager(
       // Idempotent: tearing down an already-removed task is a no-op.
       return;
     }
+    // Path-traversal guard. `removeWorktree` performs recursive deletes,
+    // and a registration whose path escapes the configured workspace
+    // would let a corrupt persistence layer (or a malicious task record)
+    // wipe arbitrary directories on disk. Any registration outside
+    // `worktreesRoot` is a programming error: refuse it loudly and leave
+    // the bookkeeping intact so the operator can investigate. The check
+    // is intentionally strict — we *only* delete inside `worktreesRoot`,
+    // never under `reposRoot`, never the workspace root itself, never
+    // anywhere else on the filesystem.
+    if (!isUnderWorktreesRoot(path)) {
+      throw new Error(
+        `refusing to remove worktree at ${path}: ` +
+          `path is not under the configured workspace (${worktreesRoot}). ` +
+          `This guards against path-traversal via corrupt task registrations.`,
+      );
+    }
     // Locate the bare clone for this worktree path so we can serialize
     // against other operations on the same repo.
     const repoKey = bareCloneForWorktreePath(path);
     // The bare clone may itself be gone (a user `rm -rf`'d the workspace,
-    // or this is a stray registration outside `worktreesRoot`). In both
-    // cases, talking to git is pointless: the metadata to prune lives
-    // *inside* the bare clone, so its absence already means there is
-    // nothing to reclaim. Fall back to a manual rm so the API stays
+    // or its bookkeeping was lost). Talking to git is pointless then: the
+    // metadata to prune lives *inside* the bare clone, so its absence
+    // already means there is nothing to reclaim. Fall back to a manual rm
+    // — still bounded by the prefix guard above — so the API stays
     // idempotent on corrupted state.
     const bareCloneUsable = repoKey !== null && (await pathExists(join(repoKey, "HEAD")));
     await withRepoLock(repoKey ?? path, async () => {
@@ -414,6 +447,19 @@ export function createWorktreeManager(
       }
       taskIdToPath.delete(taskId);
     });
+  }
+
+  /**
+   * True when `path` sits under `<worktreesRoot>/` (with a separator) and
+   * is not equal to `worktreesRoot` itself. The check runs against the
+   * raw string — it does not resolve symlinks, so a worktree path that
+   * traverses a symlink out of the workspace is treated as in-bounds (the
+   * supervisor never creates such paths). We *only* normalize the prefix
+   * with a trailing `/` so `<worktreesRoot>foo` (no separator) is rejected.
+   */
+  function isUnderWorktreesRoot(path: string): boolean {
+    const prefix = worktreesRoot + "/";
+    return path.startsWith(prefix);
   }
 
   /**
@@ -477,10 +523,15 @@ export function createWorktreeManager(
 }
 
 /**
- * Slugify a `<owner>/<name>` repo identifier into a single filesystem
- * segment. We use `<owner>__<name>` rather than `<owner>--<name>` because
- * GitHub names allow hyphens but not double-underscores, so the slug round-
- * trips losslessly.
+ * Convert a `<owner>/<name>` repo identifier into a single filesystem
+ * segment by replacing the `/` separator with `__`. We use `__` rather
+ * than `--` so hyphens in GitHub owner/repository names remain unchanged.
+ *
+ * The substitution is **best-effort**, not a reversible escape: a name
+ * that happens to embed `__` would alias another, and {@link makeRepoFullName}
+ * does not enforce a no-double-underscore invariant (W1 contract). The slug
+ * is purely for laying out files on disk; callers who need to recover the
+ * `<owner>/<name>` pair must keep it stored alongside, not parse it back.
  *
  * @param repo The repository name.
  * @returns A filesystem-safe slug.
