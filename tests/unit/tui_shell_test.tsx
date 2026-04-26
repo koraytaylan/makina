@@ -829,6 +829,27 @@ Deno.test("SocketDaemonClient: encode failure rejects without writing", async ()
 });
 
 Deno.test(
+  "SocketDaemonClient: send after explicit close reports the permanent-close error",
+  async () => {
+    // Regression: previously the connection/writer guard fired before
+    // the `closed` guard, so a send after close() rejected with "not
+    // connected" — the recoverable error — instead of the documented
+    // "client has been closed" message. Tests and callers rely on the
+    // permanent-close wording to tell an explicit shutdown apart from
+    // a transient transport failure.
+    const pair = makeDuplexPair();
+    const client = new SocketDaemonClient("/unused", () => Promise.resolve(pair.client));
+    await client.connect();
+    await client.close();
+    await assertRejects(
+      () => client.send({ id: "1", type: "ping", payload: {} }),
+      DaemonClientError,
+      "client has been closed",
+    );
+  },
+);
+
+Deno.test(
   "SocketDaemonClient: peer disconnect mid-request rejects pending sends",
   async () => {
     // Regression for the race Copilot caught at ipc-client.ts:413: when

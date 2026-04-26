@@ -242,11 +242,16 @@ export class SocketDaemonClient implements DaemonClient {
    *   reply arrives.
    */
   send(envelope: MessageEnvelope): Promise<DaemonReply> {
-    if (this.connection === undefined || this.writer === undefined) {
-      return Promise.reject(new DaemonClientError("not connected"));
-    }
+    // Check `closed` before the connection-state guard so a `send` after
+    // an explicit `close()` rejects with the documented permanent-close
+    // error instead of the recoverable "not connected" message — close()
+    // tears down `connection`/`writer`, so both branches would otherwise
+    // fire and the less-specific one would win the race.
     if (this.closed) {
       return Promise.reject(new DaemonClientError("client has been closed"));
+    }
+    if (this.connection === undefined || this.writer === undefined) {
+      return Promise.reject(new DaemonClientError("not connected"));
     }
     let bytes: Uint8Array;
     try {
