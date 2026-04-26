@@ -39,7 +39,7 @@
  *
  * The drop-on-overflow policy and the synchronous-callback contract are
  * both load-bearing design choices captured in
- * `docs/adrs/010-event-bus-backpressure-and-sync-callbacks.md`. Any change
+ * `docs/adrs/012-event-bus-backpressure-and-sync-callbacks.md`. Any change
  * to either is a contract change and needs an ADR amendment.
  *
  * @module

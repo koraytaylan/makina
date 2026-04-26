@@ -1,4 +1,4 @@
-# ADR-010: In-process event bus — drop-on-overflow + synchronous callbacks
+# ADR-012: In-process event bus — drop-on-overflow + synchronous callbacks
 
 ## Status
 
