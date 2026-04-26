@@ -201,6 +201,33 @@ Deno.test("ensureBareClone: surfaces git failures as GitCommandError", async () 
   }
 });
 
+Deno.test(
+  "ensureBareClone: redacts userinfo credentials from GitCommandError on failure",
+  async () => {
+    const rig = await makeRig();
+    try {
+      // Simulate the W3 supervisor injecting a GitHub App installation
+      // token into the clone URL. The host (`example.invalid`) does not
+      // resolve, so `git clone` fails — and the resulting GitCommandError
+      // must NOT echo the token back to the caller.
+      const token = "ghs_supersecret_token_value";
+      const url = `https://x-access-token:${token}@example.invalid/octo/widgets.git`;
+
+      const error = await assertRejects(
+        () => rig.manager.ensureBareClone(makeRepoFullName("octo/widgets"), url),
+        GitCommandError,
+      );
+      const haystack = `${error.message} ${error.command.join(" ")} ${error.stderr}`;
+      assert(!haystack.includes(token), "token leaked into GitCommandError");
+      assert(!haystack.includes("x-access-token"), "userinfo leaked into GitCommandError");
+      assert(haystack.includes("REDACTED"), "redaction marker present");
+      assert(haystack.includes("example.invalid"), "host kept for debuggability");
+    } finally {
+      await rig.cleanup();
+    }
+  },
+);
+
 // ---------------------------------------------------------------------------
 // createWorktreeForIssue
 // ---------------------------------------------------------------------------
@@ -408,6 +435,33 @@ Deno.test("removeWorktree: tolerates registrations outside the workspace root", 
     await rig.cleanup();
   }
 });
+
+Deno.test(
+  "removeWorktree: cleans up when the bare clone has been deleted out from under us",
+  async () => {
+    const rig = await makeRig();
+    try {
+      const repo = makeRepoFullName("octo/widgets");
+      await rig.manager.ensureBareClone(repo, rig.remoteUrl);
+      const path = await rig.manager.createWorktreeForIssue(repo, makeIssueNumber(11));
+      const taskId = makeTaskId("task-11");
+      rig.manager.registerTaskId(taskId, path);
+
+      // User nukes the bare clone directory — the worktree path still
+      // computes a `repoKey` under `worktreesRoot`, but the bare repo
+      // no longer exists. `git worktree remove`/`prune` would throw
+      // against a non-repo; the manager must fall back to a manual rm.
+      const bareDir = join(rig.workspace, "repos", "octo__widgets.git");
+      await Deno.remove(bareDir, { recursive: true });
+
+      await rig.manager.removeWorktree(taskId);
+      assert(!(await pathExists(path)), "worktree directory cleaned up");
+      assertEquals(rig.manager.worktreePathFor(taskId), undefined);
+    } finally {
+      await rig.cleanup();
+    }
+  },
+);
 
 // ---------------------------------------------------------------------------
 // pruneAll

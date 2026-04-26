@@ -260,11 +260,19 @@ export function createWorktreeManager(
     const stdout = new TextDecoder().decode(result.stdout);
     const stderr = new TextDecoder().decode(result.stderr);
     if (!result.success) {
+      // Redact credentials from any URL-shaped argv positions before the
+      // error escapes — the supervisor injects GitHub App installation
+      // tokens into clone URLs (`https://x-access-token:<token>@github.com/...`)
+      // and a bare exception would otherwise route them straight into logs
+      // and telemetry. We keep the host + path so the failure is still
+      // diagnosable.
+      const sanitizedArgs = args.map(redactUrlCredentials);
+      const sanitizedStderr = redactUrlCredentials(stderr);
       throw new GitCommandError(
-        `git ${args.join(" ")} failed (exit ${result.code})`,
-        [gitBinary, ...args],
+        `git ${sanitizedArgs.join(" ")} failed (exit ${result.code})`,
+        [gitBinary, ...sanitizedArgs],
         result.code,
-        stderr,
+        sanitizedStderr,
       );
     }
     return { stdout, stderr };
@@ -368,19 +376,26 @@ export function createWorktreeManager(
     // Locate the bare clone for this worktree path so we can serialize
     // against other operations on the same repo.
     const repoKey = bareCloneForWorktreePath(path);
+    // The bare clone may itself be gone (a user `rm -rf`'d the workspace,
+    // or this is a stray registration outside `worktreesRoot`). In both
+    // cases, talking to git is pointless: the metadata to prune lives
+    // *inside* the bare clone, so its absence already means there is
+    // nothing to reclaim. Fall back to a manual rm so the API stays
+    // idempotent on corrupted state.
+    const bareCloneUsable = repoKey !== null && (await pathExists(join(repoKey, "HEAD")));
     await withRepoLock(repoKey ?? path, async () => {
-      if (repoKey === null) {
-        // No bare clone we can talk to — fall back to a manual rm. This
-        // keeps the API idempotent even in the face of corrupted state.
+      if (!bareCloneUsable) {
         if (await pathExists(path)) {
           await Deno.remove(path, { recursive: true });
         }
         taskIdToPath.delete(taskId);
         return;
       }
+      // `repoKey` is non-null because `bareCloneUsable` requires it.
+      const bareDir = repoKey as string;
       if (await pathExists(path)) {
         try {
-          await runGit(["worktree", "remove", "--force", path], repoKey);
+          await runGit(["worktree", "remove", "--force", path], bareDir);
         } catch (error) {
           // If `git worktree remove` failed (e.g. because the worktree
           // metadata is corrupt), fall back to a manual rm followed by
@@ -388,14 +403,14 @@ export function createWorktreeManager(
           if (await pathExists(path)) {
             await Deno.remove(path, { recursive: true });
           }
-          await runGit(["worktree", "prune"], repoKey);
+          await runGit(["worktree", "prune"], bareDir);
           if (!(error instanceof GitCommandError)) {
             throw error;
           }
         }
       } else {
         // The directory is gone but git may still hold metadata for it.
-        await runGit(["worktree", "prune"], repoKey);
+        await runGit(["worktree", "prune"], bareDir);
       }
       taskIdToPath.delete(taskId);
     });
@@ -472,4 +487,29 @@ export function createWorktreeManager(
  */
 function repoSlug(repo: RepoFullName): string {
   return repo.replace("/", "__");
+}
+
+/**
+ * Strip `userinfo` (`user`, `user:password`, or a bare token) from any
+ * URL-shaped substring inside `text`, replacing it with the literal
+ * `REDACTED` so the host + path remain debuggable. Used by `runGit` to
+ * sanitize argv and stderr before they enter a {@link GitCommandError}:
+ * the W3 supervisor injects GitHub App installation tokens as the
+ * userinfo part of the clone URL (`https://x-access-token:<token>@…`),
+ * and we must not leak those into logs/telemetry on a `git clone`
+ * failure.
+ *
+ * The regex is intentionally conservative: it matches `scheme://user[:pw]@`
+ * sequences. URLs without userinfo, SSH-style `git@host:` strings (no
+ * credential to redact), and arbitrary non-URL text pass through unchanged.
+ *
+ * @param text Argv element or stderr buffer that may contain a URL.
+ * @returns `text` with any `userinfo` segments rewritten to `REDACTED`.
+ */
+function redactUrlCredentials(text: string): string {
+  // Match `scheme://userinfo@`. The userinfo grammar in RFC 3986 allows
+  // unreserved chars + a few sub-delims + `:` + percent-encodings; we use
+  // a permissive `[^@\s/]+` to avoid pulling in URL parsing for what is
+  // ultimately a redaction routine.
+  return text.replace(/([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/)[^@\s/]+@/g, "$1REDACTED@");
 }
