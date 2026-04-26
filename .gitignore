@@ -24,3 +24,6 @@ Thumbs.db
 .env
 .env.local
 *.pem
+
+# Claude Code session state (lock files for scheduled tasks etc.)
+.claude/
