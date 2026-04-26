@@ -146,6 +146,8 @@ export class GitHubAppAuthError extends Error {
   readonly operation: string;
 
   /**
+   * Construct a new {@link GitHubAppAuthError}.
+   *
    * @param operation A short identifier for the failing operation.
    * @param cause The original error thrown by `@octokit/auth-app`.
    */

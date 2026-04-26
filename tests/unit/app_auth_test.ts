@@ -484,3 +484,83 @@ Deno.test("createGitHubAppAuth: returned object satisfies the W1 GitHubAuth inte
   const result: string = await auth.getInstallationToken(installation);
   assertEquals(typeof result, "string");
 });
+
+// ---------------------------------------------------------------------------
+// Default-injection paths
+// ---------------------------------------------------------------------------
+//
+// The two paths below exercise the production default factories so the
+// `?? defaultCreateAppAuthStrategy` and `?? defaultNowMilliseconds`
+// branches do not stay dead code in coverage. We do not let the real
+// `@octokit/auth-app` perform any HTTP request — we cancel before the
+// install-token exchange ever fires.
+
+Deno.test("createGitHubAppAuth: default factory hooks the real @octokit/auth-app", async () => {
+  // Real @octokit/auth-app requires a parseable PEM at construction. A
+  // deliberately-malformed key proves the default factory was actually
+  // invoked: the call must throw a GitHubAppAuthError tagged
+  // `getInstallationToken` (the install-token call delegates JWT signing
+  // to the lazy auth() invocation, so the error surfaces there).
+  const auth = createGitHubAppAuth({
+    appId: 1234,
+    privateKey: "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n-----END RSA PRIVATE KEY-----",
+    installationId: 9876543,
+  });
+  await assertRejects(
+    () => auth.getInstallationToken(makeInstallationId(9876543)),
+    GitHubAppAuthError,
+  );
+});
+
+Deno.test("createGitHubAppAuth: default clock falls back to Date.now()", async () => {
+  // Provide a stub strategy but omit `nowMilliseconds` so the production
+  // default (`Date.now`) is exercised. The token mints with a TTL much
+  // larger than any real clock skew, so a single hit/refresh cycle is
+  // deterministic against wall-clock time.
+  const farFutureExpiry = new Date(Date.now() + ONE_HOUR_MILLISECONDS).toISOString();
+  let invocations = 0;
+  const strategy: CreateAppAuthStrategy = () => {
+    return () => {
+      invocations += 1;
+      return Promise.resolve({
+        token: `default-clock-token-${invocations}`,
+        expiresAt: farFutureExpiry,
+      });
+    };
+  };
+
+  const auth = createGitHubAppAuth({
+    ...COMMON_OPTS,
+    createAppAuthStrategy: strategy,
+  });
+
+  const first = await auth.getInstallationToken(makeInstallationId(9876543));
+  const second = await auth.getInstallationToken(makeInstallationId(9876543));
+  assertEquals(first, second);
+  assertEquals(invocations, 1);
+});
+
+Deno.test("createGitHubAppAuth: surfaces unprintable thrown values as String(error)", async () => {
+  // Build a circular structure so JSON.stringify throws inside
+  // describeError; the fallback is `String(error)`.
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+
+  const clock = createClock(0);
+  const { strategy } = createStubStrategy({
+    clock,
+    scriptedReplies: [{ kind: "error", error: circular }],
+  });
+  const auth = createGitHubAppAuth({
+    ...COMMON_OPTS,
+    createAppAuthStrategy: strategy,
+    nowMilliseconds: clock.now,
+  });
+
+  const error = await assertRejects(
+    () => auth.getInstallationToken(makeInstallationId(9876543)),
+    GitHubAppAuthError,
+  );
+  // Default `String({})` formats as "[object Object]".
+  assertEquals(error.message.endsWith("[object Object]"), true);
+});
