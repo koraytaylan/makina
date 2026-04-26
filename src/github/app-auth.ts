@@ -16,11 +16,14 @@
  * Steps 1 and 2 are delegated to `@octokit/auth-app` per
  * {@link "../../docs/adrs/005-no-jose-using-octokit-auth-app.md" | ADR-005} —
  * we do not reimplement the JOSE/JWT primitives, the install-token
- * exchange, or its retry/clock-skew handling. The cache is **ours**: we
- * intentionally bypass `@octokit/auth-app`'s built-in cache so the lead
- * time matches {@link INSTALLATION_TOKEN_REFRESH_LEAD_MILLISECONDS} exactly
- * and so the cache key is the branded {@link InstallationId} rather than a
- * Octokit-internal string.
+ * exchange, or its retry/clock-skew handling. The cache is **ours**: every
+ * call into `@octokit/auth-app` passes `refresh: true` so its built-in LRU
+ * cache is bypassed and the lead time matches
+ * {@link INSTALLATION_TOKEN_REFRESH_LEAD_MILLISECONDS} exactly. The cache
+ * key is the branded {@link InstallationId} rather than an Octokit-internal
+ * string, which keeps the surface area auditable. See
+ * {@link "../../docs/adrs/010-bypass-octokit-auth-app-cache.md" | ADR-010}
+ * for the trade-off.
  *
  * **Errors.** Anything thrown by `@octokit/auth-app` (private-key parse
  * failure, `403 Bad credentials`, network outage) is rewrapped as a
@@ -60,6 +63,11 @@ export interface CreateAppAuthStrategy {
  * that this module actually uses: ask for an installation token, get back
  * `{ token, expiresAt }`.
  *
+ * The `refresh: true` flag is mandatory and bypasses the library's own
+ * LRU cache (see {@link defaultCreateAppAuthStrategy} for why). Test stubs
+ * may ignore the flag because they have no internal cache, but production
+ * callers MUST forward it to `@octokit/auth-app`.
+ *
  * Modeled as an interface so a test stub can implement it without pulling
  * in the full Octokit `AuthInterface` (which mostly covers OAuth flows we
  * do not exercise).
@@ -68,6 +76,7 @@ export interface InstallationAuthHook {
   (options: {
     readonly type: "installation";
     readonly installationId: number;
+    readonly refresh: true;
   }): Promise<InstallationAuthResult>;
 }
 
@@ -95,14 +104,14 @@ export interface CreateGitHubAppAuthOptions {
    */
   readonly privateKey: string;
   /**
-   * Default installation id passed through to `createAppAuth`. Callers
-   * that target a single installation can omit `installationId` from each
-   * `getInstallationToken` call; the default is used.
+   * Installation id passed through to `createAppAuth`.
    *
-   * Note: every call to {@link GitHubAuth.getInstallationToken} still
-   * receives an explicit {@link InstallationId} per the W1 contract; this
-   * default lets us reuse the same auth strategy for any installation
-   * instead of constructing a fresh one per token request.
+   * This value configures the underlying `@octokit/auth-app` strategy, but
+   * it is **not** a default for the {@link GitHubAuth.getInstallationToken}
+   * parameter: callers still pass an explicit {@link InstallationId} to
+   * each token request per the W1 contract. The single auth strategy is
+   * reused across installations rather than constructed afresh per token
+   * request.
    */
   readonly installationId: number;
   /**
@@ -213,6 +222,12 @@ export function createGitHubAppAuth(opts: CreateGitHubAppAuthOptions): GitHubAut
       result = await authHook({
         type: "installation",
         installationId,
+        // Force `@octokit/auth-app` to bypass its built-in LRU cache so the
+        // refresh decision lives entirely in *our* lead-time logic. Without
+        // this, the library could hand back a stale cached token whose
+        // expiry is closer than INSTALLATION_TOKEN_REFRESH_LEAD_MILLISECONDS
+        // away — defeating the whole point of our cache.
+        refresh: true,
       });
     } catch (error) {
       throw new GitHubAppAuthError("getInstallationToken", error);
@@ -268,6 +283,15 @@ interface CachedToken {
  * Default strategy: real `@octokit/auth-app`. The Octokit `auth()`
  * function returns an `InstallationAccessTokenAuthentication`; we narrow
  * it to the {@link InstallationAuthResult} surface this module needs.
+ *
+ * `@octokit/auth-app` ships with its own LRU cache that holds installation
+ * tokens for ~59 of the GitHub-issued 60 minutes. Forwarding the
+ * `refresh: true` flag from the request bypasses that cache entirely so
+ * cache lifetime is governed *only* by this module's
+ * {@link INSTALLATION_TOKEN_REFRESH_LEAD_MILLISECONDS} lead-time logic.
+ * Without this, near-expiry refreshes initiated by our cache could still
+ * receive the library's stale token and the lead-time guarantee in the
+ * module header would not hold.
  */
 function defaultCreateAppAuthStrategy(options: {
   readonly appId: number;
@@ -279,7 +303,12 @@ function defaultCreateAppAuthStrategy(options: {
     privateKey: options.privateKey,
     ...(options.installationId === undefined ? {} : { installationId: options.installationId }),
   });
-  return (request) => auth({ type: "installation", installationId: request.installationId });
+  return (request) =>
+    auth({
+      type: "installation",
+      installationId: request.installationId,
+      refresh: request.refresh,
+    });
 }
 
 /**

@@ -75,12 +75,12 @@ function createStubStrategy(args: {
   readonly factoryError?: unknown;
 }): {
   strategy: CreateAppAuthStrategy;
-  authCalls: Array<{ installationId: number }>;
+  authCalls: Array<{ installationId: number; refresh: true }>;
   factoryCalls: Array<{ appId: number; privateKey: string; installationId?: number }>;
 } {
   const ttl = args.tokenTtlMilliseconds ?? ONE_HOUR_MILLISECONDS;
   const scripted = args.scriptedReplies ? [...args.scriptedReplies] : [];
-  const authCalls: Array<{ installationId: number }> = [];
+  const authCalls: Array<{ installationId: number; refresh: true }> = [];
   const factoryCalls: Array<{ appId: number; privateKey: string; installationId?: number }> = [];
   let mintCounter = 0;
 
@@ -102,7 +102,7 @@ function createStubStrategy(args: {
     }
 
     const hook: InstallationAuthHook = (request) => {
-      authCalls.push({ installationId: request.installationId });
+      authCalls.push({ installationId: request.installationId, refresh: request.refresh });
       const next = scripted.shift();
       if (next !== undefined) {
         if (next.kind === "error") {
@@ -468,6 +468,32 @@ Deno.test("createGitHubAppAuth: passes the requested installationId on each toke
   assertEquals(authCalls.map((c) => c.installationId), [11, 22]);
 });
 
+Deno.test("createGitHubAppAuth: forwards refresh:true to bypass the library's LRU cache", async () => {
+  // Regression guard for the security boundary documented in the module
+  // header: every authHook invocation must set `refresh: true` so the
+  // library does not serve a stale token from its own LRU cache and
+  // defeat our INSTALLATION_TOKEN_REFRESH_LEAD_MILLISECONDS lead time.
+  const clock = createClock(1_700_000_000_000);
+  const { strategy, authCalls } = createStubStrategy({ clock });
+
+  const auth = createGitHubAppAuth({
+    ...COMMON_OPTS,
+    createAppAuthStrategy: strategy,
+    nowMilliseconds: clock.now,
+  });
+
+  const installation = makeInstallationId(9876543);
+  await auth.getInstallationToken(installation);
+  // Force a refresh by advancing past the lead-time window.
+  clock.advance(ONE_HOUR_MILLISECONDS - INSTALLATION_TOKEN_REFRESH_LEAD_MILLISECONDS);
+  await auth.getInstallationToken(installation);
+
+  assertEquals(authCalls.length, 2);
+  for (const call of authCalls) {
+    assertEquals(call.refresh, true);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Type sanity
 // ---------------------------------------------------------------------------
@@ -501,15 +527,35 @@ Deno.test("createGitHubAppAuth: default factory hooks the real @octokit/auth-app
   // invoked: the call must throw a GitHubAppAuthError tagged
   // `getInstallationToken` (the install-token call delegates JWT signing
   // to the lazy auth() invocation, so the error surfaces there).
-  const auth = createGitHubAppAuth({
-    appId: 1234,
-    privateKey: "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n-----END RSA PRIVATE KEY-----",
-    installationId: 9876543,
-  });
-  await assertRejects(
-    () => auth.getInstallationToken(makeInstallationId(9876543)),
-    GitHubAppAuthError,
-  );
+  //
+  // Explicitly forbid outbound HTTP in this unit test. If library behavior
+  // changes and reaches the install-token exchange, the fetch stub will
+  // make that visible — the assertion below verifies the failure was a
+  // local JWT/private-key parse error, not a network call.
+  const originalFetch = globalThis.fetch;
+  const unexpectedNetworkMessage = "unexpected network call in unit test";
+  globalThis.fetch = (() => {
+    throw new Error(unexpectedNetworkMessage);
+  }) as typeof fetch;
+
+  try {
+    const auth = createGitHubAppAuth({
+      appId: 1234,
+      privateKey: "-----BEGIN RSA PRIVATE KEY-----\nnot-a-real-key\n-----END RSA PRIVATE KEY-----",
+      installationId: 9876543,
+    });
+    const error = await assertRejects(
+      () => auth.getInstallationToken(makeInstallationId(9876543)),
+      GitHubAppAuthError,
+    );
+    assertNotEquals(
+      error.message.includes(unexpectedNetworkMessage),
+      true,
+      "expected the failure to be a local JWT/PEM parse error, not an outbound HTTP call",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 Deno.test("createGitHubAppAuth: default clock falls back to Date.now()", async () => {
