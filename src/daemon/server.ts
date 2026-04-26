@@ -227,18 +227,33 @@ export async function startDaemon(opts: DaemonServerOptions): Promise<DaemonHand
 }
 
 /**
- * Probe `socketPath` to detect a stale socket left behind by a previous
- * unclean shutdown and unlink it so {@link Deno.listen} can rebind.
+ * Probe `socketPath` to detect a stale Unix-domain socket left behind by a
+ * previous unclean shutdown and unlink it so {@link Deno.listen} can
+ * rebind.
  *
- * The probe order is important:
+ * The probe order is intentionally narrow to avoid data-loss scenarios:
  *  1. If the file does not exist, do nothing (the listener will create
  *     it).
- *  2. If `Deno.connect` succeeds, a live peer owns the socket — surface
- *     `Deno.errors.AddrInUse` so the caller sees a deterministic error.
- *  3. If `Deno.connect` fails (no listener answered), treat the file as
- *     stale and `Deno.remove` it.
+ *  2. If the path exists but is **not** a Unix-domain socket (regular
+ *     file, directory, symlink to either, etc.), do nothing. We refuse
+ *     to remove unrelated filesystem entries even when the user has
+ *     misconfigured `socketPath` to point at one — the subsequent
+ *     {@link Deno.listen} call will surface its native error
+ *     (`AddrInUse`, `IsADirectory`, …) and the user can correct the
+ *     configuration.
+ *  3. If the file is a socket and `Deno.connect` succeeds, a live peer
+ *     owns it — surface `Deno.errors.AddrInUse` so the caller sees a
+ *     deterministic error.
+ *  4. If the file is a socket and `Deno.connect` fails with a recognised
+ *     "no listener" error (`ConnectionRefused`, `NotFound`), treat it as
+ *     stale and `Deno.remove` it. Any other probe failure (e.g.,
+ *     `PermissionDenied`) is rethrown — silently deleting the entry on a
+ *     misconfiguration is more dangerous than an explicit failure.
  *
  * @param socketPath The candidate socket file to probe.
+ * @throws Deno.errors.AddrInUse when a live peer is already bound.
+ * @throws Deno.errors.PermissionDenied (or other unexpected probe error)
+ *   so misconfiguration cannot silently delete filesystem entries.
  */
 async function cleanupStaleSocket(socketPath: string): Promise<void> {
   let stat: Deno.FileInfo;
@@ -250,29 +265,52 @@ async function cleanupStaleSocket(socketPath: string): Promise<void> {
     }
     throw error;
   }
-  // Only probe regular sockets; refuse to remove a real file that happens
-  // to share the path so we cannot be tricked into deleting unrelated
-  // data.
-  if (!stat.isSocket && !stat.isFile) {
+  // Strict gate: only ever unlink a real Unix-domain socket file. A
+  // regular file, directory, or anything else at this path is left
+  // untouched — `Deno.listen` will surface the native error and the
+  // operator can correct the configuration without losing data.
+  if (!stat.isSocket) {
     return;
   }
+  let probe: Deno.UnixConn;
   try {
-    const probe = await Deno.connect({ transport: "unix", path: socketPath });
-    probe.close();
-    throw new Deno.errors.AddrInUse(`socket already in use: ${socketPath}`);
+    probe = await Deno.connect({ transport: "unix", path: socketPath });
   } catch (error) {
-    if (error instanceof Deno.errors.AddrInUse) {
-      throw error;
-    }
-    // No peer answered — the file is stale; remove it.
-    try {
-      await Deno.remove(socketPath);
-    } catch (removeError) {
-      if (!(removeError instanceof Deno.errors.NotFound)) {
-        throw removeError;
+    if (isStaleSocketProbeError(error)) {
+      // No peer answered — the file is stale; remove it.
+      try {
+        await Deno.remove(socketPath);
+      } catch (removeError) {
+        if (!(removeError instanceof Deno.errors.NotFound)) {
+          throw removeError;
+        }
       }
+      return;
     }
+    // Anything else (PermissionDenied, etc.) is a misconfiguration we
+    // refuse to recover from silently.
+    throw error;
   }
+  probe.close();
+  throw new Deno.errors.AddrInUse(`socket already in use: ${socketPath}`);
+}
+
+/**
+ * Whether `error` from a `Deno.connect({ transport: "unix" })` probe
+ * indicates that the socket file exists but no listener is bound.
+ *
+ * The kernel returns `ECONNREFUSED` when a Unix-domain socket file is
+ * present but no process has called `accept()` on it — that is the
+ * canonical "stale socket from a crashed daemon" signal. `NotFound`
+ * covers the race where the file vanishes between the `lstat` and the
+ * `connect`. Every other error (permission, address family, runtime
+ * resource limits) is treated as suspect and rethrown by the caller.
+ */
+function isStaleSocketProbeError(error: unknown): boolean {
+  return (
+    error instanceof Deno.errors.ConnectionRefused ||
+    error instanceof Deno.errors.NotFound
+  );
 }
 
 /**
@@ -478,8 +516,11 @@ function registerSubscription(args: {
     // Fire-and-forget; sendEnvelope swallows broken pipes and the
     // catch keeps the bus's publish loop free of exceptions.
     sendEnvelope(eventEnvelope).catch(() => {
-      // Per-event delivery failures are logged inside sendEnvelope's
-      // caller; nothing else to do here.
+      // Per-event delivery failures are intentionally ignored here to
+      // avoid surfacing exceptions into the event bus publish loop.
+      // sendEnvelope already converts broken-pipe errors into a benign
+      // no-op; anything else would be a daemon bug we cannot meaningfully
+      // recover from inside a fan-out callback.
     });
   });
   subscriptions.set(envelope.id, subscription);

@@ -253,19 +253,35 @@ Deno.test("startDaemon fans out a published event to a per-task subscription", a
   }
 });
 
-Deno.test("startDaemon cleans up a stale socket file on startup", async () => {
-  // Create a leftover regular file at the socket path; the daemon should
-  // detect it as stale (no listener) and unlink it before binding.
+Deno.test("startDaemon cleans up a stale socket left by a crashed predecessor", async () => {
+  // Simulate a crashed daemon: bind a Unix-domain socket through
+  // `node:net` and close the server WITHOUT unlinking the file. Unlike
+  // `Deno.listen({ transport: "unix" })` (whose drop hook unlinks on
+  // close), `net.Server#close` leaves the socket entry on disk — which
+  // is precisely the "crashed daemon" state the cleanup helper exists
+  // to recover from. The leftover entry is a real Unix-domain socket
+  // (`isSocket === true`) with no listener accepting connections, so a
+  // probe via `Deno.connect` will fail with `ConnectionRefused`.
+  const { createServer } = await import("node:net");
   const dir = await Deno.makeTempDir({ prefix: "makina-stale-" });
   const socketPath = `${dir}/sock`;
-  await Deno.writeTextFile(socketPath, "leftover");
-  // Sanity: file is present.
+
+  const leakedServer = createServer();
+  await new Promise<void>((resolve, reject) => {
+    leakedServer.once("error", reject);
+    leakedServer.listen(socketPath, () => resolve());
+  });
+  await new Promise<void>((resolve) => {
+    leakedServer.close(() => resolve());
+  });
+
+  // Sanity: the socket file is still on disk and is a real socket.
   const before = await Deno.lstat(socketPath);
-  assertEquals(before.isFile, true);
+  assertEquals(before.isSocket, true);
 
   const handle = await startDaemon({ socketPath });
   try {
-    // After startup, the file is replaced by a bound socket.
+    // After startup, the path is bound by our fresh listener.
     const after = await Deno.lstat(socketPath);
     assertEquals(after.isSocket, true);
 
@@ -281,6 +297,26 @@ Deno.test("startDaemon cleans up a stale socket file on startup", async () => {
   } finally {
     await handle.stop();
   }
+});
+
+Deno.test("startDaemon refuses to delete a regular file left at the socket path", async () => {
+  // Misconfiguration check: if the operator points `socketPath` at a
+  // real file (e.g., a typo'd path that hits an unrelated file), the
+  // daemon must leave the file intact and surface an error instead of
+  // silently `unlink`ing it. We let `Deno.listen` produce the error
+  // rather than reinventing the diagnostic.
+  const dir = await Deno.makeTempDir({ prefix: "makina-regular-" });
+  const socketPath = `${dir}/important.txt`;
+  const contents = "important user data";
+  await Deno.writeTextFile(socketPath, contents);
+
+  await assertRejects(() => startDaemon({ socketPath }));
+
+  // The file is still on disk with its original contents.
+  const after = await Deno.lstat(socketPath);
+  assertEquals(after.isFile, true);
+  const surviving = await Deno.readTextFile(socketPath);
+  assertEquals(surviving, contents);
 });
 
 Deno.test("startDaemon refuses to bind when the socket is still in use", async () => {
@@ -372,11 +408,20 @@ Deno.test("startDaemon drops events for a closed peer without crashing", async (
 
 Deno.test("startDaemon dispatches to a custom command handler", async () => {
   const socketPath = await makeSocketPath();
+  // The AckPayload contract reserves `error` for failure descriptions
+  // (see `src/ipc/protocol.ts`), so verifying dispatch by stuffing
+  // success output into `error` would invite confusion. Use a captured
+  // side effect instead, then assert a clean `{ ok: true }` ack.
+  const observed: { name: string; args: readonly string[] }[] = [];
   const handle = await startDaemon({
     socketPath,
     handlers: {
       command: (envelope) => {
-        return { ok: true, error: `executed:${envelope.payload.name}` };
+        observed.push({
+          name: envelope.payload.name,
+          args: envelope.payload.args,
+        });
+        return { ok: true };
       },
     },
   });
@@ -390,14 +435,18 @@ Deno.test("startDaemon dispatches to a custom command handler", async () => {
       });
       const reply = await client.next();
       assertEquals(reply.type, "ack");
-      assertEquals((reply.payload as AckPayload).ok, true);
-      assertEquals((reply.payload as AckPayload).error, "executed:issue");
+      const payload = reply.payload as AckPayload;
+      assertEquals(payload.ok, true);
+      assertEquals(payload.error, undefined);
     } finally {
       await client.close();
     }
   } finally {
     await handle.stop();
   }
+  assertEquals(observed.length, 1);
+  assertEquals(observed[0]?.name, "issue");
+  assertEquals(observed[0]?.args, ["42"]);
 });
 
 Deno.test("startDaemon dispatches to a custom prompt handler", async () => {
@@ -656,12 +705,15 @@ Deno.test("startDaemon stop() is idempotent and unlinks the socket file", async 
   await assertRejects(() => Deno.lstat(socketPath), Deno.errors.NotFound);
 });
 
-Deno.test("startDaemon ignores a non-socket regular file at the same path that is not a socket", async () => {
-  // A directory at the path is neither isSocket nor isFile; the daemon
-  // skips the unlink, lets Deno.listen surface its native error, and
-  // does not blow up our cleanup helper.
+Deno.test("startDaemon refuses to delete a directory at the socket path", async () => {
+  // A directory at the path is not a socket; the daemon skips the
+  // unlink, lets Deno.listen surface its native error, and does not
+  // blow up our cleanup helper. The directory must still exist after
+  // the failure so the operator can inspect what they hit.
   const dir = await Deno.makeTempDir({ prefix: "makina-dir-" });
   await assertRejects(() => startDaemon({ socketPath: dir }));
+  const stillThere = await Deno.lstat(dir);
+  assertEquals(stillThere.isDirectory, true);
   // Tidy up.
   await Deno.remove(dir);
 });
