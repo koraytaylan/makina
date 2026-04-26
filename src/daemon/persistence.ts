@@ -57,6 +57,20 @@ const TEMP_FILE_SUFFIX = ".tmp";
 const JSON_INDENT_SPACES = 2;
 
 /**
+ * Function shape used by {@link createPersistence} to open files and
+ * directories on the write path. Structurally identical to
+ * {@link Deno.open}; production wiring uses `Deno.open` itself, while
+ * tests can inject a spy that records `syncData` calls without mutating
+ * the global. The latter matters because `deno test --parallel` shares a
+ * single process with every test file, and a swapped-out `Deno.open` is
+ * a cross-test race waiting to happen.
+ */
+export type FsOpen = (
+  path: string | URL,
+  options?: Deno.OpenOptions,
+) => Promise<Deno.FsFile>;
+
+/**
  * Construct an atomic JSON-backed {@link Persistence}.
  *
  * The returned object owns the on-disk file at `opts.path`. Multiple
@@ -71,6 +85,12 @@ const JSON_INDENT_SPACES = 2;
  * @param opts.path Absolute filesystem path of the live store. The
  *   parent directory is created if it does not exist; the file itself is
  *   created on demand.
+ * @param opts.open Optional override for `Deno.open`. Production callers
+ *   leave this unset and get the real syscall; tests pass a spy so they
+ *   can observe `syncData()` invocations without mutating `Deno.open`
+ *   process-wide. Read-side IO (`Deno.readTextFile`, `Deno.rename`)
+ *   bypasses this hook because no test currently needs to intercept it
+ *   and the production behavior is identical either way.
  * @returns A {@link Persistence} bound to `opts.path`.
  *
  * @example
@@ -84,8 +104,10 @@ const JSON_INDENT_SPACES = 2;
  * }
  * ```
  */
-export function createPersistence(opts: { readonly path: string }): Persistence {
-  return new AtomicJsonPersistence(opts.path);
+export function createPersistence(
+  opts: { readonly path: string; readonly open?: FsOpen },
+): Persistence {
+  return new AtomicJsonPersistence(opts.path, opts.open ?? Deno.open);
 }
 
 /**
@@ -100,6 +122,12 @@ class AtomicJsonPersistence implements Persistence {
   /** Absolute path of the staging file used for atomic writes. */
   private readonly tempPath: string;
   /**
+   * Injected `Deno.open` (or a test spy with the same shape). Used for the
+   * temp-file write and the parent-directory open whose `syncData()` calls
+   * make the rename durable.
+   */
+  private readonly open: FsOpen;
+  /**
    * Tail of the serialization mutex chain. Every mutation appends itself by
    * `await`-ing the previous tail and assigning a new tail; concurrent
    * callers therefore queue rather than race the rename.
@@ -111,10 +139,13 @@ class AtomicJsonPersistence implements Persistence {
 
   /**
    * @param livePath Absolute path of the live JSON store.
+   * @param open Function used to open files/directories on the write path.
+   *   Defaults to {@link Deno.open}; tests inject a spy.
    */
-  constructor(livePath: string) {
+  constructor(livePath: string, open: FsOpen) {
     this.livePath = livePath;
     this.tempPath = `${livePath}${TEMP_FILE_SUFFIX}`;
+    this.open = open;
   }
 
   /**
@@ -300,7 +331,7 @@ class AtomicJsonPersistence implements Persistence {
     await ensureDir(parent);
     const json = JSON.stringify(tasks, null, JSON_INDENT_SPACES);
     const bytes = new TextEncoder().encode(json);
-    const file = await Deno.open(this.tempPath, {
+    const file = await this.open(this.tempPath, {
       write: true,
       create: true,
       truncate: true,
@@ -312,7 +343,32 @@ class AtomicJsonPersistence implements Persistence {
       file.close();
     }
     await Deno.rename(this.tempPath, this.livePath);
-    await syncDirectory(parent);
+    await this.syncDirectory(parent);
+  }
+
+  /**
+   * `fdatasync` the directory at `path` so the most recent rename within it
+   * is durable across power loss.
+   *
+   * On POSIX filesystems a `rename(2)` updates the parent directory's
+   * dirty page cache; the entry is not durable until the directory itself
+   * is flushed. macOS, Linux ext4, XFS, and APFS all permit opening a
+   * directory read-only and calling `fdatasync` on the descriptor — Deno
+   * exposes that as `Deno.FsFile.syncData()`.
+   *
+   * Routed through the injected {@link FsOpen} so the same spy that
+   * observes the temp-file sync also sees the directory sync.
+   *
+   * Any IO failure is propagated; a half-durable rename is worse than no
+   * rename because callers think their write committed.
+   */
+  private async syncDirectory(path: string): Promise<void> {
+    const dir = await this.open(path, { read: true });
+    try {
+      await dir.syncData();
+    } finally {
+      dir.close();
+    }
   }
 }
 
@@ -467,26 +523,4 @@ function coerceTask(entry: unknown, index: number, livePath: string): Task {
     );
   }
   return record as unknown as Task;
-}
-
-/**
- * `fdatasync` the directory at `path` so the most recent rename within it
- * is durable across power loss.
- *
- * On POSIX filesystems a `rename(2)` updates the parent directory's
- * dirty page cache; the entry is not durable until the directory itself
- * is flushed. macOS, Linux ext4, XFS, and APFS all permit opening a
- * directory read-only and calling `fdatasync` on the descriptor — Deno
- * exposes that as `Deno.FsFile.syncData()`.
- *
- * Any IO failure is propagated; a half-durable rename is worse than no
- * rename because callers think their write committed.
- */
-async function syncDirectory(path: string): Promise<void> {
-  const dir = await Deno.open(path, { read: true });
-  try {
-    await dir.syncData();
-  } finally {
-    dir.close();
-  }
 }

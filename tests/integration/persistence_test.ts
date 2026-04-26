@@ -495,25 +495,29 @@ Deno.test("after save the live file holds the new bytes (read postcondition)", a
 
 Deno.test("save fsyncs the staged temp file and the parent directory", async () => {
   // The page-cache-immediate-read trick won't catch a missing `syncData`,
-  // so we instrument `Deno.open` to record `syncData` invocations against
-  // each opened path. After one save we expect both the temp file
-  // (`<path>.tmp`) and the parent directory to have been synced.
+  // so we inject a spy `open` into the persistence factory and record
+  // every `syncData` invocation. After one save we expect both the temp
+  // file (`<path>.tmp`) and the parent directory to have been synced.
+  //
+  // Spy is per-instance — `Deno.open` is never mutated process-wide, so
+  // this test is safe under `deno test --parallel`.
   const { path, cleanup } = await makeTempStorePath();
-  const originalOpen = Deno.open;
-  const synced: string[] = [];
-  // deno-lint-ignore no-explicit-any
-  (Deno as any).open = async (target: string | URL, options?: Deno.OpenOptions) => {
-    const file = await originalOpen(target as string, options);
-    const targetPath = typeof target === "string" ? target : target.pathname;
-    const originalSyncData = file.syncData.bind(file);
-    file.syncData = async () => {
-      synced.push(targetPath);
-      await originalSyncData();
-    };
-    return file;
-  };
   try {
-    const persistence = createPersistence({ path });
+    const synced: string[] = [];
+    const spyOpen: typeof Deno.open = async (
+      target: string | URL,
+      options?: Deno.OpenOptions,
+    ) => {
+      const file = await Deno.open(target, options);
+      const targetPath = typeof target === "string" ? target : target.pathname;
+      const originalSyncData = file.syncData.bind(file);
+      file.syncData = async () => {
+        synced.push(targetPath);
+        await originalSyncData();
+      };
+      return file;
+    };
+    const persistence = createPersistence({ path, open: spyOpen });
     await persistence.save(makeTask({ id: makeTaskId("task_fsync_spy") }));
     // Both the staged temp file and the parent directory must have been
     // syncData()'d. Without the parent-dir sync, a power loss after the
@@ -531,8 +535,6 @@ Deno.test("save fsyncs the staged temp file and the parent directory", async () 
       `expected fsync on ${parentDir}, saw ${JSON.stringify(synced)}`,
     );
   } finally {
-    // deno-lint-ignore no-explicit-any
-    (Deno as any).open = originalOpen;
     await cleanup();
   }
 });
