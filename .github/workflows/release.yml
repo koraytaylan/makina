@@ -54,14 +54,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS x86_64 is cross-compiled from a macos-14 (ARM) runner because
-        # the macos-13 (Intel) runner pool is scarce and queue times routinely
-        # exceed the entire rest of the workflow. Deno's `compile --target`
-        # bundles the right denort binary for the requested triple.
+        # macOS Intel (x86_64-apple-darwin) is intentionally not built — Apple
+        # Silicon has been the default since 2020. See ADR-008.
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
-          - target: x86_64-apple-darwin
             runner: macos-14
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest

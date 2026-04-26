@@ -1,4 +1,4 @@
-# ADR-008: Defer Windows support
+# ADR-008: Defer Windows and x86_64 macOS support
 
 ## Status
 
@@ -16,9 +16,15 @@ to CI. The cost is real: ~2–3 days of work plus a permanent ongoing test surfa
 
 ## Decision
 
-v1 ships macOS and Linux only. Windows is explicitly out of scope. The release pipeline builds for
-`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
+v1 ships **Apple Silicon macOS** and **Linux** only. Windows and Intel macOS are explicitly out of
+scope. The release pipeline builds for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
 `aarch64-unknown-linux-gnu`.
+
+Apple has shipped only Apple Silicon Macs since 2020; the Intel macOS user base shrinks every
+quarter, and the GitHub-hosted macos-13 (Intel) runner pool is scarce enough that queue times
+exceeded the entire rest of the release workflow. Cross-compiling from a macos-14 (ARM) runner is
+technically possible but adds an artifact whose audience is small and shrinking. WSL2 covers Windows
+users.
 
 ## Consequences
 
@@ -31,5 +37,8 @@ v1 ships macOS and Linux only. Windows is explicitly out of scope. The release p
 
 - Windows users cannot run `makina` natively. WSL2 works (it is Linux for our purposes); document
   this in the README if users ask.
-- Re-opening Windows support later means a transport abstraction PR plus matrix expansion in CI and
-  `release.yml`. Tractable; not free.
+- Intel-Mac users are not supported. The cohort is small (Apple has been ARM-only since 2020) and
+  Rosetta 2 does not help here because the binary is statically linked to a target-specific Deno
+  runtime.
+- Re-opening either platform later means a transport abstraction PR (Windows) and/or a matrix
+  expansion in CI and `release.yml` (either). Tractable; not free.
