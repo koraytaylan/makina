@@ -277,6 +277,8 @@ export type RebasePhaseResult =
  * it never originates inside this module.
  *
  *  - `"fetch"` — `git fetch origin <refspec>` failed.
+ *  - `"rev-parse"` — `git rev-parse <ref>` failed when capturing the
+ *    base-branch SHA for the conflict prompt context.
  *  - `"rebase-start"` — initial `git rebase <ref>` exited non-zero
  *    without unmerged files (a non-conflict failure).
  *  - `"add"` — `git add -A` after the agent settled failed.
@@ -292,6 +294,7 @@ export type RebasePhaseResult =
  */
 export type StabilizeRebaseOperation =
   | "fetch"
+  | "rev-parse"
   | "rebase-start"
   | "add"
   | "rebase-continue"
@@ -431,6 +434,19 @@ export async function runRebasePhase(
     );
   }
 
+  // Step 1b: capture the base-branch SHA right after the fetch so the
+  // conflict prompt embeds the exact commit the agent is rebasing
+  // onto. Per issue #15's brief, conflict context must include the
+  // latest base-branch SHA. We resolve `refs/remotes/origin/<base>`
+  // (the freshly-updated remote-tracking ref from the fetch above)
+  // rather than `origin/<base>` so a missing fetch refspec surfaces
+  // here rather than silently using a stale value.
+  const baseBranchSha = await captureBaseBranchSha(
+    gitInvoker,
+    remoteTrackingRef,
+    cwd,
+  );
+
   // Step 2: try the rebase. A clean rebase exits 0 and the phase is
   // done. A non-zero exit puts us into the conflict-resolution loop.
   const rebaseStart = await invokeGit(
@@ -470,6 +486,7 @@ export async function runRebasePhase(
     const prompt = await buildConflictPrompt({
       issueNumber: opts.issueNumber,
       baseBranch: opts.baseBranch,
+      baseBranchSha,
       conflictingFiles,
       worktreePath: cwd,
       reader: conflictFileReader,
@@ -627,16 +644,62 @@ async function invokeGit(
 // ---------------------------------------------------------------------------
 
 /**
+ * Capture the SHA the base branch resolves to right after the fetch
+ * via `git rev-parse <ref>`. Embedded in the conflict prompt so the
+ * agent has a stable, unambiguous handle on the commit it is rebasing
+ * onto (the ref itself can move between iterations if a sibling task
+ * lands during the loop, but the SHA cannot).
+ *
+ * We resolve the explicit `refs/remotes/origin/<base>` form (the same
+ * ref the rebase will run against) so a missing fetch refspec — the
+ * exact failure mode the explicit refspec in step 1 protects against —
+ * surfaces here as a tagged {@link StabilizeRebaseError} rather than a
+ * silent rebase against a stale value. The trailing newline from
+ * `rev-parse`'s output is stripped before the SHA is embedded.
+ */
+async function captureBaseBranchSha(
+  gitInvoker: StabilizeGitInvoker,
+  ref: string,
+  cwd: string,
+): Promise<string> {
+  const result = await invokeGit(
+    gitInvoker,
+    ["rev-parse", ref],
+    cwd,
+    "rev-parse",
+  );
+  if (result.exitCode !== STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE) {
+    throw new StabilizeRebaseError(
+      `git rev-parse ${ref} failed (exit ${result.exitCode}): ${result.stderr.trim()}`,
+      "rev-parse",
+    );
+  }
+  const sha = result.stdout.trim();
+  if (sha.length === 0) {
+    throw new StabilizeRebaseError(
+      `git rev-parse ${ref} returned empty output`,
+      "rev-parse",
+    );
+  }
+  return sha;
+}
+
+/**
  * Fetch the list of files with unresolved merge conflicts via
  * `git diff --name-only --diff-filter=U`. The diff filter `U` selects
  * "unmerged" entries (files with conflict markers post-rebase).
  *
- * The output is one path per line; we trim trailing whitespace and
- * filter empty lines so a stray newline at end-of-output does not
- * produce a phantom entry. Returned paths are left exactly as git
- * prints them, which means forward slashes may appear even on Windows.
- * Path-separator normalisation, when needed for filesystem reads, is
- * performed at the call site (see {@link joinWorktreePath}).
+ * The output is one path per line. We split on `\n`, strip a trailing
+ * `\r` (so Windows-style `\r\n` line endings do not leak into the
+ * paths), and drop empty entries so a stray terminator at end-of-output
+ * does not produce a phantom file. **Internal whitespace is preserved
+ * verbatim** — file names like `"  leading.txt"` or `"trailing  "` are
+ * legal on POSIX, and `git diff --name-only` emits them as-is, so
+ * `String.prototype.trim` would silently corrupt them. Returned paths
+ * are left exactly as git prints them, which means forward slashes may
+ * appear even on Windows. Path-separator normalisation, when needed for
+ * filesystem reads, is performed at the call site (see
+ * {@link joinWorktreePath}).
  */
 async function listConflictingFiles(
   gitInvoker: StabilizeGitInvoker,
@@ -654,19 +717,29 @@ async function listConflictingFiles(
       "diff-conflicts",
     );
   }
-  const lines = result.stdout.split("\n").map((line) => line.trim());
+  // Strip only the line terminator (\n / \r\n), never internal
+  // whitespace — leading/trailing spaces in a path are valid POSIX
+  // characters and must round-trip into the agent prompt and back.
+  const lines = result.stdout
+    .split("\n")
+    .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
   return lines.filter((line) => line.length > 0);
 }
 
 /**
  * Build the conflict-context prompt for the agent.
  *
- * The prompt embeds the issue number, the base branch, and the head of
- * each conflicting file (capped at
- * {@link STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS} per file). The
- * agent is told it is mid-rebase, must resolve the conflict markers,
- * and must not run any git commands itself — the daemon will continue
- * the rebase once the agent settles.
+ * The prompt embeds the issue number, the base branch, the latest
+ * base-branch SHA (captured right after `git fetch` — see
+ * {@link captureBaseBranchSha}), and the head of each conflicting file
+ * (capped at {@link STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS} per
+ * file). The agent is told it is mid-rebase, must resolve the conflict
+ * markers, and must not run any git commands itself — the daemon will
+ * continue the rebase once the agent settles.
+ *
+ * Embedding the SHA lets the agent disambiguate between "rebasing onto
+ * yesterday's main" and "rebasing onto a freshly merged sibling task"
+ * without relying on the volatile `origin/<base>` symbolic ref.
  *
  * If reading a particular file fails (e.g. it has been deleted by the
  * rebase), we log a warning and surface the failure inline in the
@@ -676,17 +749,27 @@ async function listConflictingFiles(
 async function buildConflictPrompt(args: {
   readonly issueNumber: IssueNumber;
   readonly baseBranch: string;
+  readonly baseBranchSha: string;
   readonly conflictingFiles: readonly string[];
   readonly worktreePath: string;
   readonly reader: ConflictFileReader;
   readonly logger: StabilizeLogger;
 }): Promise<string> {
-  const { issueNumber, baseBranch, conflictingFiles, worktreePath, reader, logger } = args;
+  const {
+    issueNumber,
+    baseBranch,
+    baseBranchSha,
+    conflictingFiles,
+    worktreePath,
+    reader,
+    logger,
+  } = args;
   const sections: string[] = [];
   sections.push(STABILIZE_REBASE_CONFLICT_PROMPT_HEAD);
   sections.push("");
   sections.push(`Issue: #${issueNumber}`);
   sections.push(`Base branch: ${baseBranch}`);
+  sections.push(`Base branch SHA: ${baseBranchSha}`);
   sections.push(`Conflicting files (${conflictingFiles.length}):`);
   for (const path of conflictingFiles) {
     sections.push(`  - ${path}`);

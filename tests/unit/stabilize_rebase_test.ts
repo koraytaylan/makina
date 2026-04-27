@@ -145,6 +145,23 @@ function scriptedGitInvoker(steps: readonly GitScriptedStep[]): {
 const SUCCESS: GitInvocationResult = { exitCode: 0, stdout: "", stderr: "" };
 
 /**
+ * `git rev-parse` reply that runs immediately after every successful
+ * fetch — the rebase phase captures the base-branch SHA so the
+ * conflict prompt embeds it. Tests that script a clean fetch must
+ * also script this lookup.
+ */
+const REV_PARSE_OK: GitInvocationResult = {
+  exitCode: 0,
+  stdout: "deadbeef0123456789abcdef0123456789abcdef\n",
+  stderr: "",
+};
+
+const REV_PARSE_STEP: GitScriptedStep = {
+  match: (args) => args[0] === "rev-parse",
+  result: REV_PARSE_OK,
+};
+
+/**
  * Mint a `task_*` brand for the test. The real supervisor formats it
  * with an ISO timestamp; tests use a static suffix for readability.
  */
@@ -173,6 +190,7 @@ Deno.test(
   async () => {
     const { invoker, calls } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args[1] === "refs/remotes/origin/main",
         result: SUCCESS,
@@ -184,16 +202,18 @@ Deno.test(
     );
     assertEquals(result, { kind: "clean", iterations: 0 });
     assertEquals(runner.recordedInvocations().length, 0);
-    assertEquals(calls.length, 2);
+    assertEquals(calls.length, 3);
     assertEquals(calls[0]?.args, [
       "fetch",
       "origin",
       "main:refs/remotes/origin/main",
     ]);
-    assertEquals(calls[1]?.args, ["rebase", "refs/remotes/origin/main"]);
-    // Both invocations target the supplied worktree path.
+    assertEquals(calls[1]?.args, ["rev-parse", "refs/remotes/origin/main"]);
+    assertEquals(calls[2]?.args, ["rebase", "refs/remotes/origin/main"]);
+    // All invocations target the supplied worktree path.
     assertEquals(calls[0]?.cwd, "/tmp/fake-worktree");
     assertEquals(calls[1]?.cwd, "/tmp/fake-worktree");
+    assertEquals(calls[2]?.cwd, "/tmp/fake-worktree");
   },
 );
 
@@ -206,6 +226,7 @@ Deno.test(
   async () => {
     const { invoker, calls } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       // First rebase fails with conflicts.
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
@@ -257,11 +278,13 @@ Deno.test(
     assertEquals(result, { kind: "clean", iterations: 1 });
     const invocations = runner.recordedInvocations();
     assertEquals(invocations.length, 1);
-    // The dispatched prompt embeds the conflict context.
+    // The dispatched prompt embeds the conflict context, including
+    // the base-branch SHA captured right after the fetch.
     const prompt = invocations[0]?.prompt ?? "";
     assertStringIncludes(prompt, STABILIZE_REBASE_CONFLICT_PROMPT_HEAD);
     assertStringIncludes(prompt, "Issue: #42");
     assertStringIncludes(prompt, "Base branch: main");
+    assertStringIncludes(prompt, "Base branch SHA: deadbeef0123456789abcdef0123456789abcdef");
     assertStringIncludes(prompt, "src/a.ts");
     assertStringIncludes(prompt, "<<<<<<<");
     assertStringIncludes(prompt, "=======");
@@ -269,6 +292,7 @@ Deno.test(
     // The git command sequence covers the full conflict-resolve cycle.
     assertEquals(calls.map((call) => call.args[0]), [
       "fetch",
+      "rev-parse",
       "rebase",
       "diff",
       "add",
@@ -300,6 +324,7 @@ Deno.test(
     };
     const { invoker, calls } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: {
@@ -400,6 +425,7 @@ Deno.test(
   async () => {
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: {
@@ -438,6 +464,7 @@ Deno.test(
     };
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -479,6 +506,7 @@ Deno.test(
     };
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -517,6 +545,7 @@ Deno.test(
   async () => {
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -625,6 +654,7 @@ Deno.test(
   async () => {
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -676,6 +706,7 @@ Deno.test(
   async () => {
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -719,6 +750,7 @@ Deno.test(
   async () => {
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -759,6 +791,7 @@ Deno.test(
   async () => {
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -806,6 +839,7 @@ Deno.test(
     };
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       // Initial rebase fails with a conflict.
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
@@ -890,6 +924,7 @@ Deno.test(
     };
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -947,6 +982,7 @@ Deno.test(
     };
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -995,6 +1031,7 @@ Deno.test(
     };
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
@@ -1041,6 +1078,7 @@ Deno.test(
     // supervisor doesn't emit a redundant transition.
     const { invoker } = scriptedGitInvoker([
       { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
       {
         match: (args) => args[0] === "rebase" && args.length === 2,
         result: SUCCESS,
@@ -1101,5 +1139,197 @@ Deno.test(
     // The error message uses the full refspec, not just the base
     // branch name, so refspec/remote-tracking issues are debuggable.
     assertStringIncludes(error.message, "develop:refs/remotes/origin/develop");
+  },
+);
+
+// ---------------------------------------------------------------------------
+// rev-parse: failure surfaces as a fatal StabilizeRebaseError
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "runRebasePhase throws StabilizeRebaseError when git rev-parse fails after fetch",
+  async () => {
+    // The fetch succeeds, but the rev-parse used to capture the
+    // base-branch SHA fails — typical when the explicit refspec
+    // populated FETCH_HEAD but failed to write the remote-tracking
+    // ref. Surface as a fatal phase error so the supervisor lands in
+    // FAILED rather than rebasing against an unknown SHA.
+    const { invoker } = scriptedGitInvoker([
+      { match: (args) => args[0] === "fetch", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rev-parse",
+        result: {
+          exitCode: 128,
+          stdout: "",
+          stderr: "fatal: ambiguous argument 'refs/remotes/origin/main'",
+        },
+      },
+    ]);
+    const error = await assertRejects(
+      async () => {
+        await runRebasePhase(BASE_OPTS({ gitInvoker: invoker }));
+      },
+      StabilizeRebaseError,
+      "git rev-parse refs/remotes/origin/main failed",
+    );
+    assertEquals(error.operation, "rev-parse");
+  },
+);
+
+Deno.test(
+  "runRebasePhase throws StabilizeRebaseError when git rev-parse returns empty output",
+  async () => {
+    // git rev-parse succeeded (exit 0) but printed nothing; treat as
+    // a fatal failure rather than embedding an empty SHA into the
+    // conflict prompt.
+    const { invoker } = scriptedGitInvoker([
+      { match: (args) => args[0] === "fetch", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rev-parse",
+        result: { exitCode: 0, stdout: "   \n", stderr: "" },
+      },
+    ]);
+    const error = await assertRejects(
+      async () => {
+        await runRebasePhase(BASE_OPTS({ gitInvoker: invoker }));
+      },
+      StabilizeRebaseError,
+      "empty output",
+    );
+    assertEquals(error.operation, "rev-parse");
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Conflict prompt embeds the captured base-branch SHA verbatim
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "runRebasePhase embeds the captured base-branch SHA in the conflict prompt",
+  async () => {
+    const customSha = "abc123def456abc123def456abc123def4567890";
+    const { invoker } = scriptedGitInvoker([
+      { match: (args) => args[0] === "fetch", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rev-parse",
+        // Trailing newline + whitespace must be trimmed before embed.
+        result: { exitCode: 0, stdout: `${customSha}\n`, stderr: "" },
+      },
+      {
+        match: (args) => args[0] === "rebase" && args.length === 2,
+        result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
+      },
+      {
+        match: (args) => args[0] === "diff",
+        result: { exitCode: 0, stdout: "src/a.ts\n", stderr: "" },
+      },
+      { match: (args) => args[0] === "add", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rebase" && args[1] === "--continue",
+        result: SUCCESS,
+      },
+    ]);
+    const runner = new MockAgentRunner();
+    runner.queueRun({ messages: [{ role: "assistant", text: "ok" }] });
+    const reader = (_path: string): Promise<string> => Promise.resolve("x");
+    const result = await runRebasePhase(
+      BASE_OPTS({
+        gitInvoker: invoker,
+        agentRunner: runner,
+        conflictFileReader: reader,
+      }),
+    );
+    assertEquals(result.kind, "clean");
+    const prompt = runner.recordedInvocations()[0]?.prompt ?? "";
+    assertStringIncludes(prompt, `Base branch SHA: ${customSha}`);
+    // The SHA is captured against the explicit remote-tracking ref,
+    // not the symbolic `origin/<base>` form, so a missing fetch
+    // refspec surfaces as a rev-parse failure.
+    assertStringIncludes(prompt, "Base branch: main");
+  },
+);
+
+// ---------------------------------------------------------------------------
+// listConflictingFiles preserves internal whitespace in file names
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "runRebasePhase preserves leading/trailing whitespace in conflicting file names",
+  async () => {
+    // POSIX file names like `"  weird name.txt"` are legal and git
+    // diff prints them verbatim. The phase must NOT strip internal
+    // whitespace — only the line terminator (`\n` / `\r\n`).
+    const weirdName = "  weird name.txt  ";
+    const { invoker } = scriptedGitInvoker([
+      { match: (args) => args[0] === "fetch", result: SUCCESS },
+      REV_PARSE_STEP,
+      {
+        match: (args) => args[0] === "rebase" && args.length === 2,
+        result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
+      },
+      // Mix of \r\n and \n terminators with a trailing empty line.
+      {
+        match: (args) => args[0] === "diff",
+        result: {
+          exitCode: 0,
+          stdout: `${weirdName}\r\nsrc/a.ts\n\n`,
+          stderr: "",
+        },
+      },
+      { match: (args) => args[0] === "add", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rebase" && args[1] === "--continue",
+        result: { exitCode: 1, stdout: "", stderr: "still" },
+      },
+      // re-confirm conflict set after continue.
+      {
+        match: (args) => args[0] === "diff",
+        result: {
+          exitCode: 0,
+          stdout: `${weirdName}\r\nsrc/a.ts\n`,
+          stderr: "",
+        },
+      },
+      // Final diff after exhaustion + abort.
+      {
+        match: (args) => args[0] === "diff",
+        result: {
+          exitCode: 0,
+          stdout: `${weirdName}\r\nsrc/a.ts\n`,
+          stderr: "",
+        },
+      },
+      {
+        match: (args) => args[0] === "rebase" && args[1] === "--abort",
+        result: SUCCESS,
+      },
+    ]);
+    const runner = new MockAgentRunner();
+    runner.queueRun({ messages: [{ role: "assistant", text: "iteration 1" }] });
+    const reader = (path: string): Promise<string> => {
+      // Reader sees the absolute joined path; only assert the
+      // weird-name suffix is preserved verbatim.
+      assert(
+        path.endsWith(weirdName) || path.endsWith("src/a.ts"),
+        `unexpected reader path: ${JSON.stringify(path)}`,
+      );
+      return Promise.resolve("x");
+    };
+    const result = await runRebasePhase(
+      BASE_OPTS({
+        gitInvoker: invoker,
+        agentRunner: runner,
+        conflictFileReader: reader,
+        maxIterations: 1,
+      }),
+    );
+    assertEquals(result.kind, "needs-human");
+    if (result.kind === "needs-human") {
+      // Exact, byte-for-byte preservation — no trim().
+      assertEquals(result.conflictingFiles, [weirdName, "src/a.ts"]);
+    }
+    // The conflict prompt also lists the weird name verbatim.
+    const prompt = runner.recordedInvocations()[0]?.prompt ?? "";
+    assertStringIncludes(prompt, weirdName);
   },
 );

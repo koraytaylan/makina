@@ -769,6 +769,16 @@ Deno.test(
       };
       const invoker: StabilizeGitInvoker = (args, _options) => {
         if (args[0] === "fetch") return Promise.resolve(SUCCESS);
+        if (args[0] === "rev-parse") {
+          // The rebase phase captures the base-branch SHA right after
+          // fetch so the conflict prompt can embed it. Stub a stable
+          // value so the loop keeps iterating into the conflict path.
+          return Promise.resolve({
+            exitCode: 0,
+            stdout: "feedfacefeedfacefeedfacefeedfacefeedface\n",
+            stderr: "",
+          });
+        }
         if (args[0] === "rebase") {
           if (args[1] === "--continue") {
             return Promise.resolve({
