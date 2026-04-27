@@ -1240,11 +1240,16 @@ Deno.test("tool_use blocks render an empty input string when input is null/undef
 
 Deno.test({
   name: "the default resolveExecutable invokes `which` against the real PATH",
-  // We rely on the host's `which sh` returning something useful. POSIX
-  // hosts (the only platforms makina ships to per ADR-008) all carry it.
-  // Branding `claude` would couple the test to whether the developer has
-  // Claude Code installed; a near-universal binary keeps the test green
-  // on a fresh dev box without skipping.
+  // The runner under test resolves `claude` via `which claude`, so this
+  // test exercises both branches of `defaultResolveExecutable`:
+  //  - success: `claude` is on PATH (developer has Claude Code installed),
+  //    in which case the resolver returns a non-empty path and the stub
+  //    query is invoked.
+  //  - failure: `claude` is not on PATH (typical fresh CI), in which case
+  //    the resolver throws an `AgentRunnerError` with
+  //    `operation: "resolveExecutable"`.
+  // Whichever branch the host happens to take, the assertions below cover
+  // it — neither outcome should leave a fresh dev box red.
   async fn() {
     const fake = fakeQuery({ messages: [assistantMessage("ok")] });
     const bus = createEventBus({ logger: recordingLogger() });

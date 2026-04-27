@@ -639,9 +639,12 @@ export function createAgentRunner(opts: AgentRunnerOptions): AgentRunnerImpl {
     const iterable = runAgentInternal(args, (result) => {
       captured = result;
     });
-    for await (const _ of iterable) {
-      // Drain the iterable to drive `onResult` to completion. The
-      // projection is already published on the bus.
+    // Drain the iterable to drive `onResult` to completion. The projection
+    // is already published on the bus, so we discard the messages here and
+    // only need to advance the iterator.
+    const drain = iterable[Symbol.asyncIterator]();
+    while (!(await drain.next()).done) {
+      // intentionally empty — see comment above
     }
     if (captured === undefined) {
       // Defensive: `runAgentInternal` always invokes the callback when the

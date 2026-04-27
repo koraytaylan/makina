@@ -81,7 +81,7 @@ Deno.test({
         if (claudePath === undefined) {
           // The harness ignores `t.step` failure-or-skip semantics, so we
           // explicitly bail with a console note rather than failing.
-          // eslint-disable-next-line no-console -- informational skip note
+          // deno-lint-ignore no-console -- informational skip note
           console.warn(
             `agent_runner_real: \`claude\` is not on PATH; skipping. ` +
               `Install Claude Code to exercise this path.`,
