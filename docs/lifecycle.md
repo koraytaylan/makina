@@ -1,6 +1,12 @@
 # Lifecycle
 
-> Wave 0 stub. The full stabilize loop is implemented in Wave 4.
+> Wave 3 ships the supervisor skeleton (#12); the three `STABILIZING` sub-phases are stubs that
+> immediately fall through to `READY_TO_MERGE`. Wave 4 fills them in.
+
+Every transition the supervisor performs follows the **persist → emit → act** ordering documented in
+[ADR-015](adrs/015-supervisor-persist-then-emit-then-act.md): the new state is durably on disk
+_before_ it appears on the event bus, and the side effect attached to the destination state runs
+only after both. This keeps a daemon crash mid-transition replayable on the next boot.
 
 The TaskSupervisor walks each issue through this state graph:
 

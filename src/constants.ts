@@ -207,3 +207,44 @@ export const RADIX_DECIMAL = 10;
  * rather than a bare numeric `2`.
  */
 export const HOME_PREFIX = "~/";
+
+/**
+ * Length, in characters, of the random suffix appended to a {@link TaskId}.
+ *
+ * The supervisor mints task ids of the form
+ * `task_<isoDate>_<rand>` where `<rand>` is six lower-case hex
+ * characters. Six characters keep the id readable in logs while leaving
+ * 16,777,216 distinct values per ISO-second — enough that an accidental
+ * collision in a single tick is implausible without coordination.
+ */
+export const TASK_ID_RANDOM_SUFFIX_LENGTH_CHARACTERS = 6;
+
+/**
+ * Number of bytes drawn from `crypto.getRandomValues` to produce a single
+ * task-id suffix.
+ *
+ * Three bytes encode to six hex characters, matching
+ * {@link TASK_ID_RANDOM_SUFFIX_LENGTH_CHARACTERS}. Centralised so the
+ * supervisor's id-mint helper keeps the bytes-to-characters relationship
+ * explicit rather than hard-coding the `3 * 2 = 6` arithmetic at the
+ * call site.
+ */
+export const TASK_ID_RANDOM_SUFFIX_BYTES = 3;
+
+/**
+ * Radix used when projecting `task-id` random bytes into hex characters.
+ *
+ * Hex is base-16; centralising the value makes the
+ * `byte.toString(HEX_RADIX)` call site self-documenting and consistent
+ * with the rule that bare numeric literals do not appear in `src/`.
+ */
+export const HEX_RADIX = 16;
+
+/**
+ * Width, in characters, of a single zero-padded hex byte.
+ *
+ * Each byte rendered with `padStart(HEX_BYTE_WIDTH_CHARACTERS, "0")`
+ * yields a stable two-character pair regardless of value. Pairs with
+ * {@link HEX_RADIX} for the supervisor's id-mint helper.
+ */
+export const HEX_BYTE_WIDTH_CHARACTERS = 2;
