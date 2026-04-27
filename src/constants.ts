@@ -528,3 +528,86 @@ export const HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
  * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/021-merge-modes-failure-classification.md ADR-021}.
  */
 export const HTTP_STATUS_CONFLICT = 409;
+
+/**
+ * Page size used by the App-level GitHub client when walking
+ * `GET /installation/repositories` during the setup wizard.
+ *
+ * GitHub caps a page at 100 for this endpoint; using the documented maximum
+ * minimises the round-trip count for the wizard's one-shot enumeration. The
+ * value is centralised here so neither `src/github/app-client.ts` nor its
+ * pagination tests carry a bare numeric literal, matching the rule at the
+ * top of this file.
+ */
+export const APP_INSTALLATION_REPOSITORIES_PAGE_SIZE = 100;
+
+/**
+ * Defensive upper bound on pages walked by the App-level GitHub client when
+ * paginating `GET /installation/repositories`.
+ *
+ * The realistic ceiling on an installation's repository count is in the
+ * thousands; capping at one thousand pages (= one hundred thousand repos at
+ * {@link APP_INSTALLATION_REPOSITORIES_PAGE_SIZE} per page) protects against
+ * a malformed `total_count` or an API behaviour change driving an unbounded
+ * loop while staying well above every plausible real-world installation. If
+ * the cap is hit without a short page, the client surfaces a
+ * `pagination-overflow` `GitHubAppClientError` rather than silently
+ * truncating the repository list — the wizard should fail loudly so the
+ * developer knows discovery was incomplete.
+ */
+export const APP_INSTALLATION_REPOSITORIES_MAX_PAGES = 1_000;
+
+/**
+ * Page size used by the App-level GitHub client when walking
+ * `GET /app/installations` during the setup wizard.
+ *
+ * GitHub paginates `/app/installations` at a default of thirty entries per
+ * page and accepts up to one hundred via `per_page`. The wizard's discovery
+ * surface assumes an exhaustive list, so we always request the documented
+ * maximum to minimise the round-trip count for Apps installed in many
+ * accounts. Mirrors {@link APP_INSTALLATION_REPOSITORIES_PAGE_SIZE} so both
+ * App-level paginating loops carry the same shape.
+ */
+export const APP_INSTALLATIONS_PAGE_SIZE = 100;
+
+/**
+ * Defensive upper bound on pages walked by the App-level GitHub client when
+ * paginating `GET /app/installations`.
+ *
+ * Mirrors {@link APP_INSTALLATION_REPOSITORIES_MAX_PAGES}: an App with more
+ * than one hundred thousand installations is implausible, but capping the
+ * loop guards against a malformed envelope or an API behaviour change
+ * driving an unbounded walk. If the cap is hit without a short page, the
+ * client surfaces a `pagination-overflow` `GitHubAppClientError` so the
+ * wizard fails loudly rather than presenting a silently-truncated picker.
+ */
+export const APP_INSTALLATIONS_MAX_PAGES = 1_000;
+
+/**
+ * `User-Agent` header sent on every outbound GitHub request, both
+ * installation-scoped (`src/github/client.ts`) and App-scoped
+ * (`src/github/app-client.ts`).
+ *
+ * GitHub recommends every API caller identify itself; centralising the string
+ * here keeps the two client surfaces in sync (a drift would surface in
+ * server-side request logs as two distinct callers and is hard to spot
+ * locally) and matches the project's bare-literal policy at the top of this
+ * file. The value pairs the project name with the package's published
+ * version; bump it when shipping a release.
+ */
+export const GITHUB_CLIENT_USER_AGENT = "makina-github-client/0.1";
+
+/**
+ * Maximum number of `listInstallationRepositories` calls the setup
+ * wizard issues in parallel.
+ *
+ * Each App installation needs its own token-mint + repo-listing call to
+ * project the picker the wizard shows. Sequencing them was visibly slow;
+ * unbounded `Promise.all` could fan out to hundreds of simultaneous
+ * sockets for an App with many installations and risks both local socket
+ * exhaustion and a GitHub-side secondary rate-limit. Eight is the
+ * typical "small async pool" default, fast enough that an App with a
+ * few dozen installations finishes in under a second on a normal
+ * connection while keeping the network and GitHub's rate buckets calm.
+ */
+export const WIZARD_INSTALLATIONS_MAX_PARALLELISM = 8;
