@@ -188,6 +188,14 @@ function scriptHappyPath(rig: SupervisorTestRig): void {
     },
   });
   rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+  // Wave 4 (#16): the stabilize-CI sub-phase polls combined-status until
+  // it crosses out of `pending`. The happy path scripts a single
+  // green-on-first-poll reply so the supervisor walks the timeline
+  // without dispatching the agent for a CI fix.
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: "deadbeefcafe" },
+  });
   rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
 }
 
@@ -537,6 +545,13 @@ Deno.test(
         },
       });
       fresh.queueRequestReviewers({ kind: "value", value: undefined });
+      // The manual-merge happy path still runs the stabilize-CI phase
+      // before stopping at READY_TO_MERGE; script a green CI reply so
+      // the phase completes without dispatching the agent.
+      fresh.queueGetCombinedStatus({
+        kind: "value",
+        value: { state: "success", sha: "abcdef" },
+      });
       scriptDraftingRun(rig);
 
       const bus = createEventBus();
@@ -684,6 +699,13 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // Stabilize CI must complete before mergePullRequest fires; script
+      // a green CI on the first poll so the supervisor reaches the
+      // merge step.
+      rig.githubClient.queueGetCombinedStatus({
+        kind: "value",
+        value: { state: "success", sha: "13" },
+      });
       rig.githubClient.queueMergePullRequest({
         kind: "error",
         error: new Error("405 Method Not Allowed: not mergeable"),
@@ -752,6 +774,11 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // Stabilize CI: green-on-first-poll for the round-2 happy path.
+      rig.githubClient.queueGetCombinedStatus({
+        kind: "value",
+        value: { state: "success", sha: "abc" },
+      });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       rig.agentRunner.queueRun({ messages: [{ role: "assistant", text: "ok" }] });
 
@@ -825,6 +852,11 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // Stabilize CI: green-on-first-poll for the first run.
+      rig.githubClient.queueGetCombinedStatus({
+        kind: "value",
+        value: { state: "success", sha: "x" },
+      });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       scriptDraftingRun(rig);
 
@@ -884,6 +916,11 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // Stabilize CI: green-on-first-poll for the round-2 happy path.
+      rig.githubClient.queueGetCombinedStatus({
+        kind: "value",
+        value: { state: "success", sha: "y" },
+      });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       rig.agentRunner.queueRun({
         messages: [{ role: "assistant", text: "round 2" }],

@@ -5,12 +5,17 @@
  * Wave 3 (#12) ships the skeleton: the supervisor drives a task through
  * `INIT → CLONING_WORKTREE → DRAFTING → COMMITTING → PUSHING → PR_OPEN
  *  → STABILIZING → READY_TO_MERGE → MERGED | NEEDS_HUMAN | FAILED`.
- * The three `STABILIZING` sub-phases (`REBASE`, `CI`, `CONVERSATIONS`)
- * are stubbed: each one publishes its `state-changed` event with the
- * matching {@link StabilizePhase} on the bus so observers see the
- * expected timeline, and the loop exits to `READY_TO_MERGE`
- * immediately. Wave 4 (#15+) replaces those stubs with the real
- * stabilize logic.
+ * Wave 4 fills in the `STABILIZING` sub-phases:
+ *
+ *  - **CI** (#16, this PR) — polls `getCombinedStatus` + `listCheckRuns`
+ *    at the configured cadence; on red, fetches failing-job logs trimmed
+ *    to {@link STABILIZE_CI_LOG_BUDGET_BYTES}, dispatches the agent, and
+ *    restarts polling on the post-fix head SHA. Bounded by
+ *    {@link MAX_TASK_ITERATIONS} → `NEEDS_HUMAN` on exhaustion.
+ *  - **REBASE** (#15) and **CONVERSATIONS** (#17) — still stubs that
+ *    publish their `state-changed` event so observers see the expected
+ *    timeline, then yield back to the loop. Sibling agents replace them
+ *    in their own PRs.
  *
  * **Invariants the FSM upholds.**
  *
@@ -57,6 +62,10 @@ import { getLogger } from "@std/log";
 import {
   HEX_BYTE_WIDTH_CHARACTERS,
   HEX_RADIX,
+  MAX_TASK_ITERATIONS,
+  POLL_INTERVAL_MILLISECONDS,
+  STABILIZE_CI_LOG_BUDGET_BYTES,
+  STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS,
   TASK_ID_RANDOM_SUFFIX_BYTES,
   TASK_ID_RANDOM_SUFFIX_LENGTH_CHARACTERS,
 } from "../constants.ts";
@@ -76,6 +85,8 @@ import {
   type TaskId,
   type TaskState,
 } from "../types.ts";
+import type { CheckRunSummary, StabilizeGitHubClient } from "../github/client.ts";
+import { createPoller, PollerError, type PollerImpl } from "./poller.ts";
 import type { WorktreeManagerImpl } from "./worktree-manager.ts";
 
 /**
@@ -193,6 +204,56 @@ export interface TaskSupervisorOptions {
    * `crypto.getRandomValues`.
    */
   readonly randomSource?: SupervisorRandomSource;
+  /**
+   * Optional poller used by the stabilize loop's CI phase to space its
+   * `getCombinedStatus` / `listCheckRuns` reads. Defaults to a fresh
+   * {@link createPoller} instance with the standard cadence-and-backoff
+   * defaults; tests inject a recording poller (or a poller backed by a
+   * synthetic clock) so cadence assertions are deterministic.
+   *
+   * The supervisor binds to the wider {@link PollerImpl} surface so the
+   * CI phase can pass an `onError` callback (the W1 {@link Poller}
+   * contract is intentionally narrower; {@link PollerImpl} extends it
+   * additively per ADR-017).
+   */
+  readonly poller?: PollerImpl;
+  /**
+   * Optional poll cadence for the stabilize-CI loop, in milliseconds.
+   * Defaults to {@link POLL_INTERVAL_MILLISECONDS}. Tests pin this to a
+   * small value so a `green-on-first-poll` timeline does not consume
+   * real wall-clock time even with a real poller.
+   */
+  readonly pollIntervalMilliseconds?: number;
+  /**
+   * Optional upper bound on agent iterations spent inside the stabilize
+   * loop's CI fix loop before the supervisor escalates to
+   * {@link "NEEDS_HUMAN"}. Defaults to {@link MAX_TASK_ITERATIONS}.
+   * The bound is shared across stabilize sub-phases — the rebase phase
+   * and the conversations phase debit the same budget — so a task that
+   * already burned half its iterations on a rebase gets the remainder
+   * for the CI fix loop. The supervisor reads `task.iterationCount` from
+   * persistence so the budget survives a daemon restart.
+   */
+  readonly maxIterations?: number;
+  /**
+   * Optional upper bound on the per-failing-job log excerpt the CI phase
+   * forwards to the agent prompt, in bytes. Defaults to
+   * {@link STABILIZE_CI_LOG_BUDGET_BYTES} (100 KB).
+   */
+  readonly ciLogBudgetBytes?: number;
+  /**
+   * Optional resolver for the head SHA of the per-task branch. Returns
+   * the SHA the CI phase should poll. Called once on entry to the CI
+   * phase and once after each agent fix iteration so the supervisor
+   * polls CI for the **new** head commit. Defaults to a stub that
+   * returns the SHA captured from the PR-open response and never
+   * advances; production wires this to a `git rev-parse` against the
+   * worktree.
+   *
+   * @param task The task whose branch head should be resolved.
+   * @returns The current head SHA of `task.branchName`.
+   */
+  readonly resolveHeadSha?: (task: Task) => Promise<string>;
 }
 
 /**
@@ -348,6 +409,11 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
   const random: SupervisorRandomSource = opts.randomSource ?? defaultRandomSource();
   const cloneUrlFor = opts.cloneUrlFor ??
     ((repo: RepoFullName) => `https://github.com/${repo}.git`);
+  const poller: PollerImpl = opts.poller ?? createPoller();
+  const pollIntervalMilliseconds = opts.pollIntervalMilliseconds ??
+    POLL_INTERVAL_MILLISECONDS;
+  const maxIterations = opts.maxIterations ?? MAX_TASK_ITERATIONS;
+  const ciLogBudgetBytes = opts.ciLogBudgetBytes ?? STABILIZE_CI_LOG_BUDGET_BYTES;
 
   /**
    * In-memory task table. Wave 3's daemon hydrates this on boot via
@@ -357,6 +423,33 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    * inspect mid-flight transitions.
    */
   const tasks = new Map<TaskId, Task>();
+
+  /**
+   * Per-task head SHA captured from the {@link PullRequestDetails}
+   * returned by `createPullRequest`. The stabilize-CI phase polls this
+   * SHA until CI flips green; after each agent fix iteration the
+   * resolver below re-reads the head SHA so we poll for the new commit.
+   *
+   * Not persisted: a daemon restart re-resolves the head SHA on the way
+   * back into the CI phase via `resolveHeadSha`. Keeping this off-disk
+   * keeps the {@link Task} record stable for cross-wave consumers.
+   */
+  const headShasByTaskId = new Map<TaskId, string>();
+
+  const resolveHeadSha = opts.resolveHeadSha ?? defaultResolveHeadSha;
+
+  function defaultResolveHeadSha(task: Task): Promise<string> {
+    const sha = headShasByTaskId.get(task.id);
+    if (sha === undefined) {
+      return Promise.reject(
+        new Error(
+          `supervisor: no head SHA captured for task ${task.id}; ` +
+            "production wiring must inject `resolveHeadSha` before stabilize CI runs.",
+        ),
+      );
+    }
+    return Promise.resolve(sha);
+  }
 
   /**
    * Run `mutate(prev)` to produce the next task record, persist it,
@@ -615,6 +708,12 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       );
       return await fail(task, error, "create-pull-request");
     }
+    // Capture the head SHA so the stabilize-CI phase can poll the right
+    // commit. The map is not persisted: a daemon restart re-enters the
+    // FSM at `PR_OPEN` and the production wiring's `resolveHeadSha`
+    // (defaulting to `git rev-parse HEAD` against the worktree) will
+    // re-source the SHA on the next CI tick.
+    headShasByTaskId.set(task.id, pullRequest.headSha);
     return await transition(
       task,
       { state: "PR_OPEN", prNumber: pullRequest.number },
@@ -661,21 +760,372 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
   }
 
   async function runStabilizing(task: Task): Promise<Task> {
-    // Stub bodies for the three stabilize sub-phases. Each one walks
-    // through `REBASE → CI → CONVERSATIONS` so observers see the
-    // expected timeline; Wave 4 fills in the per-phase logic.
-    let current = task;
-    for (const phase of ["REBASE", "CI", "CONVERSATIONS"] as const) {
-      current = await transition(
-        current,
-        { state: "STABILIZING", stabilizePhase: phase },
-        `stabilize phase ${phase} (stub)`,
-      );
-    }
+    // Wave 4 splits the stabilize loop into three phases that run in
+    // strict order: rebase → CI → conversations. The CI phase is the
+    // only one fully implemented in this PR (issue #16). The rebase
+    // (#15) and conversations (#17) phases stay as stubs so the
+    // event-bus timeline is observable — the supervisor publishes the
+    // `STABILIZING / <phase>` transition for each, and the next phase
+    // takes over without doing real work yet.
+    let current = await runStabilizeRebase(task);
+    if (isTerminal(current.state)) return current;
+    current = await runStabilizeCi(current);
+    if (isTerminal(current.state)) return current;
+    current = await runStabilizeConversations(current);
+    if (isTerminal(current.state)) return current;
     return await transition(
       current,
       { state: "READY_TO_MERGE" },
       "stabilize loop settled",
+    );
+  }
+
+  /**
+   * Stub body for the rebase sub-phase (#15 replaces this). Records the
+   * phase transition on the bus so observers see the expected timeline,
+   * then yields to the next phase.
+   */
+  async function runStabilizeRebase(task: Task): Promise<Task> {
+    return await transition(
+      task,
+      { state: "STABILIZING", stabilizePhase: "REBASE" },
+      "stabilize phase REBASE (stub)",
+    );
+  }
+
+  /**
+   * Stub body for the conversations sub-phase (#17 replaces this).
+   * Records the phase transition on the bus so observers see the
+   * expected timeline, then yields back to {@link runStabilizing}.
+   */
+  async function runStabilizeConversations(task: Task): Promise<Task> {
+    return await transition(
+      task,
+      { state: "STABILIZING", stabilizePhase: "CONVERSATIONS" },
+      "stabilize phase CONVERSATIONS (stub)",
+    );
+  }
+
+  /**
+   * Stabilize-loop CI sub-phase (#16).
+   *
+   * Polls `getCombinedStatus` + `listCheckRuns` for the per-task head
+   * SHA at {@link pollIntervalMilliseconds} cadence:
+   *
+   *  - **Pending**: keep polling. Each poll publishes a `github-call`
+   *    event so observers (the TUI, integration tests) see the cadence.
+   *  - **Green** (`success`): phase complete; return.
+   *  - **Red** (`failure` / `error`): collect the failing job ids,
+   *    fetch their logs trimmed to {@link ciLogBudgetBytes} (line
+   *    boundary preferred, byte boundary fallback), dispatch the agent
+   *    with the failing-job summary, advance `iterationCount`, restart
+   *    polling on the new head SHA. Bounded by {@link maxIterations}; on
+   *    exhaustion the task transitions to {@link "NEEDS_HUMAN"}.
+   */
+  async function runStabilizeCi(task: Task): Promise<Task> {
+    let current = await transition(
+      task,
+      { state: "STABILIZING", stabilizePhase: "CI" },
+      "stabilize phase CI",
+    );
+    if (current.worktreePath === undefined) {
+      return await fail(
+        current,
+        new Error("STABILIZING/CI entered without a worktree path"),
+        "ci-precondition",
+      );
+    }
+    const stabilizeClient = asStabilizeClient(opts.githubClient);
+    if (stabilizeClient === undefined) {
+      return await fail(
+        current,
+        new Error(
+          "STABILIZING/CI requires a StabilizeGitHubClient (listCheckRuns / getCheckRunLogs); " +
+            "supervisor was constructed with a plain GitHubClient",
+        ),
+        "ci-precondition",
+      );
+    }
+
+    while (true) {
+      let headSha: string;
+      try {
+        headSha = await resolveHeadSha(current);
+      } catch (error) {
+        logger.warn(
+          `supervisor: resolveHeadSha failed for task ${current.id}: ${errorMessage(error)}`,
+        );
+        return await fail(current, error, "ci-resolve-head");
+      }
+
+      const outcome = await pollCiOnce(
+        current,
+        stabilizeClient,
+        headSha,
+      );
+      if (outcome.kind === "fatal") {
+        return await fail(current, outcome.error, "ci-poll");
+      }
+      if (outcome.kind === "green") {
+        return current;
+      }
+
+      // Red: budget check before we spin the agent.
+      if (current.iterationCount >= maxIterations) {
+        publish(opts.eventBus, {
+          taskId: current.id,
+          atIso: clock.nowIso(),
+          kind: "log",
+          data: {
+            level: "error",
+            message:
+              `stabilize CI exhausted ${maxIterations} agent iterations on perpetually-red CI`,
+          },
+        });
+        return await transition(
+          current,
+          {
+            state: "NEEDS_HUMAN",
+            terminalReason: `ci-perpetually-red: agent iteration cap (${maxIterations}) exhausted`,
+          },
+          "stabilize CI exhausted iteration budget",
+        );
+      }
+
+      try {
+        current = await dispatchCiAgent(
+          current,
+          stabilizeClient,
+          headSha,
+          outcome.failingChecks,
+        );
+      } catch (error) {
+        logger.warn(
+          `supervisor: stabilize CI agent dispatch failed for task ${current.id}: ${
+            errorMessage(error)
+          }`,
+        );
+        return await fail(current, error, "ci-agent");
+      }
+      // Loop: re-resolve the head SHA (now pointing at the agent's fix
+      // commit) and poll again.
+    }
+  }
+
+  /**
+   * Drive a single CI polling episode for `headSha` to completion.
+   *
+   * Returns once the combined status crosses out of `pending`. The
+   * poller spaces successful ticks by `pollIntervalMilliseconds`;
+   * each tick publishes a `github-call` event so observers see the
+   * cadence. The function resolves with one of:
+   *
+   *  - `{ kind: "green" }` — `state === "success"`.
+   *  - `{ kind: "red", failingChecks }` — `state === "failure"` or
+   *    `"error"`.
+   *  - `{ kind: "fatal", error }` — the fetcher hit a non-retryable
+   *    error (a {@link PollerError} of kind `"fatal"` or any synchronous
+   *    throw the poller cannot absorb).
+   */
+  async function pollCiOnce(
+    task: Task,
+    client: StabilizeGitHubClient,
+    headSha: string,
+  ): Promise<TerminalCiPollOutcome> {
+    return await new Promise<TerminalCiPollOutcome>((resolve) => {
+      let settled = false;
+      let consecutiveErrors = 0;
+      const handle = poller.poll<CiPollOutcome>({
+        taskId: task.id,
+        intervalMilliseconds: pollIntervalMilliseconds,
+        fetcher: async (): Promise<CiPollOutcome> => {
+          const status = await client.getCombinedStatus(task.repo, headSha);
+          publish(opts.eventBus, {
+            taskId: task.id,
+            atIso: clock.nowIso(),
+            kind: "github-call",
+            data: {
+              method: "GET",
+              endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/status",
+            },
+          });
+          if (status.state === "pending") {
+            return { kind: "pending" };
+          }
+          if (status.state === "success") {
+            return { kind: "green" };
+          }
+          // failure / error: read the per-check breakdown so we can
+          // surface failing job ids to the caller.
+          const checkRuns = await client.listCheckRuns(task.repo, headSha);
+          publish(opts.eventBus, {
+            taskId: task.id,
+            atIso: clock.nowIso(),
+            kind: "github-call",
+            data: {
+              method: "GET",
+              endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/check-runs",
+            },
+          });
+          return {
+            kind: "red",
+            failingChecks: checkRuns.filter(isFailedCheckRun),
+          };
+        },
+        onResult: (result) => {
+          if (settled) return;
+          // Any successful fetcher resolution clears the error budget —
+          // the poller's own bookkeeping does the same on its
+          // exponential-backoff series, but we mirror it here so the
+          // CI-level threshold below tracks *consecutive* fetcher
+          // failures, not lifetime ones.
+          consecutiveErrors = 0;
+          if (result.kind === "pending") {
+            return; // keep polling
+          }
+          if (result.kind === "fatal") {
+            // The fetcher itself does not produce fatal outcomes (those
+            // arrive through `onError`); the discriminant exists so the
+            // caller can surface a uniform shape.
+            return;
+          }
+          settled = true;
+          handle.cancel();
+          resolve(result);
+        },
+        onError: (error: unknown) => {
+          if (settled) return;
+          if (error instanceof PollerError && error.kind === "fatal") {
+            settled = true;
+            handle.cancel();
+            resolve({ kind: "fatal", error });
+            return;
+          }
+          // Transient errors and rate-limit waits stay inside the poll
+          // loop — the poller's exponential backoff handles them. We
+          // keep an additional CI-level counter that bails out if the
+          // fetcher rejects `STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS`
+          // times in a row; without it, an oblivious test (or a real
+          // outage that flips every retry into a rejection) would loop
+          // forever even after the poller's backoff saturates at the
+          // upper bound.
+          consecutiveErrors += 1;
+          if (consecutiveErrors >= STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS) {
+            settled = true;
+            handle.cancel();
+            resolve({ kind: "fatal", error });
+          }
+        },
+      });
+    });
+  }
+
+  /**
+   * Build the agent prompt from `failingChecks`, run the agent, and
+   * return the post-iteration {@link Task} record. The transition into
+   * the agent run uses the task's existing state (`STABILIZING / CI`);
+   * we only bump `iterationCount` so the budget check at the top of the
+   * outer loop can detect exhaustion.
+   */
+  async function dispatchCiAgent(
+    task: Task,
+    client: StabilizeGitHubClient,
+    headSha: string,
+    failingChecks: readonly CheckRunSummary[],
+  ): Promise<Task> {
+    if (task.worktreePath === undefined) {
+      throw new Error("dispatchCiAgent: task has no worktreePath");
+    }
+    const logsByJob = new Map<number, string>();
+    for (const check of failingChecks) {
+      try {
+        const bytes = await client.getCheckRunLogs(task.repo, check.id);
+        publish(opts.eventBus, {
+          taskId: task.id,
+          atIso: clock.nowIso(),
+          kind: "github-call",
+          data: {
+            method: "GET",
+            endpoint: "GET /repos/{owner}/{repo}/check-runs/{check_run_id}/logs",
+          },
+        });
+        logsByJob.set(check.id, trimLogToBudget(decodeUtf8Lossy(bytes), ciLogBudgetBytes));
+      } catch (error) {
+        // Don't abort the whole CI iteration when a single log fetch
+        // fails — surface the failure on the bus and replace the
+        // excerpt with a placeholder so the agent still has the job
+        // name and url.
+        publish(opts.eventBus, {
+          taskId: task.id,
+          atIso: clock.nowIso(),
+          kind: "log",
+          data: {
+            level: "warn",
+            message: `stabilize CI: log fetch failed for check ${check.id} (${check.name}): ${
+              errorMessage(error)
+            }`,
+          },
+        });
+        logsByJob.set(check.id, `[log fetch failed: ${errorMessage(error)}]`);
+      }
+    }
+
+    const prompt = buildCiAgentPrompt({
+      issueNumber: task.issueNumber,
+      headSha,
+      failingChecks,
+      logsByJob,
+    });
+
+    let lastSessionId: string | undefined = task.sessionId;
+    const runArgs: {
+      taskId: TaskId;
+      worktreePath: string;
+      prompt: string;
+      model: string;
+      sessionId?: string;
+    } = task.sessionId === undefined
+      ? {
+        taskId: task.id,
+        worktreePath: task.worktreePath,
+        prompt,
+        model: task.model,
+      }
+      : {
+        taskId: task.id,
+        worktreePath: task.worktreePath,
+        prompt,
+        model: task.model,
+        sessionId: task.sessionId,
+      };
+    for await (const message of opts.agentRunner.runAgent(runArgs)) {
+      publish(opts.eventBus, {
+        taskId: task.id,
+        atIso: clock.nowIso(),
+        kind: "agent-message",
+        data: { role: message.role, text: message.text },
+      });
+      const candidate = (message as { sessionId?: string }).sessionId;
+      if (candidate !== undefined) {
+        lastSessionId = candidate;
+      }
+    }
+
+    return await transition(
+      task,
+      lastSessionId === undefined
+        ? {
+          state: "STABILIZING",
+          stabilizePhase: "CI",
+          iterationCount: task.iterationCount + 1,
+        }
+        : {
+          state: "STABILIZING",
+          stabilizePhase: "CI",
+          iterationCount: task.iterationCount + 1,
+          sessionId: lastSessionId,
+        },
+      `stabilize CI agent iteration ${task.iterationCount + 1}`,
     );
   }
 
@@ -1000,4 +1450,219 @@ function defaultRandomSource(): SupervisorRandomSource {
       crypto.getRandomValues(bytes);
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Stabilize CI helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Discriminated union returned by a single tick of the stabilize-CI
+ * fetcher. `pending` keeps the poll loop running; the other variants
+ * settle the {@link pollCiOnce} promise.
+ */
+export type CiPollOutcome =
+  | { readonly kind: "pending" }
+  | { readonly kind: "green" }
+  | {
+    readonly kind: "red";
+    /** Failing per-check entries collected from `listCheckRuns`. */
+    readonly failingChecks: readonly CheckRunSummary[];
+  }
+  | {
+    readonly kind: "fatal";
+    /** The fatal error that exited the poller. */
+    readonly error: unknown;
+  };
+
+/**
+ * Subset of {@link CiPollOutcome} that {@link pollCiOnce} resolves
+ * with: `pending` is filtered out internally because the poll loop
+ * continues on pending ticks rather than returning to the caller.
+ */
+export type TerminalCiPollOutcome = Exclude<CiPollOutcome, { kind: "pending" }>;
+
+/**
+ * Narrow `client` to the {@link StabilizeGitHubClient} extension if it
+ * implements the four CI-phase methods, otherwise return `undefined`.
+ *
+ * The supervisor's W1 contract is the narrower {@link GitHubClient};
+ * the stabilize phases need the additive surface. We feature-detect
+ * rather than re-typing the constructor so consumers passing the
+ * production {@link GitHubClientImpl} (which implements both surfaces)
+ * see the wider methods without rewiring, and tests passing the
+ * {@link InMemoryGitHubClient} double get the same behavior.
+ */
+function asStabilizeClient(
+  client: GitHubClient,
+): StabilizeGitHubClient | undefined {
+  const candidate = client as Partial<StabilizeGitHubClient>;
+  if (
+    typeof candidate.listCheckRuns === "function" &&
+    typeof candidate.getCheckRunLogs === "function" &&
+    typeof candidate.listReviews === "function" &&
+    typeof candidate.listReviewComments === "function"
+  ) {
+    return client as StabilizeGitHubClient;
+  }
+  return undefined;
+}
+
+/**
+ * Predicate selecting CI check runs the supervisor must escalate to the
+ * agent: completed runs whose `conclusion` is one of the failure-class
+ * values. Skipped, neutral, and stale runs are not failures; queued and
+ * in-progress runs are not yet completed and would have kept the
+ * combined-status `pending`.
+ */
+function isFailedCheckRun(check: CheckRunSummary): boolean {
+  if (check.status !== "completed") return false;
+  return (
+    check.conclusion === "failure" ||
+    check.conclusion === "timed_out" ||
+    check.conclusion === "action_required" ||
+    check.conclusion === "cancelled"
+  );
+}
+
+/**
+ * Decode `bytes` as UTF-8, replacing malformed sequences with U+FFFD.
+ *
+ * GitHub returns check-run logs as a ZIP whose extracted entries are
+ * UTF-8 text, but real-world logs occasionally contain stray bytes
+ * (terminal escapes, cropped surrogate pairs). The lossy decode keeps
+ * the supervisor robust against pathological inputs without requiring
+ * a streaming UTF-8 validator.
+ *
+ * @param bytes Raw log bytes.
+ * @returns UTF-8 string with malformed sequences replaced.
+ */
+function decodeUtf8Lossy(bytes: Uint8Array): string {
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+/**
+ * Trim `text` to fit within `budgetBytes` UTF-8 bytes, preferring a
+ * line boundary so the truncation is readable.
+ *
+ * Strategy:
+ *
+ *  1. If the encoded length already fits within `budgetBytes`, return
+ *     `text` unchanged.
+ *  2. Otherwise, walk the suffix backwards in line-sized chunks until
+ *     the remaining tail fits. The CI phase wants the *trailing* part
+ *     of the log (the lines around the failed assertion) so we keep the
+ *     **end** of the input.
+ *  3. If a single trailing line exceeds `budgetBytes` (e.g. a
+ *     megabyte-long stack-trace line), fall back to a hard byte slice
+ *     against the encoded form and a UTF-8 decode of the tail.
+ *  4. Prepend a marker line so downstream readers (the agent prompt,
+ *     log viewers) can tell at a glance that the excerpt is truncated.
+ *
+ * @param text Source text. Long inputs are sliced from the **end**.
+ * @param budgetBytes Maximum UTF-8 byte budget (must be a positive
+ *   finite integer; non-positive values are clamped to zero, in which
+ *   case the marker line alone is returned).
+ * @returns Trimmed text with a leading marker.
+ *
+ * @example
+ * ```ts
+ * const trimmed = trimLogToBudget(rawLog, 100 * 1024);
+ * // "[…truncated; showing trailing 102400 bytes…]\n…"
+ * ```
+ */
+export function trimLogToBudget(text: string, budgetBytes: number): string {
+  const safeBudget = Number.isFinite(budgetBytes) && budgetBytes > 0 ? Math.floor(budgetBytes) : 0;
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(text);
+  if (encoded.byteLength <= safeBudget) {
+    return text;
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  // Try to keep whole trailing lines first — split on `\n`, walk
+  // backwards, and concatenate until we run out of budget.
+  const lines = text.split("\n");
+  let remaining = safeBudget;
+  const tail: string[] = [];
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i] ?? "";
+    // The terminator costs one byte (UTF-8 `\n`) for every line we
+    // re-join, except for the last one which we already account for in
+    // the marker prepending below. Compute the byte cost of this line
+    // in isolation; `encoder.encode(line)` has no trailing terminator.
+    const lineBytes = encoder.encode(line).byteLength + (tail.length === 0 ? 0 : 1);
+    if (lineBytes > remaining) {
+      break;
+    }
+    remaining -= lineBytes;
+    tail.unshift(line);
+  }
+  const marker = `[…truncated; showing trailing ${safeBudget} bytes…]`;
+  if (tail.length > 0) {
+    return `${marker}\n${tail.join("\n")}`;
+  }
+  // Pathological case: the trailing line alone exceeds the budget. Hard
+  // byte slice against the UTF-8 encoded form and decode the tail.
+  if (safeBudget === 0) {
+    return marker;
+  }
+  const sliceStart = Math.max(0, encoded.byteLength - safeBudget);
+  const tailBytes = encoded.subarray(sliceStart);
+  return `${marker}\n${decoder.decode(tailBytes)}`;
+}
+
+/**
+ * Build the agent prompt for a stabilize-CI fix iteration.
+ *
+ * The prompt opens with the issue context, lists every failing check
+ * with its name and url, and embeds each job's trimmed log excerpt
+ * inside a fenced code block. The shape is asserted by the unit tests
+ * so any drift is caught before the model sees it.
+ *
+ * Exported so tests can compare against the literal prompt.
+ *
+ * @param args Prompt inputs.
+ * @returns The prompt text.
+ *
+ * @example
+ * ```ts
+ * const prompt = buildCiAgentPrompt({
+ *   issueNumber: makeIssueNumber(42),
+ *   headSha: "deadbeefcafe",
+ *   failingChecks: [{ id: 1, name: "build", status: "completed", conclusion: "failure", htmlUrl: "https://…" }],
+ *   logsByJob: new Map([[1, "expected 200, got 500"]]),
+ * });
+ * ```
+ */
+export function buildCiAgentPrompt(args: {
+  readonly issueNumber: IssueNumber;
+  readonly headSha: string;
+  readonly failingChecks: readonly CheckRunSummary[];
+  readonly logsByJob: ReadonlyMap<number, string>;
+}): string {
+  const header = [
+    `# Stabilize CI fix for issue #${args.issueNumber}`,
+    "",
+    `CI failed against commit \`${args.headSha}\` on this PR. Read the failing-job`,
+    "logs below, identify the root cause, fix it in the worktree, and commit",
+    "the fix. The supervisor will push and re-run CI on the new commit.",
+    "",
+    `## Failing checks (${args.failingChecks.length})`,
+    "",
+  ];
+  const summary = args.failingChecks.map((check) => {
+    const conclusion = check.conclusion ?? "unknown";
+    return `- **${check.name}** (id=${check.id}, conclusion=\`${conclusion}\`) — ${check.htmlUrl}`;
+  });
+  const sections: string[] = [];
+  for (const check of args.failingChecks) {
+    const log = args.logsByJob.get(check.id) ?? "[no log captured]";
+    sections.push("");
+    sections.push(`### Logs — ${check.name} (id=${check.id})`);
+    sections.push("");
+    sections.push("```");
+    sections.push(log);
+    sections.push("```");
+  }
+  return [...header, ...summary, ...sections].join("\n");
 }

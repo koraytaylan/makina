@@ -1,7 +1,10 @@
 # Lifecycle
 
-> Wave 3 ships the supervisor skeleton (#12); the three `STABILIZING` sub-phases are stubs that
-> immediately fall through to `READY_TO_MERGE`. Wave 4 fills them in.
+> Wave 3 ships the supervisor skeleton (#12); Wave 4 fills in the `STABILIZING` sub-phases. Issue
+> #16 implements the **CI** sub-phase end-to-end (poll combined-status, fetch failing-job logs
+> trimmed to `STABILIZE_CI_LOG_BUDGET_BYTES`, dispatch the agent, restart on the new commit, bound
+> by `MAX_TASK_ITERATIONS` → `NEEDS_HUMAN`); the **rebase** (#15) and **conversations** (#17) phases
+> remain stubs that publish their `state-changed` event and yield back to the loop.
 
 Every transition the supervisor performs follows the **persist → emit → act** ordering documented in
 [ADR-016](adrs/016-supervisor-persist-then-emit-then-act.md): the new state is durably on disk
