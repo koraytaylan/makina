@@ -48,3 +48,30 @@ Consumers do not import zod directly: `src/ipc/protocol.ts` exposes typed interf
 `parseEnvelope(raw): ParseEnvelopeResult` function; the same idiom in `src/config/schema.ts` exposes
 `parseConfig`. This keeps the public API zod-free so `deno doc --lint` reflects the contract, not
 the validator implementation.
+
+## TUI client (W2)
+
+`src/tui/ipc-client.ts` exports a `DaemonClient` interface plus a `SocketDaemonClient` that opens a
+Unix-domain socket via `Deno.connect({ transport: "unix" })`, encodes outgoing envelopes through
+`src/ipc/codec.ts`, and decodes pushed envelopes back into typed values. Reply correlation is by
+envelope id; pushed `event` envelopes fan out through `subscribeEvents`. The interface surface
+mirrors `tests/helpers/in_memory_daemon_client.ts` so consumers can swap the real client for the
+in-memory double in tests with no other change.
+
+`src/tui/hooks/useDaemonConnection.ts` wraps the client in a React hook that exposes
+`{ status, lastError, send, subscribe, connect, disconnect }` and walks the lifecycle
+`idle → connecting → connected → disconnected | error`. The hook is transport-agnostic: a client
+without `connect`/`close` methods (the in-memory double) starts directly in `connected`.
+
+The Wave-2 shell is intentionally read-only. Wave 3 wires the command palette and task switcher;
+Wave 3 also turns the focused-task id into a real selection driven by the task-list component.
+
+### Ink-on-Deno feasibility verdict (issue #10)
+
+Ink 5.2 renders cleanly under Deno 2.7 with `npm:ink`/`npm:react` specifiers. Yoga's WASM layer
+loads, the default `process.stdout`/`process.stdin` adapters provided by Deno's Node compatibility
+shim work as Ink expects, and `signal-exit`'s 13 signal listeners are released on `unmount()`. The
+ADR-001 risk is closed in favor of the original Deno-native plan; ADR-010 (Node-side Ink subprocess
+fallback) was not invoked. The single test-side caveat is that the Deno test sanitizer is strict
+about signal-listener leaks during interleaved Ink renders, so the App-level snapshot tests opt out
+of `sanitizeOps`/`sanitizeResources` (component-level tests keep both on).

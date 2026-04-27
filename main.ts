@@ -1,13 +1,17 @@
 /**
  * makina entry point.
  *
- * Argv-dispatch shell. Today this just exposes the `--version` flag so the
- * release pipeline (and the `build:smoke` CI step) can prove that a compiled
- * binary starts. The real subcommands (`daemon`, `setup`, default TUI) are
- * wired in by the Wave 2+ feature branches; this file is the only entrypoint
- * the eventual `deno compile` target produces, and it imports the version
- * string from `src/constants.ts` so both this stub and any future code share
- * a single source of truth.
+ * Argv-dispatch shell. The release pipeline (and the `build:smoke` CI step)
+ * exercises the `--version` flag. The real subcommands wire in as their
+ * Wave 2 branches land:
+ *
+ * - `daemon` — long-running supervisor (#9), already on develop.
+ * - `setup` — first-run GitHub-App configuration wizard (#3), still in
+ *   review on `feature/w2-config-loader`. Until that lands, the
+ *   subcommand prints a notice instead of falling through to the TUI.
+ * - default → launch the Ink TUI (#10).
+ *
+ * The version constant is the single source of truth in `src/constants.ts`.
  */
 
 import { MAKINA_VERSION } from "./src/constants.ts";
@@ -18,7 +22,9 @@ if (Deno.args.includes("--version")) {
   Deno.exit(0);
 }
 
-if (Deno.args[0] === "daemon") {
+const subcommand = Deno.args[0];
+
+if (subcommand === "daemon") {
   // Defensive wiring for the Wave 2 daemon subcommand.
   //
   // The real config loader (#3) and EventBus (#8) may or may not be on
@@ -100,12 +106,15 @@ if (Deno.args[0] === "daemon") {
   };
   Deno.addSignalListener("SIGINT", shutdown);
   Deno.addSignalListener("SIGTERM", shutdown);
+} else if (subcommand === "setup") {
+  // Owned by the `feature/w2-config-loader` branch (#3); still in review.
+  // Until it merges, the subcommand prints a notice instead of falling
+  // through to the TUI launch path.
+  console.log("`setup` subcommand is not yet wired on develop (tracked in #3).");
+  Deno.exit(0);
 } else {
-  console.log("makina — agentic GitHub issue resolver");
-  console.log("");
-  console.log("Wave 1 skeleton. Most subcommands are not yet implemented.");
-  console.log("Run `makina --version` to see the version.");
-  console.log("See https://github.com/koraytaylan/makina for status.");
+  // Default branch → launch the Ink-based TUI.
+  await import("./src/tui/App.tsx").then((module) => module.launch());
 }
 
 /**

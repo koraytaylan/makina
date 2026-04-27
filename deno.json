@@ -2,6 +2,7 @@
   "compilerOptions": {
     "jsx": "react-jsx",
     "jsxImportSource": "npm:react@18",
+    "jsxImportSourceTypes": "npm:@types/react@18",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
