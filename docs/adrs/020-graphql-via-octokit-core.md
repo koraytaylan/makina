@@ -1,4 +1,4 @@
-# ADR-019: GraphQL via `@octokit/core`, not a separate `@octokit/graphql` dependency
+# ADR-020: GraphQL via `@octokit/core`, not a separate `@octokit/graphql` dependency
 
 ## Status
 

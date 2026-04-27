@@ -13,7 +13,7 @@
  * via the injected {@link PollerImpl}, groups new comments by review
  * thread, dispatches the agent runner, then resolves each thread via
  * GraphQL `resolveReviewThread` and re-requests Copilot review on
- * every push (per ADR-019). REBASE and CI remain stubs that emit a
+ * every push (per ADR-020). REBASE and CI remain stubs that emit a
  * single `state-changed` event each so the observable timeline stays
  * `REBASE → CI → CONVERSATIONS`.
  *

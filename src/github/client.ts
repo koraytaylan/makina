@@ -227,7 +227,7 @@ export interface StabilizeGitHubClient extends GitHubClient {
    * the conversations phase obtains it from the threads payload it
    * groups per pull request.
    *
-   * See ADR-019 for the dependency-policy rationale (we route the
+   * See ADR-020 for the dependency-policy rationale (we route the
    * mutation through `@octokit/core`'s built-in `graphql()` rather than
    * pulling in `@octokit/graphql` as a separate dependency).
    *
@@ -321,7 +321,7 @@ const HEADER_RATE_LIMIT_RESET = "x-ratelimit-reset";
  *
  * The mutation only requires the `threadId` input; the response payload
  * is read for shape (so a misconfigured GraphQL endpoint surfaces as a
- * type error rather than silent success). See ADR-019 for the
+ * type error rather than silent success). See ADR-020 for the
  * dependency-policy rationale (no `@octokit/graphql` dependency added).
  */
 const RESOLVE_REVIEW_THREAD_MUTATION = `mutation ResolveReviewThread($threadId: ID!) {
@@ -582,7 +582,7 @@ export class GitHubClientImpl implements StabilizeGitHubClient {
    * `resolveReviewThread` mutation.
    *
    * Routes the mutation through `@octokit/core`'s built-in `graphql()`
-   * helper (see ADR-019) so we do not pull in `@octokit/graphql` as a
+   * helper (see ADR-020) so we do not pull in `@octokit/graphql` as a
    * separate dependency. The token is minted on every call from the
    * same {@link GitHubAuth} strategy the REST methods use, so token
    * rotation is automatic.
