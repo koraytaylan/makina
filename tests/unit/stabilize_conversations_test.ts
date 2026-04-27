@@ -28,7 +28,7 @@
  *    re-process settled threads.
  *  - **Iteration budget exhausted → NEEDS_HUMAN.** A scripted timeline
  *    that always surfaces fresh comments hits the
- *    `maxTaskIterations` cap; the task lands in `NEEDS_HUMAN` and the
+ *    `maxIterations` cap; the task lands in `NEEDS_HUMAN` and the
  *    terminal reason carries the budget number.
  *  - **Pure helpers.** `buildConversationsPrompt`,
  *    `groupCommentsByThread`, `filterNewComments`,
@@ -240,6 +240,14 @@ function scriptIntoStabilize(fixture: Fixture): void {
     } satisfies PullRequestDetails,
   });
   fixture.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+  // CI sub-phase polls combined-status before CONVERSATIONS runs.
+  // The conversations tests exercise the conversations branches, not
+  // the CI loop, so queue a green-on-first-poll so the phase exits
+  // immediately and the supervisor advances to CONVERSATIONS.
+  fixture.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: "deadbeef" },
+  });
   fixture.agentRunner.queueRun({
     messages: [{ role: "assistant", text: "drafting" }],
   });
@@ -515,7 +523,7 @@ Deno.test("buildConversationsPrompt: emits one section per thread with file:line
  * Returns the final task record so tests can assert on terminal state.
  */
 async function drive(fixture: Fixture, options?: {
-  readonly maxTaskIterations?: number;
+  readonly maxIterations?: number;
 }): Promise<Task> {
   // The conversations-phase tests treat the worktree manager as an
   // opaque collaborator — none of the assertions read its surface. The
@@ -544,9 +552,7 @@ async function drive(fixture: Fixture, options?: {
     }),
     pollIntervalMilliseconds: 0,
     gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
-    ...(options?.maxTaskIterations !== undefined
-      ? { maxTaskIterations: options.maxTaskIterations }
-      : {}),
+    ...(options?.maxIterations !== undefined ? { maxIterations: options.maxIterations } : {}),
   });
   return await supervisor.start({
     repo: fixture.repo,
@@ -761,7 +767,7 @@ Deno.test(
 
     // Always-on comments: every poll surfaces a fresh comment newer
     // than the last watermark, so the loop never converges. With
-    // maxTaskIterations=2 the supervisor exhausts the budget on the
+    // maxIterations=2 the supervisor exhausts the budget on the
     // third would-be dispatch.
     function queueRound(timestampSec: number, threadNodeId: string): void {
       fixture.githubClient.queueListReviews({ kind: "value", value: [] });
@@ -790,14 +796,14 @@ Deno.test(
       });
     }
     // DRAFTING already counts as iteration 1; with
-    // `maxTaskIterations: 2`, the conversations loop has budget for
+    // `maxIterations: 2`, the conversations loop has budget for
     // exactly one dispatch.
     queueRound(1, "PRRT_a");
     queuePushFollowup();
     // Second round: budget is exhausted before the dispatch fires.
     queueRound(2, "PRRT_b");
 
-    const finalTask = await drive(fixture, { maxTaskIterations: 2 });
+    const finalTask = await drive(fixture, { maxIterations: 2 });
 
     assertEquals(finalTask.state, "NEEDS_HUMAN");
     assert(finalTask.terminalReason !== undefined);

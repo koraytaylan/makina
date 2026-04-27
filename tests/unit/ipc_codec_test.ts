@@ -140,6 +140,25 @@ const sampleEnvelopes: readonly MessageEnvelope[] = [
     },
   },
   {
+    // Regression: `github-call` events must round-trip the optional
+    // `error` field that `GitHubCallPayload` carries (set by the
+    // stabilize-CI fetcher and `dispatchCiAgent` when a single GitHub
+    // call rejects). The schema is `.strict()`, so an unknown `error`
+    // field used to be rejected at the IPC seam.
+    id: "12b",
+    type: "event",
+    payload: {
+      taskId: "task_abc",
+      atIso: "2026-04-26T12:00:03.500Z",
+      kind: "github-call",
+      data: {
+        method: "GET",
+        endpoint: "/repos/x/y/check-runs/99/logs",
+        error: "404 Not Found",
+      },
+    },
+  },
+  {
     id: "13",
     type: "event",
     payload: {

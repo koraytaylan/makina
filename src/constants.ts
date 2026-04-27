@@ -57,6 +57,41 @@ export const POLL_INTERVAL_MILLISECONDS = 30_000;
 export const MAX_TASK_ITERATIONS = 8;
 
 /**
+ * Default upper bound on the per-failing-job log excerpt the stabilize-loop
+ * CI phase forwards to the agent prompt, in bytes.
+ *
+ * GitHub returns check-run logs as a ZIP that, once unpacked, can run into
+ * tens of megabytes for verbose CI workflows. Forwarding the full blob to
+ * Claude would explode the prompt budget, slow every iteration, and bury
+ * the actually-failing assertion in noise. One hundred kilobytes is
+ * generous for the trailing tail of a typical failing job (the section a
+ * human would scroll back to first) while staying well below the model
+ * context window. Trimming happens at a sensible boundary: prefer line
+ * boundaries inside the budget, fall back to a hard byte slice when a
+ * single line exceeds the cap. Configurable per-supervisor via
+ * `TaskSupervisorOptions.ciLogBudgetBytes`.
+ */
+export const STABILIZE_CI_LOG_BUDGET_BYTES = 100 * 1_024;
+
+/**
+ * Upper bound on consecutive fetcher rejections the stabilize-CI loop
+ * will absorb before surfacing the failure as fatal and exiting the
+ * poll loop.
+ *
+ * The {@link Poller} already applies exponential backoff with jitter and
+ * caps the inter-tick sleep at {@link POLLER_BACKOFF_MAX_MILLISECONDS},
+ * so a single transient outage cannot stall the supervisor — but with
+ * no upper bound the loop spins forever if the fetcher rejects
+ * indefinitely (a permanently-revoked installation token, a malformed
+ * GitHub response on every call, or an under-scripted test double).
+ * Five consecutive rejections means the poller has already burned the
+ * full backoff series; one more retry is unlikely to recover, and
+ * surfacing the failure to the supervisor lets it land the task in
+ * `FAILED` rather than spin.
+ */
+export const STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS = 5;
+
+/**
  * Lead time before a GitHub installation token expires at which the auth
  * cache treats it as stale and refreshes, in milliseconds.
  *
