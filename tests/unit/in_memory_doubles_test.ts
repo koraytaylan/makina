@@ -166,6 +166,81 @@ Deno.test("InMemoryGitHubClient: records every method invocation", async () => {
   assertEquals(calls[3]?.method, "mergePullRequest");
 });
 
+Deno.test("InMemoryGitHubClient: records the stabilize-phase methods (getCombinedStatus + four extensions)", async () => {
+  const client = new InMemoryGitHubClient();
+  const repo = makeRepoFullName("a/b");
+  client.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: "abc" },
+  });
+  client.queueListCheckRuns({
+    kind: "value",
+    value: [
+      {
+        id: 1,
+        name: "build",
+        status: "completed",
+        conclusion: "success",
+        htmlUrl: "https://github.com/check/1",
+      },
+    ],
+  });
+  client.queueGetCheckRunLogs({
+    kind: "value",
+    value: new Uint8Array([1, 2, 3]),
+  });
+  client.queueListReviews({
+    kind: "value",
+    value: [
+      {
+        id: 10,
+        user: "Copilot",
+        state: "COMMENTED",
+        body: "looks ok",
+        submittedAtIso: "2026-04-26T12:00:00Z",
+      },
+    ],
+  });
+  client.queueListReviewComments({
+    kind: "value",
+    value: [
+      {
+        id: 100,
+        pullRequestReviewId: 10,
+        user: "Copilot",
+        body: "Consider renaming.",
+        path: "src/x.ts",
+        line: 12,
+        inReplyToId: null,
+        createdAtIso: "2026-04-26T12:00:00Z",
+      },
+    ],
+  });
+
+  const status = await client.getCombinedStatus(repo, "abc");
+  const runs = await client.listCheckRuns(repo, "abc");
+  const logs = await client.getCheckRunLogs(repo, 1);
+  const reviews = await client.listReviews(repo, makeIssueNumber(7));
+  const comments = await client.listReviewComments(repo, makeIssueNumber(7));
+
+  assertEquals(status.state, "success");
+  assertEquals(runs.length, 1);
+  assertEquals(runs[0]?.name, "build");
+  assertEquals(Array.from(logs), [1, 2, 3]);
+  assertEquals(reviews.length, 1);
+  assertEquals(reviews[0]?.state, "COMMENTED");
+  assertEquals(comments.length, 1);
+  assertEquals(comments[0]?.line, 12);
+
+  const calls = client.recordedCalls();
+  assertEquals(calls.length, 5);
+  assertEquals(calls[0]?.method, "getCombinedStatus");
+  assertEquals(calls[1]?.method, "listCheckRuns");
+  assertEquals(calls[2]?.method, "getCheckRunLogs");
+  assertEquals(calls[3]?.method, "listReviews");
+  assertEquals(calls[4]?.method, "listReviewComments");
+});
+
 // ---------------------------------------------------------------------------
 // InMemoryDaemonClient
 // ---------------------------------------------------------------------------
