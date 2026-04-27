@@ -588,6 +588,19 @@ interface InstallationRepositoriesEnvelope {
  * specific projection failure rather than a generic "TypeError" from a
  * downstream `.map`.
  */
+/**
+ * Render a `non-object` entry's type for an error message in a way
+ * that distinguishes `null` from a real object — `typeof null === "object"`
+ * in JavaScript, which makes "unexpected non-object entry: object" a
+ * misleading diagnostic. Used by the projection helpers below.
+ */
+function describeNonObjectEntry(entry: unknown): string {
+  if (entry === null) {
+    return "null";
+  }
+  return typeof entry;
+}
+
 function projectInstallations(data: unknown): readonly AppInstallation[] {
   if (!Array.isArray(data)) {
     throw new GitHubAppClientError(
@@ -603,7 +616,7 @@ function projectInstallations(data: unknown): readonly AppInstallation[] {
       throw new GitHubAppClientError(
         "projectInstallations",
         new TypeError(
-          `unexpected non-object installation entry: ${typeof entry}`,
+          `unexpected non-object installation entry: ${describeNonObjectEntry(entry)}`,
         ),
       );
     }
@@ -661,7 +674,7 @@ function projectRepositories(
       throw new GitHubAppClientError(
         "projectRepositories",
         new TypeError(
-          `unexpected non-object repository entry: ${typeof entry}`,
+          `unexpected non-object repository entry: ${describeNonObjectEntry(entry)}`,
         ),
       );
     }

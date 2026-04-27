@@ -596,3 +596,18 @@ export const APP_INSTALLATIONS_MAX_PAGES = 1_000;
  * version; bump it when shipping a release.
  */
 export const GITHUB_CLIENT_USER_AGENT = "makina-github-client/0.1";
+
+/**
+ * Maximum number of `listInstallationRepositories` calls the setup
+ * wizard issues in parallel.
+ *
+ * Each App installation needs its own token-mint + repo-listing call to
+ * project the picker the wizard shows. Sequencing them was visibly slow;
+ * unbounded `Promise.all` could fan out to hundreds of simultaneous
+ * sockets for an App with many installations and risks both local socket
+ * exhaustion and a GitHub-side secondary rate-limit. Eight is the
+ * typical "small async pool" default, fast enough that an App with a
+ * few dozen installations finishes in under a second on a normal
+ * connection while keeping the network and GitHub's rate buckets calm.
+ */
+export const WIZARD_INSTALLATIONS_MAX_PARALLELISM = 8;

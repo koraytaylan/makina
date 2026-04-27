@@ -36,6 +36,7 @@
  * @module
  */
 
+import { WIZARD_INSTALLATIONS_MAX_PARALLELISM } from "../constants.ts";
 import {
   type AppClient,
   createAppClient,
@@ -180,32 +181,87 @@ export function createWizardGitHubClient(
       });
 
       const installations = await client.listAppInstallations();
-      // Parallelise the per-installation repo fetch. Each call is
-      // independent (App-scoped pagination per installation id), and
-      // serializing them via a `for-await` made `makina setup`
-      // perceptibly slow for Apps with many installations: N
-      // round-trips at the network's RTT each. `Promise.all` collapses
-      // wall-clock time to the slowest single call, which matters when
-      // the wizard is the user's first impression of the daemon.
-      // GitHub's installation-token rate-limit is per installation, so
-      // parallel calls do not stack against a shared bucket.
+      // Parallelise the per-installation repo fetch with a bounded
+      // worker pool. Each call is independent (App-scoped pagination
+      // per installation id) and GitHub's installation-token rate
+      // limit is per installation, so concurrent calls do not stack
+      // against a shared bucket. Sequencing them via a `for-await` was
+      // perceptibly slow for Apps with many installations; unbounded
+      // `Promise.all` would fan out to hundreds of sockets for a
+      // similarly-large App and risks local socket exhaustion plus a
+      // GitHub-side secondary rate-limit. The
+      // {@link WIZARD_INSTALLATIONS_MAX_PARALLELISM} cap (8) is the
+      // standard async-pool default — fast enough on small Apps,
+      // gentle enough on the network and GitHub's buckets for large
+      // ones.
       //
-      // GitHub's `<owner>/<name>` slug is the wizard's canonical
-      // repo identifier (it is what `config.json` stores as the key
-      // of `github.installations`). Build it once here so the
-      // wizard's downstream logic does not also need to know about
-      // owner/name splitting.
-      return await Promise.all(
-        installations.map(async (installation) => {
+      // GitHub's `<owner>/<name>` slug is the wizard's canonical repo
+      // identifier (it is what `config.json` stores as the key of
+      // `github.installations`). Build it once here so the wizard's
+      // downstream logic does not also need to know about owner/name
+      // splitting.
+      return await mapWithBoundedConcurrency(
+        installations,
+        WIZARD_INSTALLATIONS_MAX_PARALLELISM,
+        async (installation) => {
           const repos = await client.listInstallationRepositories(installation.id);
           return {
             installationId: installation.id,
             repositories: repos.map((repo) => `${repo.owner}/${repo.name}`),
           };
-        }),
+        },
       );
     },
   };
+}
+
+/**
+ * Map every `item` to a `Promise<U>`, running at most `limit` of them in
+ * parallel and preserving the input order in the returned array.
+ *
+ * A small worker-pool implementation. The N workers race for the next
+ * un-claimed index; each worker awaits its task before claiming the
+ * next, so total in-flight promises never exceed `limit`. Any rejection
+ * propagates to the returned promise on the next `await` cycle and
+ * cancels further claims by failing the workers' shared awaits.
+ *
+ * Inlined here rather than added to a shared utility module because
+ * this is the only call site today; once a second consumer appears it
+ * graduates to `src/util/concurrency.ts` (per the project's
+ * minimum-deps + minimum-shared-utility policy).
+ *
+ * @param items Items to map, in order.
+ * @param limit Maximum number of in-flight promises. Must be ? 1.
+ * @param fn Async mapper run for each item.
+ * @returns Mapped values in input order.
+ */
+async function mapWithBoundedConcurrency<T, U>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<U>,
+): Promise<readonly U[]> {
+  const results: U[] = new Array(items.length);
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) {
+        return;
+      }
+      const item = items[index];
+      if (item === undefined) {
+        // `noUncheckedIndexedAccess` requires a guard; in practice this
+        // branch is unreachable because `cursor` only walks `items`.
+        return;
+      }
+      results[index] = await fn(item);
+    }
+  }
+  const workerCount = Math.min(limit, items.length);
+  const workers = new Array(workerCount).fill(null).map(() => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 /**
