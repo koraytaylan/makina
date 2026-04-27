@@ -383,7 +383,17 @@ function parseRepo(tokens: readonly string[]): CommandPayload {
       const repo = parseRepoFullNameArg("/repo add", repoToken);
       // Validate the installation id parses as a positive integer up
       // front. The daemon will re-validate, but a fast local check
-      // gives the user a tight error loop.
+      // gives the user a tight error loop. Reject tokens with trailing
+      // junk before parsing — otherwise `"123oops"` parses as `123`
+      // and silently routes to a different installation.
+      if (!POSITIVE_DECIMAL_INTEGER_PATTERN.test(installationToken)) {
+        throw new SlashCommandParseError(
+          "bad-arguments",
+          `/repo add: installation id must be a positive integer; got ${
+            JSON.stringify(installationToken)
+          }.`,
+        );
+      }
       const installationId = Number.parseInt(installationToken, RADIX_DECIMAL);
       if (
         !Number.isFinite(installationId) ||
@@ -564,13 +574,33 @@ function tokenise(raw: string): string[] {
 }
 
 /**
+ * Decimal-integer regex used by the slash-command parser to reject tokens
+ * with leading/trailing junk (e.g. `"12abc"`) before they reach
+ * `Number.parseInt`. The regex matches one-or-more digits and nothing else.
+ *
+ * Centralised here so both the issue-number and installation-id call
+ * sites share the exact same validation contract.
+ */
+const POSITIVE_DECIMAL_INTEGER_PATTERN = /^[0-9]+$/u;
+
+/**
  * Parse a token expected to be a positive integer issue number.
+ *
+ * Rejects any token that is not entirely digits — `Number.parseInt`'s
+ * default behaviour of accepting trailing junk (e.g. parsing `"12abc"`
+ * as `12`) would silently misroute slash commands to the wrong issue.
  *
  * @param scope Caller name, prepended to the error message.
  * @param raw The candidate token.
  * @returns The branded {@link IssueNumber}.
  */
 function parseIssueNumberArg(scope: string, raw: string): IssueNumber {
+  if (!POSITIVE_DECIMAL_INTEGER_PATTERN.test(raw)) {
+    throw new SlashCommandParseError(
+      "bad-arguments",
+      `${scope}: issue number must be a positive integer; got ${JSON.stringify(raw)}.`,
+    );
+  }
   const numeric = Number.parseInt(raw, RADIX_DECIMAL);
   if (!Number.isFinite(numeric)) {
     throw new SlashCommandParseError(
