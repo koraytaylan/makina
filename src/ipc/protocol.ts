@@ -34,6 +34,8 @@ import {
   type IssueNumber,
   makeIssueNumber,
   makeRepoFullName,
+  MERGE_MODES,
+  type MergeMode,
   type RepoFullName,
   type StabilizePhase,
   type TaskState,
@@ -89,6 +91,14 @@ export interface CommandPayload {
   readonly repo?: RepoFullName | undefined;
   /** Optional issue number scope override. */
   readonly issueNumber?: IssueNumber | undefined;
+  /**
+   * Optional merge mode override. The TUI's slash-command parser
+   * populates this field for `/issue <n> --merge=<mode>` so the daemon
+   * can forward operator intent to {@link "../daemon/supervisor.ts"
+   * .StartTaskArgs.mergeMode}; absent means the supervisor falls back
+   * to its default.
+   */
+  readonly mergeMode?: MergeMode | undefined;
 }
 
 /**
@@ -126,6 +136,19 @@ export interface AckPayload {
   readonly ok: boolean;
   /** Failure description when {@link AckPayload.ok} is `false`. */
   readonly error?: string | undefined;
+  /**
+   * Optional structured success payload when {@link AckPayload.ok} is
+   * `true`. The daemon uses this for commands whose acknowledgement
+   * carries a result body (today: `/status`); leaving the shape as
+   * `unknown` keeps the codec frame-cap check intact while letting
+   * each command define its own body schema in its module. Clients
+   * that do not understand a particular shape ignore the field.
+   *
+   * Mutually exclusive with {@link AckPayload.error} in spirit:
+   * successful responses never set `error`, and rejected ones never
+   * set `data`.
+   */
+  readonly data?: unknown;
 }
 
 /** Per-kind data payload for a `state-changed` event. */
@@ -323,12 +346,15 @@ const unsubscribePayloadSchema: z.ZodType<UnsubscribePayload, z.ZodTypeDef, unkn
   })
   .strict();
 
+const mergeModeSchema = z.enum(MERGE_MODES as readonly [MergeMode, ...MergeMode[]]);
+
 const commandPayloadSchema: z.ZodType<CommandPayload, z.ZodTypeDef, unknown> = z
   .object({
     name: z.string().min(1),
     args: z.array(z.string()).default([]),
     repo: repoFullNameSchema.optional(),
     issueNumber: issueNumberSchema.optional(),
+    mergeMode: mergeModeSchema.optional(),
   })
   .strict();
 
@@ -349,6 +375,11 @@ const ackPayloadSchema: z.ZodType<AckPayload, z.ZodTypeDef, unknown> = z
   .object({
     ok: z.boolean(),
     error: z.string().optional(),
+    // `data` is opaque on the wire; per-command modules narrow the
+    // shape after the envelope parses. Allow `null` so a JSON-style
+    // round-trip (`JSON.parse(JSON.stringify({ data: undefined }))`)
+    // does not get rejected.
+    data: z.unknown().optional(),
   })
   .strict();
 
