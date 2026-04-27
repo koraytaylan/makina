@@ -9,7 +9,8 @@ Semantic versioning. Pre-release tags use the form `vX.Y.Z-rc.N` and ship as Git
 ## Pre-flight checklist
 
 1. `develop` is green on CI.
-2. The release-tracking issue (`chore: release v…`) lists every Wave 4/5 issue as closed.
+2. The release-tracking issue (`chore: release v…`) lists every issue scheduled for the release as
+   closed.
 3. `develop` was merged into `main` via PR (squash or merge — your call; both keep the changelog
    clean since Conventional Commits drives it).
 4. You have `Releases: write` permission on the repo (project owner: yes).

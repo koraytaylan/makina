@@ -1,7 +1,7 @@
 # Setting up the GitHub App
 
-> Wave 2's `setup` wizard drives steps 3.2 onwards. Steps 1 and 2 are manual GitHub actions taken in
-> your browser; the wizard handles everything after the App is installed.
+> The `makina setup` wizard drives steps 3.2 onwards. Steps 1 and 2 are manual GitHub actions taken
+> in your browser; the wizard handles everything after the App is installed.
 
 makina authenticates to GitHub as a GitHub App (rather than a personal access token). This is
 ADR-003: it gives us higher rate limits, fine-grained per-repo permissions, and a clean bot identity
@@ -34,7 +34,7 @@ On the App page → **Install App** → choose the account → choose specific r
    installations endpoint to discover which repositories you can target, and writes the resulting
    `config.json` to the platform-appropriate location (see `docs/configuration.md`). The discovery
    step uses the App-level client documented in
-   [ADR-024](./adrs/024-app-level-github-client-for-setup-wizard.md).
+   [ADR-025](./adrs/025-app-level-github-client-for-setup-wizard.md).
 
 The wizard validates the private-key path against the filesystem before calling GitHub, prints the
 list of reachable repositories with one-based numbers, and writes the resulting `config.json`. On

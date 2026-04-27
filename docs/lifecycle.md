@@ -1,10 +1,8 @@
 # Lifecycle
 
-> Wave 3 ships the supervisor skeleton (#12); Wave 4 fills in the `STABILIZING` sub-phases. Issue
-> #16 implements the **CI** sub-phase end-to-end (poll combined-status, fetch failing-job logs
-> trimmed to `STABILIZE_CI_LOG_BUDGET_BYTES`, dispatch the agent, restart on the new commit, bound
-> by `MAX_TASK_ITERATIONS` → `NEEDS_HUMAN`); the **rebase** (#15) and **conversations** (#17) phases
-> remain stubs that publish their `state-changed` event and yield back to the loop.
+The supervisor (`src/daemon/supervisor.ts`) walks every issue through a per-task FSM. The three
+stabilize sub-phases — rebase, CI, and conversations — are all wired end-to-end and bounded by
+`MAX_TASK_ITERATIONS` (default 8): exhaustion in any phase escalates the task to `NEEDS_HUMAN`.
 
 Every transition the supervisor performs follows the **persist → emit → act** ordering documented in
 [ADR-016](adrs/016-supervisor-persist-then-emit-then-act.md): the new state is durably on disk
@@ -32,11 +30,17 @@ loop restarts at phase 1 against the just-pushed HEAD. The loop exits cleanly to
 only when none of the phases needs to do work AND a configurable settling window has elapsed.
 
 1. **Rebase** — fetch the base branch and `git rebase`. On conflict, dispatch a focused agent run
-   with the conflict diff. Bounded by `maxIterationsPerTask`. Unresolvable → `NEEDS_HUMAN`.
-2. **CI** — poll combined commit status + check runs. On red, fetch failing-job logs trimmed to a
-   configurable byte budget, dispatch the agent. Restart at phase 1 after the fix is pushed.
-3. **Conversations** — fetch new review comments and review summaries since `lastReviewAt`. If any,
-   group them and dispatch the agent. After the fix is pushed, resolve threads via GraphQL
+   with the conflict diff (see [ADR-018](adrs/018-stabilize-rebase-conflict-loop.md)). Bounded by
+   `maxIterationsPerTask`. Unresolvable → `NEEDS_HUMAN`.
+2. **CI** — poll combined commit status + check runs. On red, fetch failing-job logs trimmed to
+   `STABILIZE_CI_LOG_BUDGET_BYTES` (see
+   [ADR-019](adrs/019-stabilize-ci-log-budget-and-trim-policy.md) and
+   [ADR-022](adrs/022-stabilize-ci-zip-extraction.md) for the ZIP-extraction policy), dispatch the
+   agent. Restart at phase 1 after the fix is pushed.
+3. **Conversations** — fetch new review comments and review summaries since `lastReviewAt` (see
+   [ADR-023](adrs/023-conversations-watermark-monotonicity.md) for the monotonic-watermark guarantee
+   and [ADR-020](adrs/020-graphql-via-octokit-core.md) for the GraphQL transport). If any, group
+   them and dispatch the agent. After the fix is pushed, resolve threads via GraphQL
    `resolveReviewThread` and re-request Copilot review. Restart at phase 1.
 
 ## Merge
