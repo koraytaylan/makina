@@ -5,17 +5,26 @@
  * Wave 3 (#12) ships the skeleton: the supervisor drives a task through
  * `INIT → CLONING_WORKTREE → DRAFTING → COMMITTING → PUSHING → PR_OPEN
  *  → STABILIZING → READY_TO_MERGE → MERGED | NEEDS_HUMAN | FAILED`.
- * Wave 4 fills in the `STABILIZING` sub-phases:
  *
+ * Wave 4 fills in the three `STABILIZING` sub-phases:
+ *
+ *  - **REBASE** (#15) — `runRebaseSubPhase` rebases the per-task feature
+ *    branch on top of the latest base via {@link runRebasePhase}; on
+ *    conflicts the agent is dispatched with conflict-marker context and
+ *    the rebase resumes (`runRebasePhase` is owned by `daemon/stabilize.ts`).
  *  - **CI** (#16, this PR) — polls `getCombinedStatus` + `listCheckRuns`
  *    at the configured cadence; on red, fetches failing-job logs trimmed
  *    to {@link STABILIZE_CI_LOG_BUDGET_BYTES}, dispatches the agent, and
  *    restarts polling on the post-fix head SHA. Bounded by
  *    {@link MAX_TASK_ITERATIONS} → `NEEDS_HUMAN` on exhaustion.
- *  - **REBASE** (#15) and **CONVERSATIONS** (#17) — still stubs that
- *    publish their `state-changed` event so observers see the expected
- *    timeline, then yield back to the loop. Sibling agents replace them
- *    in their own PRs.
+ *  - **CONVERSATIONS** (#17) — `runConversationsPhase` polls
+ *    `listReviews`, `listReviewComments`, and `listReviewThreads` via
+ *    the injected {@link PollerImpl}, joins the REST comments with the
+ *    GraphQL threads payload to populate
+ *    {@link PullRequestReviewComment.threadNodeId}, groups the new
+ *    comments by review thread, dispatches the agent runner, then
+ *    resolves each thread via GraphQL `resolveReviewThread` and
+ *    re-requests Copilot review on every push (per ADR-020).
  *
  * **Invariants the FSM upholds.**
  *
@@ -62,6 +71,8 @@ import { getLogger } from "@std/log";
 import {
   HEX_BYTE_WIDTH_CHARACTERS,
   HEX_RADIX,
+  HTTP_STATUS_CONFLICT,
+  HTTP_STATUS_METHOD_NOT_ALLOWED,
   MAX_TASK_ITERATIONS,
   POLL_INTERVAL_MILLISECONDS,
   STABILIZE_CI_LOG_BUDGET_BYTES,
@@ -85,8 +96,21 @@ import {
   type TaskId,
   type TaskState,
 } from "../types.ts";
-import type { CheckRunSummary, StabilizeGitHubClient } from "../github/client.ts";
+import {
+  type CheckRunSummary,
+  type PullRequestReview,
+  type PullRequestReviewComment,
+  type PullRequestReviewThread,
+  type StabilizeGitHubClient,
+} from "../github/client.ts";
 import { createPoller, PollerError, type PollerImpl } from "./poller.ts";
+import {
+  type ConflictFileReader,
+  type RebasePhaseResult,
+  runRebasePhase,
+  type StabilizeGitInvoker,
+  StabilizeRebaseError,
+} from "./stabilize.ts";
 import type { WorktreeManagerImpl } from "./worktree-manager.ts";
 
 /**
@@ -205,29 +229,31 @@ export interface TaskSupervisorOptions {
    */
   readonly randomSource?: SupervisorRandomSource;
   /**
-   * Optional poller used by the stabilize loop's CI phase to space its
-   * `getCombinedStatus` / `listCheckRuns` reads. Defaults to a fresh
-   * {@link createPoller} instance with the standard cadence-and-backoff
-   * defaults; tests inject a recording poller (or a poller backed by a
-   * synthetic clock) so cadence assertions are deterministic.
+   * Optional poller used by the stabilize loop's CI and conversations
+   * phases. The CI phase uses it to space `getCombinedStatus` /
+   * `listCheckRuns` reads; the conversations phase uses it to drive its
+   * single per-iteration tick. Defaults to a fresh {@link createPoller}
+   * instance with the standard cadence-and-backoff defaults; tests
+   * inject a recording poller (or one backed by a synthetic clock) so
+   * cadence assertions are deterministic.
    *
    * The supervisor binds to the wider {@link PollerImpl} surface so the
-   * CI phase can pass an `onError` callback (the W1 {@link Poller}
-   * contract is intentionally narrower; {@link PollerImpl} extends it
-   * additively per ADR-017).
+   * stabilize phases can pass an `onError` callback (the W1
+   * {@link Poller} contract is intentionally narrower; {@link PollerImpl}
+   * extends it additively per ADR-017).
    */
   readonly poller?: PollerImpl;
   /**
-   * Optional poll cadence for the stabilize-CI loop, in milliseconds.
-   * Defaults to {@link POLL_INTERVAL_MILLISECONDS}. Tests pin this to a
-   * small value so a `green-on-first-poll` timeline does not consume
-   * real wall-clock time even with a real poller.
+   * Optional poll cadence for the stabilize-CI and conversations loops,
+   * in milliseconds. Defaults to {@link POLL_INTERVAL_MILLISECONDS}.
+   * Tests pin this to a small value (or `0`) so back-to-back ticks
+   * settle without real wall-clock delay.
    */
   readonly pollIntervalMilliseconds?: number;
   /**
-   * Optional upper bound on agent iterations spent inside the stabilize
-   * loop's CI fix loop before the supervisor escalates to
-   * {@link "NEEDS_HUMAN"}. Defaults to {@link MAX_TASK_ITERATIONS}.
+   * Optional upper bound on agent iterations the stabilize phases (CI
+   * and CONVERSATIONS) will dispatch on a single task before escalating
+   * to {@link "NEEDS_HUMAN"}. Defaults to {@link MAX_TASK_ITERATIONS}.
    * The bound is shared across stabilize sub-phases — the rebase phase
    * and the conversations phase debit the same budget — so a task that
    * already burned half its iterations on a rebase gets the remainder
@@ -254,6 +280,32 @@ export interface TaskSupervisorOptions {
    * @returns The current head SHA of `task.branchName`.
    */
   readonly resolveHeadSha?: (task: Task) => Promise<string>;
+  /**
+   * Optional override for the git invoker used by the stabilize-rebase
+   * phase ({@link runRebasePhase}). Production leaves this unset and
+   * the rebase phase backs onto `Deno.Command("git", …)`; unit tests
+   * inject a scripted double so the rebase loop is deterministic without
+   * touching real git.
+   */
+  readonly gitInvoker?: StabilizeGitInvoker;
+  /**
+   * Optional override for the conflict-file reader used by the
+   * stabilize-rebase phase. Production leaves this unset and the phase
+   * backs onto `Deno.readTextFile`; unit tests inject a scripted reader
+   * so the conflict-marker branch can be exercised without a real
+   * filesystem.
+   */
+  readonly conflictFileReader?: ConflictFileReader;
+  /**
+   * If `true`, the supervisor leaves the per-task worktree on disk
+   * after `MERGED`; if `false`, it tears the worktree down via
+   * {@link WorktreeManagerImpl.removeWorktree} as the final step of
+   * the merge pipeline. Mirrors `lifecycle.preserveWorktreeOnMerge`
+   * from `config.json`. Defaults to `false` so a fresh `makina setup`
+   * leaves disk usage bounded; operators who want to keep the
+   * worktree for follow-up flip the bit in their config.
+   */
+  readonly preserveWorktreeOnMerge?: boolean;
 }
 
 /**
@@ -329,14 +381,88 @@ export interface TaskSupervisorImpl {
    *   with that id exists.
    */
   getTask(taskId: TaskId): Task | undefined;
+
+  /**
+   * Force the merge of a task currently parked at `READY_TO_MERGE`.
+   *
+   * Wired to the `/merge <task-id>` slash command for tasks configured
+   * with `mergeMode === "manual"` (the only mode that parks rather
+   * than auto-merging once stabilize settles). Re-enters the FSM at
+   * `READY_TO_MERGE` and runs the same merge → cleanup pipeline as the
+   * auto-merge path: GitHub `mergePullRequest` is invoked with the
+   * task's recorded mode (overridden internally to `squash`/`rebase`
+   * — the supervisor refuses to call the API with `manual`, since
+   * GitHub has no equivalent strategy), the worktree is cleaned up
+   * (or preserved per `preserveWorktreeOnMerge`), and the task lands
+   * in `MERGED`. Failures classify the same way as the auto-merge
+   * path (see {@link MergeError.category}).
+   *
+   * @param taskId Identifier of the task to merge.
+   * @param overrideMode Optional override of the merge strategy for
+   *   this single call. Defaults to `"squash"` when the task itself
+   *   carries `manual` (the API needs a concrete strategy); ignored
+   *   otherwise.
+   * @returns The persisted task record after the merge attempt
+   *   (`MERGED`, `NEEDS_HUMAN`, or `FAILED`).
+   * @throws SupervisorError synchronously when the call cannot reach
+   *   the FSM transition. Thrown kinds:
+   *   - `unknown-task` — no task exists for the given id.
+   *   - `not-ready-to-merge` — the task is not at `READY_TO_MERGE`.
+   *   - `merge-in-flight` — a prior `/merge` for the same task is
+   *     still mid-flight on the GitHub merge call.
+   *   - `merge-precondition` — `overrideMode === "manual"`, which is
+   *     not a GitHub merge strategy.
+   *
+   *   Each error carries a `kind` discriminator so the daemon's
+   *   command dispatcher can reply with a precise
+   *   `ack { ok: false, error }`. FSM-internal failures (the merge
+   *   itself faulting after preconditions pass) do **not** throw —
+   *   they land the task in `MERGED`, `NEEDS_HUMAN`, or `FAILED`.
+   */
+  mergeReadyTask(
+    taskId: TaskId,
+    overrideMode?: MergeMode,
+  ): Promise<Task>;
 }
+
+/**
+ * Categories of caller-visible failures the supervisor surfaces
+ * synchronously through {@link SupervisorError}. The daemon's command
+ * dispatcher reads the `kind` to map an exception onto a precise
+ * `ack { ok: false, error }`:
+ *
+ * - `duplicate-start` — `start()` was called for a `(repo, issue)`
+ *   pair already in flight.
+ * - `unknown-task` — `mergeReadyTask()` was passed a task id the
+ *   supervisor does not own.
+ * - `not-ready-to-merge` — `mergeReadyTask()` was called for a task
+ *   not currently in `READY_TO_MERGE`.
+ * - `merge-in-flight` — `mergeReadyTask()` was called concurrently for
+ *   the same task id; an earlier invocation is still mid-flight on the
+ *   GitHub merge call, so the second request is rejected synchronously
+ *   instead of issuing a duplicate `mergePullRequest`.
+ * - `merge-precondition` — `mergeReadyTask()` was called with an
+ *   `overrideMode` that is not a valid GitHub merge strategy
+ *   (currently only `"manual"`, which is a makina-side concept meaning
+ *   "wait for /merge"). Rejected synchronously so a caller bug cannot
+ *   land the task in `FAILED` via `runMergeStep`'s defensive check.
+ * - `persistence` — the initial `start()` save failed (no record on
+ *   disk; in-memory entry rolled back so callers can retry).
+ */
+export type SupervisorErrorKind =
+  | "duplicate-start"
+  | "unknown-task"
+  | "not-ready-to-merge"
+  | "merge-in-flight"
+  | "merge-precondition"
+  | "persistence";
 
 /**
  * Domain error class thrown by the supervisor for caller-visible
  * failures (double-start, unknown task, brand violation). FSM-internal
  * failures (worktree creation, PR open, merge) are *not* thrown — they
- * land the task in `FAILED` and the caller observes the terminal
- * record's `terminalReason`.
+ * land the task in `FAILED` (or `NEEDS_HUMAN` for non-mergeable PRs)
+ * and the caller observes the terminal record's `terminalReason`.
  *
  * The class wraps the underlying exception via `cause` so log readers
  * can recover the original stack.
@@ -354,22 +480,91 @@ export interface TaskSupervisorImpl {
  * }
  * ```
  *
- * @throws by {@link TaskSupervisorImpl.start} when the FSM rejects the
+ * @throws by {@link TaskSupervisorImpl.start} and
+ *   {@link TaskSupervisorImpl.mergeReadyTask} when the FSM rejects the
  *   call before any state transition is persisted.
  */
 export class SupervisorError extends Error {
   /** Discriminator visible in stack traces and `error.name === ...` checks. */
   override readonly name = "SupervisorError";
+  /** Category tag — the daemon's `/merge` dispatcher reads this. */
+  readonly kind: SupervisorErrorKind;
 
   /**
    * Build a supervisor error.
    *
+   * @param kind Failure category (see {@link SupervisorErrorKind}).
    * @param message Human-readable description.
    * @param options Optional standard `cause` carrying the underlying
    *   exception.
    */
-  constructor(message: string, options?: { readonly cause?: unknown }) {
+  constructor(
+    kind: SupervisorErrorKind,
+    message: string,
+    options?: { readonly cause?: unknown },
+  ) {
     super(message, options);
+    this.kind = kind;
+  }
+}
+
+/**
+ * Categories of {@link MergeError} the supervisor produces during
+ * `READY_TO_MERGE → MERGED`. Mapped onto a destination FSM state by
+ * {@link mergeErrorTerminalState}:
+ *
+ * - `not-mergeable` — GitHub refused the merge because the PR was
+ *   not in a mergeable state (HTTP `405`, conflicts, base protection,
+ *   stale head SHA). The supervisor escalates to `NEEDS_HUMAN` so an
+ *   operator can investigate without losing the PR.
+ * - `transient` — a 5xx, network glitch, or other category-unaware
+ *   failure. The supervisor lands the task in `FAILED` so a follow-up
+ *   `start()` (or, for manual mode, a follow-up `/merge`) can retry.
+ */
+export type MergeErrorCategory = "not-mergeable" | "transient";
+
+/**
+ * Domain error wrapping a `mergePullRequest` failure with a
+ * caller-visible `category` so the supervisor can decide whether to
+ * escalate the task to `NEEDS_HUMAN` (the PR is genuinely
+ * non-mergeable: conflicts, base-branch protection, stale head) or
+ * `FAILED` (the API call faulted for a transient reason).
+ *
+ * The class never escapes the supervisor — it is constructed inside
+ * the merge step and consumed by the FSM transition. Tests inspect the
+ * resulting `terminalReason` rather than this class directly.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.mergePullRequest(repo, prNumber, "squash");
+ * } catch (error) {
+ *   throw classifyMergeError(error);
+ * }
+ * ```
+ */
+export class MergeError extends Error {
+  /** Discriminator visible in stack traces and `error.name === ...` checks. */
+  override readonly name = "MergeError";
+  /** Category tag — drives the FSM destination state. */
+  readonly category: MergeErrorCategory;
+
+  /**
+   * Build a merge error.
+   *
+   * @param category Whether the failure is the PR being non-mergeable
+   *   (operator action required) or a transient API fault.
+   * @param message Human-readable description.
+   * @param options Optional standard `cause` carrying the underlying
+   *   GitHub-client exception.
+   */
+  constructor(
+    category: MergeErrorCategory,
+    message: string,
+    options?: { readonly cause?: unknown },
+  ) {
+    super(message, options);
+    this.category = category;
   }
 }
 
@@ -414,6 +609,9 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     POLL_INTERVAL_MILLISECONDS;
   const maxIterations = opts.maxIterations ?? MAX_TASK_ITERATIONS;
   const ciLogBudgetBytes = opts.ciLogBudgetBytes ?? STABILIZE_CI_LOG_BUDGET_BYTES;
+  const stabilizeGitInvoker = opts.gitInvoker;
+  const stabilizeConflictReader = opts.conflictFileReader;
+  const preserveWorktreeOnMerge: boolean = opts.preserveWorktreeOnMerge ?? false;
 
   /**
    * In-memory task table. Wave 3's daemon hydrates this on boot via
@@ -452,6 +650,25 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
   }
 
   /**
+   * Set of task ids whose `mergeReadyTask()` invocation is currently
+   * mid-flight on the GitHub merge call. Acts as an in-memory mutex:
+   * the second concurrent `/merge <task-id>` for the same task fails
+   * fast with `SupervisorErrorKind.merge-in-flight` instead of racing
+   * the first call into a duplicate `mergePullRequest` request.
+   *
+   * The guard is process-local (a daemon restart clears it) and lives
+   * alongside the `READY_TO_MERGE` state check inside `mergeReadyTask`:
+   * the state check guarantees that only `READY_TO_MERGE` tasks reach
+   * the GitHub call, but two callers can both pass that check before
+   * either persists a terminal transition. The mid-flight set closes
+   * the gap between "state check accepted" and "transition persisted".
+   *
+   * Cleared in a `finally` so a thrown classifier (or any other
+   * unexpected exception) cannot strand the task forever.
+   */
+  const mergeInFlight = new Set<TaskId>();
+
+  /**
    * Run `mutate(prev)` to produce the next task record, persist it,
    * and publish a `state-changed` event covering the transition. The
    * persist-then-emit ordering is the load-bearing invariant
@@ -480,8 +697,9 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       readonly terminalReason?: string;
     },
     reason?: string,
+    lastReviewAtIso?: string,
   ): Promise<Task> {
-    const updated = applyTransition(prev, next, clock.nowIso());
+    const updated = applyTransition(prev, next, clock.nowIso(), lastReviewAtIso);
     await opts.persistence.save(updated);
     tasks.set(updated.id, updated);
     publish(opts.eventBus, {
@@ -526,6 +744,7 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       // pair is not blocked by a phantom entry.
       tasks.delete(taskId);
       throw new SupervisorError(
+        "persistence",
         `failed to persist initial task record for ${args.repo}#${args.issueNumber}`,
         { cause: saveError },
       );
@@ -761,48 +980,56 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
 
   async function runStabilizing(task: Task): Promise<Task> {
     // Wave 4 splits the stabilize loop into three phases that run in
-    // strict order: rebase → CI → conversations. The CI phase is the
-    // only one fully implemented in this PR (issue #16). The rebase
-    // (#15) and conversations (#17) phases stay as stubs so the
-    // event-bus timeline is observable — the supervisor publishes the
-    // `STABILIZING / <phase>` transition for each, and the next phase
-    // takes over without doing real work yet.
-    let current = await runStabilizeRebase(task);
+    // strict order: rebase → CI → conversations.
+    //   - REBASE (#39): `runRebaseSubPhase` rebases the per-task feature
+    //     branch on top of the latest base via `runRebasePhase`.
+    //   - CI (#41, this PR): polls combined status / check runs and
+    //     dispatches the agent on red until CI is green or the iteration
+    //     budget is exhausted (`runStabilizeCi`).
+    //   - CONVERSATIONS (#40): polls `listReviews` /
+    //     `listReviewComments` / `listReviewThreads` and dispatches the
+    //     agent for each new review thread (`runConversationsPhase`).
+    //
+    // REBASE publishes its `STABILIZING(REBASE)` self-transition inside
+    // `runRebaseSubPhase`; CI emits its `STABILIZING(CI)` self-transition
+    // at the start of `runStabilizeCi`. The conversations phase emits
+    // its own self-transition before driving the agent.
+    const rebaseStart = await transition(
+      task,
+      { state: "STABILIZING", stabilizePhase: "REBASE" },
+      "stabilize phase REBASE",
+    );
+    let current: Task;
+    try {
+      current = await runRebaseSubPhase(rebaseStart);
+    } catch (error) {
+      logger.warn(
+        `supervisor: stabilize-rebase failed for task ${task.id}: ${errorMessage(error)}`,
+      );
+      const operation = error instanceof StabilizeRebaseError
+        ? `stabilize-rebase-${error.operation}`
+        : "stabilize-rebase";
+      return await fail(rebaseStart, error, operation);
+    }
     if (isTerminal(current.state)) return current;
     current = await runStabilizeCi(current);
     if (isTerminal(current.state)) return current;
-    current = await runStabilizeConversations(current);
-    if (isTerminal(current.state)) return current;
+    current = await transition(
+      current,
+      { state: "STABILIZING", stabilizePhase: "CONVERSATIONS" },
+      "stabilize phase CONVERSATIONS",
+    );
+    current = await runConversationsPhase(current);
+    if (current.state !== "STABILIZING") {
+      // The conversations phase escalated to NEEDS_HUMAN (or FAILED via
+      // `fail`) and persisted that transition itself; the parent driver
+      // returns the new state directly without forcing READY_TO_MERGE.
+      return current;
+    }
     return await transition(
       current,
       { state: "READY_TO_MERGE" },
       "stabilize loop settled",
-    );
-  }
-
-  /**
-   * Stub body for the rebase sub-phase (#15 replaces this). Records the
-   * phase transition on the bus so observers see the expected timeline,
-   * then yields to the next phase.
-   */
-  async function runStabilizeRebase(task: Task): Promise<Task> {
-    return await transition(
-      task,
-      { state: "STABILIZING", stabilizePhase: "REBASE" },
-      "stabilize phase REBASE (stub)",
-    );
-  }
-
-  /**
-   * Stub body for the conversations sub-phase (#17 replaces this).
-   * Records the phase transition on the bus so observers see the
-   * expected timeline, then yields back to {@link runStabilizing}.
-   */
-  async function runStabilizeConversations(task: Task): Promise<Task> {
-    return await transition(
-      task,
-      { state: "STABILIZING", stabilizePhase: "CONVERSATIONS" },
-      "stabilize phase CONVERSATIONS (stub)",
     );
   }
 
@@ -910,6 +1137,183 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       }
       // Loop: re-resolve the head SHA (now pointing at the agent's fix
       // commit) and poll again.
+    }
+  }
+
+  /**
+   * Conversations-phase loop.
+   *
+   * One iteration:
+   *
+   *  1. Poll {@link StabilizeGitHubClient.listReviews},
+   *     {@link StabilizeGitHubClient.listReviewComments}, and
+   *     {@link StabilizeGitHubClient.listReviewThreads} for the task's
+   *     PR, via the injected {@link PollerImpl}, then join the comments
+   *     with the threads payload to populate
+   *     {@link PullRequestReviewComment.threadNodeId}.
+   *  2. Filter to comments whose `createdAtIso` is strictly newer than
+   *     the task's `lastReviewAtIso` watermark.
+   *  3. If new comments are present: group them by review thread,
+   *     dispatch the agent runner with the grouped context as the
+   *     prompt, then resolve every grouped thread via
+   *     {@link StabilizeGitHubClient.resolveReviewThread} and
+   *     re-request Copilot review.
+   *  4. Update the watermark to the latest seen `createdAtIso` so the
+   *     next poll only sees fresh comments.
+   *  5. If iteration count exceeds {@link maxIterations}, escalate to
+   *     `NEEDS_HUMAN`. Otherwise loop back to (1) until a poll returns
+   *     no new comments.
+   *
+   * The Poller's tick is consumed via a per-tick promise so a single
+   * polling tick yields a single decision; the supervisor cancels the
+   * per-tick handle as soon as the tick settles. **Fail-fast on
+   * fetcher errors:** any `onError` from the poller (transient or
+   * fatal) rejects the per-tick promise and the conversations phase
+   * transitions the task to `FAILED`. This is intentional — the W4
+   * Poller's exponential-backoff path is for *steady-state* polling
+   * (e.g. CI), where the supervisor wants to keep waiting through
+   * transient flakes. The conversations phase only needs *one* poll
+   * to decide whether work exists, so rejecting on the first failure
+   * surfaces the problem immediately rather than burning the
+   * iteration budget on retries.
+   */
+  async function runConversationsPhase(task: Task): Promise<Task> {
+    if (task.prNumber === undefined) {
+      return await fail(
+        task,
+        new Error("CONVERSATIONS entered without a PR number"),
+        "conversations-precondition",
+      );
+    }
+    if (!isStabilizeClient(opts.githubClient)) {
+      return await fail(
+        task,
+        new Error(
+          "CONVERSATIONS requires a StabilizeGitHubClient " +
+            "(listReviews/listReviewComments/listReviewThreads/resolveReviewThread)",
+        ),
+        "conversations-precondition",
+      );
+    }
+    const stabilizeClient = opts.githubClient;
+    let current = task;
+    while (true) {
+      let pollResult: ConversationsPollResult;
+      try {
+        pollResult = await runConversationsPoll(
+          stabilizeClient,
+          current.id,
+          current.repo,
+          current.prNumber as IssueNumber,
+        );
+      } catch (error) {
+        logger.warn(
+          `supervisor: conversations poll failed for task ${current.id}: ${errorMessage(error)}`,
+        );
+        return await fail(current, error, "conversations-poll");
+      }
+      // Persist the watermark on every successful poll, even when the
+      // poll yielded no work — the brief calls for an updated
+      // `lastReviewAt` after every successful tick so a subsequent
+      // resume of the task does not re-process settled threads.
+      //
+      // The watermark is *monotonic*: we never let a partial/truncated
+      // GitHub timeline (or a deletion that lowers `latestCreatedAtIso`)
+      // regress the high-water mark and cause already-processed
+      // comments to look fresh on the next tick. See ADR-023.
+      const nextWatermark = monotonicWatermark(
+        current.lastReviewAtIso,
+        pollResult.latestCreatedAtIso,
+      );
+      const newComments = filterNewComments(
+        pollResult.comments,
+        current.lastReviewAtIso,
+      );
+      if (newComments.length === 0) {
+        // No new conversations to address — phase converges. Persist
+        // the (possibly-advanced) watermark and return the in-memory
+        // record unchanged otherwise.
+        if (
+          nextWatermark !== undefined &&
+          nextWatermark !== current.lastReviewAtIso
+        ) {
+          current = await transition(
+            current,
+            { state: "STABILIZING", stabilizePhase: "CONVERSATIONS" },
+            "conversations watermark advanced",
+            nextWatermark,
+          );
+        }
+        return current;
+      }
+      // Bound the loop. We compare *after* a non-empty batch because the
+      // brief calls for the exhaustion path to fire when work *exists*
+      // but the budget is spent.
+      if (current.iterationCount >= maxIterations) {
+        publish(opts.eventBus, {
+          taskId: current.id,
+          atIso: clock.nowIso(),
+          kind: "log",
+          data: {
+            level: "warn",
+            message:
+              `conversations: iteration budget (${maxIterations}) exhausted with ${newComments.length} unresolved comment(s)`,
+          },
+        });
+        return await transition(
+          current,
+          {
+            state: "NEEDS_HUMAN",
+            terminalReason: `conversations: iteration budget (${maxIterations}) exhausted`,
+          },
+          "iteration budget exhausted",
+        );
+      }
+      // Dispatch the agent run.
+      try {
+        current = await runConversationsAgentDispatch(
+          current,
+          pollResult.reviews,
+          newComments,
+        );
+      } catch (error) {
+        logger.warn(
+          `supervisor: conversations agent run failed for task ${current.id}: ${
+            errorMessage(error)
+          }`,
+        );
+        return await fail(current, error, "conversations-agent");
+      }
+      // Resolve threads + re-request Copilot review on every push.
+      try {
+        await resolveAddressedThreads(stabilizeClient, newComments);
+        await stabilizeClient.requestReviewers(
+          current.repo,
+          current.prNumber as IssueNumber,
+          [COPILOT_REVIEWER_LOGIN],
+        );
+      } catch (error) {
+        logger.warn(
+          `supervisor: conversations resolve/re-request failed for task ${current.id}: ${
+            errorMessage(error)
+          }`,
+        );
+        return await fail(current, error, "conversations-resolve");
+      }
+      // Persist the watermark advance so the next poll's filter is
+      // tight; the iteration counter was already incremented inside
+      // `runConversationsAgentDispatch`.
+      if (
+        nextWatermark !== undefined &&
+        nextWatermark !== current.lastReviewAtIso
+      ) {
+        current = await transition(
+          current,
+          { state: "STABILIZING", stabilizePhase: "CONVERSATIONS" },
+          "conversations watermark advanced",
+          nextWatermark,
+        );
+      }
     }
   }
 
@@ -1228,13 +1632,287 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     );
   }
 
+  /**
+   * Run a single poll of the conversations endpoints via the injected
+   * {@link PollerImpl}. Resolves with the latest reviews and comments
+   * the moment one tick settles, then cancels the poll handle.
+   *
+   * The poller drives the tick on the synthetic interval the supervisor
+   * was constructed with (`pollIntervalMilliseconds`); tests pass `0`
+   * to fire back-to-back. A `PollerError(kind: "fatal")` propagates as
+   * a regular rejection — the loop's caller absorbs it into a `FAILED`
+   * transition.
+   *
+   * **Thread-id join.** GitHub's REST Pulls Comments API does not
+   * expose the GraphQL thread node id that
+   * {@link StabilizeGitHubClient.resolveReviewThread} requires. The
+   * fetcher fans out three calls in parallel — `listReviews`,
+   * `listReviewComments`, `listReviewThreads` — and merges the threads
+   * payload onto each comment by joining on the REST comment id. A
+   * comment that pre-carries `threadNodeId` (e.g. seeded by a unit
+   * test) keeps its existing value; only comments with `undefined`
+   * are filled in from the join. Comments left without a thread mapping
+   * stay {@link PullRequestReviewComment.threadNodeId | undefined} and
+   * are skipped by `resolveAddressedThreads` — the documented "thread
+   * not GraphQL-addressable yet" branch.
+   */
+  function runConversationsPoll(
+    stabilizeClient: StabilizeGitHubClient,
+    taskId: TaskId,
+    repo: RepoFullName,
+    pullRequestNumber: IssueNumber,
+  ): Promise<ConversationsPollResult> {
+    return new Promise<ConversationsPollResult>((resolve, reject) => {
+      // The poller's `runLoop` always `await`s the fetcher before
+      // invoking `onResult`/`onError`, so the callbacks cannot fire
+      // synchronously inside `poll(...)`. We can therefore capture the
+      // handle directly from the return value and call `handle.cancel()`
+      // straight from the callbacks. Re-entry is still defended via
+      // `settled` (the poller's cancel is best-effort, and a second
+      // tick that landed before our cancel propagated would otherwise
+      // race the `resolve`/`reject`).
+      let settled = false;
+      const handle = poller.poll<ConversationsPollResult>({
+        taskId,
+        intervalMilliseconds: pollIntervalMilliseconds,
+        fetcher: async () => {
+          const [reviews, comments, threads] = await Promise.all([
+            stabilizeClient.listReviews(repo, pullRequestNumber),
+            stabilizeClient.listReviewComments(repo, pullRequestNumber),
+            stabilizeClient.listReviewThreads(repo, pullRequestNumber),
+          ]);
+          const enriched = joinCommentsWithThreads(comments, threads);
+          const latestCreatedAtIso = latestCommentTimestamp(enriched);
+          // `exactOptionalPropertyTypes` forbids assigning a literal
+          // `undefined` to an optional field; project the result with
+          // an explicit shape that omits the key when there is no
+          // latest timestamp to share.
+          const projected: ConversationsPollResult = latestCreatedAtIso === undefined
+            ? { reviews, comments: enriched }
+            : { reviews, comments: enriched, latestCreatedAtIso };
+          return projected;
+        },
+        onResult: (result) => {
+          if (settled) return;
+          settled = true;
+          handle.cancel();
+          resolve(result);
+        },
+        onError: (error) => {
+          if (settled) return;
+          settled = true;
+          handle.cancel();
+          reject(error);
+        },
+      });
+    });
+  }
+
+  /**
+   * Dispatch the agent runner with the grouped review comments as
+   * prompt context, stream every message onto the event bus, and
+   * transition the task with `iterationCount + 1` and (optionally) the
+   * SDK's session id.
+   */
+  async function runConversationsAgentDispatch(
+    task: Task,
+    reviews: readonly PullRequestReview[],
+    comments: readonly PullRequestReviewComment[],
+  ): Promise<Task> {
+    if (task.worktreePath === undefined) {
+      throw new Error("CONVERSATIONS dispatch entered without a worktree path");
+    }
+    const prompt = buildConversationsPrompt(reviews, comments);
+    let lastSessionId: string | undefined = task.sessionId;
+    for await (
+      const message of opts.agentRunner.runAgent(
+        task.sessionId === undefined
+          ? {
+            taskId: task.id,
+            worktreePath: task.worktreePath,
+            prompt,
+            model: task.model,
+          }
+          : {
+            taskId: task.id,
+            worktreePath: task.worktreePath,
+            prompt,
+            model: task.model,
+            sessionId: task.sessionId,
+          },
+      )
+    ) {
+      publish(opts.eventBus, {
+        taskId: task.id,
+        atIso: clock.nowIso(),
+        kind: "agent-message",
+        data: { role: message.role, text: message.text },
+      });
+      const candidate = (message as { sessionId?: string }).sessionId;
+      if (candidate !== undefined) {
+        lastSessionId = candidate;
+      }
+    }
+    return await transition(
+      task,
+      lastSessionId === undefined
+        ? {
+          state: "STABILIZING",
+          stabilizePhase: "CONVERSATIONS",
+          iterationCount: task.iterationCount + 1,
+        }
+        : {
+          state: "STABILIZING",
+          stabilizePhase: "CONVERSATIONS",
+          iterationCount: task.iterationCount + 1,
+          sessionId: lastSessionId,
+        },
+      "conversations: agent draft complete",
+    );
+  }
+
+  /**
+   * Resolve every distinct review thread referenced by `comments` via
+   * the GraphQL `resolveReviewThread` mutation. Comments whose
+   * `threadNodeId` is `undefined` (e.g. surfaced by a REST listing that
+   * cannot map back to GraphQL) are skipped — the brief calls out
+   * "resolve each thread", not "resolve every comment", and a missing
+   * id is the documented signal that a thread is not GraphQL-addressable
+   * yet.
+   */
+  async function resolveAddressedThreads(
+    stabilizeClient: StabilizeGitHubClient,
+    comments: readonly PullRequestReviewComment[],
+  ): Promise<void> {
+    const seen = new Set<string>();
+    for (const comment of comments) {
+      const threadId = comment.threadNodeId;
+      if (threadId === undefined) continue;
+      if (seen.has(threadId)) continue;
+      seen.add(threadId);
+      await stabilizeClient.resolveReviewThread(threadId);
+    }
+  }
+
+  /**
+   * Run the rebase sub-phase against `task`'s worktree. On a clean
+   * rebase, returns `task` unchanged so the caller can advance to the
+   * next sub-phase. On `needs-human`, transitions the task to
+   * `NEEDS_HUMAN` with a `terminalReason` listing the conflicting
+   * files; the worktree is preserved by {@link runRebasePhase} (it
+   * runs `git rebase --abort` so the worktree is back on the feature
+   * branch) so an operator can inspect.
+   */
+  async function runRebaseSubPhase(task: Task): Promise<Task> {
+    if (task.worktreePath === undefined) {
+      throw new StabilizeRebaseError(
+        "STABILIZING entered without a worktree path",
+        "precondition",
+      );
+    }
+    const rebaseOptions = {
+      taskId: task.id,
+      issueNumber: task.issueNumber,
+      worktreePath: task.worktreePath,
+      baseBranch: DEFAULT_BASE_BRANCH,
+      model: task.model,
+      agentRunner: opts.agentRunner,
+      ...(task.sessionId !== undefined ? { sessionId: task.sessionId } : {}),
+      ...(stabilizeGitInvoker !== undefined ? { gitInvoker: stabilizeGitInvoker } : {}),
+      ...(stabilizeConflictReader !== undefined
+        ? { conflictFileReader: stabilizeConflictReader }
+        : {}),
+    };
+    const result: RebasePhaseResult = await runRebasePhase(rebaseOptions);
+    // The rebase phase may have driven the agent runner across one or
+    // more iterations and observed a fresh SDK session id; persist it
+    // back onto the task so the next stabilize phase can resume the
+    // same session. The phase only sets `sessionId` when the runner
+    // actually emitted a new id distinct from the one the supervisor
+    // passed in, so a missing value means "no change to record".
+    const sessionUpdate: { sessionId?: string } = result.sessionId !== undefined &&
+        result.sessionId !== task.sessionId
+      ? { sessionId: result.sessionId }
+      : {};
+    if (result.kind === "needs-human") {
+      const reason = formatRebaseNeedsHumanReason(result.conflictingFiles);
+      return await transition(
+        task,
+        { state: "NEEDS_HUMAN", terminalReason: reason, ...sessionUpdate },
+        reason,
+      );
+    }
+    if (sessionUpdate.sessionId !== undefined) {
+      // Clean rebase that nonetheless required at least one agent
+      // iteration; record the resumed session id by emitting a
+      // self-transition into the same `STABILIZING(REBASE)` state. CI
+      // is the next sub-phase the outer loop will drive.
+      return await transition(
+        task,
+        {
+          state: "STABILIZING",
+          stabilizePhase: "REBASE",
+          ...sessionUpdate,
+        },
+        "stabilize-rebase recorded resumed session",
+      );
+    }
+    return task;
+  }
+
+  /**
+   * Side effect for `READY_TO_MERGE`. Three branches:
+   *
+   *  - **`manual`** parks the FSM at `READY_TO_MERGE` without calling
+   *    `mergePullRequest`. The auto-driver loop in {@link drive}
+   *    returns the task; the operator unblocks it later through
+   *    {@link mergeReadyTask} (wired to the `/merge <task-id>`
+   *    slash command).
+   *  - **`squash` / `rebase`** call the GitHub API straight through
+   *    {@link runMergeStep}.
+   *
+   * Any failure path inside `runMergeStep` is absorbed into a
+   * persisted `MERGED | NEEDS_HUMAN | FAILED` transition; this helper
+   * never throws.
+   */
   async function runReadyToMerge(task: Task): Promise<Task> {
     if (task.mergeMode === "manual") {
-      // Manual merge mode: stay in READY_TO_MERGE; an operator takes
-      // over from the GitHub UI. The integration test exercises
-      // `squash`, but the manual branch keeps the FSM honest.
+      // Park the task; an operator takes over by issuing
+      // `/merge <task-id>`. The driver loop in `drive()` returns this
+      // task as-is, leaving the in-memory + persistence record at
+      // `READY_TO_MERGE`. We do **not** publish a "parked" event —
+      // the `READY_TO_MERGE` state-changed event already published by
+      // the stabilize loop's exit covers the observer's needs.
       return task;
     }
+    return await runMergeStep(task, task.mergeMode);
+  }
+
+  /**
+   * Perform the merge-then-cleanup pipeline for a task at
+   * `READY_TO_MERGE`. The flow is:
+   *
+   *   1. Validate the precondition (`prNumber !== undefined`).
+   *   2. Call `mergePullRequest(repo, prNumber, mode)`.
+   *   3. Classify any failure via {@link classifyMergeError} and
+   *      escalate to `NEEDS_HUMAN` (non-mergeable PR) or `FAILED`
+   *      (transient API fault).
+   *   4. On success, optionally tear down the worktree per
+   *      `preserveWorktreeOnMerge` and persist `MERGED`.
+   *
+   * Used both from {@link runReadyToMerge} (auto-merge) and from
+   * {@link mergeReadyTask} (the `/merge` slash command) so the two
+   * paths share identical error handling and cleanup behaviour.
+   *
+   * @param task The READY_TO_MERGE task record.
+   * @param mode The merge strategy to use. Callers pass the task's
+   *   own `mergeMode` for auto-merge; the manual-merge entry point
+   *   substitutes a concrete strategy when the task itself was
+   *   configured with `manual`.
+   * @returns The persisted post-merge record (`MERGED`,
+   *   `NEEDS_HUMAN`, or `FAILED`).
+   */
+  async function runMergeStep(task: Task, mode: MergeMode): Promise<Task> {
     if (task.prNumber === undefined) {
       return await fail(
         task,
@@ -1242,22 +1920,95 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
         "merge-precondition",
       );
     }
+    if (mode === "manual") {
+      // Defensive: `manual` is not a GitHub merge_method; the caller
+      // (mergeReadyTask) already substitutes a concrete mode before
+      // reaching here. Treat any leak as a programming error rather
+      // than a silent escalation.
+      return await fail(
+        task,
+        new Error('runMergeStep called with mode="manual"; expected squash or rebase'),
+        "merge-precondition",
+      );
+    }
     try {
-      await opts.githubClient.mergePullRequest(
-        task.repo,
-        task.prNumber,
-        task.mergeMode,
+      await opts.githubClient.mergePullRequest(task.repo, task.prNumber, mode);
+    } catch (error) {
+      const merge = classifyMergeError(error);
+      logger.warn(
+        `supervisor: mergePullRequest failed for task ${task.id} (${merge.category}): ${merge.message}`,
+      );
+      if (merge.category === "not-mergeable") {
+        return await escalateToHuman(task, merge);
+      }
+      return await fail(task, merge, "merge");
+    }
+    const merged = await transition(
+      task,
+      { state: "MERGED", terminalReason: "merged" },
+      `PR merged (${mode})`,
+    );
+    await maybeCleanupWorktree(merged);
+    return merged;
+  }
+
+  /**
+   * Tear down the per-task worktree after a successful merge unless
+   * `preserveWorktreeOnMerge` is set. Cleanup failures are logged but
+   * never re-thrown — the merge is the load-bearing transition; a
+   * stuck worktree is recoverable manually and the FSM has already
+   * persisted `MERGED`.
+   *
+   * Logs a single info line either way so an operator scanning logs
+   * sees what happened to the worktree without grepping multiple
+   * sources.
+   */
+  async function maybeCleanupWorktree(task: Task): Promise<void> {
+    const worktreePath = task.worktreePath;
+    if (worktreePath === undefined) {
+      return;
+    }
+    if (preserveWorktreeOnMerge) {
+      logger.info(
+        `supervisor: preserving worktree for task ${task.id} at ${worktreePath}`,
+      );
+      return;
+    }
+    try {
+      await opts.worktreeManager.removeWorktree(task.id);
+      logger.info(
+        `supervisor: removed worktree for task ${task.id} at ${worktreePath}`,
       );
     } catch (error) {
       logger.warn(
-        `supervisor: mergePullRequest failed for task ${task.id}: ${errorMessage(error)}`,
+        `supervisor: removeWorktree failed for task ${task.id} at ${worktreePath}: ${
+          errorMessage(error)
+        }`,
       );
-      return await fail(task, error, "merge");
     }
+  }
+
+  /**
+   * Drive `task` to `NEEDS_HUMAN`, recording the merge error on
+   * `terminalReason` and the bus's `error` event. Reserved for
+   * non-mergeable PRs — i.e. cases an operator must look at (the
+   * code is not at fault but the PR cannot be merged automatically:
+   * conflicts, base-branch protection, stale head SHA).
+   */
+  async function escalateToHuman(task: Task, error: MergeError): Promise<Task> {
+    publish(opts.eventBus, {
+      taskId: task.id,
+      atIso: clock.nowIso(),
+      kind: "error",
+      data: { message: `merge: ${error.message}` },
+    });
     return await transition(
       task,
-      { state: "MERGED", terminalReason: "merged" },
-      "PR merged",
+      {
+        state: "NEEDS_HUMAN",
+        terminalReason: `merge (not-mergeable): ${error.message}`,
+      },
+      "PR not mergeable; escalating to operator",
     );
   }
 
@@ -1281,6 +2032,79 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     );
   }
 
+  /**
+   * Implementation of {@link TaskSupervisorImpl.mergeReadyTask}.
+   *
+   * Validates the task exists and is at `READY_TO_MERGE` synchronously
+   * (so a `/merge` for a `DRAFTING` or `MERGED` task fails fast with
+   * a precise error), then re-uses {@link runMergeStep} to share the
+   * GitHub call, classification, and cleanup behaviour with the
+   * auto-merge path.
+   *
+   * Concurrent invocations for the same task id are guarded by the
+   * {@link mergeInFlight} set: the first caller registers the id
+   * synchronously after the state check passes; any second caller that
+   * arrives before the first persists its terminal transition fails
+   * fast with `SupervisorErrorKind.merge-in-flight`. The guard is
+   * cleared in a `finally` so an unexpected exception inside
+   * `runMergeStep` cannot strand the id.
+   */
+  async function mergeReadyTask(
+    taskId: TaskId,
+    overrideMode?: MergeMode,
+  ): Promise<Task> {
+    if (overrideMode === "manual") {
+      // `manual` is not a GitHub merge_method (`merge_method` accepts
+      // `merge` / `squash` / `rebase` only). Reject at the entry point
+      // so a caller bug never reaches `runMergeStep`'s defensive check
+      // — that path lands the task in `FAILED`, which would be a
+      // misleading terminal state for what is purely a misuse of the
+      // public API.
+      throw new SupervisorError(
+        "merge-precondition",
+        '/merge overrideMode "manual" is not a GitHub merge strategy; pass "squash" or "rebase"',
+      );
+    }
+    const task = tasks.get(taskId);
+    if (task === undefined) {
+      throw new SupervisorError(
+        "unknown-task",
+        `no task found for id ${taskId}`,
+      );
+    }
+    if (task.state !== "READY_TO_MERGE") {
+      throw new SupervisorError(
+        "not-ready-to-merge",
+        `task ${taskId} is not at READY_TO_MERGE (current state: ${task.state})`,
+      );
+    }
+    if (mergeInFlight.has(taskId)) {
+      throw new SupervisorError(
+        "merge-in-flight",
+        `task ${taskId} already has a /merge in flight; refusing duplicate`,
+      );
+    }
+    // Register before the first `await` so a concurrent caller that
+    // arrives during the same microtask sees the in-flight marker. The
+    // `READY_TO_MERGE` check above and this `add` form a synchronous
+    // pair: only one caller can transition from "state check passed"
+    // to "marker registered" before yielding the event loop.
+    mergeInFlight.add(taskId);
+    try {
+      // The task's recorded `mergeMode` may be `manual` (the typical
+      // case for `/merge`) or one of the auto modes (rare: an operator
+      // can issue `/merge` to force-finish a parked auto-merge task
+      // that was paused mid-flight by daemon restart). Either way, the
+      // GitHub API needs a concrete strategy: `manual` falls back to
+      // `squash` unless the caller overrode it.
+      const mode: MergeMode = overrideMode ??
+        (task.mergeMode === "manual" ? "squash" : task.mergeMode);
+      return await runMergeStep(task, mode);
+    } finally {
+      mergeInFlight.delete(taskId);
+    }
+  }
+
   return {
     start,
     listTasks(): readonly Task[] {
@@ -1289,6 +2113,7 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     getTask(taskId: TaskId): Task | undefined {
       return tasks.get(taskId);
     },
+    mergeReadyTask,
   };
 }
 
@@ -1322,6 +2147,7 @@ function applyTransition(
     readonly terminalReason?: string;
   },
   nowIso: string,
+  lastReviewAtIso?: string,
 ): Task {
   const baseRecord: Task = {
     id: prev.id,
@@ -1356,11 +2182,18 @@ function applyTransition(
   const withSession: Task = (next.sessionId ?? prev.sessionId) !== undefined
     ? { ...withWorktree, sessionId: next.sessionId ?? prev.sessionId as string }
     : withWorktree;
+  // `lastReviewAtIso` is only set by the conversations phase, but any
+  // transition can carry it forward (the FSM never erases the
+  // watermark — once advanced, it stays advanced through to terminal).
+  const resolvedReviewIso = lastReviewAtIso ?? prev.lastReviewAtIso;
+  const withReviewIso: Task = resolvedReviewIso !== undefined
+    ? { ...withSession, lastReviewAtIso: resolvedReviewIso }
+    : withSession;
   const withTerminal: Task = next.terminalReason !== undefined
-    ? { ...withSession, terminalReason: next.terminalReason }
+    ? { ...withReviewIso, terminalReason: next.terminalReason }
     : (prev.terminalReason !== undefined && isTerminal(next.state)
-      ? { ...withSession, terminalReason: prev.terminalReason }
-      : withSession);
+      ? { ...withReviewIso, terminalReason: prev.terminalReason }
+      : withReviewIso);
   return withTerminal;
 }
 
@@ -1401,6 +2234,86 @@ function isTerminal(state: TaskState): boolean {
 }
 
 /**
+ * HTTP status codes the supervisor treats as "PR is genuinely not
+ * mergeable" — i.e. an operator must look at the PR before merging it.
+ *
+ * Per GitHub's [merge a PR](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+ * semantics:
+ *
+ * - {@link HTTP_STATUS_METHOD_NOT_ALLOWED} — the response GitHub sends
+ *   for "Pull Request is not mergeable" (conflicts, missing reviews on
+ *   a protected branch, etc.).
+ * - {@link HTTP_STATUS_CONFLICT} — head SHA mismatch when the caller
+ *   passed `sha`; treated the same way because the underlying state
+ *   requires a fresh PR view to resolve.
+ *
+ * Centralised here (rather than inlined into a string match) so the
+ * unit tests assert against the same constant the production path
+ * keys off. The numeric values themselves live in `src/constants.ts`
+ * per the bare-literal rule documented at the top of that file.
+ */
+export const MERGE_NOT_MERGEABLE_HTTP_STATUSES: readonly number[] = [
+  HTTP_STATUS_METHOD_NOT_ALLOWED,
+  HTTP_STATUS_CONFLICT,
+];
+
+/**
+ * Classify a thrown error from `mergePullRequest` into a
+ * {@link MergeError} carrying a category that drives the FSM
+ * destination state. The classifier inspects:
+ *
+ *  1. Pre-classified `MergeError` instances pass through untouched
+ *     (an already-classified caller wins).
+ *  2. Errors carrying an HTTP `status` (Octokit's `RequestError`
+ *     and similar shapes) get matched against
+ *     {@link MERGE_NOT_MERGEABLE_HTTP_STATUSES}.
+ *  3. Anything else falls back to `transient`.
+ *
+ * Exported alongside the supervisor so unit tests can assert the
+ * mapping directly.
+ *
+ * @param error The raw error thrown by the GitHub client.
+ * @returns A {@link MergeError} ready for FSM consumption.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.mergePullRequest(repo, prNumber, "squash");
+ * } catch (error) {
+ *   const merge = classifyMergeError(error);
+ *   if (merge.category === "not-mergeable") escalateToHuman(task, merge);
+ * }
+ * ```
+ */
+export function classifyMergeError(error: unknown): MergeError {
+  if (error instanceof MergeError) {
+    return error;
+  }
+  const status = readHttpStatus(error);
+  const message = errorMessage(error);
+  if (status !== undefined && MERGE_NOT_MERGEABLE_HTTP_STATUSES.includes(status)) {
+    return new MergeError("not-mergeable", message, { cause: error });
+  }
+  return new MergeError("transient", message, { cause: error });
+}
+
+/**
+ * Best-effort extraction of an HTTP status from an error. Mirrors
+ * `src/github/client.ts`'s reader without importing it (keeps the
+ * supervisor decoupled from the concrete client class).
+ */
+function readHttpStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) {
+    return undefined;
+  }
+  const candidate = error as { status?: unknown };
+  if (typeof candidate.status === "number") {
+    return candidate.status;
+  }
+  return undefined;
+}
+
+/**
  * Reject a duplicate {@link TaskSupervisorImpl.start} call for a
  * `(repo, issueNumber)` pair already tracked by a non-terminal task.
  *
@@ -1418,6 +2331,7 @@ function rejectDuplicateTask(
     }
     if (!isTerminal(task.state)) {
       throw new SupervisorError(
+        "duplicate-start",
         `task already in flight for ${repo}#${issueNumber} (taskId=${task.id}, state=${task.state})`,
       );
     }
@@ -1502,6 +2416,292 @@ export function prBodyFor(issueNumber: IssueNumber): string {
  */
 export function buildInitialDraftPrompt(title: string, body: string): string {
   return `# ${title}\n\n${body}`;
+}
+
+/**
+ * Result the conversations-phase poller surfaces to the caller after a
+ * single tick.
+ *
+ * Exported so unit tests can inspect the same shape the supervisor
+ * consumes; production wiring keeps the type local to the supervisor.
+ */
+export interface ConversationsPollResult {
+  /** Reviews submitted on the PR, in submission order. */
+  readonly reviews: readonly PullRequestReview[];
+  /** Inline review comments on the PR, in creation order. */
+  readonly comments: readonly PullRequestReviewComment[];
+  /**
+   * ISO-8601 timestamp of the most recently created comment, or
+   * `undefined` when the PR has none. The supervisor uses it as the
+   * next watermark when the poll yields.
+   */
+  readonly latestCreatedAtIso?: string;
+}
+
+/**
+ * Build the conversations-phase agent prompt by grouping the new
+ * comments by review thread and emitting a markdown block per thread.
+ *
+ * The grouping key is `threadNodeId` when present (so the agent sees
+ * the same boundaries the supervisor uses to call
+ * {@link StabilizeGitHubClient.resolveReviewThread}), falling back to
+ * the comment's own id when the GraphQL id has not been resolved.
+ * Comments inside a group are listed in their original order.
+ *
+ * Reviews supply preamble headers; per-review-id review bodies appear
+ * as bulleted notes above the threads they cover. Comments without a
+ * matching review (orphans) get a generic "Inline comment" header so
+ * the agent can still address them.
+ *
+ * @param reviews Reviews collected from `listReviews`.
+ * @param comments Inline comments newer than the watermark.
+ * @returns The prompt body the agent runner receives.
+ */
+export function buildConversationsPrompt(
+  reviews: readonly PullRequestReview[],
+  comments: readonly PullRequestReviewComment[],
+): string {
+  const grouped = groupCommentsByThread(comments);
+  const reviewById = new Map<number, PullRequestReview>();
+  for (const review of reviews) {
+    reviewById.set(review.id, review);
+  }
+  const lines: string[] = [
+    "# Address pull-request review feedback",
+    "",
+    "The following review threads need to be addressed. Make the requested changes,",
+    "commit, and push. Each thread starts with the review body (when present) and",
+    "lists every inline comment in order.",
+    "",
+  ];
+  for (const group of grouped) {
+    const headerComment = group.comments[0];
+    if (headerComment === undefined) continue;
+    const reviewId = headerComment.pullRequestReviewId;
+    const review = reviewId !== null ? reviewById.get(reviewId) : undefined;
+    lines.push(
+      `## Thread ${group.key} (${headerComment.path}${
+        headerComment.line !== null ? `:${headerComment.line}` : ""
+      })`,
+    );
+    if (review !== undefined && review.body.length > 0) {
+      lines.push(`> Review by @${review.user} (${review.state}): ${review.body}`);
+      lines.push("");
+    }
+    for (const comment of group.comments) {
+      lines.push(`- @${comment.user}: ${comment.body}`);
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Group `comments` by review thread so the conversations phase can
+ * dispatch one prompt per thread *and* call
+ * {@link StabilizeGitHubClient.resolveReviewThread} once per thread
+ * after the agent push.
+ *
+ * Grouping key is `threadNodeId` when present, otherwise the comment's
+ * own id when it is the root, otherwise `inReplyToId` (a reply joins
+ * its parent's group). Output groups follow first-appearance order so
+ * test assertions over the prompt and the resolve calls are stable.
+ *
+ * @param comments Comments to group.
+ * @returns One group per thread, with the comments inside listed in
+ *   their original order.
+ */
+export function groupCommentsByThread(
+  comments: readonly PullRequestReviewComment[],
+): readonly { readonly key: string; readonly comments: readonly PullRequestReviewComment[] }[] {
+  const groupsByKey = new Map<string, PullRequestReviewComment[]>();
+  const orderedKeys: string[] = [];
+  for (const comment of comments) {
+    const key = comment.threadNodeId ?? `comment-${comment.inReplyToId ?? comment.id}`;
+    let bucket = groupsByKey.get(key);
+    if (bucket === undefined) {
+      bucket = [];
+      groupsByKey.set(key, bucket);
+      orderedKeys.push(key);
+    }
+    bucket.push(comment);
+  }
+  return orderedKeys.map((key) => ({
+    key,
+    comments: groupsByKey.get(key) as PullRequestReviewComment[],
+  }));
+}
+
+/**
+ * Filter `comments` to those strictly newer than `watermark`.
+ *
+ * Comparison uses ISO-8601 lexicographic ordering — the comparison is
+ * `>`, so a comment whose `createdAtIso` ties the watermark is
+ * *excluded* (already accounted for by an earlier tick). When the
+ * watermark is `undefined`, every comment is returned.
+ *
+ * @param comments Candidate comments.
+ * @param watermark High-water mark.
+ * @returns The subset of `comments` strictly newer than `watermark`.
+ */
+export function filterNewComments(
+  comments: readonly PullRequestReviewComment[],
+  watermark: string | undefined,
+): readonly PullRequestReviewComment[] {
+  if (watermark === undefined) return [...comments];
+  return comments.filter((comment) => comment.createdAtIso > watermark);
+}
+
+/**
+ * Combine the existing watermark with the latest timestamp seen on a
+ * fresh poll, returning a value that is **monotonically non-decreasing**
+ * in ISO-8601 lexicographic order. The conversations phase uses this so
+ * a partial GitHub timeline (or a deletion that lowers the freshly-seen
+ * latest timestamp) cannot rewind the persisted high-water mark and
+ * cause already-processed comments to look fresh on the next tick. See
+ * ADR-023 for the rationale.
+ *
+ * Both inputs may be `undefined`; the return reflects whichever side
+ * carries information, biased toward keeping the existing watermark.
+ *
+ * @param current Currently persisted `lastReviewAtIso`.
+ * @param incoming Latest `createdAtIso` from the fresh poll, if any.
+ * @returns The watermark to persist for the next tick.
+ */
+export function monotonicWatermark(
+  current: string | undefined,
+  incoming: string | undefined,
+): string | undefined {
+  if (current === undefined) return incoming;
+  if (incoming === undefined) return current;
+  return incoming > current ? incoming : current;
+}
+
+/**
+ * Return the latest `createdAtIso` across `comments`, or `undefined`
+ * when the array is empty.
+ *
+ * The conversations phase uses this as the next watermark to persist
+ * after a successful poll, so a subsequent resume of the task does not
+ * re-process comments it already saw.
+ *
+ * @param comments Comments collected from `listReviewComments`.
+ * @returns The latest ISO timestamp present, or `undefined`.
+ */
+export function latestCommentTimestamp(
+  comments: readonly PullRequestReviewComment[],
+): string | undefined {
+  let latest: string | undefined;
+  for (const comment of comments) {
+    if (latest === undefined || comment.createdAtIso > latest) {
+      latest = comment.createdAtIso;
+    }
+  }
+  return latest;
+}
+
+/**
+ * Stamp each comment in `comments` with the GraphQL
+ * {@link PullRequestReviewComment.threadNodeId} sourced from `threads`.
+ *
+ * GitHub's REST Pulls Comments API does not expose the GraphQL thread
+ * node id that {@link StabilizeGitHubClient.resolveReviewThread}
+ * requires. The supervisor calls
+ * {@link StabilizeGitHubClient.listReviewThreads} alongside
+ * `listReviewComments` and uses this helper to join the two on the REST
+ * comment id. A comment that already carries a `threadNodeId` (e.g.
+ * supplied directly by a test fixture or a future client that augments
+ * the REST listing itself) keeps its existing value — the join only
+ * fills `undefined` slots so callers can layer their own mapping on top
+ * if they ever need to. A comment with no matching thread stays
+ * `threadNodeId: undefined`; the conversations phase treats that as
+ * "thread not GraphQL-addressable yet" and skips the resolve call.
+ *
+ * Exported so unit tests can pin the join behavior independently of the
+ * supervisor's poll wiring.
+ *
+ * @param comments REST review comments, in their original order.
+ * @param threads GraphQL review threads, each carrying the REST comment
+ *   ids it covers.
+ * @returns A new array of comments with `threadNodeId` populated where
+ *   the join could supply one.
+ */
+export function joinCommentsWithThreads(
+  comments: readonly PullRequestReviewComment[],
+  threads: readonly PullRequestReviewThread[],
+): readonly PullRequestReviewComment[] {
+  if (comments.length === 0) return [];
+  // Build the join index up front — `O(threads * commentIds)` once, then
+  // `O(1)` per comment. The map's value is the first thread id seen for
+  // each comment id; in practice GitHub guarantees a comment belongs to
+  // at most one thread, but the deterministic "first wins" rule makes
+  // the behavior robust to a malformed payload.
+  const commentToThread = new Map<number, string>();
+  for (const thread of threads) {
+    for (const commentId of thread.commentIds) {
+      if (!commentToThread.has(commentId)) {
+        commentToThread.set(commentId, thread.id);
+      }
+    }
+  }
+  return comments.map((comment) => {
+    if (comment.threadNodeId !== undefined) {
+      // Test seam / future augmentation already supplied a thread id;
+      // do not overwrite it.
+      return comment;
+    }
+    const threadId = commentToThread.get(comment.id);
+    if (threadId === undefined) return comment;
+    return { ...comment, threadNodeId: threadId };
+  });
+}
+
+/**
+ * Narrow a {@link GitHubClient} to a {@link StabilizeGitHubClient}.
+ *
+ * The supervisor accepts the W1 `GitHubClient` contract on
+ * construction (so consumers that never enter the stabilize loop can
+ * pass the narrower interface), but the conversations phase needs the
+ * additive review-listing and thread-resolution methods. This guard
+ * checks for them at runtime so a misconfigured supervisor surfaces a
+ * loud `FAILED` instead of a `TypeError` deep inside the loop.
+ */
+function isStabilizeClient(client: GitHubClient): client is StabilizeGitHubClient {
+  const candidate = client as Partial<StabilizeGitHubClient>;
+  return typeof candidate.listReviews === "function" &&
+    typeof candidate.listReviewComments === "function" &&
+    typeof candidate.listReviewThreads === "function" &&
+    typeof candidate.resolveReviewThread === "function";
+}
+
+/**
+ * Format the `terminalReason` recorded on a task that the rebase phase
+ * surrendered to `NEEDS_HUMAN` after exhausting its iteration budget.
+ *
+ * The reason names every conflicting file the agent could not resolve
+ * in a comma-separated inline list after a single-sentence summary, so
+ * the TUI's status bar (and any operator inspecting persistence) sees
+ * the actionable file list on a single line without parsing the rebase
+ * phase's internal state. Centralised so unit tests can assert against
+ * the same constant the production code emits.
+ *
+ * @param conflictingFiles Worktree-relative paths still carrying
+ *   conflict markers when the iteration budget exhausted.
+ * @returns Human-readable summary suitable for `Task.terminalReason`.
+ *
+ * @example
+ * ```ts
+ * formatRebaseNeedsHumanReason(["src/a.ts", "src/b.ts"]);
+ * // "stabilize-rebase: conflicts unresolved after agent iteration budget; files: src/a.ts, src/b.ts"
+ * ```
+ */
+export function formatRebaseNeedsHumanReason(
+  conflictingFiles: readonly string[],
+): string {
+  const filesPart = conflictingFiles.length === 0
+    ? "no files reported"
+    : `files: ${conflictingFiles.join(", ")}`;
+  return `stabilize-rebase: conflicts unresolved after agent iteration budget; ${filesPart}`;
 }
 
 /**

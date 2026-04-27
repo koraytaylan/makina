@@ -32,15 +32,18 @@ import {
   COPILOT_REVIEWER_LOGIN,
   createTaskSupervisor,
   DEFAULT_BASE_BRANCH,
+  formatRebaseNeedsHumanReason,
   prBodyFor,
   prTitleFor,
   type SupervisorClock,
   SupervisorError,
   type SupervisorRandomSource,
 } from "../../src/daemon/supervisor.ts";
+import type { GitInvocationResult, StabilizeGitInvoker } from "../../src/daemon/stabilize.ts";
 import { createEventBus } from "../../src/daemon/event-bus.ts";
 import { createPersistence } from "../../src/daemon/persistence.ts";
 import { createWorktreeManager } from "../../src/daemon/worktree-manager.ts";
+import { MAX_TASK_ITERATIONS } from "../../src/constants.ts";
 import {
   type IssueNumber,
   makeIssueNumber,
@@ -196,6 +199,13 @@ function scriptHappyPath(rig: SupervisorTestRig): void {
     kind: "value",
     value: { state: "success", sha: "deadbeefcafe" },
   });
+  // Wave 4 (#17): the conversations sub-phase polls listReviews +
+  // listReviewComments + listReviewThreads. The happy path returns no
+  // reviews / no comments / no threads, so the phase exits without
+  // dispatching the agent and the FSM advances to READY_TO_MERGE.
+  rig.githubClient.queueListReviews({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
   rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
 }
 
@@ -261,6 +271,11 @@ Deno.test(
         cloneUrlFor: () => rig.source.url,
         clock: rig.clock,
         randomSource: new FixedRandomSource(),
+        // Preserve the worktree across the happy path so the
+        // `Deno.stat(worktreePath)` assertion below still passes.
+        // Cleanup behaviour (default: tear down on merge) has its
+        // own dedicated coverage in `tests/unit/merge_modes_test.ts`.
+        preserveWorktreeOnMerge: true,
       });
 
       const finalTask = await supervisor.start({
@@ -305,7 +320,11 @@ Deno.test(
         // PR open → STABILIZING after the Copilot reviewer is
         // requested.
         { fromState: "PR_OPEN", toState: "STABILIZING" },
-        // Three stub stabilize sub-phases (REBASE → CI → CONVERSATIONS).
+        // Three stabilize sub-phases (REBASE → CI → CONVERSATIONS).
+        // REBASE and CI are still stubs (#15, #16); CONVERSATIONS
+        // (#17) emits its own entry transition then runs the inner
+        // poll loop, which with no review feedback queued exits after
+        // one empty poll without further self-transitions.
         { fromState: "STABILIZING", toState: "STABILIZING" },
         { fromState: "STABILIZING", toState: "STABILIZING" },
         { fromState: "STABILIZING", toState: "STABILIZING" },
@@ -315,7 +334,7 @@ Deno.test(
 
       // Stabilize sub-phase labels appear on the bus in order. The
       // first PR_OPEN→STABILIZING transition records `REBASE`, then
-      // three stub-driven self-transitions cycle through
+      // three stub-or-entry self-transitions cycle through
       // `REBASE → CI → CONVERSATIONS`.
       const stabilizePhases: string[] = [];
       for (const event of rig.events) {
@@ -545,13 +564,17 @@ Deno.test(
         },
       });
       fresh.queueRequestReviewers({ kind: "value", value: undefined });
-      // The manual-merge happy path still runs the stabilize-CI phase
-      // before stopping at READY_TO_MERGE; script a green CI reply so
-      // the phase completes without dispatching the agent.
+      // The manual-merge happy path still runs the stabilize phases
+      // (CI then conversations) before stopping at READY_TO_MERGE.
+      // Script green CI + empty conversations replies so the phases
+      // complete without dispatching the agent.
       fresh.queueGetCombinedStatus({
         kind: "value",
         value: { state: "success", sha: "abcdef" },
       });
+      fresh.queueListReviews({ kind: "value", value: [] });
+      fresh.queueListReviewComments({ kind: "value", value: [] });
+      fresh.queueListReviewThreads({ kind: "value", value: [] });
       scriptDraftingRun(rig);
 
       const bus = createEventBus();
@@ -699,13 +722,17 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
-      // Stabilize CI must complete before mergePullRequest fires; script
-      // a green CI on the first poll so the supervisor reaches the
+      // Stabilize CI + CONVERSATIONS must complete before
+      // mergePullRequest fires; script a green CI + empty
+      // conversations on the first poll so the supervisor reaches the
       // merge step.
       rig.githubClient.queueGetCombinedStatus({
         kind: "value",
         value: { state: "success", sha: "13" },
       });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({
         kind: "error",
         error: new Error("405 Method Not Allowed: not mergeable"),
@@ -744,6 +771,224 @@ Deno.test(
 );
 
 Deno.test(
+  "supervisor lands the task in NEEDS_HUMAN when the rebase phase exhausts its budget",
+  async () => {
+    const rig = await makeRig();
+    try {
+      // Use a fresh GitHub client (not `rig.githubClient` via
+      // `scriptHappyPath`) because NEEDS_HUMAN means we never reach
+      // merge, so we deliberately do NOT queue a `mergePullRequest`
+      // reply: an unexpected merge attempt would surface as
+      // "no scripted reply queued" and fail the test loudly.
+      const fresh = new InMemoryGitHubClient();
+      fresh.queueGetIssue({
+        kind: "value",
+        value: {
+          number: rig.issueNumber,
+          title: "Conflict scenario",
+          body: "Body.",
+          state: "open",
+        },
+      });
+      fresh.queueCreatePullRequest({
+        kind: "value",
+        value: {
+          number: makeIssueNumber(11),
+          headSha: "deadbeef",
+          headRef: branchNameFor(rig.issueNumber),
+          baseRef: DEFAULT_BASE_BRANCH,
+          state: "open",
+        },
+      });
+      fresh.queueRequestReviewers({ kind: "value", value: undefined });
+      scriptDraftingRun(rig);
+
+      // Pattern-matching git invoker that always reports conflicts so
+      // the rebase phase exhausts its iteration budget. Each call
+      // returns the right reply for the argv shape; the rebase phase
+      // loops MAX_TASK_ITERATIONS times before surrendering.
+      const SUCCESS: GitInvocationResult = { exitCode: 0, stdout: "", stderr: "" };
+      const conflictingDiff: GitInvocationResult = {
+        exitCode: 0,
+        stdout: "src/conflict.ts\n",
+        stderr: "",
+      };
+      const invoker: StabilizeGitInvoker = (args, _options) => {
+        if (args[0] === "fetch") return Promise.resolve(SUCCESS);
+        if (args[0] === "rev-parse") {
+          // The rebase phase captures the base-branch SHA right after
+          // fetch so the conflict prompt can embed it. Stub a stable
+          // value so the loop keeps iterating into the conflict path.
+          return Promise.resolve({
+            exitCode: 0,
+            stdout: "feedfacefeedfacefeedfacefeedfacefeedface\n",
+            stderr: "",
+          });
+        }
+        if (args[0] === "rebase") {
+          if (args[1] === "--continue") {
+            return Promise.resolve({
+              exitCode: 1,
+              stdout: "",
+              stderr: "still conflicting",
+            });
+          }
+          if (args[1] === "--abort") return Promise.resolve(SUCCESS);
+          // Initial `git rebase <ref>` — emit a conflict so the loop
+          // enters the agent-resolve path on the first pass.
+          return Promise.resolve({
+            exitCode: 1,
+            stdout: "",
+            stderr: "CONFLICT",
+          });
+        }
+        if (args[0] === "diff") return Promise.resolve(conflictingDiff);
+        if (args[0] === "add") return Promise.resolve(SUCCESS);
+        return Promise.reject(
+          new Error(`unexpected git invocation: git ${args.join(" ")}`),
+        );
+      };
+
+      // Queue an agent run for every iteration the budget allows. We
+      // queue MAX_TASK_ITERATIONS runs (the default budget) so each
+      // iteration's MockAgentRunner.runAgent finds a scripted reply.
+      for (let i = 0; i < MAX_TASK_ITERATIONS; i += 1) {
+        rig.agentRunner.queueRun({
+          messages: [{ role: "assistant", text: `iteration ${i + 1}` }],
+        });
+      }
+
+      const bus = createEventBus();
+      const subscription = recordEvents(rig, bus);
+      const persistence = createPersistence({ path: rig.statePath });
+      const worktreeManager = createWorktreeManager({ workspace: rig.workspace });
+
+      const supervisor = createTaskSupervisor({
+        githubClient: fresh,
+        worktreeManager,
+        persistence,
+        eventBus: bus,
+        agentRunner: rig.agentRunner,
+        cloneUrlFor: () => rig.source.url,
+        clock: rig.clock,
+        randomSource: new FixedRandomSource(),
+        gitInvoker: invoker,
+        conflictFileReader: () =>
+          Promise.resolve(
+            "<<<<<<< HEAD\nour\n=======\ntheir\n>>>>>>> origin/main\n",
+          ),
+      });
+
+      const finalTask = await supervisor.start({
+        repo: rig.repo,
+        issueNumber: rig.issueNumber,
+      });
+
+      assertEquals(finalTask.state, "NEEDS_HUMAN");
+      assert(
+        finalTask.terminalReason !== undefined &&
+          finalTask.terminalReason.includes("stabilize-rebase") &&
+          finalTask.terminalReason.includes("src/conflict.ts"),
+        `expected rebase NEEDS_HUMAN reason; got ${finalTask.terminalReason}`,
+      );
+      assertEquals(
+        finalTask.terminalReason,
+        formatRebaseNeedsHumanReason(["src/conflict.ts"]),
+      );
+
+      // The worktree directory is preserved (Lesson #15: the rebase
+      // phase aborts the rebase but never tears the worktree down).
+      const stat = await Deno.stat(finalTask.worktreePath as string);
+      assert(stat.isDirectory);
+
+      // Persistence carries the NEEDS_HUMAN record.
+      const replay = await persistence.loadAll();
+      assertEquals(replay.length, 1);
+      assertEquals(replay[0]?.state, "NEEDS_HUMAN");
+
+      // No merge attempt was made.
+      const calls = fresh.recordedCalls();
+      assert(
+        !calls.some((call) => call.method === "mergePullRequest"),
+        "mergePullRequest must not be invoked when the rebase phase escalates",
+      );
+
+      subscription.unsubscribe();
+    } finally {
+      await rig.cleanup();
+    }
+  },
+);
+
+Deno.test(
+  "supervisor lands the task in FAILED when git fetch errors during the rebase phase",
+  async () => {
+    const rig = await makeRig();
+    try {
+      const fresh = new InMemoryGitHubClient();
+      fresh.queueGetIssue({
+        kind: "value",
+        value: {
+          number: rig.issueNumber,
+          title: "Fetch failure",
+          body: "Body.",
+          state: "open",
+        },
+      });
+      fresh.queueCreatePullRequest({
+        kind: "value",
+        value: {
+          number: makeIssueNumber(13),
+          headSha: "abc",
+          headRef: branchNameFor(rig.issueNumber),
+          baseRef: DEFAULT_BASE_BRANCH,
+          state: "open",
+        },
+      });
+      fresh.queueRequestReviewers({ kind: "value", value: undefined });
+      scriptDraftingRun(rig);
+
+      const invoker: StabilizeGitInvoker = (_args, _options) =>
+        Promise.resolve({
+          exitCode: 128,
+          stdout: "",
+          stderr: "fatal: could not read from remote",
+        });
+
+      const bus = createEventBus();
+      const persistence = createPersistence({ path: rig.statePath });
+      const worktreeManager = createWorktreeManager({ workspace: rig.workspace });
+
+      const supervisor = createTaskSupervisor({
+        githubClient: fresh,
+        worktreeManager,
+        persistence,
+        eventBus: bus,
+        agentRunner: rig.agentRunner,
+        cloneUrlFor: () => rig.source.url,
+        clock: rig.clock,
+        randomSource: new FixedRandomSource(),
+        gitInvoker: invoker,
+      });
+
+      const finalTask = await supervisor.start({
+        repo: rig.repo,
+        issueNumber: rig.issueNumber,
+      });
+
+      assertEquals(finalTask.state, "FAILED");
+      assert(
+        finalTask.terminalReason !== undefined &&
+          finalTask.terminalReason.startsWith("stabilize-rebase-fetch:"),
+        `expected stabilize-rebase-fetch terminalReason; got ${finalTask.terminalReason}`,
+      );
+    } finally {
+      await rig.cleanup();
+    }
+  },
+);
+
+Deno.test(
   "supervisor allows a fresh start once the prior task reaches a terminal state",
   async () => {
     const rig = await makeRig();
@@ -774,11 +1019,16 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
-      // Stabilize CI: green-on-first-poll for the round-2 happy path.
+      // Stabilize CI + CONVERSATIONS: green-on-first-poll for the
+      // round-2 happy path; empty conversations so the loop exits
+      // immediately.
       rig.githubClient.queueGetCombinedStatus({
         kind: "value",
         value: { state: "success", sha: "abc" },
       });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       rig.agentRunner.queueRun({ messages: [{ role: "assistant", text: "ok" }] });
 
@@ -852,11 +1102,15 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
-      // Stabilize CI: green-on-first-poll for the first run.
+      // Stabilize CI + CONVERSATIONS: green-on-first-poll + empty
+      // conversations for the first run.
       rig.githubClient.queueGetCombinedStatus({
         kind: "value",
         value: { state: "success", sha: "x" },
       });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       scriptDraftingRun(rig);
 
@@ -916,11 +1170,15 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
-      // Stabilize CI: green-on-first-poll for the round-2 happy path.
+      // Stabilize CI + CONVERSATIONS: green-on-first-poll + empty
+      // conversations for the round-2 happy path.
       rig.githubClient.queueGetCombinedStatus({
         kind: "value",
         value: { state: "success", sha: "y" },
       });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       rig.agentRunner.queueRun({
         messages: [{ role: "assistant", text: "round 2" }],

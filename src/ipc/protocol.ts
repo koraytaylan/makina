@@ -166,6 +166,16 @@ export interface GitHubCallData {
   readonly statusCode?: number | undefined;
   /** Wall-clock duration of the request, in milliseconds. */
   readonly durationMilliseconds?: number | undefined;
+  /**
+   * Single-line error message when the call rejected (network error,
+   * 4xx/5xx that the client surfaces, JSON parse failure, etc.).
+   * Absent on successful calls. Mirrors
+   * {@link "../types.ts".GitHubCallPayload.error} so the daemon can
+   * publish a `github-call` event for a failing request and the IPC
+   * codec round-trips it through the strict validator without
+   * stripping or rejecting the field.
+   */
+  readonly error?: string | undefined;
 }
 
 /** Per-kind data payload for an `error` event. */
@@ -387,6 +397,7 @@ const githubCallDataSchema: z.ZodType<GitHubCallData, z.ZodTypeDef, unknown> = z
     endpoint: z.string().min(1),
     statusCode: z.number().int().optional(),
     durationMilliseconds: z.number().nonnegative().optional(),
+    error: z.string().optional(),
   })
   .strict();
 

@@ -457,3 +457,74 @@ export const HOURS_PER_DAY = 24;
  * dominant content of the open palette.
  */
 export const COMMAND_PALETTE_SUGGESTION_WIDTH_CODE_UNITS = 160;
+
+/**
+ * Exit code that `git` (and POSIX processes generally) report on
+ * successful invocations.
+ *
+ * Centralised so the rebase phase reads
+ * `result.exitCode === STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE`
+ * instead of a bare `0`, matching the bare-numeric-literal rule at
+ * the top of this file.
+ */
+export const STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE = 0;
+
+/**
+ * Maximum number of UTF-16 code units (characters) of each conflicting
+ * file the rebase-phase conflict prompt embeds for the agent.
+ *
+ * The truncation is performed via `String.prototype.slice`, which
+ * operates on UTF-16 code units rather than bytes. For ASCII-heavy
+ * source files (the dominant case for codebase content) the byte and
+ * character counts are equivalent; for files containing non-BMP code
+ * points (emoji, surrogate pairs) the budget cap may be exceeded by up
+ * to one code unit at the slice boundary if a surrogate pair is split.
+ * Conflict markers and surrounding context fit comfortably inside 16Ki
+ * code units for nearly every codebase file the daemon will see; larger
+ * files are truncated with an ellipsis token so the agent prompt stays
+ * bounded. The agent can read the full file via its tools if it needs
+ * to.
+ */
+export const STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS = 16_384;
+
+/**
+ * First line of the conflict-context prompt sent to the agent during
+ * the rebase phase. Centralised so the unit tests can match against
+ * the same string the production code emits.
+ *
+ * The agent is told it is mid-rebase, that conflict markers in the
+ * worktree need resolving, and that it must not run any git commands
+ * itself. The daemon will resume the rebase once the agent settles.
+ */
+export const STABILIZE_REBASE_CONFLICT_PROMPT_HEAD: string =
+  "You are resolving merge conflicts during a `git rebase`. " +
+  "The worktree has files with conflict markers (<<<<<<<, =======, >>>>>>>). " +
+  "Edit each file to resolve the conflicts, preserving the intent of both sides where possible. " +
+  "Do NOT run `git add`, `git commit`, or `git rebase` — the daemon will continue the rebase " +
+  "after you settle.";
+
+/**
+ * HTTP `405 Method Not Allowed` — the response GitHub returns from the
+ * [merge a PR endpoint](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+ * when the pull request is not in a mergeable state (conflicts, missing
+ * reviews on a protected branch, stale head SHA, etc.).
+ *
+ * The supervisor's `classifyMergeError` keys off this status to escalate
+ * the task to `NEEDS_HUMAN`. Centralised here so neither the source
+ * module nor its unit tests carry the bare numeric literal.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/021-merge-modes-failure-classification.md ADR-021}.
+ */
+export const HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
+
+/**
+ * HTTP `409 Conflict` — returned by GitHub's merge endpoint when the
+ * caller passed a `sha` that no longer matches the PR's head (a fresh
+ * commit landed between read and merge). Treated the same as `405` by
+ * the supervisor: the task escalates to `NEEDS_HUMAN` because the
+ * underlying state needs an operator's eyes before another merge
+ * attempt.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/021-merge-modes-failure-classification.md ADR-021}.
+ */
+export const HTTP_STATUS_CONFLICT = 409;

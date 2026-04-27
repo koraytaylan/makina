@@ -52,10 +52,29 @@ import {
 import type { CheckRunSummary, StabilizeGitHubClient } from "../../src/github/client.ts";
 import { PollerError, type PollerImpl } from "../../src/daemon/poller.ts";
 import { decodeCheckRunLogs } from "../../src/daemon/supervisor.ts";
+import type { StabilizeGitInvoker } from "../../src/daemon/stabilize.ts";
 import { STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS } from "../../src/constants.ts";
 import { InMemoryGitHubClient } from "../helpers/in_memory_github_client.ts";
 import { MockAgentRunner } from "../helpers/mock_agent_runner.ts";
 import { STABILIZE_CI_LOG_BUDGET_BYTES } from "../../src/constants.ts";
+
+/**
+ * Always-clean rebase stub. The CI tests exercise the supervisor's CI
+ * branches; the stabilize-rebase phase has its own coverage in
+ * `tests/unit/stabilize_rebase_test.ts`. Short-circuit `git fetch` /
+ * `git rev-parse` / `git rebase` so the CI tests reach
+ * `STABILIZING(CI)` without needing a real worktree on disk.
+ */
+const ALWAYS_CLEAN_REBASE_INVOKER: StabilizeGitInvoker = (args, _options) => {
+  if (args[0] === "rev-parse") {
+    return Promise.resolve({
+      exitCode: 0,
+      stdout: "deadbeefcafebabe0123456789abcdef01234567\n",
+      stderr: "",
+    });
+  }
+  return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+};
 
 // ---------------------------------------------------------------------------
 // Test rig
@@ -241,6 +260,7 @@ function makeSupervisor(rig: CiTestRig, opts: {
     randomSource: new FixedRandomSource(),
     poller: syncPoller(),
     pollIntervalMilliseconds: 1,
+    gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
     ...(opts.maxIterations !== undefined ? { maxIterations: opts.maxIterations } : {}),
     resolveHeadSha: (task: Task) => {
       // The drafting phase bumps `iterationCount` to 1 before the CI
@@ -269,6 +289,10 @@ Deno.test("stabilize CI green-on-first-poll completes the phase without dispatch
     kind: "value",
     value: { state: "success", sha: rig.headShas[0] ?? "sha-initial" },
   });
+  // CONVERSATIONS sub-phase: queue an empty timeline so it converges.
+  rig.githubClient.queueListReviews({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
   rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
 
   const subscription = recordEvents(rig);
@@ -333,6 +357,10 @@ Deno.test("stabilize CI red-then-fixed dispatches the agent once and re-polls th
     kind: "value",
     value: { state: "success", sha: "sha-after-fix" },
   });
+  // CONVERSATIONS sub-phase: queue an empty timeline so it converges.
+  rig.githubClient.queueListReviews({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
   rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
 
   const subscription = recordEvents(rig);
@@ -611,6 +639,7 @@ Deno.test("stabilize CI requires a StabilizeGitHubClient and fails the task othe
     randomSource: new FixedRandomSource(),
     poller: syncPoller(),
     pollIntervalMilliseconds: 1,
+    gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
   });
   const subscription = recordEvents(rig);
   const finalTask = await supervisor.start({
@@ -655,6 +684,7 @@ Deno.test("ci-precondition message lists every required StabilizeGitHubClient me
     randomSource: new FixedRandomSource(),
     poller: syncPoller(),
     pollIntervalMilliseconds: 1,
+    gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
   });
   const finalTask = await supervisor.start({
     repo: makeRepoFullName("o/r"),
@@ -729,6 +759,10 @@ Deno.test("stabilize CI ignores rate-limited PollerErrors when accumulating cons
     kind: "value",
     value: { state: "success", sha: rig.headShas[0] ?? "sha-initial" },
   });
+  // CONVERSATIONS sub-phase: queue an empty timeline so it converges.
+  rig.githubClient.queueListReviews({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
   rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
   const subscription = recordEvents(rig);
   const supervisor = makeSupervisor(rig);
@@ -770,6 +804,7 @@ Deno.test("stabilize CI surfaces a synchronous poller throw as a fatal outcome",
     randomSource: new FixedRandomSource(),
     poller: throwingPoller,
     pollIntervalMilliseconds: 1,
+    gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
   });
   const finalTask = await supervisor.start({
     repo: makeRepoFullName("o/r"),
