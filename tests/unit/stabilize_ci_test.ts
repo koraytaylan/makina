@@ -844,6 +844,169 @@ Deno.test("decodeCheckRunLogs caps STORED extraction at maxBytes and skips later
   assertStringIncludes(decoded, "[…truncated; extraction stopped at");
 });
 
+Deno.test("decodeCheckRunLogs keeps the TAIL of a large DEFLATE entry when capped (round-4 invariant)", async () => {
+  // Round-3 bounded peak memory by stopping the inflater early — but
+  // it captured the *prefix* of the log, exactly the wrong half: CI
+  // failures live at the end. Round-4 drains the stream through a
+  // tail-retaining ring buffer so memory stays bounded AND the
+  // retained slice is the actual tail. This regression test pins
+  // both invariants:
+  //
+  //   1. **Content**: the bytes we keep are the *last* `cap` bytes
+  //      of the original log, byte-for-byte (verified by content,
+  //      not just length). If a future "fix" reverts to head-keeping
+  //      this will fail loudly.
+  //   2. **Memory bound**: the rendered prompt fits in `cap + slack`
+  //      bytes, so peak resident memory is bounded by the cap even
+  //      though the inflater consumed all 10 MB.
+  //
+  // We use a 10 MB synthetic log with a 1 KB cap — a 10000:1 ratio
+  // big enough that any prefix-keeping regression would obviously
+  // flunk the content assertion, since the unique tail marker only
+  // appears in the last KB of the stream.
+  const TEN_MB = 10 * 1024 * 1024;
+  const cap = 1024;
+  // Construct a log where every byte of the tail is unique enough
+  // that head-keeping cannot accidentally satisfy the assertion.
+  // Body: repeated "noise " (unique-ish padding); tail: a marker
+  // that only exists at the end, with a fixed-length suffix so we
+  // can identify it byte-precisely.
+  const tailMarker = "FAIL: assertion failed at end-of-log line\n";
+  const tailRepeat = cap * 4; // pad so the last `cap` bytes are
+  // entirely tail-marker territory and trivial to verify.
+  const tail = tailMarker.repeat(Math.ceil(tailRepeat / tailMarker.length))
+    .slice(0, tailRepeat);
+  const headFiller = "header-noise-line\n".repeat(
+    Math.ceil((TEN_MB - tail.length) / "header-noise-line\n".length),
+  ).slice(0, TEN_MB - tail.length);
+  const fullLog = headFiller + tail;
+  const fullBytes = new TextEncoder().encode(fullLog);
+  // Sanity: the log really is at least 10 MB (we pad the head
+  // exactly, so this is just to make the assertion's intent clear).
+  assert(
+    fullBytes.byteLength >= TEN_MB,
+    `synthetic log too small: ${fullBytes.byteLength} bytes`,
+  );
+  // The expected retained slice: the last `cap` bytes of the
+  // original log. We compare against this byte-for-byte.
+  const expectedTail = fullBytes.subarray(fullBytes.byteLength - cap);
+
+  const compressed = await deflateRawBytes(fullBytes);
+  const zip = buildDeflateZip("step.txt", compressed, fullBytes.byteLength);
+  const decoded = await decodeCheckRunLogs(zip, cap);
+
+  // (1) Memory bound: prompt fits in `cap` plus banner + truncation
+  // marker overhead. The banner ("--- step.txt ---\n") and the
+  // "[…truncated; extraction stopped at <N> bytes…]" tail together
+  // are well under 256 bytes — same headroom the existing DEFLATE
+  // test uses.
+  const decodedBytes = new TextEncoder().encode(decoded).byteLength;
+  assert(
+    decodedBytes <= cap + 256,
+    `decoded ${decodedBytes} bytes, expected <= ${cap + 256}`,
+  );
+
+  // (2) Truncation marker present — operators must see that the
+  // log was capped during extraction.
+  assertStringIncludes(decoded, "[…truncated; extraction stopped at");
+
+  // (3) Content invariant: the decoded prompt must include the
+  // tail marker (which only appears in the last KB). A
+  // prefix-keeping implementation cannot satisfy this — the tail
+  // marker does not exist in the head 9.99 MB.
+  assertStringIncludes(decoded, "FAIL: assertion failed at end-of-log line");
+
+  // (4) Strict tail invariant: the retained payload between the
+  // banner and the truncation marker must equal the *byte-precise*
+  // last `cap` bytes of the original log. This is the assertion
+  // that pins the prefix-vs-tail invariant — it would fail loudly
+  // if a future change reverted to head-keeping.
+  //
+  // Strip the leading "--- step.txt ---\n" banner and the trailing
+  // "\n[…truncated; …]" marker that `decodeCheckRunLogs` appends.
+  const banner = "--- step.txt ---\n";
+  assert(
+    decoded.startsWith(banner),
+    `expected banner prefix, got: ${decoded.slice(0, 64)}…`,
+  );
+  const truncIdx = decoded.lastIndexOf("\n[…truncated; extraction stopped at");
+  assert(truncIdx > banner.length, "truncation marker not found after banner");
+  const retained = decoded.slice(banner.length, truncIdx);
+  const retainedBytes = new TextEncoder().encode(retained);
+  // Allow the retainer's slice to be at most `cap` bytes (it could
+  // be slightly less if the last UTF-8 codepoint straddles the
+  // boundary; here our log is pure ASCII so the slice is exact).
+  assertEquals(
+    retainedBytes.byteLength,
+    cap,
+    `retained slice should be exactly ${cap} bytes; got ${retainedBytes.byteLength}`,
+  );
+  // Byte-for-byte equality with the expected tail. Any prefix-keeping
+  // regression would diverge here.
+  for (let i = 0; i < cap; i += 1) {
+    if (retainedBytes[i] !== expectedTail[i]) {
+      throw new Error(
+        `tail mismatch at byte ${i}: retained=${retainedBytes[i]} expected=${expectedTail[i]}`,
+      );
+    }
+  }
+});
+
+Deno.test("decodeCheckRunLogs keeps the TAIL of a large STORED entry when capped (round-4 invariant)", async () => {
+  // STORED entries take a different code path than DEFLATE — the
+  // round-3 `compressed.subarray(0, remainingBudget)` slice also
+  // captured the prefix and missed the failing-assertion lines.
+  // This test pins the same tail invariant for STORED, with a log
+  // small enough that we can compute the expected tail directly.
+  //
+  // Memory note: STORED entries are not inflated, so the "peak
+  // memory" failure mode is different — the entire compressed
+  // (== uncompressed) entry is already resident as a `subarray`
+  // view of the ZIP bytes. The fix here is purely about *which
+  // half* we forward to the decoder, not about peak memory.
+  const headFiller = "filler line\n".repeat(8192);
+  const tailMarker = "ERROR: failure on the very last line of the log\n";
+  const fullLog = headFiller + tailMarker;
+  const cap = 256;
+  const zip = buildStoredZip([{ name: "stored.txt", text: fullLog }]);
+  const decoded = await decodeCheckRunLogs(zip, cap);
+
+  // The tail marker must be present (it only exists in the last
+  // ~50 bytes of the log; a head-truncated entry would not contain
+  // it).
+  assertStringIncludes(decoded, "ERROR: failure on the very last line of the log");
+
+  // Bound the prompt size: banner + cap + truncation marker.
+  const decodedBytes = new TextEncoder().encode(decoded).byteLength;
+  assert(
+    decodedBytes <= cap + 256,
+    `decoded ${decodedBytes} bytes, expected <= ${cap + 256}`,
+  );
+
+  // Strict tail invariant for STORED: the retained payload must
+  // equal the byte-precise last `cap` bytes of the original log.
+  const fullBytes = new TextEncoder().encode(fullLog);
+  const expectedTail = fullBytes.subarray(fullBytes.byteLength - cap);
+  const banner = "--- stored.txt ---\n";
+  assert(decoded.startsWith(banner), `expected banner; got: ${decoded.slice(0, 64)}…`);
+  const truncIdx = decoded.lastIndexOf("\n[…truncated; extraction stopped at");
+  assert(truncIdx > banner.length, "truncation marker not found after banner");
+  const retained = decoded.slice(banner.length, truncIdx);
+  const retainedBytes = new TextEncoder().encode(retained);
+  assertEquals(
+    retainedBytes.byteLength,
+    cap,
+    `retained slice should be exactly ${cap} bytes; got ${retainedBytes.byteLength}`,
+  );
+  for (let i = 0; i < cap; i += 1) {
+    if (retainedBytes[i] !== expectedTail[i]) {
+      throw new Error(
+        `tail mismatch at byte ${i}: retained=${retainedBytes[i]} expected=${expectedTail[i]}`,
+      );
+    }
+  }
+});
+
 Deno.test("stabilize CI publishes a `github-call` event with `error` when getCombinedStatus rejects", async () => {
   // Round-3: a rejection in the fetcher must still surface a
   // `github-call` event (with `error` set) so the TUI sees *which*

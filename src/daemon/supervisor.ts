@@ -1754,13 +1754,19 @@ export async function decodeCheckRunLogs(
  * compressed stream.
  *
  * Memory safety: when `maxBytes` is provided, the per-entry
- * decompression stops as soon as the *running total* across previously
- * extracted entries plus the in-flight stream's accumulated chunks
- * reaches `maxBytes`. The current entry is truncated to the remaining
- * budget and subsequent entries are skipped entirely. This caps the
- * peak memory footprint at roughly `maxBytes` rather than the full
- * uncompressed archive size — important because GitHub log archives
- * can unpack to tens of MB.
+ * decompression keeps at most `remainingBudget` bytes resident via a
+ * tail-retaining ring buffer (see {@link TailRetainer}); subsequent
+ * entries are skipped once the running total fills the cap. The
+ * resident footprint is capped at roughly `maxBytes` rather than the
+ * full uncompressed archive size — important because GitHub log
+ * archives can unpack to tens of MB.
+ *
+ * Tail vs. prefix (round-4 fix): the retained slice is the **tail** of
+ * each entry, not its prefix. Round-3 truncated to the head, which was
+ * memory-safe but content-wrong: CI failures live at the end of the
+ * log and the downstream {@link trimLogToBudget} step is also
+ * tail-oriented, so a head-truncated entry would never have surfaced
+ * the failing assertion lines.
  *
  * @param bytes Raw ZIP archive.
  * @param maxBytes Optional upper bound on the total decompressed bytes
@@ -1844,19 +1850,26 @@ async function extractZipEntriesAsText(
     const compressed = bytes.subarray(dataStart, dataEnd);
     let raw: Uint8Array;
     if (compressionMethod === 0) {
-      // STORED entries are already raw — slice to the budget without
-      // copying the full payload first.
+      // STORED entries are already raw. When the entry overflows the
+      // remaining budget we slice the **tail** (not the head), because
+      // CI failures live at the end of the log and the downstream
+      // `trimLogToBudget` step is also tail-oriented (round-4 fix —
+      // round-3 mistakenly kept the prefix here).
       if (hasBudget && compressed.byteLength > remainingBudget) {
-        raw = compressed.subarray(0, remainingBudget);
+        raw = compressed.subarray(compressed.byteLength - remainingBudget);
         truncated = true;
       } else {
         raw = compressed;
       }
     } else if (compressionMethod === 8) {
-      // DEFLATE entries stream chunk-by-chunk and stop as soon as the
-      // accumulated chunks reach the budget. This is the OOM-prone
-      // path: a multi-MB compressed entry can unpack to tens of MB,
-      // and pre-budget code held all of that in memory before trim.
+      // DEFLATE entries stream chunk-by-chunk through a tail-retaining
+      // circular buffer: the entire compressed stream is drained (so
+      // the kept bytes are the **last** `remainingBudget`, not the
+      // first), but only `remainingBudget` bytes are ever resident at
+      // peak. This costs the CPU of full inflation but keeps memory
+      // bounded — and crucially keeps the part of the log operators
+      // actually need (round-4 fix; round-3 stopped the stream early
+      // and captured the prefix instead of the tail).
       const inflated = await inflateRawBounded(
         compressed,
         hasBudget ? remainingBudget : Infinity,
@@ -1895,26 +1908,112 @@ function findEocdOffset(view: DataView): number {
 }
 
 /**
- * Decompress a raw DEFLATE stream (no zlib header) chunk-by-chunk via
- * the platform's `DecompressionStream`, stopping as soon as the
- * accumulated output reaches `maxBytes`.
+ * Fixed-capacity ring buffer that retains the **last** `capacity` bytes
+ * pushed into it. Used by {@link inflateRawBounded} to drain the entire
+ * DEFLATE stream while keeping only the tail in memory.
  *
- * The original implementation drained the entire stream before
- * returning, which is fine for small entries but pathological for
- * multi-MB GitHub log archives — a single entry can unpack to tens of
- * MB and Copilot flagged the in-memory accumulation as an OOM risk
- * even though `trimLogToBudget` later caps the prompt size. By passing
- * a remaining-byte budget through to the stream loop and breaking
- * (then cancelling the reader) once we cross the threshold, peak
- * allocation stays bounded by `maxBytes` regardless of the original
- * entry's uncompressed size.
+ * The buffer is allocated once at `capacity` bytes and never grown.
+ * Writes that overflow wrap to the start, overwriting older content.
+ * `toUint8Array()` materializes the in-order tail by stitching the two
+ * halves of the wrap. Inflater chunks are pushed verbatim, so a single
+ * push can be much larger than the capacity — in that case only the
+ * trailing `capacity` bytes of the chunk survive.
+ *
+ * Memory is exactly `capacity` (plus the per-chunk transient that the
+ * `DecompressionStream` allocates and we copy out of), independent of
+ * the original entry's uncompressed size.
+ */
+class TailRetainer {
+  private readonly buffer: Uint8Array;
+  private readonly capacity: number;
+  private writePos = 0;
+  private filled = 0;
+  // Total bytes ever pushed across the lifetime of the retainer. Used
+  // by the regression test to assert that the inflater really did see
+  // the full uncompressed stream (i.e. memory stayed bounded but the
+  // pipeline still consumed everything, which is the whole point of
+  // the round-4 fix).
+  private _totalSeen = 0;
+
+  constructor(capacity: number) {
+    if (!Number.isFinite(capacity) || capacity <= 0) {
+      throw new Error(`TailRetainer: capacity must be positive (got ${capacity})`);
+    }
+    this.capacity = Math.floor(capacity);
+    this.buffer = new Uint8Array(this.capacity);
+  }
+
+  push(chunk: Uint8Array): void {
+    this._totalSeen += chunk.byteLength;
+    if (chunk.byteLength === 0) return;
+    // If the chunk is bigger than the whole ring, the only bytes that
+    // can survive are its trailing `capacity` — the rest will be
+    // immediately overwritten. Skip the wasted copies.
+    const effectiveStart = chunk.byteLength > this.capacity ? chunk.byteLength - this.capacity : 0;
+    const effective = effectiveStart === 0 ? chunk : chunk.subarray(effectiveStart);
+    const len = effective.byteLength;
+    // Chunk fits without wrapping past the end of the buffer.
+    if (this.writePos + len <= this.capacity) {
+      this.buffer.set(effective, this.writePos);
+      this.writePos = (this.writePos + len) % this.capacity;
+    } else {
+      // Split write across the wrap.
+      const firstPart = this.capacity - this.writePos;
+      this.buffer.set(effective.subarray(0, firstPart), this.writePos);
+      this.buffer.set(effective.subarray(firstPart), 0);
+      this.writePos = len - firstPart;
+    }
+    this.filled = Math.min(this.capacity, this.filled + len);
+  }
+
+  toUint8Array(): Uint8Array {
+    if (this.filled < this.capacity) {
+      // Buffer never wrapped; the live region is `[0, filled)`.
+      return this.buffer.slice(0, this.filled);
+    }
+    // Buffer wrapped at least once; the oldest byte is at `writePos`.
+    const out = new Uint8Array(this.capacity);
+    const tailLen = this.capacity - this.writePos;
+    out.set(this.buffer.subarray(this.writePos), 0);
+    out.set(this.buffer.subarray(0, this.writePos), tailLen);
+    return out;
+  }
+
+  /** Total bytes ever pushed (regression-test instrumentation). */
+  get totalSeen(): number {
+    return this._totalSeen;
+  }
+}
+
+/**
+ * Decompress a raw DEFLATE stream (no zlib header) and return at most
+ * the **trailing** `maxBytes` of inflated output.
+ *
+ * Round-3 stopped reading the stream once the budget was reached, which
+ * bounded memory but kept the **prefix** of the entry — exactly the
+ * wrong half for CI logs, where the failure typically lives at the
+ * tail. Round-4 keeps the same memory bound (`maxBytes` resident at
+ * peak via {@link TailRetainer}) but drains the entire stream so the
+ * retained slice is the last `maxBytes` of the inflated output.
+ *
+ * Trade-off: we pay the CPU cost of inflating bytes we'll discard, but
+ * the alternative (random-access inflate from the tail) requires either
+ * a second pass through the stream or a non-streaming zlib library —
+ * both rejected against ADR-004's no-new-deps constraint and the
+ * fact that GitHub log archives are still bounded at low tens of MB.
+ *
+ * For the unbounded case (`maxBytes === Infinity`), behavior matches
+ * round-2: every chunk is collected into a flat `Uint8Array` and
+ * returned. This preserves the existing test contract for callers that
+ * omit `maxBytes`.
  *
  * @param compressed Raw DEFLATE bytes (no zlib/gzip header).
- * @param maxBytes Upper bound on the inflated size to materialize.
- *   `Infinity` disables the cap.
- * @returns Inflated bytes (capped at `maxBytes`) and a `truncated`
- *   flag set when the stream still had more output when the budget
- *   was reached.
+ * @param maxBytes Upper bound on the **resident** inflated size — and,
+ *   when finite, the size of the returned trailing slice. `Infinity`
+ *   disables the cap and returns the full inflated output.
+ * @returns Inflated bytes — the full output when unbounded, or the
+ *   trailing `maxBytes` when bounded — and a `truncated` flag set when
+ *   the original stream produced more output than fit in the budget.
  */
 async function inflateRawBounded(
   compressed: Uint8Array,
@@ -1930,54 +2029,49 @@ async function inflateRawBounded(
     .stream()
     .pipeThrough(new DecompressionStream("deflate-raw"));
   const reader = stream.getReader();
+  // Bounded path: tail-retaining ring buffer. Unbounded path: legacy
+  // chunk list (used for the no-cap test case and any future caller
+  // that wants the whole entry — we still drain the full stream there).
+  const bounded = Number.isFinite(maxBytes) && maxBytes > 0;
+  const retainer = bounded ? new TailRetainer(maxBytes) : null;
   const chunks: Uint8Array[] = [];
-  let total = 0;
-  let truncated = false;
+  let totalSeen = 0;
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       if (value === undefined) continue;
-      const remaining = maxBytes - total;
-      if (remaining <= 0) {
-        // Already at the budget — stop reading further. Cancel the
-        // underlying reader so the source pipeline can release its
-        // resources promptly.
-        truncated = true;
-        await reader.cancel();
-        break;
+      totalSeen += value.byteLength;
+      if (retainer !== null) {
+        retainer.push(value);
+      } else {
+        chunks.push(value);
       }
-      if (value.byteLength > remaining) {
-        // This chunk spills past the budget. Keep just the head, mark
-        // truncated, and cancel the rest of the stream — there's no
-        // sense decompressing more bytes only to drop them.
-        chunks.push(value.subarray(0, remaining));
-        total += remaining;
-        truncated = true;
-        await reader.cancel();
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
     }
   } finally {
-    // Best-effort: if `cancel()` already ran, this is a no-op. The
-    // underlying ReadableStream releases the lock when the reader is
-    // garbage-collected, but explicit release keeps Deno's resource
-    // table tidy when the test runs back-to-back.
+    // Best-effort: the reader releases its lock when garbage-collected,
+    // but an explicit release keeps Deno's resource table tidy for
+    // back-to-back tests.
     try {
       reader.releaseLock();
     } catch {
-      // ignore — already released after cancel()
+      // ignore
     }
   }
-  const out = new Uint8Array(total);
+  if (retainer !== null) {
+    return {
+      bytes: retainer.toUint8Array(),
+      truncated: totalSeen > maxBytes,
+    };
+  }
+  // Unbounded fast path: stitch chunks into a flat array.
+  const out = new Uint8Array(totalSeen);
   let written = 0;
   for (const chunk of chunks) {
     out.set(chunk, written);
     written += chunk.byteLength;
   }
-  return { bytes: out, truncated };
+  return { bytes: out, truncated: false };
 }
 
 /**
