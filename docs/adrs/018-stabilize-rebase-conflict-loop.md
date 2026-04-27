@@ -73,7 +73,7 @@ When `git rebase` exits non-zero, the phase iterates up to `maxIterations` (defa
 1. List unmerged files via `git diff --name-only --diff-filter=U`. Empty list with a non-zero rebase
    exit code is fatal — typical when the rebase aborted mid-flight and the worktree is clean.
 2. Build the conflict-context prompt (issue number, base branch, file list, conflict-marker preview
-   per file capped at `STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_BYTES`).
+   per file capped at `STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS`).
 3. Dispatch the agent runner with the prompt, threading the SDK session id forward across iterations
    so the model carries context.
 4. Stage every edit with `git add -A`. A non-zero exit here is fatal — the worktree is in a broken
