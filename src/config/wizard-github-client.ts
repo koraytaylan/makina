@@ -71,9 +71,12 @@ export type ReadKeyFile = (
  *   delegates to `Deno.env.get`.
  * @returns The PEM contents of the file.
  * @throws Whatever `Deno.readTextFile` throws (e.g. `Deno.errors.NotFound`,
- *   `Deno.errors.PermissionDenied`). The wizard wraps these as
- *   {@link SetupWizardError} via the catch block in
- *   {@link "./setup-wizard.ts".fetchInstallations}.
+ *   `Deno.errors.PermissionDenied`). The thrown value is caught and
+ *   re-thrown as a `Setup_*` error in
+ *   {@link createWizardGitHubClient}'s `getInstallations` body before
+ *   it ever reaches `setup-wizard.ts`; that re-throw carries the
+ *   original message in its `cause` chain so operators still see the
+ *   underlying filesystem error.
  */
 export async function defaultReadKeyFile(
   privateKeyPath: string,
@@ -177,21 +180,30 @@ export function createWizardGitHubClient(
       });
 
       const installations = await client.listAppInstallations();
-      const projected: WizardInstallation[] = [];
-      for (const installation of installations) {
-        const repos = await client.listInstallationRepositories(installation.id);
-        // GitHub's `<owner>/<name>` slug is the wizard's canonical
-        // repo identifier (it is what `config.json` stores as the key
-        // of `github.installations`). Build it once here so the
-        // wizard's downstream logic does not also need to know about
-        // owner/name splitting.
-        const repositories = repos.map((repo) => `${repo.owner}/${repo.name}`);
-        projected.push({
-          installationId: installation.id,
-          repositories,
-        });
-      }
-      return projected;
+      // Parallelise the per-installation repo fetch. Each call is
+      // independent (App-scoped pagination per installation id), and
+      // serializing them via a `for-await` made `makina setup`
+      // perceptibly slow for Apps with many installations: N
+      // round-trips at the network's RTT each. `Promise.all` collapses
+      // wall-clock time to the slowest single call, which matters when
+      // the wizard is the user's first impression of the daemon.
+      // GitHub's installation-token rate-limit is per installation, so
+      // parallel calls do not stack against a shared bucket.
+      //
+      // GitHub's `<owner>/<name>` slug is the wizard's canonical
+      // repo identifier (it is what `config.json` stores as the key
+      // of `github.installations`). Build it once here so the
+      // wizard's downstream logic does not also need to know about
+      // owner/name splitting.
+      return await Promise.all(
+        installations.map(async (installation) => {
+          const repos = await client.listInstallationRepositories(installation.id);
+          return {
+            installationId: installation.id,
+            repositories: repos.map((repo) => `${repo.owner}/${repo.name}`),
+          };
+        }),
+      );
     },
   };
 }
