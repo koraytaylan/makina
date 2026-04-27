@@ -16,7 +16,7 @@ import { ensureDir } from "@std/fs";
 import { dirname } from "@std/path";
 
 import { MAKINA_VERSION } from "./src/constants.ts";
-import { expandHome, loadConfig } from "./src/config/load.ts";
+import { ConfigLoadError, expandHome, loadConfig } from "./src/config/load.ts";
 import { startDaemon } from "./src/daemon/server.ts";
 import {
   createStdioWizardIo,
@@ -68,12 +68,18 @@ if (subcommand === "daemon") {
     // expands it before reading. The wizard writes to the same path, so
     // a successful `makina setup` is what populates this file.
     const config = await loadConfig(defaultConfigPath());
-    socketPath = config.daemon.socketPath;
+    // Per the loader's path-expansion contract, nested path fields
+    // (including `daemon.socketPath`) are returned verbatim — each
+    // consumer is responsible for expanding `~/` at its own boundary.
+    // This is that boundary: `Deno.listen({ transport: "unix", path })`
+    // would otherwise bind a literal `~/...` string.
+    socketPath = expandHome(config.daemon.socketPath);
   } catch (error) {
-    // `kind === "not-found"` is the "no setup yet" path; everything else
-    // is a real misconfiguration the operator must fix.
-    const kind = (error as { kind?: unknown }).kind;
-    if (kind === "not-found") {
+    // The "not-found" branch is the "no setup yet" path; everything
+    // else is a real misconfiguration the operator must fix. Narrow on
+    // `ConfigLoadError` first so an unrelated error that happens to
+    // expose a `kind` field cannot masquerade as a missing file.
+    if (error instanceof ConfigLoadError && error.kind === "not-found") {
       console.error(
         `[daemon] note: no config.json yet (run \`makina setup\`); using fallback socket ${socketPath}`,
       );

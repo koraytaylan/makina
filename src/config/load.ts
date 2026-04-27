@@ -21,15 +21,23 @@
  *
  * The loader expands `~/` **only on the path it is asked to read**. The
  * other path fields inside the config (`github.privateKeyPath`,
- * `daemon.socketPath`, `workspace`) are returned **verbatim**. Each
- * consumer is responsible for calling {@link expandHome} at the
- * boundary it cares about (the daemon expands `socketPath` before
- * binding; the GitHub App client will expand `privateKeyPath` before
- * opening the file; the wizard expands `privateKeyPath` for an
- * existence check before persisting). This keeps `config.json`
- * portable across machines belonging to the same user, even when
- * `$HOME` differs. `src/config/schema.ts`'s field-level docs reflect
- * this contract.
+ * `daemon.socketPath`, `workspace`) are returned **verbatim**. Any
+ * code that consumes those nested path fields must decide at its own
+ * boundary whether to call {@link expandHome} before using them.
+ * Concretely, in this repo:
+ *
+ *  - `main.ts`'s `daemon` branch calls {@link expandHome} on
+ *    `config.daemon.socketPath` before passing it to `startDaemon` so
+ *    `Deno.listen` never sees a literal `~/` path.
+ *  - The wizard expands `github.privateKeyPath` for an existence check
+ *    but persists the raw `~/`-prefixed string the user typed so the
+ *    on-disk `config.json` stays portable across machines.
+ *  - The production `WizardGitHubClient` (#4) and the future
+ *    `workspace` consumer (#7) expand at their own boundaries.
+ *
+ * This keeps `config.json` portable across machines belonging to the
+ * same user, even when `$HOME` differs. `src/config/schema.ts`'s
+ * field-level docs reflect this contract.
  *
  * @module
  */
