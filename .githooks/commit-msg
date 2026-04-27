@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Validates the proposed commit message against the Conventional Commits
+# convention used by makina (see CONTRIBUTING.md). Invoked automatically
+# by git when `core.hooksPath` points at .githooks.
+set -euo pipefail
+
+MSG_FILE="$1"
+SUBJECT="$(head -n 1 "${MSG_FILE}")"
+
+# Skip auto-generated subjects from merge / fixup / revert workflows.
+case "${SUBJECT}" in
+  "Merge "*|"merge "*|"fixup! "*|"squash! "*|"Revert "*)
+    exit 0 ;;
+esac
+
+PATTERN='^(feat|fix|docs|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .{1,72}$'
+if printf '%s\n' "${SUBJECT}" | grep -qE "${PATTERN}"; then
+  exit 0
+fi
+
+cat >&2 <<MSG
+Invalid commit subject:
+  ${SUBJECT}
+
+Subjects must match: <type>[(<scope>)][!]: <subject>
+  type    one of: feat, fix, docs, refactor, perf, test, build, ci, chore, revert
+  scope   optional; "(#NNN)" when the change relates to a GitHub issue
+  subject imperative, lower-case, no trailing period, <= 72 chars
+
+Examples:
+  feat(#42): add task switcher overlay
+  fix(daemon): handle SIGPIPE on TUI disconnect
+  docs: clarify GitHub App setup
+  refactor(supervisor)!: split stabilize loop into phases
+
+See CONTRIBUTING.md for the full convention.
+MSG
+exit 1

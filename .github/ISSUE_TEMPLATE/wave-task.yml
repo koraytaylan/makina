@@ -1,0 +1,100 @@
+name: Wave task
+description: A single actionable item from the plan's wave catalog. The body sections below match the plan's issue catalog.
+title: "[W?-?] "
+labels:
+  - agent:claimable
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for every wave task. The fields match the §Issue catalog in the plan so an agent can pick this up and implement it without context outside the issue.
+
+  - type: input
+    id: depends-on
+    attributes:
+      label: Depends on
+      description: Comma-separated list of issue numbers that must close before this can start. Use `none` if there are no dependencies.
+      placeholder: "#1, #2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: One paragraph stating what success looks like and why it matters.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What this task does. Be concrete — files, modules, behaviors.
+    validations:
+      required: true
+
+  - type: textarea
+    id: files
+    attributes:
+      label: Files
+      description: Files this task creates or modifies.
+      placeholder: |
+        - src/foo/bar.ts
+        - tests/unit/bar_test.ts
+    validations:
+      required: true
+
+  - type: textarea
+    id: inputs
+    attributes:
+      label: Inputs (contracts depended on)
+      description: Typed interfaces or modules this task consumes from earlier waves.
+      placeholder: |
+        - `GitHubClient` from `src/github/client.ts` (W2)
+        - `Task` from `src/types.ts` (W1)
+    validations:
+      required: false
+
+  - type: textarea
+    id: outputs
+    attributes:
+      label: Outputs
+      description: Typed interfaces, modules, or behaviors this task delivers for later waves.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: A checklist starting with the Definition of Done, then issue-specific bullets.
+      value: |
+        Definition of Done (always required):
+        - [ ] New exported symbols carry JSDoc; `deno doc --lint` green.
+        - [ ] Tests cover the new code; ≥ 80% lines AND branches; in-memory doubles for any external collaborator land here too.
+        - [ ] New architectural choices ship with their ADR.
+        - [ ] User-facing behavior changes update README and `docs/*.md`.
+        - [ ] Commits follow Conventional Commits.
+        - [ ] `deno task ci` is green on the branch.
+
+        Issue-specific:
+        - [ ] (add bullets here)
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What this task explicitly does not do (deferred to other issues).
+    validations:
+      required: false
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Plan section, ADR(s), external docs.
+    validations:
+      required: true

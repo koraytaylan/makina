@@ -1,2 +1,26 @@
+# Coverage artifacts produced by `deno task test:coverage`
+cov/
+cov.lcov
+
+# Release build artifacts produced by `release.yml`
+dist/
+
+# Generated API docs
+docs/api/
+
+# Node leftovers (only present if someone accidentally invokes npm tooling)
+node_modules/
+
+# OS noise
 .DS_Store
 Thumbs.db
+
+# Editor noise
+.idea/
+.vscode/
+*.swp
+
+# Environment & secrets — the GitHub App private key in particular MUST NOT be tracked
+.env
+.env.local
+*.pem
