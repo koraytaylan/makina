@@ -80,8 +80,10 @@ export const MAX_IPC_FRAME_BYTES = 1_048_576;
  *
  * `MAX_IPC_FRAME_BYTES` plus a small overhead, expressed as the largest
  * decimal-string length the framer will read before declaring the frame
- * malformed. Six digits caps the prefix at 999,999 bytes which is below
- * `MAX_IPC_FRAME_BYTES` — both bounds are checked at decode time.
+ * malformed. Eight digits cap the prefix at 99,999,999 bytes which is well
+ * above `MAX_IPC_FRAME_BYTES` — both bounds are checked at decode time, so
+ * the byte-count cap is the tight bound and the digit cap protects the
+ * framer from reading an unbounded run of digits before the newline.
  */
 export const MAX_IPC_LENGTH_PREFIX_DIGITS = 8;
 

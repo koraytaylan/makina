@@ -397,47 +397,85 @@ const errorDataSchema: z.ZodType<ErrorData, z.ZodTypeDef, unknown> = z
   })
   .strict();
 
+// Each `z.object(...)` below is `.strict()` so that an unknown field on
+// the wire (e.g. an envelope or event payload with a new key the
+// receiver does not yet know about) is rejected at the IPC boundary
+// rather than silently stripped. Stripping at this seam is the failure
+// mode where a producer "thinks" it sent a field that the consumer
+// "thinks" it received — strict rejection turns that into a parse error
+// with a helpful path.
+//
+// The event-payload arms inline the shared `taskId`/`atIso` fields
+// rather than building the schema as `z.object({taskId, atIso}).strict()
+// .and(z.discriminatedUnion("kind", ...))`: with strict on both sides
+// of an intersection, zod parses the same input against each side and
+// each arm rejects the other arm's keys as "unrecognized". Inlining
+// keeps strict mode meaningful and lets each arm authoritatively list
+// its full key set.
+const eventPayloadCommonShape = {
+  taskId: z.string().min(1),
+  atIso: z.string().min(1),
+} as const;
+
 const eventPayloadSchema: z.ZodType<EventPayload, z.ZodTypeDef, unknown> = z
-  .object({
-    taskId: z.string().min(1),
-    atIso: z.string().min(1),
-  })
-  .and(
-    z.discriminatedUnion("kind", [
-      z.object({ kind: z.literal("state-changed"), data: stateChangedDataSchema }),
-      z.object({ kind: z.literal("log"), data: logDataSchema }),
-      z.object({ kind: z.literal("agent-message"), data: agentMessageDataSchema }),
-      z.object({ kind: z.literal("github-call"), data: githubCallDataSchema }),
-      z.object({ kind: z.literal("error"), data: errorDataSchema }),
-    ]),
-  );
+  .discriminatedUnion("kind", [
+    z.object({
+      ...eventPayloadCommonShape,
+      kind: z.literal("state-changed"),
+      data: stateChangedDataSchema,
+    }).strict(),
+    z.object({
+      ...eventPayloadCommonShape,
+      kind: z.literal("log"),
+      data: logDataSchema,
+    }).strict(),
+    z.object({
+      ...eventPayloadCommonShape,
+      kind: z.literal("agent-message"),
+      data: agentMessageDataSchema,
+    }).strict(),
+    z.object({
+      ...eventPayloadCommonShape,
+      kind: z.literal("github-call"),
+      data: githubCallDataSchema,
+    }).strict(),
+    z.object({
+      ...eventPayloadCommonShape,
+      kind: z.literal("error"),
+      data: errorDataSchema,
+    }).strict(),
+  ]);
 
 const messageEnvelopeSchema: z.ZodType<MessageEnvelope, z.ZodTypeDef, unknown> = z
   .discriminatedUnion("type", [
-    z.object({ id: messageIdSchema, type: z.literal("ping"), payload: pingPayloadSchema }),
+    z.object({ id: messageIdSchema, type: z.literal("ping"), payload: pingPayloadSchema })
+      .strict(),
     z.object({
       id: messageIdSchema,
       type: z.literal("subscribe"),
       payload: subscribePayloadSchema,
-    }),
+    }).strict(),
     z.object({
       id: messageIdSchema,
       type: z.literal("unsubscribe"),
       payload: unsubscribePayloadSchema,
-    }),
+    }).strict(),
     z.object({
       id: messageIdSchema,
       type: z.literal("command"),
       payload: commandPayloadSchema,
-    }),
+    }).strict(),
     z.object({
       id: messageIdSchema,
       type: z.literal("prompt"),
       payload: promptPayloadSchema,
-    }),
-    z.object({ id: messageIdSchema, type: z.literal("pong"), payload: pongPayloadSchema }),
-    z.object({ id: messageIdSchema, type: z.literal("ack"), payload: ackPayloadSchema }),
-    z.object({ id: messageIdSchema, type: z.literal("event"), payload: eventPayloadSchema }),
+    }).strict(),
+    z.object({ id: messageIdSchema, type: z.literal("pong"), payload: pongPayloadSchema })
+      .strict(),
+    z.object({ id: messageIdSchema, type: z.literal("ack"), payload: ackPayloadSchema })
+      .strict(),
+    z.object({ id: messageIdSchema, type: z.literal("event"), payload: eventPayloadSchema })
+      .strict(),
   ]);
 
 // ---------------------------------------------------------------------------
