@@ -803,7 +803,7 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       // The watermark is *monotonic*: we never let a partial/truncated
       // GitHub timeline (or a deletion that lowers `latestCreatedAtIso`)
       // regress the high-water mark and cause already-processed
-      // comments to look fresh on the next tick. See ADR-022.
+      // comments to look fresh on the next tick. See ADR-023.
       const nextWatermark = monotonicWatermark(
         current.lastReviewAtIso,
         pollResult.latestCreatedAtIso,
@@ -1475,7 +1475,7 @@ export function filterNewComments(
  * a partial GitHub timeline (or a deletion that lowers the freshly-seen
  * latest timestamp) cannot rewind the persisted high-water mark and
  * cause already-processed comments to look fresh on the next tick. See
- * ADR-022 for the rationale.
+ * ADR-023 for the rationale.
  *
  * Both inputs may be `undefined`; the return reflects whichever side
  * carries information, biased toward keeping the existing watermark.

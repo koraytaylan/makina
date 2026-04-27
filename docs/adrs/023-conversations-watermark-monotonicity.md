@@ -1,4 +1,4 @@
-# ADR-022: Conversations-phase watermark is monotonic
+# ADR-023: Conversations-phase watermark is monotonic
 
 ## Status
 
