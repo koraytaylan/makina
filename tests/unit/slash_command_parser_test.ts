@@ -53,6 +53,68 @@ Deno.test("parseSlashCommand: /issue with --repo flag before the number", () => 
   assertEquals(payload.repo, makeRepoFullName("owner/repo"));
 });
 
+Deno.test("parseSlashCommand: /issue with --merge=<mode> populates mergeMode", () => {
+  // The daemon's handler reads `payload.mergeMode` to forward the
+  // operator's intent to `supervisor.start({ ..., mergeMode })`. The
+  // parser is the contract surface for that field — see the regression
+  // test in `handlers_test.ts` for the wiring side.
+  const payload = parseSlashCommand("/issue 7 --merge=squash");
+  assertEquals(payload.name, "issue");
+  assertEquals(payload.args, ["7"]);
+  assertEquals(payload.issueNumber, makeIssueNumber(7));
+  assertEquals(payload.mergeMode, "squash");
+});
+
+Deno.test("parseSlashCommand: /issue accepts --merge <mode> as two tokens", () => {
+  // Equivalent spelling for parity with `--repo <owner/name>`.
+  const payload = parseSlashCommand("/issue 8 --merge rebase");
+  assertEquals(payload.mergeMode, "rebase");
+});
+
+Deno.test("parseSlashCommand: /issue --merge accepts manual mode", () => {
+  const payload = parseSlashCommand("/issue 9 --merge=manual");
+  assertEquals(payload.mergeMode, "manual");
+});
+
+Deno.test("parseSlashCommand: /issue without --merge leaves mergeMode undefined", () => {
+  // The supervisor's default kicks in only when the parser does not
+  // populate the field — make sure the omission is faithful.
+  const payload = parseSlashCommand("/issue 10");
+  assertEquals(payload.mergeMode, undefined);
+});
+
+Deno.test('parseSlashCommand: /issue with an unknown --merge value throws "bad-arguments"', () => {
+  const error = assertThrows(
+    () => parseSlashCommand("/issue 1 --merge=ff-only"),
+    SlashCommandParseError,
+  );
+  assertEquals(error.kind, "bad-arguments");
+});
+
+Deno.test('parseSlashCommand: /issue with --merge missing its value throws "bad-arguments"', () => {
+  const error = assertThrows(
+    () => parseSlashCommand("/issue 1 --merge"),
+    SlashCommandParseError,
+  );
+  assertEquals(error.kind, "bad-arguments");
+});
+
+Deno.test('parseSlashCommand: /issue with empty --merge= value throws "bad-arguments"', () => {
+  const error = assertThrows(
+    () => parseSlashCommand("/issue 1 --merge="),
+    SlashCommandParseError,
+  );
+  assertEquals(error.kind, "bad-arguments");
+});
+
+Deno.test("parseSlashCommand: /issue rejects duplicate --merge flags", () => {
+  const error = assertThrows(
+    () => parseSlashCommand("/issue 1 --merge=squash --merge=rebase"),
+    SlashCommandParseError,
+  );
+  assertEquals(error.kind, "bad-arguments");
+});
+
 Deno.test("parseSlashCommand: /repo add returns the repo + installation id tokens", () => {
   const payload = parseSlashCommand("/repo add owner/repo 9876543");
   assertEquals(payload.name, "repo");
