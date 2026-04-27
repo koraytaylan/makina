@@ -24,7 +24,7 @@ Two cooperating processes communicate over a Unix domain socket using NDJSON:
 | GitHubClient    | `src/github/client.ts`           | W2   | High-level methods over `@octokit/core`.      |
 | Poller          | `src/daemon/poller.ts`           | W3   | Per-task polling with backoff.                |
 | Persistence     | `src/daemon/persistence.ts`      | W2   | Atomic JSON state store.                      |
-| EventBus        | `src/daemon/event-bus.ts`        | W2   | In-process pub/sub.                           |
+| EventBus        | `src/daemon/event-bus.ts`        | W2   | In-process pub/sub (see ADR-012).             |
 | Daemon server   | `src/daemon/server.ts`           | W2   | Unix socket listener + dispatch.              |
 
 ## TUI
