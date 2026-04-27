@@ -754,9 +754,9 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    *     to `NEEDS_HUMAN`. Otherwise loop back to (1) until a poll
    *     returns no new comments.
    *
-   * The Poller's tick is consumed via a `Promise.withResolvers()` so a
-   * single polling tick yields a single decision; the supervisor cancels
-   * the per-tick handle as soon as the tick settles. Failures inside the
+   * The Poller's tick is consumed via a per-tick promise so a single
+   * polling tick yields a single decision; the supervisor cancels the
+   * per-tick handle as soon as the tick settles. Failures inside the
    * fetcher take the Poller's exponential-backoff path; fatal failures
    * (auth revocation) propagate via the `onError` callback and we tear
    * down the loop into `FAILED`.
@@ -799,7 +799,15 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       // poll yielded no work — the brief calls for an updated
       // `lastReviewAt` after every successful tick so a subsequent
       // resume of the task does not re-process settled threads.
-      const nextWatermark = pollResult.latestCreatedAtIso ?? current.lastReviewAtIso;
+      //
+      // The watermark is *monotonic*: we never let a partial/truncated
+      // GitHub timeline (or a deletion that lowers `latestCreatedAtIso`)
+      // regress the high-water mark and cause already-processed
+      // comments to look fresh on the next tick. See ADR-022.
+      const nextWatermark = monotonicWatermark(
+        current.lastReviewAtIso,
+        pollResult.latestCreatedAtIso,
+      );
       const newComments = filterNewComments(
         pollResult.comments,
         current.lastReviewAtIso,
@@ -1443,8 +1451,9 @@ export function groupCommentsByThread(
 /**
  * Filter `comments` to those strictly newer than `watermark`.
  *
- * Comparison uses ISO-8601 lexicographic ordering — same-millisecond
- * comments tie and are kept (the comparison is `>` not `>=`). When the
+ * Comparison uses ISO-8601 lexicographic ordering — the comparison is
+ * `>`, so a comment whose `createdAtIso` ties the watermark is
+ * *excluded* (already accounted for by an earlier tick). When the
  * watermark is `undefined`, every comment is returned.
  *
  * @param comments Candidate comments.
@@ -1457,6 +1466,31 @@ export function filterNewComments(
 ): readonly PullRequestReviewComment[] {
   if (watermark === undefined) return [...comments];
   return comments.filter((comment) => comment.createdAtIso > watermark);
+}
+
+/**
+ * Combine the existing watermark with the latest timestamp seen on a
+ * fresh poll, returning a value that is **monotonically non-decreasing**
+ * in ISO-8601 lexicographic order. The conversations phase uses this so
+ * a partial GitHub timeline (or a deletion that lowers the freshly-seen
+ * latest timestamp) cannot rewind the persisted high-water mark and
+ * cause already-processed comments to look fresh on the next tick. See
+ * ADR-022 for the rationale.
+ *
+ * Both inputs may be `undefined`; the return reflects whichever side
+ * carries information, biased toward keeping the existing watermark.
+ *
+ * @param current Currently persisted `lastReviewAtIso`.
+ * @param incoming Latest `createdAtIso` from the fresh poll, if any.
+ * @returns The watermark to persist for the next tick.
+ */
+export function monotonicWatermark(
+  current: string | undefined,
+  incoming: string | undefined,
+): string | undefined {
+  if (current === undefined) return incoming;
+  if (incoming === undefined) return current;
+  return incoming > current ? incoming : current;
 }
 
 /**

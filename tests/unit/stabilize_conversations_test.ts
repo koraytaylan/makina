@@ -31,9 +31,10 @@
  *    `maxTaskIterations` cap; the task lands in `NEEDS_HUMAN` and the
  *    terminal reason carries the budget number.
  *  - **Pure helpers.** `buildConversationsPrompt`,
- *    `groupCommentsByThread`, `filterNewComments`, and
- *    `latestCommentTimestamp` are exercised in isolation so the
- *    supervisor's prompt shape is pinned.
+ *    `groupCommentsByThread`, `filterNewComments`,
+ *    `latestCommentTimestamp`, and `monotonicWatermark` are exercised
+ *    in isolation so the supervisor's prompt shape and the watermark
+ *    monotonicity contract are pinned.
  *
  * Per Wave 2 lessons: every collaborator is injected, no
  * `Date.now`/`setTimeout`/`Deno.env` mocks; the synthetic clock is a
@@ -51,6 +52,7 @@ import {
   filterNewComments,
   groupCommentsByThread,
   latestCommentTimestamp,
+  monotonicWatermark,
   type SupervisorClock,
   type SupervisorRandomSource,
 } from "../../src/daemon/supervisor.ts";
@@ -290,6 +292,41 @@ Deno.test("latestCommentTimestamp: finds the maximum ISO", () => {
     makeComment({ id: 3, createdAtIso: "2026-04-26T00:00:00Z" }),
   ];
   assertEquals(latestCommentTimestamp(comments), "2026-04-27T00:00:00Z");
+});
+
+Deno.test("monotonicWatermark: returns incoming when current is undefined", () => {
+  assertEquals(monotonicWatermark(undefined, "2026-04-26T00:00:00Z"), "2026-04-26T00:00:00Z");
+});
+
+Deno.test("monotonicWatermark: returns current when incoming is undefined", () => {
+  assertEquals(monotonicWatermark("2026-04-26T00:00:00Z", undefined), "2026-04-26T00:00:00Z");
+});
+
+Deno.test("monotonicWatermark: both undefined returns undefined", () => {
+  assertEquals(monotonicWatermark(undefined, undefined), undefined);
+});
+
+Deno.test("monotonicWatermark: advances when incoming is strictly newer", () => {
+  assertEquals(
+    monotonicWatermark("2026-04-26T00:00:00Z", "2026-04-27T00:00:00Z"),
+    "2026-04-27T00:00:00Z",
+  );
+});
+
+Deno.test("monotonicWatermark: pins to current when incoming would regress (deletion/truncation)", () => {
+  // The conversations phase must never let a partial timeline lower the
+  // persisted high-water mark and re-surface already-processed comments.
+  assertEquals(
+    monotonicWatermark("2026-04-27T00:00:00Z", "2026-04-26T00:00:00Z"),
+    "2026-04-27T00:00:00Z",
+  );
+});
+
+Deno.test("monotonicWatermark: pins to current on a tie", () => {
+  assertEquals(
+    monotonicWatermark("2026-04-26T00:00:00Z", "2026-04-26T00:00:00Z"),
+    "2026-04-26T00:00:00Z",
+  );
 });
 
 Deno.test("groupCommentsByThread: groups by threadNodeId when present", () => {

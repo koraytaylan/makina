@@ -598,6 +598,55 @@ Deno.test("listReviewComments: 500 propagates", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// resolveReviewThread (GraphQL mutation)
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "resolveReviewThread: posts the exact ResolveReviewThread mutation body to /graphql",
+  async () => {
+    const harness = new FakeFetchHarness();
+    harness.enqueueResponse(200, {
+      data: { resolveReviewThread: { thread: { id: "PRRT_123" } } },
+    });
+    const { client } = buildClient(harness);
+
+    await client.resolveReviewThread("PRRT_123");
+
+    const recorded = harness.recordedRequests[0];
+    assertEquals(recorded?.method, "POST");
+    assertEquals(recorded?.url, "https://api.github.com/graphql");
+    const parsed = recorded?.body !== null && recorded?.body !== undefined
+      ? JSON.parse(recorded.body) as Record<string, unknown>
+      : {};
+    // The exact mutation body must match what production sends so a
+    // future refactor cannot silently drift the GraphQL query.
+    assertEquals(
+      parsed.query,
+      `mutation ResolveReviewThread($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) {
+    thread { id }
+  }
+}`,
+    );
+    assertEquals(parsed.variables, { threadId: "PRRT_123" });
+  },
+);
+
+Deno.test(
+  "resolveReviewThread: GraphQL error response propagates as a rejection",
+  async () => {
+    const harness = new FakeFetchHarness();
+    // GraphQL errors are surfaced by Octokit even on a 200 status when
+    // the response body carries an `errors` array.
+    harness.enqueueResponse(200, {
+      errors: [{ message: "Could not resolve to a node with the global id of 'BAD'." }],
+    });
+    const { client } = buildClient(harness);
+    await assertRejects(() => client.resolveReviewThread("BAD"));
+  },
+);
+
+// ---------------------------------------------------------------------------
 // mergePullRequest
 // ---------------------------------------------------------------------------
 
