@@ -25,8 +25,10 @@ const SHUTDOWN_GRACE_MS = 1_000;
 
 /**
  * Build a minimal-but-valid `config.json` with a `~/`-prefixed
- * `daemon.socketPath`. The wizard normalises to `~/.local/state/...`,
- * so this matches the realistic shape of a freshly-written config.
+ * `daemon.socketPath`. The wizard preserves the user-typed `~/...`
+ * shape verbatim (path expansion happens at the daemon's binding
+ * boundary in `main.ts`, not at config-load time), so this matches the
+ * realistic shape of a freshly-written config.
  */
 function configWithTildeSocket(): string {
   return JSON.stringify(
@@ -132,8 +134,10 @@ Deno.test("main.ts daemon: expands ~/ in daemon.socketPath before binding", asyn
       `${configDir}/${CONFIG_FILENAME}`,
       configWithTildeSocket(),
     );
-    // The daemon expects the socket directory to exist; the wizard
-    // creates it on first run, but here we set it up by hand.
+    // The daemon expects the socket directory to exist. The wizard
+    // (`runSetupWizard`) does not create it today; production installs
+    // create it via `mkdir -p`. Here we set it up by hand so the
+    // spawned daemon can bind without bootstrap noise.
     const socketDir = `${fakeHome}/.local/state/makina`;
     await Deno.mkdir(socketDir, { recursive: true });
     const expectedSocketPath = `${socketDir}/${SOCKET_FILENAME}`;
