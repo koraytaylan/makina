@@ -46,6 +46,7 @@ import {
   type RepoFullName,
   type TaskId,
 } from "../../src/types.ts";
+import type { StabilizeGitInvoker } from "../../src/daemon/stabilize.ts";
 import type { WorktreeManagerImpl } from "../../src/daemon/worktree-manager.ts";
 import { InMemoryGitHubClient } from "../helpers/in_memory_github_client.ts";
 import { MockAgentRunner } from "../helpers/mock_agent_runner.ts";
@@ -166,6 +167,24 @@ interface MergeCommandRig {
   cleanup(): Promise<void>;
 }
 
+/**
+ * Always-clean rebase stub. The /merge command tests exercise the daemon's
+ * IPC layer; the stabilize-rebase phase has its own dedicated coverage in
+ * `tests/unit/stabilize_rebase_test.ts`. We short-circuit the three calls
+ * a clean rebase makes — fetch, rev-parse, and rebase — so the merge
+ * command tests reach READY_TO_MERGE without needing a real worktree.
+ */
+const ALWAYS_CLEAN_REBASE_INVOKER: StabilizeGitInvoker = (args, _options) => {
+  if (args[0] === "rev-parse") {
+    return Promise.resolve({
+      exitCode: 0,
+      stdout: "deadbeefcafebabe0123456789abcdef01234567\n",
+      stderr: "",
+    });
+  }
+  return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+};
+
 async function makeRig(): Promise<MergeCommandRig> {
   const dir = await Deno.makeTempDir({ prefix: "makina-merge-cmd-" });
   const socketPath = join(dir, "sock");
@@ -182,6 +201,7 @@ async function makeRig(): Promise<MergeCommandRig> {
     clock: new DeterministicClock(),
     randomSource: new FixedRandomSource(),
     preserveWorktreeOnMerge: false,
+    gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
   });
   return {
     socketPath,
