@@ -14,6 +14,7 @@
 
 import { assert, assertEquals, assertRejects } from "@std/assert";
 
+import { type EnvLookup } from "../../src/config/load.ts";
 import { parseConfig } from "../../src/config/schema.ts";
 import {
   type ByteReader,
@@ -25,6 +26,16 @@ import {
   type WizardGitHubClient,
   type WizardInstallation,
 } from "../../src/config/setup-wizard.ts";
+
+/**
+ * Build an `EnvLookup` over a fixed map. Used by tests that need to
+ * exercise the wizard's `~/` expansion without mutating `Deno.env`,
+ * which would race other tests under `--parallel`.
+ */
+function envLookupFrom(entries: Record<string, string>): EnvLookup {
+  const map = new Map(Object.entries(entries));
+  return (name) => map.get(name);
+}
 
 /**
  * Build a `readLine` that drains a scripted list of answers in order.
@@ -105,20 +116,26 @@ async function makeKeyFile(): Promise<string> {
 /**
  * Mint an `io` bundle from primitives. Centralises the construction so
  * the per-test setups stay focused on their scripted answers.
+ *
+ * `envLookup` is propagated only when the caller supplied one; with
+ * `exactOptionalPropertyTypes` enabled the field cannot be set to
+ * `undefined` explicitly.
  */
 function buildIo(args: {
   readonly answers: readonly string[];
   readonly client: WizardGitHubClient;
+  readonly envLookup?: EnvLookup;
 }): SetupWizardIo & { output: () => string; remaining: () => readonly string[] } {
   const reader = scriptedReader(args.answers);
   const writer = captureWriter();
-  return {
+  const base = {
     readLine: reader.readLine,
     writeLine: writer.writeLine,
     githubClient: args.client,
     output: writer.output,
     remaining: reader.remaining,
   };
+  return args.envLookup === undefined ? base : { ...base, envLookup: args.envLookup };
 }
 
 Deno.test("runSetupWizard: happy path produces a valid config", async () => {
@@ -380,26 +397,19 @@ Deno.test("runSetupWizard: expands ~/ for the private-key existence check", asyn
       keyPath,
       "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
     );
-    const previousHome = Deno.env.get("HOME");
-    Deno.env.set("HOME", tempHome);
-    try {
-      const client = new StubWizardGitHubClient([
-        { installationId: 1, repositories: ["a/b"] },
-      ]);
-      const io = buildIo({
-        answers: ["1", "~/key.pem", "1"],
-        client,
-      });
-      const config = await runSetupWizard(io);
-      // The user-typed form is preserved so the config stays portable.
-      assertEquals(config.github.privateKeyPath, "~/key.pem");
-    } finally {
-      if (previousHome === undefined) {
-        Deno.env.delete("HOME");
-      } else {
-        Deno.env.set("HOME", previousHome);
-      }
-    }
+    const client = new StubWizardGitHubClient([
+      { installationId: 1, repositories: ["a/b"] },
+    ]);
+    // Inject a per-test `EnvLookup` rather than mutating `Deno.env` so
+    // the integration suite stays parallel-safe.
+    const io = buildIo({
+      answers: ["1", "~/key.pem", "1"],
+      client,
+      envLookup: envLookupFrom({ HOME: tempHome }),
+    });
+    const config = await runSetupWizard(io);
+    // The user-typed form is preserved so the config stays portable.
+    assertEquals(config.github.privateKeyPath, "~/key.pem");
   } finally {
     await Deno.remove(tempHome, { recursive: true });
   }

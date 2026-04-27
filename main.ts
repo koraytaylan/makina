@@ -16,7 +16,7 @@ import { ensureDir } from "@std/fs";
 import { dirname } from "@std/path";
 
 import { MAKINA_VERSION } from "./src/constants.ts";
-import { expandHome } from "./src/config/load.ts";
+import { expandHome, loadConfig } from "./src/config/load.ts";
 import { startDaemon } from "./src/daemon/server.ts";
 import {
   createStdioWizardIo,
@@ -37,46 +37,45 @@ const subcommand = Deno.args[0];
 if (subcommand === "daemon") {
   // Defensive wiring for the Wave 2 daemon subcommand.
   //
-  // The real config loader (#3) and EventBus (#8) may or may not be on
-  // `develop` when this branch lands; both are loaded via dynamic
-  // `import()` so a still-missing sibling does not block the daemon
-  // from starting. We carefully distinguish two outcomes:
+  // The config loader is now a direct import (this PR lands it). The
+  // EventBus (#8) is still loaded via dynamic `import()` because we
+  // distinguish two outcomes for *that* sibling:
   //
   //  1. **Module not found** (`ERR_MODULE_NOT_FOUND`): the sibling has
-  //     not landed yet. Log a single `note:` line so operators know we
-  //     fell back, then continue with:
-  //       - a hardcoded `${TMPDIR:-/tmp}/makina.sock` socket path so
-  //         the binary can boot for smoke-testing;
-  //       - no event bus, which makes `subscribe` envelopes ack with
-  //         `{ ok: false, error: "unimplemented" }` until #8 lands.
+  //     not landed yet. Log a single `note:` line and continue with no
+  //     event bus, which makes `subscribe` envelopes ack with
+  //     `{ ok: false, error: "unimplemented" }`.
   //  2. **Anything else** (parse failure, permission error, throwing
   //     constructor, …): a real misconfiguration. Print the diagnostic
   //     to stderr and exit non-zero. Silently swallowing these would
   //     mean a typo'd `config.json` boots a daemon on `/tmp/makina.sock`
   //     and the operator has no signal that anything went wrong.
   //
-  // TODO(#3): once #3 lands, the loadConfig branch is the only path —
-  // drop the module-missing fallback.
-  // TODO(#8): once #8 lands, the same applies to the event bus branch.
+  // For the loader, a missing user `config.json` is also a benign signal
+  // ("user has not run `makina setup` yet") — we log a one-liner and
+  // fall back to `${TMPDIR:-/tmp}/makina.sock` so the binary still boots
+  // for smoke-testing. Any other config failure (permissions, malformed
+  // JSON, schema-invalid) exits non-zero with the loader's diagnostic.
+  //
+  // TODO(#8): once #8 lands, the event-bus branch becomes a direct
+  // import and the module-missing fallback can be dropped.
   const tmpDir = Deno.env.get("TMPDIR") ?? "/tmp";
   const fallbackSocketPath = `${tmpDir.replace(/\/$/, "")}/makina.sock`;
 
   let socketPath = fallbackSocketPath;
   try {
-    const configModule = await import("./src/config/load.ts");
-    if (
-      typeof (configModule as { loadConfig?: unknown }).loadConfig === "function"
-    ) {
-      const loadConfig = (configModule as {
-        loadConfig: () => Promise<{ daemon: { socketPath: string } }>;
-      }).loadConfig;
-      const config = await loadConfig();
-      socketPath = config.daemon.socketPath;
-    }
+    // `defaultConfigPath()` returns a `~/`-prefixed string; the loader
+    // expands it before reading. The wizard writes to the same path, so
+    // a successful `makina setup` is what populates this file.
+    const config = await loadConfig(defaultConfigPath());
+    socketPath = config.daemon.socketPath;
   } catch (error) {
-    if (isModuleNotFoundError(error)) {
+    // `kind === "not-found"` is the "no setup yet" path; everything else
+    // is a real misconfiguration the operator must fix.
+    const kind = (error as { kind?: unknown }).kind;
+    if (kind === "not-found") {
       console.error(
-        `[daemon] note: src/config/load.ts not found; using fallback socket ${socketPath}`,
+        `[daemon] note: no config.json yet (run \`makina setup\`); using fallback socket ${socketPath}`,
       );
     } else {
       console.error(`[daemon] failed to load configuration: ${formatError(error)}`);
@@ -117,33 +116,21 @@ if (subcommand === "daemon") {
   Deno.addSignalListener("SIGINT", shutdown);
   Deno.addSignalListener("SIGTERM", shutdown);
 } else if (subcommand === "setup") {
-  // The interactive wizard is fully implemented; what is **not** yet
-  // wired in this PR is the App-level GitHub client that lists reachable
-  // installations. That client lands with [W2-github-app-auth] (issue #4)
-  // and the wizard already accepts it via injection. To avoid a UX where
-  // the user types the App ID and key path only to hit a "not
-  // implemented" error mid-flow, the subcommand gates itself behind the
-  // `MAKINA_ALLOW_WIZARD_STUB=1` env var until #4 lands. Without the
-  // flag we exit immediately with a pointer; with the flag the wizard
-  // runs and the stub surfaces a clear failure on the discovery step.
-  const allowStub = Deno.env.get("MAKINA_ALLOW_WIZARD_STUB") === "1";
-  if (!allowStub) {
-    console.error(
-      "makina setup is not yet usable: the GitHub App client is wired in #4.",
-    );
-    console.error(
-      "Track issue #4 ([W2-github-app-auth]); set MAKINA_ALLOW_WIZARD_STUB=1 to dry-run the wizard.",
-    );
-    Deno.exit(2);
-  }
-  // Stub used only for the `MAKINA_ALLOW_WIZARD_STUB=1` dry-run path. It
-  // throws on the discovery step so contributors can exercise the
-  // prompts without a real App client; the wizard's own tests inject
-  // their own client and never touch this code.
+  // The interactive wizard is fully implemented and runs unconditionally.
+  // What is **not** yet wired in this PR is the App-level GitHub client
+  // that lists reachable installations; that lands with
+  // [W2-github-app-auth] (issue #4). Until then, the wizard fails with a
+  // clear "not yet implemented" message at the discovery step — the user
+  // has typed their App ID and key path, but they get a single-line
+  // diagnostic pointing at #4 rather than a stack trace.
+  //
+  // The wizard's own tests inject their own `WizardGitHubClient` and
+  // never touch this code path; the in-memory doubles are isolated from
+  // production wiring by design.
   const stubClient: WizardGitHubClient = {
     getInstallations(): Promise<readonly WizardInstallation[]> {
       throw new Error(
-        "Real GitHub App client is not yet wired. Track [W2-github-app-auth] (issue #4).",
+        "GitHub App auth not yet implemented (#4 — [W2-github-app-auth]).",
       );
     },
   };

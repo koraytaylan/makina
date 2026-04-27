@@ -31,11 +31,13 @@
 import { exists } from "@std/fs";
 
 import { type Config, type GitHubConfig, parseConfig } from "./schema.ts";
-import { expandHome } from "./load.ts";
+import { defaultEnvLookup, type EnvLookup, expandHome } from "./load.ts";
 import {
   MAX_TASK_ITERATIONS,
   POLL_INTERVAL_MILLISECONDS,
+  RADIX_DECIMAL,
   SETTLING_WINDOW_MILLISECONDS,
+  WIZARD_READ_CHUNK_BYTES,
 } from "../constants.ts";
 
 /**
@@ -109,6 +111,14 @@ export interface SetupWizardIo {
   readonly writeLine: WriteLine;
   /** GitHub client for App-level installation discovery. */
   readonly githubClient: WizardGitHubClient;
+  /**
+   * Env reader the wizard uses for `$HOME` lookups (currently the
+   * private-key-path existence check). Optional — tests inject a
+   * per-test stub so they can run with `deno test --parallel` without
+   * mutating `Deno.env` and racing with sibling tests; production
+   * callers omit the field and the wizard falls back to `Deno.env.get`.
+   */
+  readonly envLookup?: EnvLookup;
 }
 
 /**
@@ -170,8 +180,9 @@ export async function runSetupWizard(io: SetupWizardIo): Promise<Config> {
   await io.writeLine("for details on creating the App itself.");
   await io.writeLine("");
 
+  const envLookup = io.envLookup ?? defaultEnvLookup;
   const appId = await promptAppId(io);
-  const privateKeyPath = await promptPrivateKeyPath(io);
+  const privateKeyPath = await promptPrivateKeyPath(io, envLookup);
   const installations = await fetchInstallations(io, appId, privateKeyPath);
   const repoChoices = collectRepositoryChoices(installations);
   if (repoChoices.length === 0) {
@@ -243,26 +254,32 @@ export interface ByteWriter {
  * Build a {@link SetupWizardIo} backed by an arbitrary byte reader and
  * writer. The reader is decoded as UTF-8 and split on `\n` (a trailing
  * `\r` is stripped so Windows-style stdin Just Works). The writer
- * receives `${text}\n` per call.
+ * receives `${text}\n` per call, looping over partial writes until the
+ * buffer drains.
  *
- * Tests use this with `Deno.Buffer`-backed reader/writer pairs;
- * production code goes through {@link createStdioWizardIo}.
+ * Tests pass custom `ByteReader` / `ByteWriter` implementations
+ * (`StringReader`, `CapturingWriter` in the integration suite — see
+ * `tests/integration/setup_wizard_test.ts`); production code goes
+ * through {@link createStdioWizardIo}.
  *
  * @param reader Byte source (typically `Deno.stdin`).
  * @param writer Byte sink (typically `Deno.stdout`).
  * @param githubClient Wizard-only GitHub client.
+ * @param envLookup Optional env reader for `$HOME`. Tests inject a
+ *   per-test stub to avoid mutating `Deno.env`; production callers omit
+ *   the argument and the wizard uses `Deno.env.get`.
  * @returns An IO bundle suitable for {@link runSetupWizard}.
  */
 export function createWizardIo(
   reader: ByteReader,
   writer: ByteWriter,
   githubClient: WizardGitHubClient,
+  envLookup?: EnvLookup,
 ): SetupWizardIo {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
   let eof = false;
-  const readChunkBytes = 1_024;
 
   const readLine: ReadLine = async () => {
     while (true) {
@@ -281,10 +298,14 @@ export function createWizardIo(
         buffer = "";
         return remainder.endsWith("\r") ? remainder.slice(0, -1) : remainder;
       }
-      const chunk = new Uint8Array(readChunkBytes);
+      const chunk = new Uint8Array(WIZARD_READ_CHUNK_BYTES);
       const bytesRead = await reader.read(chunk);
       if (bytesRead === null) {
         eof = true;
+        // Flush the streaming decoder so a partial multi-byte UTF-8
+        // sequence at end-of-stream surfaces as the replacement
+        // character rather than getting silently dropped.
+        buffer += decoder.decode();
         continue;
       }
       buffer += decoder.decode(chunk.subarray(0, bytesRead), { stream: true });
@@ -292,10 +313,31 @@ export function createWizardIo(
   };
 
   const writeLine: WriteLine = async (text: string) => {
-    await writer.write(encoder.encode(`${text}\n`));
+    // Deno's `Writer`-style API permits partial writes — `writer.write`
+    // is allowed to return a value smaller than `buffer.length`. Loop
+    // until every byte drains so a slow sink cannot truncate prompts.
+    let pending = encoder.encode(`${text}\n`);
+    while (pending.length > 0) {
+      const written = await writer.write(pending);
+      if (written <= 0) {
+        // A non-positive return indicates the sink will not make
+        // progress; failing fast here surfaces it instead of looping
+        // forever on a half-closed pipe.
+        throw new Error(
+          `wizard writer returned non-positive byte count (${written}); aborting.`,
+        );
+      }
+      pending = pending.subarray(written);
+    }
   };
 
-  return { readLine, writeLine, githubClient };
+  // Build the IO object. The `envLookup` field is optional under
+  // `exactOptionalPropertyTypes` — we only set it when the caller
+  // provided one so an `undefined` does not show up on the property.
+  const io: SetupWizardIo = envLookup === undefined
+    ? { readLine, writeLine, githubClient }
+    : { readLine, writeLine, githubClient, envLookup };
+  return io;
 }
 
 /**
@@ -313,7 +355,7 @@ export function createWizardIo(
 export function createStdioWizardIo(
   githubClient: WizardGitHubClient,
 ): SetupWizardIo {
-  return createWizardIo(Deno.stdin, Deno.stdout, githubClient);
+  return createWizardIo(Deno.stdin, Deno.stdout, githubClient, defaultEnvLookup);
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +365,7 @@ export function createStdioWizardIo(
 async function promptAppId(io: SetupWizardIo): Promise<number> {
   await io.writeLine("GitHub App ID (integer printed at the top of the App settings page):");
   const raw = await readRequiredLine(io, "App ID");
-  const parsed = Number.parseInt(raw, 10);
+  const parsed = Number.parseInt(raw, RADIX_DECIMAL);
   if (!Number.isInteger(parsed) || parsed < 1 || `${parsed}` !== raw) {
     throw new SetupWizardError(
       `invalid App ID ${JSON.stringify(raw)}: expected a positive integer`,
@@ -332,11 +374,14 @@ async function promptAppId(io: SetupWizardIo): Promise<number> {
   return parsed;
 }
 
-async function promptPrivateKeyPath(io: SetupWizardIo): Promise<string> {
+async function promptPrivateKeyPath(
+  io: SetupWizardIo,
+  envLookup: EnvLookup,
+): Promise<string> {
   await io.writeLine("");
   await io.writeLine("Path to the App's private key (PEM). May begin with ~/.");
   const raw = await readRequiredLine(io, "Private-key path");
-  const expanded = expandHome(raw);
+  const expanded = expandHome(raw, envLookup);
   const found = await exists(expanded, { isFile: true });
   if (!found) {
     throw new SetupWizardError(
@@ -427,7 +472,7 @@ async function promptDefaultRepo(
     `Pick the default repository (1-${choices.length}). Slash commands without an explicit [owner/repo] target this one.`,
   );
   const raw = await readRequiredLine(io, "Default repo");
-  const numeric = Number.parseInt(raw, 10);
+  const numeric = Number.parseInt(raw, RADIX_DECIMAL);
   if (!Number.isInteger(numeric) || `${numeric}` !== raw) {
     throw new SetupWizardError(
       `invalid choice ${JSON.stringify(raw)}: expected a number between 1 and ${choices.length}.`,

@@ -15,7 +15,17 @@
 
 import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 
-import { ConfigLoadError, expandHome, loadConfig } from "../../src/config/load.ts";
+import { ConfigLoadError, type EnvLookup, expandHome, loadConfig } from "../../src/config/load.ts";
+
+/**
+ * Build an `EnvLookup` over a fixed map. Tests use this instead of
+ * mutating `Deno.env`; the suite runs with `--parallel`, so global env
+ * mutation can race across files.
+ */
+function envLookupFrom(entries: Record<string, string>): EnvLookup {
+  const map = new Map(Object.entries(entries));
+  return (name) => map.get(name);
+}
 
 function fullValidConfigText(): string {
   return JSON.stringify(
@@ -97,18 +107,13 @@ Deno.test("loadConfig: expands a leading ~/ against $HOME", async () => {
   try {
     const filePath = `${tempDir}/config.json`;
     await Deno.writeTextFile(filePath, fullValidConfigText());
-    const previousHome = Deno.env.get("HOME");
-    Deno.env.set("HOME", tempDir);
-    try {
-      const config = await loadConfig("~/config.json");
-      assertEquals(config.github.appId, 1234567);
-    } finally {
-      if (previousHome === undefined) {
-        Deno.env.delete("HOME");
-      } else {
-        Deno.env.set("HOME", previousHome);
-      }
-    }
+    // Inject a per-test `EnvLookup` rather than mutating `Deno.env` so
+    // the suite can run with `deno test --parallel` without racing.
+    const config = await loadConfig(
+      "~/config.json",
+      envLookupFrom({ HOME: tempDir }),
+    );
+    assertEquals(config.github.appId, 1234567);
   } finally {
     await Deno.remove(tempDir, { recursive: true });
   }
@@ -197,77 +202,45 @@ Deno.test("loadConfig: read-failed surfaces when the path points at a directory"
 });
 
 Deno.test("expandHome: returns ~ alone as $HOME", () => {
-  const previous = Deno.env.get("HOME");
-  Deno.env.set("HOME", "/Users/mock");
-  try {
-    assertEquals(expandHome("~"), "/Users/mock");
-  } finally {
-    if (previous === undefined) {
-      Deno.env.delete("HOME");
-    } else {
-      Deno.env.set("HOME", previous);
-    }
-  }
+  assertEquals(
+    expandHome("~", envLookupFrom({ HOME: "/Users/mock" })),
+    "/Users/mock",
+  );
 });
 
 Deno.test("expandHome: leaves non-~ paths untouched", () => {
-  assertEquals(expandHome("/abs/path"), "/abs/path");
-  assertEquals(expandHome("./rel"), "./rel");
-  assertEquals(expandHome("~user/foo"), "~user/foo");
+  // No `$HOME` lookup is needed for these inputs; pass an empty env so
+  // a future bug that *does* reach for `HOME` would surface as a clear
+  // "cannot expand" error.
+  const empty = envLookupFrom({});
+  assertEquals(expandHome("/abs/path", empty), "/abs/path");
+  assertEquals(expandHome("./rel", empty), "./rel");
+  assertEquals(expandHome("~user/foo", empty), "~user/foo");
 });
 
 Deno.test("expandHome: handles a $HOME with a trailing slash without producing //", () => {
-  const previous = Deno.env.get("HOME");
-  Deno.env.set("HOME", "/Users/mock/");
-  try {
-    assertEquals(expandHome("~/foo/bar"), "/Users/mock/foo/bar");
-  } finally {
-    if (previous === undefined) {
-      Deno.env.delete("HOME");
-    } else {
-      Deno.env.set("HOME", previous);
-    }
-  }
+  assertEquals(
+    expandHome("~/foo/bar", envLookupFrom({ HOME: "/Users/mock/" })),
+    "/Users/mock/foo/bar",
+  );
 });
 
 Deno.test("expandHome: throws when ~/ is used without $HOME set", () => {
   // Per ADR-008 (Windows out of scope) the loader only honors $HOME.
-  // The test scrubs USERPROFILE too so we'd notice if a future change
-  // accidentally re-introduced a Windows fallback.
-  const previousHome = Deno.env.get("HOME");
-  const previousProfile = Deno.env.get("USERPROFILE");
-  Deno.env.delete("HOME");
-  Deno.env.delete("USERPROFILE");
-  try {
-    assertThrows(() => expandHome("~/foo"), Error, "cannot expand");
-  } finally {
-    if (previousHome !== undefined) {
-      Deno.env.set("HOME", previousHome);
-    }
-    if (previousProfile !== undefined) {
-      Deno.env.set("USERPROFILE", previousProfile);
-    }
-  }
+  assertThrows(
+    () => expandHome("~/foo", envLookupFrom({})),
+    Error,
+    "cannot expand",
+  );
 });
 
 Deno.test("expandHome: ignores USERPROFILE (ADR-008 — Windows out of scope)", () => {
   // We do NOT promise %USERPROFILE% expansion. Setting it without HOME
   // must still raise so we never accidentally start advertising native
   // Windows behavior we don't actually support.
-  const previousHome = Deno.env.get("HOME");
-  const previousProfile = Deno.env.get("USERPROFILE");
-  Deno.env.delete("HOME");
-  Deno.env.set("USERPROFILE", "/Users/mock");
-  try {
-    assertThrows(() => expandHome("~/foo"), Error, "cannot expand");
-  } finally {
-    if (previousHome !== undefined) {
-      Deno.env.set("HOME", previousHome);
-    }
-    if (previousProfile === undefined) {
-      Deno.env.delete("USERPROFILE");
-    } else {
-      Deno.env.set("USERPROFILE", previousProfile);
-    }
-  }
+  assertThrows(
+    () => expandHome("~/foo", envLookupFrom({ USERPROFILE: "/Users/mock" })),
+    Error,
+    "cannot expand",
+  );
 });

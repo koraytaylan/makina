@@ -4,7 +4,8 @@
  * Wave 1's `src/config/schema.ts` froze the typed shape; this module is
  * the only place Wave 2+ reads the file from disk. The loader:
  *
- * 1. Expands a single leading `~/` to the user's home directory.
+ * 1. Expands a single leading `~/` on the **config path argument** to
+ *    {@link loadConfig} so callers can pass `~/.config/makina/...`.
  * 2. Reads the file (UTF-8, JSON-with-comments tolerant via
  *    {@link "@std/jsonc"}).
  * 3. Pipes the parsed value through {@link parseConfig} so the caller
@@ -16,10 +17,19 @@
  * exposes structured `issues` for callers that want to render their own
  * formatting.
  *
- * The loader intentionally does **not** expand `~/` recursively or
- * touch other paths inside the config (e.g. `github.privateKeyPath`,
- * `daemon.socketPath`, `workspace`). Each consumer expands the paths
- * relevant to it; the convention keeps config text human-readable.
+ * ## Path-expansion contract
+ *
+ * The loader expands `~/` **only on the path it is asked to read**. The
+ * other path fields inside the config (`github.privateKeyPath`,
+ * `daemon.socketPath`, `workspace`) are returned **verbatim**. Each
+ * consumer is responsible for calling {@link expandHome} at the
+ * boundary it cares about (the daemon expands `socketPath` before
+ * binding; the GitHub App client will expand `privateKeyPath` before
+ * opening the file; the wizard expands `privateKeyPath` for an
+ * existence check before persisting). This keeps `config.json`
+ * portable across machines belonging to the same user, even when
+ * `$HOME` differs. `src/config/schema.ts`'s field-level docs reflect
+ * this contract.
  *
  * @module
  */
@@ -27,6 +37,26 @@
 import * as jsonc from "@std/jsonc";
 
 import { type Config, type ConfigValidationIssue, parseConfig } from "./schema.ts";
+import { HOME_PREFIX } from "../constants.ts";
+
+/**
+ * Read a single environment variable.
+ *
+ * Tests inject a custom `EnvLookup` (typically backed by a per-test
+ * `Map`) so the suite can run with `--parallel` without mutating
+ * `Deno.env` and racing with sibling tests. Production code passes
+ * {@link defaultEnvLookup}, which delegates to `Deno.env.get`.
+ */
+export type EnvLookup = (name: string) => string | undefined;
+
+/**
+ * Production-time {@link EnvLookup}. Reads through to `Deno.env.get`.
+ *
+ * Exported so tests that need to scope env access for a single call can
+ * compose against it, but most callers (including {@link loadConfig} and
+ * {@link expandHome}) accept this as the implicit default.
+ */
+export const defaultEnvLookup: EnvLookup = (name: string): string | undefined => Deno.env.get(name);
 
 /**
  * Reason a {@link loadConfig} call failed.
@@ -47,9 +77,11 @@ export type ConfigLoadFailureKind =
 /**
  * Error thrown by {@link loadConfig} when the file cannot be loaded.
  *
- * `message` always begins with the resolved path, then a one-line
- * summary, and (for `invalid-schema`) lists every failing field as
- * `<path>: <message>`. Catch sites can read `kind` to branch.
+ * The `message` is a single-line summary that **embeds the resolved
+ * path** (e.g. `"config file /home/u/.config/makina/config.json not
+ * found"`) and, for `invalid-schema`, then lists every failing field as
+ * `  - <path>: <message>` on subsequent lines. Catch sites can read
+ * `kind` to branch and `resolvedPath` for a clean unformatted path.
  *
  * @example
  * ```ts
@@ -108,6 +140,11 @@ export class ConfigLoadError extends Error {
  * in misconfigured environments).
  *
  * @param path Candidate path, possibly beginning with `~/`.
+ * @param envLookup Optional env reader for `$HOME`. Tests pass a
+ *   per-test stub so they can run with `deno test --parallel` without
+ *   mutating `Deno.env` and racing with sibling tests; production
+ *   callers omit the argument and the function falls back to
+ *   {@link defaultEnvLookup} (a thin wrapper around `Deno.env.get`).
  * @returns The expanded path.
  * @throws Error when `~/` cannot be expanded because no home directory is
  *   configured.
@@ -118,20 +155,23 @@ export class ConfigLoadError extends Error {
  * expandHome("/etc/makina/config.json");      // → "/etc/makina/config.json"
  * ```
  */
-export function expandHome(path: string): string {
+export function expandHome(
+  path: string,
+  envLookup: EnvLookup = defaultEnvLookup,
+): string {
   if (path === "~") {
-    return resolveHome();
+    return resolveHome(envLookup);
   }
-  if (path.startsWith("~/")) {
-    return joinHome(path.slice(2));
+  if (path.startsWith(HOME_PREFIX)) {
+    return joinHome(path.slice(HOME_PREFIX.length), envLookup);
   }
   return path;
 }
 
-function resolveHome(): string {
+function resolveHome(envLookup: EnvLookup): string {
   // ADR-008 defers Windows: only POSIX `$HOME` is supported. WSL2 users
   // have a `$HOME` like any other Linux env, so this still covers them.
-  const home = Deno.env.get("HOME");
+  const home = envLookup("HOME");
   if (home === undefined || home.length === 0) {
     throw new Error(
       "cannot expand ~/: $HOME is not set",
@@ -140,8 +180,8 @@ function resolveHome(): string {
   return home;
 }
 
-function joinHome(rest: string): string {
-  const home = resolveHome();
+function joinHome(rest: string, envLookup: EnvLookup): string {
+  const home = resolveHome(envLookup);
   // The home dir typically lacks a trailing slash. Strip a leading slash
   // from `rest` before joining so we never produce `//`.
   const trimmedRest = rest.startsWith("/") ? rest.slice(1) : rest;
@@ -159,6 +199,9 @@ function joinHome(rest: string): string {
  * schema-invalid).
  *
  * @param path The config file path. May begin with `~/`.
+ * @param envLookup Optional env reader for `$HOME`. Tests pass a
+ *   per-test stub; production callers omit the argument and the loader
+ *   falls back to `Deno.env.get`.
  * @returns The validated, typed {@link Config}.
  * @throws {ConfigLoadError} for any failure to load.
  *
@@ -168,8 +211,11 @@ function joinHome(rest: string): string {
  * console.log(config.github.defaultRepo);
  * ```
  */
-export async function loadConfig(path: string): Promise<Config> {
-  const resolvedPath = expandHome(path);
+export async function loadConfig(
+  path: string,
+  envLookup: EnvLookup = defaultEnvLookup,
+): Promise<Config> {
+  const resolvedPath = expandHome(path, envLookup);
 
   let text: string;
   try {

@@ -58,10 +58,10 @@ makina setup
 Walks through the App ID, private-key path, installation discovery, and default repo. See
 `docs/setup-github-app.md` for App creation.
 
-> **Status (this PR):** the wizard's interactive flow is implemented but the GitHub App client used
-> for installation discovery lands with `[W2-github-app-auth]` (#4). Until then, `makina setup`
-> exits immediately with a pointer to issue #4. Set `MAKINA_ALLOW_WIZARD_STUB=1` to dry-run the
-> prompts; the discovery step will fail with a clear "App client not yet wired" message.
+> **Status (this PR):** the wizard's interactive flow is implemented and runs unconditionally. The
+> GitHub App client used for installation discovery lands with `[W2-github-app-auth]` (#4); until
+> then, `makina setup` fails at the discovery step with a clear "GitHub App auth not yet implemented
+> (#4)" error (after the App ID and private-key path have been collected).
 
 ## Loader behavior
 

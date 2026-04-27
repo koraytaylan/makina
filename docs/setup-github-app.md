@@ -1,8 +1,9 @@
 # Setting up the GitHub App
 
-> Wave 2's `setup` wizard will drive steps 3.2 onwards once `[W2-github-app-auth]` (#4) wires the
-> GitHub App client. Steps 1 and 2 are manual GitHub actions taken in your browser; the wizard
-> handles everything after the App is installed. See section 3 for the current `makina setup` gate.
+> Wave 2's `setup` wizard drives steps 3.2 onwards. Steps 1 and 2 are manual GitHub actions taken in
+> your browser; the wizard handles everything after the App is installed. The wizard runs end-to-end
+> except for installation discovery, which lands with `[W2-github-app-auth]` (#4) — until then the
+> wizard exits with a clear "not yet implemented" message at that step.
 
 makina authenticates to GitHub as a GitHub App (rather than a personal access token). This is
 ADR-003: it gives us higher rate limits, fine-grained per-repo permissions, and a clean bot identity
@@ -36,17 +37,16 @@ On the App page → **Install App** → choose the account → choose specific r
    discover which repos you can target, and write the resulting `config.json` to the
    platform-appropriate location (see `docs/configuration.md`).
 
-> **Status (this PR):** the wizard's prompts, validation, and config-writing are implemented, but
-> the GitHub App client used for installation discovery is wired in `[W2-github-app-auth]` (#4).
-> Until that lands, `makina setup` exits immediately with a pointer instead of prompting; set the
-> `MAKINA_ALLOW_WIZARD_STUB=1` env var to dry-run the prompts (the discovery step will then surface
-> a clear "GitHub App client not yet wired" error). When the App client lands the gate goes away in
-> the same PR.
+> **Status (this PR):** the wizard's prompts, validation, and config-writing are implemented and run
+> unconditionally. The GitHub App client used for installation discovery is wired in
+> `[W2-github-app-auth]` (#4); until that lands, `makina setup` will fail with a clear "GitHub App
+> auth not yet implemented (#4)" error at the discovery step (after the App ID and private-key path
+> have been collected). When the App client lands the wizard completes end-to-end with no further
+> changes here.
 
-When usable, the wizard validates the private-key path against the filesystem before calling GitHub,
-prints the list of reachable repositories with one-based numbers, and writes the resulting
-`config.json`. On EOF or invalid input the wizard exits with a one-line summary; rerun the command
-to start over.
+The wizard validates the private-key path against the filesystem before calling GitHub, prints the
+list of reachable repositories with one-based numbers, and writes the resulting `config.json`. On
+EOF or invalid input the wizard exits with a one-line summary; rerun the command to start over.
 
 ## Copilot review
 
