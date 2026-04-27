@@ -42,6 +42,17 @@
  * `save` overwrites it. If the live `<path>` is missing entirely, the store
  * is empty — `loadAll` returns `[]` rather than failing.
  *
+ * **`@std/fs` policy.** Issue #7 specifies "All file IO through `@std/fs`
+ * where possible". The persistence layer is the documented exception:
+ * `@std/fs` exposes neither the rename, the file-descriptor `syncData`, nor
+ * a directory-tracking `mkdir` that would let us fsync each newly-created
+ * parent (see `ensureDurableParentChain` below for why that matters). We
+ * therefore call `Deno.readTextFile`, `Deno.rename`, `Deno.mkdir`, and
+ * `Deno.open` directly. The rationale is captured in
+ * {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/014-persistence-durability-protocol.md ADR-014}.
+ * Other modules without a hard durability contract should continue to use
+ * `@std/fs`.
+ *
  * @module
  */
 
