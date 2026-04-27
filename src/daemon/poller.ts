@@ -52,6 +52,7 @@ import { getLogger } from "@std/log";
 import {
   POLLER_BACKOFF_BASE_MILLISECONDS,
   POLLER_BACKOFF_JITTER_RATIO,
+  POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT,
   POLLER_BACKOFF_MAX_MILLISECONDS,
 } from "../constants.ts";
 import type { Poller, TaskId } from "../types.ts";
@@ -556,6 +557,11 @@ async function runLoop<TResult>(args: LoopArgs<TResult>): Promise<void> {
  * after a success, 2 for the next, …). The returned value is
  * `min(base * 2^(attempt-1), max) * jitter`, where `jitter` is uniform
  * in `[1 - ratio, 1 + ratio]`. Clamped from above by `max`.
+ *
+ * The exponent is also capped at {@link POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT}
+ * to keep `Math.pow(2, …)` clear of `Infinity`; with realistic
+ * `(base, max)` pairs the outer `min(…, max)` saturates the series long
+ * before the cap takes effect (see the constant's JSDoc).
  */
 function computeBackoff(
   attempt: number,
@@ -564,11 +570,7 @@ function computeBackoff(
   jitterRatio: number,
   random: () => number,
 ): number {
-  // 2^53 is the JavaScript safe-integer ceiling. We never get anywhere
-  // near that with realistic backoff bases, but `Math.pow(2, 1024)`
-  // returns `Infinity`, which `clamp` handles, but capping the exponent
-  // keeps the math debuggable.
-  const safeAttempt = Math.min(attempt, 30);
+  const safeAttempt = Math.min(attempt, POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT);
   const exponential = base * Math.pow(2, safeAttempt - 1);
   const capped = Math.min(exponential, max);
   if (jitterRatio === 0) {
@@ -663,14 +665,10 @@ function defaultClock(): PollerClock {
           return;
         }
         let resolved = false;
-        const timeout = setTimeout(() => {
-          if (resolved) return;
-          resolved = true;
-          if (signal !== undefined && abortListener !== undefined) {
-            signal.removeEventListener("abort", abortListener);
-          }
-          resolve();
-        }, wait);
+        // `abortListener` is declared up-front so the `setTimeout`
+        // callback (and the listener itself) can both reference it
+        // without tripping the temporal-dead-zone — and so the cleanup
+        // path is plain to read without forward references.
         const abortListener = (): void => {
           if (resolved) return;
           resolved = true;
@@ -678,6 +676,12 @@ function defaultClock(): PollerClock {
           signal?.removeEventListener("abort", abortListener);
           resolve();
         };
+        const timeout = setTimeout(() => {
+          if (resolved) return;
+          resolved = true;
+          signal?.removeEventListener("abort", abortListener);
+          resolve();
+        }, wait);
         signal?.addEventListener("abort", abortListener);
         // `setTimeout` in Deno returns a numeric handle; `unref` is not
         // available on every runtime. We do not block daemon shutdown on

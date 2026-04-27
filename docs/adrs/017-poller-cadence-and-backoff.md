@@ -47,13 +47,18 @@ After each fetcher resolution the poller sleeps for one of three durations befor
 - **Success or `PollerError` carrying `retryAfterMs`** → that value, clamped to
   `[0, POLLER_BACKOFF_MAX_MILLISECONDS]`. Header-driven rate-limit waits dominate any other signal.
 - **Failure (rejection or `PollerError` without `retryAfterMs`)** → exponential backoff with jitter:
-  `min(POLLER_BACKOFF_BASE_MILLISECONDS * 2^attempt, POLLER_BACKOFF_MAX_MILLISECONDS)` multiplied by
-  a uniform jitter factor in `[1 - POLLER_BACKOFF_JITTER_RATIO, 1 + POLLER_BACKOFF_JITTER_RATIO]`.
-  The attempt counter is per-task and resets to zero on the next successful tick.
+  `min(POLLER_BACKOFF_BASE_MILLISECONDS * 2^(attempt - 1), POLLER_BACKOFF_MAX_MILLISECONDS)`
+  multiplied by a uniform jitter factor in
+  `[1 - POLLER_BACKOFF_JITTER_RATIO, 1 + POLLER_BACKOFF_JITTER_RATIO]`. The attempt counter is the
+  per-task consecutive-failure count starting at 1 (so the first backoff is exactly the base) and
+  resets to zero on the next successful tick. The exponent is internally capped at
+  `POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT` (30) to keep `Math.pow(2, …)` away from `Infinity`; with the
+  default `MAX` of five minutes the series saturates well before that cap.
 
-`intervalMilliseconds` defaults to `POLL_INTERVAL_MILLISECONDS` when the caller omits it. Callers
-can pass `0` when they want the poller to fire back-to-back (used by the in-memory tests for the
-conversations phase).
+`intervalMilliseconds` is required on the `poll(...)` call; the supervisor passes
+`POLL_INTERVAL_MILLISECONDS` from `src/constants.ts` (the per-phase default). Callers can pass `0`
+when they want the poller to fire back-to-back (used by the in-memory tests for the conversations
+phase).
 
 ### Single-flight per task
 

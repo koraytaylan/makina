@@ -212,11 +212,12 @@ export const HOME_PREFIX = "~/";
  * Base sleep used by the {@link Poller} when retrying after a transient
  * fetcher rejection, in milliseconds.
  *
- * The actual wait is `min(BASE * 2^attempt, MAX) * jitter`, where
+ * The actual wait is `min(BASE * 2^(attempt - 1), MAX) * jitter`, where
  * `attempt` is the run of consecutive failures since the last successful
- * tick. One second is short enough that a single transient blip recovers
- * inside one poll interval, and long enough that we do not pound a
- * struggling GitHub.
+ * tick (1 on the first failure, so the first backoff is exactly `BASE`).
+ * One second is short enough that a single transient blip recovers inside
+ * one poll interval, and long enough that we do not pound a struggling
+ * GitHub.
  *
  * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
  */
@@ -248,3 +249,23 @@ export const POLLER_BACKOFF_MAX_MILLISECONDS = 5 * 60 * 1_000;
  * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
  */
 export const POLLER_BACKOFF_JITTER_RATIO = 0.2;
+
+/**
+ * Internal ceiling on the consecutive-failure count fed into the
+ * {@link Poller}'s `2^(attempt - 1)` exponent.
+ *
+ * `Math.pow(2, 1023)` is the largest power-of-two finite double; beyond
+ * that the multiplication overflows to `Infinity`. The poller's outer
+ * `clamp` would still saturate the result to `POLLER_BACKOFF_MAX_MILLISECONDS`,
+ * but capping the exponent keeps the math debuggable and avoids a flicker
+ * of `Infinity` in trace logs. Thirty is comfortably above the saturation
+ * point for every realistic `(base, max)` pair: with the default
+ * `BASE = 1 s` and `MAX = 5 min`, the series saturates at attempt nine
+ * (`1 s * 2^8 = 256 s`); even a `MAX` of one hour saturates at attempt
+ * twelve.
+ *
+ * Callers configuring an unusually large `backoffMaxMilliseconds` should
+ * note that increasing `MAX` past `BASE * 2^29` will not lengthen the
+ * series further — the cap dominates first.
+ */
+export const POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT = 30;
