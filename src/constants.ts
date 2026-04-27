@@ -218,7 +218,7 @@ export const HOME_PREFIX = "~/";
  * inside one poll interval, and long enough that we do not pound a
  * struggling GitHub.
  *
- * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/015-poller-cadence-and-backoff.md ADR-015}.
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
  */
 export const POLLER_BACKOFF_BASE_MILLISECONDS = 1_000;
 
@@ -231,7 +231,7 @@ export const POLLER_BACKOFF_BASE_MILLISECONDS = 1_000;
  * comfortably above any realistic GitHub `Retry-After` and well below
  * the supervisor's settling-window upper bound.
  *
- * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/015-poller-cadence-and-backoff.md ADR-015}.
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
  */
 export const POLLER_BACKOFF_MAX_MILLISECONDS = 5 * 60 * 1_000;
 
@@ -245,6 +245,6 @@ export const POLLER_BACKOFF_MAX_MILLISECONDS = 5 * 60 * 1_000;
  * shape and is small enough that the steady-state cadence stays
  * recognisable.
  *
- * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/015-poller-cadence-and-backoff.md ADR-015}.
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
  */
 export const POLLER_BACKOFF_JITTER_RATIO = 0.2;

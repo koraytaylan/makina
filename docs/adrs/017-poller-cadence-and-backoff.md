@@ -1,4 +1,4 @@
-# ADR-015: Poller cadence, backoff, and rate-limit honoring
+# ADR-017: Poller cadence, backoff, and rate-limit honoring
 
 ## Status
 

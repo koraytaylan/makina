@@ -10,7 +10,7 @@
  * binds to.
  *
  * The behavior split between this module and {@link GitHubClientImpl}
- * mirrors ADR-006 + ADR-011 + ADR-015:
+ * mirrors ADR-006 + ADR-011 + ADR-017:
  *
  * - The GitHub client honors header-driven rate-limit waits (`Retry-After`,
  *   `X-RateLimit-Reset`) **inside** the fetch wrapper, so a single
@@ -31,7 +31,7 @@
  * touch the real clock. The default implementation uses `Date.now`
  * and `setTimeout`; tests inject a deterministic clock that records
  * every sleep duration. The clock is the **only** way the module
- * measures time. Per ADR-015, no `Date.now()` call lives outside the
+ * measures time. Per ADR-017, no `Date.now()` call lives outside the
  * default-clock factory.
  *
  * **Cancellation.** Both the returned `cancel()` handle and a caller-
@@ -41,7 +41,7 @@
  *
  * The cadence semantics, the `PollerError` taxonomy, and the synthetic-
  * clock contract are captured in
- * `docs/adrs/015-poller-cadence-and-backoff.md`. Any change to those
+ * `docs/adrs/017-poller-cadence-and-backoff.md`. Any change to those
  * shapes is a contract change and needs an ADR amendment.
  *
  * @module
@@ -328,7 +328,7 @@ export interface PollerImpl extends Poller {
  *
  * The returned poller drives one loop per task with the cadence and
  * backoff policy spelled out in
- * `docs/adrs/015-poller-cadence-and-backoff.md`. See the module doc
+ * `docs/adrs/017-poller-cadence-and-backoff.md`. See the module doc
  * for the full contract.
  *
  * @param options Optional configuration overrides.
