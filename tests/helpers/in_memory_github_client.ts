@@ -92,6 +92,10 @@ export type RecordedCall =
     readonly pullRequestNumber: IssueNumber;
   }
   | {
+    readonly method: "resolveReviewThread";
+    readonly threadId: string;
+  }
+  | {
     readonly method: "mergePullRequest";
     readonly repo: RepoFullName;
     readonly pullRequestNumber: IssueNumber;
@@ -107,6 +111,7 @@ interface MethodTimelines {
   getCheckRunLogs: ScriptedReply<Uint8Array>[];
   listReviews: ScriptedReply<readonly PullRequestReview[]>[];
   listReviewComments: ScriptedReply<readonly PullRequestReviewComment[]>[];
+  resolveReviewThread: ScriptedReply<void>[];
   mergePullRequest: ScriptedReply<void>[];
 }
 
@@ -137,6 +142,7 @@ export class InMemoryGitHubClient implements StabilizeGitHubClient {
     getCheckRunLogs: [],
     listReviews: [],
     listReviewComments: [],
+    resolveReviewThread: [],
     mergePullRequest: [],
   };
   private readonly callLog: RecordedCall[] = [];
@@ -212,6 +218,15 @@ export class InMemoryGitHubClient implements StabilizeGitHubClient {
     reply: ScriptedReply<readonly PullRequestReviewComment[]>,
   ): void {
     this.timelines.listReviewComments.push(reply);
+  }
+
+  /**
+   * Queue the next reply for
+   * {@link InMemoryGitHubClient.resolveReviewThread}.
+   * @param reply The next scripted reply.
+   */
+  queueResolveReviewThread(reply: ScriptedReply<void>): void {
+    this.timelines.resolveReviewThread.push(reply);
   }
 
   /**
@@ -305,6 +320,15 @@ export class InMemoryGitHubClient implements StabilizeGitHubClient {
     return resolveScripted(
       this.timelines.listReviewComments,
       "listReviewComments",
+    );
+  }
+
+  /** {@inheritdoc StabilizeGitHubClient.resolveReviewThread} */
+  resolveReviewThread(threadId: string): Promise<void> {
+    this.callLog.push({ method: "resolveReviewThread", threadId });
+    return resolveScripted(
+      this.timelines.resolveReviewThread,
+      "resolveReviewThread",
     );
   }
 

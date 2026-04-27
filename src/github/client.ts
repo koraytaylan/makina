@@ -117,7 +117,11 @@ export interface PullRequestReview {
  * Mirrors the subset of the [Pulls Comments API](https://docs.github.com/en/rest/pulls/comments)
  * the stabilize loop reads. Threading metadata
  * (`pull_request_review_id`, `in_reply_to_id`) is preserved so the
- * conversations phase can group comments by thread.
+ * conversations phase can group comments by thread; the optional
+ * {@link PullRequestReviewComment.threadNodeId} carries the GraphQL
+ * node id the
+ * {@link StabilizeGitHubClient.resolveReviewThread} mutation requires
+ * once the supervisor pushes a fix for the thread.
  */
 export interface PullRequestReviewComment {
   /** Comment id; stable. */
@@ -134,6 +138,15 @@ export interface PullRequestReviewComment {
   readonly line: number | null;
   /** Parent comment id when this is a reply, otherwise `null`. */
   readonly inReplyToId: number | null;
+  /**
+   * GraphQL node id of the review thread this comment belongs to, when
+   * known. Required by
+   * {@link StabilizeGitHubClient.resolveReviewThread}; the REST Pulls
+   * Comments API does not expose it directly, so the conversations
+   * phase treats `undefined` as "thread cannot be resolved" and skips
+   * the resolve call rather than calling the mutation with a guessed id.
+   */
+  readonly threadNodeId?: string;
   /** ISO-8601 timestamp the comment was created. */
   readonly createdAtIso: string;
 }
@@ -148,13 +161,13 @@ export interface PullRequestReviewComment {
  * The W1 `GitHubClient` contract in `src/types.ts` is intentionally
  * minimal — every interface there is the surface every Wave 2 branch
  * builds in parallel and consumer waves cannot cheaply reshape it.
- * The four methods Wave 4's stabilize loop needs (per-check-run reads
- * for the CI phase, review/comment reads for the conversations phase)
- * are additive, so we expose them on a separate interface that
- * **extends** `GitHubClient` instead. Consumers (Wave 4's supervisor,
- * the in-memory double `tests/helpers/in_memory_github_client.ts`)
- * depend on this interface rather than the concrete
- * {@link GitHubClientImpl} class.
+ * The methods Wave 4's stabilize loop needs (per-check-run reads
+ * for the CI phase, review/comment reads + thread resolution for the
+ * conversations phase) are additive, so we expose them on a separate
+ * interface that **extends** `GitHubClient` instead. Consumers (Wave
+ * 4's supervisor, the in-memory double
+ * `tests/helpers/in_memory_github_client.ts`) depend on this interface
+ * rather than the concrete {@link GitHubClientImpl} class.
  *
  * @example
  * ```ts
@@ -205,6 +218,22 @@ export interface StabilizeGitHubClient extends GitHubClient {
     repo: RepoFullName,
     pullRequestNumber: IssueNumber,
   ): Promise<readonly PullRequestReviewComment[]>;
+  /**
+   * Resolve a single review thread via GitHub's GraphQL API.
+   *
+   * GitHub does not expose a REST endpoint for resolving review threads
+   * — the action is GraphQL-only via the `resolveReviewThread` mutation.
+   * The thread id is the **GraphQL node id**, not the REST review-id;
+   * the conversations phase obtains it from the threads payload it
+   * groups per pull request.
+   *
+   * See ADR-019 for the dependency-policy rationale (we route the
+   * mutation through `@octokit/core`'s built-in `graphql()` rather than
+   * pulling in `@octokit/graphql` as a separate dependency).
+   *
+   * @param threadId GraphQL node id of the review thread to resolve.
+   */
+  resolveReviewThread(threadId: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +311,24 @@ export const DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS = 1_000;
 const HEADER_RETRY_AFTER = "retry-after";
 const HEADER_RATE_LIMIT_REMAINING = "x-ratelimit-remaining";
 const HEADER_RATE_LIMIT_RESET = "x-ratelimit-reset";
+
+/**
+ * GraphQL mutation used by
+ * {@link GitHubClientImpl.resolveReviewThread} to mark a single review
+ * thread as resolved. Centralised so the unit test asserts against the
+ * exact body the production code sends, and any future amendment
+ * (`unresolveReviewThread`, additional return fields) lives next to it.
+ *
+ * The mutation only requires the `threadId` input; the response payload
+ * is read for shape (so a misconfigured GraphQL endpoint surfaces as a
+ * type error rather than silent success). See ADR-019 for the
+ * dependency-policy rationale (no `@octokit/graphql` dependency added).
+ */
+const RESOLVE_REVIEW_THREAD_MUTATION = `mutation ResolveReviewThread($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) {
+    thread { id }
+  }
+}`;
 
 /**
  * Default `User-Agent` string. GitHub demands a non-empty UA on every
@@ -528,6 +575,31 @@ export class GitHubClientImpl implements StabilizeGitHubClient {
     );
     const data = response.data as ReviewCommentResponse[];
     return data.map((comment) => projectReviewComment(comment));
+  }
+
+  /**
+   * Resolve a single review thread via GitHub's GraphQL
+   * `resolveReviewThread` mutation.
+   *
+   * Routes the mutation through `@octokit/core`'s built-in `graphql()`
+   * helper (see ADR-019) so we do not pull in `@octokit/graphql` as a
+   * separate dependency. The token is minted on every call from the
+   * same {@link GitHubAuth} strategy the REST methods use, so token
+   * rotation is automatic.
+   *
+   * @param threadId GraphQL node id of the review thread to resolve.
+   * @throws The same surface `@octokit/core` raises for GraphQL
+   *   errors — typically `GraphqlResponseError` with a `status` field.
+   */
+  async resolveReviewThread(threadId: string): Promise<void> {
+    const token = await this.auth.getInstallationToken(this.installationId);
+    await this.octokit.graphql<{ resolveReviewThread: { thread: { id: string } } }>(
+      RESOLVE_REVIEW_THREAD_MUTATION,
+      {
+        threadId,
+        headers: { authorization: `token ${token}` },
+      },
+    );
   }
 
   /**
