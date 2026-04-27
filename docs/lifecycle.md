@@ -38,5 +38,19 @@ only when none of the phases needs to do work AND a configurable settling window
 
 ## Merge
 
-When `mergeMode` is `squash` or `rebase`, the supervisor performs the merge via the GitHub API once
-stable. `manual` stops at `READY_TO_MERGE` and waits for `/merge`.
+Once a task reaches `READY_TO_MERGE`, the supervisor branches on `mergeMode`:
+
+- `squash` and `rebase` auto-merge through `GitHubClient.mergePullRequest`. On success the task
+  lands in `MERGED`. On failure, [ADR-018](adrs/018-merge-modes-failure-classification.md)
+  classifies the error: HTTP `405` / `409` from the merge endpoint mean the PR is genuinely not
+  mergeable (conflicts, base-branch protection, stale head SHA) and escalate the task to
+  `NEEDS_HUMAN`; every other failure is transient and lands the task in `FAILED`.
+- `manual` parks at `READY_TO_MERGE` without calling the GitHub API. An operator unblocks the task
+  by issuing `/merge <task-id>` from the TUI; the daemon dispatches into the supervisor's
+  `mergeReadyTask` entry point, which re-uses the same merge step (so failure classification and
+  cleanup behave identically). `/merge` rejects with a precise `ack { ok: false, error }` if the
+  target task is unknown or not currently at `READY_TO_MERGE`.
+
+After a successful merge, the worktree is removed via `WorktreeManager.removeWorktree` unless
+`lifecycle.preserveWorktreeOnMerge` is true. Cleanup failures are logged but never unwind the
+`MERGED` transition — `MERGED` is the durable success state.
