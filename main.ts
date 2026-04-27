@@ -87,10 +87,22 @@ if (subcommand === "daemon") {
   console.error(`[daemon] listening on ${handle.socketPath}`);
 
   // Translate SIGINT/SIGTERM into a clean shutdown so a crashed daemon
-  // does not leave a stale socket file behind.
+  // does not leave a stale socket file behind. We always exit at the end
+  // of the handler — the signal has already fired, the operator wants
+  // the process gone, and any further work would race the OS-level
+  // tear-down. A `handle.stop()` rejection (e.g. an in-flight tear-down
+  // that fails to release the socket) is logged with a non-zero exit
+  // code so it is visible to whatever supervisor restarted us; without
+  // the try/catch the rejection would surface as an unhandled-promise
+  // warning while the process kept running.
   const shutdown = async () => {
-    await handle.stop();
-    Deno.exit(0);
+    try {
+      await handle.stop();
+      Deno.exit(0);
+    } catch (error) {
+      console.error(`[daemon] error during shutdown: ${formatError(error)}`);
+      Deno.exit(1);
+    }
   };
   Deno.addSignalListener("SIGINT", shutdown);
   Deno.addSignalListener("SIGTERM", shutdown);
