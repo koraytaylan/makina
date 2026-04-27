@@ -88,6 +88,39 @@ No new npm dependency is added (ADR-004 dependency-policy):
 - Two layers of bytes-to-text conversion (ZIP entries → UTF-8 → trim-to-budget) — acceptable because
   the trim step's input contract is text and the helper composes cleanly.
 
+## Round-3 amendment (2026-04-27): bounded streaming decompression
+
+Round-3 review (Copilot) flagged the original `inflateRaw` helper as an OOM risk: it drained the
+full `DecompressionStream` into memory before the supervisor's later `trimLogToBudget` step capped
+the output. For a single multi-MB compressed entry that unpacks to tens of MB (which the GitHub docs
+explicitly warn about — large CI jobs routinely produce log archives in the 5–50 MB range), the
+daemon could see a multiplicatively larger transient allocation than the configured
+`STABILIZE_CI_LOG_BUDGET_BYTES` would suggest.
+
+The amendment threads the byte budget through the extractor:
+
+1. `decodeCheckRunLogs(bytes, maxBytes?)` — the call site at `dispatchCiAgent` now passes
+   `ciLogBudgetBytes` as `maxBytes`.
+2. `extractZipEntriesAsText(bytes, maxBytes?)` — tracks a `remainingBudget` counter across entries,
+   slices `STORED` payloads with `subarray(0, remainingBudget)`, and forwards the per-entry
+   remaining budget into the DEFLATE inflater. Entries past the cumulative budget are skipped
+   entirely (not just trimmed) so we never fault their data into memory.
+3. `inflateRawBounded(compressed, maxBytes)` (replacing the unbounded `inflateRaw`) reads the
+   decompression stream chunk-by-chunk and `cancel()`s the reader as soon as the accumulated chunks
+   reach `maxBytes`. A trailing chunk that would spill past the cap is sliced; subsequent chunks are
+   never decompressed.
+
+Returned tuple: `{ entries, truncated }` so `decodeCheckRunLogs` can append a
+`[…truncated; extraction stopped at <N> bytes…]` marker — operators reading the agent prompt see
+_both_ the in-extraction cap (this ADR) and the in-prompt cap (ADR-019) when the budget bites.
+
+Peak memory after the amendment is bounded by `O(maxBytes)` regardless of the original archive's
+uncompressed size. The `trimLogToBudget` step (ADR-019) still runs on the rendered output to
+preserve line-boundary trimming and the leading marker contract.
+
+The unbounded path (`maxBytes` omitted or non-finite) is preserved so the in-memory test double and
+any future caller that legitimately needs the full archive can continue to drain the stream.
+
 ## Related
 
 - ADR-004: Dependency policy (justification for the no-new-dep choice).

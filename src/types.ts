@@ -413,6 +413,16 @@ export interface GitHubCallPayload {
   readonly statusCode?: number;
   /** Wall-clock duration of the request in milliseconds. */
   readonly durationMilliseconds?: number;
+  /**
+   * Single-line error message when the call rejected (network error,
+   * 4xx/5xx that the client surfaces, JSON parse failure, etc.).
+   * Absent on successful calls.
+   *
+   * Operators (and the TUI) read this to see *which* request failed
+   * and why; without it, a sustained outage is invisible because the
+   * supervisor only emits `github-call` after the request resolves.
+   */
+  readonly error?: string;
 }
 
 /** An error the supervisor surfaces to the TUI. */

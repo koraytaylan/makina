@@ -950,14 +950,37 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
           taskId: task.id,
           intervalMilliseconds: pollIntervalMilliseconds,
           fetcher: async (): Promise<CiPollOutcome> => {
-            const status = await client.getCombinedStatus(task.repo, headSha);
+            // Each GitHub call is wrapped so a rejection still emits a
+            // `github-call` event before the error propagates to the
+            // poller's `onError`. Without this the TUI sees nothing
+            // when the fetcher rejects (network outage, 404 for an
+            // unknown SHA, transient 5xx on the way back from
+            // GitHub) — operators couldn't see *which* request failed
+            // even though the polling cadence was happening.
+            const statusEndpoint = "GET /repos/{owner}/{repo}/commits/{ref}/status";
+            let status;
+            try {
+              status = await client.getCombinedStatus(task.repo, headSha);
+            } catch (error) {
+              publish(opts.eventBus, {
+                taskId: task.id,
+                atIso: clock.nowIso(),
+                kind: "github-call",
+                data: {
+                  method: "GET",
+                  endpoint: statusEndpoint,
+                  error: errorMessage(error),
+                },
+              });
+              throw error;
+            }
             publish(opts.eventBus, {
               taskId: task.id,
               atIso: clock.nowIso(),
               kind: "github-call",
               data: {
                 method: "GET",
-                endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/status",
+                endpoint: statusEndpoint,
               },
             });
             if (status.state === "pending") {
@@ -968,14 +991,30 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
             }
             // failure / error: read the per-check breakdown so we can
             // surface failing job ids to the caller.
-            const checkRuns = await client.listCheckRuns(task.repo, headSha);
+            const checkRunsEndpoint = "GET /repos/{owner}/{repo}/commits/{ref}/check-runs";
+            let checkRuns;
+            try {
+              checkRuns = await client.listCheckRuns(task.repo, headSha);
+            } catch (error) {
+              publish(opts.eventBus, {
+                taskId: task.id,
+                atIso: clock.nowIso(),
+                kind: "github-call",
+                data: {
+                  method: "GET",
+                  endpoint: checkRunsEndpoint,
+                  error: errorMessage(error),
+                },
+              });
+              throw error;
+            }
             publish(opts.eventBus, {
               taskId: task.id,
               atIso: clock.nowIso(),
               kind: "github-call",
               data: {
                 method: "GET",
-                endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/check-runs",
+                endpoint: checkRunsEndpoint,
               },
             });
             return {
@@ -1070,6 +1109,7 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       throw new Error("dispatchCiAgent: task has no worktreePath");
     }
     const logsByJob = new Map<number, string>();
+    const logsEndpoint = "GET /repos/{owner}/{repo}/check-runs/{check_run_id}/logs";
     for (const check of failingChecks) {
       try {
         const bytes = await client.getCheckRunLogs(task.repo, check.id);
@@ -1079,18 +1119,41 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
           kind: "github-call",
           data: {
             method: "GET",
-            endpoint: "GET /repos/{owner}/{repo}/check-runs/{check_run_id}/logs",
+            endpoint: logsEndpoint,
           },
         });
         logsByJob.set(
           check.id,
-          trimLogToBudget(await decodeCheckRunLogs(bytes), ciLogBudgetBytes),
+          // Thread the budget through to the ZIP extractor so
+          // decompression itself stops at `ciLogBudgetBytes` rather
+          // than first materializing the full uncompressed archive
+          // (which can be tens of MB) and then trimming. The
+          // subsequent `trimLogToBudget` still caps the rendered
+          // prompt — including the marker and line-boundary tail
+          // logic — but it now operates on an at-most-budget input.
+          trimLogToBudget(
+            await decodeCheckRunLogs(bytes, ciLogBudgetBytes),
+            ciLogBudgetBytes,
+          ),
         );
       } catch (error) {
         // Don't abort the whole CI iteration when a single log fetch
-        // fails — surface the failure on the bus and replace the
-        // excerpt with a placeholder so the agent still has the job
-        // name and url.
+        // fails — surface the failure on the bus (both as a
+        // `github-call` event with the request's `error` field set,
+        // so observability tools see *which* request failed, and as
+        // a human-readable warn-level `log` event for the TUI
+        // scrollback) and replace the excerpt with a placeholder so
+        // the agent still has the job name and url.
+        publish(opts.eventBus, {
+          taskId: task.id,
+          atIso: clock.nowIso(),
+          kind: "github-call",
+          data: {
+            method: "GET",
+            endpoint: logsEndpoint,
+            error: errorMessage(error),
+          },
+        });
         publish(opts.eventBus, {
           taskId: task.id,
           atIso: clock.nowIso(),
@@ -1611,13 +1674,22 @@ function looksLikeZip(bytes: Uint8Array): boolean {
  *     test double's pre-extracted text) are decoded as UTF-8 directly,
  *     preserving the existing test contract.
  *  2. For real ZIP responses, parses the central directory, decodes
- *     each `*.txt` step-log entry through `DecompressionStream("deflate-raw")`
- *     (or copies through verbatim for `STORED` entries), and joins
+ *     each entry through `DecompressionStream("deflate-raw")` (or
+ *     copies through verbatim for `STORED` entries), and joins
  *     them with a `--- <path> ---` separator so the agent prompt sees
  *     readable per-step output instead of binary gibberish.
  *  3. Falls back to a UTF-8 decode of the raw bytes if the parse fails
  *     mid-way — better to surface partial garbage with a warning than to
  *     starve the agent of context entirely.
+ *
+ * Memory safety: GitHub's check-run log archives can unpack to tens of
+ * MB. To avoid transient large allocations (and an outright OOM on a
+ * pathological run), this function threads `maxBytes` (when provided)
+ * through to {@link extractZipEntriesAsText}. Decompression of each
+ * entry stops as soon as the running total reaches `maxBytes`, and
+ * subsequent entries are skipped. The caller's downstream
+ * {@link trimLogToBudget} step still caps the *prompt* size, but the
+ * cap here means we never hold the full unpacked archive in memory.
  *
  * The implementation intentionally avoids adding a new npm dependency
  * (see ADR-004): the parser only handles the `STORED` and `DEFLATE`
@@ -1626,21 +1698,36 @@ function looksLikeZip(bytes: Uint8Array): boolean {
  * to track the optional data-descriptor variant.
  *
  * @param bytes Raw response bytes from `getCheckRunLogs`.
+ * @param maxBytes Optional upper bound on the *total decompressed*
+ *   bytes the helper materializes. When set, decompression stops as
+ *   soon as the running total reaches this value; entries past the
+ *   budget are skipped and a `[…truncated;…]` marker is appended so
+ *   downstream readers can tell the excerpt was capped during
+ *   extraction (separately from the {@link trimLogToBudget} cap that
+ *   may further trim the rendered prompt). If omitted or non-finite,
+ *   no extraction-time cap is applied.
  * @returns Concatenated UTF-8 text of every text-like ZIP entry, or the
  *   raw byte decode if the input is not a ZIP.
  */
-export async function decodeCheckRunLogs(bytes: Uint8Array): Promise<string> {
+export async function decodeCheckRunLogs(
+  bytes: Uint8Array,
+  maxBytes?: number,
+): Promise<string> {
   if (!looksLikeZip(bytes)) {
     return decodeUtf8Lossy(bytes);
   }
   try {
-    const entries = await extractZipEntriesAsText(bytes);
+    const { entries, truncated } = await extractZipEntriesAsText(bytes, maxBytes);
     if (entries.length === 0) {
       return decodeUtf8Lossy(bytes);
     }
-    return entries
+    const joined = entries
       .map(({ name, text }) => `--- ${name} ---\n${text}`)
       .join("\n");
+    if (truncated) {
+      return `${joined}\n[…truncated; extraction stopped at ${maxBytes} bytes…]`;
+    }
+    return joined;
   } catch {
     // Best-effort fallback: surface whatever the raw bytes decode to.
     // The trim-to-budget step below will still cap the output, so a
@@ -1666,17 +1753,35 @@ export async function decodeCheckRunLogs(bytes: Uint8Array): Promise<string> {
  * optional data-descriptor variant some encoders emit after the
  * compressed stream.
  *
+ * Memory safety: when `maxBytes` is provided, the per-entry
+ * decompression stops as soon as the *running total* across previously
+ * extracted entries plus the in-flight stream's accumulated chunks
+ * reaches `maxBytes`. The current entry is truncated to the remaining
+ * budget and subsequent entries are skipped entirely. This caps the
+ * peak memory footprint at roughly `maxBytes` rather than the full
+ * uncompressed archive size — important because GitHub log archives
+ * can unpack to tens of MB.
+ *
  * @param bytes Raw ZIP archive.
- * @returns The list of `{ name, text }` entries in central-directory
- *   order. Empty entries (size 0) are kept so the caller can still see
- *   the file name in the merged output.
+ * @param maxBytes Optional upper bound on the total decompressed bytes
+ *   to materialize across all entries. When provided, decompression
+ *   stops short and the returned tuple's `truncated` flag is set.
+ * @returns A discriminated record with the list of `{ name, text }`
+ *   entries in central-directory order and a `truncated` flag set when
+ *   extraction stopped early due to `maxBytes`. Empty entries (size 0)
+ *   are kept so the caller can still see the file name in the merged
+ *   output.
  * @throws If the EOCD cannot be located, the central directory walk
  *   runs past `bytes`, or an entry uses an unsupported compression
  *   method.
  */
 async function extractZipEntriesAsText(
   bytes: Uint8Array,
-): Promise<readonly { readonly name: string; readonly text: string }[]> {
+  maxBytes?: number,
+): Promise<{
+  readonly entries: readonly { readonly name: string; readonly text: string }[];
+  readonly truncated: boolean;
+}> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const eocdOffset = findEocdOffset(view);
   if (eocdOffset === -1) {
@@ -1690,6 +1795,11 @@ async function extractZipEntriesAsText(
   }
   const decoder = new TextDecoder("utf-8", { fatal: false });
   const entries: { name: string; text: string }[] = [];
+  // Effective budget: a finite positive number means we cap; anything
+  // else (undefined, NaN, Infinity, <= 0) disables the cap.
+  const hasBudget = typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes > 0;
+  let remainingBudget = hasBudget && maxBytes !== undefined ? Math.floor(maxBytes) : Infinity;
+  let truncated = false;
   let cursor = cdOffset;
   for (let i = 0; i < totalEntries; i += 1) {
     if (cursor + 46 > bytes.byteLength) {
@@ -1707,6 +1817,13 @@ async function extractZipEntriesAsText(
     const nameBytes = bytes.subarray(cursor + 46, cursor + 46 + nameLength);
     const name = decoder.decode(nameBytes);
     cursor += 46 + nameLength + extraLength + commentLength;
+
+    if (hasBudget && remainingBudget <= 0) {
+      // Budget exhausted; skip every remaining entry rather than
+      // decompressing data we'd immediately discard.
+      truncated = true;
+      continue;
+    }
 
     // Walk the local file header to find the actual data offset (the
     // local header has its own variable-length name + extra fields).
@@ -1727,17 +1844,38 @@ async function extractZipEntriesAsText(
     const compressed = bytes.subarray(dataStart, dataEnd);
     let raw: Uint8Array;
     if (compressionMethod === 0) {
-      raw = compressed;
+      // STORED entries are already raw — slice to the budget without
+      // copying the full payload first.
+      if (hasBudget && compressed.byteLength > remainingBudget) {
+        raw = compressed.subarray(0, remainingBudget);
+        truncated = true;
+      } else {
+        raw = compressed;
+      }
     } else if (compressionMethod === 8) {
-      raw = await inflateRaw(compressed);
+      // DEFLATE entries stream chunk-by-chunk and stop as soon as the
+      // accumulated chunks reach the budget. This is the OOM-prone
+      // path: a multi-MB compressed entry can unpack to tens of MB,
+      // and pre-budget code held all of that in memory before trim.
+      const inflated = await inflateRawBounded(
+        compressed,
+        hasBudget ? remainingBudget : Infinity,
+      );
+      raw = inflated.bytes;
+      if (inflated.truncated) {
+        truncated = true;
+      }
     } else {
       throw new Error(
         `ZIP: unsupported compression method ${compressionMethod} for "${name}"`,
       );
     }
     entries.push({ name, text: decoder.decode(raw) });
+    if (hasBudget) {
+      remainingBudget -= raw.byteLength;
+    }
   }
-  return entries;
+  return { entries, truncated };
 }
 
 /**
@@ -1757,12 +1895,31 @@ function findEocdOffset(view: DataView): number {
 }
 
 /**
- * Decompress a raw DEFLATE stream (no zlib header) using the platform's
- * `DecompressionStream`. Deno 2 implements the WHATWG Compression
- * Streams spec; this helper just wraps the stream pipeline so callers
- * stay synchronous-looking.
+ * Decompress a raw DEFLATE stream (no zlib header) chunk-by-chunk via
+ * the platform's `DecompressionStream`, stopping as soon as the
+ * accumulated output reaches `maxBytes`.
+ *
+ * The original implementation drained the entire stream before
+ * returning, which is fine for small entries but pathological for
+ * multi-MB GitHub log archives — a single entry can unpack to tens of
+ * MB and Copilot flagged the in-memory accumulation as an OOM risk
+ * even though `trimLogToBudget` later caps the prompt size. By passing
+ * a remaining-byte budget through to the stream loop and breaking
+ * (then cancelling the reader) once we cross the threshold, peak
+ * allocation stays bounded by `maxBytes` regardless of the original
+ * entry's uncompressed size.
+ *
+ * @param compressed Raw DEFLATE bytes (no zlib/gzip header).
+ * @param maxBytes Upper bound on the inflated size to materialize.
+ *   `Infinity` disables the cap.
+ * @returns Inflated bytes (capped at `maxBytes`) and a `truncated`
+ *   flag set when the stream still had more output when the budget
+ *   was reached.
  */
-async function inflateRaw(compressed: Uint8Array): Promise<Uint8Array> {
+async function inflateRawBounded(
+  compressed: Uint8Array,
+  maxBytes: number,
+): Promise<{ readonly bytes: Uint8Array; readonly truncated: boolean }> {
   // `Blob` types accept `BlobPart`, which (under TS lib.dom 5.5+) requires
   // an `ArrayBuffer` rather than the broader `ArrayBufferLike` a generic
   // `Uint8Array` exposes. Materialize a fresh `ArrayBuffer`-backed view
@@ -1775,12 +1932,43 @@ async function inflateRaw(compressed: Uint8Array): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    if (value !== undefined) {
+  let truncated = false;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      const remaining = maxBytes - total;
+      if (remaining <= 0) {
+        // Already at the budget — stop reading further. Cancel the
+        // underlying reader so the source pipeline can release its
+        // resources promptly.
+        truncated = true;
+        await reader.cancel();
+        break;
+      }
+      if (value.byteLength > remaining) {
+        // This chunk spills past the budget. Keep just the head, mark
+        // truncated, and cancel the rest of the stream — there's no
+        // sense decompressing more bytes only to drop them.
+        chunks.push(value.subarray(0, remaining));
+        total += remaining;
+        truncated = true;
+        await reader.cancel();
+        break;
+      }
       chunks.push(value);
       total += value.byteLength;
+    }
+  } finally {
+    // Best-effort: if `cancel()` already ran, this is a no-op. The
+    // underlying ReadableStream releases the lock when the reader is
+    // garbage-collected, but explicit release keeps Deno's resource
+    // table tidy when the test runs back-to-back.
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore — already released after cancel()
     }
   }
   const out = new Uint8Array(total);
@@ -1789,7 +1977,7 @@ async function inflateRaw(compressed: Uint8Array): Promise<Uint8Array> {
     out.set(chunk, written);
     written += chunk.byteLength;
   }
-  return out;
+  return { bytes: out, truncated };
 }
 
 /**

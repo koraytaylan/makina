@@ -781,6 +781,221 @@ Deno.test("stabilize CI surfaces a synchronous poller throw as a fatal outcome",
 });
 
 // ---------------------------------------------------------------------------
+// Round-3 follow-ups (Copilot)
+// ---------------------------------------------------------------------------
+
+Deno.test("decodeCheckRunLogs caps DEFLATE extraction at maxBytes (no full decompression)", async () => {
+  // Build a single DEFLATE entry whose uncompressed payload is much
+  // larger than the budget. Round-2 would have inflated the entire
+  // entry first and then trimmed; round-3 must stop the stream early
+  // so peak memory stays bounded by `maxBytes`.
+  const huge = "X".repeat(64 * 1024); // 64 KiB uncompressed
+  const compressed = await deflateRawBytes(new TextEncoder().encode(huge));
+  const zip = buildDeflateZip("step.txt", compressed, huge.length);
+  const cap = 1024;
+  const decoded = await decodeCheckRunLogs(zip, cap);
+  // The header banner alone is small; the payload after it must be
+  // bounded by the cap. Allow generous headroom for the entry banner
+  // and the truncation marker tail.
+  const decodedBytes = new TextEncoder().encode(decoded).byteLength;
+  assert(
+    decodedBytes <= cap + 256,
+    `decoded ${decodedBytes} bytes, expected <= ${cap + 256}`,
+  );
+  // The truncation marker is appended by `decodeCheckRunLogs` when the
+  // extractor stops short — operators reading the agent prompt should
+  // see *something* indicating the cap fired.
+  assertStringIncludes(decoded, "[…truncated; extraction stopped at");
+});
+
+Deno.test("decodeCheckRunLogs without maxBytes still drains the entire DEFLATE entry", async () => {
+  // Backwards-compatibility: omitting the budget keeps the legacy
+  // behavior so existing tests (and the in-memory test double) do not
+  // need to thread a cap through.
+  const text = "first line\nsecond line\nthird line\n";
+  const compressed = await deflateRawBytes(new TextEncoder().encode(text));
+  const zip = buildDeflateZip("step.txt", compressed, text.length);
+  const decoded = await decodeCheckRunLogs(zip);
+  assertStringIncludes(decoded, "first line");
+  assertStringIncludes(decoded, "second line");
+  assertStringIncludes(decoded, "third line");
+  // No truncation marker on the unbounded path.
+  assert(!decoded.includes("extraction stopped"));
+});
+
+Deno.test("decodeCheckRunLogs caps STORED extraction at maxBytes and skips later entries", async () => {
+  // Two STORED entries; the first alone exceeds the budget, so the
+  // second entry must be skipped entirely (not just trimmed).
+  const big = "A".repeat(8192);
+  const small = "tail entry\n";
+  const zip = buildStoredZip([
+    { name: "first.txt", text: big },
+    { name: "second.txt", text: small },
+  ]);
+  const cap = 1024;
+  const decoded = await decodeCheckRunLogs(zip, cap);
+  // First entry is sliced to the budget — the banner is present but
+  // the second entry's banner must be absent (it was skipped).
+  assertStringIncludes(decoded, "--- first.txt ---");
+  assert(
+    !decoded.includes("--- second.txt ---"),
+    "second entry must be skipped once the budget is exhausted",
+  );
+  assertStringIncludes(decoded, "[…truncated; extraction stopped at");
+});
+
+Deno.test("stabilize CI publishes a `github-call` event with `error` when getCombinedStatus rejects", async () => {
+  // Round-3: a rejection in the fetcher must still surface a
+  // `github-call` event (with `error` set) so the TUI sees *which*
+  // request failed. Pre-fix, the event was only published on the
+  // success path, leaving operators blind to outages and 404s.
+  const rig = makeRig();
+  scriptHappyPathPrefix(rig);
+  // First reply: a rejection (the `kind: "error"` shape on the
+  // in-memory client makes `getCombinedStatus` reject with the
+  // supplied error).
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "error",
+    error: new Error("simulated 503 from GitHub"),
+  });
+  // Second reply: a normal green so the supervisor exits cleanly
+  // through MERGED rather than burning the consecutive-error budget.
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: rig.headShas[0] ?? "sha-initial" },
+  });
+  rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
+
+  const subscription = recordEvents(rig);
+  const supervisor = makeSupervisor(rig);
+  await supervisor.start({
+    repo: makeRepoFullName("o/r"),
+    issueNumber: rig.issueNumber,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  subscription.unsubscribe();
+
+  // Find every `github-call` event for the combined-status endpoint
+  // and assert the rejection produced one with `error` set.
+  const githubEvents = rig.events.filter((e) => e.kind === "github-call");
+  const statusEvents = githubEvents.filter((e) =>
+    e.kind === "github-call" && e.data.endpoint.includes("/status")
+  );
+  assert(statusEvents.length >= 2, "expected one event per status call (reject + green)");
+  const erroredEvents = statusEvents.filter((e) =>
+    e.kind === "github-call" && e.data.error !== undefined
+  );
+  assertEquals(erroredEvents.length, 1);
+  const firstErrored = erroredEvents[0];
+  if (firstErrored?.kind !== "github-call") throw new Error("unreachable");
+  assertStringIncludes(firstErrored.data.error ?? "", "simulated 503");
+});
+
+Deno.test("stabilize CI publishes a `github-call` event with `error` when listCheckRuns rejects", async () => {
+  // The fetcher only reaches `listCheckRuns` on a non-success status.
+  // Queue a failure status that lands at the second call site, then
+  // reject `listCheckRuns` to confirm the second emit path also
+  // surfaces `error` on the bus.
+  const rig = makeRig();
+  scriptHappyPathPrefix(rig);
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "failure", sha: rig.headShas[0] ?? "sha-initial" },
+  });
+  rig.githubClient.queueListCheckRuns({
+    kind: "error",
+    error: new Error("simulated 404 from GitHub"),
+  });
+  // The poller's onError will retry — feed a green tick on the next
+  // pass so the supervisor exits via MERGED rather than the
+  // consecutive-error fatal path.
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: rig.headShas[0] ?? "sha-initial" },
+  });
+  rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
+
+  const subscription = recordEvents(rig);
+  const supervisor = makeSupervisor(rig);
+  await supervisor.start({
+    repo: makeRepoFullName("o/r"),
+    issueNumber: rig.issueNumber,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  subscription.unsubscribe();
+
+  const githubEvents = rig.events.filter((e) => e.kind === "github-call");
+  const checkRunEvents = githubEvents.filter((e) =>
+    e.kind === "github-call" && e.data.endpoint.includes("/check-runs")
+  );
+  const erroredEvents = checkRunEvents.filter((e) =>
+    e.kind === "github-call" && e.data.error !== undefined
+  );
+  assertEquals(erroredEvents.length, 1);
+  const firstErrored = erroredEvents[0];
+  if (firstErrored?.kind !== "github-call") throw new Error("unreachable");
+  assertStringIncludes(firstErrored.data.error ?? "", "simulated 404");
+});
+
+Deno.test("stabilize CI publishes a `github-call` event with `error` when getCheckRunLogs rejects", async () => {
+  // The third GitHub call from the CI loop is the per-job log fetch
+  // inside `dispatchCiAgent`. A rejection there must also surface a
+  // `github-call` event with `error` set (in addition to the existing
+  // human-readable warn-level `log` event).
+  const rig = makeRig();
+  rig.headShas.push("sha-after-fix");
+  scriptHappyPathPrefix(rig);
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "failure", sha: rig.headShas[0] ?? "sha-initial" },
+  });
+  rig.githubClient.queueListCheckRuns({
+    kind: "value",
+    value: [{
+      id: 99,
+      name: "build",
+      status: "completed",
+      conclusion: "failure",
+      htmlUrl: "https://github.com/o/r/runs/99",
+    }],
+  });
+  rig.githubClient.queueGetCheckRunLogs({
+    kind: "error",
+    error: new Error("simulated logs 502"),
+  });
+  // Agent runs once; the next poll is green on the post-fix SHA.
+  rig.agentRunner.queueRun({
+    messages: [{ role: "assistant", text: "fix attempt" }],
+  });
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: "sha-after-fix" },
+  });
+  rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
+
+  const subscription = recordEvents(rig);
+  const supervisor = makeSupervisor(rig);
+  await supervisor.start({
+    repo: makeRepoFullName("o/r"),
+    issueNumber: rig.issueNumber,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  subscription.unsubscribe();
+
+  const githubEvents = rig.events.filter((e) => e.kind === "github-call");
+  const logEvents = githubEvents.filter((e) =>
+    e.kind === "github-call" && e.data.endpoint.includes("/logs")
+  );
+  const erroredEvents = logEvents.filter((e) =>
+    e.kind === "github-call" && e.data.error !== undefined
+  );
+  assertEquals(erroredEvents.length, 1);
+  const firstErrored = erroredEvents[0];
+  if (firstErrored?.kind !== "github-call") throw new Error("unreachable");
+  assertStringIncludes(firstErrored.data.error ?? "", "simulated logs 502");
+});
+
+// ---------------------------------------------------------------------------
 // ZIP fixture helpers (round-2)
 // ---------------------------------------------------------------------------
 
