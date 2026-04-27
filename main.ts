@@ -41,9 +41,8 @@ import {
   defaultConfigPath,
   runSetupWizard,
   SetupWizardError,
-  type WizardGitHubClient,
-  type WizardInstallation,
 } from "./src/config/setup-wizard.ts";
+import { createWizardGitHubClient } from "./src/config/wizard-github-client.ts";
 
 if (Deno.args.includes("--version")) {
   console.log(MAKINA_VERSION);
@@ -155,26 +154,24 @@ if (subcommand === "daemon") {
   Deno.addSignalListener("SIGINT", shutdown);
   Deno.addSignalListener("SIGTERM", shutdown);
 } else if (subcommand === "setup") {
-  // The interactive wizard is fully implemented and runs unconditionally.
-  // What is **not** yet wired in this PR is the App-level GitHub client
-  // that lists reachable installations; that lands with
-  // [W2-github-app-auth] (issue #4). Until then, the wizard fails with a
-  // clear "not yet implemented" message at the discovery step — the user
-  // has typed their App ID and key path, but they get a single-line
-  // diagnostic pointing at #4 rather than a stack trace.
+  // First-run wizard wiring (#3 + #32).
+  //
+  // The wizard prompts for App ID + private-key path, then calls into
+  // the {@link WizardGitHubClient} to enumerate installations. The
+  // production client (lives in `src/config/wizard-github-client.ts`)
+  // bridges that narrow interface to the App-level
+  // {@link "./src/github/app-client.ts".AppClient}: it reads the PEM
+  // key from disk (with `~/` expansion), mints a JWT via
+  // `@octokit/auth-app`, walks `/app/installations` +
+  // `/installation/repositories`, and projects the join into the
+  // `WizardInstallation` shape the wizard renders.
   //
   // The wizard's own tests inject their own `WizardGitHubClient` and
-  // never touch this code path; the in-memory doubles are isolated from
+  // never touch this branch; the in-memory doubles are isolated from
   // production wiring by design.
-  const stubClient: WizardGitHubClient = {
-    getInstallations(): Promise<readonly WizardInstallation[]> {
-      throw new Error(
-        "GitHub App auth not yet implemented (#4 — [W2-github-app-auth]).",
-      );
-    },
-  };
+  const githubClient = createWizardGitHubClient();
   try {
-    const config = await runSetupWizard(createStdioWizardIo(stubClient));
+    const config = await runSetupWizard(createStdioWizardIo(githubClient));
     const targetPath = expandHome(defaultConfigPath());
     await ensureDir(dirname(targetPath));
     await Deno.writeTextFile(targetPath, `${JSON.stringify(config, null, 2)}\n`);

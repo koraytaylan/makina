@@ -1,9 +1,7 @@
 # Setting up the GitHub App
 
 > Wave 2's `setup` wizard drives steps 3.2 onwards. Steps 1 and 2 are manual GitHub actions taken in
-> your browser; the wizard handles everything after the App is installed. The wizard runs end-to-end
-> except for installation discovery, which lands with `[W2-github-app-auth]` (#4) — until then the
-> wizard exits with a clear "not yet implemented" message at that step.
+> your browser; the wizard handles everything after the App is installed.
 
 makina authenticates to GitHub as a GitHub App (rather than a personal access token). This is
 ADR-003: it gives us higher rate limits, fine-grained per-repo permissions, and a clean bot identity
@@ -32,17 +30,11 @@ On the App page → **Install App** → choose the account → choose specific r
 ## 3. Wire up makina
 
 1. Save the `.pem` somewhere private — e.g. `~/.config/makina/app-private-key.pem` with mode `0600`.
-2. Run `makina setup`. Once the App-level client lands (issue #4 — `[W2-github-app-auth]`), the
-   wizard will ask for the App ID, private-key path, query the App's installations endpoint to
-   discover which repos you can target, and write the resulting `config.json` to the
-   platform-appropriate location (see `docs/configuration.md`).
-
-> **Status (this PR):** the wizard's prompts, validation, and config-writing are implemented and run
-> unconditionally. The GitHub App client used for installation discovery is wired in
-> `[W2-github-app-auth]` (#4); until that lands, `makina setup` will fail with a clear "GitHub App
-> auth not yet implemented (#4)" error at the discovery step (after the App ID and private-key path
-> have been collected). When the App client lands the wizard completes end-to-end with no further
-> changes here.
+2. Run `makina setup`. The wizard asks for the App ID and private-key path, queries the App's
+   installations endpoint to discover which repositories you can target, and writes the resulting
+   `config.json` to the platform-appropriate location (see `docs/configuration.md`). The discovery
+   step uses the App-level client documented in
+   [ADR-024](./adrs/024-app-level-github-client-for-setup-wizard.md).
 
 The wizard validates the private-key path against the filesystem before calling GitHub, prints the
 list of reachable repositories with one-based numbers, and writes the resulting `config.json`. On
