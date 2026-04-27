@@ -1,4 +1,4 @@
-# ADR-015: Supervisor transition ordering — persist, emit, then act
+# ADR-016: Supervisor transition ordering — persist, emit, then act
 
 ## Status
 

@@ -17,7 +17,7 @@ Two cooperating processes communicate over a Unix domain socket using NDJSON:
 
 | Component       | File                             | Wave | Purpose                                       |
 | --------------- | -------------------------------- | ---- | --------------------------------------------- |
-| TaskSupervisor  | `src/daemon/supervisor.ts`       | W3   | Per-issue state machine (see ADR-015).        |
+| TaskSupervisor  | `src/daemon/supervisor.ts`       | W3   | Per-issue state machine (see ADR-016).        |
 | Stabilize loop  | `src/daemon/stabilize.ts`        | W4   | Rebase → CI → conversations after every push. |
 | AgentRunner     | `src/daemon/agent-runner.ts`     | W3   | Wraps `@anthropic-ai/claude-agent-sdk`.       |
 | WorktreeManager | `src/daemon/worktree-manager.ts` | W2   | Bare clone + per-task worktrees.              |
