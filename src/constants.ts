@@ -207,3 +207,44 @@ export const RADIX_DECIMAL = 10;
  * rather than a bare numeric `2`.
  */
 export const HOME_PREFIX = "~/";
+
+/**
+ * Base sleep used by the {@link Poller} when retrying after a transient
+ * fetcher rejection, in milliseconds.
+ *
+ * The actual wait is `min(BASE * 2^attempt, MAX) * jitter`, where
+ * `attempt` is the run of consecutive failures since the last successful
+ * tick. One second is short enough that a single transient blip recovers
+ * inside one poll interval, and long enough that we do not pound a
+ * struggling GitHub.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/015-poller-cadence-and-backoff.md ADR-015}.
+ */
+export const POLLER_BACKOFF_BASE_MILLISECONDS = 1_000;
+
+/**
+ * Upper bound on a single {@link Poller} sleep, in milliseconds.
+ *
+ * Caps both the exponential backoff series and a `retryAfterMs` value
+ * surfaced by a fetcher (e.g. from an upstream rate-limit response) so a
+ * runaway value cannot stall the supervisor for an hour. Five minutes is
+ * comfortably above any realistic GitHub `Retry-After` and well below
+ * the supervisor's settling-window upper bound.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/015-poller-cadence-and-backoff.md ADR-015}.
+ */
+export const POLLER_BACKOFF_MAX_MILLISECONDS = 5 * 60 * 1_000;
+
+/**
+ * Jitter ratio applied to each {@link Poller} backoff sleep.
+ *
+ * The exponential delay is multiplied by a uniform random factor in
+ * `[1 - ratio, 1 + ratio]` so a fleet of pollers that all hit a transient
+ * outage at the same wall-clock instant do not retry in lockstep. A
+ * 20% spread is the AWS architecture-blog default for the same problem
+ * shape and is small enough that the steady-state cadence stays
+ * recognisable.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/015-poller-cadence-and-backoff.md ADR-015}.
+ */
+export const POLLER_BACKOFF_JITTER_RATIO = 0.2;
