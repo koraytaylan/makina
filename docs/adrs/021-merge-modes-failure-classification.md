@@ -1,4 +1,4 @@
-# ADR-018 — Merge-mode failure classification and `/merge` re-entry surface
+# ADR-021 — Merge-mode failure classification and `/merge` re-entry surface
 
 ## Status
 

@@ -41,7 +41,7 @@ only when none of the phases needs to do work AND a configurable settling window
 Once a task reaches `READY_TO_MERGE`, the supervisor branches on `mergeMode`:
 
 - `squash` and `rebase` auto-merge through `GitHubClient.mergePullRequest`. On success the task
-  lands in `MERGED`. On failure, [ADR-018](adrs/018-merge-modes-failure-classification.md)
+  lands in `MERGED`. On failure, [ADR-021](adrs/021-merge-modes-failure-classification.md)
   classifies the error: HTTP `405` / `409` from the merge endpoint mean the PR is genuinely not
   mergeable (conflicts, base-branch protection, stale head SHA) and escalate the task to
   `NEEDS_HUMAN`; every other failure is transient and lands the task in `FAILED`.
