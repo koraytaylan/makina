@@ -154,6 +154,23 @@ export interface AppClientAuthStrategy {
   (options: {
     readonly appId: number;
     readonly privateKey: string;
+    /**
+     * Optional GitHub Enterprise / staging API base URL forwarded from
+     * {@link CreateAppClientOptions.baseUrl}. The default strategy
+     * passes this to `@octokit/auth-app` so installation-token minting
+     * targets the same host as the rest of the client; an unset value
+     * falls back to `@octokit/auth-app`'s default (`api.github.com`).
+     */
+    readonly baseUrl?: string;
+    /**
+     * Optional `fetch` implementation forwarded from
+     * {@link CreateAppClientOptions.fetch}. The default strategy passes
+     * this to `@octokit/auth-app` so installation-token minting goes
+     * through the same test seam as the rest of the client. Unit tests
+     * inject a scripted fake fetch here so the auth path never touches
+     * the network.
+     */
+    readonly fetch?: typeof globalThis.fetch;
   }): AppClientAuthHook;
 }
 
@@ -318,7 +335,23 @@ export function createAppClient(opts: CreateAppClientOptions): AppClient {
 
   let authHook: AppClientAuthHook;
   try {
-    authHook = strategy({ appId: opts.appId, privateKey: opts.privateKey });
+    // Forward `baseUrl`/`fetch` so the auth path goes through the same
+    // host and the same test seam as the client itself. Without this,
+    // installation-token minting (`POST /app/installations/.../access_tokens`)
+    // would always hit github.com via the default fetch even when the
+    // caller injected a custom baseUrl/fetch — invisible to scripted-fetch
+    // unit tests and broken on GitHub Enterprise.
+    //
+    // The conditional spreads exist because the project's
+    // `exactOptionalPropertyTypes: true` setting forbids passing
+    // `undefined` to optional fields; either include the field (with a
+    // defined value) or omit it entirely.
+    authHook = strategy({
+      appId: opts.appId,
+      privateKey: opts.privateKey,
+      ...(opts.baseUrl !== undefined ? { baseUrl: opts.baseUrl } : {}),
+      ...(opts.fetch !== undefined ? { fetch: opts.fetch } : {}),
+    });
   } catch (error) {
     throw new GitHubAppClientError("createAppAuth", error);
   }
@@ -479,11 +512,27 @@ export function createAppClient(opts: CreateAppClientOptions): AppClient {
 function defaultCreateAppAuthStrategy(options: {
   readonly appId: number;
   readonly privateKey: string;
+  readonly baseUrl?: string;
+  readonly fetch?: typeof globalThis.fetch;
 }): AppClientAuthHook {
-  const auth = createAppAuth({
+  // The wider auth-app options object accepts `baseUrl` and a
+  // `request: { fetch }` override — both are documented on
+  // `@octokit/auth-app`. The local typing here is intentionally loose
+  // to avoid pulling the full `@octokit/auth-app` types into our
+  // surface; the runtime contract is what matters.
+  const authOptions: Record<string, unknown> = {
     appId: options.appId,
     privateKey: options.privateKey,
-  });
+  };
+  if (options.baseUrl !== undefined) {
+    authOptions.baseUrl = options.baseUrl;
+  }
+  if (options.fetch !== undefined) {
+    authOptions.request = { fetch: options.fetch };
+  }
+  const auth = createAppAuth(
+    authOptions as unknown as Parameters<typeof createAppAuth>[0],
+  );
   // Single overloaded hook: forward to `auth(...)` and project the result
   // shape down to the narrow types this module owns.
   function hook(options: { readonly type: "app" }): Promise<AppAuthResult>;
