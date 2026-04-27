@@ -191,6 +191,12 @@ function scriptHappyPath(rig: SupervisorTestRig): void {
     },
   });
   rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+  // Conversations phase polls listReviews + listReviewComments. The
+  // happy path returns no reviews and no comments, so the phase exits
+  // immediately and the FSM advances to READY_TO_MERGE without
+  // dispatching the agent.
+  rig.githubClient.queueListReviews({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
   rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
 }
 
@@ -305,7 +311,11 @@ Deno.test(
         // PR open → STABILIZING after the Copilot reviewer is
         // requested.
         { fromState: "PR_OPEN", toState: "STABILIZING" },
-        // Three stub stabilize sub-phases (REBASE → CI → CONVERSATIONS).
+        // Three stabilize sub-phases (REBASE → CI → CONVERSATIONS).
+        // REBASE and CI are still stubs (#15, #16); CONVERSATIONS
+        // (#17) emits its own entry transition then runs the inner
+        // poll loop, which with no review feedback queued exits after
+        // one empty poll without further self-transitions.
         { fromState: "STABILIZING", toState: "STABILIZING" },
         { fromState: "STABILIZING", toState: "STABILIZING" },
         { fromState: "STABILIZING", toState: "STABILIZING" },
@@ -315,7 +325,7 @@ Deno.test(
 
       // Stabilize sub-phase labels appear on the bus in order. The
       // first PR_OPEN→STABILIZING transition records `REBASE`, then
-      // three stub-driven self-transitions cycle through
+      // three stub-or-entry self-transitions cycle through
       // `REBASE → CI → CONVERSATIONS`.
       const stabilizePhases: string[] = [];
       for (const event of rig.events) {
@@ -545,6 +555,8 @@ Deno.test(
         },
       });
       fresh.queueRequestReviewers({ kind: "value", value: undefined });
+      fresh.queueListReviews({ kind: "value", value: [] });
+      fresh.queueListReviewComments({ kind: "value", value: [] });
       scriptDraftingRun(rig);
 
       const bus = createEventBus();
@@ -692,6 +704,8 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({
         kind: "error",
         error: new Error("405 Method Not Allowed: not mergeable"),
@@ -978,6 +992,8 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       rig.agentRunner.queueRun({ messages: [{ role: "assistant", text: "ok" }] });
 
@@ -1051,6 +1067,8 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       scriptDraftingRun(rig);
 
@@ -1110,6 +1128,8 @@ Deno.test(
         },
       });
       rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      rig.githubClient.queueListReviews({ kind: "value", value: [] });
+      rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
       rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       rig.agentRunner.queueRun({
         messages: [{ role: "assistant", text: "round 2" }],

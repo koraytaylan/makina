@@ -27,6 +27,7 @@ import {
   type GitHubClientOptions,
   type PullRequestReview,
   type PullRequestReviewComment,
+  type PullRequestReviewThread,
 } from "../../src/github/client.ts";
 import { makeInstallationId, makeIssueNumber, makeRepoFullName } from "../../src/types.ts";
 
@@ -596,6 +597,244 @@ Deno.test("listReviewComments: 500 propagates", async () => {
   await assertRejects(() => client.listReviewComments(REPO, makeIssueNumber(7)));
   assertEquals(harness.recordedRequests.length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// listReviewThreads (GraphQL query, joins comments → thread node ids)
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "listReviewThreads: posts the exact ListReviewThreads query body to /graphql and projects threads + commentIds",
+  async () => {
+    const harness = new FakeFetchHarness();
+    harness.enqueueResponse(200, {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  id: "PRRT_thread-A",
+                  comments: {
+                    nodes: [
+                      { databaseId: 100 },
+                      { databaseId: 101 },
+                    ],
+                  },
+                },
+                {
+                  id: "PRRT_thread-B",
+                  comments: {
+                    nodes: [{ databaseId: 200 }],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+    const { client } = buildClient(harness);
+
+    const threads: readonly PullRequestReviewThread[] = await client
+      .listReviewThreads(REPO, makeIssueNumber(7));
+
+    // Project shape: id + REST comment ids, in GitHub's order.
+    assertEquals(threads.length, 2);
+    assertEquals(threads[0]?.id, "PRRT_thread-A");
+    assertEquals(threads[0]?.commentIds, [100, 101]);
+    assertEquals(threads[1]?.id, "PRRT_thread-B");
+    assertEquals(threads[1]?.commentIds, [200]);
+
+    const recorded = harness.recordedRequests[0];
+    assertEquals(recorded?.method, "POST");
+    assertEquals(recorded?.url, "https://api.github.com/graphql");
+    const parsed = recorded?.body !== null && recorded?.body !== undefined
+      ? JSON.parse(recorded.body) as Record<string, unknown>
+      : {};
+    // Pin the exact query body so a future refactor cannot silently
+    // change the GraphQL shape the production code sends.
+    assertEquals(
+      parsed.query,
+      `query ListReviewThreads($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          comments(first: 100) {
+            nodes { databaseId }
+          }
+        }
+      }
+    }
+  }
+}`,
+    );
+    assertEquals(parsed.variables, {
+      owner: "octocat",
+      name: "hello-world",
+      number: 7,
+      cursor: null,
+    });
+  },
+);
+
+Deno.test(
+  "listReviewThreads: paginates the GraphQL connection until hasNextPage is false",
+  async () => {
+    const harness = new FakeFetchHarness();
+    // Page 1: hasNextPage=true, endCursor="cursor-1".
+    harness.enqueueResponse(200, {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+              nodes: [
+                {
+                  id: "PRRT_a",
+                  comments: { nodes: [{ databaseId: 10 }] },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+    // Page 2: hasNextPage=false, completes the loop.
+    harness.enqueueResponse(200, {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  id: "PRRT_b",
+                  comments: { nodes: [{ databaseId: 20 }] },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+    const { client } = buildClient(harness);
+
+    const threads = await client.listReviewThreads(REPO, makeIssueNumber(7));
+    assertEquals(threads.length, 2);
+    assertEquals(threads[0]?.id, "PRRT_a");
+    assertEquals(threads[1]?.id, "PRRT_b");
+
+    // Two requests; second carries the cursor from page 1.
+    assertEquals(harness.recordedRequests.length, 2);
+    const second = harness.recordedRequests[1];
+    const parsed = second?.body !== null && second?.body !== undefined
+      ? JSON.parse(second.body) as Record<string, unknown>
+      : {};
+    const variables = parsed.variables as Record<string, unknown>;
+    assertEquals(variables.cursor, "cursor-1");
+  },
+);
+
+Deno.test(
+  "listReviewThreads: returns the empty array when GraphQL reports no PR (repository null)",
+  async () => {
+    const harness = new FakeFetchHarness();
+    harness.enqueueResponse(200, { data: { repository: null } });
+    const { client } = buildClient(harness);
+    const threads = await client.listReviewThreads(REPO, makeIssueNumber(7));
+    assertEquals(threads, []);
+  },
+);
+
+Deno.test(
+  "listReviewThreads: skips thread comment nodes whose databaseId is not numeric",
+  async () => {
+    const harness = new FakeFetchHarness();
+    harness.enqueueResponse(200, {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  id: "PRRT_only",
+                  comments: {
+                    nodes: [
+                      { databaseId: 1 },
+                      // GitHub may return null for comments the viewer
+                      // cannot see; the projection skips those entries.
+                      null,
+                      { databaseId: null },
+                      { databaseId: 2 },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+    const { client } = buildClient(harness);
+    const threads = await client.listReviewThreads(REPO, makeIssueNumber(7));
+    assertEquals(threads.length, 1);
+    assertEquals(threads[0]?.commentIds, [1, 2]);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// resolveReviewThread (GraphQL mutation)
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "resolveReviewThread: posts the exact ResolveReviewThread mutation body to /graphql",
+  async () => {
+    const harness = new FakeFetchHarness();
+    harness.enqueueResponse(200, {
+      data: { resolveReviewThread: { thread: { id: "PRRT_123" } } },
+    });
+    const { client } = buildClient(harness);
+
+    await client.resolveReviewThread("PRRT_123");
+
+    const recorded = harness.recordedRequests[0];
+    assertEquals(recorded?.method, "POST");
+    assertEquals(recorded?.url, "https://api.github.com/graphql");
+    const parsed = recorded?.body !== null && recorded?.body !== undefined
+      ? JSON.parse(recorded.body) as Record<string, unknown>
+      : {};
+    // The exact mutation body must match what production sends so a
+    // future refactor cannot silently drift the GraphQL query.
+    assertEquals(
+      parsed.query,
+      `mutation ResolveReviewThread($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) {
+    thread { id }
+  }
+}`,
+    );
+    assertEquals(parsed.variables, { threadId: "PRRT_123" });
+  },
+);
+
+Deno.test(
+  "resolveReviewThread: GraphQL error response propagates as a rejection",
+  async () => {
+    const harness = new FakeFetchHarness();
+    // GraphQL errors are surfaced by Octokit even on a 200 status when
+    // the response body carries an `errors` array.
+    harness.enqueueResponse(200, {
+      errors: [{ message: "Could not resolve to a node with the global id of 'BAD'." }],
+    });
+    const { client } = buildClient(harness);
+    await assertRejects(() => client.resolveReviewThread("BAD"));
+  },
+);
 
 // ---------------------------------------------------------------------------
 // mergePullRequest
