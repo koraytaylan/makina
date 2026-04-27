@@ -8,9 +8,9 @@
  * `PollerOptions.clock`. Per the Wave 2 lessons, the tests never call
  * `mock.install` on `Date.now`, `setTimeout`, `Deno.env`, or any other
  * process-global. A test that wants the default-clock branch exercised
- * for coverage uses a microsecond-scale interval against the real clock,
- * cancelled before the next tick — that is the *only* place the file
- * touches real time.
+ * for coverage runs against the real clock and cancels almost
+ * immediately so the configured interval is irrelevant — that is the
+ * *only* place the file touches real time.
  *
  * Coverage map:
  *
@@ -829,10 +829,12 @@ Deno.test("createPoller: defaults survive when no options are passed", () => {
 
 Deno.test("default clock: real setTimeout-backed sleep cancels promptly on abort", async () => {
   // The only test that exercises the default `setTimeout`-backed clock.
-  // We use a microsecond-scale interval and abort almost immediately so
-  // the test still runs in well under a millisecond on real time. The
-  // inner `setTimeout` is not blocking the daemon — it would `unref`
-  // anyway — so `Deno.test` does not flag a leak.
+  // We pass a deliberately large 50 s `intervalMilliseconds` and abort
+  // almost immediately so the test still finishes in well under a
+  // millisecond on real time — the speed comes from the abort path
+  // resolving the pending sleep, not from a small interval. The inner
+  // `setTimeout` is not blocking the daemon — it would `unref` anyway —
+  // so `Deno.test` does not flag a leak.
   const poller = createPoller(); // Uses the default clock.
   const calls: number[] = [];
   const controller = new AbortController();

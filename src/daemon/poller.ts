@@ -51,7 +51,9 @@ import { getLogger } from "@std/log";
 
 import {
   POLLER_BACKOFF_BASE_MILLISECONDS,
+  POLLER_BACKOFF_EXPONENT_RADIX,
   POLLER_BACKOFF_JITTER_RATIO,
+  POLLER_BACKOFF_JITTER_WINDOW_MULTIPLIER,
   POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT,
   POLLER_BACKOFF_MAX_MILLISECONDS,
 } from "../constants.ts";
@@ -119,7 +121,14 @@ export class PollerError extends Error {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "PollerError";
     if (options.retryAfterMs !== undefined) {
-      this.retryAfterMs = options.retryAfterMs;
+      // The JSDoc above commits to a non-negative `retryAfterMs` on the
+      // public surface. Clamp here (rather than only at the loop boundary)
+      // so `onError` consumers reading `err.retryAfterMs` see the same
+      // contract the docstring promises. NaN/non-finite values are clamped
+      // to 0 as well — they cannot be honored as a wait, and propagating
+      // them would silently surprise downstream consumers.
+      const raw = options.retryAfterMs;
+      this.retryAfterMs = Number.isFinite(raw) && raw > 0 ? raw : 0;
     }
   }
 
@@ -295,6 +304,9 @@ export interface PollerImpl extends Poller {
    * @param args.intervalMilliseconds Steady-state spacing between
    *   successful ticks, in milliseconds. Negative values clamp to zero;
    *   `0` is allowed and is used by some tests to fire back-to-back.
+   *   Non-finite values (`NaN`, `Infinity`) raise {@link RangeError} —
+   *   they cannot represent a meaningful sleep duration and would either
+   *   spin instantly or hang forever if propagated to `clock.sleep`.
    * @param args.fetcher Async callable invoked once per tick. May throw
    *   {@link PollerError} for rate-limit waits or fatal exits, or any
    *   other rejection for the exponential-backoff path.
@@ -392,6 +404,15 @@ export function createPoller(options: PollerOptions = {}): PollerImpl {
       readonly onError?: (error: unknown) => void;
       readonly signal?: AbortSignal;
     }): { cancel(): void } {
+      // `Math.max(0, x)` propagates `NaN` and `Infinity`; both would feed
+      // straight into `clock.sleep(...)` and either spin instantly (NaN)
+      // or hang forever (Infinity). Reject non-finite values up-front the
+      // same way `createPoller` rejects non-finite numeric options.
+      if (!Number.isFinite(args.intervalMilliseconds)) {
+        throw new RangeError(
+          `intervalMilliseconds must be a finite number; got ${args.intervalMilliseconds}`,
+        );
+      }
       const interval = Math.max(0, args.intervalMilliseconds);
 
       // Single-flight: cancel any prior loop for the same task before
@@ -408,10 +429,23 @@ export function createPoller(options: PollerOptions = {}): PollerImpl {
 
       const abortController = new AbortController();
       let cancelled = false;
+      // Hoisted so `cancel()` can detach the external listener even if the
+      // in-flight `fetcher()` never settles and the loop never reaches
+      // `cleanup()`. Assigned later, after the early-aborted branch.
+      let externalAbortListener: (() => void) | undefined;
       const cancel = (): void => {
         if (cancelled) return;
         cancelled = true;
         abortController.abort();
+        // Detach the external signal listener immediately. If we waited
+        // for `cleanup()` (only fired when the loop body unwinds), a hung
+        // `fetcher()` would keep this listener attached after `cancel()`
+        // — a leak that survives the supersession path the supervisor
+        // relies on.
+        if (externalAbortListener !== undefined) {
+          args.signal?.removeEventListener("abort", externalAbortListener);
+          externalAbortListener = undefined;
+        }
         // Only remove the bookkeeping entry if the slot still belongs to
         // *this* loop. A later `poll(...)` for the same task would have
         // overwritten the entry with its own canceller; we must not
@@ -428,7 +462,7 @@ export function createPoller(options: PollerOptions = {}): PollerImpl {
         return { cancel };
       }
       // Wire external signal abort into our internal cancel path.
-      const externalAbortListener = (): void => {
+      externalAbortListener = (): void => {
         cancel();
       };
       args.signal?.addEventListener("abort", externalAbortListener);
@@ -450,7 +484,15 @@ export function createPoller(options: PollerOptions = {}): PollerImpl {
         abortSignal: abortController.signal,
         isCancelled: () => cancelled,
         cleanup: () => {
-          args.signal?.removeEventListener("abort", externalAbortListener);
+          // `cancel()` already detaches `externalAbortListener` on the
+          // cancel path; this handles the loop-exits-on-its-own paths
+          // (fatal `PollerError`, naturally-completed iterations) where
+          // `cancel()` was never called. Idempotent: a second
+          // `removeEventListener` with a stale reference is a no-op.
+          if (externalAbortListener !== undefined) {
+            args.signal?.removeEventListener("abort", externalAbortListener);
+            externalAbortListener = undefined;
+          }
           if (inFlight.get(args.taskId) === cancel) {
             inFlight.delete(args.taskId);
           }
@@ -571,13 +613,16 @@ function computeBackoff(
   random: () => number,
 ): number {
   const safeAttempt = Math.min(attempt, POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT);
-  const exponential = base * Math.pow(2, safeAttempt - 1);
+  const exponential = base *
+    Math.pow(POLLER_BACKOFF_EXPONENT_RADIX, safeAttempt - 1);
   const capped = Math.min(exponential, max);
   if (jitterRatio === 0) {
     return capped;
   }
-  // Uniform jitter in [1 - ratio, 1 + ratio].
-  const factor = 1 - jitterRatio + random() * (2 * jitterRatio);
+  // Uniform jitter in [1 - ratio, 1 + ratio]; window width is
+  // `JITTER_WINDOW_MULTIPLIER * ratio` (i.e. `2 * ratio`).
+  const factor = 1 - jitterRatio +
+    random() * (POLLER_BACKOFF_JITTER_WINDOW_MULTIPLIER * jitterRatio);
   return clamp(capped * factor, 0, max);
 }
 
@@ -586,7 +631,13 @@ function invokeOnError<TResult>(
   caught: unknown,
 ): void {
   if (args.onError === undefined) {
-    args.logger.warn(`poller: fetcher rejected: ${stringifyError(caught)}`);
+    // Sample the synthetic clock for the diagnostic log line. This is the
+    // documented use of `clock.now()` (jitter seeding diagnostics; never
+    // cadence math) — the value is informational only, so a non-monotonic
+    // test clock is acceptable.
+    args.logger.warn(
+      `poller: fetcher rejected at ${args.clock.now()}: ${stringifyError(caught)}`,
+    );
     return;
   }
   safeInvoke(() => args.onError?.(caught), "onError", args.logger);
@@ -658,12 +709,24 @@ function defaultClock(): PollerClock {
       return Date.now();
     },
     sleep(milliseconds: number, signal?: PollerSleepAbort): Promise<void> {
-      const wait = milliseconds <= 0 ? 0 : milliseconds;
+      // Already-aborted signal: resolve on the next microtask without
+      // touching `setTimeout`. Per the {@link PollerClock.sleep} contract,
+      // the resolution itself is the cancellation signal.
+      if (signal?.aborted === true) {
+        return Promise.resolve();
+      }
+      // Zero-or-non-finite wait: short-circuit to avoid scheduling a real
+      // timer for a sleep that is meant to be observed as "no wait" — the
+      // interface contract asks implementations to resolve immediately
+      // for `0`, and the same applies to negative or `NaN` inputs (which
+      // cannot represent a meaningful future deadline). `Promise.resolve()`
+      // resolves on the next microtask, matching the abort-already-fired
+      // path above.
+      if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+        return Promise.resolve();
+      }
+      const wait = milliseconds;
       return new Promise<void>((resolve) => {
-        if (signal?.aborted === true) {
-          resolve();
-          return;
-        }
         let resolved = false;
         // `abortListener` is declared up-front so the `setTimeout`
         // callback (and the listener itself) can both reference it

@@ -62,11 +62,19 @@ phase).
 
 ### Single-flight per task
 
-The poller keeps at most one in-flight `fetcher` invocation per `taskId`. The supervisor is the only
-caller that should reuse the same task id for overlapping `poll(...)` calls; if it does, the second
-call returns a handle that cancels the prior loop before starting fresh. This matches the
-supervisor's expectation that a stabilize-phase transition tears down and re-arms the poller
-atomically.
+The poller keeps at most one _active_ poll loop per `taskId`. The supervisor is the only caller that
+should reuse the same task id for overlapping `poll(...)` calls; if it does, the second call returns
+a handle that cancels the prior loop before starting fresh. This matches the supervisor's
+expectation that a stabilize-phase transition tears down and re-arms the poller atomically.
+
+The current `fetcher` contract does **not** accept an `AbortSignal`, so a supersession that lands
+while a previous `fetcher()` promise is still pending cannot abort the in-flight call — the new
+loop's first `fetcher()` may run concurrently with the old loop's last one. This is acceptable
+because (a) the cancelled loop drops its result on resolution (the `isCancelled()` guard short-
+circuits before `onResult`/`onError` run), and (b) the supervisor's `fetcher` implementations are
+read-only against GitHub. If a future `fetcher` needs to mutate state, the contract will need an
+`AbortSignal` parameter and an ADR amendment; the synthetic clock seam is already abortable, so the
+extension is mechanical.
 
 ### `PollerError` taxonomy
 
@@ -87,11 +95,18 @@ the poller assumes the rejection is transient and retries, capped by
 
 ### Synthetic clock seam
 
-`createPoller` accepts an optional `clock: { now(): number; sleep(ms): Promise<void> }`. Production
-wiring leaves it undefined and the poller uses a `Date.now`/`setTimeout`-backed default; tests
-inject a deterministic clock that records every sleep duration. The clock is the **only** way the
-poller measures time — there is no `Date.now()` call elsewhere in the module, no fall-through to a
-global timer.
+`createPoller` accepts an optional
+`clock: { now(): number; sleep(ms, signal?: PollerSleepAbort): Promise<void> }`. Production wiring
+leaves it undefined and the poller uses a `Date.now`/`setTimeout`-backed default; tests inject a
+deterministic clock that records every sleep duration. The clock is the **only** way the poller
+measures time — there is no `Date.now()` call elsewhere in the module, no fall-through to a global
+timer.
+
+The `signal` argument on `sleep` is the cancellation seam: `cancel()` (and external `AbortSignal`
+abort events) flip an internal flag and call `controller.abort()`, which the default sleep wakes on.
+Implementations must resolve immediately when `signal.aborted === true` at entry and on the first
+abort event after entry, and must resolve immediately for `milliseconds <= 0` (or non-finite)
+without scheduling a real timer.
 
 ### Cancellation
 

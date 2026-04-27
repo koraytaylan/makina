@@ -269,3 +269,29 @@ export const POLLER_BACKOFF_JITTER_RATIO = 0.2;
  * series further — the cap dominates first.
  */
 export const POLLER_BACKOFF_MAX_ATTEMPT_EXPONENT = 30;
+
+/**
+ * Radix used in the {@link Poller}'s exponential-backoff formula.
+ *
+ * `min(BASE * RADIX^(attempt - 1), MAX) * jitter` — the radix is `2` to
+ * yield a doubling series (industry default for transient-failure
+ * backoff). Centralised so the bare numeric `2` does not appear inside
+ * `computeBackoff`'s `Math.pow(...)` call (per the bare-literal rule at
+ * the top of this file).
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
+ */
+export const POLLER_BACKOFF_EXPONENT_RADIX = 2;
+
+/**
+ * Width of the symmetric jitter window applied to a {@link Poller}
+ * backoff sleep, expressed as a multiplier of
+ * {@link POLLER_BACKOFF_JITTER_RATIO}.
+ *
+ * The factor is uniform in `[1 - ratio, 1 + ratio]`, so the window is
+ * `2 * ratio` wide; the `2` is centralised here so `computeBackoff` reads
+ * `JITTER_WINDOW_MULTIPLIER * jitterRatio` instead of a bare literal.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
+ */
+export const POLLER_BACKOFF_JITTER_WINDOW_MULTIPLIER = 2;
