@@ -178,3 +178,32 @@ export const MIN_GITHUB_ISSUE_NUMBER = 1;
  * mode in a later wave.
  */
 export const STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS = 80;
+
+/**
+ * Chunk size used by `createWizardIo` when pulling bytes from the byte
+ * reader, in bytes.
+ *
+ * One kilobyte is large enough that a single read drains a full prompt
+ * answer typed at the terminal, but small enough that the unit tests'
+ * "concatenate across reads" path still gets exercised when the test
+ * reader hands back fewer bytes per call.
+ */
+export const WIZARD_READ_CHUNK_BYTES = 1_024;
+
+/**
+ * Radix used when parsing decimal user input (App ID, picker indexes).
+ *
+ * `Number.parseInt(text, RADIX_DECIMAL)` reads slightly clearer than the
+ * bare `10`, and the named constant keeps `src/` modules free of magic
+ * numbers per the rule at the top of this file.
+ */
+export const RADIX_DECIMAL = 10;
+
+/**
+ * The literal `~/` prefix the loader and wizard expand to `$HOME`.
+ *
+ * Centralised so the slice operations that strip it
+ * (`path.slice(HOME_PREFIX.length)`) carry their intent in the name
+ * rather than a bare numeric `2`.
+ */
+export const HOME_PREFIX = "~/";

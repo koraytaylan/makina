@@ -55,7 +55,10 @@ export interface GitHubConfig {
   readonly appId: number;
   /**
    * Filesystem path to the App's downloaded private key (PEM). May begin
-   * with `~/`; expansion happens in the loader.
+   * with `~/`; expansion happens at the consumer boundary (the GitHub
+   * App client expands before opening the file). The loader returns
+   * this string verbatim — see `src/config/load.ts` for the
+   * path-expansion contract.
    */
   readonly privateKeyPath: string;
   /**
@@ -113,7 +116,9 @@ export interface LifecycleConfig {
 export interface DaemonConfig {
   /**
    * Filesystem path of the Unix-domain socket. May begin with `~/`;
-   * expansion happens in the loader.
+   * expansion happens at the consumer boundary (the daemon expands
+   * before binding). The loader returns this string verbatim — see
+   * `src/config/load.ts` for the path-expansion contract.
    */
   readonly socketPath: string;
   /**
@@ -155,8 +160,10 @@ export interface Config {
   readonly lifecycle: LifecycleConfig;
   /**
    * Filesystem path under which makina creates per-repo bare clones and
-   * per-task worktrees. May begin with `~/`; expansion happens in the
-   * loader.
+   * per-task worktrees. May begin with `~/`; expansion happens at the
+   * consumer boundary (the worktree manager expands before creating
+   * directories). The loader returns this string verbatim — see
+   * `src/config/load.ts` for the path-expansion contract.
    */
   readonly workspace: string;
   /** Daemon process. */
