@@ -295,3 +295,22 @@ export const POLLER_BACKOFF_EXPONENT_RADIX = 2;
  * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/017-poller-cadence-and-backoff.md ADR-017}.
  */
 export const POLLER_BACKOFF_JITTER_WINDOW_MULTIPLIER = 2;
+
+/**
+ * Truncation budget applied to `agent-message` payloads before they are
+ * published on the event bus, in UTF-16 code units.
+ *
+ * The Claude Agent SDK can emit very large `assistant` blobs (long tool
+ * inputs, multi-page command outputs). Forwarding the full text onto the
+ * bus would balloon every subscriber's queue depth, run subscribers up
+ * against {@link EVENT_BUS_DEFAULT_BUFFER_SIZE} more often, and bloat
+ * persistence snapshots that include recent events. Eight kilobytes is
+ * generous for the supervisor's prose-and-summary workload while still
+ * bounding pathological cases. Truncated text is suffixed with an
+ * ellipsis token so consumers can tell rendering from a hard cap.
+ *
+ * The cut is by code units (matching `String.prototype.slice`), which is
+ * good enough for the ASCII-heavy agent stream and tolerated by the TUI's
+ * Ink renderer when a surrogate pair lands on the boundary.
+ */
+export const AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS = 8_192;
