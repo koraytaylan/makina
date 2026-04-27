@@ -46,6 +46,7 @@ import {
 } from "../../src/constants.ts";
 import {
   createPoller,
+  defaultClock,
   POLLER_ERROR_KINDS,
   PollerError,
   type PollerOptions,
@@ -880,6 +881,57 @@ Deno.test("default clock: already-aborted signal at sleep entry resolves immedia
   });
   await flushIterations(6);
   assertGreaterOrEqual(calls, 1);
+});
+
+Deno.test("default clock: abort fired between entry-check and addEventListener still resolves immediately", async () => {
+  // Regression for the abort-race. The default clock reads
+  // `signal.aborted` once on entry and then attaches a listener; if an
+  // abort lands in the synchronous gap between those two operations,
+  // the listener will never fire (AbortSignal does not replay aborts
+  // for already-aborted signals). The fix re-checks `signal.aborted`
+  // *after* attaching the listener, so this case must resolve early
+  // rather than waiting the full `wait` duration.
+  //
+  // We can not exercise this race with a real `AbortSignal` because no
+  // attacker code runs between the two synchronous lines inside the
+  // executor. We exercise it with a `PollerSleepAbort` double whose
+  // `aborted` reads `false` for the entry check and flips to `true`
+  // exactly when `addEventListener` is invoked — modeling the race
+  // window — and which intentionally never *calls* the listener (the
+  // exact missed-replay symptom the bug describes).
+  const clock = defaultClock();
+  let aborted = false;
+  let listenerInvocations = 0;
+  const racingSignal: PollerSleepAbort = {
+    get aborted(): boolean {
+      return aborted;
+    },
+    addEventListener(_type: "abort", listener: () => void): void {
+      // Flip to aborted *during* registration, but do not deliver the
+      // event — exactly the missed-replay scenario.
+      aborted = true;
+      // Track listener calls so we can assert the post-attach re-check
+      // path drove the resolution (not a stray future delivery).
+      void listener;
+    },
+    removeEventListener(_type: "abort", _listener: () => void): void {
+      listenerInvocations++;
+    },
+  };
+  // Picked far longer than the test runner's slowest reasonable
+  // resolution so a wait-the-full-duration regression would be obvious
+  // (the test would hang on the runner's hard timeout). On the fixed
+  // path the sleep resolves on the next microtask via the post-attach
+  // re-check.
+  const start = Date.now();
+  await clock.sleep(60_000, racingSignal);
+  const elapsed = Date.now() - start;
+  // The post-attach re-check must have triggered the cleanup path,
+  // which `removeEventListener`s the listener exactly once.
+  assertEquals(listenerInvocations, 1);
+  // The whole sleep must complete promptly — orders of magnitude
+  // faster than the requested 60 s wait.
+  assertLessOrEqual(elapsed, 1_000);
 });
 
 // ---------------------------------------------------------------------------

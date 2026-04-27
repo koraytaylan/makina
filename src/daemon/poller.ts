@@ -561,12 +561,20 @@ async function runLoop<TResult>(args: LoopArgs<TResult>): Promise<void> {
           // otherwise fall back to the steady-state interval. Failure
           // counter does not climb because the upstream told us a
           // precise wait; the next tick is *delayed*, not an *error*.
+          //
+          // Only the explicit `retryAfterMs` is capped at `backoffMax` —
+          // the interval fallback must be respected as-is so the cadence
+          // is consistent with the success path (which also sleeps
+          // `args.interval` without applying the backoff cap). Clamping
+          // the fallback would silently shorten the interval whenever
+          // `interval > backoffMax`, which is a configuration the caller
+          // explicitly chose.
           invokeOnError(args, caught);
-          nextWait = clamp(
-            caught.retryAfterMs ?? args.interval,
-            0,
-            args.backoffMax,
-          );
+          if (caught.retryAfterMs !== undefined) {
+            nextWait = clamp(caught.retryAfterMs, 0, args.backoffMax);
+          } else {
+            nextWait = args.interval;
+          }
         } else {
           // Generic rejection: exponential backoff with jitter.
           invokeOnError(args, caught);
@@ -702,8 +710,14 @@ function stringifyError(caught: unknown): string {
  * Pulled out as a separate factory so the poller's main body holds no
  * `Date.now()` or `setTimeout` reference — that lives entirely in this
  * function and is bypassed in every test that injects a clock.
+ *
+ * Exported so unit tests can drive the real-time clock directly with
+ * lightweight {@link PollerSleepAbort} doubles to cover races that a
+ * native `AbortSignal` cannot reach (e.g. an abort fired synchronously
+ * between the entry-check and the listener registration). Production
+ * code paths construct the clock through {@link createPoller}.
  */
-function defaultClock(): PollerClock {
+export function defaultClock(): PollerClock {
   return {
     now(): number {
       return Date.now();
@@ -746,6 +760,19 @@ function defaultClock(): PollerClock {
           resolve();
         }, wait);
         signal?.addEventListener("abort", abortListener);
+        // Re-check `signal.aborted` *after* attaching the listener.
+        // `AbortSignal` does not replay an abort that fired between the
+        // top-of-function fast path and `addEventListener`, so an abort
+        // landing in that synchronous gap would otherwise be missed and
+        // the sleep would wait the full `wait`, violating the contract
+        // that abort after entry resolves early. The check here is
+        // racing against nothing — the listener handles aborts that fire
+        // *after* this point — so it is safe to read once and trigger
+        // the same cleanup path explicitly.
+        if (signal?.aborted === true) {
+          abortListener();
+          return;
+        }
         // `setTimeout` in Deno returns a numeric handle; `unref` is not
         // available on every runtime. We do not block daemon shutdown on
         // a pending poll sleep — the supervisor's cancel paths abort the
