@@ -57,6 +57,8 @@ import { getLogger } from "@std/log";
 import {
   HEX_BYTE_WIDTH_CHARACTERS,
   HEX_RADIX,
+  HTTP_STATUS_CONFLICT,
+  HTTP_STATUS_METHOD_NOT_ALLOWED,
   TASK_ID_RANDOM_SUFFIX_BYTES,
   TASK_ID_RANDOM_SUFFIX_LENGTH_CHARACTERS,
 } from "../constants.ts";
@@ -324,6 +326,10 @@ export interface TaskSupervisorImpl {
  *   supervisor does not own.
  * - `not-ready-to-merge` — `mergeReadyTask()` was called for a task
  *   not currently in `READY_TO_MERGE`.
+ * - `merge-in-flight` — `mergeReadyTask()` was called concurrently for
+ *   the same task id; an earlier invocation is still mid-flight on the
+ *   GitHub merge call, so the second request is rejected synchronously
+ *   instead of issuing a duplicate `mergePullRequest`.
  * - `persistence` — the initial `start()` save failed (no record on
  *   disk; in-memory entry rolled back so callers can retry).
  */
@@ -331,6 +337,7 @@ export type SupervisorErrorKind =
   | "duplicate-start"
   | "unknown-task"
   | "not-ready-to-merge"
+  | "merge-in-flight"
   | "persistence";
 
 /**
@@ -490,6 +497,25 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    * inspect mid-flight transitions.
    */
   const tasks = new Map<TaskId, Task>();
+
+  /**
+   * Set of task ids whose `mergeReadyTask()` invocation is currently
+   * mid-flight on the GitHub merge call. Acts as an in-memory mutex:
+   * the second concurrent `/merge <task-id>` for the same task fails
+   * fast with `SupervisorErrorKind.merge-in-flight` instead of racing
+   * the first call into a duplicate `mergePullRequest` request.
+   *
+   * The guard is process-local (a daemon restart clears it) and lives
+   * alongside the `READY_TO_MERGE` state check inside `mergeReadyTask`:
+   * the state check guarantees that only `READY_TO_MERGE` tasks reach
+   * the GitHub call, but two callers can both pass that check before
+   * either persists a terminal transition. The mid-flight set closes
+   * the gap between "state check accepted" and "transition persisted".
+   *
+   * Cleared in a `finally` so a thrown classifier (or any other
+   * unexpected exception) cannot strand the task forever.
+   */
+  const mergeInFlight = new Set<TaskId>();
 
   /**
    * Run `mutate(prev)` to produce the next task record, persist it,
@@ -993,6 +1019,14 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    * a precise error), then re-uses {@link runMergeStep} to share the
    * GitHub call, classification, and cleanup behaviour with the
    * auto-merge path.
+   *
+   * Concurrent invocations for the same task id are guarded by the
+   * {@link mergeInFlight} set: the first caller registers the id
+   * synchronously after the state check passes; any second caller that
+   * arrives before the first persists its terminal transition fails
+   * fast with `SupervisorErrorKind.merge-in-flight`. The guard is
+   * cleared in a `finally` so an unexpected exception inside
+   * `runMergeStep` cannot strand the id.
    */
   async function mergeReadyTask(
     taskId: TaskId,
@@ -1011,15 +1045,31 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
         `task ${taskId} is not at READY_TO_MERGE (current state: ${task.state})`,
       );
     }
-    // The task's recorded `mergeMode` may be `manual` (the typical
-    // case for `/merge`) or one of the auto modes (rare: an operator
-    // can issue `/merge` to force-finish a parked auto-merge task
-    // that was paused mid-flight by daemon restart). Either way, the
-    // GitHub API needs a concrete strategy: `manual` falls back to
-    // `squash` unless the caller overrode it.
-    const mode: MergeMode = overrideMode ??
-      (task.mergeMode === "manual" ? "squash" : task.mergeMode);
-    return await runMergeStep(task, mode);
+    if (mergeInFlight.has(taskId)) {
+      throw new SupervisorError(
+        "merge-in-flight",
+        `task ${taskId} already has a /merge in flight; refusing duplicate`,
+      );
+    }
+    // Register before the first `await` so a concurrent caller that
+    // arrives during the same microtask sees the in-flight marker. The
+    // `READY_TO_MERGE` check above and this `add` form a synchronous
+    // pair: only one caller can transition from "state check passed"
+    // to "marker registered" before yielding the event loop.
+    mergeInFlight.add(taskId);
+    try {
+      // The task's recorded `mergeMode` may be `manual` (the typical
+      // case for `/merge`) or one of the auto modes (rare: an operator
+      // can issue `/merge` to force-finish a parked auto-merge task
+      // that was paused mid-flight by daemon restart). Either way, the
+      // GitHub API needs a concrete strategy: `manual` falls back to
+      // `squash` unless the caller overrode it.
+      const mode: MergeMode = overrideMode ??
+        (task.mergeMode === "manual" ? "squash" : task.mergeMode);
+      return await runMergeStep(task, mode);
+    } finally {
+      mergeInFlight.delete(taskId);
+    }
   }
 
   return {
@@ -1149,18 +1199,22 @@ function isTerminal(state: TaskState): boolean {
  * Per GitHub's [merge a PR](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
  * semantics:
  *
- * - `405 Method Not Allowed` — the response GitHub sends for "Pull
- *   Request is not mergeable" (conflicts, missing reviews on a
- *   protected branch, etc.).
- * - `409 Conflict` — head SHA mismatch when the caller passed
- *   `sha`; treated the same way because the underlying state requires
- *   a fresh PR view to resolve.
+ * - {@link HTTP_STATUS_METHOD_NOT_ALLOWED} — the response GitHub sends
+ *   for "Pull Request is not mergeable" (conflicts, missing reviews on
+ *   a protected branch, etc.).
+ * - {@link HTTP_STATUS_CONFLICT} — head SHA mismatch when the caller
+ *   passed `sha`; treated the same way because the underlying state
+ *   requires a fresh PR view to resolve.
  *
  * Centralised here (rather than inlined into a string match) so the
  * unit tests assert against the same constant the production path
- * keys off.
+ * keys off. The numeric values themselves live in `src/constants.ts`
+ * per the bare-literal rule documented at the top of that file.
  */
-export const MERGE_NOT_MERGEABLE_HTTP_STATUSES: readonly number[] = [405, 409];
+export const MERGE_NOT_MERGEABLE_HTTP_STATUSES: readonly number[] = [
+  HTTP_STATUS_METHOD_NOT_ALLOWED,
+  HTTP_STATUS_CONFLICT,
+];
 
 /**
  * Classify a thrown error from `mergePullRequest` into a

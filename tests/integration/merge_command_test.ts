@@ -130,8 +130,13 @@ function buildCommandHandler(supervisor: TaskSupervisorImpl) {
       return { ok: false, error: message };
     }
     try {
-      const merged = await supervisor.mergeReadyTask(taskId);
-      return { ok: true, error: `merged into ${merged.state}` };
+      // The merged record is intentionally discarded here: the daemon's
+      // `ack` schema (`AckPayload` in `src/ipc/protocol.ts`) carries
+      // `error` only on failure, so a successful merge returns the bare
+      // `{ ok: true }` and clients observe the resulting state through
+      // the supervisor's `state-changed` event stream instead.
+      await supervisor.mergeReadyTask(taskId);
+      return { ok: true };
     } catch (error) {
       if (error instanceof SupervisorError) {
         return { ok: false, error: error.message };

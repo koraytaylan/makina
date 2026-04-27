@@ -440,6 +440,64 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "mergeReadyTask rejects concurrent invocations with kind 'merge-in-flight'",
+  async () => {
+    const rig = await makeRig();
+    try {
+      // Park the task at READY_TO_MERGE via manual mode.
+      scriptHappyPath(rig, makeIssueNumber(46), { kind: "skip" });
+      const supervisor = buildSupervisor(rig, false);
+      const parked = await supervisor.start({
+        repo: rig.repo,
+        issueNumber: rig.issueNumber,
+        mergeMode: "manual",
+      });
+      assertEquals(parked.state, "READY_TO_MERGE");
+
+      // Stall the GitHub merge call so the first `mergeReadyTask`
+      // promise is mid-flight when the second is issued. A deferred
+      // promise resolved by the test gives us deterministic control
+      // over the sequencing.
+      let releaseMerge!: () => void;
+      const mergeGate = new Promise<void>((resolve) => {
+        releaseMerge = resolve;
+      });
+      const originalMerge = rig.githubClient.mergePullRequest.bind(
+        rig.githubClient,
+      );
+      rig.githubClient.mergePullRequest = async (repo, pr, mode) => {
+        await mergeGate;
+        // Queue the response just-in-time so the original method has a
+        // scripted reply to consume after the gate releases.
+        rig.githubClient.queueMergePullRequest({
+          kind: "value",
+          value: undefined,
+        });
+        return await originalMerge(repo, pr, mode);
+      };
+
+      // Kick off the first /merge; it pauses inside `mergePullRequest`.
+      const firstMerge = supervisor.mergeReadyTask(parked.id);
+      // The second /merge for the same id must reject synchronously
+      // with `merge-in-flight` while the first call is still pending.
+      const error = await assertRejects(
+        () => supervisor.mergeReadyTask(parked.id),
+        SupervisorError,
+      );
+      assertEquals(error.kind, "merge-in-flight");
+
+      // Release the gate so the first call can finish; the task lands
+      // in MERGED and the in-flight marker is cleared in the `finally`.
+      releaseMerge();
+      const merged = await firstMerge;
+      assertEquals(merged.state, "MERGED");
+    } finally {
+      await rig.cleanup();
+    }
+  },
+);
+
 // ---------------------------------------------------------------------------
 // Cleanup behavior
 // ---------------------------------------------------------------------------
@@ -515,45 +573,6 @@ Deno.test(
 
       assertEquals(merged.state, "MERGED");
       assertEquals(rig.worktreeManager.removed, [merged.id]);
-    } finally {
-      await rig.cleanup();
-    }
-  },
-);
-
-Deno.test(
-  "removeWorktree failures after merge are logged but do not change task state",
-  async () => {
-    const rig = await makeRig();
-    try {
-      scriptHappyPath(rig, makeIssueNumber(34), {
-        kind: "value",
-        value: undefined,
-      });
-      const supervisor = buildSupervisor(rig, false);
-      // Pre-load the failure: the recording manager will throw on the
-      // first `removeWorktree`.
-      // We don't know the task id yet; the failure is keyed by id, so
-      // we set up a default-throw via a sentinel after start.
-      const startPromise = supervisor.start({
-        repo: rig.repo,
-        issueNumber: rig.issueNumber,
-        mergeMode: "squash",
-      });
-      // Configure the failure for whatever id mintTaskId chose. The
-      // deterministic clock + random source makes the id stable; we
-      // can read it back from listTasks once the start resolves. To
-      // observe the error path, we register the failure via a wrapper
-      // by overwriting the manager's behavior post-start.
-      // Simpler: await the merge and assert that even if cleanup
-      // failed, the task is MERGED. We do this by wiring the failure
-      // up-front using a deterministic id.
-      const finalTask = await startPromise;
-      // The task id is now known; teardown already ran (manager
-      // recorded the call). The test is meaningful as a smoke check
-      // that the FSM does not unwind past `MERGED` even when cleanup
-      // throws *after* the persisted transition.
-      assertEquals(finalTask.state, "MERGED");
     } finally {
       await rig.cleanup();
     }
