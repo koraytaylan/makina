@@ -46,7 +46,6 @@
  */
 
 import { dirname } from "@std/path";
-import { ensureDir } from "@std/fs";
 
 import { MERGE_MODES, type Persistence, type Task, TASK_STATES, type TaskId } from "../types.ts";
 
@@ -82,9 +81,13 @@ export type FsOpen = (
  * file returns `[]`, which is the correct semantics for a fresh daemon
  * install.
  *
- * @param opts.path Absolute filesystem path of the live store. The
- *   parent directory is created if it does not exist; the file itself is
- *   created on demand.
+ * @param opts.path Filesystem path of the live store. May be absolute or
+ *   relative; relative paths are resolved against the daemon's current
+ *   working directory by the underlying `Deno.readTextFile` / `Deno.rename`
+ *   syscalls. The parent directory is created if it does not exist; the
+ *   file itself is created on demand. Production callers pass an absolute
+ *   path so the daemon's `cd` (or lack thereof) cannot move the store out
+ *   from under it.
  * @param opts.open Optional override for `Deno.open`. Production callers
  *   leave this unset and get the real syscall; tests pass a spy so they
  *   can observe `syncData()` invocations without mutating `Deno.open`
@@ -319,16 +322,19 @@ class AtomicJsonPersistence implements Persistence {
    * Atomically replace the live file with the JSON serialization of
    * `tasks`.
    *
-   * Sequence: ensure parent → open `<path>.tmp` (truncate) → write JSON →
-   * `fdatasync` the file descriptor → close → rename over the live path →
-   * `fdatasync` the parent directory. The rename is the commit point and
-   * the parent-directory sync makes that commit durable across power loss
-   * — without it the new directory entry can live in the directory's
-   * dirty page cache and be lost even though the file's data is on disk.
+   * Sequence: durably ensure the parent chain → open `<path>.tmp`
+   * (truncate) → write JSON → `fdatasync` the file descriptor → close →
+   * rename over the live path → `fdatasync` every directory from the leaf
+   * parent up to (and including) the highest newly-created ancestor's
+   * parent. The rename is the commit point and the directory syncs make
+   * both that commit and any freshly-created parent entries durable across
+   * power loss — without them the new directory entry (or its containing
+   * directory's entry, if we just created the directory) can live in dirty
+   * page cache and be lost even though the file's data is on disk.
    */
   private async writeAtomic(tasks: readonly Task[]): Promise<void> {
     const parent = dirname(this.livePath);
-    await ensureDir(parent);
+    const created = await this.ensureDurableParentChain(parent);
     const json = JSON.stringify(tasks, null, JSON_INDENT_SPACES);
     const bytes = new TextEncoder().encode(json);
     const file = await this.open(this.tempPath, {
@@ -343,18 +349,85 @@ class AtomicJsonPersistence implements Persistence {
       file.close();
     }
     await Deno.rename(this.tempPath, this.livePath);
-    await this.syncDirectory(parent);
+    // Always sync the leaf parent so the rename's directory entry is
+    // durable. Then walk up the chain of directories we just created and
+    // sync each of *their* parents so each new directory entry is also
+    // durable. The set is deduplicated and ordered from leaf-most outward,
+    // which matches the safe-to-fsync order on POSIX (a child must be
+    // synced before its parent if both are dirty, though syncing in either
+    // order is correct — we just want every link committed).
+    const toSync = directoriesToFsync(parent, created);
+    for (const dir of toSync) {
+      await this.syncDirectory(dir);
+    }
   }
 
   /**
-   * `fdatasync` the directory at `path` so the most recent rename within it
-   * is durable across power loss.
+   * Create every missing directory from the filesystem root down to
+   * `leaf`, fsyncing each newly-created directory's *parent* so the new
+   * entry is durable.
    *
-   * On POSIX filesystems a `rename(2)` updates the parent directory's
-   * dirty page cache; the entry is not durable until the directory itself
-   * is flushed. macOS, Linux ext4, XFS, and APFS all permit opening a
-   * directory read-only and calling `fdatasync` on the descriptor — Deno
-   * exposes that as `Deno.FsFile.syncData()`.
+   * Returns the absolute (or platform-rooted relative) paths of every
+   * directory we actually had to create, ordered leaf-most first. If the
+   * entire chain already existed, returns an empty array.
+   *
+   * Why this is not just `ensureDir + syncDirectory(leaf)`: when
+   * `ensureDir` creates intermediate directories (e.g., creating
+   * `<workspace>/persistence/` to host `state.json` when `<workspace>`
+   * exists but `persistence/` does not), the new sub-directory's
+   * directory entry lives in `<workspace>`'s dirty page cache. Without
+   * fsyncing `<workspace>`, a power loss after the rename can lose the
+   * `persistence/` entry — which loses the state file even though we
+   * fsync'd it.
+   */
+  private async ensureDurableParentChain(leaf: string): Promise<string[]> {
+    // Build the chain from leaf up to the root by repeated `dirname`.
+    const chain: string[] = [];
+    let current = leaf;
+    // `dirname("/")` is "/" on POSIX; `dirname(".")` is "." — both are
+    // fixed points, which is how we terminate. Defensive cap so a buggy
+    // path does not loop forever.
+    for (let i = 0; i < 4096; i += 1) {
+      chain.push(current);
+      const next = dirname(current);
+      if (next === current) {
+        break;
+      }
+      current = next;
+    }
+    // Walk root → leaf (reverse), creating each directory if missing.
+    // Track which ones we actually created so we can fsync their parents
+    // afterwards.
+    const created: string[] = [];
+    for (let i = chain.length - 1; i >= 0; i -= 1) {
+      const dir = chain[i];
+      if (dir === undefined) {
+        continue;
+      }
+      try {
+        await Deno.mkdir(dir);
+        created.push(dir);
+      } catch (error) {
+        if (error instanceof Deno.errors.AlreadyExists) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    // `created` is in root → leaf order; flip to leaf → root so callers
+    // see the deepest directory first (matches the natural fsync order).
+    return created.reverse();
+  }
+
+  /**
+   * `fdatasync` the directory at `path` so the most recent rename or
+   * mkdir within it is durable across power loss.
+   *
+   * On POSIX filesystems a `rename(2)` or `mkdir(2)` updates the parent
+   * directory's dirty page cache; the entry is not durable until the
+   * directory itself is flushed. macOS, Linux ext4, XFS, and APFS all
+   * permit opening a directory read-only and calling `fdatasync` on the
+   * descriptor — Deno exposes that as `Deno.FsFile.syncData()`.
    *
    * Routed through the injected {@link FsOpen} so the same spy that
    * observes the temp-file sync also sees the directory sync.
@@ -370,6 +443,49 @@ class AtomicJsonPersistence implements Persistence {
       dir.close();
     }
   }
+}
+
+/**
+ * Compute the set of directories whose `fdatasync` makes a `writeAtomic`
+ * commit fully durable, ordered leaf-most first.
+ *
+ * Two distinct directory entries can be dirty after a `writeAtomic`:
+ *
+ *  1. The leaf parent directory of the live file — its rename's new
+ *     entry lives in the leaf's dirty page cache.
+ *  2. The parent of every directory that {@link AtomicJsonPersistence.ensureDurableParentChain}
+ *     just created — each new directory's entry lives in *its* parent's
+ *     dirty page cache.
+ *
+ * `created` from `ensureDurableParentChain` is leaf-most first, so the
+ * parents we need to fsync are `dirname(created[0])`,
+ * `dirname(created[1])`, etc., plus the leaf itself. Deduplicating keeps
+ * us from fsyncing the same directory twice when the leaf parent was
+ * itself one of the just-created directories (e.g., when the entire
+ * persistence dir tree was new). The leaf-most-first ordering is the
+ * natural shape — fsyncing the deepest directory first covers the
+ * just-renamed file entry before we move outward to durably link in
+ * the new directories themselves.
+ */
+function directoriesToFsync(leafParent: string, created: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const push = (path: string): void => {
+    if (seen.has(path)) {
+      return;
+    }
+    seen.add(path);
+    out.push(path);
+  };
+  // Always sync the leaf parent — that is the directory whose entry
+  // table changed when we renamed the temp file over the live file.
+  push(leafParent);
+  // Then sync the parent of every newly-created directory (where its own
+  // directory entry now lives), walking outward from leaf to root.
+  for (const dir of created) {
+    push(dirname(dir));
+  }
+  return out;
 }
 
 /**

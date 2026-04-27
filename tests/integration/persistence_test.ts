@@ -729,3 +729,109 @@ Deno.test("save against a zero-byte existing file uses empty-store path", async 
     await cleanup();
   }
 });
+
+Deno.test("save fsyncs every newly-created directory in a deep parent chain", async () => {
+  // Regression guard for the durability of the directory chain itself.
+  // When `writeAtomic` has to create multiple intermediate directories
+  // (e.g., `<tempdir>/a/b/c/state.json` where only `<tempdir>` exists),
+  // the new sub-directory entries live in their parents' dirty page
+  // caches. A power loss after the rename can lose the entire chain even
+  // though the file's data is on disk. The fix fsyncs every directory
+  // whose entry table changed: the leaf parent (where the rename
+  // committed) and the parent of every directory we just created (where
+  // each new directory's entry was committed).
+  //
+  // Spy is per-instance — `Deno.open` is never mutated process-wide, so
+  // this test is safe under `deno test --parallel`.
+  const root = await Deno.makeTempDir({ prefix: "makina-persistence-deep-" });
+  const path = join(root, "a", "b", "c", "state.json");
+  try {
+    const synced: string[] = [];
+    const spyOpen: typeof Deno.open = async (
+      target: string | URL,
+      options?: Deno.OpenOptions,
+    ) => {
+      const file = await Deno.open(target, options);
+      const targetPath = typeof target === "string" ? target : target.pathname;
+      const originalSyncData = file.syncData.bind(file);
+      file.syncData = async () => {
+        synced.push(targetPath);
+        await originalSyncData();
+      };
+      return file;
+    };
+    const persistence = createPersistence({ path, open: spyOpen });
+    await persistence.save(makeTask({ id: makeTaskId("task_deep") }));
+    // Every directory whose entry table changed must have been
+    // syncData()'d:
+    //  - <root>/a/b/c (the rename's parent — committed `state.json`)
+    //  - <root>/a/b   (committed the new `c/` entry)
+    //  - <root>/a     (committed the new `b/` entry)
+    //  - <root>       (committed the new `a/` entry)
+    const expected = [
+      join(root, "a", "b", "c"),
+      join(root, "a", "b"),
+      join(root, "a"),
+      root,
+    ];
+    for (const dir of expected) {
+      assertEquals(
+        synced.includes(dir),
+        true,
+        `expected fsync on ${dir}, saw ${JSON.stringify(synced)}`,
+      );
+    }
+    // The save must of course have actually landed.
+    const tasks = await persistence.loadAll();
+    assertEquals(tasks.length, 1);
+    assertEquals(tasks[0]?.id, "task_deep");
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("save fsyncs only the leaf parent when the parent chain already exists", async () => {
+  // Counterpart to the deep-chain test: when the parent chain is fully
+  // present (no `mkdir` calls happen), the only directory whose entry
+  // table changed is the leaf parent itself. We must not redundantly
+  // fsync ancestors we did not write to — that would be wasted IO.
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    const synced: string[] = [];
+    const spyOpen: typeof Deno.open = async (
+      target: string | URL,
+      options?: Deno.OpenOptions,
+    ) => {
+      const file = await Deno.open(target, options);
+      const targetPath = typeof target === "string" ? target : target.pathname;
+      const originalSyncData = file.syncData.bind(file);
+      file.syncData = async () => {
+        synced.push(targetPath);
+        await originalSyncData();
+      };
+      return file;
+    };
+    const persistence = createPersistence({ path, open: spyOpen });
+    await persistence.save(makeTask({ id: makeTaskId("task_shallow") }));
+    const parent = dirname(path);
+    // The leaf parent must be fsynced.
+    assertEquals(
+      synced.includes(parent),
+      true,
+      `expected fsync on ${parent}, saw ${JSON.stringify(synced)}`,
+    );
+    // Every directory we fsynced must be either the temp file or the
+    // leaf parent — never an unrelated ancestor.
+    const tempPath = `${path}.tmp`;
+    for (const target of synced) {
+      const allowed = target === tempPath || target === parent;
+      assertEquals(
+        allowed,
+        true,
+        `unexpected fsync on ${target}; allowed only ${tempPath} or ${parent}`,
+      );
+    }
+  } finally {
+    await cleanup();
+  }
+});
