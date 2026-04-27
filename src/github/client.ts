@@ -1,16 +1,16 @@
 /**
  * github/client.ts — high-level typed GitHub client used by the supervisor.
  *
- * Implements {@link GitHubClient} from `src/types.ts` and adds the four
+ * Implements {@link GitHubClient} from `src/types.ts` and adds the
  * stabilize-phase methods (`listCheckRuns`, `getCheckRunLogs`,
- * `listReviews`, `listReviewComments`) the Wave 4 conversations and CI
- * loops need. Those four extensions live behind
- * {@link StabilizeGitHubClient}, an additive interface exported from this
- * module; the Wave 1 {@link GitHubClient} contract in `src/types.ts`
- * stays frozen. Built on `@octokit/core` with a {@link GitHubAuth}
- * strategy injected: every request resolves an installation token via
- * `getInstallationToken` immediately before the call so token rotation
- * is automatic.
+ * `listReviews`, `listReviewComments`, `listReviewThreads`,
+ * `resolveReviewThread`) the Wave 4 conversations and CI loops need.
+ * Those extensions live behind {@link StabilizeGitHubClient}, an
+ * additive interface exported from this module; the Wave 1
+ * {@link GitHubClient} contract in `src/types.ts` stays frozen. Built on
+ * `@octokit/core` with a {@link GitHubAuth} strategy injected: every
+ * request resolves an installation token via `getInstallationToken`
+ * immediately before the call so token rotation is automatic.
  *
  * **Rate-limit awareness.** The retry policy intentionally fires only
  * when GitHub gave us a clear rate-limit signal (see ADR-011):
@@ -117,7 +117,11 @@ export interface PullRequestReview {
  * Mirrors the subset of the [Pulls Comments API](https://docs.github.com/en/rest/pulls/comments)
  * the stabilize loop reads. Threading metadata
  * (`pull_request_review_id`, `in_reply_to_id`) is preserved so the
- * conversations phase can group comments by thread.
+ * conversations phase can group comments by thread; the optional
+ * {@link PullRequestReviewComment.threadNodeId} carries the GraphQL
+ * node id the
+ * {@link StabilizeGitHubClient.resolveReviewThread} mutation requires
+ * once the supervisor pushes a fix for the thread.
  */
 export interface PullRequestReviewComment {
   /** Comment id; stable. */
@@ -134,8 +138,51 @@ export interface PullRequestReviewComment {
   readonly line: number | null;
   /** Parent comment id when this is a reply, otherwise `null`. */
   readonly inReplyToId: number | null;
+  /**
+   * GraphQL node id of the review thread this comment belongs to, when
+   * known. Required by
+   * {@link StabilizeGitHubClient.resolveReviewThread}; the REST Pulls
+   * Comments API does not expose it directly, so the supervisor's
+   * conversations phase calls
+   * {@link StabilizeGitHubClient.listReviewThreads} alongside
+   * `listReviewComments` and joins the two by comment `id` to populate
+   * this field. The field stays optional on the type because the join
+   * can fail (e.g. a thread that has not yet been indexed by GraphQL on
+   * GitHub's side); when `undefined` the conversations phase logs and
+   * skips the resolve call rather than guessing an id.
+   */
+  readonly threadNodeId?: string;
   /** ISO-8601 timestamp the comment was created. */
   readonly createdAtIso: string;
+}
+
+/**
+ * One review thread on a pull request, projected from GitHub's GraphQL
+ * `pullRequest.reviewThreads` payload.
+ *
+ * The conversations phase needs the thread node id (for
+ * {@link StabilizeGitHubClient.resolveReviewThread}) plus the set of
+ * REST review-comment ids inside the thread so it can map each comment
+ * surfaced by {@link StabilizeGitHubClient.listReviewComments} back to
+ * the thread it belongs to. Other thread fields (state, path, line,
+ * author) are intentionally omitted — the supervisor does not need them
+ * and keeping the projection small keeps the GraphQL query cheap.
+ */
+export interface PullRequestReviewThread {
+  /**
+   * GraphQL node id of the thread (the `PRRT_*` value GraphQL returns).
+   * Pass this directly to
+   * {@link StabilizeGitHubClient.resolveReviewThread}.
+   */
+  readonly id: string;
+  /**
+   * REST comment ids attached to this thread, in GitHub's natural order.
+   * Each id matches {@link PullRequestReviewComment.id}; the supervisor
+   * builds a `commentId → threadNodeId` map so it can stamp
+   * {@link PullRequestReviewComment.threadNodeId} on every comment
+   * returned by `listReviewComments`.
+   */
+  readonly commentIds: readonly number[];
 }
 
 // ---------------------------------------------------------------------------
@@ -148,13 +195,13 @@ export interface PullRequestReviewComment {
  * The W1 `GitHubClient` contract in `src/types.ts` is intentionally
  * minimal — every interface there is the surface every Wave 2 branch
  * builds in parallel and consumer waves cannot cheaply reshape it.
- * The four methods Wave 4's stabilize loop needs (per-check-run reads
- * for the CI phase, review/comment reads for the conversations phase)
- * are additive, so we expose them on a separate interface that
- * **extends** `GitHubClient` instead. Consumers (Wave 4's supervisor,
- * the in-memory double `tests/helpers/in_memory_github_client.ts`)
- * depend on this interface rather than the concrete
- * {@link GitHubClientImpl} class.
+ * The methods Wave 4's stabilize loop needs (per-check-run reads
+ * for the CI phase, review/comment reads + thread resolution for the
+ * conversations phase) are additive, so we expose them on a separate
+ * interface that **extends** `GitHubClient` instead. Consumers (Wave
+ * 4's supervisor, the in-memory double
+ * `tests/helpers/in_memory_github_client.ts`) depend on this interface
+ * rather than the concrete {@link GitHubClientImpl} class.
  *
  * @example
  * ```ts
@@ -197,6 +244,14 @@ export interface StabilizeGitHubClient extends GitHubClient {
   /**
    * List inline review comments on a pull request, in creation order.
    *
+   * The REST Pulls Comments API does not return GraphQL thread node ids,
+   * so the comments returned here have
+   * {@link PullRequestReviewComment.threadNodeId} unset. Callers that
+   * need to resolve threads should also call
+   * {@link StabilizeGitHubClient.listReviewThreads} and join the two by
+   * comment `id`. The supervisor's conversations phase does this
+   * automatically inside `runConversationsPoll`.
+   *
    * @param repo Target repository.
    * @param pullRequestNumber Pull-request number.
    * @returns Inline review comments in their creation order.
@@ -205,6 +260,48 @@ export interface StabilizeGitHubClient extends GitHubClient {
     repo: RepoFullName,
     pullRequestNumber: IssueNumber,
   ): Promise<readonly PullRequestReviewComment[]>;
+  /**
+   * List review threads on a pull request via GitHub's GraphQL API,
+   * projecting only the data the conversations phase needs:
+   * the thread's GraphQL node id and the REST comment ids attached to
+   * it.
+   *
+   * The REST Pulls Comments API does not expose the GraphQL thread node
+   * id (`PullRequestReviewThread.id`) that
+   * {@link StabilizeGitHubClient.resolveReviewThread} requires. The
+   * supervisor calls this method alongside `listReviewComments` and
+   * builds a `commentId → threadNodeId` map so each comment returned by
+   * the REST listing can be stamped with the thread it belongs to. See
+   * ADR-020 for the GraphQL-via-`@octokit/core` rationale.
+   *
+   * Implementations must paginate the GraphQL response transparently —
+   * the returned array contains every thread on the PR.
+   *
+   * @param repo Target repository.
+   * @param pullRequestNumber Pull-request number.
+   * @returns One projection per thread, in GitHub's natural order.
+   */
+  listReviewThreads(
+    repo: RepoFullName,
+    pullRequestNumber: IssueNumber,
+  ): Promise<readonly PullRequestReviewThread[]>;
+  /**
+   * Resolve a single review thread via GitHub's GraphQL API.
+   *
+   * GitHub does not expose a REST endpoint for resolving review threads
+   * — the action is GraphQL-only via the `resolveReviewThread` mutation.
+   * The thread id is the **GraphQL node id**, not the REST review-id;
+   * the conversations phase obtains it from the
+   * {@link StabilizeGitHubClient.listReviewThreads} payload it joins
+   * with the REST review-comments listing.
+   *
+   * See ADR-020 for the dependency-policy rationale (we route the
+   * mutation through `@octokit/core`'s built-in `graphql()` rather than
+   * pulling in `@octokit/graphql` as a separate dependency).
+   *
+   * @param threadId GraphQL node id of the review thread to resolve.
+   */
+  resolveReviewThread(threadId: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +379,55 @@ export const DEFAULT_FALLBACK_RETRY_SLEEP_MILLISECONDS = 1_000;
 const HEADER_RETRY_AFTER = "retry-after";
 const HEADER_RATE_LIMIT_REMAINING = "x-ratelimit-remaining";
 const HEADER_RATE_LIMIT_RESET = "x-ratelimit-reset";
+
+/**
+ * GraphQL mutation used by
+ * {@link GitHubClientImpl.resolveReviewThread} to mark a single review
+ * thread as resolved. Centralised so the unit test asserts against the
+ * exact body the production code sends, and any future amendment
+ * (`unresolveReviewThread`, additional return fields) lives next to it.
+ *
+ * The mutation only requires the `threadId` input; the response payload
+ * is read for shape (so a misconfigured GraphQL endpoint surfaces as a
+ * type error rather than silent success). See ADR-020 for the
+ * dependency-policy rationale (no `@octokit/graphql` dependency added).
+ */
+const RESOLVE_REVIEW_THREAD_MUTATION = `mutation ResolveReviewThread($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) {
+    thread { id }
+  }
+}`;
+
+/**
+ * GraphQL query used by
+ * {@link GitHubClientImpl.listReviewThreads} to enumerate every review
+ * thread on a pull request together with the REST `databaseId` of every
+ * comment inside the thread. Centralised so the unit test asserts
+ * against the exact body the production code sends, and pagination
+ * lives in one place.
+ *
+ * `databaseId` is the field GitHub's GraphQL surface uses for the REST
+ * id; pairing it with the thread's GraphQL node id is what lets the
+ * supervisor join `listReviewComments` (REST) with `listReviewThreads`
+ * (GraphQL) on a stable key. The 100-per-page caps match the GitHub
+ * GraphQL maximum so each round-trip pulls as much as the API allows.
+ */
+const LIST_REVIEW_THREADS_QUERY =
+  `query ListReviewThreads($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          comments(first: 100) {
+            nodes { databaseId }
+          }
+        }
+      }
+    }
+  }
+}`;
 
 /**
  * Default `User-Agent` string. GitHub demands a non-empty UA on every
@@ -531,6 +677,108 @@ export class GitHubClientImpl implements StabilizeGitHubClient {
   }
 
   /**
+   * List every review thread on a pull request via GraphQL, projecting
+   * the thread node id and the REST comment ids inside each thread.
+   *
+   * Paginates the GraphQL `reviewThreads` connection transparently with
+   * `pageInfo { hasNextPage, endCursor }` until every thread is loaded.
+   * The page size matches the GitHub GraphQL maximum (100); a PR with
+   * more threads than that is rare in practice but the loop is correct
+   * for the unbounded case.
+   *
+   * Routes the query through `@octokit/core`'s built-in `graphql()`
+   * helper (see ADR-020). Tokens are minted on every page so a long-
+   * running request still rotates the installation token between pages.
+   *
+   * @param repo Target repository.
+   * @param pullRequestNumber Pull-request number.
+   * @returns Every review thread on the PR, in GitHub's natural order.
+   * @throws The same surface `@octokit/core` raises for GraphQL errors
+   *   — typically `GraphqlResponseError` with a `status` field.
+   */
+  async listReviewThreads(
+    repo: RepoFullName,
+    pullRequestNumber: IssueNumber,
+  ): Promise<readonly PullRequestReviewThread[]> {
+    const { owner, name } = splitRepo(repo);
+    const threads: PullRequestReviewThread[] = [];
+    let cursor: string | null = null;
+    // Bound the loop defensively. The GitHub GraphQL `reviewThreads`
+    // connection is bounded by the PR's actual thread count, but a
+    // malformed `pageInfo.hasNextPage` (always-true) would otherwise
+    // hang the supervisor on a single PR. The cap is `MAX_PAGES` *
+    // page-size threads (10_000), well above any realistic PR.
+    const MAX_PAGES = 100;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const token = await this.auth.getInstallationToken(this.installationId);
+      const response: ReviewThreadsGraphqlResponse = await this.octokit
+        .graphql<ReviewThreadsGraphqlResponse>(
+          LIST_REVIEW_THREADS_QUERY,
+          {
+            owner,
+            name,
+            number: pullRequestNumber,
+            cursor,
+            headers: { authorization: `token ${token}` },
+          },
+        );
+      const connection: ReviewThreadsConnection | null | undefined = response
+        ?.repository?.pullRequest?.reviewThreads;
+      if (connection === undefined || connection === null) {
+        // PR not found, or the viewer cannot see review threads — return
+        // what we have collected so far rather than throwing. The empty
+        // array is the documented signal for "no thread mapping
+        // available", and the supervisor's resolve loop already tolerates
+        // missing entries by skipping the resolve call.
+        return threads;
+      }
+      for (const node of connection.nodes ?? []) {
+        if (node === null) continue;
+        const commentIds: number[] = [];
+        for (const comment of node.comments?.nodes ?? []) {
+          if (comment === null) continue;
+          if (typeof comment.databaseId === "number") {
+            commentIds.push(comment.databaseId);
+          }
+        }
+        threads.push({ id: node.id, commentIds });
+      }
+      const pageInfo: ReviewThreadsPageInfo | null | undefined = connection.pageInfo;
+      if (pageInfo === undefined || pageInfo === null) break;
+      if (pageInfo.hasNextPage !== true) break;
+      const next: string | null = pageInfo.endCursor;
+      if (next === null) break;
+      cursor = next;
+    }
+    return threads;
+  }
+
+  /**
+   * Resolve a single review thread via GitHub's GraphQL
+   * `resolveReviewThread` mutation.
+   *
+   * Routes the mutation through `@octokit/core`'s built-in `graphql()`
+   * helper (see ADR-020) so we do not pull in `@octokit/graphql` as a
+   * separate dependency. The token is minted on every call from the
+   * same {@link GitHubAuth} strategy the REST methods use, so token
+   * rotation is automatic.
+   *
+   * @param threadId GraphQL node id of the review thread to resolve.
+   * @throws The same surface `@octokit/core` raises for GraphQL
+   *   errors — typically `GraphqlResponseError` with a `status` field.
+   */
+  async resolveReviewThread(threadId: string): Promise<void> {
+    const token = await this.auth.getInstallationToken(this.installationId);
+    await this.octokit.graphql<{ resolveReviewThread: { thread: { id: string } } }>(
+      RESOLVE_REVIEW_THREAD_MUTATION,
+      {
+        threadId,
+        headers: { authorization: `token ${token}` },
+      },
+    );
+  }
+
+  /**
    * Merge the pull request per `mode`.
    *
    * - `"squash"` performs a squash merge.
@@ -738,6 +986,41 @@ interface ReviewCommentResponse {
   readonly line: number | null;
   readonly in_reply_to_id?: number | null;
   readonly created_at: string;
+}
+
+interface ReviewThreadCommentNode {
+  readonly databaseId: number | null;
+}
+
+interface ReviewThreadCommentConnection {
+  readonly nodes: ReadonlyArray<ReviewThreadCommentNode | null> | null;
+}
+
+interface ReviewThreadNode {
+  readonly id: string;
+  readonly comments: ReviewThreadCommentConnection | null;
+}
+
+interface ReviewThreadsPageInfo {
+  readonly hasNextPage: boolean;
+  readonly endCursor: string | null;
+}
+
+interface ReviewThreadsConnection {
+  readonly pageInfo: ReviewThreadsPageInfo | null;
+  readonly nodes: ReadonlyArray<ReviewThreadNode | null> | null;
+}
+
+interface ReviewThreadsPullRequest {
+  readonly reviewThreads: ReviewThreadsConnection | null;
+}
+
+interface ReviewThreadsRepository {
+  readonly pullRequest: ReviewThreadsPullRequest | null;
+}
+
+interface ReviewThreadsGraphqlResponse {
+  readonly repository: ReviewThreadsRepository | null;
 }
 
 function splitRepo(repo: RepoFullName): { owner: string; name: string } {

@@ -202,6 +202,10 @@ async function makeRig(): Promise<MergeCommandRig> {
     randomSource: new FixedRandomSource(),
     preserveWorktreeOnMerge: false,
     gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
+    // Conversations phase is real; drive ticks back-to-back so the
+    // empty timeline scripted in `scriptParkedTask` is consumed without
+    // a 30 s steady-state wait.
+    pollIntervalMilliseconds: 0,
   });
   return {
     socketPath,
@@ -266,6 +270,11 @@ function scriptParkedTask(rig: MergeCommandRig, prNumber: IssueNumber): void {
     },
   });
   rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+  // Conversations sub-phase polls before READY_TO_MERGE; queue an empty
+  // timeline so the loop converges without dispatching the agent.
+  rig.githubClient.queueListReviews({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
   rig.agentRunner.queueRun({
     messages: [{ role: "assistant", text: "ok" }],
   });

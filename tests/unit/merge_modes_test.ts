@@ -196,6 +196,13 @@ function scriptHappyPath(
     },
   });
   rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+  // The CONVERSATIONS sub-phase polls the PR's review timeline before the
+  // FSM can advance to READY_TO_MERGE. The merge-modes tests exercise the
+  // merge branches, not the conversations loop, so queue an empty timeline
+  // — the phase converges immediately and the supervisor moves on.
+  rig.githubClient.queueListReviews({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewComments({ kind: "value", value: [] });
+  rig.githubClient.queueListReviewThreads({ kind: "value", value: [] });
   if (mergeReply.kind !== "skip") {
     rig.githubClient.queueMergePullRequest(mergeReply);
   }
@@ -242,6 +249,10 @@ function buildSupervisor(
     randomSource: new FixedRandomSource(),
     preserveWorktreeOnMerge,
     gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
+    // Conversations phase is real now; drive ticks back-to-back so the
+    // empty timeline scripted in `scriptHappyPath` is consumed without
+    // a 30 s steady-state wait.
+    pollIntervalMilliseconds: 0,
   });
 }
 
@@ -890,6 +901,11 @@ Deno.test(
         },
       });
       githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // Conversations sub-phase polls before merge; queue an empty
+      // timeline so the loop converges immediately.
+      githubClient.queueListReviews({ kind: "value", value: [] });
+      githubClient.queueListReviewComments({ kind: "value", value: [] });
+      githubClient.queueListReviewThreads({ kind: "value", value: [] });
       githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       agentRunner.queueRun({
         messages: [{ role: "assistant", text: "ok" }],
@@ -910,6 +926,7 @@ Deno.test(
         clock: new DeterministicClock(),
         randomSource: new FixedRandomSource(),
         preserveWorktreeOnMerge: false,
+        pollIntervalMilliseconds: 0,
       });
 
       const finalTask = await supervisor.start({
@@ -964,6 +981,11 @@ Deno.test(
         },
       });
       githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // Conversations sub-phase polls before merge; queue an empty
+      // timeline so the loop converges immediately.
+      githubClient.queueListReviews({ kind: "value", value: [] });
+      githubClient.queueListReviewComments({ kind: "value", value: [] });
+      githubClient.queueListReviewThreads({ kind: "value", value: [] });
       githubClient.queueMergePullRequest({ kind: "value", value: undefined });
       agentRunner.queueRun({
         messages: [{ role: "assistant", text: "ok" }],
@@ -984,6 +1006,7 @@ Deno.test(
         clock: new DeterministicClock(),
         randomSource: new FixedRandomSource(),
         preserveWorktreeOnMerge: true,
+        pollIntervalMilliseconds: 0,
       });
 
       const finalTask = await supervisor.start({
