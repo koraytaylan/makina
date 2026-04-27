@@ -15,8 +15,10 @@
  *     arrives) and that the daemon's IPC layer surfaces the right
  *     acknowledgement.
  *  3. `/status` reflects the started task's projection. The `ack` body
- *     embeds a JSON payload with the task table; the test parses it and
- *     verifies the `(repo, issueNumber)` pair routed correctly.
+ *     carries the task table on the structured `data` field (per the
+ *     IPC contract; `error` is reserved for failure descriptions); the
+ *     test parses it and verifies the `(repo, issueNumber)` pair routed
+ *     correctly.
  *  4. An unknown command name yields `ack { ok: false, error: "unknown
  *     command: ..." }`.
  *
@@ -397,8 +399,13 @@ Deno.test("main.ts daemon runtime: ping/pong, /issue, /status, unknown command",
       }
       assert(statusAck !== undefined, "did not receive status ack");
       assertEquals(statusAck.ok, true);
-      assert(statusAck.error !== undefined, "status ack should embed JSON in `error`");
-      const parsed = JSON.parse(statusAck.error) as {
+      assertEquals(
+        statusAck.error,
+        undefined,
+        "status ack must not overload `error` (contract: error is for failures)",
+      );
+      assert(statusAck.data !== undefined, "status ack should carry tasks on `data`");
+      const parsed = statusAck.data as {
         readonly tasks: ReadonlyArray<{
           readonly id: string;
           readonly repo: string;
@@ -410,7 +417,7 @@ Deno.test("main.ts daemon runtime: ping/pong, /issue, /status, unknown command",
       const issueTask = parsed.tasks.find((t) => t.repo === "owner/repo" && t.issueNumber === 42);
       assert(
         issueTask !== undefined,
-        `status missing the issue we started; got: ${statusAck.error}`,
+        `status missing the issue we started; got: ${JSON.stringify(statusAck.data)}`,
       );
     } finally {
       await client.close();

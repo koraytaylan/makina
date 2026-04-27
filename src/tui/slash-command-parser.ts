@@ -16,7 +16,7 @@
  *
  * **Supported commands** (full grammar in {@link SLASH_COMMAND_SPECS}):
  *
- * - `/issue <number> [--repo <owner/name>]` — start a new task.
+ * - `/issue <number> [--repo <owner/name>] [--merge=<squash|rebase|manual>]` — start a new task.
  * - `/repo add <owner/name> <installation-id>` — register a repo.
  * - `/repo default <owner/name>` — set the default repo.
  * - `/repo list` — print the registered repositories.
@@ -37,6 +37,8 @@ import {
   type IssueNumber,
   makeIssueNumber,
   makeRepoFullName,
+  MERGE_MODES,
+  type MergeMode,
   type RepoFullName,
 } from "../types.ts";
 import type { CommandPayload } from "../ipc/protocol.ts";
@@ -108,7 +110,7 @@ export const SLASH_COMMAND_SPECS: readonly SlashCommandSpec[] = [
   {
     name: "issue",
     summary: "Start a new task for an issue.",
-    usage: "/issue <number> [--repo <owner/name>]",
+    usage: "/issue <number> [--repo <owner/name>] [--merge=<squash|rebase|manual>]",
   },
   {
     name: "logs",
@@ -278,11 +280,18 @@ function isKnownCommand(raw: string): raw is SlashCommandName {
 // ---------------------------------------------------------------------------
 
 /**
- * Parse `/issue <number> [--repo <owner/name>]`.
+ * Parse `/issue <number> [--repo <owner/name>] [--merge=<mode>]`.
  *
  * The `--repo` flag is optional and may appear before or after the
  * positional issue number; positional non-flag tokens beyond the issue
  * number are rejected so the parser fails fast on typos.
+ *
+ * The `--merge` flag accepts both `--merge=<mode>` and `--merge <mode>`
+ * spellings so palette users can pick whichever feels natural; the
+ * value must be one of {@link MERGE_MODES}. The merge mode rides on the
+ * {@link CommandPayload.mergeMode} field — it is **not** added to
+ * `args[]` so the daemon-side dispatcher reads a single canonical
+ * field instead of re-parsing the positional tail.
  *
  * @param tokens Tokens after the command name.
  * @returns The command payload.
@@ -290,6 +299,7 @@ function isKnownCommand(raw: string): raw is SlashCommandName {
 function parseIssue(tokens: readonly string[]): CommandPayload {
   let issueArg: string | undefined;
   let repoArg: string | undefined;
+  let mergeArg: string | undefined;
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token === "--repo") {
@@ -308,6 +318,38 @@ function parseIssue(tokens: readonly string[]): CommandPayload {
       }
       repoArg = next;
       index += 1;
+      continue;
+    }
+    // Accept both spellings: `--merge=<mode>` (single token, common in
+    // CLI ergonomics) and `--merge <mode>` (two tokens, mirrors --repo).
+    if (token !== undefined && (token === "--merge" || token.startsWith("--merge="))) {
+      let candidate: string | undefined;
+      if (token === "--merge") {
+        candidate = tokens[index + 1];
+        if (candidate === undefined) {
+          throw new SlashCommandParseError(
+            "bad-arguments",
+            "/issue: --merge requires an argument.",
+          );
+        }
+        index += 1;
+      } else {
+        // `--merge=` prefix; everything after the `=` is the value.
+        candidate = token.slice("--merge=".length);
+        if (candidate.length === 0) {
+          throw new SlashCommandParseError(
+            "bad-arguments",
+            "/issue: --merge requires an argument.",
+          );
+        }
+      }
+      if (mergeArg !== undefined) {
+        throw new SlashCommandParseError(
+          "bad-arguments",
+          "/issue: --merge specified more than once.",
+        );
+      }
+      mergeArg = candidate;
       continue;
     }
     if (token !== undefined && token.startsWith("--")) {
@@ -332,11 +374,13 @@ function parseIssue(tokens: readonly string[]): CommandPayload {
   }
   const issueNumber = parseIssueNumberArg("/issue", issueArg);
   const repo = repoArg === undefined ? undefined : parseRepoFullNameArg("/issue", repoArg);
+  const mergeMode = mergeArg === undefined ? undefined : parseMergeModeArg("/issue", mergeArg);
   return makePayload({
     name: "issue",
     args: [issueArg],
     issueNumber,
     repo,
+    mergeMode,
   });
 }
 
@@ -620,6 +664,28 @@ function parseIssueNumberArg(scope: string, raw: string): IssueNumber {
 }
 
 /**
+ * Parse a token expected to be one of {@link MERGE_MODES}.
+ *
+ * The check is case-sensitive — operators see the canonical spelling
+ * in `/help issue` and the parser is the contract surface for that
+ * vocabulary, so a typo of `Squash` falls through to a clean error
+ * rather than being silently lower-cased.
+ *
+ * @param scope Caller name, prepended to the error message.
+ * @param raw The candidate token.
+ * @returns The {@link MergeMode}.
+ */
+function parseMergeModeArg(scope: string, raw: string): MergeMode {
+  if (!(MERGE_MODES as readonly string[]).includes(raw)) {
+    throw new SlashCommandParseError(
+      "bad-arguments",
+      `${scope}: --merge must be one of ${MERGE_MODES.join(", ")}; got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return raw as MergeMode;
+}
+
+/**
  * Parse a token expected to be `<owner>/<name>`.
  *
  * @param scope Caller name, prepended to the error message.
@@ -652,6 +718,7 @@ function makePayload(
     readonly args: readonly string[];
     readonly repo?: RepoFullName | undefined;
     readonly issueNumber?: IssueNumber | undefined;
+    readonly mergeMode?: MergeMode | undefined;
   },
 ): CommandPayload {
   const payload: {
@@ -659,6 +726,7 @@ function makePayload(
     args: readonly string[];
     repo?: RepoFullName;
     issueNumber?: IssueNumber;
+    mergeMode?: MergeMode;
   } = {
     name: input.name,
     args: input.args,
@@ -668,6 +736,9 @@ function makePayload(
   }
   if (input.issueNumber !== undefined) {
     payload.issueNumber = input.issueNumber;
+  }
+  if (input.mergeMode !== undefined) {
+    payload.mergeMode = input.mergeMode;
   }
   return payload;
 }

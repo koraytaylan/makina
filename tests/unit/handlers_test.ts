@@ -17,7 +17,11 @@
 
 import { assert, assertEquals } from "@std/assert";
 
-import { createDaemonHandlers, type StatusTaskProjection } from "../../src/daemon/handlers.ts";
+import {
+  createDaemonHandlers,
+  type StatusResponseData,
+  type StatusTaskProjection,
+} from "../../src/daemon/handlers.ts";
 import { SupervisorError, type TaskSupervisorImpl } from "../../src/daemon/supervisor.ts";
 import type { AckPayload, CommandPayload, MessageEnvelope } from "../../src/ipc/protocol.ts";
 import {
@@ -107,6 +111,7 @@ function commandEnvelope(
     readonly args?: readonly string[];
     readonly repo?: RepoFullName;
     readonly issueNumber?: IssueNumber;
+    readonly mergeMode?: MergeMode;
   },
   id: string = "1",
 ): Extract<MessageEnvelope, { type: "command" }> {
@@ -115,12 +120,14 @@ function commandEnvelope(
     args: readonly string[];
     repo?: RepoFullName;
     issueNumber?: IssueNumber;
+    mergeMode?: MergeMode;
   } = {
     name: payload.name,
     args: payload.args ?? [],
   };
   if (payload.repo !== undefined) built.repo = payload.repo;
   if (payload.issueNumber !== undefined) built.issueNumber = payload.issueNumber;
+  if (payload.mergeMode !== undefined) built.mergeMode = payload.mergeMode;
   return { id, type: "command", payload: built as CommandPayload };
 }
 
@@ -191,6 +198,57 @@ Deno.test("createDaemonHandlers: /issue starts a task with the default repo when
   assert(call !== undefined);
   assertEquals(call.repo, DEFAULT_REPO);
   assertEquals(call.issueNumber, makeIssueNumber(42));
+});
+
+Deno.test("createDaemonHandlers: /issue forwards mergeMode from the parsed payload to supervisor.start", async () => {
+  // Regression: the parser populates `payload.mergeMode` for
+  // `/issue <n> --merge=<mode>`, and the handler must pass it through
+  // to `supervisor.start({ ..., mergeMode })`. Earlier wiring dropped
+  // the field on the floor (it constructed `start({ repo, issueNumber })`
+  // verbatim), silently downgrading explicit operator intent to the
+  // supervisor's default. See PR #45 round-2 review.
+  const rig = newRig();
+  const ack = await rig.commandHandler(
+    commandEnvelope({
+      name: "issue",
+      args: ["8"],
+      issueNumber: makeIssueNumber(8),
+      mergeMode: "rebase" as MergeMode,
+    }),
+  );
+
+  assertEquals(ack, { ok: true });
+  await Promise.resolve();
+  assertEquals(rig.supervisor.startCalls.length, 1);
+  const call = rig.supervisor.startCalls[0];
+  assert(call !== undefined);
+  assertEquals(call.mergeMode, "rebase");
+});
+
+Deno.test("createDaemonHandlers: /issue omits mergeMode when the payload does not set it", async () => {
+  // Complementary to the regression above: when the parser did not
+  // see `--merge=<mode>`, the handler must call `supervisor.start`
+  // *without* a `mergeMode` field so the supervisor's own default
+  // kicks in. We assert via `Object.hasOwn` because the StubSupervisor
+  // records args verbatim.
+  const rig = newRig();
+  const ack = await rig.commandHandler(
+    commandEnvelope({
+      name: "issue",
+      args: ["9"],
+      issueNumber: makeIssueNumber(9),
+    }),
+  );
+
+  assertEquals(ack, { ok: true });
+  await Promise.resolve();
+  const call = rig.supervisor.startCalls[0];
+  assert(call !== undefined);
+  assertEquals(
+    Object.hasOwn(call as object, "mergeMode"),
+    false,
+    "handler must omit mergeMode when payload did not set it",
+  );
 });
 
 Deno.test("createDaemonHandlers: /issue uses the explicit --repo when supplied", async () => {
@@ -410,7 +468,7 @@ Deno.test("createDaemonHandlers: /merge wraps non-supervisor errors", async () =
   assertEquals(ack.error, "network blip");
 });
 
-Deno.test("createDaemonHandlers: /status projects every task and embeds JSON in the ack", async () => {
+Deno.test("createDaemonHandlers: /status projects every task on the structured `data` field", async () => {
   const rig = newRig();
   rig.supervisor.injectTask({
     id: makeTaskId("task_one"),
@@ -429,12 +487,13 @@ Deno.test("createDaemonHandlers: /status projects every task and embeds JSON in 
 
   const ack = await rig.commandHandler(commandEnvelope({ name: "status" }));
   assertEquals(ack.ok, true);
-  assert(ack.error !== undefined);
-  const decoded = JSON.parse(ack.error) as {
-    readonly tasks: readonly StatusTaskProjection[];
-  };
+  // The handler must NOT overload `error` for a successful response —
+  // `error` is reserved for failure descriptions per the IPC contract.
+  assertEquals(ack.error, undefined);
+  assert(ack.data !== undefined, "/status ack should populate `data`");
+  const decoded = ack.data as StatusResponseData;
   assertEquals(decoded.tasks.length, 1);
-  const projection = decoded.tasks[0];
+  const projection: StatusTaskProjection | undefined = decoded.tasks[0];
   assert(projection !== undefined);
   assertEquals(projection.id, "task_one");
   assertEquals(projection.repo, DEFAULT_REPO as string);

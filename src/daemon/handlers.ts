@@ -11,15 +11,18 @@
  *
  * **What the routes do today.**
  *
- *  - `command { name: "issue", … }` mints a {@link TaskId}, calls
- *    `supervisor.start({ repo, issueNumber, mergeMode })`, and replies
- *    `ack { ok: true }` once the FSM has accepted the start. The drive
- *    of the FSM continues in the background — the handler does **not**
- *    await the terminal state because `start()` walks every phase to a
- *    {@link "MERGED"} | {@link "NEEDS_HUMAN"} | {@link "FAILED"}
- *    landing (which can take minutes) and a synchronous IPC reply
- *    cannot block that long. The TUI observes the lifecycle through
- *    the event-bus subscription instead.
+ *  - `command { name: "issue", … }` calls
+ *    `supervisor.start({ repo, issueNumber, mergeMode })` (with
+ *    `mergeMode` populated when the slash-command parser saw
+ *    `--merge=<mode>`) and replies `ack { ok: true }` once the FSM
+ *    has accepted the start request. The supervisor — not this
+ *    handler — owns task identity and any defaulted run settings.
+ *    The drive of the FSM continues in the background: the handler
+ *    does **not** await the terminal state because `start()` walks
+ *    every phase to a {@link "MERGED"} | {@link "NEEDS_HUMAN"} |
+ *    {@link "FAILED"} landing (which can take minutes) and a
+ *    synchronous IPC reply cannot block that long. The TUI observes
+ *    the lifecycle through the event-bus subscription instead.
  *  - `command { name: "merge", … }` calls
  *    `supervisor.mergeReadyTask(taskId)`. Synchronous failures
  *    (`unknown-task`, `not-ready-to-merge`, `merge-in-flight`,
@@ -116,11 +119,12 @@ export interface DaemonHandlersOptions {
    */
   readonly supervisor: TaskSupervisorImpl;
   /**
-   * Resolve the configured default repository when an `issue` command
+   * Configured default repository to use when an `issue` command
    * arrives without an explicit `--repo` flag. Production wiring takes
-   * this from `config.github.defaultRepo`. Returning `undefined` makes
-   * the handler reply with `ack { ok: false }` so the TUI surfaces a
-   * helpful error rather than minting a task with no repo.
+   * this from `config.github.defaultRepo`, so handlers can always fall
+   * back to a concrete repo rather than minting a task with no repo;
+   * the type is therefore required (not optional). Tests pass any
+   * branded {@link RepoFullName} the scenario needs.
    */
   readonly defaultRepo: RepoFullName;
   /**
@@ -284,10 +288,15 @@ async function handleIssueCommand(args: {
   }
 
   if (!hasGitHubClientFor(validatedRepo)) {
+    // The predicate is also `false` when daemon GitHub auth itself is
+    // unavailable (e.g. the App private key failed to load and the
+    // wiring fed an empty registry through), so the diagnostic names
+    // both possibilities and points operators at the right next step
+    // for either case.
     return {
       ok: false,
       error:
-        `no GitHub installation configured for ${validatedRepo}; run \`makina setup\` to register it.`,
+        `GitHub access is unavailable for ${validatedRepo}: either no GitHub installation is configured for this repo, or daemon GitHub authentication is unavailable (for example, the app private key failed to load); run \`makina setup\` to register the installation, and verify the daemon's GitHub credentials are configured correctly.`,
     };
   }
 
@@ -323,13 +332,25 @@ async function handleIssueCommand(args: {
     };
   }
 
+  // Forward the parsed merge mode (set by the slash-command parser when
+  // the user typed `/issue <n> --merge=<mode>`) so operator intent is
+  // not silently dropped. Omitting the field when undefined keeps the
+  // supervisor's own default in charge.
+  const startArgs: Parameters<typeof supervisor.start>[0] = payload.mergeMode === undefined
+    ? { repo: validatedRepo, issueNumber: validatedIssueNumber }
+    : {
+      repo: validatedRepo,
+      issueNumber: validatedIssueNumber,
+      mergeMode: payload.mergeMode,
+    };
+
   // The FSM walk runs in the background. We acknowledge the start
   // immediately and let the event bus stream every transition to the
   // TUI; awaiting here would tie the IPC reply latency to the merge
   // pipeline (minutes), which the codec's frame deadline would not
   // tolerate and which would make the palette feel hung.
   void supervisor
-    .start({ repo: validatedRepo, issueNumber: validatedIssueNumber })
+    .start(startArgs)
     .catch((error) => {
       onBackgroundError(error, `supervisor.start ${validatedRepo}#${validatedIssueNumber}`);
     });
@@ -395,16 +416,33 @@ async function handleMergeCommand(args: {
 }
 
 /**
+ * Structured success payload for `/status`. Carried on
+ * {@link AckPayload.data} so the IPC contract's `error` field stays
+ * reserved for failure descriptions (per
+ * {@link AckPayload}'s JSDoc) — embedding JSON in `error` while
+ * `ok: true` would let a careless client treat status responses as
+ * errors.
+ *
+ * Exported so client-side code (today: the integration test; tomorrow:
+ * the TUI's `/status` renderer) can narrow `ack.data` to a single
+ * known shape rather than re-deriving it from the wire.
+ */
+export interface StatusResponseData {
+  /** Snapshot of every task the supervisor knows about. */
+  readonly tasks: readonly StatusTaskProjection[];
+}
+
+/**
  * Dispatcher for `command { name: "status", ... }`.
  *
  * Projects every supervisor-tracked task onto the small
- * {@link StatusTaskProjection} payload. The projection is embedded in
- * the `ack`'s `error` field as a JSON string today — the IPC ack
- * envelope does not carry a structured payload, and the TUI already
- * reads the bus for live state, so this is mostly a CLI smoke-test
- * affordance. Future surface widening (an `ack`-with-payload type, or
- * a dedicated `status-response` envelope) would replace the JSON
- * embedding without changing the supervisor side.
+ * {@link StatusTaskProjection} payload and returns it on the
+ * {@link AckPayload.data} field as a structured
+ * {@link StatusResponseData} object. The IPC contract reserves
+ * `error` for failure descriptions (i.e. `ok: false`), so success
+ * payloads ride on `data` instead. The TUI keeps its own copy via
+ * the bus; this command is mostly a CLI affordance and a smoke-test
+ * seam for the integration tests.
  *
  * @param args Supervisor context.
  * @returns The {@link AckPayload} to write back to the IPC client.
@@ -414,13 +452,10 @@ function handleStatusCommand(args: {
 }): AckPayload {
   const tasks = args.supervisor.listTasks();
   const projection = tasks.map(projectTaskForStatus);
-  // Embed the JSON in the `error` field so the existing `ack` envelope
-  // shape can carry it without growing a new payload variant. The TUI
-  // (and the integration test) parse it back out; production clients
-  // that want structured access should subscribe to the bus instead.
+  const data: StatusResponseData = { tasks: projection };
   return {
     ok: true,
-    error: JSON.stringify({ tasks: projection }),
+    data,
   };
 }
 
