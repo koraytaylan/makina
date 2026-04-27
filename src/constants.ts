@@ -556,3 +556,29 @@ export const APP_INSTALLATION_REPOSITORIES_PAGE_SIZE = 100;
  * developer knows discovery was incomplete.
  */
 export const APP_INSTALLATION_REPOSITORIES_MAX_PAGES = 1_000;
+
+/**
+ * Page size used by the App-level GitHub client when walking
+ * `GET /app/installations` during the setup wizard.
+ *
+ * GitHub paginates `/app/installations` at a default of thirty entries per
+ * page and accepts up to one hundred via `per_page`. The wizard's discovery
+ * surface assumes an exhaustive list, so we always request the documented
+ * maximum to minimise the round-trip count for Apps installed in many
+ * accounts. Mirrors {@link APP_INSTALLATION_REPOSITORIES_PAGE_SIZE} so both
+ * App-level paginating loops carry the same shape.
+ */
+export const APP_INSTALLATIONS_PAGE_SIZE = 100;
+
+/**
+ * Defensive upper bound on pages walked by the App-level GitHub client when
+ * paginating `GET /app/installations`.
+ *
+ * Mirrors {@link APP_INSTALLATION_REPOSITORIES_MAX_PAGES}: an App with more
+ * than one hundred thousand installations is implausible, but capping the
+ * loop guards against a malformed envelope or an API behaviour change
+ * driving an unbounded walk. If the cap is hit without a short page, the
+ * client surfaces a `pagination-overflow` `GitHubAppClientError` so the
+ * wizard fails loudly rather than presenting a silently-truncated picker.
+ */
+export const APP_INSTALLATIONS_MAX_PAGES = 1_000;

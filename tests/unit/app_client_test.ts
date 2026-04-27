@@ -4,10 +4,10 @@
  * The AppClient is the App-level companion to the installation-scoped
  * `GitHubClientImpl`. These tests cover:
  *
- *   1. **`listAppInstallations` happy path** — sends a GET to
- *      `/app/installations` with the JWT minted by the injected auth
- *      strategy and projects the response into the typed
- *      `AppInstallation[]` shape.
+ *   1. **`listAppInstallations` happy path + pagination** — sends a GET
+ *      to `/app/installations` with the JWT minted by the injected auth
+ *      strategy, walks pages until a short page is observed, and
+ *      projects the response into the typed `AppInstallation[]` shape.
  *   2. **`listInstallationRepositories` happy path + pagination** —
  *      mints an installation token, GETs `/installation/repositories`,
  *      and walks pages until a short page is returned.
@@ -17,6 +17,9 @@
  *      response, missing fields) surface as `GitHubAppClientError`.
  *   5. **HTTP failure propagation** — a 5xx from GitHub propagates as
  *      `GitHubAppClientError` with the original Octokit error on `cause`.
+ *   6. **Pagination-overflow regression** — both paginating loops throw
+ *      `GitHubAppClientError("pagination-overflow", ...)` when their
+ *      respective MAX_PAGES caps are hit without a short page.
  *
  * No real network or JWT signing happens: the tests inject a scripted
  * `fetch` (Octokit's `request: { fetch }` test seam) and a stub auth
@@ -28,6 +31,8 @@ import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
 import {
   APP_INSTALLATION_REPOSITORIES_MAX_PAGES,
   APP_INSTALLATION_REPOSITORIES_PAGE_SIZE,
+  APP_INSTALLATIONS_MAX_PAGES,
+  APP_INSTALLATIONS_PAGE_SIZE,
 } from "../../src/constants.ts";
 import {
   type AppClientAuthStrategy,
@@ -188,10 +193,15 @@ Deno.test("listAppInstallations: happy path projects /app/installations payload"
   assertEquals(authCalls[0]?.type, "app");
 
   // The request hit `/app/installations` with the JWT as a Bearer token.
+  // Octokit serialises `per_page` and `page` as query params on a GET; the
+  // 2-installation payload is short, so the loop terminates after one page.
   assertEquals(harness.recordedRequests.length, 1);
   const recorded = harness.recordedRequests[0];
   assertEquals(recorded?.method, "GET");
-  assertEquals(recorded?.url, "https://api.github.com/app/installations");
+  assertEquals(
+    recorded?.url,
+    "https://api.github.com/app/installations?per_page=100&page=1",
+  );
   assertEquals(recorded?.headers["authorization"], "Bearer jwt-token");
 });
 
@@ -285,7 +295,7 @@ Deno.test("listAppInstallations: forwards a custom baseUrl to Octokit", async ()
   const recorded = harness.recordedRequests[0];
   assertEquals(
     recorded?.url,
-    "https://ghe.example.com/api/v3/app/installations",
+    "https://ghe.example.com/api/v3/app/installations?per_page=100&page=1",
   );
 });
 
@@ -345,6 +355,86 @@ Deno.test("listAppInstallations: auth-hook rejection propagates as mintAppJwt er
   );
   assertEquals(error.operation, "mintAppJwt");
   assertEquals(harness.recordedRequests.length, 0);
+});
+
+Deno.test("listAppInstallations: paginates until a short page", async () => {
+  // Build a first page of exactly PAGE_SIZE installations, then a short
+  // second page. The aggregator should stitch them in order without ever
+  // requesting a third page.
+  const harness = new FakeFetchHarness();
+  const fullPage = Array.from(
+    { length: APP_INSTALLATIONS_PAGE_SIZE },
+    (_value, index) => ({ id: index + 1, account: { login: `org-${index}` } }),
+  );
+  harness.enqueueResponse(200, fullPage);
+  harness.enqueueResponse(200, [
+    { id: 9001, account: { login: "tail-org" } },
+    { id: 9002, account: { login: "tail-org-2" } },
+  ]);
+  const { strategy, authCalls } = createStubStrategy();
+  const client = createAppClient({
+    ...COMMON_OPTS,
+    createAppAuthStrategy: strategy,
+    fetch: harness.fetch,
+  });
+
+  const installations = await client.listAppInstallations();
+  assertEquals(installations.length, APP_INSTALLATIONS_PAGE_SIZE + 2);
+  assertEquals(installations[0]?.id, 1);
+  assertEquals(installations[0]?.accountLogin, "org-0");
+  assertEquals(
+    installations[APP_INSTALLATIONS_PAGE_SIZE - 1]?.id,
+    APP_INSTALLATIONS_PAGE_SIZE,
+  );
+  assertEquals(installations[APP_INSTALLATIONS_PAGE_SIZE]?.id, 9001);
+  assertEquals(installations[APP_INSTALLATIONS_PAGE_SIZE + 1]?.id, 9002);
+
+  // The App JWT was minted exactly once and reused across both page fetches.
+  assertEquals(authCalls.length, 1);
+  assertEquals(authCalls[0]?.type, "app");
+
+  assertEquals(harness.recordedRequests.length, 2);
+  assertEquals(
+    harness.recordedRequests[0]?.url,
+    "https://api.github.com/app/installations?per_page=100&page=1",
+  );
+  assertEquals(
+    harness.recordedRequests[1]?.url,
+    "https://api.github.com/app/installations?per_page=100&page=2",
+  );
+});
+
+Deno.test("listAppInstallations: rejects with pagination-overflow when MAX_PAGES is reached without a short page", async () => {
+  // Regression: an App that returns a full page on every request for
+  // `APP_INSTALLATIONS_MAX_PAGES` consecutive pages used to silently
+  // truncate the installation list once the loop hit the cap. We now throw
+  // a `pagination-overflow` `GitHubAppClientError` so the wizard surfaces
+  // the incomplete enumeration instead of presenting a partial picker.
+  const harness = new FakeFetchHarness();
+  const fullPage = Array.from(
+    { length: APP_INSTALLATIONS_PAGE_SIZE },
+    (_value, index) => ({ id: index + 1, account: { login: `org-${index}` } }),
+  );
+  for (let page = 1; page <= APP_INSTALLATIONS_MAX_PAGES; page += 1) {
+    harness.enqueueResponse(200, fullPage);
+  }
+  const { strategy } = createStubStrategy();
+  const client = createAppClient({
+    ...COMMON_OPTS,
+    createAppAuthStrategy: strategy,
+    fetch: harness.fetch,
+  });
+
+  const error = await assertRejects(
+    () => client.listAppInstallations(),
+    GitHubAppClientError,
+  );
+  assertEquals(error.operation, "pagination-overflow");
+  // The wrapped cause names the cap so logs are scannable.
+  assertStringIncludes(error.message, String(APP_INSTALLATIONS_MAX_PAGES));
+  // Every page-budget request was issued before the overflow fired —
+  // we did not bail early on a transient short read.
+  assertEquals(harness.recordedRequests.length, APP_INSTALLATIONS_MAX_PAGES);
 });
 
 // ---------------------------------------------------------------------------

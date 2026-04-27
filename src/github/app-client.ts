@@ -44,6 +44,8 @@ import { Octokit } from "@octokit/core";
 import {
   APP_INSTALLATION_REPOSITORIES_MAX_PAGES,
   APP_INSTALLATION_REPOSITORIES_PAGE_SIZE,
+  APP_INSTALLATIONS_MAX_PAGES,
+  APP_INSTALLATIONS_PAGE_SIZE,
 } from "../constants.ts";
 
 // ---------------------------------------------------------------------------
@@ -109,7 +111,11 @@ export interface AppClient {
    * Uses an App-level JWT against `GET /app/installations`. The JWT is
    * minted on every call because the wizard runs at most once per
    * `makina setup` invocation; caching a 10-minute JWT for that duration
-   * would buy nothing.
+   * would buy nothing. Pagination follows the same shape as
+   * {@link AppClient.listInstallationRepositories}: walk pages with the
+   * documented `per_page` maximum until a short page is observed, bounded
+   * by a defensive max-page cap that surfaces a `pagination-overflow`
+   * error rather than silently truncating the list.
    *
    * @returns Every installation the App can see, in GitHub's natural order.
    * @throws {GitHubAppClientError} on auth, network, or JSON-projection failure.
@@ -332,15 +338,56 @@ export function createAppClient(opts: CreateAppClientOptions): AppClient {
       } catch (error) {
         throw new GitHubAppClientError("mintAppJwt", error);
       }
-      let response: { data: unknown };
-      try {
-        response = await octokit.request("GET /app/installations", {
-          headers: { authorization: `Bearer ${appAuth.token}` },
-        });
-      } catch (error) {
-        throw new GitHubAppClientError("listAppInstallations", error);
+      // Walk every page of `/app/installations`. The endpoint paginates at a
+      // default of thirty entries; an App installed in many accounts (a
+      // realistic shape for any organisation-wide rollout) silently loses
+      // installations past the first page if we don't ask. The `per_page`
+      // and `page` parameters are GitHub-documented. Page size and the
+      // defensive max-page cap are centralised in `src/constants.ts` so
+      // this module carries no bare numeric literals.
+      const aggregated: AppInstallation[] = [];
+      let sawShortPage = false;
+      for (
+        let page = 1;
+        page <= APP_INSTALLATIONS_MAX_PAGES;
+        page += 1
+      ) {
+        let response: { data: unknown };
+        try {
+          response = await octokit.request("GET /app/installations", {
+            per_page: APP_INSTALLATIONS_PAGE_SIZE,
+            page,
+            headers: { authorization: `Bearer ${appAuth.token}` },
+          });
+        } catch (error) {
+          throw new GitHubAppClientError("listAppInstallations", error);
+        }
+        const projected = projectInstallations(response.data);
+        for (const installation of projected) {
+          aggregated.push(installation);
+        }
+        if (projected.length < APP_INSTALLATIONS_PAGE_SIZE) {
+          // Short page → final page. Saves an extra round-trip for the
+          // common case of an App installed in fewer than 100 accounts.
+          sawShortPage = true;
+          break;
+        }
       }
-      return projectInstallations(response.data);
+      if (!sawShortPage) {
+        // The cap was hit without a short page, which means the list is
+        // almost certainly truncated. Surface this loudly rather than
+        // silently returning a partial installation set: the wizard's
+        // downstream flow trusts the projection to be exhaustive.
+        throw new GitHubAppClientError(
+          "pagination-overflow",
+          new Error(
+            `exceeded MAX_PAGES (${APP_INSTALLATIONS_MAX_PAGES}) ` +
+              `walking GET /app/installations without observing a ` +
+              `short page; refusing to silently truncate`,
+          ),
+        );
+      }
+      return aggregated;
     },
 
     async listInstallationRepositories(
