@@ -39,6 +39,7 @@
 
 import { Octokit } from "@octokit/core";
 
+import { GITHUB_CLIENT_USER_AGENT } from "../constants.ts";
 import {
   type CombinedStatus,
   type GitHubAuth,
@@ -429,12 +430,6 @@ const LIST_REVIEW_THREADS_QUERY =
   }
 }`;
 
-/**
- * Default `User-Agent` string. GitHub demands a non-empty UA on every
- * request; ours identifies the daemon and its version line.
- */
-const DEFAULT_USER_AGENT = "makina-github-client/0.1";
-
 // ---------------------------------------------------------------------------
 // GitHubClient implementation
 // ---------------------------------------------------------------------------
@@ -479,7 +474,7 @@ export class GitHubClientImpl implements StabilizeGitHubClient {
     this.maxRetrySleepMilliseconds = options.maxRetrySleepMilliseconds ??
       DEFAULT_MAX_RETRY_SLEEP_MILLISECONDS;
 
-    const userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
+    const userAgent = options.userAgent ?? GITHUB_CLIENT_USER_AGENT;
     const octokitOptions: Record<string, unknown> = { userAgent };
     if (options.baseUrl !== undefined) {
       octokitOptions.baseUrl = options.baseUrl;

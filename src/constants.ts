@@ -582,3 +582,17 @@ export const APP_INSTALLATIONS_PAGE_SIZE = 100;
  * wizard fails loudly rather than presenting a silently-truncated picker.
  */
 export const APP_INSTALLATIONS_MAX_PAGES = 1_000;
+
+/**
+ * `User-Agent` header sent on every outbound GitHub request, both
+ * installation-scoped (`src/github/client.ts`) and App-scoped
+ * (`src/github/app-client.ts`).
+ *
+ * GitHub recommends every API caller identify itself; centralising the string
+ * here keeps the two client surfaces in sync (a drift would surface in
+ * server-side request logs as two distinct callers and is hard to spot
+ * locally) and matches the project's bare-literal policy at the top of this
+ * file. The value pairs the project name with the package's published
+ * version; bump it when shipping a release.
+ */
+export const GITHUB_CLIENT_USER_AGENT = "makina-github-client/0.1";

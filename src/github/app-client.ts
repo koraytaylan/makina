@@ -46,6 +46,7 @@ import {
   APP_INSTALLATION_REPOSITORIES_PAGE_SIZE,
   APP_INSTALLATIONS_MAX_PAGES,
   APP_INSTALLATIONS_PAGE_SIZE,
+  GITHUB_CLIENT_USER_AGENT,
 } from "../constants.ts";
 
 // ---------------------------------------------------------------------------
@@ -271,12 +272,13 @@ export class GitHubAppClientError extends Error {
 }
 
 /**
- * Default `User-Agent` string. Mirrors
- * {@link "./client.ts".GitHubClientImpl} so a single string identifies
- * the daemon across both client surfaces. GitHub rejects requests
- * without a `User-Agent`.
+ * Re-export the centralised default `User-Agent` so existing callers that
+ * import from this module continue to work. The single source of truth is
+ * {@link GITHUB_CLIENT_USER_AGENT} in `src/constants.ts`; both client
+ * surfaces (`./client.ts` and this module) point at the same string so
+ * server-side request logs see one caller, not two.
  */
-export const DEFAULT_USER_AGENT = "makina-github-client/0.1";
+export { GITHUB_CLIENT_USER_AGENT as DEFAULT_USER_AGENT };
 
 // ---------------------------------------------------------------------------
 // Public factory
@@ -312,7 +314,7 @@ export const DEFAULT_USER_AGENT = "makina-github-client/0.1";
  */
 export function createAppClient(opts: CreateAppClientOptions): AppClient {
   const strategy = opts.createAppAuthStrategy ?? defaultCreateAppAuthStrategy;
-  const userAgent = opts.userAgent ?? DEFAULT_USER_AGENT;
+  const userAgent = opts.userAgent ?? GITHUB_CLIENT_USER_AGENT;
 
   let authHook: AppClientAuthHook;
   try {
