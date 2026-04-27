@@ -690,17 +690,6 @@ function buildSpawnEnv(fakeHome: string): Record<string, string> {
 }
 
 /**
- * Wait for the daemon's "[daemon] listening on ..." line on stderr. We
- * key off the listen line (rather than the socket file) because a
- * regression that bound the socket but failed to emit the line would
- * leave the test hung; the line guarantees `Deno.listen` returned and
- * any failure surfaces as a parsable diagnostic in the rejection
- * message.
- *
- * @param stderr The daemon's stderr stream.
- * @param timeoutMs Bound on the wait, in milliseconds.
- */
-/**
  * Internal waiter slot for {@link runHarnessReadLoop}. Mirrors the
  * inline shape used by {@link bootHarness}; pulled out as a named type
  * so the harness body and the unit-test stay in lock-step.
@@ -831,6 +820,17 @@ export function runHarnessReadLoop(params: HarnessReadLoopParams): Promise<void>
   })();
 }
 
+/**
+ * Wait for the daemon's "[daemon] listening on ..." line on stderr. We
+ * key off the listen line (rather than the socket file) because a
+ * regression that bound the socket but failed to emit the line would
+ * leave the test hung; the line guarantees `Deno.listen` returned and
+ * any failure surfaces as a parsable diagnostic in the rejection
+ * message.
+ *
+ * @param stderr The daemon's stderr stream.
+ * @param timeoutMs Bound on the wait, in milliseconds.
+ */
 async function waitForListenLine(
   stderr: ReadableStream<Uint8Array>,
   timeoutMs: number,

@@ -98,8 +98,9 @@ Deno.test(
       },
     };
     const server = await makeOneShotServer([encode(eventEnvelope)]);
+    let conn: Deno.UnixConn | undefined;
     try {
-      const conn = await Deno.connect({
+      conn = await Deno.connect({
         transport: "unix",
         path: server.path,
       });
@@ -155,6 +156,19 @@ Deno.test(
       assertEquals(replyWaiters.size, 0);
       assertEquals(eventWaiters.length, 0);
     } finally {
+      // Close the client connection to keep `sanitizeResources` happy
+      // even after the server's clean EOF: Deno does not auto-close the
+      // client side when the server side closes, so without this the
+      // open `UnixConn` resource trips the test sanitizer at end of
+      // test.
+      if (conn !== undefined) {
+        try {
+          conn.close();
+        } catch {
+          // Connection may already be closed by the read loop's
+          // releaseLock; ignore.
+        }
+      }
       try {
         await Deno.remove(server.tempDir, { recursive: true });
       } catch {
