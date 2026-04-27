@@ -172,10 +172,21 @@ const NAMED_KEYS: Readonly<Record<string, keyof KeystrokeFlags>> = {
 /**
  * Test whether a keystroke matches a chord string.
  *
- * Modifier flags must match exactly — a chord without `shift+` does
- * not fire when the user is holding shift. The bare key compares
+ * **Modifier flags must match exactly.** A chord without `shift+` does
+ * not fire when the user is holding shift, and a `ctrl+shift+x` chord
+ * does not fire on a plain `ctrl+x` keystroke. The bare key compares
  * case-insensitively against the typed character (or against
  * {@link KeystrokeFlags}'s named-key flags for special keys).
+ *
+ * **Ctrl+letter terminal quirks.** Many terminals deliver `Ctrl+A`
+ * through `Ctrl+Z` as the corresponding ASCII control byte (`\x01`..
+ * `\x1A`) instead of the bare letter; some Ink configurations leave
+ * `input` empty altogether. The implementation accepts three shapes:
+ * the literal letter, the ASCII control byte, or empty input plus a
+ * single-character chord key. The empty-input branch is intentionally
+ * permissive — it cannot disambiguate between two `ctrl+<letter>`
+ * bindings — but the control-byte branch keeps a `ctrl+p` chord from
+ * matching a `ctrl+,` keystroke on standards-conforming terminals.
  *
  * @param chord The chord string from the config.
  * @param input The character Ink reports for the keystroke.
@@ -208,23 +219,48 @@ export function matchesKeybinding(
   // matches the keystroke's flag bag uniformly.
   const requiresMeta = parsed.meta || parsed.alt;
   if (requiresMeta !== flags.meta) return false;
-  // Shift behaviour: treat "ctrl+shift+x" strictly (require shift) but
-  // do not require shift when the chord did not name it. This mirrors
-  // typical terminal behaviour where a literal "p" might or might
-  // not arrive with shift depending on the key map.
-  if (parsed.shift && !flags.shift) return false;
+  // Shift behaviour: enforce strict equality so the JSDoc contract
+  // ("must match exactly") is the truth. A chord without `shift+` will
+  // not fire while shift is held, and a `ctrl+shift+x` chord will not
+  // fire on a plain `ctrl+x` keystroke. Named keys (`tab`, `escape`,
+  // arrows…) follow the same rule. Callers that genuinely want a
+  // shift-tolerant binding should declare both forms.
+  if (parsed.shift !== flags.shift) return false;
   const namedFlag = NAMED_KEYS[parsed.key];
   if (namedFlag !== undefined) {
     return flags[namedFlag];
   }
   // Plain character key. Ink hands us the raw character in `input`.
-  // For control combinations the input is often empty (Ctrl+P does
-  // not produce a printable character on most terminals), so when
-  // ctrl is required and input is empty we still match on the key
-  // string having the expected length and the chord asking for a
-  // single-character key.
-  if (parsed.ctrl && input.length === 0) {
-    return parsed.key.length === 1;
+  // For Ctrl+letter combinations many terminals deliver the ASCII
+  // control byte (`Ctrl+A` → `\x01`, …, `Ctrl+Z` → `\x1A`) while the
+  // `key.ctrl` flag is also true; some Ink configurations leave
+  // `input` empty instead. We accept three shapes for `ctrl+<letter>`:
+  //
+  //   1. `input` matches the chord key directly (e.g. `"p"` for
+  //      `ctrl+p`) — Ink's behaviour on most platforms.
+  //   2. `input` is the ASCII control byte for the chord key
+  //      (e.g. `"\x10"` for `ctrl+p`) — what xterm-style terminals
+  //      put on the wire. We compute the expected byte here so a
+  //      `ctrl+p` chord no longer matches a `ctrl+,` keystroke.
+  //   3. `input` is empty AND the chord key is a single character —
+  //      ambiguous, but unavoidable when Ink hides both the typed
+  //      character and the control byte. In that case any single-letter
+  //      `ctrl+<x>` chord will match; callers that need precision should
+  //      configure terminals that surface either the letter or the
+  //      control byte. This branch is documented in the test suite.
+  if (parsed.ctrl) {
+    if (input.length === 0) {
+      return parsed.key.length === 1;
+    }
+    if (parsed.key.length === 1) {
+      const expected = parsed.key.toLowerCase();
+      const code = expected.charCodeAt(0);
+      // Ctrl+a..z → 1..26; only meaningful for ASCII letters.
+      if (code >= 97 && code <= 122) {
+        const controlByte = String.fromCharCode(code - 96);
+        if (input === controlByte) return true;
+      }
+    }
   }
   return input.toLowerCase() === parsed.key.toLowerCase();
 }

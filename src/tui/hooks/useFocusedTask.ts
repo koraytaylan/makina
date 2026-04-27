@@ -100,7 +100,13 @@ export interface FocusedTaskApi {
    * @param taskId The task to focus.
    */
   readonly focusTask: (taskId: TaskId) => void;
-  /** Drop the current focus (the header reverts to "no task focused"). */
+  /**
+   * Drop the current focus. The header reverts to "no task focused"
+   * and stays that way until the caller invokes
+   * {@link FocusedTaskApi.focusTask} again — the auto-focus path that
+   * promotes the first observed task is suppressed once `clearFocus`
+   * has fired, so subsequent events do not silently re-acquire focus.
+   */
   readonly clearFocus: () => void;
 }
 
@@ -193,28 +199,42 @@ export function useFocusedTask(options: UseFocusedTaskOptions): FocusedTaskApi {
     });
   }, [taskMap]);
 
-  // Stable callbacks — they read the focused-task id through the ref
-  // below so they do not need to re-bind on every render.
+  // `clearedRef` records that the user has explicitly dropped focus.
+  // Once set, the auto-focus path in `handleFocusedTaskEvent` no longer
+  // promotes the next task into focus; the user has to opt back in via
+  // `focusTask`. The Wave 2 first-event auto-focus survives intact for
+  // the initial-load case (where `clearedRef` is still false).
+  const clearedRef = useRef(false);
+
+  // Stable callbacks — they manipulate state through the setters and
+  // the cleared-focus ref so they survive re-renders.
   const focusTask = useCallback((taskId: TaskId) => {
+    clearedRef.current = false;
     setFocusedTaskId(taskId);
   }, []);
 
   const clearFocus = useCallback(() => {
+    clearedRef.current = true;
     setFocusedTaskId(undefined);
   }, []);
-
-  // `sourceRef` mirrors the source so the subscribe effect can pick up
-  // a fresh subscriber on remount without re-running on every render.
-  const sourceRef = useRef(source);
-  useEffect(() => {
-    sourceRef.current = source;
-  }, [source]);
 
   useEffect(() => {
     const subscription = source.subscribeEvents((event) => {
       handleFocusedTaskEvent(event, {
         setTaskMap,
-        setFocusedTaskId,
+        setFocusedTaskId: (update) => {
+          setFocusedTaskId((previous) => {
+            // Once the user has explicitly cleared focus we honour that
+            // until they invoke `focusTask` again. The auto-focus path
+            // would otherwise promote the next inbound event back into
+            // focus, contradicting `clearFocus`'s "drop the current
+            // focus" contract.
+            if (clearedRef.current) {
+              return previous;
+            }
+            return update(previous);
+          });
+        },
       });
     });
     return () => {

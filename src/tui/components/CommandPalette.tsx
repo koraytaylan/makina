@@ -92,7 +92,7 @@ export function CommandPalette(props: CommandPaletteProps): ReactElement {
   } = props;
   const [input, setInput] = useState(initialInput);
   const [suggestionIndex, setSuggestionIndex] = useState(0);
-  const [, setHistoryIndex] = useState<number | null>(null);
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [parseError, setParseError] = useState<string | undefined>(undefined);
 
   // Trim and de-duplicate the seeded history so the up/down navigation
@@ -139,6 +139,13 @@ export function CommandPalette(props: CommandPaletteProps): ReactElement {
     inputRef.current = input;
   }, [input]);
 
+  // Draft retained across history navigation. The first time the user
+  // walks into history we snapshot the in-progress input; when they
+  // walk back above the freshest entry we restore it. The ref is reset
+  // whenever the user types a fresh character (handleInputChange) so a
+  // brand-new input does not leak the previous draft.
+  const draftRef = useRef<string | null>(null);
+
   const applyHistory = useCallback(
     (delta: 1 | -1) => {
       if (trimmedHistory.length === 0) {
@@ -146,10 +153,19 @@ export function CommandPalette(props: CommandPaletteProps): ReactElement {
       }
       setHistoryIndex((previous) => {
         const start = previous ?? -1;
+        if (previous === null && delta === 1) {
+          // Entering history: capture the current input so we can
+          // restore it if the user walks back above the freshest entry.
+          draftRef.current = inputRef.current;
+        }
         const candidate = start + delta;
         if (candidate < 0) {
           // Walked above the freshest entry — restore the in-progress
           // input the user had before they started navigating.
+          if (draftRef.current !== null) {
+            setInput(draftRef.current);
+            draftRef.current = null;
+          }
           return null;
         }
         const clamped = Math.min(candidate, trimmedHistory.length - 1);
@@ -168,12 +184,19 @@ export function CommandPalette(props: CommandPaletteProps): ReactElement {
     setHistoryIndex(null);
     setSuggestionIndex(0);
     setParseError(undefined);
+    // The user is editing a fresh draft now; drop any cached pre-history
+    // snapshot so a future history walk captures the new value.
+    draftRef.current = null;
   }, []);
 
-  // Decide whether arrow keys walk history or autocomplete: when the
-  // input field is empty (or whitespace), arrows walk history; once
-  // the user is typing, arrows navigate the suggestion dropdown.
-  const arrowsNavigateHistory = input.trim().length === 0;
+  // Decide whether arrow keys walk history or autocomplete. Two
+  // conditions keep arrows on the history rail: the input field is
+  // empty (a fresh palette open), or the user is already in the middle
+  // of a history walk (so the recalled command does not flip arrows
+  // over to the suggestion dropdown). Once the user types a fresh
+  // character `handleInputChange` clears `historyIndex` and arrows
+  // switch back to navigating suggestions.
+  const arrowsNavigateHistory = historyIndex !== null || input.trim().length === 0;
 
   useInput(
     (rawInput, key) => {

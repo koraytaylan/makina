@@ -844,3 +844,52 @@ Deno.test("matchesKeybinding: ctrl+p with empty input still matches via key leng
   });
   assertEquals(fired, true);
 });
+
+Deno.test("matchesKeybinding: ctrl+p matches the ASCII control byte \\x10", () => {
+  // xterm-style terminals deliver Ctrl+P as key.ctrl=true with input="\x10".
+  // The chord must match the right control byte; a chord asking for ctrl+p
+  // must NOT fire on a ctrl+, keystroke that delivers a different byte.
+  const flags = {
+    ctrl: true,
+    shift: false,
+    meta: false,
+    tab: false,
+    return: false,
+    escape: false,
+    backspace: false,
+    delete: false,
+    upArrow: false,
+    downArrow: false,
+    leftArrow: false,
+    rightArrow: false,
+    pageUp: false,
+    pageDown: false,
+  };
+  assertEquals(matchesKeybinding("ctrl+p", "\x10", flags), true);
+  assertEquals(matchesKeybinding("ctrl+a", "\x01", flags), true);
+  assertEquals(matchesKeybinding("ctrl+z", "\x1a", flags), true);
+  // ctrl+p (\x10) keystroke must not fire a ctrl+a (\x01) chord.
+  assertEquals(matchesKeybinding("ctrl+a", "\x10", flags), false);
+});
+
+Deno.test("matchesKeybinding: shift-tolerant — chord without shift does not fire while shift is held", () => {
+  // Doc/impl drift fix: the JSDoc claims modifiers must match exactly,
+  // and the implementation now enforces that for shift too.
+  const fired = matchesKeybinding("ctrl+p", "p", {
+    ctrl: true,
+    shift: true,
+    meta: false,
+    tab: false,
+    return: false,
+    escape: false,
+    backspace: false,
+    delete: false,
+    upArrow: false,
+    downArrow: false,
+    leftArrow: false,
+    rightArrow: false,
+    pageUp: false,
+    pageDown: false,
+  });
+  assertEquals(fired, false);
+});
