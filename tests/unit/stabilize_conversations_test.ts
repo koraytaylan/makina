@@ -58,6 +58,7 @@ import {
   type SupervisorRandomSource,
 } from "../../src/daemon/supervisor.ts";
 import { createPoller } from "../../src/daemon/poller.ts";
+import { type StabilizeGitInvoker } from "../../src/daemon/stabilize.ts";
 import {
   type IssueNumber,
   makeIssueNumber,
@@ -199,6 +200,25 @@ function makeFixture(): Fixture {
  * Pre-script the GitHub client through PR-open + reviewer-request.
  * Tests then layer the conversations-specific timeline on top.
  */
+/**
+ * Always-clean rebase stub. The conversations-phase tests exercise the
+ * supervisor's CONVERSATIONS branches; the stabilize-rebase phase has its
+ * own dedicated coverage in `tests/unit/stabilize_rebase_test.ts`. We
+ * short-circuit the calls a clean rebase makes — fetch, rev-parse, and
+ * rebase — so the conversations tests reach `STABILIZING(CONVERSATIONS)`
+ * without needing a real worktree on disk.
+ */
+const ALWAYS_CLEAN_REBASE_INVOKER: StabilizeGitInvoker = (args, _options) => {
+  if (args[0] === "rev-parse") {
+    return Promise.resolve({
+      exitCode: 0,
+      stdout: "deadbeefcafebabe0123456789abcdef01234567\n",
+      stderr: "",
+    });
+  }
+  return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+};
+
 function scriptIntoStabilize(fixture: Fixture): void {
   fixture.githubClient.queueGetIssue({
     kind: "value",
@@ -523,6 +543,7 @@ async function drive(fixture: Fixture, options?: {
       },
     }),
     pollIntervalMilliseconds: 0,
+    gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
     ...(options?.maxTaskIterations !== undefined
       ? { maxTaskIterations: options.maxTaskIterations }
       : {}),
