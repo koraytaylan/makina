@@ -7,9 +7,10 @@
  * `claude` CLI subprocess, talks to the Anthropic API, and depends on
  * network reachability. It runs only when `AGENT_RUNNER_REAL_TEST=1` is
  * set in the environment; the daemon CI workflow leaves it off by
- * default. The local developer running `deno task test` sees it
- * `t.step`-skipped with a one-line note explaining the gate so the
- * bypass is never silent.
+ * default. When the gate is off the test is `ignore:`-skipped at the
+ * outer `Deno.test` level — no `t.step` runs and no console note is
+ * printed. The console note (see below) is only emitted when the gate
+ * is on but `claude` cannot be located on PATH.
  *
  * **Skip when claude is missing.** Even with the gate enabled, the test
  * skips with a clear note when `which claude` returns nothing — that
@@ -27,12 +28,7 @@ import { assert, assertExists } from "@std/assert";
 
 import { createAgentRunner } from "../../src/daemon/agent-runner.ts";
 import { createEventBus } from "../../src/daemon/event-bus.ts";
-import {
-  type AgentRunnerMessage,
-  makeIssueNumber,
-  makeTaskId,
-  type TaskEvent,
-} from "../../src/types.ts";
+import { makeIssueNumber, makeTaskId, type TaskEvent } from "../../src/types.ts";
 
 const REAL_TEST_ENV_VAR = "AGENT_RUNNER_REAL_TEST";
 const REAL_TEST_ENABLED_VALUE = "1";
@@ -107,7 +103,6 @@ Deno.test({
             pathToClaudeCodeExecutable: claudePath,
           });
 
-          const messages: AgentRunnerMessage[] = [];
           try {
             // A short, deterministic prompt so the agent finishes quickly.
             // The model id is hard-coded to Sonnet 4.6 because the test
@@ -128,9 +123,6 @@ Deno.test({
             assert(events.every((event) => event.taskId === taskId));
           } finally {
             sub.unsubscribe();
-            // Drain anything still queued so the sanitizer does not
-            // flag a pending publish.
-            messages.length = 0;
           }
         } finally {
           await Deno.remove(tempDir, { recursive: true });

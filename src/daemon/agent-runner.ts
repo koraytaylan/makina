@@ -5,9 +5,9 @@
  *
  * The supervisor (Wave 3) drives every agent iteration through this module:
  *
- *  1. Mint or recover a {@link Task}'s `sessionId`.
+ *  1. Mint or recover the task's `sessionId` (see `Task` in `src/types.ts`).
  *  2. Call {@link AgentRunnerImpl.runAgent} with the per-task
- *     {@link Task.worktreePath} pinned as `cwd`.
+ *     `worktreePath` pinned as `cwd`.
  *  3. Iterate the returned async iterable. Each yielded
  *     {@link AgentRunnerMessage} is also published onto the injected
  *     {@link EventBus} as a `task-event` of kind `agent-message`,
@@ -49,6 +49,7 @@
  */
 
 import { getLogger } from "@std/log";
+import { isAbsolute } from "@std/path";
 
 import { AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS } from "../constants.ts";
 import type {
@@ -90,15 +91,18 @@ export interface SdkMessageProjection {
   /** SDK-assigned session id; populated on every message. */
   readonly session_id?: string;
   /**
-   * The model's response payload for `type === "assistant"` messages.
-   * Mirrors the SDK's `BetaMessage` shape; only `content` is consumed.
+   * The model's response payload for `type === "assistant"` messages
+   * **and** the tool-output payload for `type === "user"` messages.
+   * Mirrors the SDK's `BetaMessage` / `MessageParam` shape; only
+   * `content` is consumed.
    */
   readonly message?: {
     readonly content?: ReadonlyArray<SdkContentBlockProjection>;
   };
   /**
-   * The user's payload for `type === "user"` messages. Mirrors the SDK's
-   * `MessageParam` shape; only `content` is consumed.
+   * The SDK's final result payload for `type === "result"` messages.
+   * The runner surfaces this as the rendered text when the SDK signals
+   * the run has settled.
    */
   readonly result?: string;
   /** Free-form fields that may exist on richer SDK message variants. */
@@ -225,14 +229,28 @@ export interface AgentRunnerLogger {
  * Arguments accepted by {@link AgentRunnerImpl.runAgent}.
  *
  * Mirrors the {@link AgentRunner.runAgent} contract from `src/types.ts`
- * and adds `issueNumber`, which the runner uses to format the
- * conventional-commits system-prompt addendum.
+ * and adds an optional `issueNumber`, which the runner uses to format the
+ * conventional-commits system-prompt addendum. `issueNumber` is optional
+ * so the runner remains assignable to the W1 `AgentRunner` interface
+ * (which does not include it). When omitted, the addendum is rendered
+ * with the issue scope dropped — the format is `<type>: <subject>`
+ * instead of `<type>(#<n>): <subject>` — and the model is told to author
+ * commits in plain Conventional Commits without an issue scope. The
+ * supervisor (the only production caller) always passes `issueNumber`;
+ * the optional shape exists so consumers typed as `AgentRunner` cannot
+ * trip a `#undefined` rendering.
  */
 export interface RunAgentArgs {
   /** Task this run belongs to; events are published tagged with this id. */
   readonly taskId: TaskId;
-  /** GitHub issue number; embedded into the system-prompt addendum. */
-  readonly issueNumber: IssueNumber;
+  /**
+   * GitHub issue number; embedded into the system-prompt addendum. When
+   * omitted (e.g. a generic `AgentRunner` consumer that has not adopted
+   * the W3 extension) the runner builds an addendum without the
+   * `(#<n>)` issue scope; the commit format degrades to plain
+   * Conventional Commits.
+   */
+  readonly issueNumber?: IssueNumber;
   /** Absolute path of the per-task git worktree; pinned as `cwd`. */
   readonly worktreePath: string;
   /** Prompt to send to the model. */
@@ -251,7 +269,7 @@ export interface RunAgentArgs {
  * Settled result of a `runAgent` call.
  *
  * Returned by {@link AgentRunnerImpl.runAgent} once the async iterable is
- * exhausted. The supervisor stores `sessionId` on the {@link Task} so the
+ * exhausted. The supervisor stores `sessionId` on the task record so the
  * next iteration can resume.
  */
 export interface AgentRunResult {
@@ -458,6 +476,15 @@ export function createAgentRunner(opts: AgentRunnerOptions): AgentRunnerImpl {
         "worktreePath",
       );
     }
+    if (!isAbsolute(args.worktreePath)) {
+      throw new AgentRunnerError(
+        `RunAgentArgs.worktreePath must be an absolute path (got ${
+          JSON.stringify(args.worktreePath)
+        })`,
+        "validateArgs",
+        "worktreePath",
+      );
+    }
     if (args.prompt.length === 0) {
       throw new AgentRunnerError(
         "RunAgentArgs.prompt must be a non-empty string",
@@ -495,32 +522,50 @@ export function createAgentRunner(opts: AgentRunnerOptions): AgentRunnerImpl {
   }
 
   /**
-   * Adapt one SDK message into the runner's projection plus the bus event.
-   * Returns the projection (yielded to the iterable consumer) and the
-   * session id (if observed).
+   * Adapt one SDK message into the runner's projection (yielded to the
+   * iterable consumer at full length) plus the truncated payload for the
+   * event bus, plus the session id (if observed).
+   *
+   * The iterable carries the full rendered text so a consumer that wants
+   * the entire tool output (e.g. a future persistence sink) is not
+   * silently capped at the bus budget. Only the bus-side payload is
+   * truncated to the
+   * {@link AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS} ceiling so subscriber
+   * queues stay bounded.
    */
   function adaptMessage(
     sdkMessage: SdkMessageProjection,
-  ): { readonly projection: AgentRunnerMessage; readonly sessionId: string | undefined } {
+  ): {
+    readonly projection: AgentRunnerMessage;
+    readonly busPayload: AgentRunnerMessage;
+    readonly sessionId: string | undefined;
+  } {
     const role = mapSdkTypeToRole(sdkMessage.type);
     const text = renderSdkMessageText(sdkMessage);
     const truncated = truncateForBus(text);
+    const projection: AgentRunnerMessage = { role, text };
+    const busPayload: AgentRunnerMessage = truncated === text
+      ? projection
+      : { role, text: truncated };
     return {
-      projection: { role, text: truncated },
+      projection,
+      busPayload,
       sessionId: typeof sdkMessage.session_id === "string" ? sdkMessage.session_id : undefined,
     };
   }
 
   /**
    * Publish an `agent-message` event tagged with `taskId`. Caller is the
-   * runner; subscribers see the same projection consumers iterate.
+   * runner; subscribers see the bus-budget projection (truncated when the
+   * rendered text exceeded {@link AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS}).
+   * The yielded iterable carries the full text — see {@link adaptMessage}.
    */
-  function publishMessage(taskId: TaskId, projection: AgentRunnerMessage): void {
+  function publishMessage(taskId: TaskId, busPayload: AgentRunnerMessage): void {
     const event: TaskEvent = {
       taskId,
       atIso: nowIso(),
       kind: "agent-message",
-      data: projection,
+      data: busPayload,
     };
     try {
       eventBus.publish(event);
@@ -549,15 +594,21 @@ export function createAgentRunner(opts: AgentRunnerOptions): AgentRunnerImpl {
     let messageCount = 0;
     let observedSessionId: string | undefined = args.sessionId;
 
-    const stream = queryFn({ prompt: args.prompt, options });
     try {
+      // `queryFn(...)` lives inside the try so a synchronous SDK throw
+      // (e.g. test stub raising before yielding the iterable, or the
+      // production SDK validating its arguments eagerly) is wrapped in
+      // an `AgentRunnerError` consistent with the iteration-failure
+      // path. Without this, a sync throw would bypass the wrapping and
+      // surface a raw error type to the supervisor.
+      const stream = queryFn({ prompt: args.prompt, options });
       for await (const sdkMessage of stream) {
         messageCount += 1;
         const adapted = adaptMessage(sdkMessage);
         if (adapted.sessionId !== undefined) {
           observedSessionId = adapted.sessionId;
         }
-        publishMessage(args.taskId, adapted.projection);
+        publishMessage(args.taskId, adapted.busPayload);
         yield adapted.projection;
       }
     } catch (caught) {
@@ -614,39 +665,53 @@ export function createAgentRunner(opts: AgentRunnerOptions): AgentRunnerImpl {
 // ---------------------------------------------------------------------------
 
 /**
- * Format the conventional-commits system-prompt addendum for `issueNumber`.
+ * Format the conventional-commits system-prompt addendum.
  *
  * The addendum is appended to the SDK's preset system prompt via the
  * `append` field. It is short, deterministic, and unambiguous so the
  * model can quote it back when it commits.
  *
+ * When `issueNumber` is provided, the addendum embeds the
+ * `<type>(#<issueNumber>): <subject>` Conventional Commits format with
+ * the issue scope. When `issueNumber` is `undefined`, the format
+ * degrades to plain `<type>: <subject>` so a consumer typed as the W1
+ * `AgentRunner` (which does not pass `issueNumber`) never produces a
+ * `#undefined` literal in the prompt.
+ *
  * The exact wording is asserted by snapshot in
  * `tests/unit/agent_runner_test.ts` so any drift is caught before it
  * reaches a PR description.
  *
- * @param issueNumber The GitHub issue this run is operating on.
+ * @param issueNumber The GitHub issue this run is operating on. Omit to
+ *   render the addendum without an issue scope.
  * @returns The addendum text.
  *
  * @example
  * ```ts
  * const text = buildSystemPromptAddendum(makeIssueNumber(42));
  * // "When you author commits ..."
+ * const generic = buildSystemPromptAddendum();
+ * // Same body, scope-less examples.
  * ```
  */
-export function buildSystemPromptAddendum(issueNumber: IssueNumber): string {
+export function buildSystemPromptAddendum(issueNumber?: IssueNumber): string {
+  const scope = issueNumber === undefined ? "" : `(#${issueNumber})`;
+  const formatHeader = issueNumber === undefined
+    ? "the Conventional Commits format:"
+    : "the Conventional Commits format with the issue scope:";
   return [
     "When you author commits in this worktree, every commit message MUST follow",
-    "the Conventional Commits format with the issue scope:",
+    formatHeader,
     "",
-    `    <type>(#${issueNumber}): <subject>`,
+    `    <type>${scope}: <subject>`,
     "",
     "where `<type>` is one of: feat, fix, docs, refactor, perf, test, build, ci,",
     "chore, revert. The subject is imperative, lower-case, no trailing period,",
     "and 72 characters or fewer. Body and footer are optional but follow the",
     "same convention. Examples:",
     "",
-    `    feat(#${issueNumber}): add task switcher overlay`,
-    `    fix(#${issueNumber}): handle SIGPIPE on TUI disconnect`,
+    `    feat${scope}: add task switcher overlay`,
+    `    fix${scope}: handle SIGPIPE on TUI disconnect`,
     "",
     "Do not deviate from this format; the repository's commit-msg hook rejects",
     "non-conforming subjects.",
@@ -677,12 +742,20 @@ function mapSdkTypeToRole(type: string): AgentRunnerMessage["role"] {
  *
  * `assistant` messages carry a `BetaMessage` whose `content` is an array
  * of blocks; we concatenate the `text` of every text block and surface
- * `tool_use` blocks as a single `tool: <name>(<json input>)` line so the
+ * `tool_use` blocks as a single `[tool <name>] <input>` line so the
  * TUI can show the tool call without parsing the SDK shape itself.
  *
- * `result` messages carry the final `result` string. Other messages are
- * rendered as `<type>: <session_id>` so the TUI has *something* to show
- * without coupling to every SDK variant.
+ * `result` messages carry the final `result` string.
+ *
+ * Standalone `tool_use` / `tool_result` messages (which
+ * {@link mapSdkTypeToRole} surfaces as the `tool-use` / `tool-result`
+ * roles) render their `name`/`input` fields the same way embedded
+ * `tool_use` blocks do, so the transcript stays informative whichever
+ * shape the SDK chose.
+ *
+ * Other messages fall back to a bracketed type tag such as
+ * `[tool_progress]` so the TUI has *something* to show without coupling
+ * to every SDK variant.
  */
 function renderSdkMessageText(message: SdkMessageProjection): string {
   if (message.type === "assistant" && message.message?.content !== undefined) {
@@ -709,6 +782,28 @@ function renderSdkMessageText(message: SdkMessageProjection): string {
   if (message.type === "result" && typeof message.result === "string") {
     return message.result;
   }
+  if (message.type === "tool_use") {
+    // Standalone `tool_use` carries `name`/`input` at the message root
+    // (no embedded content blocks). Render the same way the embedded
+    // case does so the transcript line is uniform.
+    const name = typeof message.name === "string" ? message.name : "";
+    const inputText = renderToolInput(message.input);
+    return name.length === 0 ? `[tool_use] ${inputText}`.trimEnd() : `[tool ${name}] ${inputText}`;
+  }
+  if (message.type === "tool_result") {
+    // Standalone `tool_result` may carry the rendered output as
+    // `content` (string) or a nested `result.content` payload depending
+    // on SDK variant. Surface the string form when present; otherwise
+    // fall back to the bracketed type so the discriminant remains
+    // useful.
+    if (typeof message.content === "string") {
+      return `[tool_result] ${message.content}`;
+    }
+    if (typeof message.result === "string") {
+      return `[tool_result] ${message.result}`;
+    }
+    return `[tool_result]`;
+  }
   // Fallback for system/tool_progress/etc. — the type discriminant alone
   // is more useful than nothing, and any caller that wants the full
   // shape can hold the SDK message themselves (the runner exposes
@@ -720,9 +815,12 @@ function renderSdkMessageText(message: SdkMessageProjection): string {
  * Render the input of a `tool_use` block as a single line.
  *
  * Strings pass through verbatim, JSON-serializable values are
- * `JSON.stringify`'d, and unrepresentable values (cycles, BigInts) are
- * stringified through `String()` so a malformed tool call never aborts
- * the agent loop.
+ * `JSON.stringify`'d, and unrepresentable values (cycles, BigInts,
+ * functions, symbols) are stringified through `String()` so a malformed
+ * tool call never aborts the agent loop. `JSON.stringify` returns
+ * `undefined` for top-level functions and symbols; the explicit guard
+ * below converts those to `String(input)` rather than the literal
+ * `"undefined"` that string interpolation would otherwise produce.
  */
 function renderToolInput(input: unknown): string {
   if (typeof input === "string") {
@@ -732,7 +830,8 @@ function renderToolInput(input: unknown): string {
     return "";
   }
   try {
-    return JSON.stringify(input);
+    const stringified = JSON.stringify(input);
+    return stringified === undefined ? String(input) : stringified;
   } catch {
     return String(input);
   }

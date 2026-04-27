@@ -434,6 +434,32 @@ Deno.test("buildSystemPromptAddendum embeds the issue number verbatim (snapshot)
   assertEquals(text, expected);
 });
 
+Deno.test("buildSystemPromptAddendum drops the issue scope when no issueNumber is given", () => {
+  // The W1 `AgentRunner` contract does not include `issueNumber`; a
+  // consumer typed as `AgentRunner` legally omits it. The runner
+  // degrades the format to plain Conventional Commits (no scope) so we
+  // never produce a `#undefined` literal in the prompt.
+  const text = buildSystemPromptAddendum();
+  const expected = [
+    "When you author commits in this worktree, every commit message MUST follow",
+    "the Conventional Commits format:",
+    "",
+    "    <type>: <subject>",
+    "",
+    "where `<type>` is one of: feat, fix, docs, refactor, perf, test, build, ci,",
+    "chore, revert. The subject is imperative, lower-case, no trailing period,",
+    "and 72 characters or fewer. Body and footer are optional but follow the",
+    "same convention. Examples:",
+    "",
+    "    feat: add task switcher overlay",
+    "    fix: handle SIGPIPE on TUI disconnect",
+    "",
+    "Do not deviate from this format; the repository's commit-msg hook rejects",
+    "non-conforming subjects.",
+  ].join("\n");
+  assertEquals(text, expected);
+});
+
 Deno.test("runAgent appends the addendum to the SDK's preset system prompt", async () => {
   const { runner, captures, stop } = buildRunner({
     pathOverride: FIXTURE_CLAUDE,
@@ -599,6 +625,33 @@ Deno.test("runAgent rejects when worktreePath is empty", async () => {
   }
 });
 
+Deno.test("runAgent rejects when worktreePath is not absolute", async () => {
+  // The error message claims an absolute path is required; the
+  // validator must enforce that, not just non-empty.
+  const { runner, stop } = buildRunner({
+    pathOverride: FIXTURE_CLAUDE,
+    messages: [],
+  });
+  try {
+    const error = await assertRejects(
+      () =>
+        drain(runner.runAgent({
+          taskId: FIXTURE_TASK_ID,
+          issueNumber: FIXTURE_ISSUE,
+          worktreePath: "relative/path",
+          prompt: FIXTURE_PROMPT,
+          model: FIXTURE_MODEL,
+        })),
+      AgentRunnerError,
+    );
+    assertEquals(error.operation, "validateArgs");
+    assertEquals(error.field, "worktreePath");
+    assertStringIncludes(error.message, "absolute");
+  } finally {
+    stop();
+  }
+});
+
 Deno.test("runAgent rejects when prompt is empty", async () => {
   const { runner, stop } = buildRunner({
     pathOverride: FIXTURE_CLAUDE,
@@ -673,6 +726,38 @@ Deno.test("runAgent wraps SDK rejections as AgentRunnerError carrying the cause"
   } finally {
     stop();
   }
+});
+
+Deno.test("runAgent wraps synchronous queryFn throws as AgentRunnerError", async () => {
+  // The SDK's `query` (or a misbehaving test stub) may throw before
+  // returning the iterable. The runner must wrap that synchronous throw
+  // the same way it wraps async iteration failures so the supervisor
+  // sees a single error type.
+  const cause = new Error("synchronous SDK boom");
+  const throwingQuery: SdkQueryFunction = () => {
+    throw cause;
+  };
+  const bus = createEventBus({ logger: recordingLogger() });
+  const runner = createAgentRunner({
+    eventBus: bus,
+    query: throwingQuery,
+    pathToClaudeCodeExecutable: FIXTURE_CLAUDE,
+    nowIso: () => "2026-04-26T00:00:00.000Z",
+  });
+  const error = await assertRejects(
+    () =>
+      drain(runner.runAgent({
+        taskId: FIXTURE_TASK_ID,
+        issueNumber: FIXTURE_ISSUE,
+        worktreePath: FIXTURE_WORKTREE,
+        prompt: FIXTURE_PROMPT,
+        model: FIXTURE_MODEL,
+      })),
+    AgentRunnerError,
+  );
+  assertEquals(error.operation, "sdkQuery");
+  assertEquals(error.cause, cause);
+  assertStringIncludes(error.message, "synchronous SDK boom");
 });
 
 Deno.test(
@@ -857,8 +942,56 @@ Deno.test("tool_use blocks render gracefully when input has unrepresentable valu
   }
 });
 
-Deno.test("very long assistant text is truncated to the bus budget", async () => {
-  const oversized = "x".repeat(AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS + 100);
+Deno.test("tool_use blocks fall back to String() when JSON.stringify returns undefined", async () => {
+  // `JSON.stringify(<function>)` and `JSON.stringify(<symbol>)` return
+  // `undefined`. Without an explicit guard, string interpolation
+  // converts that to the literal `"undefined"`. The renderer must fall
+  // back to `String(input)` so the line carries something more useful
+  // (the function/symbol's debug representation) than `undefined`.
+  const { runner, stop } = buildRunner({
+    pathOverride: FIXTURE_CLAUDE,
+    messages: [
+      {
+        type: "assistant",
+        session_id: "session-stub",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              name: "Weird",
+              input: function namedFn() {/* nothing */},
+            },
+          ],
+        },
+      },
+    ],
+  });
+  try {
+    const messages = await drain(runner.runAgent({
+      taskId: FIXTURE_TASK_ID,
+      issueNumber: FIXTURE_ISSUE,
+      worktreePath: FIXTURE_WORKTREE,
+      prompt: FIXTURE_PROMPT,
+      model: FIXTURE_MODEL,
+    }));
+    const first = messages[0];
+    assertExists(first);
+    assertStringIncludes(first.text, "[tool Weird]");
+    // The fallback path is `String(input)`, which for a function yields
+    // its source. We just assert the literal `undefined` does not leak.
+    assertEquals(first.text.includes("undefined"), false);
+  } finally {
+    stop();
+  }
+});
+
+Deno.test("very long assistant text yields full length but truncates on the event bus", async () => {
+  // The iterable carries the full rendered text so a future consumer
+  // (e.g. a persistence sink) is not silently capped at the bus budget.
+  // Only the bus-side payload is truncated to keep subscriber queues
+  // bounded.
+  const oversizedLength = AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS + 100;
+  const oversized = "x".repeat(oversizedLength);
   const { runner, events, stop } = buildRunner({
     pathOverride: FIXTURE_CLAUDE,
     messages: [assistantMessage(oversized)],
@@ -872,17 +1005,17 @@ Deno.test("very long assistant text is truncated to the bus budget", async () =>
       model: FIXTURE_MODEL,
     }));
     await flush();
-    assertEquals(
-      messages[0]?.text.length,
-      AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS + 1, // ellipsis
-    );
-    assert(messages[0]?.text.endsWith("…"));
+    // Iterable: full length, no ellipsis.
+    assertEquals(messages[0]?.text.length, oversizedLength);
+    assertEquals(messages[0]?.text.endsWith("…"), false);
+    // Bus: capped at the budget plus one ellipsis code unit.
     assertEquals(events.length, 1);
     assert(events[0]?.kind === "agent-message");
     assertEquals(
       events[0]?.data.text.length,
       AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS + 1,
     );
+    assert(events[0]?.data.text.endsWith("…"));
   } finally {
     stop();
   }
@@ -951,7 +1084,9 @@ Deno.test("MockAgentRunner implements the supervisor's AgentRunner shape", async
 Deno.test("MockAgentRunner records a roundtripped sessionId", () => {
   const mock = new MockAgentRunner();
   mock.queueRun({ messages: [] });
-  const _ = mock.runAgent({
+  // `runAgent` records the invocation synchronously; the iterable does
+  // not need to be drained for the assertion below.
+  mock.runAgent({
     taskId: FIXTURE_TASK_ID,
     worktreePath: FIXTURE_WORKTREE,
     prompt: FIXTURE_PROMPT,
@@ -984,6 +1119,40 @@ Deno.test("standalone tool_use messages map to the tool-use role", async () => {
   }
 });
 
+Deno.test("standalone tool_use messages render their name and input", async () => {
+  // Standalone `tool_use` messages carry `name`/`input` at the message
+  // root (no embedded blocks). Render them the same way embedded
+  // tool_use blocks render so the transcript is uniform regardless of
+  // SDK variant.
+  const { runner, stop } = buildRunner({
+    pathOverride: FIXTURE_CLAUDE,
+    messages: [
+      {
+        type: "tool_use",
+        session_id: "s",
+        name: "Bash",
+        input: { command: "ls" },
+      },
+    ],
+  });
+  try {
+    const messages = await drain(runner.runAgent({
+      taskId: FIXTURE_TASK_ID,
+      issueNumber: FIXTURE_ISSUE,
+      worktreePath: FIXTURE_WORKTREE,
+      prompt: FIXTURE_PROMPT,
+      model: FIXTURE_MODEL,
+    }));
+    const first = messages[0];
+    assertExists(first);
+    assertEquals(first.role, "tool-use");
+    assertStringIncludes(first.text, "[tool Bash]");
+    assertStringIncludes(first.text, "ls");
+  } finally {
+    stop();
+  }
+});
+
 Deno.test("standalone tool_result messages map to the tool-result role", async () => {
   const { runner, stop } = buildRunner({
     pathOverride: FIXTURE_CLAUDE,
@@ -998,6 +1167,35 @@ Deno.test("standalone tool_result messages map to the tool-result role", async (
       model: FIXTURE_MODEL,
     }));
     assertEquals(messages[0]?.role, "tool-result");
+  } finally {
+    stop();
+  }
+});
+
+Deno.test("standalone tool_result messages render their content payload", async () => {
+  const { runner, stop } = buildRunner({
+    pathOverride: FIXTURE_CLAUDE,
+    messages: [
+      {
+        type: "tool_result",
+        session_id: "s",
+        content: "command output line",
+      },
+    ],
+  });
+  try {
+    const messages = await drain(runner.runAgent({
+      taskId: FIXTURE_TASK_ID,
+      issueNumber: FIXTURE_ISSUE,
+      worktreePath: FIXTURE_WORKTREE,
+      prompt: FIXTURE_PROMPT,
+      model: FIXTURE_MODEL,
+    }));
+    const first = messages[0];
+    assertExists(first);
+    assertEquals(first.role, "tool-result");
+    assertStringIncludes(first.text, "[tool_result]");
+    assertStringIncludes(first.text, "command output line");
   } finally {
     stop();
   }

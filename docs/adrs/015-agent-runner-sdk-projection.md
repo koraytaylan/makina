@@ -28,7 +28,11 @@ runner's exact contract:
 The W1 contract in `src/types.ts` froze the `AgentRunner` interface at
 `runAgent(...) → AsyncIterable<AgentRunnerMessage>` where `AgentRunnerMessage = { role, text }`.
 That is a deliberately narrow projection of `SDKMessage`. This ADR captures the rationale for the
-projection plus two implementation decisions made on top of it.
+projection plus two implementation decisions made on top of it. Note: issue scoping (the
+`issueNumber` the supervisor passes) is **not** part of the frozen `AgentRunner` contract; the
+runner exposes it on a widened `RunAgentArgs` and treats it as optional so the implementation
+remains assignable to the W1 interface (see "System-prompt addendum" below for the degraded
+rendering when `issueNumber` is absent).
 
 ## Decision
 
@@ -93,6 +97,13 @@ The decision rationale:
 - **Issue number formatted into the addendum, not into `extraArgs`.** The runner is responsible for
   the conventional-commits contract; the supervisor passes the number through `runAgent`'s
   `issueNumber` argument and never has to hand-format the prompt itself.
+- **`issueNumber` is _optional_ on `RunAgentArgs`.** The W1 `AgentRunner` interface in
+  `src/types.ts` does not include `issueNumber`; making the field required on `RunAgentArgs` would
+  break the assignability `AgentRunnerImpl extends AgentRunner` claims. So the field is optional and
+  the runner degrades gracefully: when omitted, `buildSystemPromptAddendum()` drops the `(#<n>)`
+  scope and renders the format as `<type>: <subject>`. The supervisor (the only production caller)
+  always passes the issue number; the optional shape exists so a generic `AgentRunner` consumer
+  cannot accidentally produce a `#undefined` literal in the prompt.
 - **Snapshot-tested wording.** A small text drift (a different word, a missing example) is the kind
   of regression that doesn't fail the build but fails the agent at commit time. The snapshot is the
   cheapest line of defense.
