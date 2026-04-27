@@ -165,3 +165,16 @@ export const MIN_GITHUB_INSTALLATION_ID = 1;
  * Issue numbers start at one within each repository.
  */
 export const MIN_GITHUB_ISSUE_NUMBER = 1;
+
+/**
+ * Maximum width, in UTF-16 code units, of an `agent-message` payload
+ * rendered to the TUI status bar.
+ *
+ * The status bar is one Ink `<Text>` row; longer text wraps and shoves
+ * the rest of the layout down. The cut is by code units (matching
+ * `String.prototype.slice`), which is good enough for ASCII-heavy agent
+ * chatter and tolerated by Ink's renderer when a surrogate pair lands
+ * on the boundary. Bumped only if the status bar grows a multi-line
+ * mode in a later wave.
+ */
+export const STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS = 80;
