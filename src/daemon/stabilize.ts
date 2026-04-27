@@ -16,11 +16,13 @@
  * the per-task feature branch with `<baseBranch>` so the PR stays
  * mergeable while sibling tasks are landing. The phase:
  *
- *  1. `git fetch origin <baseBranch>` inside the per-task worktree —
- *     refresh the remote's view of the base branch. Failures here are
- *     surfaced as {@link StabilizeRebaseError} for the supervisor to
- *     translate into a `FAILED` transition; they are not retryable.
- *  2. `git rebase origin/<baseBranch>` against the same worktree.
+ *  1. `git fetch origin <baseBranch>:refs/remotes/origin/<baseBranch>`
+ *     inside the per-task worktree — refresh the remote-tracking view
+ *     of the base branch. Failures here are surfaced as
+ *     {@link StabilizeRebaseError} for the supervisor to translate into
+ *     a `FAILED` transition; they are not retryable.
+ *  2. `git rebase refs/remotes/origin/<baseBranch>` against the same
+ *     worktree.
  *     Three observable outcomes:
  *
  *       - **Clean rebase** — exit 0; the phase resolves with kind
@@ -365,8 +367,9 @@ export class StabilizeRebaseError extends Error {
 /**
  * Run the rebase sub-phase of the stabilize loop.
  *
- * Walks the per-task worktree through `git fetch origin <baseBranch>`
- * and `git rebase origin/<baseBranch>`. On conflicts, dispatches the
+ * Walks the per-task worktree through
+ * `git fetch origin <baseBranch>:refs/remotes/origin/<baseBranch>`
+ * and `git rebase refs/remotes/origin/<baseBranch>`. On conflicts, dispatches the
  * agent runner with a deterministic conflict-context prompt
  * ({@link buildConflictPrompt}) up to {@link MAX_TASK_ITERATIONS} times.
  * Each iteration runs `git add -A && git rebase --continue` after the
