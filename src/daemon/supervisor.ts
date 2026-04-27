@@ -57,6 +57,8 @@ import { getLogger } from "@std/log";
 import {
   HEX_BYTE_WIDTH_CHARACTERS,
   HEX_RADIX,
+  HTTP_STATUS_CONFLICT,
+  HTTP_STATUS_METHOD_NOT_ALLOWED,
   TASK_ID_RANDOM_SUFFIX_BYTES,
   TASK_ID_RANDOM_SUFFIX_LENGTH_CHARACTERS,
 } from "../constants.ts";
@@ -216,6 +218,16 @@ export interface TaskSupervisorOptions {
    * filesystem.
    */
   readonly conflictFileReader?: ConflictFileReader;
+  /**
+   * If `true`, the supervisor leaves the per-task worktree on disk
+   * after `MERGED`; if `false`, it tears the worktree down via
+   * {@link WorktreeManagerImpl.removeWorktree} as the final step of
+   * the merge pipeline. Mirrors `lifecycle.preserveWorktreeOnMerge`
+   * from `config.json`. Defaults to `false` so a fresh `makina setup`
+   * leaves disk usage bounded; operators who want to keep the
+   * worktree for follow-up flip the bit in their config.
+   */
+  readonly preserveWorktreeOnMerge?: boolean;
 }
 
 /**
@@ -291,14 +303,88 @@ export interface TaskSupervisorImpl {
    *   with that id exists.
    */
   getTask(taskId: TaskId): Task | undefined;
+
+  /**
+   * Force the merge of a task currently parked at `READY_TO_MERGE`.
+   *
+   * Wired to the `/merge <task-id>` slash command for tasks configured
+   * with `mergeMode === "manual"` (the only mode that parks rather
+   * than auto-merging once stabilize settles). Re-enters the FSM at
+   * `READY_TO_MERGE` and runs the same merge → cleanup pipeline as the
+   * auto-merge path: GitHub `mergePullRequest` is invoked with the
+   * task's recorded mode (overridden internally to `squash`/`rebase`
+   * — the supervisor refuses to call the API with `manual`, since
+   * GitHub has no equivalent strategy), the worktree is cleaned up
+   * (or preserved per `preserveWorktreeOnMerge`), and the task lands
+   * in `MERGED`. Failures classify the same way as the auto-merge
+   * path (see {@link MergeError.category}).
+   *
+   * @param taskId Identifier of the task to merge.
+   * @param overrideMode Optional override of the merge strategy for
+   *   this single call. Defaults to `"squash"` when the task itself
+   *   carries `manual` (the API needs a concrete strategy); ignored
+   *   otherwise.
+   * @returns The persisted task record after the merge attempt
+   *   (`MERGED`, `NEEDS_HUMAN`, or `FAILED`).
+   * @throws SupervisorError synchronously when the call cannot reach
+   *   the FSM transition. Thrown kinds:
+   *   - `unknown-task` — no task exists for the given id.
+   *   - `not-ready-to-merge` — the task is not at `READY_TO_MERGE`.
+   *   - `merge-in-flight` — a prior `/merge` for the same task is
+   *     still mid-flight on the GitHub merge call.
+   *   - `merge-precondition` — `overrideMode === "manual"`, which is
+   *     not a GitHub merge strategy.
+   *
+   *   Each error carries a `kind` discriminator so the daemon's
+   *   command dispatcher can reply with a precise
+   *   `ack { ok: false, error }`. FSM-internal failures (the merge
+   *   itself faulting after preconditions pass) do **not** throw —
+   *   they land the task in `MERGED`, `NEEDS_HUMAN`, or `FAILED`.
+   */
+  mergeReadyTask(
+    taskId: TaskId,
+    overrideMode?: MergeMode,
+  ): Promise<Task>;
 }
+
+/**
+ * Categories of caller-visible failures the supervisor surfaces
+ * synchronously through {@link SupervisorError}. The daemon's command
+ * dispatcher reads the `kind` to map an exception onto a precise
+ * `ack { ok: false, error }`:
+ *
+ * - `duplicate-start` — `start()` was called for a `(repo, issue)`
+ *   pair already in flight.
+ * - `unknown-task` — `mergeReadyTask()` was passed a task id the
+ *   supervisor does not own.
+ * - `not-ready-to-merge` — `mergeReadyTask()` was called for a task
+ *   not currently in `READY_TO_MERGE`.
+ * - `merge-in-flight` — `mergeReadyTask()` was called concurrently for
+ *   the same task id; an earlier invocation is still mid-flight on the
+ *   GitHub merge call, so the second request is rejected synchronously
+ *   instead of issuing a duplicate `mergePullRequest`.
+ * - `merge-precondition` — `mergeReadyTask()` was called with an
+ *   `overrideMode` that is not a valid GitHub merge strategy
+ *   (currently only `"manual"`, which is a makina-side concept meaning
+ *   "wait for /merge"). Rejected synchronously so a caller bug cannot
+ *   land the task in `FAILED` via `runMergeStep`'s defensive check.
+ * - `persistence` — the initial `start()` save failed (no record on
+ *   disk; in-memory entry rolled back so callers can retry).
+ */
+export type SupervisorErrorKind =
+  | "duplicate-start"
+  | "unknown-task"
+  | "not-ready-to-merge"
+  | "merge-in-flight"
+  | "merge-precondition"
+  | "persistence";
 
 /**
  * Domain error class thrown by the supervisor for caller-visible
  * failures (double-start, unknown task, brand violation). FSM-internal
  * failures (worktree creation, PR open, merge) are *not* thrown — they
- * land the task in `FAILED` and the caller observes the terminal
- * record's `terminalReason`.
+ * land the task in `FAILED` (or `NEEDS_HUMAN` for non-mergeable PRs)
+ * and the caller observes the terminal record's `terminalReason`.
  *
  * The class wraps the underlying exception via `cause` so log readers
  * can recover the original stack.
@@ -316,22 +402,91 @@ export interface TaskSupervisorImpl {
  * }
  * ```
  *
- * @throws by {@link TaskSupervisorImpl.start} when the FSM rejects the
+ * @throws by {@link TaskSupervisorImpl.start} and
+ *   {@link TaskSupervisorImpl.mergeReadyTask} when the FSM rejects the
  *   call before any state transition is persisted.
  */
 export class SupervisorError extends Error {
   /** Discriminator visible in stack traces and `error.name === ...` checks. */
   override readonly name = "SupervisorError";
+  /** Category tag — the daemon's `/merge` dispatcher reads this. */
+  readonly kind: SupervisorErrorKind;
 
   /**
    * Build a supervisor error.
    *
+   * @param kind Failure category (see {@link SupervisorErrorKind}).
    * @param message Human-readable description.
    * @param options Optional standard `cause` carrying the underlying
    *   exception.
    */
-  constructor(message: string, options?: { readonly cause?: unknown }) {
+  constructor(
+    kind: SupervisorErrorKind,
+    message: string,
+    options?: { readonly cause?: unknown },
+  ) {
     super(message, options);
+    this.kind = kind;
+  }
+}
+
+/**
+ * Categories of {@link MergeError} the supervisor produces during
+ * `READY_TO_MERGE → MERGED`. Mapped onto a destination FSM state by
+ * {@link mergeErrorTerminalState}:
+ *
+ * - `not-mergeable` — GitHub refused the merge because the PR was
+ *   not in a mergeable state (HTTP `405`, conflicts, base protection,
+ *   stale head SHA). The supervisor escalates to `NEEDS_HUMAN` so an
+ *   operator can investigate without losing the PR.
+ * - `transient` — a 5xx, network glitch, or other category-unaware
+ *   failure. The supervisor lands the task in `FAILED` so a follow-up
+ *   `start()` (or, for manual mode, a follow-up `/merge`) can retry.
+ */
+export type MergeErrorCategory = "not-mergeable" | "transient";
+
+/**
+ * Domain error wrapping a `mergePullRequest` failure with a
+ * caller-visible `category` so the supervisor can decide whether to
+ * escalate the task to `NEEDS_HUMAN` (the PR is genuinely
+ * non-mergeable: conflicts, base-branch protection, stale head) or
+ * `FAILED` (the API call faulted for a transient reason).
+ *
+ * The class never escapes the supervisor — it is constructed inside
+ * the merge step and consumed by the FSM transition. Tests inspect the
+ * resulting `terminalReason` rather than this class directly.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.mergePullRequest(repo, prNumber, "squash");
+ * } catch (error) {
+ *   throw classifyMergeError(error);
+ * }
+ * ```
+ */
+export class MergeError extends Error {
+  /** Discriminator visible in stack traces and `error.name === ...` checks. */
+  override readonly name = "MergeError";
+  /** Category tag — drives the FSM destination state. */
+  readonly category: MergeErrorCategory;
+
+  /**
+   * Build a merge error.
+   *
+   * @param category Whether the failure is the PR being non-mergeable
+   *   (operator action required) or a transient API fault.
+   * @param message Human-readable description.
+   * @param options Optional standard `cause` carrying the underlying
+   *   GitHub-client exception.
+   */
+  constructor(
+    category: MergeErrorCategory,
+    message: string,
+    options?: { readonly cause?: unknown },
+  ) {
+    super(message, options);
+    this.category = category;
   }
 }
 
@@ -373,6 +528,7 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     ((repo: RepoFullName) => `https://github.com/${repo}.git`);
   const stabilizeGitInvoker = opts.gitInvoker;
   const stabilizeConflictReader = opts.conflictFileReader;
+  const preserveWorktreeOnMerge: boolean = opts.preserveWorktreeOnMerge ?? false;
 
   /**
    * In-memory task table. Wave 3's daemon hydrates this on boot via
@@ -382,6 +538,25 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    * inspect mid-flight transitions.
    */
   const tasks = new Map<TaskId, Task>();
+
+  /**
+   * Set of task ids whose `mergeReadyTask()` invocation is currently
+   * mid-flight on the GitHub merge call. Acts as an in-memory mutex:
+   * the second concurrent `/merge <task-id>` for the same task fails
+   * fast with `SupervisorErrorKind.merge-in-flight` instead of racing
+   * the first call into a duplicate `mergePullRequest` request.
+   *
+   * The guard is process-local (a daemon restart clears it) and lives
+   * alongside the `READY_TO_MERGE` state check inside `mergeReadyTask`:
+   * the state check guarantees that only `READY_TO_MERGE` tasks reach
+   * the GitHub call, but two callers can both pass that check before
+   * either persists a terminal transition. The mid-flight set closes
+   * the gap between "state check accepted" and "transition persisted".
+   *
+   * Cleared in a `finally` so a thrown classifier (or any other
+   * unexpected exception) cannot strand the task forever.
+   */
+  const mergeInFlight = new Set<TaskId>();
 
   /**
    * Run `mutate(prev)` to produce the next task record, persist it,
@@ -458,6 +633,7 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       // pair is not blocked by a phantom entry.
       tasks.delete(taskId);
       throw new SupervisorError(
+        "persistence",
         `failed to persist initial task record for ${args.repo}#${args.issueNumber}`,
         { cause: saveError },
       );
@@ -799,13 +975,59 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     return task;
   }
 
+  /**
+   * Side effect for `READY_TO_MERGE`. Three branches:
+   *
+   *  - **`manual`** parks the FSM at `READY_TO_MERGE` without calling
+   *    `mergePullRequest`. The auto-driver loop in {@link drive}
+   *    returns the task; the operator unblocks it later through
+   *    {@link mergeReadyTask} (wired to the `/merge <task-id>`
+   *    slash command).
+   *  - **`squash` / `rebase`** call the GitHub API straight through
+   *    {@link runMergeStep}.
+   *
+   * Any failure path inside `runMergeStep` is absorbed into a
+   * persisted `MERGED | NEEDS_HUMAN | FAILED` transition; this helper
+   * never throws.
+   */
   async function runReadyToMerge(task: Task): Promise<Task> {
     if (task.mergeMode === "manual") {
-      // Manual merge mode: stay in READY_TO_MERGE; an operator takes
-      // over from the GitHub UI. The integration test exercises
-      // `squash`, but the manual branch keeps the FSM honest.
+      // Park the task; an operator takes over by issuing
+      // `/merge <task-id>`. The driver loop in `drive()` returns this
+      // task as-is, leaving the in-memory + persistence record at
+      // `READY_TO_MERGE`. We do **not** publish a "parked" event —
+      // the `READY_TO_MERGE` state-changed event already published by
+      // the stabilize loop's exit covers the observer's needs.
       return task;
     }
+    return await runMergeStep(task, task.mergeMode);
+  }
+
+  /**
+   * Perform the merge-then-cleanup pipeline for a task at
+   * `READY_TO_MERGE`. The flow is:
+   *
+   *   1. Validate the precondition (`prNumber !== undefined`).
+   *   2. Call `mergePullRequest(repo, prNumber, mode)`.
+   *   3. Classify any failure via {@link classifyMergeError} and
+   *      escalate to `NEEDS_HUMAN` (non-mergeable PR) or `FAILED`
+   *      (transient API fault).
+   *   4. On success, optionally tear down the worktree per
+   *      `preserveWorktreeOnMerge` and persist `MERGED`.
+   *
+   * Used both from {@link runReadyToMerge} (auto-merge) and from
+   * {@link mergeReadyTask} (the `/merge` slash command) so the two
+   * paths share identical error handling and cleanup behaviour.
+   *
+   * @param task The READY_TO_MERGE task record.
+   * @param mode The merge strategy to use. Callers pass the task's
+   *   own `mergeMode` for auto-merge; the manual-merge entry point
+   *   substitutes a concrete strategy when the task itself was
+   *   configured with `manual`.
+   * @returns The persisted post-merge record (`MERGED`,
+   *   `NEEDS_HUMAN`, or `FAILED`).
+   */
+  async function runMergeStep(task: Task, mode: MergeMode): Promise<Task> {
     if (task.prNumber === undefined) {
       return await fail(
         task,
@@ -813,22 +1035,95 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
         "merge-precondition",
       );
     }
+    if (mode === "manual") {
+      // Defensive: `manual` is not a GitHub merge_method; the caller
+      // (mergeReadyTask) already substitutes a concrete mode before
+      // reaching here. Treat any leak as a programming error rather
+      // than a silent escalation.
+      return await fail(
+        task,
+        new Error('runMergeStep called with mode="manual"; expected squash or rebase'),
+        "merge-precondition",
+      );
+    }
     try {
-      await opts.githubClient.mergePullRequest(
-        task.repo,
-        task.prNumber,
-        task.mergeMode,
+      await opts.githubClient.mergePullRequest(task.repo, task.prNumber, mode);
+    } catch (error) {
+      const merge = classifyMergeError(error);
+      logger.warn(
+        `supervisor: mergePullRequest failed for task ${task.id} (${merge.category}): ${merge.message}`,
+      );
+      if (merge.category === "not-mergeable") {
+        return await escalateToHuman(task, merge);
+      }
+      return await fail(task, merge, "merge");
+    }
+    const merged = await transition(
+      task,
+      { state: "MERGED", terminalReason: "merged" },
+      `PR merged (${mode})`,
+    );
+    await maybeCleanupWorktree(merged);
+    return merged;
+  }
+
+  /**
+   * Tear down the per-task worktree after a successful merge unless
+   * `preserveWorktreeOnMerge` is set. Cleanup failures are logged but
+   * never re-thrown — the merge is the load-bearing transition; a
+   * stuck worktree is recoverable manually and the FSM has already
+   * persisted `MERGED`.
+   *
+   * Logs a single info line either way so an operator scanning logs
+   * sees what happened to the worktree without grepping multiple
+   * sources.
+   */
+  async function maybeCleanupWorktree(task: Task): Promise<void> {
+    const worktreePath = task.worktreePath;
+    if (worktreePath === undefined) {
+      return;
+    }
+    if (preserveWorktreeOnMerge) {
+      logger.info(
+        `supervisor: preserving worktree for task ${task.id} at ${worktreePath}`,
+      );
+      return;
+    }
+    try {
+      await opts.worktreeManager.removeWorktree(task.id);
+      logger.info(
+        `supervisor: removed worktree for task ${task.id} at ${worktreePath}`,
       );
     } catch (error) {
       logger.warn(
-        `supervisor: mergePullRequest failed for task ${task.id}: ${errorMessage(error)}`,
+        `supervisor: removeWorktree failed for task ${task.id} at ${worktreePath}: ${
+          errorMessage(error)
+        }`,
       );
-      return await fail(task, error, "merge");
     }
+  }
+
+  /**
+   * Drive `task` to `NEEDS_HUMAN`, recording the merge error on
+   * `terminalReason` and the bus's `error` event. Reserved for
+   * non-mergeable PRs — i.e. cases an operator must look at (the
+   * code is not at fault but the PR cannot be merged automatically:
+   * conflicts, base-branch protection, stale head SHA).
+   */
+  async function escalateToHuman(task: Task, error: MergeError): Promise<Task> {
+    publish(opts.eventBus, {
+      taskId: task.id,
+      atIso: clock.nowIso(),
+      kind: "error",
+      data: { message: `merge: ${error.message}` },
+    });
     return await transition(
       task,
-      { state: "MERGED", terminalReason: "merged" },
-      "PR merged",
+      {
+        state: "NEEDS_HUMAN",
+        terminalReason: `merge (not-mergeable): ${error.message}`,
+      },
+      "PR not mergeable; escalating to operator",
     );
   }
 
@@ -852,6 +1147,79 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     );
   }
 
+  /**
+   * Implementation of {@link TaskSupervisorImpl.mergeReadyTask}.
+   *
+   * Validates the task exists and is at `READY_TO_MERGE` synchronously
+   * (so a `/merge` for a `DRAFTING` or `MERGED` task fails fast with
+   * a precise error), then re-uses {@link runMergeStep} to share the
+   * GitHub call, classification, and cleanup behaviour with the
+   * auto-merge path.
+   *
+   * Concurrent invocations for the same task id are guarded by the
+   * {@link mergeInFlight} set: the first caller registers the id
+   * synchronously after the state check passes; any second caller that
+   * arrives before the first persists its terminal transition fails
+   * fast with `SupervisorErrorKind.merge-in-flight`. The guard is
+   * cleared in a `finally` so an unexpected exception inside
+   * `runMergeStep` cannot strand the id.
+   */
+  async function mergeReadyTask(
+    taskId: TaskId,
+    overrideMode?: MergeMode,
+  ): Promise<Task> {
+    if (overrideMode === "manual") {
+      // `manual` is not a GitHub merge_method (`merge_method` accepts
+      // `merge` / `squash` / `rebase` only). Reject at the entry point
+      // so a caller bug never reaches `runMergeStep`'s defensive check
+      // — that path lands the task in `FAILED`, which would be a
+      // misleading terminal state for what is purely a misuse of the
+      // public API.
+      throw new SupervisorError(
+        "merge-precondition",
+        '/merge overrideMode "manual" is not a GitHub merge strategy; pass "squash" or "rebase"',
+      );
+    }
+    const task = tasks.get(taskId);
+    if (task === undefined) {
+      throw new SupervisorError(
+        "unknown-task",
+        `no task found for id ${taskId}`,
+      );
+    }
+    if (task.state !== "READY_TO_MERGE") {
+      throw new SupervisorError(
+        "not-ready-to-merge",
+        `task ${taskId} is not at READY_TO_MERGE (current state: ${task.state})`,
+      );
+    }
+    if (mergeInFlight.has(taskId)) {
+      throw new SupervisorError(
+        "merge-in-flight",
+        `task ${taskId} already has a /merge in flight; refusing duplicate`,
+      );
+    }
+    // Register before the first `await` so a concurrent caller that
+    // arrives during the same microtask sees the in-flight marker. The
+    // `READY_TO_MERGE` check above and this `add` form a synchronous
+    // pair: only one caller can transition from "state check passed"
+    // to "marker registered" before yielding the event loop.
+    mergeInFlight.add(taskId);
+    try {
+      // The task's recorded `mergeMode` may be `manual` (the typical
+      // case for `/merge`) or one of the auto modes (rare: an operator
+      // can issue `/merge` to force-finish a parked auto-merge task
+      // that was paused mid-flight by daemon restart). Either way, the
+      // GitHub API needs a concrete strategy: `manual` falls back to
+      // `squash` unless the caller overrode it.
+      const mode: MergeMode = overrideMode ??
+        (task.mergeMode === "manual" ? "squash" : task.mergeMode);
+      return await runMergeStep(task, mode);
+    } finally {
+      mergeInFlight.delete(taskId);
+    }
+  }
+
   return {
     start,
     listTasks(): readonly Task[] {
@@ -860,6 +1228,7 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     getTask(taskId: TaskId): Task | undefined {
       return tasks.get(taskId);
     },
+    mergeReadyTask,
   };
 }
 
@@ -972,6 +1341,86 @@ function isTerminal(state: TaskState): boolean {
 }
 
 /**
+ * HTTP status codes the supervisor treats as "PR is genuinely not
+ * mergeable" — i.e. an operator must look at the PR before merging it.
+ *
+ * Per GitHub's [merge a PR](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+ * semantics:
+ *
+ * - {@link HTTP_STATUS_METHOD_NOT_ALLOWED} — the response GitHub sends
+ *   for "Pull Request is not mergeable" (conflicts, missing reviews on
+ *   a protected branch, etc.).
+ * - {@link HTTP_STATUS_CONFLICT} — head SHA mismatch when the caller
+ *   passed `sha`; treated the same way because the underlying state
+ *   requires a fresh PR view to resolve.
+ *
+ * Centralised here (rather than inlined into a string match) so the
+ * unit tests assert against the same constant the production path
+ * keys off. The numeric values themselves live in `src/constants.ts`
+ * per the bare-literal rule documented at the top of that file.
+ */
+export const MERGE_NOT_MERGEABLE_HTTP_STATUSES: readonly number[] = [
+  HTTP_STATUS_METHOD_NOT_ALLOWED,
+  HTTP_STATUS_CONFLICT,
+];
+
+/**
+ * Classify a thrown error from `mergePullRequest` into a
+ * {@link MergeError} carrying a category that drives the FSM
+ * destination state. The classifier inspects:
+ *
+ *  1. Pre-classified `MergeError` instances pass through untouched
+ *     (an already-classified caller wins).
+ *  2. Errors carrying an HTTP `status` (Octokit's `RequestError`
+ *     and similar shapes) get matched against
+ *     {@link MERGE_NOT_MERGEABLE_HTTP_STATUSES}.
+ *  3. Anything else falls back to `transient`.
+ *
+ * Exported alongside the supervisor so unit tests can assert the
+ * mapping directly.
+ *
+ * @param error The raw error thrown by the GitHub client.
+ * @returns A {@link MergeError} ready for FSM consumption.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.mergePullRequest(repo, prNumber, "squash");
+ * } catch (error) {
+ *   const merge = classifyMergeError(error);
+ *   if (merge.category === "not-mergeable") escalateToHuman(task, merge);
+ * }
+ * ```
+ */
+export function classifyMergeError(error: unknown): MergeError {
+  if (error instanceof MergeError) {
+    return error;
+  }
+  const status = readHttpStatus(error);
+  const message = errorMessage(error);
+  if (status !== undefined && MERGE_NOT_MERGEABLE_HTTP_STATUSES.includes(status)) {
+    return new MergeError("not-mergeable", message, { cause: error });
+  }
+  return new MergeError("transient", message, { cause: error });
+}
+
+/**
+ * Best-effort extraction of an HTTP status from an error. Mirrors
+ * `src/github/client.ts`'s reader without importing it (keeps the
+ * supervisor decoupled from the concrete client class).
+ */
+function readHttpStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) {
+    return undefined;
+  }
+  const candidate = error as { status?: unknown };
+  if (typeof candidate.status === "number") {
+    return candidate.status;
+  }
+  return undefined;
+}
+
+/**
  * Reject a duplicate {@link TaskSupervisorImpl.start} call for a
  * `(repo, issueNumber)` pair already tracked by a non-terminal task.
  *
@@ -989,6 +1438,7 @@ function rejectDuplicateTask(
     }
     if (!isTerminal(task.state)) {
       throw new SupervisorError(
+        "duplicate-start",
         `task already in flight for ${repo}#${issueNumber} (taskId=${task.id}, state=${task.state})`,
       );
     }

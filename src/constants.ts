@@ -467,3 +467,29 @@ export const STABILIZE_REBASE_CONFLICT_PROMPT_HEAD: string =
   "Edit each file to resolve the conflicts, preserving the intent of both sides where possible. " +
   "Do NOT run `git add`, `git commit`, or `git rebase` — the daemon will continue the rebase " +
   "after you settle.";
+
+/**
+ * HTTP `405 Method Not Allowed` — the response GitHub returns from the
+ * [merge a PR endpoint](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+ * when the pull request is not in a mergeable state (conflicts, missing
+ * reviews on a protected branch, stale head SHA, etc.).
+ *
+ * The supervisor's `classifyMergeError` keys off this status to escalate
+ * the task to `NEEDS_HUMAN`. Centralised here so neither the source
+ * module nor its unit tests carry the bare numeric literal.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/021-merge-modes-failure-classification.md ADR-021}.
+ */
+export const HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
+
+/**
+ * HTTP `409 Conflict` — returned by GitHub's merge endpoint when the
+ * caller passed a `sha` that no longer matches the PR's head (a fresh
+ * commit landed between read and merge). Treated the same as `405` by
+ * the supervisor: the task escalates to `NEEDS_HUMAN` because the
+ * underlying state needs an operator's eyes before another merge
+ * attempt.
+ *
+ * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/021-merge-modes-failure-classification.md ADR-021}.
+ */
+export const HTTP_STATUS_CONFLICT = 409;

@@ -256,6 +256,11 @@ Deno.test(
         cloneUrlFor: () => rig.source.url,
         clock: rig.clock,
         randomSource: new FixedRandomSource(),
+        // Preserve the worktree across the happy path so the
+        // `Deno.stat(worktreePath)` assertion below still passes.
+        // Cleanup behaviour (default: tear down on merge) has its
+        // own dedicated coverage in `tests/unit/merge_modes_test.ts`.
+        preserveWorktreeOnMerge: true,
       });
 
       const finalTask = await supervisor.start({
