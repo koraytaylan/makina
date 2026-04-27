@@ -153,11 +153,16 @@ Deno.test("main.ts daemon: expands ~/ in daemon.socketPath before binding", asyn
       spawnEnv.DENO_DIR = denoDir;
     } else {
       // No explicit DENO_DIR: Deno's default lives under the parent's
-      // HOME, so we must reach for the parent's HOME too. Read it once
-      // and pin it.
+      // HOME, but the path is platform-specific:
+      //   darwin: ~/Library/Caches/deno
+      //   linux:  ~/.cache/deno
+      // Branch on Deno.build.os so CI runners on Linux (where DENO_DIR
+      // is also typically unset) point at the correct cache location.
       const parentHome = Deno.env.get("HOME");
       if (parentHome !== undefined) {
-        spawnEnv.DENO_DIR = `${parentHome}/Library/Caches/deno`;
+        spawnEnv.DENO_DIR = Deno.build.os === "darwin"
+          ? `${parentHome}/Library/Caches/deno`
+          : `${parentHome}/.cache/deno`;
       }
     }
     // PATH and friends are needed for Deno itself to locate sub-tools;
