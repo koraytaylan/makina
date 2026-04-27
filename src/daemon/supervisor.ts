@@ -840,7 +840,8 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       return await fail(
         current,
         new Error(
-          "STABILIZING/CI requires a StabilizeGitHubClient (listCheckRuns / getCheckRunLogs); " +
+          "STABILIZING/CI requires a StabilizeGitHubClient " +
+            "(listCheckRuns / getCheckRunLogs / listReviews / listReviewComments); " +
             "supervisor was constructed with a plain GitHubClient",
         ),
         "ci-precondition",
@@ -935,88 +936,120 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     return await new Promise<TerminalCiPollOutcome>((resolve) => {
       let settled = false;
       let consecutiveErrors = 0;
-      const handle = poller.poll<CiPollOutcome>({
-        taskId: task.id,
-        intervalMilliseconds: pollIntervalMilliseconds,
-        fetcher: async (): Promise<CiPollOutcome> => {
-          const status = await client.getCombinedStatus(task.repo, headSha);
-          publish(opts.eventBus, {
-            taskId: task.id,
-            atIso: clock.nowIso(),
-            kind: "github-call",
-            data: {
-              method: "GET",
-              endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/status",
-            },
-          });
-          if (status.state === "pending") {
-            return { kind: "pending" };
-          }
-          if (status.state === "success") {
-            return { kind: "green" };
-          }
-          // failure / error: read the per-check breakdown so we can
-          // surface failing job ids to the caller.
-          const checkRuns = await client.listCheckRuns(task.repo, headSha);
-          publish(opts.eventBus, {
-            taskId: task.id,
-            atIso: clock.nowIso(),
-            kind: "github-call",
-            data: {
-              method: "GET",
-              endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/check-runs",
-            },
-          });
-          return {
-            kind: "red",
-            failingChecks: checkRuns.filter(isFailedCheckRun),
-          };
-        },
-        onResult: (result) => {
-          if (settled) return;
-          // Any successful fetcher resolution clears the error budget —
-          // the poller's own bookkeeping does the same on its
-          // exponential-backoff series, but we mirror it here so the
-          // CI-level threshold below tracks *consecutive* fetcher
-          // failures, not lifetime ones.
-          consecutiveErrors = 0;
-          if (result.kind === "pending") {
-            return; // keep polling
-          }
-          if (result.kind === "fatal") {
-            // The fetcher itself does not produce fatal outcomes (those
-            // arrive through `onError`); the discriminant exists so the
-            // caller can surface a uniform shape.
-            return;
-          }
-          settled = true;
-          handle.cancel();
-          resolve(result);
-        },
-        onError: (error: unknown) => {
-          if (settled) return;
-          if (error instanceof PollerError && error.kind === "fatal") {
+      // `poller.poll(...)` validates `intervalMilliseconds` synchronously
+      // (see `poller.ts:411-415` — non-finite values throw `RangeError`).
+      // Without this guard the throw would bypass the `{ kind: "fatal" }`
+      // outcome path and bubble out of the surrounding `runStabilizeCi`,
+      // skipping the FAILED transition that downstream observers (the
+      // TUI, integration tests) depend on. Catch and resolve as fatal
+      // instead so every exit from `pollCiOnce` flows through the same
+      // discriminated outcome shape.
+      let handle: { cancel(): void };
+      try {
+        handle = poller.poll<CiPollOutcome>({
+          taskId: task.id,
+          intervalMilliseconds: pollIntervalMilliseconds,
+          fetcher: async (): Promise<CiPollOutcome> => {
+            const status = await client.getCombinedStatus(task.repo, headSha);
+            publish(opts.eventBus, {
+              taskId: task.id,
+              atIso: clock.nowIso(),
+              kind: "github-call",
+              data: {
+                method: "GET",
+                endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/status",
+              },
+            });
+            if (status.state === "pending") {
+              return { kind: "pending" };
+            }
+            if (status.state === "success") {
+              return { kind: "green" };
+            }
+            // failure / error: read the per-check breakdown so we can
+            // surface failing job ids to the caller.
+            const checkRuns = await client.listCheckRuns(task.repo, headSha);
+            publish(opts.eventBus, {
+              taskId: task.id,
+              atIso: clock.nowIso(),
+              kind: "github-call",
+              data: {
+                method: "GET",
+                endpoint: "GET /repos/{owner}/{repo}/commits/{ref}/check-runs",
+              },
+            });
+            return {
+              kind: "red",
+              failingChecks: checkRuns.filter(isFailedCheckRun),
+            };
+          },
+          onResult: (result) => {
+            if (settled) return;
+            // Any successful fetcher resolution clears the error budget —
+            // the poller's own bookkeeping does the same on its
+            // exponential-backoff series, but we mirror it here so the
+            // CI-level threshold below tracks *consecutive* fetcher
+            // failures, not lifetime ones.
+            consecutiveErrors = 0;
+            if (result.kind === "pending") {
+              return; // keep polling
+            }
+            if (result.kind === "fatal") {
+              // The fetcher itself does not produce fatal outcomes (those
+              // arrive through `onError`); the discriminant exists so the
+              // caller can surface a uniform shape.
+              return;
+            }
             settled = true;
             handle.cancel();
-            resolve({ kind: "fatal", error });
-            return;
-          }
-          // Transient errors and rate-limit waits stay inside the poll
-          // loop — the poller's exponential backoff handles them. We
-          // keep an additional CI-level counter that bails out if the
-          // fetcher rejects `STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS`
-          // times in a row; without it, an oblivious test (or a real
-          // outage that flips every retry into a rejection) would loop
-          // forever even after the poller's backoff saturates at the
-          // upper bound.
-          consecutiveErrors += 1;
-          if (consecutiveErrors >= STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS) {
-            settled = true;
-            handle.cancel();
-            resolve({ kind: "fatal", error });
-          }
-        },
-      });
+            resolve(result);
+          },
+          onError: (error: unknown) => {
+            if (settled) return;
+            if (error instanceof PollerError && error.kind === "fatal") {
+              settled = true;
+              handle.cancel();
+              resolve({ kind: "fatal", error });
+              return;
+            }
+            // `PollerError(kind: "rate-limited")` is a normal control-flow
+            // signal: the fetcher is telling the poller "skip ahead, don't
+            // retry-storm". The poller itself does **not** count it as a
+            // failure for backoff bookkeeping (see `poller.ts:553-577`).
+            // Mirror that here: counting rate-limited tickets toward the
+            // CI-level fatal threshold would let a sustained rate-limit
+            // (which is recoverable) trip `STABILIZE_CI_MAX_CONSECUTIVE_
+            // FETCHER_ERRORS` even though no fetcher error actually
+            // occurred. Reset the counter — a rate-limited tick is a
+            // success-shaped event, not a failure.
+            if (error instanceof PollerError && error.kind === "rate-limited") {
+              consecutiveErrors = 0;
+              return;
+            }
+            // Transient errors stay inside the poll loop — the poller's
+            // exponential backoff handles them. We keep an additional
+            // CI-level counter that bails out if the fetcher rejects
+            // `STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS` times in a
+            // row; without it, an oblivious test (or a real outage that
+            // flips every retry into a rejection) would loop forever even
+            // after the poller's backoff saturates at the upper bound.
+            consecutiveErrors += 1;
+            if (consecutiveErrors >= STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS) {
+              settled = true;
+              handle.cancel();
+              resolve({ kind: "fatal", error });
+            }
+          },
+        });
+      } catch (error) {
+        // Synchronous throw from `poller.poll(...)` — currently only the
+        // `intervalMilliseconds` finite-number guard. Surface it through
+        // the same fatal outcome shape the async paths use so the caller
+        // (`runStabilizeCi`) transitions the task to FAILED rather than
+        // letting the error escape upward.
+        resolve({ kind: "fatal", error });
+        return;
+      }
     });
   }
 
@@ -1049,7 +1082,10 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
             endpoint: "GET /repos/{owner}/{repo}/check-runs/{check_run_id}/logs",
           },
         });
-        logsByJob.set(check.id, trimLogToBudget(decodeUtf8Lossy(bytes), ciLogBudgetBytes));
+        logsByJob.set(
+          check.id,
+          trimLogToBudget(await decodeCheckRunLogs(bytes), ciLogBudgetBytes),
+        );
       } catch (error) {
         // Don't abort the whole CI iteration when a single log fetch
         // fails — surface the failure on the bus and replace the
@@ -1484,7 +1520,9 @@ export type TerminalCiPollOutcome = Exclude<CiPollOutcome, { kind: "pending" }>;
 
 /**
  * Narrow `client` to the {@link StabilizeGitHubClient} extension if it
- * implements the four CI-phase methods, otherwise return `undefined`.
+ * implements the four stabilize-phase methods (`listCheckRuns`,
+ * `getCheckRunLogs`, `listReviews`, `listReviewComments`), otherwise
+ * return `undefined`.
  *
  * The supervisor's W1 contract is the narrower {@link GitHubClient};
  * the stabilize phases need the additive surface. We feature-detect
@@ -1528,17 +1566,230 @@ function isFailedCheckRun(check: CheckRunSummary): boolean {
 /**
  * Decode `bytes` as UTF-8, replacing malformed sequences with U+FFFD.
  *
- * GitHub returns check-run logs as a ZIP whose extracted entries are
- * UTF-8 text, but real-world logs occasionally contain stray bytes
- * (terminal escapes, cropped surrogate pairs). The lossy decode keeps
- * the supervisor robust against pathological inputs without requiring
- * a streaming UTF-8 validator.
+ * Used for already-extracted text content. The lossy decode keeps the
+ * supervisor robust against pathological inputs (terminal escapes,
+ * cropped surrogate pairs) without requiring a streaming UTF-8
+ * validator.
  *
- * @param bytes Raw log bytes.
+ * @param bytes Raw text bytes.
  * @returns UTF-8 string with malformed sequences replaced.
  */
 function decodeUtf8Lossy(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+/** First two bytes of every ZIP signature: `P` `K`. */
+const ZIP_MAGIC_P = 0x50;
+const ZIP_MAGIC_K = 0x4b;
+/** End-of-central-directory record size, excluding the variable comment. */
+const EOCD_FIXED_SIZE = 22;
+/** Maximum size of the optional EOCD comment, per the ZIP spec. */
+const EOCD_MAX_COMMENT = 0xffff;
+/** Central-directory file-header signature (little-endian `PK\x01\x02`). */
+const CDFH_SIGNATURE = 0x02014b50;
+/** End-of-central-directory record signature (little-endian `PK\x05\x06`). */
+const EOCD_SIGNATURE = 0x06054b50;
+
+/**
+ * Detect a ZIP container by its `PK` magic prefix. The full signature
+ * test is deferred to {@link extractZipEntriesAsText}; this is a fast
+ * pre-check that lets us pass already-extracted text through unchanged
+ * (the test doubles in `tests/helpers/in_memory_github_client.ts` queue
+ * raw text bytes rather than building real ZIPs).
+ */
+function looksLikeZip(bytes: Uint8Array): boolean {
+  return bytes.length >= 4 && bytes[0] === ZIP_MAGIC_P && bytes[1] === ZIP_MAGIC_K;
+}
+
+/**
+ * Decode a check-run logs payload to readable text.
+ *
+ * `GitHubClientImpl.getCheckRunLogs` returns the raw `application/zip`
+ * bytes the GitHub API hands back (see ADR-022). This function:
+ *
+ *  1. Inspects the magic prefix. Non-ZIP byte streams (the in-memory
+ *     test double's pre-extracted text) are decoded as UTF-8 directly,
+ *     preserving the existing test contract.
+ *  2. For real ZIP responses, parses the central directory, decodes
+ *     each `*.txt` step-log entry through `DecompressionStream("deflate-raw")`
+ *     (or copies through verbatim for `STORED` entries), and joins
+ *     them with a `--- <path> ---` separator so the agent prompt sees
+ *     readable per-step output instead of binary gibberish.
+ *  3. Falls back to a UTF-8 decode of the raw bytes if the parse fails
+ *     mid-way — better to surface partial garbage with a warning than to
+ *     starve the agent of context entirely.
+ *
+ * The implementation intentionally avoids adding a new npm dependency
+ * (see ADR-004): the parser only handles the `STORED` and `DEFLATE`
+ * compression methods GitHub actually uses, and reads the central
+ * directory rather than streaming local file headers so we don't have
+ * to track the optional data-descriptor variant.
+ *
+ * @param bytes Raw response bytes from `getCheckRunLogs`.
+ * @returns Concatenated UTF-8 text of every text-like ZIP entry, or the
+ *   raw byte decode if the input is not a ZIP.
+ */
+export async function decodeCheckRunLogs(bytes: Uint8Array): Promise<string> {
+  if (!looksLikeZip(bytes)) {
+    return decodeUtf8Lossy(bytes);
+  }
+  try {
+    const entries = await extractZipEntriesAsText(bytes);
+    if (entries.length === 0) {
+      return decodeUtf8Lossy(bytes);
+    }
+    return entries
+      .map(({ name, text }) => `--- ${name} ---\n${text}`)
+      .join("\n");
+  } catch {
+    // Best-effort fallback: surface whatever the raw bytes decode to.
+    // The trim-to-budget step below will still cap the output, so a
+    // garbage payload cannot blow the prompt budget.
+    return decodeUtf8Lossy(bytes);
+  }
+}
+
+/**
+ * Parse a ZIP container's central directory and return every entry as
+ * UTF-8 text.
+ *
+ * Supports the two compression methods GitHub uses: method 0 (`STORED`)
+ * copies the local-header payload verbatim; method 8 (`DEFLATE`) feeds
+ * the payload through `DecompressionStream("deflate-raw")`. Other
+ * methods raise — `decodeCheckRunLogs` catches the throw and falls back
+ * to a raw-byte decode.
+ *
+ * Reads the End-of-Central-Directory (EOCD) record from the tail to
+ * locate the central directory, then walks each Central-Directory File
+ * Header (CDFH) to find local-header offsets. Reading from the central
+ * directory (rather than streaming local headers) sidesteps the
+ * optional data-descriptor variant some encoders emit after the
+ * compressed stream.
+ *
+ * @param bytes Raw ZIP archive.
+ * @returns The list of `{ name, text }` entries in central-directory
+ *   order. Empty entries (size 0) are kept so the caller can still see
+ *   the file name in the merged output.
+ * @throws If the EOCD cannot be located, the central directory walk
+ *   runs past `bytes`, or an entry uses an unsupported compression
+ *   method.
+ */
+async function extractZipEntriesAsText(
+  bytes: Uint8Array,
+): Promise<readonly { readonly name: string; readonly text: string }[]> {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const eocdOffset = findEocdOffset(view);
+  if (eocdOffset === -1) {
+    throw new Error("ZIP: end-of-central-directory record not found");
+  }
+  const totalEntries = view.getUint16(eocdOffset + 10, true);
+  const cdSize = view.getUint32(eocdOffset + 12, true);
+  const cdOffset = view.getUint32(eocdOffset + 16, true);
+  if (cdOffset + cdSize > bytes.byteLength) {
+    throw new Error("ZIP: central directory exceeds archive bounds");
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  const entries: { name: string; text: string }[] = [];
+  let cursor = cdOffset;
+  for (let i = 0; i < totalEntries; i += 1) {
+    if (cursor + 46 > bytes.byteLength) {
+      throw new Error("ZIP: central-directory entry header truncated");
+    }
+    if (view.getUint32(cursor, true) !== CDFH_SIGNATURE) {
+      throw new Error("ZIP: bad central-directory file-header signature");
+    }
+    const compressionMethod = view.getUint16(cursor + 10, true);
+    const compressedSize = view.getUint32(cursor + 20, true);
+    const nameLength = view.getUint16(cursor + 28, true);
+    const extraLength = view.getUint16(cursor + 30, true);
+    const commentLength = view.getUint16(cursor + 32, true);
+    const localHeaderOffset = view.getUint32(cursor + 42, true);
+    const nameBytes = bytes.subarray(cursor + 46, cursor + 46 + nameLength);
+    const name = decoder.decode(nameBytes);
+    cursor += 46 + nameLength + extraLength + commentLength;
+
+    // Walk the local file header to find the actual data offset (the
+    // local header has its own variable-length name + extra fields).
+    if (localHeaderOffset + 30 > bytes.byteLength) {
+      throw new Error(`ZIP: local header for "${name}" truncated`);
+    }
+    const localNameLength = view.getUint16(localHeaderOffset + 26, true);
+    const localExtraLength = view.getUint16(localHeaderOffset + 28, true);
+    const dataStart = localHeaderOffset + 30 + localNameLength + localExtraLength;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > bytes.byteLength) {
+      throw new Error(`ZIP: data for "${name}" exceeds archive bounds`);
+    }
+    if (name.endsWith("/") && compressedSize === 0) {
+      // Directory entry — skip.
+      continue;
+    }
+    const compressed = bytes.subarray(dataStart, dataEnd);
+    let raw: Uint8Array;
+    if (compressionMethod === 0) {
+      raw = compressed;
+    } else if (compressionMethod === 8) {
+      raw = await inflateRaw(compressed);
+    } else {
+      throw new Error(
+        `ZIP: unsupported compression method ${compressionMethod} for "${name}"`,
+      );
+    }
+    entries.push({ name, text: decoder.decode(raw) });
+  }
+  return entries;
+}
+
+/**
+ * Locate the End-of-Central-Directory record by scanning backwards from
+ * the tail. The record is variable-length (a trailing comment up to
+ * 64 KiB), so the spec mandates a reverse scan for its 4-byte signature.
+ */
+function findEocdOffset(view: DataView): number {
+  const end = view.byteLength;
+  const minStart = Math.max(0, end - EOCD_FIXED_SIZE - EOCD_MAX_COMMENT);
+  for (let offset = end - EOCD_FIXED_SIZE; offset >= minStart; offset -= 1) {
+    if (view.getUint32(offset, true) === EOCD_SIGNATURE) {
+      return offset;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Decompress a raw DEFLATE stream (no zlib header) using the platform's
+ * `DecompressionStream`. Deno 2 implements the WHATWG Compression
+ * Streams spec; this helper just wraps the stream pipeline so callers
+ * stay synchronous-looking.
+ */
+async function inflateRaw(compressed: Uint8Array): Promise<Uint8Array> {
+  // `Blob` types accept `BlobPart`, which (under TS lib.dom 5.5+) requires
+  // an `ArrayBuffer` rather than the broader `ArrayBufferLike` a generic
+  // `Uint8Array` exposes. Materialize a fresh `ArrayBuffer`-backed view
+  // so the Blob constructor sees a concrete buffer type.
+  const owned = new Uint8Array(compressed.byteLength);
+  owned.set(compressed);
+  const stream = new Blob([owned])
+    .stream()
+    .pipeThrough(new DecompressionStream("deflate-raw"));
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value !== undefined) {
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  }
+  const out = new Uint8Array(total);
+  let written = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, written);
+    written += chunk.byteLength;
+  }
+  return out;
 }
 
 /**

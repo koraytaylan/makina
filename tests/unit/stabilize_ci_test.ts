@@ -50,7 +50,9 @@ import {
   type TaskId,
 } from "../../src/types.ts";
 import type { CheckRunSummary, StabilizeGitHubClient } from "../../src/github/client.ts";
-import type { PollerImpl } from "../../src/daemon/poller.ts";
+import { PollerError, type PollerImpl } from "../../src/daemon/poller.ts";
+import { decodeCheckRunLogs } from "../../src/daemon/supervisor.ts";
+import { STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS } from "../../src/constants.ts";
 import { InMemoryGitHubClient } from "../helpers/in_memory_github_client.ts";
 import { MockAgentRunner } from "../helpers/mock_agent_runner.ts";
 import { STABILIZE_CI_LOG_BUDGET_BYTES } from "../../src/constants.ts";
@@ -621,3 +623,371 @@ Deno.test("stabilize CI requires a StabilizeGitHubClient and fails the task othe
   assertEquals(finalTask.state, "FAILED");
   assert(finalTask.terminalReason?.startsWith("ci-precondition:"));
 });
+
+// ---------------------------------------------------------------------------
+// Round-2 follow-ups (Copilot)
+// ---------------------------------------------------------------------------
+
+Deno.test("ci-precondition message lists every required StabilizeGitHubClient method", async () => {
+  const rig = makeRig();
+  scriptHappyPathPrefix(rig);
+  const narrow = new Proxy(rig.githubClient, {
+    get(target, prop, receiver) {
+      if (
+        prop === "listCheckRuns" || prop === "getCheckRunLogs" ||
+        prop === "listReviews" || prop === "listReviewComments"
+      ) {
+        return undefined;
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  }) as unknown as StabilizeGitHubClient;
+  const supervisor = createTaskSupervisor({
+    githubClient: narrow,
+    worktreeManager:
+      // deno-lint-ignore no-explicit-any
+      fakeWorktreeManager() as any,
+    persistence: rig.persistence,
+    eventBus: rig.bus,
+    agentRunner: rig.agentRunner,
+    cloneUrlFor: () => "file:///dev/null",
+    clock: new FixedClock(),
+    randomSource: new FixedRandomSource(),
+    poller: syncPoller(),
+    pollIntervalMilliseconds: 1,
+  });
+  const finalTask = await supervisor.start({
+    repo: makeRepoFullName("o/r"),
+    issueNumber: rig.issueNumber,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const reason = finalTask.terminalReason ?? "";
+  // Round-2: the message must enumerate the full StabilizeGitHubClient
+  // surface (four methods), matching what `asStabilizeClient` actually
+  // feature-detects. Round-1 listed only two methods, which was
+  // misleading when a partial double tripped the precondition.
+  for (const method of ["listCheckRuns", "getCheckRunLogs", "listReviews", "listReviewComments"]) {
+    assertStringIncludes(reason, method);
+  }
+});
+
+Deno.test("decodeCheckRunLogs extracts text entries from a real ZIP container", async () => {
+  // Minimal ZIP with a single STORED entry — STORED has no compression
+  // and lets the test exercise the central-directory parser without
+  // depending on a deflate fixture.
+  const zip = buildStoredZip([{ name: "0_step.txt", text: "hello world\n" }]);
+  const decoded = await decodeCheckRunLogs(zip);
+  assertStringIncludes(decoded, "--- 0_step.txt ---");
+  assertStringIncludes(decoded, "hello world");
+});
+
+Deno.test("decodeCheckRunLogs extracts a DEFLATE-compressed entry", async () => {
+  // Round-trip a known string through the platform's CompressionStream
+  // so the test does not hard-code deflate bytes.
+  const text = "deflate-compressed log line\n";
+  const compressed = await deflateRawBytes(new TextEncoder().encode(text));
+  const zip = buildDeflateZip("step.txt", compressed, text.length);
+  const decoded = await decodeCheckRunLogs(zip);
+  assertStringIncludes(decoded, "--- step.txt ---");
+  assertStringIncludes(decoded, "deflate-compressed log line");
+});
+
+Deno.test("decodeCheckRunLogs falls back to raw decode for non-ZIP bytes", async () => {
+  // The in-memory test double queues pre-extracted text bytes; this
+  // path must still pass through unchanged so existing tests do not
+  // need a ZIP fixture.
+  const decoded = await decodeCheckRunLogs(new TextEncoder().encode("plain text\n"));
+  assertEquals(decoded, "plain text\n");
+});
+
+Deno.test("decodeCheckRunLogs falls back to raw decode for malformed ZIP bytes", async () => {
+  // PK magic but truncated central directory — should not throw; the
+  // helper degrades gracefully so the agent prompt still has *some*
+  // context.
+  const truncated = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00]);
+  const decoded = await decodeCheckRunLogs(truncated);
+  // Raw UTF-8 decode of the byte garbage; just assert the call returns
+  // a string rather than throwing.
+  assertEquals(typeof decoded, "string");
+});
+
+Deno.test("stabilize CI ignores rate-limited PollerErrors when accumulating consecutive errors", async () => {
+  const rig = makeRig();
+  scriptHappyPathPrefix(rig);
+  // Fire one more rate-limited rejection than the consecutive-error
+  // threshold; if the supervisor counted them, the task would land in
+  // FAILED. With the round-2 fix it must keep going and consume the
+  // green tick that follows.
+  const rateLimitTickets = STABILIZE_CI_MAX_CONSECUTIVE_FETCHER_ERRORS + 2;
+  for (let i = 0; i < rateLimitTickets; i += 1) {
+    rig.githubClient.queueGetCombinedStatus({
+      kind: "error",
+      error: new PollerError("rate-limited", `tick ${i}`, { retryAfterMs: 1 }),
+    });
+  }
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: rig.headShas[0] ?? "sha-initial" },
+  });
+  rig.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
+  const subscription = recordEvents(rig);
+  const supervisor = makeSupervisor(rig);
+  const finalTask = await supervisor.start({
+    repo: makeRepoFullName("o/r"),
+    issueNumber: rig.issueNumber,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  subscription.unsubscribe();
+  // The supervisor reached MERGED — proving the rate-limited stream did
+  // not trip the fatal threshold.
+  assertEquals(finalTask.state, "MERGED");
+});
+
+Deno.test("stabilize CI surfaces a synchronous poller throw as a fatal outcome", async () => {
+  const rig = makeRig();
+  scriptHappyPathPrefix(rig);
+  // Replace the poller with one whose `poll()` throws synchronously
+  // (the same shape `poller.poll` itself uses for non-finite intervals
+  // per `src/daemon/poller.ts:411-415`). Without the round-2 try/catch
+  // this would bubble out of `runStabilizeCi` and skip the FAILED
+  // transition; the fix routes the throw through the discriminated
+  // outcome path.
+  const throwingPoller: PollerImpl = {
+    poll(): { cancel(): void } {
+      throw new RangeError("synthetic non-finite interval");
+    },
+  };
+  const supervisor = createTaskSupervisor({
+    githubClient: rig.githubClient,
+    worktreeManager:
+      // deno-lint-ignore no-explicit-any
+      fakeWorktreeManager() as any,
+    persistence: rig.persistence,
+    eventBus: rig.bus,
+    agentRunner: rig.agentRunner,
+    cloneUrlFor: () => "file:///dev/null",
+    clock: new FixedClock(),
+    randomSource: new FixedRandomSource(),
+    poller: throwingPoller,
+    pollIntervalMilliseconds: 1,
+  });
+  const finalTask = await supervisor.start({
+    repo: makeRepoFullName("o/r"),
+    issueNumber: rig.issueNumber,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assertEquals(finalTask.state, "FAILED");
+  assert(finalTask.terminalReason?.startsWith("ci-poll:"));
+});
+
+// ---------------------------------------------------------------------------
+// ZIP fixture helpers (round-2)
+// ---------------------------------------------------------------------------
+
+interface ZipEntry {
+  readonly name: string;
+  readonly text: string;
+}
+
+/**
+ * Build a minimal ZIP archive whose every entry uses compression
+ * method 0 (`STORED`). Enough of the spec to round-trip through the
+ * supervisor's central-directory reader; not a general-purpose ZIP
+ * encoder.
+ */
+function buildStoredZip(entries: readonly ZipEntry[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const localHeaders: Uint8Array[] = [];
+  const cdHeaders: Uint8Array[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const data = encoder.encode(entry.text);
+    const nameBytes = encoder.encode(entry.name);
+    const localHeader = buildLocalHeader({
+      compressionMethod: 0,
+      compressedSize: data.byteLength,
+      uncompressedSize: data.byteLength,
+      crc32: crc32(data),
+      nameBytes,
+    });
+    const localPayload = concat([localHeader, data]);
+    localHeaders.push(localPayload);
+    cdHeaders.push(buildCdfh({
+      compressionMethod: 0,
+      compressedSize: data.byteLength,
+      uncompressedSize: data.byteLength,
+      crc32: crc32(data),
+      nameBytes,
+      localHeaderOffset: offset,
+    }));
+    offset += localPayload.byteLength;
+  }
+  const cd = concat(cdHeaders);
+  const eocd = buildEocd({
+    totalEntries: entries.length,
+    cdSize: cd.byteLength,
+    cdOffset: offset,
+  });
+  return concat([...localHeaders, cd, eocd]);
+}
+
+/**
+ * Build a ZIP with a single DEFLATE-compressed entry. The compressed
+ * payload comes from {@link deflateRawBytes}.
+ */
+function buildDeflateZip(
+  name: string,
+  compressed: Uint8Array,
+  uncompressedSize: number,
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const nameBytes = encoder.encode(name);
+  // CRC32 is computed over the *uncompressed* data — deflate fixtures
+  // don't actually verify the CRC, but the central directory still
+  // expects a value, so use 0.
+  const crc = 0;
+  const localHeader = buildLocalHeader({
+    compressionMethod: 8,
+    compressedSize: compressed.byteLength,
+    uncompressedSize,
+    crc32: crc,
+    nameBytes,
+  });
+  const localPayload = concat([localHeader, compressed]);
+  const cdHeader = buildCdfh({
+    compressionMethod: 8,
+    compressedSize: compressed.byteLength,
+    uncompressedSize,
+    crc32: crc,
+    nameBytes,
+    localHeaderOffset: 0,
+  });
+  const eocd = buildEocd({
+    totalEntries: 1,
+    cdSize: cdHeader.byteLength,
+    cdOffset: localPayload.byteLength,
+  });
+  return concat([localPayload, cdHeader, eocd]);
+}
+
+function buildLocalHeader(args: {
+  readonly compressionMethod: number;
+  readonly compressedSize: number;
+  readonly uncompressedSize: number;
+  readonly crc32: number;
+  readonly nameBytes: Uint8Array;
+}): Uint8Array {
+  const buffer = new Uint8Array(30 + args.nameBytes.byteLength);
+  const view = new DataView(buffer.buffer);
+  view.setUint32(0, 0x04034b50, true); // local file header signature
+  view.setUint16(4, 20, true); // version needed
+  view.setUint16(6, 0, true); // gp flags
+  view.setUint16(8, args.compressionMethod, true);
+  view.setUint16(10, 0, true); // mod time
+  view.setUint16(12, 0, true); // mod date
+  view.setUint32(14, args.crc32, true);
+  view.setUint32(18, args.compressedSize, true);
+  view.setUint32(22, args.uncompressedSize, true);
+  view.setUint16(26, args.nameBytes.byteLength, true);
+  view.setUint16(28, 0, true); // extra length
+  buffer.set(args.nameBytes, 30);
+  return buffer;
+}
+
+function buildCdfh(args: {
+  readonly compressionMethod: number;
+  readonly compressedSize: number;
+  readonly uncompressedSize: number;
+  readonly crc32: number;
+  readonly nameBytes: Uint8Array;
+  readonly localHeaderOffset: number;
+}): Uint8Array {
+  const buffer = new Uint8Array(46 + args.nameBytes.byteLength);
+  const view = new DataView(buffer.buffer);
+  view.setUint32(0, 0x02014b50, true); // central-directory file header
+  view.setUint16(4, 20, true); // version made by
+  view.setUint16(6, 20, true); // version needed
+  view.setUint16(8, 0, true); // gp flags
+  view.setUint16(10, args.compressionMethod, true);
+  view.setUint16(12, 0, true);
+  view.setUint16(14, 0, true);
+  view.setUint32(16, args.crc32, true);
+  view.setUint32(20, args.compressedSize, true);
+  view.setUint32(24, args.uncompressedSize, true);
+  view.setUint16(28, args.nameBytes.byteLength, true);
+  view.setUint16(30, 0, true);
+  view.setUint16(32, 0, true);
+  view.setUint16(34, 0, true); // disk
+  view.setUint16(36, 0, true); // internal attrs
+  view.setUint32(38, 0, true); // external attrs
+  view.setUint32(42, args.localHeaderOffset, true);
+  buffer.set(args.nameBytes, 46);
+  return buffer;
+}
+
+function buildEocd(args: {
+  readonly totalEntries: number;
+  readonly cdSize: number;
+  readonly cdOffset: number;
+}): Uint8Array {
+  const buffer = new Uint8Array(22);
+  const view = new DataView(buffer.buffer);
+  view.setUint32(0, 0x06054b50, true);
+  view.setUint16(4, 0, true); // disk
+  view.setUint16(6, 0, true); // disk with CD start
+  view.setUint16(8, args.totalEntries, true);
+  view.setUint16(10, args.totalEntries, true);
+  view.setUint32(12, args.cdSize, true);
+  view.setUint32(16, args.cdOffset, true);
+  view.setUint16(20, 0, true); // comment length
+  return buffer;
+}
+
+function concat(parts: readonly Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const part of parts) total += part.byteLength;
+  const out = new Uint8Array(total);
+  let written = 0;
+  for (const part of parts) {
+    out.set(part, written);
+    written += part.byteLength;
+  }
+  return out;
+}
+
+/** CRC32 (IEEE polynomial) used by ZIP central-directory entries. */
+function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) {
+    crc ^= bytes[i] ?? 0;
+    for (let j = 0; j < 8; j += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Compress `bytes` through the platform's `CompressionStream("deflate-raw")`
+ * so the test fixture exercises the same primitive the supervisor's
+ * `inflateRaw` reads.
+ */
+async function deflateRawBytes(bytes: Uint8Array): Promise<Uint8Array> {
+  const owned = new Uint8Array(bytes.byteLength);
+  owned.set(bytes);
+  const stream = new Blob([owned])
+    .stream()
+    .pipeThrough(new CompressionStream("deflate-raw"));
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value !== undefined) {
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  }
+  return concat(chunks);
+}
