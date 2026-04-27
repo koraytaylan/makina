@@ -46,6 +46,7 @@ import {
 } from "../../src/daemon/supervisor.ts";
 import { createEventBus } from "../../src/daemon/event-bus.ts";
 import { createPersistence } from "../../src/daemon/persistence.ts";
+import type { StabilizeGitInvoker } from "../../src/daemon/stabilize.ts";
 import {
   createWorktreeManager,
   type WorktreeManagerImpl,
@@ -203,6 +204,24 @@ function scriptHappyPath(
   });
 }
 
+/**
+ * Always-clean rebase stub. The merge-modes tests exercise the supervisor's
+ * READY_TO_MERGE branches; the stabilize-rebase phase has its own dedicated
+ * coverage in `tests/unit/stabilize_rebase_test.ts`. We short-circuit the
+ * three calls a clean rebase makes — fetch, rev-parse, and rebase — so the
+ * merge-mode tests reach READY_TO_MERGE without needing a real worktree.
+ */
+const ALWAYS_CLEAN_REBASE_INVOKER: StabilizeGitInvoker = (args, _options) => {
+  if (args[0] === "rev-parse") {
+    return Promise.resolve({
+      exitCode: 0,
+      stdout: "deadbeefcafebabe0123456789abcdef01234567\n",
+      stderr: "",
+    });
+  }
+  return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+};
+
 function buildSupervisor(
   rig: MergeModesRig,
   preserveWorktreeOnMerge: boolean,
@@ -222,6 +241,7 @@ function buildSupervisor(
     clock: new DeterministicClock(),
     randomSource: new FixedRandomSource(),
     preserveWorktreeOnMerge,
+    gitInvoker: ALWAYS_CLEAN_REBASE_INVOKER,
   });
 }
 
