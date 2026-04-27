@@ -9,13 +9,15 @@
  * Wave 4 fills in the three `STABILIZING` sub-phases — `REBASE` (#15),
  * `CI` (#16), and `CONVERSATIONS` (#17). This file ships the
  * conversations phase as the first non-stub Wave 4 implementation:
- * `runConversationsPhase` polls `listReviews` + `listReviewComments`
- * via the injected {@link PollerImpl}, groups new comments by review
- * thread, dispatches the agent runner, then resolves each thread via
- * GraphQL `resolveReviewThread` and re-requests Copilot review on
- * every push (per ADR-020). REBASE and CI remain stubs that emit a
- * single `state-changed` event each so the observable timeline stays
- * `REBASE → CI → CONVERSATIONS`.
+ * `runConversationsPhase` polls `listReviews`, `listReviewComments`,
+ * and `listReviewThreads` via the injected {@link PollerImpl}, joins
+ * the REST comments with the GraphQL threads payload to populate
+ * {@link PullRequestReviewComment.threadNodeId}, groups the new
+ * comments by review thread, dispatches the agent runner, then
+ * resolves each thread via GraphQL `resolveReviewThread` and
+ * re-requests Copilot review on every push (per ADR-020). REBASE and
+ * CI remain stubs that emit a single `state-changed` event each so the
+ * observable timeline stays `REBASE → CI → CONVERSATIONS`.
  *
  * **Invariants the FSM upholds.**
  *
@@ -86,6 +88,7 @@ import {
 import {
   type PullRequestReview,
   type PullRequestReviewComment,
+  type PullRequestReviewThread,
   type StabilizeGitHubClient,
 } from "../github/client.ts";
 import { createPoller, type PollerImpl } from "./poller.ts";
@@ -738,9 +741,12 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    *
    * One iteration:
    *
-   *  1. Poll {@link StabilizeGitHubClient.listReviews} +
-   *     {@link StabilizeGitHubClient.listReviewComments} for the task's
-   *     PR, via the injected {@link PollerImpl}.
+   *  1. Poll {@link StabilizeGitHubClient.listReviews},
+   *     {@link StabilizeGitHubClient.listReviewComments}, and
+   *     {@link StabilizeGitHubClient.listReviewThreads} for the task's
+   *     PR, via the injected {@link PollerImpl}, then join the comments
+   *     with the threads payload to populate
+   *     {@link PullRequestReviewComment.threadNodeId}.
    *  2. Filter to comments whose `createdAtIso` is strictly newer than
    *     the task's `lastReviewAtIso` watermark.
    *  3. If new comments are present: group them by review thread,
@@ -773,7 +779,8 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       return await fail(
         task,
         new Error(
-          "CONVERSATIONS requires a StabilizeGitHubClient (listReviews/listReviewComments)",
+          "CONVERSATIONS requires a StabilizeGitHubClient " +
+            "(listReviews/listReviewComments/listReviewThreads/resolveReviewThread)",
         ),
         "conversations-precondition",
       );
@@ -910,6 +917,19 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    * to fire back-to-back. A `PollerError(kind: "fatal")` propagates as
    * a regular rejection — the loop's caller absorbs it into a `FAILED`
    * transition.
+   *
+   * **Thread-id join.** GitHub's REST Pulls Comments API does not
+   * expose the GraphQL thread node id that
+   * {@link StabilizeGitHubClient.resolveReviewThread} requires. The
+   * fetcher fans out three calls in parallel — `listReviews`,
+   * `listReviewComments`, `listReviewThreads` — and merges the threads
+   * payload onto each comment by joining on the REST comment id. A
+   * comment that pre-carries `threadNodeId` (e.g. seeded by a unit
+   * test) keeps its existing value; only comments with `undefined`
+   * are filled in from the join. Comments left without a thread mapping
+   * stay {@link PullRequestReviewComment.threadNodeId | undefined} and
+   * are skipped by `resolveAddressedThreads` — the documented "thread
+   * not GraphQL-addressable yet" branch.
    */
   function runConversationsPoll(
     stabilizeClient: StabilizeGitHubClient,
@@ -918,47 +938,45 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     pullRequestNumber: IssueNumber,
   ): Promise<ConversationsPollResult> {
     return new Promise<ConversationsPollResult>((resolve, reject) => {
+      // The poller's `runLoop` always `await`s the fetcher before
+      // invoking `onResult`/`onError`, so the callbacks cannot fire
+      // synchronously inside `poll(...)`. We can therefore capture the
+      // handle directly from the return value and call `handle.cancel()`
+      // straight from the callbacks. Re-entry is still defended via
+      // `settled` (the poller's cancel is best-effort, and a second
+      // tick that landed before our cancel propagated would otherwise
+      // race the `resolve`/`reject`).
       let settled = false;
-      // The handle reference is captured *after* `poll(...)` returns,
-      // but the success/error callbacks may fire synchronously inside
-      // `poll(...)` if the fetcher resolves before the next microtask.
-      // We therefore wire the cancel call through a deferred reference
-      // so the handlers can cancel the prior tick once they have decided.
-      let handle: { cancel(): void } | undefined;
-      const cancel = (): void => {
-        if (handle !== undefined) {
-          handle.cancel();
-          handle = undefined;
-        }
-      };
-      handle = poller.poll<ConversationsPollResult>({
+      const handle = poller.poll<ConversationsPollResult>({
         taskId,
         intervalMilliseconds: pollIntervalMilliseconds,
         fetcher: async () => {
-          const [reviews, comments] = await Promise.all([
+          const [reviews, comments, threads] = await Promise.all([
             stabilizeClient.listReviews(repo, pullRequestNumber),
             stabilizeClient.listReviewComments(repo, pullRequestNumber),
+            stabilizeClient.listReviewThreads(repo, pullRequestNumber),
           ]);
-          const latestCreatedAtIso = latestCommentTimestamp(comments);
+          const enriched = joinCommentsWithThreads(comments, threads);
+          const latestCreatedAtIso = latestCommentTimestamp(enriched);
           // `exactOptionalPropertyTypes` forbids assigning a literal
           // `undefined` to an optional field; project the result with
           // an explicit shape that omits the key when there is no
           // latest timestamp to share.
           const projected: ConversationsPollResult = latestCreatedAtIso === undefined
-            ? { reviews, comments }
-            : { reviews, comments, latestCreatedAtIso };
+            ? { reviews, comments: enriched }
+            : { reviews, comments: enriched, latestCreatedAtIso };
           return projected;
         },
         onResult: (result) => {
           if (settled) return;
           settled = true;
-          cancel();
+          handle.cancel();
           resolve(result);
         },
         onError: (error) => {
           if (settled) return;
           settled = true;
-          cancel();
+          handle.cancel();
           reject(error);
         },
       });
@@ -1517,6 +1535,62 @@ export function latestCommentTimestamp(
 }
 
 /**
+ * Stamp each comment in `comments` with the GraphQL
+ * {@link PullRequestReviewComment.threadNodeId} sourced from `threads`.
+ *
+ * GitHub's REST Pulls Comments API does not expose the GraphQL thread
+ * node id that {@link StabilizeGitHubClient.resolveReviewThread}
+ * requires. The supervisor calls
+ * {@link StabilizeGitHubClient.listReviewThreads} alongside
+ * `listReviewComments` and uses this helper to join the two on the REST
+ * comment id. A comment that already carries a `threadNodeId` (e.g.
+ * supplied directly by a test fixture or a future client that augments
+ * the REST listing itself) keeps its existing value — the join only
+ * fills `undefined` slots so callers can layer their own mapping on top
+ * if they ever need to. A comment with no matching thread stays
+ * `threadNodeId: undefined`; the conversations phase treats that as
+ * "thread not GraphQL-addressable yet" and skips the resolve call.
+ *
+ * Exported so unit tests can pin the join behavior independently of the
+ * supervisor's poll wiring.
+ *
+ * @param comments REST review comments, in their original order.
+ * @param threads GraphQL review threads, each carrying the REST comment
+ *   ids it covers.
+ * @returns A new array of comments with `threadNodeId` populated where
+ *   the join could supply one.
+ */
+export function joinCommentsWithThreads(
+  comments: readonly PullRequestReviewComment[],
+  threads: readonly PullRequestReviewThread[],
+): readonly PullRequestReviewComment[] {
+  if (comments.length === 0) return [];
+  // Build the join index up front — `O(threads * commentIds)` once, then
+  // `O(1)` per comment. The map's value is the first thread id seen for
+  // each comment id; in practice GitHub guarantees a comment belongs to
+  // at most one thread, but the deterministic "first wins" rule makes
+  // the behavior robust to a malformed payload.
+  const commentToThread = new Map<number, string>();
+  for (const thread of threads) {
+    for (const commentId of thread.commentIds) {
+      if (!commentToThread.has(commentId)) {
+        commentToThread.set(commentId, thread.id);
+      }
+    }
+  }
+  return comments.map((comment) => {
+    if (comment.threadNodeId !== undefined) {
+      // Test seam / future augmentation already supplied a thread id;
+      // do not overwrite it.
+      return comment;
+    }
+    const threadId = commentToThread.get(comment.id);
+    if (threadId === undefined) return comment;
+    return { ...comment, threadNodeId: threadId };
+  });
+}
+
+/**
  * Narrow a {@link GitHubClient} to a {@link StabilizeGitHubClient}.
  *
  * The supervisor accepts the W1 `GitHubClient` contract on
@@ -1530,6 +1604,7 @@ function isStabilizeClient(client: GitHubClient): client is StabilizeGitHubClien
   const candidate = client as Partial<StabilizeGitHubClient>;
   return typeof candidate.listReviews === "function" &&
     typeof candidate.listReviewComments === "function" &&
+    typeof candidate.listReviewThreads === "function" &&
     typeof candidate.resolveReviewThread === "function";
 }
 

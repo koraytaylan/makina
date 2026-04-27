@@ -27,6 +27,7 @@ import {
   type CheckRunSummary,
   type PullRequestReview,
   type PullRequestReviewComment,
+  type PullRequestReviewThread,
   type StabilizeGitHubClient,
 } from "../../src/github/client.ts";
 
@@ -92,6 +93,11 @@ export type RecordedCall =
     readonly pullRequestNumber: IssueNumber;
   }
   | {
+    readonly method: "listReviewThreads";
+    readonly repo: RepoFullName;
+    readonly pullRequestNumber: IssueNumber;
+  }
+  | {
     readonly method: "resolveReviewThread";
     readonly threadId: string;
   }
@@ -111,6 +117,7 @@ interface MethodTimelines {
   getCheckRunLogs: ScriptedReply<Uint8Array>[];
   listReviews: ScriptedReply<readonly PullRequestReview[]>[];
   listReviewComments: ScriptedReply<readonly PullRequestReviewComment[]>[];
+  listReviewThreads: ScriptedReply<readonly PullRequestReviewThread[]>[];
   resolveReviewThread: ScriptedReply<void>[];
   mergePullRequest: ScriptedReply<void>[];
 }
@@ -142,6 +149,7 @@ export class InMemoryGitHubClient implements StabilizeGitHubClient {
     getCheckRunLogs: [],
     listReviews: [],
     listReviewComments: [],
+    listReviewThreads: [],
     resolveReviewThread: [],
     mergePullRequest: [],
   };
@@ -218,6 +226,28 @@ export class InMemoryGitHubClient implements StabilizeGitHubClient {
     reply: ScriptedReply<readonly PullRequestReviewComment[]>,
   ): void {
     this.timelines.listReviewComments.push(reply);
+  }
+
+  /**
+   * Queue the next reply for
+   * {@link InMemoryGitHubClient.listReviewThreads}.
+   *
+   * Tests that exercise the conversations phase against this double
+   * usually queue a `listReviewThreads` reply alongside their
+   * `listReviewComments` reply: the supervisor calls both per tick and
+   * joins them on comment id to populate
+   * {@link PullRequestReviewComment.threadNodeId}. When a test omits
+   * this queue entirely the double's `listReviewThreads` returns the
+   * empty array (see the implementation below), preserving the
+   * pre-existing behavior where `threadNodeId` was set directly on the
+   * scripted comment payload.
+   *
+   * @param reply The next scripted reply.
+   */
+  queueListReviewThreads(
+    reply: ScriptedReply<readonly PullRequestReviewThread[]>,
+  ): void {
+    this.timelines.listReviewThreads.push(reply);
   }
 
   /**
@@ -321,6 +351,38 @@ export class InMemoryGitHubClient implements StabilizeGitHubClient {
       this.timelines.listReviewComments,
       "listReviewComments",
     );
+  }
+
+  /**
+   * {@inheritdoc StabilizeGitHubClient.listReviewThreads}
+   *
+   * Unlike the other timelines, `listReviewThreads` returns the empty
+   * array (rather than throwing) when the queue is empty. This keeps
+   * existing tests that pre-populate
+   * {@link PullRequestReviewComment.threadNodeId} directly on their
+   * scripted `listReviewComments` payload working without modification:
+   * the supervisor merges thread mappings onto comments, and an empty
+   * mapping leaves whatever the test set on the comment in place. Tests
+   * that want to exercise the join itself should call
+   * {@link InMemoryGitHubClient.queueListReviewThreads} explicitly.
+   */
+  listReviewThreads(
+    repo: RepoFullName,
+    pullRequestNumber: IssueNumber,
+  ): Promise<readonly PullRequestReviewThread[]> {
+    this.callLog.push({
+      method: "listReviewThreads",
+      repo,
+      pullRequestNumber,
+    });
+    const next = this.timelines.listReviewThreads.shift();
+    if (next === undefined) {
+      return Promise.resolve([]);
+    }
+    if (next.kind === "error") {
+      return Promise.reject(next.error);
+    }
+    return Promise.resolve(next.value);
   }
 
   /** {@inheritdoc StabilizeGitHubClient.resolveReviewThread} */

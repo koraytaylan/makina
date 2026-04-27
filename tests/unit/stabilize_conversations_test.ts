@@ -51,6 +51,7 @@ import {
   createTaskSupervisor,
   filterNewComments,
   groupCommentsByThread,
+  joinCommentsWithThreads,
   latestCommentTimestamp,
   monotonicWatermark,
   type SupervisorClock,
@@ -68,7 +69,11 @@ import {
   type TaskEvent,
   type TaskId,
 } from "../../src/types.ts";
-import { type PullRequestReview, type PullRequestReviewComment } from "../../src/github/client.ts";
+import {
+  type PullRequestReview,
+  type PullRequestReviewComment,
+  type PullRequestReviewThread,
+} from "../../src/github/client.ts";
 import { InMemoryGitHubClient, type RecordedCall } from "../helpers/in_memory_github_client.ts";
 import { MockAgentRunner } from "../helpers/mock_agent_runner.ts";
 
@@ -293,6 +298,77 @@ Deno.test("latestCommentTimestamp: finds the maximum ISO", () => {
   ];
   assertEquals(latestCommentTimestamp(comments), "2026-04-27T00:00:00Z");
 });
+
+Deno.test(
+  "joinCommentsWithThreads: stamps threadNodeId on every comment whose id appears in a thread",
+  () => {
+    const comments: PullRequestReviewComment[] = [
+      makeComment({ id: 100, createdAtIso: "2026-04-26T00:00:00Z" }),
+      makeComment({ id: 101, createdAtIso: "2026-04-26T00:01:00Z" }),
+      makeComment({ id: 200, createdAtIso: "2026-04-26T00:02:00Z" }),
+    ];
+    const threads: PullRequestReviewThread[] = [
+      { id: "PRRT_thread-A", commentIds: [100, 101] },
+      { id: "PRRT_thread-B", commentIds: [200] },
+    ];
+    const enriched = joinCommentsWithThreads(comments, threads);
+    // The join is what makes resolveReviewThread reachable in production
+    // — every comment must carry its thread node id after this call.
+    assertEquals(enriched.length, 3);
+    assertEquals(enriched[0]?.threadNodeId, "PRRT_thread-A");
+    assertEquals(enriched[1]?.threadNodeId, "PRRT_thread-A");
+    assertEquals(enriched[2]?.threadNodeId, "PRRT_thread-B");
+  },
+);
+
+Deno.test(
+  "joinCommentsWithThreads: leaves comments without a matching thread untouched (threadNodeId stays undefined)",
+  () => {
+    const comments: PullRequestReviewComment[] = [
+      makeComment({ id: 100, createdAtIso: "2026-04-26T00:00:00Z" }),
+      makeComment({ id: 999, createdAtIso: "2026-04-26T00:01:00Z" }),
+    ];
+    const threads: PullRequestReviewThread[] = [
+      { id: "PRRT_thread-A", commentIds: [100] },
+    ];
+    const enriched = joinCommentsWithThreads(comments, threads);
+    assertEquals(enriched[0]?.threadNodeId, "PRRT_thread-A");
+    // Comment 999 was not in any thread; the supervisor's
+    // `resolveAddressedThreads` will skip the resolve call for it.
+    assertEquals(enriched[1]?.threadNodeId, undefined);
+  },
+);
+
+Deno.test(
+  "joinCommentsWithThreads: preserves a pre-set threadNodeId rather than overwriting it",
+  () => {
+    const comments: PullRequestReviewComment[] = [
+      makeComment({
+        id: 100,
+        createdAtIso: "2026-04-26T00:00:00Z",
+        threadNodeId: "PRRT_pre-existing",
+      }),
+    ];
+    const threads: PullRequestReviewThread[] = [
+      // The threads payload says comment 100 belongs to a different
+      // thread; the join must not overwrite the test/test-fixture's
+      // pre-set value.
+      { id: "PRRT_other", commentIds: [100] },
+    ];
+    const enriched = joinCommentsWithThreads(comments, threads);
+    assertEquals(enriched[0]?.threadNodeId, "PRRT_pre-existing");
+  },
+);
+
+Deno.test(
+  "joinCommentsWithThreads: returns an empty array when comments are empty",
+  () => {
+    const threads: PullRequestReviewThread[] = [
+      { id: "PRRT_thread-A", commentIds: [100] },
+    ];
+    assertEquals(joinCommentsWithThreads([], threads), []);
+  },
+);
 
 Deno.test("monotonicWatermark: returns incoming when current is undefined", () => {
   assertEquals(monotonicWatermark(undefined, "2026-04-26T00:00:00Z"), "2026-04-26T00:00:00Z");
@@ -840,6 +916,107 @@ Deno.test(
       .recordedCalls()
       .filter((call) => call.method === "resolveReviewThread");
     assertEquals(resolveCalls.length, 0);
+  },
+);
+
+Deno.test(
+  "conversations: REST comments without threadNodeId are joined with listReviewThreads payload and resolved",
+  async () => {
+    // Regression test for the round-3 bug: production
+    // `GitHubClientImpl.listReviewComments()` projects from REST and
+    // never sets `PullRequestReviewComment.threadNodeId`. The supervisor
+    // must call `listReviewThreads` alongside it and join the two so
+    // the conversations phase can resolve each thread. This test pins
+    // that path: a REST listing with bare comments (no `threadNodeId`)
+    // plus a GraphQL threads payload mapping comment ids → thread node
+    // ids must produce a `resolveReviewThread` call per distinct thread.
+    const fixture = makeFixture();
+    scriptIntoStabilize(fixture);
+
+    // First poll: review + two REST comments, neither with threadNodeId
+    // pre-set (matches what the real client returns).
+    fixture.githubClient.queueListReviews({
+      kind: "value",
+      value: [
+        makeReview({
+          id: 10,
+          state: "CHANGES_REQUESTED",
+          body: "Two threads.",
+          submittedAtIso: "2026-04-26T13:00:00Z",
+        }),
+      ],
+    });
+    fixture.githubClient.queueListReviewComments({
+      kind: "value",
+      value: [
+        makeComment({
+          id: 100,
+          pullRequestReviewId: 10,
+          // Intentionally no threadNodeId — this is the production
+          // shape the real GitHubClientImpl returns.
+          createdAtIso: "2026-04-26T13:00:01Z",
+          body: "fix the rename",
+        }),
+        makeComment({
+          id: 200,
+          pullRequestReviewId: 10,
+          createdAtIso: "2026-04-26T13:00:02Z",
+          body: "extract helper",
+        }),
+      ],
+    });
+    // GraphQL threads payload maps the REST ids to thread node ids.
+    fixture.githubClient.queueListReviewThreads({
+      kind: "value",
+      value: [
+        { id: "PRRT_thread-100", commentIds: [100] },
+        { id: "PRRT_thread-200", commentIds: [200] },
+      ],
+    });
+    fixture.agentRunner.queueRun({
+      messages: [{ role: "assistant", text: "addressing review" }],
+    });
+    fixture.githubClient.queueResolveReviewThread({ kind: "value", value: undefined });
+    fixture.githubClient.queueResolveReviewThread({ kind: "value", value: undefined });
+    fixture.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+    // Second poll: empty (the agent's push made the comments stale).
+    fixture.githubClient.queueListReviews({ kind: "value", value: [] });
+    fixture.githubClient.queueListReviewComments({ kind: "value", value: [] });
+    fixture.githubClient.queueMergePullRequest({ kind: "value", value: undefined });
+
+    const finalTask = await drive(fixture);
+
+    assertEquals(finalTask.state, "MERGED");
+    // The join populated threadNodeId for both REST comments, so
+    // resolveReviewThread fires once per distinct thread node id —
+    // proving the production-shaped REST payload no longer regresses
+    // through the `threadNodeId === undefined` skip branch.
+    const resolveCalls = fixture.githubClient
+      .recordedCalls()
+      .filter(
+        (call): call is RecordedCall & { method: "resolveReviewThread" } =>
+          call.method === "resolveReviewThread",
+      );
+    assertEquals(resolveCalls.map((call) => call.threadId), [
+      "PRRT_thread-100",
+      "PRRT_thread-200",
+    ]);
+    // Both `listReviewThreads` and `listReviewComments` were called on
+    // the same poll — the join is wired through `runConversationsPoll`.
+    const calls = fixture.githubClient.recordedCalls();
+    const firstThreadsIdx = calls.findIndex(
+      (call) => call.method === "listReviewThreads",
+    );
+    const firstCommentsIdx = calls.findIndex(
+      (call) => call.method === "listReviewComments",
+    );
+    assertGreater(firstThreadsIdx, -1);
+    assertGreater(firstCommentsIdx, -1);
+    // The conversations prompt grouped by thread (the joined node ids).
+    const conversationsInvocation = fixture.agentRunner.recordedInvocations()[1];
+    assert(conversationsInvocation !== undefined);
+    assert(conversationsInvocation.prompt.includes("PRRT_thread-100"));
+    assert(conversationsInvocation.prompt.includes("PRRT_thread-200"));
   },
 );
 
