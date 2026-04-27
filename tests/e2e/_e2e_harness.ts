@@ -33,6 +33,7 @@
  * @module
  */
 
+import { expandHome } from "../../src/config/load.ts";
 import { decode, encode } from "../../src/ipc/codec.ts";
 import {
   type AckPayload,
@@ -92,6 +93,21 @@ export const E2E_REVIEW_COMMENT_ISSUE_ENV = "MAKINA_E2E_REVIEW_COMMENT_ISSUE";
  * variable directly.
  */
 export const E2E_DEFAULT_TIMEOUT_MILLISECONDS = 30 * 60 * 1_000;
+
+/**
+ * Maximum number of unmatched supervisor events the harness keeps in
+ * its in-memory queue. Beyond this size the harness drops the oldest
+ * entry and emits a single warning so the operator notices the leak.
+ *
+ * The cap exists because long-running e2e scenarios (notably the
+ * `ci_fail_recovery` loop) can emit thousands of `agent-message` and
+ * log events that no installed waiter ever consumes; without a bound
+ * the queue would grow until the test runner OOMed. 1024 is large
+ * enough that any realistic scenario sees every interesting transition
+ * without dropping it (the supervisor emits ~tens of events per FSM
+ * cycle), and small enough to keep the resident size negligible.
+ */
+export const EVENT_QUEUE_MAX = 1024;
 
 /**
  * Result of {@link checkGate}: either the gate is open with every
@@ -217,23 +233,30 @@ export function checkGate(): GateResult {
   // permissions in a test runner sandbox. The daemon will reject a
   // missing file with its own diagnostic; the e2e test will then
   // surface the failure through the listen-line wait.
+  //
+  // Expand `~/` in the private-key path so the spawned daemon's auth
+  // loader (which reads the file directly without re-expanding) does
+  // not look up the synthetic HOME we pin in {@link buildSpawnEnv}.
+  // The contract documented on the wider config-loader is "expand at
+  // the boundary"; the harness is the boundary for the synthetic
+  // config it writes.
+  const privateKeyPathRaw = Deno.env.get("MAKINA_E2E_PRIVATE_KEY_PATH") ?? "";
+  const privateKeyPath = expandHome(privateKeyPathRaw);
+  // Conditional spreads keep optional fields absent (rather than
+  // present-with-undefined) under `exactOptionalPropertyTypes: true`.
+  // The same pattern is documented on `createAppClient` in
+  // `src/github/app-client.ts`.
   const env: ResolvedE2eEnv = {
     appId,
-    privateKeyPath: Deno.env.get("MAKINA_E2E_PRIVATE_KEY_PATH") ?? "",
+    privateKeyPath,
     repo,
     installationId,
     timeoutMilliseconds,
+    ...(happyIssue !== undefined ? { happyIssue } : {}),
+    ...(ciFailIssue !== undefined ? { ciFailIssue } : {}),
+    ...(reviewCommentIssue !== undefined ? { reviewCommentIssue } : {}),
   };
-  if (happyIssue !== undefined) {
-    return {
-      mode: "run",
-      env: { ...env, happyIssue, ciFailIssue, reviewCommentIssue } as ResolvedE2eEnv,
-    };
-  }
-  return {
-    mode: "run",
-    env: { ...env, ciFailIssue, reviewCommentIssue } as ResolvedE2eEnv,
-  };
+  return { mode: "run", env };
 }
 
 /**
@@ -402,19 +425,35 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
     >();
 
     // Read loop: dispatch every decoded envelope.
+    let queueOverflowWarned = false;
     const readLoop = (async () => {
       try {
         for await (const envelope of decode(conn.readable)) {
           if (envelope.type === "event") {
-            eventQueue.push(envelope.payload as EventPayload);
+            const payload = envelope.payload as EventPayload;
+            eventQueue.push(payload);
+            // Cap the queue so a long-running scenario whose installed
+            // waiters do not match every emitted event cannot OOM the
+            // runner. Drop the oldest entry; warn once on the first
+            // overflow so the operator can size up if a real scenario
+            // is losing a transition it cared about.
+            while (eventQueue.length > EVENT_QUEUE_MAX) {
+              eventQueue.shift();
+              if (!queueOverflowWarned) {
+                queueOverflowWarned = true;
+                console.warn(
+                  `[e2e] eventQueue exceeded ${EVENT_QUEUE_MAX}; dropping oldest events.`,
+                );
+              }
+            }
             // Drain any waiter whose predicate now matches.
             for (let i = eventWaiters.length - 1; i >= 0; i -= 1) {
               const waiter = eventWaiters[i];
               if (waiter === undefined) continue;
-              if (waiter.predicate(envelope.payload as EventPayload)) {
+              if (waiter.predicate(payload)) {
                 clearTimeout(waiter.timer);
                 eventWaiters.splice(i, 1);
-                waiter.resolve(envelope.payload as EventPayload);
+                waiter.resolve(payload);
               }
             }
             continue;
