@@ -43,6 +43,7 @@
  * @module
  */
 
+import { getLogger } from "@std/log";
 import { dirname, join, resolve } from "@std/path";
 
 import {
@@ -51,6 +52,17 @@ import {
   type TaskId,
   type WorktreeManager,
 } from "../types.ts";
+
+/**
+ * Narrow logger surface used by the worktree manager. The `@std/log`
+ * `Logger` class satisfies this shape (its `warn` accepts a string), but
+ * the narrower interface lets tests inject a recording double without
+ * matching the SDK's full overload signature.
+ */
+export interface WorktreeManagerLogger {
+  /** Emit a warning. */
+  warn(message: string): void;
+}
 
 /** Constructor options for {@link createWorktreeManager}. */
 export interface WorktreeManagerOptions {
@@ -66,6 +78,16 @@ export interface WorktreeManagerOptions {
    * specific binary.
    */
   readonly gitBinary?: string;
+  /**
+   * Logger used for non-fatal warnings — currently only
+   * {@link WorktreeManagerImpl.pruneAll} skipping a corrupt bare directory.
+   * Defaults to `getLogger()` from `@std/log` (the default-namespace
+   * logger), adapted to the {@link WorktreeManagerLogger} surface.
+   *
+   * Tests inject a recording logger to assert warning behavior without
+   * touching the global logger registry.
+   */
+  readonly logger?: WorktreeManagerLogger;
 }
 
 /**
@@ -189,6 +211,7 @@ export function createWorktreeManager(
   }
   const workspace = opts.workspace;
   const gitBinary = opts.gitBinary ?? "git";
+  const logger = opts.logger ?? defaultLogger();
 
   const reposRoot = join(workspace, "repos");
   const worktreesRoot = join(workspace, "worktrees");
@@ -524,9 +547,26 @@ export function createWorktreeManager(
         continue;
       }
       const bareDir = join(reposRoot, entry.name);
+      // `pruneAll` is startup hygiene, called once before any worktree
+      // creation. A single corrupt entry (a partial clone that never
+      // wrote `HEAD`, or a manually-dropped `*.git` folder) must not
+      // abort pruning the rest — that would prevent the daemon from
+      // starting on an otherwise-recoverable workspace. Catch the
+      // per-directory `GitCommandError`, warn, and move on. Errors
+      // outside `runGit` (filesystem, lock primitive) still propagate.
       tasks.push(
         withRepoLock(bareDir, async () => {
-          await runGit(["worktree", "prune"], bareDir);
+          try {
+            await runGit(["worktree", "prune"], bareDir);
+          } catch (error) {
+            if (!(error instanceof GitCommandError)) {
+              throw error;
+            }
+            logger.warn(
+              `worktree-manager: skipping prune of ${bareDir} ` +
+                `(git exited ${error.exitCode}: ${error.stderr.trim()})`,
+            );
+          }
         }),
       );
     }
@@ -551,6 +591,21 @@ export function createWorktreeManager(
     pruneAll,
     registerTaskId,
     worktreePathFor,
+  };
+}
+
+/**
+ * Adapt the default-namespace `@std/log` logger to the narrow
+ * {@link WorktreeManagerLogger} surface. `getLogger()` returns a `Logger`
+ * whose `warn` overload accepts a plain string, but TypeScript needs a
+ * thin adapter to project the SDK's shape onto our interface.
+ */
+function defaultLogger(): WorktreeManagerLogger {
+  const inner = getLogger();
+  return {
+    warn(message: string): void {
+      inner.warn(message);
+    },
   };
 }
 

@@ -26,6 +26,7 @@ import {
   createWorktreeManager,
   GitCommandError,
   type WorktreeManagerImpl,
+  type WorktreeManagerLogger,
 } from "../../src/daemon/worktree-manager.ts";
 
 // ---------------------------------------------------------------------------
@@ -67,8 +68,8 @@ async function git(args: readonly string[], cwd: string): Promise<string> {
 }
 
 /**
- * Build a self-contained source repo with two commits on `main` plus a
- * second branch, then return a `file://` URL the manager can clone from.
+ * Build a self-contained source repo with two commits on `main`, then
+ * return a `file://` URL the manager can clone from.
  */
 async function makeSourceRepo(): Promise<{ dir: string; url: string }> {
   const dir = await Deno.makeTempDir({ prefix: "makina-src-" });
@@ -611,6 +612,59 @@ Deno.test("pruneAll: ignores non-bare entries beneath repos/", async () => {
     await rig.cleanup();
   }
 });
+
+Deno.test(
+  "pruneAll: tolerates a corrupt *.git directory and prunes the rest",
+  async () => {
+    // Regression: previously a single bare directory missing `HEAD` (a
+    // crashed/partial clone, or a manually-dropped folder with the `.git`
+    // suffix) made `git worktree prune` exit non-zero, the
+    // `Promise.all` fan-out rejected, and `pruneAll()` threw — which the
+    // supervisor calls during boot, so a single corrupt entry would
+    // prevent the whole daemon from starting. The fix swallows
+    // `GitCommandError` per-bare-dir, warns, and keeps going.
+    const warnings: string[] = [];
+    const recorder: WorktreeManagerLogger = {
+      warn(message) {
+        warnings.push(message);
+      },
+    };
+    const workspace = await Deno.makeTempDir({ prefix: "makina-ws-" });
+    const source = await makeSourceRepo();
+    const manager = createWorktreeManager({ workspace, logger: recorder });
+    try {
+      // Healthy repo so we can prove the loop didn't bail early.
+      const repo = makeRepoFullName("octo/widgets");
+      await manager.ensureBareClone(repo, source.url);
+      const path = await manager.createWorktreeForIssue(repo, makeIssueNumber(7));
+      await Deno.remove(path, { recursive: true });
+
+      // Sibling corrupt entry: empty `*.git/` directory with no `HEAD`,
+      // exactly what a partial clone leaves behind.
+      const brokenDir = join(workspace, "repos", "broken.git");
+      await Deno.mkdir(brokenDir, { recursive: true });
+
+      // Must not throw.
+      await manager.pruneAll();
+
+      // Healthy repo's stale metadata was still pruned.
+      const healthyBare = join(workspace, "repos", "octo__widgets.git");
+      const after = await git(["worktree", "list", "--porcelain"], healthyBare);
+      assert(!after.includes("issue-7"), "metadata cleared after prune");
+
+      // Corrupt entry produced one warning that mentions the path.
+      assertEquals(warnings.length, 1, `expected 1 warning, got ${warnings.length}`);
+      const warning = warnings[0] ?? "";
+      assert(
+        warning.includes("broken.git"),
+        `warning should mention broken.git, got: ${warning}`,
+      );
+    } finally {
+      await Deno.remove(workspace, { recursive: true });
+      await Deno.remove(source.dir, { recursive: true });
+    }
+  },
+);
 
 // ---------------------------------------------------------------------------
 // registerTaskId / worktreePathFor
