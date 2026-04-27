@@ -43,7 +43,7 @@
  * @module
  */
 
-import { dirname, join } from "@std/path";
+import { dirname, join, resolve } from "@std/path";
 
 import {
   type IssueNumber,
@@ -409,14 +409,20 @@ export function createWorktreeManager(
     // Locate the bare clone for this worktree path so we can serialize
     // against other operations on the same repo.
     const repoKey = bareCloneForWorktreePath(path);
-    // The bare clone may itself be gone (a user `rm -rf`'d the workspace,
-    // or its bookkeeping was lost). Talking to git is pointless then: the
-    // metadata to prune lives *inside* the bare clone, so its absence
-    // already means there is nothing to reclaim. Fall back to a manual rm
-    // — still bounded by the prefix guard above — so the API stays
-    // idempotent on corrupted state.
-    const bareCloneUsable = repoKey !== null && (await pathExists(join(repoKey, "HEAD")));
     await withRepoLock(repoKey ?? path, async () => {
+      // Re-check bare-clone usability *inside* the lock. A check before
+      // the lock would race against a concurrent `removeWorktree` (or an
+      // out-of-band `rm -rf`) that wipes the bare clone between the
+      // check and the locked section: we'd then take the git path and
+      // throw, breaking the idempotency guarantee. The bare clone may be
+      // gone (a user `rm -rf`'d the workspace, or its bookkeeping was
+      // lost). Talking to git is pointless then: the metadata to prune
+      // lives *inside* the bare clone, so its absence already means
+      // there is nothing to reclaim. Fall back to a manual rm — still
+      // bounded by the prefix guard above — so the API stays idempotent
+      // on corrupted state.
+      const bareCloneUsable = repoKey !== null &&
+        (await pathExists(join(repoKey, "HEAD")));
       if (!bareCloneUsable) {
         if (await pathExists(path)) {
           await Deno.remove(path, { recursive: true });
@@ -432,48 +438,74 @@ export function createWorktreeManager(
         } catch (error) {
           // If `git worktree remove` failed (e.g. because the worktree
           // metadata is corrupt), fall back to a manual rm followed by
-          // `git worktree prune` so bookkeeping stays consistent.
+          // `git worktree prune` so bookkeeping stays consistent. The
+          // prune itself is best-effort: if the bare clone vanished
+          // mid-flight we treat that as "nothing to reclaim" rather than
+          // re-throwing past the idempotency guarantee.
           if (await pathExists(path)) {
             await Deno.remove(path, { recursive: true });
           }
-          await runGit(["worktree", "prune"], bareDir);
+          if (await pathExists(join(bareDir, "HEAD"))) {
+            await runGit(["worktree", "prune"], bareDir);
+          }
           if (!(error instanceof GitCommandError)) {
             throw error;
           }
         }
       } else {
         // The directory is gone but git may still hold metadata for it.
-        await runGit(["worktree", "prune"], bareDir);
+        // Bare clone may have vanished concurrently — only prune if it's
+        // still there to be pruned.
+        if (await pathExists(join(bareDir, "HEAD"))) {
+          await runGit(["worktree", "prune"], bareDir);
+        }
       }
       taskIdToPath.delete(taskId);
     });
   }
 
   /**
-   * True when `path` sits under `<worktreesRoot>/` (with a separator) and
-   * is not equal to `worktreesRoot` itself. The check runs against the
-   * raw string — it does not resolve symlinks, so a worktree path that
-   * traverses a symlink out of the workspace is treated as in-bounds (the
-   * supervisor never creates such paths). We *only* normalize the prefix
-   * with a trailing `/` so `<worktreesRoot>foo` (no separator) is rejected.
+   * True when `path` sits strictly under `<worktreesRoot>/` after lexical
+   * normalization. We *resolve* `path` before checking — a corrupt
+   * registration like `<worktreesRoot>/repo/../../../outside` passes a raw
+   * `startsWith` test but `Deno.remove()` would happily traverse the `..`
+   * segments and wipe directories outside the workspace. Resolving first
+   * collapses the `..` so the prefix check sees the real target.
+   *
+   * The check is purely lexical (no symlink resolution): the supervisor
+   * never creates symlinked worktree paths, and a real-filesystem
+   * `realpath` would fail for paths whose leaf doesn't exist yet. The
+   * trailing-separator prefix (`<worktreesRoot>/`) keeps siblings like
+   * `<worktreesRoot>-suffix` out of bounds, and the explicit equality
+   * check rejects the root itself.
    */
   function isUnderWorktreesRoot(path: string): boolean {
-    const prefix = worktreesRoot + "/";
-    return path.startsWith(prefix);
+    const normalizedRoot = resolve(worktreesRoot);
+    const normalized = resolve(path);
+    if (normalized === normalizedRoot) {
+      return false;
+    }
+    const prefix = normalizedRoot + "/";
+    return normalized.startsWith(prefix);
   }
 
   /**
    * Recover the bare-clone path that a worktree path lives under. Returns
    * `null` if the worktree path doesn't sit under our `worktrees/` root —
-   * that shouldn't happen via the manager's own APIs, but we tolerate it
-   * to keep `removeWorktree` idempotent on weird state.
+   * that shouldn't happen via the manager's own APIs (the prefix guard in
+   * {@link isUnderWorktreesRoot} runs first), but we tolerate it to keep
+   * `removeWorktree` idempotent on weird state. We resolve `path` first
+   * for the same reason `isUnderWorktreesRoot` does: a stored path that
+   * embeds `..` segments must be normalized before we slice the slug.
    */
   function bareCloneForWorktreePath(path: string): string | null {
-    const prefix = worktreesRoot + "/";
-    if (!path.startsWith(prefix)) {
+    const normalizedRoot = resolve(worktreesRoot);
+    const normalized = resolve(path);
+    const prefix = normalizedRoot + "/";
+    if (!normalized.startsWith(prefix)) {
       return null;
     }
-    const remainder = path.slice(prefix.length);
+    const remainder = normalized.slice(prefix.length);
     const slash = remainder.indexOf("/");
     if (slash <= 0) {
       return null;

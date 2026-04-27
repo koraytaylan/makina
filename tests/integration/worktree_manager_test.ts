@@ -465,18 +465,15 @@ Deno.test(
     const sentinel = join(outside, "DO_NOT_TOUCH");
     await Deno.writeTextFile(sentinel, "evidence");
     try {
-      // Case 1: a `..`-laced path that starts under worktreesRoot but
-      // climbs out via segment traversal.
-      const traversal = join(
-        rig.workspace,
-        "worktrees",
-        "octo__widgets",
-        "..",
-        "..",
-        "..",
-        // Attempt to land inside the temp-dir hierarchy alongside the workspace.
-        "outside-target",
-      );
+      // Case 1: a raw `..`-laced path that starts under worktreesRoot
+      // but climbs out via segment traversal. Build this with string
+      // concatenation rather than `join(...)` so the literal `..`
+      // segments survive into `registerTaskId()` — `join` would
+      // normalize them away here, hiding the very bug the guard exists
+      // to catch (a corrupt persisted registration containing literal
+      // `..` segments).
+      const worktreesRoot = join(rig.workspace, "worktrees");
+      const traversal = `${worktreesRoot}/octo__widgets/../../../outside-target`;
       const tA = makeTaskId("traversal-task");
       rig.manager.registerTaskId(tA, traversal);
       await assertRejects(
