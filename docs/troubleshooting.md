@@ -44,8 +44,11 @@ Two distinct causes share this status code; check the response body to tell them
 GitHub's PR-reviewer endpoint expects the literal `Copilot` (no suffix) for the App-driven Copilot
 review feature. Some installations historically required the `[bot]` suffix (`copilot[bot]`); this
 has been observed to fail with 422 on more recent App versions. The supervisor uses the unsuffixed
-form by default; if your installation rejects it, the `github-call` event surfaces the body and an
-operator can flip the wire format via the App settings rather than the daemon.
+form, hard-coded as `COPILOT_REVIEWER_LOGIN = "Copilot"` in `src/daemon/supervisor.ts`. The form is
+not currently configurable at runtime: there is no daemon flag, App-setting toggle, or `config.json`
+key for switching it. If your installation rejects the unsuffixed form, the `github-call` event
+surfaces the response body so the operator can confirm the failure mode; making the constant
+configurable is tracked as v0.2.0 work.
 
 ### `git rebase` / `git push` fails with the wrong base branch
 

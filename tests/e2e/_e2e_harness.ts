@@ -110,6 +110,38 @@ export const E2E_DEFAULT_TIMEOUT_MILLISECONDS = 30 * 60 * 1_000;
 export const EVENT_QUEUE_MAX = 1024;
 
 /**
+ * Discriminator tags for {@link HarnessError}. Tests can pattern-match
+ * on `.kind` to distinguish a clean peer close from a decode failure
+ * without relying on message string matching.
+ */
+export type HarnessErrorKind = "connection-closed";
+
+/**
+ * Typed error raised by the harness when an internal invariant
+ * surfaces. Currently carries a single `kind` discriminator
+ * (`"connection-closed"`) so the regression test for the read-loop
+ * clean-close path can assert against the cause without parsing the
+ * message; future kinds can be added without breaking the existing
+ * surface.
+ */
+export class HarnessError extends Error {
+  /** Tag identifying which invariant surfaced the error. */
+  readonly kind: HarnessErrorKind;
+
+  /**
+   * Construct a harness error.
+   *
+   * @param kind Discriminator the test pattern-matches on.
+   * @param message Human-readable description.
+   */
+  constructor(kind: HarnessErrorKind, message: string) {
+    super(message);
+    this.name = "HarnessError";
+    this.kind = kind;
+  }
+}
+
+/**
  * Result of {@link checkGate}: either the gate is open with every
  * required variable present, or the test should skip with a message
  * naming the missing piece.
@@ -332,6 +364,16 @@ export interface Harness {
  * sandbox repo, spawns the daemon, waits for the listen line, opens a
  * client socket, and subscribes to wildcard events.
  *
+ * **Failure semantics.** If any step after the temp-dir creation
+ * fails, the catch path tears down every resource that was actually
+ * allocated before rethrowing — in order: close the client socket
+ * (if connected), `SIGTERM` the daemon child (followed by `SIGKILL`
+ * after a short grace), await `child.status` so the kernel reaps the
+ * pid, then remove the temp dir. Each step is wrapped so a failure
+ * in one (e.g. socket already closed) does not prevent the others.
+ * The original error is rethrown unchanged so the test sees the same
+ * diagnostic it would have on a normal failure path.
+ *
  * @param env The resolved environment (see {@link checkGate}).
  * @returns A {@link Harness} whose `cleanup` must be awaited from the
  *   caller's `finally`.
@@ -350,6 +392,12 @@ export interface Harness {
  */
 export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
   const home = await Deno.makeTempDir({ dir: "/tmp", prefix: "makina-e2e-" });
+  // Track partially-allocated resources so the catch path can release
+  // every one that was actually opened. `child` and `conn` are
+  // assigned mid-try; the catch reads what's set and tears down each
+  // independently so a failure in one step does not strand the others.
+  let child: Deno.ChildProcess | undefined;
+  let conn: Deno.UnixConn | undefined;
   try {
     const configDir = Deno.build.os === "darwin"
       ? `${home}/Library/Application Support/makina`
@@ -395,7 +443,7 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
       stderr: "piped",
       stdin: "null",
     });
-    const child = command.spawn();
+    child = command.spawn();
 
     await waitForListenLine(child.stderr, 30_000);
 
@@ -410,7 +458,7 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }
-    const conn = await Deno.connect({ transport: "unix", path: socketPath });
+    conn = await Deno.connect({ transport: "unix", path: socketPath });
     const writer = conn.writable.getWriter();
     const eventQueue: EventPayload[] = [];
     const eventWaiters: Array<{
@@ -425,56 +473,12 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
     >();
 
     // Read loop: dispatch every decoded envelope.
-    let queueOverflowWarned = false;
-    const readLoop = (async () => {
-      try {
-        for await (const envelope of decode(conn.readable)) {
-          if (envelope.type === "event") {
-            const payload = envelope.payload as EventPayload;
-            eventQueue.push(payload);
-            // Cap the queue so a long-running scenario whose installed
-            // waiters do not match every emitted event cannot OOM the
-            // runner. Drop the oldest entry; warn once on the first
-            // overflow so the operator can size up if a real scenario
-            // is losing a transition it cared about.
-            while (eventQueue.length > EVENT_QUEUE_MAX) {
-              eventQueue.shift();
-              if (!queueOverflowWarned) {
-                queueOverflowWarned = true;
-                console.warn(
-                  `[e2e] eventQueue exceeded ${EVENT_QUEUE_MAX}; dropping oldest events.`,
-                );
-              }
-            }
-            // Drain any waiter whose predicate now matches.
-            for (let i = eventWaiters.length - 1; i >= 0; i -= 1) {
-              const waiter = eventWaiters[i];
-              if (waiter === undefined) continue;
-              if (waiter.predicate(payload)) {
-                clearTimeout(waiter.timer);
-                eventWaiters.splice(i, 1);
-                waiter.resolve(payload);
-              }
-            }
-            continue;
-          }
-          const slot = replyWaiters.get(envelope.id);
-          if (slot !== undefined) {
-            replyWaiters.delete(envelope.id);
-            slot.resolve(envelope);
-          }
-        }
-      } catch (error) {
-        const cause = error instanceof Error ? error : new Error(String(error));
-        for (const slot of replyWaiters.values()) slot.reject(cause);
-        replyWaiters.clear();
-        for (const waiter of eventWaiters) {
-          clearTimeout(waiter.timer);
-          waiter.reject(cause);
-        }
-        eventWaiters.length = 0;
-      }
-    })();
+    const readLoop = runHarnessReadLoop({
+      readable: conn.readable,
+      eventQueue,
+      eventWaiters,
+      replyWaiters,
+    });
 
     const send = async (envelope: MessageEnvelope): Promise<MessageEnvelope> => {
       if (replyWaiters.has(envelope.id)) {
@@ -528,6 +532,11 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
       throw new Error(`harness subscribe rejected: ${ack.error ?? "(no detail)"}`);
     }
 
+    // Capture into consts so the cleanup closure narrows these to
+    // their non-undefined types (the outer `let` bindings are widened
+    // to `T | undefined` for the catch path).
+    const liveChild = child;
+    const liveConn = conn;
     let cleaned = false;
     const cleanup = async (): Promise<void> => {
       if (cleaned) return;
@@ -538,17 +547,17 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
         // Ignore.
       }
       try {
-        conn.close();
+        liveConn.close();
       } catch {
         // Ignore.
       }
       try {
-        child.kill("SIGTERM");
+        liveChild.kill("SIGTERM");
       } catch {
         // Already gone.
       }
       try {
-        await child.stderr.cancel();
+        await liveChild.stderr.cancel();
       } catch {
         // Already drained.
       }
@@ -557,16 +566,16 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
         shutdownTimer = setTimeout(resolve, 2_000);
       });
       try {
-        await Promise.race([child.status, shutdownTimeout]);
+        await Promise.race([liveChild.status, shutdownTimeout]);
       } finally {
         if (shutdownTimer !== undefined) clearTimeout(shutdownTimer);
       }
       try {
-        child.kill("SIGKILL");
+        liveChild.kill("SIGKILL");
       } catch {
         // Already gone.
       }
-      await child.status;
+      await liveChild.status;
       await readLoop;
       try {
         await Deno.remove(home, { recursive: true });
@@ -577,7 +586,7 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
     };
 
     return {
-      child,
+      child: liveChild,
       home,
       socketPath,
       repo: env.repo,
@@ -586,11 +595,64 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
       cleanup,
     };
   } catch (error) {
-    // Boot failed — make sure the temp dir is removed.
+    // Boot failed — release every resource that was actually allocated
+    // before rethrowing. Each step is wrapped so a failure in one
+    // (socket already closed, child already exited) does not prevent
+    // the others. Order:
+    //   1. Close the client socket (if connected) so the daemon's
+    //      accept loop sees the peer drop.
+    //   2. SIGTERM the daemon child (if spawned), then await its
+    //      status with a short grace before SIGKILL — we cannot
+    //      remove the temp dir while the daemon still holds open
+    //      file descriptors under it.
+    //   3. Remove the temp dir.
+    if (conn !== undefined) {
+      try {
+        conn.close();
+      } catch {
+        // Already closed (or never bound) — ignore.
+      }
+    }
+    // Bind to a const so TypeScript narrows the type across the
+    // `await` boundaries below; the outer `child` is `let`-scoped.
+    const childToKill = child;
+    if (childToKill !== undefined) {
+      try {
+        childToKill.kill("SIGTERM");
+      } catch {
+        // Already gone — ignore.
+      }
+      try {
+        await childToKill.stderr.cancel();
+      } catch {
+        // Already drained — ignore.
+      }
+      let shutdownTimer: number | undefined;
+      const shutdownTimeout = new Promise<void>((resolve) => {
+        shutdownTimer = setTimeout(resolve, 2_000);
+      });
+      try {
+        await Promise.race([childToKill.status, shutdownTimeout]);
+      } catch {
+        // Status may already have rejected — ignore.
+      } finally {
+        if (shutdownTimer !== undefined) clearTimeout(shutdownTimer);
+      }
+      try {
+        childToKill.kill("SIGKILL");
+      } catch {
+        // Already gone — ignore.
+      }
+      try {
+        await childToKill.status;
+      } catch {
+        // Already reaped — ignore.
+      }
+    }
     try {
       await Deno.remove(home, { recursive: true });
     } catch {
-      // Ignore.
+      // Best-effort: leave the dir for the operator if removal fails.
     }
     throw error;
   }
@@ -638,6 +700,137 @@ function buildSpawnEnv(fakeHome: string): Record<string, string> {
  * @param stderr The daemon's stderr stream.
  * @param timeoutMs Bound on the wait, in milliseconds.
  */
+/**
+ * Internal waiter slot for {@link runHarnessReadLoop}. Mirrors the
+ * inline shape used by {@link bootHarness}; pulled out as a named type
+ * so the harness body and the unit-test stay in lock-step.
+ *
+ * @internal
+ */
+export interface HarnessEventWaiter {
+  predicate: (event: EventPayload) => boolean;
+  resolve: (event: EventPayload) => void;
+  reject: (error: Error) => void;
+  timer: number;
+}
+
+/**
+ * Internal reply-waiter slot for {@link runHarnessReadLoop}.
+ *
+ * @internal
+ */
+export interface HarnessReplyWaiter {
+  resolve: (envelope: MessageEnvelope) => void;
+  reject: (error: Error) => void;
+}
+
+/**
+ * Dependencies the harness's read loop needs from {@link bootHarness}.
+ * Exported so a regression test can drive the loop in isolation
+ * against a synthetic readable; the production caller wires the
+ * connection's `.readable` and the same waiter collections it owns.
+ *
+ * @internal
+ */
+export interface HarnessReadLoopParams {
+  readable: ReadableStream<Uint8Array>;
+  eventQueue: EventPayload[];
+  eventWaiters: HarnessEventWaiter[];
+  replyWaiters: Map<string, HarnessReplyWaiter>;
+}
+
+/**
+ * Drive the harness's read loop against the supplied readable. On a
+ * decoded `event` envelope, push the payload onto `eventQueue`
+ * (capped at {@link EVENT_QUEUE_MAX}, oldest dropped) and notify any
+ * matching waiter. On any other envelope, resolve the matching reply
+ * waiter by id.
+ *
+ * **Termination semantics.** The loop ends in one of two ways:
+ *
+ *   1. Decode throws (malformed frame, abrupt connection reset). All
+ *      pending waiters reject with the underlying cause.
+ *   2. Decode runs to clean EOF (peer closed the socket at a frame
+ *      boundary, e.g. after a `SIGTERM`). All pending waiters reject
+ *      with {@link HarnessError}`("connection-closed", ...)` so the
+ *      caller can distinguish a clean close from a decode failure.
+ *
+ * Splitting this out of {@link bootHarness} keeps the function unit
+ * testable: the regression test in `_e2e_harness_test.ts` drives it
+ * with a synthetic Unix socket that closes after one frame and
+ * asserts the typed close error.
+ *
+ * @internal
+ */
+export function runHarnessReadLoop(params: HarnessReadLoopParams): Promise<void> {
+  const { readable, eventQueue, eventWaiters, replyWaiters } = params;
+  let queueOverflowWarned = false;
+  const rejectAllWaiters = (cause: Error): void => {
+    for (const slot of replyWaiters.values()) slot.reject(cause);
+    replyWaiters.clear();
+    for (const waiter of eventWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(cause);
+    }
+    eventWaiters.length = 0;
+  };
+  return (async () => {
+    try {
+      for await (const envelope of decode(readable)) {
+        if (envelope.type === "event") {
+          const payload = envelope.payload as EventPayload;
+          eventQueue.push(payload);
+          // Cap the queue so a long-running scenario whose installed
+          // waiters do not match every emitted event cannot OOM the
+          // runner. Drop the oldest entry; warn once on the first
+          // overflow so the operator can size up if a real scenario
+          // is losing a transition it cared about.
+          while (eventQueue.length > EVENT_QUEUE_MAX) {
+            eventQueue.shift();
+            if (!queueOverflowWarned) {
+              queueOverflowWarned = true;
+              console.warn(
+                `[e2e] eventQueue exceeded ${EVENT_QUEUE_MAX}; dropping oldest events.`,
+              );
+            }
+          }
+          // Drain any waiter whose predicate now matches.
+          for (let i = eventWaiters.length - 1; i >= 0; i -= 1) {
+            const waiter = eventWaiters[i];
+            if (waiter === undefined) continue;
+            if (waiter.predicate(payload)) {
+              clearTimeout(waiter.timer);
+              eventWaiters.splice(i, 1);
+              waiter.resolve(payload);
+            }
+          }
+          continue;
+        }
+        const slot = replyWaiters.get(envelope.id);
+        if (slot !== undefined) {
+          replyWaiters.delete(envelope.id);
+          slot.resolve(envelope);
+        }
+      }
+      // Clean EOF: the peer closed the socket at a frame boundary.
+      // The `for await` loop exits without throwing, so without this
+      // branch any pending `send()` (whose reply was still in flight)
+      // and any installed `waitForEvent` waiter would hang
+      // indefinitely. Reject them all with a typed cause so callers
+      // can pattern-match on `error.kind === "connection-closed"`.
+      rejectAllWaiters(
+        new HarnessError(
+          "connection-closed",
+          "harness socket closed cleanly with pending waiters",
+        ),
+      );
+    } catch (error) {
+      const cause = error instanceof Error ? error : new Error(String(error));
+      rejectAllWaiters(cause);
+    }
+  })();
+}
+
 async function waitForListenLine(
   stderr: ReadableStream<Uint8Array>,
   timeoutMs: number,
