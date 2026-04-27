@@ -1,4 +1,4 @@
-# ADR-018: Stabilize-CI log byte budget and line-aware trim policy
+# ADR-019: Stabilize-CI log byte budget and line-aware trim policy
 
 ## Status
 
