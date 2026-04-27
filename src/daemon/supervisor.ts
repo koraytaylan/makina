@@ -762,10 +762,16 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
    *
    * The Poller's tick is consumed via a per-tick promise so a single
    * polling tick yields a single decision; the supervisor cancels the
-   * per-tick handle as soon as the tick settles. Failures inside the
-   * fetcher take the Poller's exponential-backoff path; fatal failures
-   * (auth revocation) propagate via the `onError` callback and we tear
-   * down the loop into `FAILED`.
+   * per-tick handle as soon as the tick settles. **Fail-fast on
+   * fetcher errors:** any `onError` from the poller (transient or
+   * fatal) rejects the per-tick promise and the conversations phase
+   * transitions the task to `FAILED`. This is intentional — the W4
+   * Poller's exponential-backoff path is for *steady-state* polling
+   * (e.g. CI), where the supervisor wants to keep waiting through
+   * transient flakes. The conversations phase only needs *one* poll
+   * to decide whether work exists, so rejecting on the first failure
+   * surfaces the problem immediately rather than burning the
+   * iteration budget on retries.
    */
   async function runConversationsPhase(task: Task): Promise<Task> {
     if (task.prNumber === undefined) {
