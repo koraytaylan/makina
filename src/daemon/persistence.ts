@@ -500,25 +500,18 @@ function directoriesToFsync(leafParent: string, created: readonly string[]): str
 }
 
 /**
- * Replace the matching record in `current` with `incoming`, or append
- * `incoming` if no record carries the same {@link Task.id}.
+ * Drop every record in `current` whose {@link Task.id} matches `incoming`,
+ * then append `incoming` once.
  *
- * Returns a new array; `current` is not mutated.
+ * Filtering (rather than in-place replace) means that if the on-disk store
+ * ever ends up with multiple records sharing one id — manual edit, file
+ * corruption, or a legacy multi-writer history — a single save converges
+ * the array back to one record per id rather than rewriting every duplicate
+ * with the new payload. Returns a new array; `current` is not mutated.
  */
 function upsertTask(current: readonly Task[], incoming: Task): Task[] {
-  const next: Task[] = [];
-  let replaced = false;
-  for (const existing of current) {
-    if (existing.id === incoming.id) {
-      next.push(incoming);
-      replaced = true;
-    } else {
-      next.push(existing);
-    }
-  }
-  if (!replaced) {
-    next.push(incoming);
-  }
+  const next = current.filter((existing) => existing.id !== incoming.id);
+  next.push(incoming);
   return next;
 }
 

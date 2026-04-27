@@ -113,6 +113,38 @@ Deno.test("save replaces a task with the same id (upsert)", async () => {
   }
 });
 
+Deno.test("save converges duplicate ids in the on-disk store to one record", async () => {
+  // Defence-in-depth: if the live file ever contains multiple records for
+  // the same id (manual edit, corruption, legacy multi-writer history), a
+  // single save must collapse them back to one entry — not rewrite every
+  // duplicate with the new payload.
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    await Deno.mkdir(dirname(path), { recursive: true });
+    const id = makeTaskId("task_dup");
+    const seeded = [
+      makeTask({ id, state: "INIT", iterationCount: 0 }),
+      makeTask({ id, state: "INIT", iterationCount: 0 }),
+      makeTask({ id, state: "INIT", iterationCount: 0 }),
+    ];
+    await Deno.writeTextFile(path, JSON.stringify(seeded));
+    const persistence = createPersistence({ path });
+    await persistence.save(makeTask({
+      id,
+      state: "DRAFTING",
+      iterationCount: 1,
+      updatedAtIso: "2026-04-26T12:01:00.000Z",
+    }));
+    const tasks = await persistence.loadAll();
+    assertEquals(tasks.length, 1);
+    assertEquals(tasks[0]?.id, "task_dup");
+    assertEquals(tasks[0]?.state, "DRAFTING");
+    assertEquals(tasks[0]?.iterationCount, 1);
+  } finally {
+    await cleanup();
+  }
+});
+
 Deno.test("save preserves siblings when adding a new task", async () => {
   const { path, cleanup } = await makeTempStorePath();
   try {
@@ -691,10 +723,12 @@ Deno.test("loadAll re-throws non-NotFound IO errors instead of swallowing them",
   }
 });
 
-Deno.test("loadAll waits for an in-flight failed save without itself rejecting", async () => {
+Deno.test("loadAll waits for an in-flight failing save and rejects on the corrupt JSON it observes", async () => {
   // Regression guard for the catch-all in waitForChain: a failed mutation
-  // must not poison a concurrent loadAll. The load arrives before the
-  // failure has been observed by anybody else.
+  // must not poison a concurrent loadAll via the shared chain. The load
+  // queues behind the failing save, then runs its own read against the
+  // still-corrupt live file; it must reject on its own JSON parse rather
+  // than on the swallowed save failure.
   const { path, cleanup } = await makeTempStorePath();
   try {
     await Deno.mkdir(dirname(path), { recursive: true });
@@ -704,9 +738,8 @@ Deno.test("loadAll waits for an in-flight failed save without itself rejecting",
     // Kick off the load before awaiting the save — both share the chain.
     const loadPromise = persistence.loadAll();
     await assertRejects(() => failingSave, Error);
-    // The load itself must reject (because the file is still corrupt) but
-    // must do so via its own JSON parse, not via the swallowed save
-    // failure.
+    // The load itself rejects (because the file is still corrupt) but must
+    // do so via its own JSON parse, not via the swallowed save failure.
     await assertRejects(() => loadPromise, Error, "is not valid JSON");
   } finally {
     await cleanup();
