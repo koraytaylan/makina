@@ -102,9 +102,11 @@ export type FsOpen = (
  * @param opts.open Optional override for `Deno.open`. Production callers
  *   leave this unset and get the real syscall; tests pass a spy so they
  *   can observe `syncData()` invocations without mutating `Deno.open`
- *   process-wide. Read-side IO (`Deno.readTextFile`, `Deno.rename`)
- *   bypasses this hook because no test currently needs to intercept it
- *   and the production behavior is identical either way.
+ *   process-wide. The hook intercepts only `Deno.open` calls; the other
+ *   filesystem syscalls used by this module — `Deno.readTextFile`,
+ *   `Deno.mkdir`, and `Deno.rename` — go directly to the runtime because
+ *   no test currently needs to observe them and the production behavior
+ *   is identical with or without a spy.
  * @returns A {@link Persistence} bound to `opts.path`.
  *
  * @example
