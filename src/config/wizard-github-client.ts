@@ -73,11 +73,12 @@ export type ReadKeyFile = (
  * @returns The PEM contents of the file.
  * @throws Whatever `Deno.readTextFile` throws (e.g. `Deno.errors.NotFound`,
  *   `Deno.errors.PermissionDenied`). The thrown value is caught and
- *   re-thrown as a `Setup_*` error in
+ *   re-thrown as a {@link SetupWizardError} in
  *   {@link createWizardGitHubClient}'s `getInstallations` body before
- *   it ever reaches `setup-wizard.ts`; that re-throw carries the
- *   original message in its `cause` chain so operators still see the
- *   underlying filesystem error.
+ *   it ever reaches `setup-wizard.ts`; the re-thrown error embeds the
+ *   underlying message in its own `message` (via the `describeError`
+ *   helper), so operators still see the filesystem cause even though
+ *   the `Error.cause` field itself is not populated.
  */
 export async function defaultReadKeyFile(
   privateKeyPath: string,
@@ -231,15 +232,25 @@ export function createWizardGitHubClient(
  * minimum-deps + minimum-shared-utility policy).
  *
  * @param items Items to map, in order.
- * @param limit Maximum number of in-flight promises. Must be ? 1.
+ * @param limit Maximum number of in-flight promises. Must be `>= 1`;
+ *   a smaller value would silently return an under-filled `results`
+ *   array because no worker would ever claim an index, so the helper
+ *   throws `RangeError` on a bad value rather than producing a wrong
+ *   result.
  * @param fn Async mapper run for each item.
  * @returns Mapped values in input order.
+ * @throws RangeError if `limit < 1`.
  */
 async function mapWithBoundedConcurrency<T, U>(
   items: readonly T[],
   limit: number,
   fn: (item: T) => Promise<U>,
 ): Promise<readonly U[]> {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new RangeError(
+      `mapWithBoundedConcurrency: limit must be an integer >= 1; got ${limit}.`,
+    );
+  }
   const results: U[] = new Array(items.length);
   let cursor = 0;
   async function worker(): Promise<void> {
