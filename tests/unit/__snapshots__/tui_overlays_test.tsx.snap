@@ -1,0 +1,73 @@
+export const snapshot = {};
+
+snapshot[`CommandPalette: empty input shows every spec 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ Command Palette                     Tab autocomplete · Enter run · Esc close │
+│ > /                                                                          │
+│ > /cancel — Cancel a non-terminal task; preserves the worktree.              │
+│   /daemon — Manage the long-running daemon (sub-commands: stop).             │
+│   /help — List commands or describe one.                                     │
+│   /issue — Start a new task for an issue.                                    │
+│   /logs — Open the task scrollback.                                          │
+│   /merge — Force the merge of a READY_TO_MERGE task.                         │
+│   /quit — Exit the TUI; the daemon keeps running.                            │
+│   /repo — Manage registered repositories (add/default/list).                 │
+│   /retry — Re-enter a NEEDS_HUMAN task after a manual fix.                   │
+│   /status — Print every in-flight task's state.                              │
+│   /switch — Focus the listed task.                                           │
+│ No history yet.                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`CommandPalette: filtered to a single command by typed prefix 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ Command Palette                     Tab autocomplete · Enter run · Esc close │
+│ > /iss                                                                       │
+│ > /issue — Start a new task for an issue.                                    │
+│ No history yet.                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`CommandPalette: closed = unmounted (no overlay markup rendered) 1`] = `""`;
+
+snapshot[`CommandPalette: history seed reports the count 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ Command Palette                     Tab autocomplete · Enter run · Esc close │
+│ > /                                                                          │
+│ > /cancel — Cancel a non-terminal task; preserves the worktree.              │
+│   /daemon — Manage the long-running daemon (sub-commands: stop).             │
+│   /help — List commands or describe one.                                     │
+│   /issue — Start a new task for an issue.                                    │
+│   /logs — Open the task scrollback.                                          │
+│   /merge — Force the merge of a READY_TO_MERGE task.                         │
+│   /quit — Exit the TUI; the daemon keeps running.                            │
+│   /repo — Manage registered repositories (add/default/list).                 │
+│   /retry — Re-enter a NEEDS_HUMAN task after a manual fix.                   │
+│   /status — Print every in-flight task's state.                              │
+│   /switch — Focus the listed task.                                           │
+│ History: 3 ↑/↓ recall                                                        │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`TaskSwitcher: zero tasks renders the empty-state hint 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ Task Switcher                         ↑/↓ navigate · Enter focus · Esc close │
+│ No tasks yet — invoke /issue to start one.                                   │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`TaskSwitcher: single task with focus pill 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ Task Switcher                         ↑/↓ navigate · Enter focus · Esc close │
+│ > * task_2026-04-26T12-00-00_abc123                              DRAFTING 5m │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;
+
+snapshot[`TaskSwitcher: N tasks with assorted state badges 1`] = `
+"╭──────────────────────────────────────────────────────────────────────────────╮
+│ Task Switcher                         ↑/↓ navigate · Enter focus · Esc close │
+│     task_alpha                                                STABILIZING 5m │
+│ > * task_beta                                             READY_TO_MERGE 15m │
+│     task_gamma                                                     FAILED 1h │
+╰──────────────────────────────────────────────────────────────────────────────╯"
+`;

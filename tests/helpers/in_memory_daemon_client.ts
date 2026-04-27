@@ -50,14 +50,61 @@ export interface DaemonEventSubscription {
 }
 
 /**
+ * The subset of {@link MessageEnvelope} variants that are
+ * client→daemon **requests** the in-memory client knows how to script
+ * replies for. Excludes `pong`, `ack`, and `event` (which are server→
+ * client envelopes the daemon emits, never receives).
+ */
+export type RequestEnvelope = Extract<
+  MessageEnvelope,
+  { type: "ping" | "subscribe" | "unsubscribe" | "command" | "prompt" }
+>;
+
+/**
+ * The {@link RequestEnvelope} variant that maps to a `pong` reply.
+ */
+export type PingEnvelope = Extract<RequestEnvelope, { type: "ping" }>;
+
+/**
+ * The {@link RequestEnvelope} variants that map to an `ack` reply
+ * (everything that is a request but not `ping`).
+ */
+export type AckEnvelope = Exclude<RequestEnvelope, { type: "ping" }>;
+
+/**
  * Per-request handler invoked when the SUT calls `send()`. Tests register
  * one with {@link InMemoryDaemonClient.setRequestHandler} to script
  * non-trivial daemon behavior; the default handler just produces an
  * `ack { ok: true }` (or a `pong` for `ping`).
+ *
+ * The signature is a callable interface with two overloads so the
+ * payload type tracks the envelope's `type` discriminant: a `ping`
+ * envelope must be answered with a {@link PongPayload}; every other
+ * request envelope must be answered with an {@link AckPayload}. This
+ * pushes the previous runtime casts inside {@link
+ * InMemoryDaemonClient.send} out to the handler boundary so the
+ * test-double's contract is self-checking.
+ *
+ * A test handler that returns the wrong shape for a given envelope
+ * type now fails to type-check, instead of silently shipping a stray
+ * runtime cast.
  */
-export type RequestHandler = (
-  envelope: MessageEnvelope,
-) => Promise<AckPayload | PongPayload>;
+export interface RequestHandler {
+  /**
+   * Reply to a `ping` envelope.
+   *
+   * @param envelope The `ping` envelope to reply to.
+   * @returns A promise resolving to the `pong` payload.
+   */
+  (envelope: PingEnvelope): Promise<PongPayload>;
+  /**
+   * Reply to any non-`ping` request envelope.
+   *
+   * @param envelope The request envelope to reply to.
+   * @returns A promise resolving to the `ack` payload.
+   */
+  (envelope: AckEnvelope): Promise<AckPayload>;
+}
 
 /**
  * In-memory daemon double for TUI shell tests.
@@ -99,11 +146,28 @@ export class InMemoryDaemonClient {
     }
     const parsed = validation.data;
     this.sentEnvelopes.push(parsed);
-    const reply = await this.requestHandler(parsed);
     if (parsed.type === "ping") {
-      return { id: parsed.id, type: "pong", payload: reply as PongPayload };
+      // The `RequestHandler` overload selected here returns
+      // `Promise<PongPayload>`; no runtime cast required.
+      const payload = await this.requestHandler(parsed);
+      return { id: parsed.id, type: "pong", payload };
     }
-    return { id: parsed.id, type: "ack", payload: reply as AckPayload };
+    if (
+      parsed.type === "subscribe" ||
+      parsed.type === "unsubscribe" ||
+      parsed.type === "command" ||
+      parsed.type === "prompt"
+    ) {
+      // The `AckEnvelope` overload returns `Promise<AckPayload>` for
+      // every non-`ping` request type. A `pong`/`ack`/`event` envelope
+      // would not be a valid client→daemon request and is rejected
+      // below.
+      const payload = await this.requestHandler(parsed);
+      return { id: parsed.id, type: "ack", payload };
+    }
+    throw new Error(
+      `InMemoryDaemonClient.send: ${parsed.type} envelopes flow daemon→client only`,
+    );
   }
 
   /**
@@ -154,9 +218,16 @@ export class InMemoryDaemonClient {
   }
 }
 
-const defaultRequestHandler: RequestHandler = (envelope) => {
+// The default handler must satisfy both overloads. Implementing both
+// signatures with one body and a runtime branch is the standard TS
+// pattern for overloaded callables.
+function defaultRequestHandler(envelope: PingEnvelope): Promise<PongPayload>;
+function defaultRequestHandler(envelope: AckEnvelope): Promise<AckPayload>;
+function defaultRequestHandler(
+  envelope: RequestEnvelope,
+): Promise<PongPayload | AckPayload> {
   if (envelope.type === "ping") {
     return Promise.resolve<PongPayload>({ daemonVersion: MAKINA_VERSION });
   }
   return Promise.resolve<AckPayload>({ ok: true });
-};
+}

@@ -27,6 +27,8 @@
 import { z } from "zod";
 
 import {
+  DEFAULT_COMMAND_PALETTE_KEYBINDING,
+  DEFAULT_TASK_SWITCHER_KEYBINDING,
   MAX_MAX_TASK_ITERATIONS,
   MAX_POLL_INTERVAL_MILLISECONDS,
   MAX_SETTLING_WINDOW_MILLISECONDS,
@@ -263,15 +265,15 @@ const daemonConfigSchema: z.ZodType<DaemonConfig, z.ZodTypeDef, unknown> = z.obj
 
 const keybindingsConfigSchema: z.ZodType<KeybindingsConfig, z.ZodTypeDef, unknown> = z
   .object({
-    commandPalette: z.string().min(1).default("ctrl+p"),
-    taskSwitcher: z.string().min(1).default("ctrl+g"),
+    commandPalette: z.string().min(1).default(DEFAULT_COMMAND_PALETTE_KEYBINDING),
+    taskSwitcher: z.string().min(1).default(DEFAULT_TASK_SWITCHER_KEYBINDING),
   })
   .strict();
 
 const tuiConfigSchema: z.ZodType<TuiConfig, z.ZodTypeDef, unknown> = z.object({
   keybindings: keybindingsConfigSchema.default({
-    commandPalette: "ctrl+p",
-    taskSwitcher: "ctrl+g",
+    commandPalette: DEFAULT_COMMAND_PALETTE_KEYBINDING,
+    taskSwitcher: DEFAULT_TASK_SWITCHER_KEYBINDING,
   }),
 }).strict();
 
@@ -283,7 +285,10 @@ const configSchema: z.ZodType<Config, z.ZodTypeDef, unknown> = z
     workspace: z.string().min(1),
     daemon: daemonConfigSchema,
     tui: tuiConfigSchema.default({
-      keybindings: { commandPalette: "ctrl+p", taskSwitcher: "ctrl+g" },
+      keybindings: {
+        commandPalette: DEFAULT_COMMAND_PALETTE_KEYBINDING,
+        taskSwitcher: DEFAULT_TASK_SWITCHER_KEYBINDING,
+      },
     }),
   })
   .strict()

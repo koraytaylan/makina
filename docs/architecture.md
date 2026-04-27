@@ -29,11 +29,39 @@ Two cooperating processes communicate over a Unix domain socket using NDJSON:
 
 ## TUI
 
-| Component                           | File                  | Wave |
-| ----------------------------------- | --------------------- | ---- |
-| `App`                               | `src/tui/App.tsx`     | W2   |
-| `Header` / `MainPane` / `StatusBar` | `src/tui/components/` | W2   |
-| `CommandPalette` / `TaskSwitcher`   | `src/tui/components/` | W3   |
+| Component                           | File                              | Wave |
+| ----------------------------------- | --------------------------------- | ---- |
+| `App`                               | `src/tui/App.tsx`                 | W2   |
+| `Header` / `MainPane` / `StatusBar` | `src/tui/components/`             | W2   |
+| `CommandPalette` / `TaskSwitcher`   | `src/tui/components/`             | W3   |
+| `useFocusedTask`                    | `src/tui/hooks/useFocusedTask.ts` | W3   |
+| Slash-command parser                | `src/tui/slash-command-parser.ts` | W3   |
+| Keybindings parser                  | `src/tui/keybindings.ts`          | W3   |
+
+### Slash commands (W3)
+
+The command palette parses leading-`/` lines through `src/tui/slash-command-parser.ts` and
+dispatches the resulting `CommandPayload` over the daemon socket. Per-command lifecycle is handled
+by the wave that owns the feature; the parser only validates shape:
+
+| Command                                 | Behaviour                               | Wave  |
+| --------------------------------------- | --------------------------------------- | ----- |
+| `/issue <number> [--repo <owner/name>]` | Start a new task.                       | W3-W4 |
+| `/repo {add\|default\|list}`            | Manage registered repositories.         | W3    |
+| `/status`                               | Print every in-flight task's state.     | W3    |
+| `/switch <task-id>`                     | Focus the listed task.                  | W3    |
+| `/cancel <task-id>`                     | Cancel a non-terminal task.             | W3    |
+| `/retry <task-id>`                      | Re-enter a `NEEDS_HUMAN` task.          | W3    |
+| `/merge <task-id>`                      | Force the merge of `READY_TO_MERGE`.    | W4    |
+| `/logs <task-id>`                       | Open the task scrollback.               | W3    |
+| `/quit`                                 | Exit the TUI; the daemon keeps running. | W3    |
+| `/daemon stop`                          | Stop the daemon process.                | W3    |
+| `/help [command]`                       | List commands or describe one.          | W3    |
+
+Default overlay toggles: `Ctrl+P` (palette), `Ctrl+G` (switcher); both are configurable via
+`tui.keybindings` in `config.json`. The chord parser in `src/tui/keybindings.ts` accepts
+`<modifier>+<key>` strings (`ctrl+p`, `ctrl+shift+tab`) and matches Ink's `useInput` flag bag
+uniformly across macOS and Linux.
 
 ## IPC protocol
 
