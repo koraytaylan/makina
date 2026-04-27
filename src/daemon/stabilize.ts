@@ -67,7 +67,7 @@ import { isAbsolute, join, SEPARATOR } from "@std/path";
 
 import {
   MAX_TASK_ITERATIONS,
-  STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_BYTES,
+  STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS,
   STABILIZE_REBASE_CONFLICT_PROMPT_HEAD,
   STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE,
 } from "../constants.ts";
@@ -117,25 +117,26 @@ export type StabilizeGitInvoker = (
 ) => Promise<GitInvocationResult>;
 
 /**
- * Reads the contents of a worktree-relative file as UTF-8 text.
+ * Reads the contents of a conflicted file in the worktree as UTF-8 text.
  *
- * Wave 4's rebase phase uses this to extract conflict markers from the
- * conflicted files for the agent prompt. The default implementation
- * backs onto `Deno.readTextFile`; tests pass a scripted reader so the
+ * The reader receives the file's absolute path. Wave 4's rebase phase
+ * uses this to extract conflict markers from conflicted files for the
+ * agent prompt. The default implementation backs onto
+ * `Deno.readTextFile`; tests pass a scripted reader so the
  * conflict-context branch can be exercised without touching the
  * filesystem.
  *
  * @example
  * ```ts
- * const reader: ConflictFileReader = async (path) => {
- *   if (path.endsWith("README.md")) {
+ * const reader: ConflictFileReader = async (absolutePath) => {
+ *   if (absolutePath.endsWith("README.md")) {
  *     return "<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> origin/main\n";
  *   }
- *   throw new Deno.errors.NotFound(`unscripted read: ${path}`);
+ *   throw new Deno.errors.NotFound(`unscripted read: ${absolutePath}`);
  * };
  * ```
  */
-export type ConflictFileReader = (path: string) => Promise<string>;
+export type ConflictFileReader = (absolutePath: string) => Promise<string>;
 
 /**
  * Logger surface used by {@link runRebasePhase}.
@@ -234,6 +235,14 @@ export type RebasePhaseResult =
     readonly kind: "clean";
     /** Number of agent iterations spent. Always `0` on a clean rebase. */
     readonly iterations: number;
+    /**
+     * Latest SDK-assigned session id observed across the agent runs
+     * dispatched by this phase, if any. `undefined` on a zero-iteration
+     * clean rebase (no agent ran), or when the runner never emitted a
+     * session id. The supervisor persists this back onto the task so
+     * subsequent stabilize phases can resume the same session.
+     */
+    readonly sessionId?: string;
   }
   | {
     /**
@@ -246,7 +255,50 @@ export type RebasePhaseResult =
     readonly conflictingFiles: readonly string[];
     /** Number of agent iterations spent. */
     readonly iterations: number;
+    /**
+     * Latest SDK-assigned session id observed across the agent runs
+     * dispatched by this phase, if any. The supervisor persists this
+     * back onto the task even on `needs-human` so an operator-driven
+     * resume can pick up where the budget exhausted.
+     */
+    readonly sessionId?: string;
   };
+
+/**
+ * Closed taxonomy of operation tags surfaced on
+ * {@link StabilizeRebaseError.operation}.
+ *
+ * Operators, tests, and the supervisor (which embeds the tag in the
+ * task's `terminalReason` as `stabilize-rebase-<operation>`) all rely
+ * on these literal values; widening the union would silently accept
+ * typos. The supervisor additionally emits `"precondition"` from
+ * `runRebaseSubPhase` when entering `STABILIZING(REBASE)` without a
+ * worktree path, so it is included here for completeness even though
+ * it never originates inside this module.
+ *
+ *  - `"fetch"` — `git fetch origin <refspec>` failed.
+ *  - `"rebase-start"` — initial `git rebase <ref>` exited non-zero
+ *    without unmerged files (a non-conflict failure).
+ *  - `"add"` — `git add -A` after the agent settled failed.
+ *  - `"rebase-continue"` — `git rebase --continue` exited non-zero
+ *    without unmerged files.
+ *  - `"diff-conflicts"` — `git diff --name-only --diff-filter=U`
+ *    failed.
+ *  - `"agent-resolve"` — the agent runner threw while resolving a
+ *    conflict iteration.
+ *  - `"validate"` — the user-supplied options bag is malformed.
+ *  - `"precondition"` — supervisor-side guard (the rebase sub-phase
+ *    was entered without `task.worktreePath`).
+ */
+export type StabilizeRebaseOperation =
+  | "fetch"
+  | "rebase-start"
+  | "add"
+  | "rebase-continue"
+  | "diff-conflicts"
+  | "agent-resolve"
+  | "validate"
+  | "precondition";
 
 /**
  * Domain error raised when the rebase phase cannot make progress for
@@ -278,24 +330,24 @@ export class StabilizeRebaseError extends Error {
   /** Discriminator visible in stack traces and `error.name === ...` checks. */
   override readonly name = "StabilizeRebaseError";
   /**
-   * Short label of the operation that failed (`"fetch"`,
-   * `"rebase-start"`, `"rebase-continue"`, `"abort"`,
-   * `"agent-resolve"`, `"read-conflicts"`). Surfaced verbatim by the
-   * supervisor in the task's `terminalReason`.
+   * Closed-taxonomy label of the operation that failed; see
+   * {@link StabilizeRebaseOperation} for the full list. Surfaced
+   * verbatim by the supervisor in the task's `terminalReason` as
+   * `stabilize-rebase-<operation>`.
    */
-  public readonly operation: string;
+  public readonly operation: StabilizeRebaseOperation;
 
   /**
    * Build a stabilize-rebase error.
    *
    * @param message Human-readable description.
-   * @param operation Short operation tag. See class JSDoc.
+   * @param operation Operation tag from {@link StabilizeRebaseOperation}.
    * @param options Optional standard `cause` carrying the underlying
    *   exception (a `Deno` error, an `AgentRunnerError`, etc.).
    */
   constructor(
     message: string,
-    operation: string,
+    operation: StabilizeRebaseOperation,
     options?: { readonly cause?: unknown },
   ) {
     super(message, options);
@@ -366,20 +418,27 @@ export async function runRebasePhase(
   // Step 1: refresh the remote's view of the base branch. A failure
   // here cannot be papered over by the agent, so we surface it as a
   // domain error the supervisor lands in FAILED.
-  const fetchResult = await gitInvoker(
+  const fetchResult = await invokeGit(
+    gitInvoker,
     ["fetch", "origin", fetchRefspec],
-    { cwd },
+    cwd,
+    "fetch",
   );
   if (fetchResult.exitCode !== STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE) {
     throw new StabilizeRebaseError(
-      `git fetch origin ${opts.baseBranch} failed (exit ${fetchResult.exitCode}): ${fetchResult.stderr.trim()}`,
+      `git fetch origin ${fetchRefspec} failed (exit ${fetchResult.exitCode}): ${fetchResult.stderr.trim()}`,
       "fetch",
     );
   }
 
   // Step 2: try the rebase. A clean rebase exits 0 and the phase is
   // done. A non-zero exit puts us into the conflict-resolution loop.
-  const rebaseStart = await gitInvoker(["rebase", remoteTrackingRef], { cwd });
+  const rebaseStart = await invokeGit(
+    gitInvoker,
+    ["rebase", remoteTrackingRef],
+    cwd,
+    "rebase-start",
+  );
   if (rebaseStart.exitCode === STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE) {
     return { kind: "clean", iterations: 0 };
   }
@@ -393,6 +452,7 @@ export async function runRebasePhase(
   // We carry a `currentSessionId` so the agent's session resumes across
   // iterations, mirroring the supervisor's drafting loop.
   let currentSessionId = opts.sessionId;
+  const startingSessionId = opts.sessionId;
   let iterations = 0;
   while (iterations < maxIterations) {
     iterations += 1;
@@ -431,7 +491,7 @@ export async function runRebasePhase(
     // Stage everything the agent edited. `git add -A` is non-failing
     // unless the worktree is missing entirely, which would have failed
     // the fetch above.
-    const addResult = await gitInvoker(["add", "-A"], { cwd });
+    const addResult = await invokeGit(gitInvoker, ["add", "-A"], cwd, "add");
     if (addResult.exitCode !== STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE) {
       throw new StabilizeRebaseError(
         `git add -A failed (exit ${addResult.exitCode}): ${addResult.stderr.trim()}`,
@@ -445,9 +505,14 @@ export async function runRebasePhase(
     //   - exit non-zero with no unmerged files: a non-conflict
     //     git-rebase failure. Surface as fatal — the agent cannot
     //     recover from it.
-    const continueResult = await gitInvoker(["rebase", "--continue"], { cwd });
+    const continueResult = await invokeGit(
+      gitInvoker,
+      ["rebase", "--continue"],
+      cwd,
+      "rebase-continue",
+    );
     if (continueResult.exitCode === STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE) {
-      return { kind: "clean", iterations };
+      return cleanResult(iterations, currentSessionId, startingSessionId);
     }
     const stillConflicting = await listConflictingFiles(gitInvoker, cwd);
     if (stillConflicting.length === 0) {
@@ -466,18 +531,95 @@ export async function runRebasePhase(
   // sees a stable state. An abort failure is logged but does not mask
   // the NEEDS_HUMAN signal — the worktree is preserved either way.
   const finalConflicts = await listConflictingFiles(gitInvoker, cwd);
-  const abortResult = await gitInvoker(["rebase", "--abort"], { cwd });
-  if (abortResult.exitCode !== STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE) {
+  // `--abort` is best-effort cleanup: a thrown invoker (binary missing,
+  // permission denied) must not mask the NEEDS_HUMAN signal we already
+  // have. Log and continue.
+  let abortResult: GitInvocationResult | undefined;
+  try {
+    abortResult = await gitInvoker(["rebase", "--abort"], { cwd });
+  } catch (caught) {
+    logger.warn(
+      `stabilize-rebase: git rebase --abort threw for task ${opts.taskId}: ${
+        stringifyError(caught)
+      }`,
+    );
+  }
+  if (
+    abortResult !== undefined &&
+    abortResult.exitCode !== STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE
+  ) {
     logger.warn(
       `stabilize-rebase: git rebase --abort failed for task ${opts.taskId} ` +
         `(exit ${abortResult.exitCode}): ${abortResult.stderr.trim()}`,
     );
   }
-  return {
-    kind: "needs-human",
-    conflictingFiles: finalConflicts,
+  return needsHumanResult(
+    finalConflicts,
     iterations,
-  };
+    currentSessionId,
+    startingSessionId,
+  );
+}
+
+/**
+ * Build a `kind: "clean"` result, omitting `sessionId` when the agent
+ * runs never produced a new session id (so the supervisor doesn't write
+ * `task.sessionId` redundantly).
+ */
+function cleanResult(
+  iterations: number,
+  observedSessionId: string | undefined,
+  startingSessionId: string | undefined,
+): RebasePhaseResult {
+  return observedSessionId !== undefined && observedSessionId !== startingSessionId
+    ? { kind: "clean", iterations, sessionId: observedSessionId }
+    : { kind: "clean", iterations };
+}
+
+/**
+ * Build a `kind: "needs-human"` result, omitting `sessionId` when no
+ * new session id was observed across the iteration budget.
+ */
+function needsHumanResult(
+  conflictingFiles: readonly string[],
+  iterations: number,
+  observedSessionId: string | undefined,
+  startingSessionId: string | undefined,
+): RebasePhaseResult {
+  return observedSessionId !== undefined && observedSessionId !== startingSessionId
+    ? {
+      kind: "needs-human",
+      conflictingFiles,
+      iterations,
+      sessionId: observedSessionId,
+    }
+    : { kind: "needs-human", conflictingFiles, iterations };
+}
+
+/**
+ * Spawn `git <args>` against `cwd`, wrapping any thrown error from the
+ * invoker (binary missing, sandbox-permission deny, EPIPE on a closed
+ * stdio handle, …) as a {@link StabilizeRebaseError} tagged with
+ * `operation`. Non-zero exit codes are *not* treated as throws here;
+ * the caller is expected to inspect the {@link GitInvocationResult} so
+ * the conflict-aware branches in the rebase loop can act on
+ * `exitCode !== 0` without losing access to stderr.
+ */
+async function invokeGit(
+  gitInvoker: StabilizeGitInvoker,
+  args: readonly string[],
+  cwd: string,
+  operation: StabilizeRebaseOperation,
+): Promise<GitInvocationResult> {
+  try {
+    return await gitInvoker(args, { cwd });
+  } catch (caught) {
+    throw new StabilizeRebaseError(
+      `git ${args.join(" ")} threw before producing an exit code: ${stringifyError(caught)}`,
+      operation,
+      { cause: caught },
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,17 +633,20 @@ export async function runRebasePhase(
  *
  * The output is one path per line; we trim trailing whitespace and
  * filter empty lines so a stray newline at end-of-output does not
- * produce a phantom entry. On Windows, paths use forward slashes (git's
- * default); we still normalise the host separator for the supervisor's
- * logging output even though the paths themselves are git's view.
+ * produce a phantom entry. Returned paths are left exactly as git
+ * prints them, which means forward slashes may appear even on Windows.
+ * Path-separator normalisation, when needed for filesystem reads, is
+ * performed at the call site (see {@link joinWorktreePath}).
  */
 async function listConflictingFiles(
   gitInvoker: StabilizeGitInvoker,
   cwd: string,
 ): Promise<readonly string[]> {
-  const result = await gitInvoker(
+  const result = await invokeGit(
+    gitInvoker,
     ["diff", "--name-only", "--diff-filter=U"],
-    { cwd },
+    cwd,
+    "diff-conflicts",
   );
   if (result.exitCode !== STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE) {
     throw new StabilizeRebaseError(
@@ -518,7 +663,7 @@ async function listConflictingFiles(
  *
  * The prompt embeds the issue number, the base branch, and the head of
  * each conflicting file (capped at
- * {@link STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_BYTES} per file). The
+ * {@link STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS} per file). The
  * agent is told it is mid-rebase, must resolve the conflict markers,
  * and must not run any git commands itself — the daemon will continue
  * the rebase once the agent settles.
@@ -552,9 +697,9 @@ async function buildConflictPrompt(args: {
     sections.push("");
     try {
       const content = await reader(joinWorktreePath(worktreePath, path));
-      const trimmed = content.length <= STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_BYTES
+      const trimmed = content.length <= STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS
         ? content
-        : `${content.slice(0, STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_BYTES)}\n...[truncated]`;
+        : `${content.slice(0, STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS)}\n...[truncated]`;
       sections.push("```");
       sections.push(trimmed);
       sections.push("```");

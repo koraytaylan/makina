@@ -763,12 +763,37 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
         : {}),
     };
     const result: RebasePhaseResult = await runRebasePhase(rebaseOptions);
+    // The rebase phase may have driven the agent runner across one or
+    // more iterations and observed a fresh SDK session id; persist it
+    // back onto the task so the next stabilize phase can resume the
+    // same session. The phase only sets `sessionId` when the runner
+    // actually emitted a new id distinct from the one the supervisor
+    // passed in, so a missing value means "no change to record".
+    const sessionUpdate: { sessionId?: string } = result.sessionId !== undefined &&
+        result.sessionId !== task.sessionId
+      ? { sessionId: result.sessionId }
+      : {};
     if (result.kind === "needs-human") {
       const reason = formatRebaseNeedsHumanReason(result.conflictingFiles);
       return await transition(
         task,
-        { state: "NEEDS_HUMAN", terminalReason: reason },
+        { state: "NEEDS_HUMAN", terminalReason: reason, ...sessionUpdate },
         reason,
+      );
+    }
+    if (sessionUpdate.sessionId !== undefined) {
+      // Clean rebase that nonetheless required at least one agent
+      // iteration; record the resumed session id by emitting a
+      // self-transition into the same `STABILIZING(REBASE)` state. CI
+      // is the next sub-phase the outer loop will drive.
+      return await transition(
+        task,
+        {
+          state: "STABILIZING",
+          stabilizePhase: "REBASE",
+          ...sessionUpdate,
+        },
+        "stabilize-rebase recorded resumed session",
       );
     }
     return task;
@@ -1054,12 +1079,12 @@ export function buildInitialDraftPrompt(title: string, body: string): string {
  * Format the `terminalReason` recorded on a task that the rebase phase
  * surrendered to `NEEDS_HUMAN` after exhausting its iteration budget.
  *
- * The reason names every conflicting file the agent could not resolve,
- * one per line under a single-sentence summary, so the TUI's status bar
- * (and any operator inspecting persistence) sees the actionable file
- * list without parsing the rebase phase's internal state. Centralised
- * so unit tests can assert against the same constant the production
- * code emits.
+ * The reason names every conflicting file the agent could not resolve
+ * in a comma-separated inline list after a single-sentence summary, so
+ * the TUI's status bar (and any operator inspecting persistence) sees
+ * the actionable file list on a single line without parsing the rebase
+ * phase's internal state. Centralised so unit tests can assert against
+ * the same constant the production code emits.
  *
  * @param conflictingFiles Worktree-relative paths still carrying
  *   conflict markers when the iteration budget exhausted.

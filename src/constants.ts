@@ -435,15 +435,22 @@ export const COMMAND_PALETTE_SUGGESTION_WIDTH_CODE_UNITS = 160;
 export const STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE = 0;
 
 /**
- * Maximum number of bytes of each conflicting file the rebase-phase
- * conflict prompt embeds for the agent.
+ * Maximum number of UTF-16 code units (characters) of each conflicting
+ * file the rebase-phase conflict prompt embeds for the agent.
  *
- * Conflict markers and surrounding context fit comfortably inside 16 KiB
- * for nearly every codebase file the daemon will see; larger files are
- * truncated with an ellipsis token so the agent prompt stays bounded.
- * The agent can read the full file via its tools if it needs to.
+ * The truncation is performed via `String.prototype.slice`, which
+ * operates on UTF-16 code units rather than bytes. For ASCII-heavy
+ * source files (the dominant case for codebase content) the byte and
+ * character counts are equivalent; for files containing non-BMP code
+ * points (emoji, surrogate pairs) the budget cap may be exceeded by up
+ * to one code unit at the slice boundary if a surrogate pair is split.
+ * Conflict markers and surrounding context fit comfortably inside 16Ki
+ * code units for nearly every codebase file the daemon will see; larger
+ * files are truncated with an ellipsis token so the agent prompt stays
+ * bounded. The agent can read the full file via its tools if it needs
+ * to.
  */
-export const STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_BYTES = 16_384;
+export const STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_CHARS = 16_384;
 
 /**
  * First line of the conflict-context prompt sent to the agent during

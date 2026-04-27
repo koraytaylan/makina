@@ -729,11 +729,11 @@ Deno.test(
   async () => {
     const rig = await makeRig();
     try {
-      scriptHappyPath(rig);
-      // Drop the merge entry queued by scriptHappyPath: NEEDS_HUMAN
-      // means we never get to merge, so a queued reply would surface
-      // as "no scripted reply queued" if the test failed and the FSM
-      // somehow advanced.
+      // Use a fresh GitHub client (not `rig.githubClient` via
+      // `scriptHappyPath`) because NEEDS_HUMAN means we never reach
+      // merge, so we deliberately do NOT queue a `mergePullRequest`
+      // reply: an unexpected merge attempt would surface as
+      // "no scripted reply queued" and fail the test loudly.
       const fresh = new InMemoryGitHubClient();
       fresh.queueGetIssue({
         kind: "value",

@@ -386,7 +386,7 @@ Deno.test(
         await runRebasePhase(BASE_OPTS({ gitInvoker: invoker }));
       },
       StabilizeRebaseError,
-      "git fetch origin main failed",
+      "git fetch origin main:refs/remotes/origin/main failed",
     );
   },
 );
@@ -930,5 +930,176 @@ Deno.test(
       logger.warns.some((line) => line.includes("git rebase --abort failed")),
       `expected warn about abort failure; got ${logger.warns.join("\n")}`,
     );
+  },
+);
+
+// ---------------------------------------------------------------------------
+// SDK session id surfaces on the result
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "runRebasePhase surfaces a fresh SDK session id on a clean result",
+  async () => {
+    const conflictDiff: GitInvocationResult = {
+      exitCode: 0,
+      stdout: "src/a.ts\n",
+      stderr: "",
+    };
+    const { invoker } = scriptedGitInvoker([
+      { match: (args) => args[0] === "fetch", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rebase" && args.length === 2,
+        result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
+      },
+      { match: (args) => args[0] === "diff", result: conflictDiff },
+      { match: (args) => args[0] === "add", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rebase" && args[1] === "--continue",
+        result: SUCCESS,
+      },
+    ]);
+    const runner = new MockAgentRunner();
+    type SessionedMessage = AgentRunnerMessage & { readonly sessionId?: string };
+    const tagged: SessionedMessage = {
+      role: "assistant",
+      text: "session-bound",
+      sessionId: "session-from-sdk",
+    };
+    runner.queueRun({ messages: [tagged] });
+    const reader = (_path: string): Promise<string> => Promise.resolve("x");
+    const result = await runRebasePhase(
+      BASE_OPTS({
+        gitInvoker: invoker,
+        agentRunner: runner,
+        conflictFileReader: reader,
+        maxIterations: 2,
+      }),
+    );
+    assertEquals(result.kind, "clean");
+    assertEquals(result.sessionId, "session-from-sdk");
+  },
+);
+
+Deno.test(
+  "runRebasePhase surfaces a fresh SDK session id on a needs-human result",
+  async () => {
+    const conflictDiff: GitInvocationResult = {
+      exitCode: 0,
+      stdout: "src/a.ts\n",
+      stderr: "",
+    };
+    const continueFailure: GitInvocationResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: "still conflicting",
+    };
+    const { invoker } = scriptedGitInvoker([
+      { match: (args) => args[0] === "fetch", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rebase" && args.length === 2,
+        result: { exitCode: 1, stdout: "", stderr: "CONFLICT" },
+      },
+      { match: (args) => args[0] === "diff", result: conflictDiff },
+      { match: (args) => args[0] === "add", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rebase" && args[1] === "--continue",
+        result: continueFailure,
+      },
+      { match: (args) => args[0] === "diff", result: conflictDiff },
+      { match: (args) => args[0] === "diff", result: conflictDiff },
+      {
+        match: (args) => args[0] === "rebase" && args[1] === "--abort",
+        result: SUCCESS,
+      },
+    ]);
+    const runner = new MockAgentRunner();
+    type SessionedMessage = AgentRunnerMessage & { readonly sessionId?: string };
+    const tagged: SessionedMessage = {
+      role: "assistant",
+      text: "session-bound",
+      sessionId: "session-after-budget",
+    };
+    runner.queueRun({ messages: [tagged] });
+    const reader = (_path: string): Promise<string> => Promise.resolve("x");
+    const result = await runRebasePhase(
+      BASE_OPTS({
+        gitInvoker: invoker,
+        agentRunner: runner,
+        conflictFileReader: reader,
+        maxIterations: 1,
+      }),
+    );
+    assertEquals(result.kind, "needs-human");
+    assertEquals(result.sessionId, "session-after-budget");
+  },
+);
+
+Deno.test(
+  "runRebasePhase omits sessionId when the runner emits no fresh id",
+  async () => {
+    // Clean rebase with no agent run — the field stays absent so the
+    // supervisor doesn't emit a redundant transition.
+    const { invoker } = scriptedGitInvoker([
+      { match: (args) => args[0] === "fetch", result: SUCCESS },
+      {
+        match: (args) => args[0] === "rebase" && args.length === 2,
+        result: SUCCESS,
+      },
+    ]);
+    const result = await runRebasePhase(
+      BASE_OPTS({ gitInvoker: invoker }),
+    );
+    assertEquals(result.kind, "clean");
+    assert(
+      !("sessionId" in result) || result.sessionId === undefined,
+      "expected no sessionId when no agent ran",
+    );
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Invoker-throws path: gitInvoker rejection wraps into StabilizeRebaseError
+// ---------------------------------------------------------------------------
+
+Deno.test(
+  "runRebasePhase wraps a thrown gitInvoker as StabilizeRebaseError tagged with the operation",
+  async () => {
+    const invoker: StabilizeGitInvoker = (args) => {
+      if (args[0] === "fetch") {
+        return Promise.reject(new Error("git binary not found on PATH"));
+      }
+      return Promise.resolve(SUCCESS);
+    };
+    const error = await assertRejects(
+      () => runRebasePhase(BASE_OPTS({ gitInvoker: invoker })),
+      StabilizeRebaseError,
+    );
+    assertEquals(error.operation, "fetch");
+    assertStringIncludes(error.message, "git binary not found on PATH");
+    assertInstanceOf(error.cause, Error);
+  },
+);
+
+Deno.test(
+  "runRebasePhase fetch error message embeds the explicit refspec",
+  async () => {
+    const invoker: StabilizeGitInvoker = (args) => {
+      if (args[0] === "fetch") {
+        return Promise.resolve({
+          exitCode: 1,
+          stdout: "",
+          stderr: "fatal: refspec rejected",
+        });
+      }
+      return Promise.resolve(SUCCESS);
+    };
+    const error = await assertRejects(
+      () => runRebasePhase(BASE_OPTS({ gitInvoker: invoker, baseBranch: "develop" })),
+      StabilizeRebaseError,
+    );
+    assertEquals(error.operation, "fetch");
+    // The error message uses the full refspec, not just the base
+    // branch name, so refspec/remote-tracking issues are debuggable.
+    assertStringIncludes(error.message, "develop:refs/remotes/origin/develop");
   },
 );
