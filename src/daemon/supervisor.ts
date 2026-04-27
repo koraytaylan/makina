@@ -303,10 +303,20 @@ export interface TaskSupervisorImpl {
    *   otherwise.
    * @returns The persisted task record after the merge attempt
    *   (`MERGED`, `NEEDS_HUMAN`, or `FAILED`).
-   * @throws SupervisorError when the task does not exist, or its
-   *   current state is not `READY_TO_MERGE`. The thrown error carries
-   *   a `kind` discriminator so the daemon's command dispatcher can
-   *   reply with a precise `ack { ok: false, error }`.
+   * @throws SupervisorError synchronously when the call cannot reach
+   *   the FSM transition. Thrown kinds:
+   *   - `unknown-task` — no task exists for the given id.
+   *   - `not-ready-to-merge` — the task is not at `READY_TO_MERGE`.
+   *   - `merge-in-flight` — a prior `/merge` for the same task is
+   *     still mid-flight on the GitHub merge call.
+   *   - `merge-precondition` — `overrideMode === "manual"`, which is
+   *     not a GitHub merge strategy.
+   *
+   *   Each error carries a `kind` discriminator so the daemon's
+   *   command dispatcher can reply with a precise
+   *   `ack { ok: false, error }`. FSM-internal failures (the merge
+   *   itself faulting after preconditions pass) do **not** throw —
+   *   they land the task in `MERGED`, `NEEDS_HUMAN`, or `FAILED`.
    */
   mergeReadyTask(
     taskId: TaskId,
@@ -330,6 +340,11 @@ export interface TaskSupervisorImpl {
  *   the same task id; an earlier invocation is still mid-flight on the
  *   GitHub merge call, so the second request is rejected synchronously
  *   instead of issuing a duplicate `mergePullRequest`.
+ * - `merge-precondition` — `mergeReadyTask()` was called with an
+ *   `overrideMode` that is not a valid GitHub merge strategy
+ *   (currently only `"manual"`, which is a makina-side concept meaning
+ *   "wait for /merge"). Rejected synchronously so a caller bug cannot
+ *   land the task in `FAILED` via `runMergeStep`'s defensive check.
  * - `persistence` — the initial `start()` save failed (no record on
  *   disk; in-memory entry rolled back so callers can retry).
  */
@@ -338,6 +353,7 @@ export type SupervisorErrorKind =
   | "unknown-task"
   | "not-ready-to-merge"
   | "merge-in-flight"
+  | "merge-precondition"
   | "persistence";
 
 /**
@@ -1032,6 +1048,18 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
     taskId: TaskId,
     overrideMode?: MergeMode,
   ): Promise<Task> {
+    if (overrideMode === "manual") {
+      // `manual` is not a GitHub merge_method (`merge_method` accepts
+      // `merge` / `squash` / `rebase` only). Reject at the entry point
+      // so a caller bug never reaches `runMergeStep`'s defensive check
+      // — that path lands the task in `FAILED`, which would be a
+      // misleading terminal state for what is purely a misuse of the
+      // public API.
+      throw new SupervisorError(
+        "merge-precondition",
+        '/merge overrideMode "manual" is not a GitHub merge strategy; pass "squash" or "rebase"',
+      );
+    }
     const task = tasks.get(taskId);
     if (task === undefined) {
       throw new SupervisorError(

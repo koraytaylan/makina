@@ -130,13 +130,22 @@ function buildCommandHandler(supervisor: TaskSupervisorImpl) {
       return { ok: false, error: message };
     }
     try {
-      // The merged record is intentionally discarded here: the daemon's
-      // `ack` schema (`AckPayload` in `src/ipc/protocol.ts`) carries
-      // `error` only on failure, so a successful merge returns the bare
-      // `{ ok: true }` and clients observe the resulting state through
-      // the supervisor's `state-changed` event stream instead.
-      await supervisor.mergeReadyTask(taskId);
-      return { ok: true };
+      // Inspect the resulting task: `mergeReadyTask` returns the
+      // post-merge record without throwing for FSM-internal failures
+      // (a non-mergeable PR escalates to `NEEDS_HUMAN`; a transient
+      // API fault lands at `FAILED`). Reporting these as
+      // `{ ok: false, error: ... }` lets the client distinguish
+      // "merged" from "escalated-to-human" via the ack alone, in
+      // addition to the supervisor's `state-changed` event stream.
+      const merged = await supervisor.mergeReadyTask(taskId);
+      if (merged.state === "MERGED") {
+        return { ok: true };
+      }
+      const reason = merged.terminalReason ?? merged.state;
+      return {
+        ok: false,
+        error: `task ${taskId} did not merge (final state: ${merged.state}): ${reason}`,
+      };
     } catch (error) {
       if (error instanceof SupervisorError) {
         return { ok: false, error: error.message };
@@ -434,7 +443,7 @@ Deno.test(
 );
 
 Deno.test(
-  "/merge surfaces a NEEDS_HUMAN escalation with a descriptive ack",
+  "/merge surfaces a NEEDS_HUMAN escalation as ack { ok: false } naming the final state",
   async () => {
     const rig = await makeRig();
     try {
@@ -471,11 +480,15 @@ Deno.test(
           const reply = await client.next();
           assertEquals(reply.type, "ack");
           const payload = reply.payload as AckPayload;
-          // The merge step itself ran (the supervisor took ownership),
-          // so the handler reports success — but the task landed in
-          // NEEDS_HUMAN, not MERGED. Both pieces of state are
-          // observable.
-          assertEquals(payload.ok, true);
+          // The merge step itself ran (the supervisor took ownership)
+          // but the task landed in NEEDS_HUMAN, not MERGED. The
+          // handler reports `ok: false` with an error string that
+          // names the final state so the client can distinguish
+          // "merged" from "escalate-to-human" without subscribing to
+          // the event stream.
+          assertEquals(payload.ok, false);
+          assert(payload.error !== undefined);
+          assert(payload.error.includes("NEEDS_HUMAN"));
         } finally {
           await client.close();
         }

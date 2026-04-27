@@ -66,24 +66,33 @@ because:
 ### 3. `mergeReadyTask` is the synchronous-failure entry point for `/merge`.
 
 The slash-command dispatcher needs to reject misuse with a precise
-`ack { ok: false, error: "..." }`. Two cases must be distinguished before any state transition is
+`ack { ok: false, error: "..." }`. Four cases must be distinguished before any state transition is
 attempted:
 
 - **Unknown task id** — `kind: "unknown-task"`.
 - **Task is not at `READY_TO_MERGE`** — `kind: "not-ready-to-merge"`.
+- **Concurrent `/merge` for the same task** — `kind: "merge-in-flight"`.
+- **Caller passed `overrideMode === "manual"`** — `kind: "merge-precondition"`. `manual` is not a
+  GitHub merge strategy; rejecting it at the entry point keeps a caller bug from landing the task in
+  `FAILED` via `runMergeStep`'s defensive check.
 
-Both cases throw a `SupervisorError` carrying a `kind` discriminator the daemon's command handler
-reads. FSM-internal failures (the merge itself faulting after the task ID and state are valid) do
-**not** throw — they land the task in `MERGED`, `NEEDS_HUMAN`, or `FAILED` and the handler reports
-the resulting state in the `ack`.
+All four cases throw a `SupervisorError` carrying a `kind` discriminator the daemon's command
+handler reads. FSM-internal failures (the merge itself faulting after the preconditions pass) do
+**not** throw — they land the task in `MERGED`, `NEEDS_HUMAN`, or `FAILED`. The handler inspects the
+returned task: `MERGED` becomes `ack { ok: true }`; `NEEDS_HUMAN` and `FAILED` become
+`ack { ok: false, error: "...final state: <STATE>: <terminalReason>" }` so clients can distinguish
+"merged" from "escalate-to-human" via the ack alone (in addition to the `state-changed` event
+stream).
 
 ### 4. `manual` substitutes `squash` when reaching the GitHub API.
 
 GitHub's `merge_method` accepts `merge`, `squash`, `rebase` only — `manual` is a makina-side concept
 meaning "wait for /merge". When `mergeReadyTask` fires for a task whose own `mergeMode` is `manual`,
 the supervisor substitutes `"squash"` as the API strategy unless the caller passes `overrideMode`.
-Operators can request a specific strategy by extending `/merge <task-id>` with a future flag (out of
-scope for this ADR); the supervisor surface already accepts the override.
+The override itself is constrained: passing `overrideMode === "manual"` is rejected synchronously
+(see §3) since substituting `manual` for `manual` would be a no-op tautology. Operators can request
+a specific strategy by extending `/merge <task-id>` with a future flag (out of scope for this ADR);
+the supervisor surface already accepts the override.
 
 ### 5. Cleanup failures never unwind the merge.
 
