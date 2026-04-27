@@ -270,6 +270,12 @@ function scriptParkedTask(rig: MergeCommandRig, prNumber: IssueNumber): void {
     },
   });
   rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+  // CI sub-phase polls combined-status before READY_TO_MERGE; queue
+  // green-on-first-poll so it exits without dispatching the agent.
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: "deadbeef" },
+  });
   // Conversations sub-phase polls before READY_TO_MERGE; queue an empty
   // timeline so the loop converges without dispatching the agent.
   rig.githubClient.queueListReviews({ kind: "value", value: [] });

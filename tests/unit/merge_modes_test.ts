@@ -196,6 +196,13 @@ function scriptHappyPath(
     },
   });
   rig.githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+  // The CI sub-phase polls combined-status before CONVERSATIONS runs.
+  // The merge-modes tests exercise the merge branches, not the CI loop,
+  // so queue a green-on-first-poll so the phase exits immediately.
+  rig.githubClient.queueGetCombinedStatus({
+    kind: "value",
+    value: { state: "success", sha: "deadbeef" },
+  });
   // The CONVERSATIONS sub-phase polls the PR's review timeline before the
   // FSM can advance to READY_TO_MERGE. The merge-modes tests exercise the
   // merge branches, not the conversations loop, so queue an empty timeline
@@ -901,6 +908,12 @@ Deno.test(
         },
       });
       githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // CI sub-phase polls combined-status before merge; queue
+      // green-on-first-poll so it exits without dispatching the agent.
+      githubClient.queueGetCombinedStatus({
+        kind: "value",
+        value: { state: "success", sha: "abc" },
+      });
       // Conversations sub-phase polls before merge; queue an empty
       // timeline so the loop converges immediately.
       githubClient.queueListReviews({ kind: "value", value: [] });
@@ -981,6 +994,12 @@ Deno.test(
         },
       });
       githubClient.queueRequestReviewers({ kind: "value", value: undefined });
+      // CI sub-phase polls combined-status before merge; queue
+      // green-on-first-poll so it exits without dispatching the agent.
+      githubClient.queueGetCombinedStatus({
+        kind: "value",
+        value: { state: "success", sha: "abc" },
+      });
       // Conversations sub-phase polls before merge; queue an empty
       // timeline so the loop converges immediately.
       githubClient.queueListReviews({ kind: "value", value: [] });
