@@ -11,6 +11,10 @@ requests a Copilot review, watches CI, addresses review comments, re-requests re
 merges the PR per the configured policy. Run multiple `/issue` commands in parallel — each task gets
 its own git worktree on its own branch.
 
+The TUI ships a command palette (default `Ctrl+P`) and a task switcher (default `Ctrl+G`) for
+mid-session control. See the [slash command catalog](docs/architecture.md#slash-commands-w3) for the
+full vocabulary.
+
 A long-running daemon owns the agents and the polling. Quitting the TUI does not stop the daemon;
 reattach later and the scrollback is intact.
 

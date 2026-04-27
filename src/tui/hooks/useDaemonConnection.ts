@@ -147,9 +147,13 @@ export interface UseDaemonConnectionOptions {
  * - Calling `send`/`subscribe` against the returned object is stable
  *   — the function references survive re-renders, so consumers can
  *   include them in dependency arrays without triggering effect loops.
- * - The hook never holds a reference to a stale client: pass a new
- *   client and the previous subscription is torn down on the cleanup
- *   pass.
+ * - The internal client reference always tracks the latest `options.client`
+ *   so subsequent `send`/`subscribe` calls hit the new instance. The
+ *   one-shot `autoConnect` effect only fires on mount, however, so swapping
+ *   the client at runtime does **not** trigger a fresh `connect()` — call
+ *   `disconnect()`/`connect()` from the consumer if a reactive re-wire is
+ *   needed. In practice no current call site passes a reactive client, so
+ *   the simpler mount-only contract is the one we ship.
  *
  * @param options Hook options. See {@link UseDaemonConnectionOptions}.
  * @returns The {@link DaemonConnectionApi} the component should render
@@ -238,9 +242,14 @@ export function useDaemonConnection(
     return () => {
       cancelled = true;
     };
-    // Intentionally empty: we want to fire connect exactly once on
-    // mount. Re-subscribing on every render would defeat the purpose
-    // of `autoConnect`.
+    // Mount-only by design: the dep array intentionally excludes
+    // `client` so a re-render with a swapped instance does not trigger
+    // a fresh `connect()`. `clientRef` is updated in the effect above
+    // so manual `connect()`/`disconnect()` calls and `send`/`subscribe`
+    // still hit the latest instance — but the auto-wire stays a
+    // one-shot. No current consumer passes a reactive client; if one
+    // ever needs that, drive the lifecycle from the consumer rather
+    // than re-subscribing here.
   }, [autoConnect]);
 
   return { status, lastError, send, subscribe, connect, disconnect };

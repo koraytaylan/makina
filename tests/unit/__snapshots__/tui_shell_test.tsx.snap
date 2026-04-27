@@ -9,7 +9,7 @@ snapshot[`App: initial render against the in-memory double 1`] = `
 │ No tasks yet — invoke /issue <repo>#<n> to start one.                        │
 │                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
- ready                                     Ctrl+C exit · / command palette (W3)"
+ ready                           ctrl+p palette · ctrl+g switcher · Ctrl+C exit"
 `;
 
 snapshot[`App: "1 task active" after a state-changed event 1`] = `
@@ -21,8 +21,8 @@ snapshot[`App: "1 task active" after a state-changed event 1`] = `
 │ 1 task active.                                                               │
 │                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
- task_2026-04-26T12-00-00_abc123: INIT →        Ctrl+C exit · / command palette
- CLONING_WORKTREE                                (W3)"
+ task_2026-04-26T12-00-00_abc123: INIT →   ctrl+p palette · ctrl+g switcher ·
+ CLONING_WORKTREE                          Ctrl+C exit"
 `;
 
 snapshot[`App: "disconnected" status is reflected in the header 1`] = `

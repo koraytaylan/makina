@@ -13,17 +13,27 @@
  * @module
  */
 
-import { Box, render, Text, useApp } from "ink";
-import { type ReactElement, useEffect, useMemo, useState } from "react";
+import { Box, render, Text, useApp, useInput } from "ink";
+import { type ReactElement, useCallback, useEffect, useMemo, useState } from "react";
 
+import { CommandPalette } from "./components/CommandPalette.tsx";
 import { Header } from "./components/Header.tsx";
 import { MainPane } from "./components/MainPane.tsx";
 import { StatusBar } from "./components/StatusBar.tsx";
-import { type DaemonClient, SocketDaemonClient } from "./ipc-client.ts";
+import { TaskSwitcher } from "./components/TaskSwitcher.tsx";
+import { type DaemonClient, type DaemonReply, SocketDaemonClient } from "./ipc-client.ts";
 import { type ConnectionLifecycle, useDaemonConnection } from "./hooks/useDaemonConnection.ts";
-import type { EventPayload } from "../ipc/protocol.ts";
+import { useFocusedTask } from "./hooks/useFocusedTask.ts";
+import { matchesKeybinding } from "./keybindings.ts";
+import type { CommandPayload, EventPayload, MessageEnvelope } from "../ipc/protocol.ts";
 import { makeTaskId, type TaskId } from "../types.ts";
-import { MAKINA_VERSION, STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS } from "../constants.ts";
+import {
+  COMMAND_PALETTE_HISTORY_LIMIT,
+  DEFAULT_COMMAND_PALETTE_KEYBINDING,
+  DEFAULT_TASK_SWITCHER_KEYBINDING,
+  MAKINA_VERSION,
+  STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS,
+} from "../constants.ts";
 
 /**
  * Default Unix-socket path the daemon listens on.
@@ -32,6 +42,18 @@ import { MAKINA_VERSION, STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS } from "../const
  * config loader can supply a different one.
  */
 const DEFAULT_DAEMON_SOCKET_PATH = `${Deno.env.get("HOME") ?? "/tmp"}/.makina/daemon.sock`;
+
+/**
+ * Subset of TUI keybindings the App reads. Only the overlay toggles
+ * are needed here; future keybindings (focus next task, send prompt,
+ * …) extend this interface alongside their config schema entries.
+ */
+export interface AppKeybindings {
+  /** Chord that toggles the command-palette overlay. */
+  readonly commandPalette: string;
+  /** Chord that toggles the task-switcher overlay. */
+  readonly taskSwitcher: string;
+}
 
 /**
  * Props accepted by {@link App}.
@@ -43,8 +65,8 @@ export interface AppProps {
    */
   readonly client: DaemonClient & ConnectionLifecycle;
   /**
-   * Initial focused-task id. Wave 3 wires the task switcher; until
-   * then the value is provided externally for snapshot determinism.
+   * Initial focused-task id. Forwarded to {@link useFocusedTask} so the
+   * Header's focus pill renders deterministically from snapshot tests.
    */
   readonly initialFocusedTaskId?: TaskId | undefined;
   /**
@@ -59,6 +81,23 @@ export interface AppProps {
    * @default true
    */
   readonly autoConnect?: boolean | undefined;
+  /**
+   * Optional keybindings override. Defaults to the constants
+   * mirrored from `src/config/schema.ts`. Production callers should
+   * forward the loaded `Config.tui.keybindings`; snapshot tests pin
+   * the defaults.
+   *
+   * @default { commandPalette: "ctrl+p", taskSwitcher: "ctrl+g" }
+   */
+  readonly keybindings?: AppKeybindings | undefined;
+  /**
+   * If `true`, Ink's `useInput` hooks at the App level are wired up.
+   * Snapshot tests render with `inputEnabled={false}` so Ink does
+   * not race the Deno test sanitizer with stdin readers.
+   *
+   * @default true
+   */
+  readonly inputEnabled?: boolean | undefined;
 }
 
 /**
@@ -81,15 +120,26 @@ export function App(props: AppProps): ReactElement {
     initialFocusedTaskId,
     version = MAKINA_VERSION,
     autoConnect = true,
+    keybindings = {
+      commandPalette: DEFAULT_COMMAND_PALETTE_KEYBINDING,
+      taskSwitcher: DEFAULT_TASK_SWITCHER_KEYBINDING,
+    },
+    inputEnabled = true,
   } = props;
   const connection = useDaemonConnection({
     client,
     autoConnect,
   });
+  const focus = useFocusedTask({
+    source: client,
+    initialFocusedTaskId,
+  });
   const [knownTaskIds, setKnownTaskIds] = useState<ReadonlySet<TaskId>>(() => new Set());
   const [lastMessage, setLastMessage] = useState<string | undefined>(undefined);
   const [lastError, setLastError] = useState<string | undefined>(undefined);
-  const [focusedTaskId, setFocusedTaskId] = useState<TaskId | undefined>(initialFocusedTaskId);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [paletteHistory, setPaletteHistory] = useState<readonly string[]>([]);
 
   useEffect(() => {
     const subscription = connection.subscribe((event) => {
@@ -97,7 +147,6 @@ export function App(props: AppProps): ReactElement {
         setKnownTaskIds,
         setLastMessage,
         setLastError,
-        setFocusedTaskId,
       });
     });
     return () => {
@@ -119,23 +168,192 @@ export function App(props: AppProps): ReactElement {
     }
   }, [connection.status, connection.lastError]);
 
+  const overlayOpen = paletteOpen || switcherOpen;
+
+  // Top-level chord handler: toggles the overlays per the configured
+  // keybindings. Disabled while an overlay is already open so the
+  // overlay's own input handler owns the keystroke (Esc closes;
+  // typing into the palette is forwarded as text).
+  useInput(
+    (input, key) => {
+      if (!inputEnabled || overlayOpen) {
+        return;
+      }
+      if (matchesKeybinding(keybindings.commandPalette, input, key)) {
+        setPaletteOpen(true);
+        return;
+      }
+      if (matchesKeybinding(keybindings.taskSwitcher, input, key)) {
+        setSwitcherOpen(true);
+      }
+    },
+    { isActive: inputEnabled && !overlayOpen },
+  );
+
+  const handlePaletteSubmit = useCallback(
+    (payload: CommandPayload, raw: string) => {
+      setPaletteHistory((previous) => trimHistory([raw, ...previous]));
+      setPaletteOpen(false);
+      // Fire-and-forget: the App reflects the dispatch in the status
+      // bar; per-command lifecycle is owned by the relevant wave.
+      void dispatchCommand((envelope) => connection.send(envelope), payload).then(
+        (result) => {
+          if (result.kind === "error") {
+            setLastError(result.message);
+            return;
+          }
+          setLastMessage(result.message);
+        },
+        // The send is wrapped in a success/error result, so the
+        // promise itself only rejects on truly exceptional errors;
+        // surface those to the status bar.
+        (error) => {
+          setLastError(
+            error instanceof Error ? error.message : String(error),
+          );
+        },
+      );
+    },
+    [connection.send],
+  );
+
+  const handlePaletteClose = useCallback(() => {
+    setPaletteOpen(false);
+  }, []);
+
+  const handleSwitcherPick = useCallback(
+    (taskId: TaskId) => {
+      focus.focusTask(taskId);
+      setSwitcherOpen(false);
+    },
+    [focus],
+  );
+
+  const handleSwitcherClose = useCallback(() => {
+    setSwitcherOpen(false);
+  }, []);
+
+  const keybindingsHint =
+    `${keybindings.commandPalette} palette · ${keybindings.taskSwitcher} switcher · Ctrl+C exit`;
+
   return (
     <Box flexDirection="column">
       <Header
         version={version}
         status={connection.status}
-        focusedTaskId={focusedTaskId}
+        focusedTaskId={focus.focusedTaskId}
       />
       <MainPane
-        activeTaskCount={knownTaskIds.size}
+        activeTaskCount={Math.max(knownTaskIds.size, focus.tasks.length)}
         hint={hint}
       />
+      {paletteOpen
+        ? (
+          <CommandPalette
+            history={paletteHistory}
+            onSubmit={handlePaletteSubmit}
+            onClose={handlePaletteClose}
+            inputEnabled={inputEnabled}
+          />
+        )
+        : null}
+      {switcherOpen
+        ? (
+          <TaskSwitcher
+            tasks={focus.tasks}
+            focusedTaskId={focus.focusedTaskId}
+            onPick={handleSwitcherPick}
+            onClose={handleSwitcherClose}
+            inputEnabled={inputEnabled}
+          />
+        )
+        : null}
       <StatusBar
         message={lastMessage ?? "ready"}
         errorMessage={lastError ?? connection.lastError}
+        keybindingsHint={keybindingsHint}
       />
     </Box>
   );
+}
+
+/**
+ * Trim `entries` to {@link COMMAND_PALETTE_HISTORY_LIMIT}, keeping the
+ * head (most-recent) entries. Exported for unit-test reuse.
+ *
+ * @param entries Candidate history entries.
+ * @returns The trimmed array.
+ */
+export function trimHistory(entries: readonly string[]): readonly string[] {
+  if (entries.length <= COMMAND_PALETTE_HISTORY_LIMIT) {
+    return entries;
+  }
+  return entries.slice(0, COMMAND_PALETTE_HISTORY_LIMIT);
+}
+
+/**
+ * Outcome reported back to {@link App}'s status bar after a palette
+ * submission. Exported so the unit tests around
+ * {@link dispatchCommand} can pin the discriminant.
+ */
+export interface DispatchOutcome {
+  /** `"ok"` for an accepted command; `"error"` for a refusal. */
+  readonly kind: "ok" | "error";
+  /** Human-readable status-bar message. */
+  readonly message: string;
+}
+
+/**
+ * Send a parsed command envelope to the daemon and translate the
+ * reply into a status-bar message. Exported for unit-test reuse.
+ *
+ * @param send The {@link useDaemonConnection} `send` callback.
+ * @param payload The parsed command payload.
+ * @returns The status-bar outcome.
+ */
+export async function dispatchCommand(
+  send: (envelope: MessageEnvelope) => Promise<DaemonReply>,
+  payload: CommandPayload,
+): Promise<DispatchOutcome> {
+  const envelope: MessageEnvelope = {
+    id: makeCommandEnvelopeId(),
+    type: "command",
+    payload,
+  };
+  try {
+    const reply = await send(envelope);
+    if (reply.type !== "ack") {
+      return {
+        kind: "error",
+        message: `unexpected reply for /${payload.name}: ${reply.type}`,
+      };
+    }
+    if (reply.payload.ok === false) {
+      return {
+        kind: "error",
+        message: reply.payload.error ?? `/${payload.name} refused`,
+      };
+    }
+    return { kind: "ok", message: `/${payload.name} dispatched` };
+  } catch (error) {
+    return {
+      kind: "error",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Mint a fresh envelope id for a command dispatch.
+ *
+ * Uses `crypto.randomUUID()` so collisions cannot happen in practice;
+ * isolated to a helper so tests that stub the random source have a
+ * single seam.
+ *
+ * @returns The envelope id.
+ */
+function makeCommandEnvelopeId(): string {
+  return `cmd-${crypto.randomUUID()}`;
 }
 
 /**
@@ -144,10 +362,9 @@ export function App(props: AppProps): ReactElement {
  * call site passes React `useState` setters, while tests pass plain
  * closures that capture into local variables.
  *
- * `setFocusedTaskId` accepts a functional updater so the handler can
- * apply "auto-focus only when nothing is focused yet" without reading
- * the current focused-task value out of band — the React setter and
- * the test stubs both honor the closure-style update.
+ * Wave 3 lifted the focused-task slot into {@link useFocusedTask}, so
+ * the handler no longer reaches in here. The remaining slots are owned
+ * by the App component: known-task tally, last log/error.
  */
 export interface EventSetters {
   /** Setter for the known-tasks set used by `MainPane`. */
@@ -158,15 +375,6 @@ export interface EventSetters {
   readonly setLastMessage: (next: string | undefined) => void;
   /** Setter for the most-recent error message rendered in the status bar. */
   readonly setLastError: (next: string | undefined) => void;
-  /**
-   * Setter for the focused task id rendered in the header.
-   *
-   * Receives a functional updater so {@link handleEvent} can preserve
-   * an existing focus instead of clobbering it on every event.
-   */
-  readonly setFocusedTaskId: (
-    update: (previous: TaskId | undefined) => TaskId | undefined,
-  ) => void;
 }
 
 /**
@@ -193,12 +401,6 @@ export function handleEvent(event: EventPayload, setters: EventSetters): void {
     next.add(taskId);
     return next;
   });
-  // Auto-focus the first task we hear about so the header's focus pill
-  // stops saying "no task focused" once events arrive. Subsequent
-  // events leave the focused task alone — Wave 3's task switcher will
-  // own focus changes — so the focus does not jump around as new
-  // tasks appear.
-  setters.setFocusedTaskId((previous) => previous ?? taskId);
   switch (event.kind) {
     case "log":
       setters.setLastMessage(`[${event.data.level}] ${event.data.message}`);

@@ -91,8 +91,12 @@ export const MAX_IPC_LENGTH_PREFIX_DIGITS = 8;
  * Default capacity of the in-process event-bus per-subscriber queue.
  *
  * Subscribers consume events through a bounded `ReadableStream`; once the
- * buffer fills the publisher applies backpressure (Wave 2 picks the exact
- * policy). The cap keeps a slow TUI from holding the daemon hostage.
+ * buffer fills, the publisher drops newly published events for that
+ * subscriber rather than blocking, and a single warning is emitted per
+ * overflow episode (further warnings are suppressed until the queue drains
+ * again, to avoid log spam). The cap keeps a slow TUI from holding the
+ * daemon hostage. See `docs/adrs/012-event-bus-backpressure-and-sync-callbacks.md`
+ * and `src/daemon/event-bus.ts` for the full policy.
  */
 export const EVENT_BUS_DEFAULT_BUFFER_SIZE = 256;
 
@@ -357,3 +361,64 @@ export const HEX_RADIX = 16;
  * {@link HEX_RADIX} for the supervisor's id-mint helper.
  */
 export const HEX_BYTE_WIDTH_CHARACTERS = 2;
+
+/**
+ * Maximum number of historical command-palette inputs the overlay
+ * remembers across opens.
+ *
+ * The history is round-robined (oldest entry drops on overflow) so a
+ * long-running session does not grow without bound. Sized to the same
+ * order as a shell scrollback's recall depth: enough to feel useful in
+ * a single session, small enough that scanning back is still cheap.
+ */
+export const COMMAND_PALETTE_HISTORY_LIMIT = 50;
+
+/**
+ * Default keybinding chord that toggles the command-palette overlay.
+ *
+ * Mirrors the schema default in `src/config/schema.ts` so the App can
+ * treat the constant as authoritative when no config has been loaded
+ * (e.g. snapshot tests).
+ */
+export const DEFAULT_COMMAND_PALETTE_KEYBINDING = "ctrl+p";
+
+/**
+ * Default keybinding chord that toggles the task-switcher overlay.
+ *
+ * Mirrors the schema default in `src/config/schema.ts`.
+ */
+export const DEFAULT_TASK_SWITCHER_KEYBINDING = "ctrl+g";
+
+/**
+ * Number of milliseconds in one second.
+ *
+ * Used by the task-switcher's age-formatter so the bare `1000` does not
+ * leak into the renderer.
+ */
+export const MILLISECONDS_PER_SECOND = 1_000;
+
+/**
+ * Number of seconds in one minute.
+ */
+export const SECONDS_PER_MINUTE = 60;
+
+/**
+ * Number of minutes in one hour.
+ */
+export const MINUTES_PER_HOUR = 60;
+
+/**
+ * Number of hours in one day.
+ */
+export const HOURS_PER_DAY = 24;
+
+/**
+ * Maximum width, in UTF-16 code units, used to truncate a command-palette
+ * suggestion when it is rendered in the dropdown.
+ *
+ * Suggestion lines longer than this are abbreviated with an ellipsis so
+ * a single long entry cannot break the overlay layout. The limit is
+ * generous (twice the status bar's) because suggestion rows are the
+ * dominant content of the open palette.
+ */
+export const COMMAND_PALETTE_SUGGESTION_WIDTH_CODE_UNITS = 160;

@@ -17,6 +17,7 @@ import { dirname } from "@std/path";
 
 import { MAKINA_VERSION } from "./src/constants.ts";
 import { ConfigLoadError, expandHome, loadConfig } from "./src/config/load.ts";
+import { createEventBus } from "./src/daemon/event-bus.ts";
 import { startDaemon } from "./src/daemon/server.ts";
 import {
   createStdioWizardIo,
@@ -35,30 +36,21 @@ if (Deno.args.includes("--version")) {
 const subcommand = Deno.args[0];
 
 if (subcommand === "daemon") {
-  // Defensive wiring for the Wave 2 daemon subcommand.
+  // Wiring for the Wave 2 daemon subcommand.
   //
-  // The config loader is now a direct import (this PR lands it). The
-  // EventBus (#8) is still loaded via dynamic `import()` because we
-  // distinguish two outcomes for *that* sibling:
+  // The config loader and the EventBus (#8) are both direct imports —
+  // `src/daemon/event-bus.ts` is permanent on develop, so the earlier
+  // dynamic-import + module-not-found fallback bought no value and just
+  // added a complex error-narrowing branch (a parse failure, a thrown
+  // top-level statement, or a permission error in the bus module would
+  // have been silently demoted to "module missing" if the sniff guessed
+  // wrong). A missing module now surfaces as a normal load failure.
   //
-  //  1. **Module not found** (`ERR_MODULE_NOT_FOUND`): the sibling has
-  //     not landed yet. Log a single `note:` line and continue with no
-  //     event bus, which makes `subscribe` envelopes ack with
-  //     `{ ok: false, error: "unimplemented" }`.
-  //  2. **Anything else** (parse failure, permission error, throwing
-  //     constructor, …): a real misconfiguration. Print the diagnostic
-  //     to stderr and exit non-zero. Silently swallowing these would
-  //     mean a typo'd `config.json` boots a daemon on `/tmp/makina.sock`
-  //     and the operator has no signal that anything went wrong.
-  //
-  // For the loader, a missing user `config.json` is also a benign signal
+  // For the loader, a missing user `config.json` is a benign signal
   // ("user has not run `makina setup` yet") — we log a one-liner and
   // fall back to `${TMPDIR:-/tmp}/makina.sock` so the binary still boots
   // for smoke-testing. Any other config failure (permissions, malformed
   // JSON, schema-invalid) exits non-zero with the loader's diagnostic.
-  //
-  // TODO(#8): once #8 lands, the event-bus branch becomes a direct
-  // import and the module-missing fallback can be dropped.
   const tmpDir = Deno.env.get("TMPDIR") ?? "/tmp";
   const fallbackSocketPath = `${tmpDir.replace(/\/$/, "")}/makina.sock`;
 
@@ -89,47 +81,28 @@ if (subcommand === "daemon") {
     }
   }
 
-  let eventBus: import("./src/types.ts").EventBus | undefined;
-  try {
-    // The event-bus module exports a `createEventBus()` factory, not a
-    // class. The dynamic import keeps the "module-missing → unimplemented"
-    // fallback while the real factory binding is the load-bearing line: a
-    // stale lookup for a non-existent class export would silently leave
-    // the daemon without an event bus and bury subscribe behind
-    // `unimplemented`. Once the dynamic-import fallback is no longer
-    // needed (TODO below), this becomes a direct top-level import.
-    const busModule = await import("./src/daemon/event-bus.ts");
-    const factory = (busModule as {
-      createEventBus?: () => import("./src/types.ts").EventBus;
-    }).createEventBus;
-    if (typeof factory === "function") {
-      eventBus = factory();
-    } else {
-      console.error(
-        "[daemon] note: src/daemon/event-bus.ts does not export createEventBus; subscribe will reply unimplemented",
-      );
-    }
-  } catch (error) {
-    if (isModuleNotFoundError(error)) {
-      console.error(
-        "[daemon] note: src/daemon/event-bus.ts not found; subscribe will reply unimplemented",
-      );
-    } else {
-      console.error(`[daemon] failed to initialise event bus: ${formatError(error)}`);
-      Deno.exit(1);
-    }
-  }
+  const eventBus = createEventBus();
 
-  const handle = await startDaemon(
-    eventBus === undefined ? { socketPath } : { socketPath, eventBus },
-  );
+  const handle = await startDaemon({ socketPath, eventBus });
   console.error(`[daemon] listening on ${handle.socketPath}`);
 
   // Translate SIGINT/SIGTERM into a clean shutdown so a crashed daemon
-  // does not leave a stale socket file behind.
+  // does not leave a stale socket file behind. We always exit at the end
+  // of the handler — the signal has already fired, the operator wants
+  // the process gone, and any further work would race the OS-level
+  // tear-down. A `handle.stop()` rejection (e.g. an in-flight tear-down
+  // that fails to release the socket) is logged with a non-zero exit
+  // code so it is visible to whatever supervisor restarted us; without
+  // the try/catch the rejection would surface as an unhandled-promise
+  // warning while the process kept running.
   const shutdown = async () => {
-    await handle.stop();
-    Deno.exit(0);
+    try {
+      await handle.stop();
+      Deno.exit(0);
+    } catch (error) {
+      console.error(`[daemon] error during shutdown: ${formatError(error)}`);
+      Deno.exit(1);
+    }
   };
   Deno.addSignalListener("SIGINT", shutdown);
   Deno.addSignalListener("SIGTERM", shutdown);
@@ -169,27 +142,6 @@ if (subcommand === "daemon") {
 } else {
   // Default branch → launch the Ink-based TUI.
   await import("./src/tui/App.tsx").then((module) => module.launch());
-}
-
-/**
- * Whether `error` is the specific "module file does not exist" failure
- * that Deno's dynamic `import()` raises. We treat this as a benign
- * "sibling has not landed yet" signal; every other failure (a parse
- * error in the module, a thrown top-level statement, a permission
- * issue) is propagated by the caller so misconfiguration cannot silently
- * downgrade the daemon's behaviour.
- *
- * Deno surfaces this as a `TypeError` whose `code` is the Node-style
- * `ERR_MODULE_NOT_FOUND`. We sniff the `code` field defensively because
- * the constructor is `TypeError` (a base class shared with many other
- * runtime failures), and the message text is best-effort only.
- */
-function isModuleNotFoundError(error: unknown): boolean {
-  if (!(error instanceof TypeError)) {
-    return false;
-  }
-  const code = (error as TypeError & { code?: unknown }).code;
-  return code === "ERR_MODULE_NOT_FOUND";
 }
 
 /** Render an arbitrary error value to a single-line diagnostic. */

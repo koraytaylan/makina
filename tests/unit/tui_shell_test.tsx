@@ -203,7 +203,7 @@ Deno.test({
   fn: async (t) => {
     const client = new InMemoryDaemonClient();
     const stdout = await renderToBuffer(
-      <App client={client} version="0.0.0-test" autoConnect={false} />,
+      <App client={client} version="0.0.0-test" autoConnect={false} inputEnabled={false} />,
     );
     await assertSnapshot(t, stdout.lastVisibleFrame());
   },
@@ -222,7 +222,7 @@ Deno.test({
     const stdout = new FakeStream();
     const stderr = new FakeStream();
     const instance = inkRender(
-      <App client={client} version="0.0.0-test" autoConnect={false} />,
+      <App client={client} version="0.0.0-test" autoConnect={false} inputEnabled={false} />,
       {
         // deno-lint-ignore no-explicit-any
         stdout: stdout as any,
@@ -271,7 +271,7 @@ Deno.test({
     // Sanity: the App with the in-memory double also renders cleanly.
     const client = new InMemoryDaemonClient();
     const stdoutApp = await renderToBuffer(
-      <App client={client} version="0.0.0-test" autoConnect={false} />,
+      <App client={client} version="0.0.0-test" autoConnect={false} inputEnabled={false} />,
     );
     assertEquals(stdoutApp.frames.length > 0, true);
   },
@@ -309,7 +309,6 @@ Deno.test("handleEvent: log event sets the last message with level prefix", () =
   let lastMessage: string | undefined;
   let lastError: string | undefined;
   let known = new Set<ReturnType<typeof makeTaskId>>();
-  let focused: ReturnType<typeof makeTaskId> | undefined;
   const event: EventPayload = {
     taskId: "t1",
     atIso: "2026-04-26T12:00:00.000Z",
@@ -326,14 +325,10 @@ Deno.test("handleEvent: log event sets the last message with level prefix", () =
     setLastError: (next) => {
       lastError = next;
     },
-    setFocusedTaskId: (update) => {
-      focused = update(focused);
-    },
   });
   assertEquals(lastMessage, "[info] hello");
   assertEquals(lastError, undefined);
   assertEquals(known.size, 1);
-  assertEquals(focused, makeTaskId("t1"));
 });
 
 Deno.test("handleEvent: state-changed event renders fromState → toState", () => {
@@ -354,51 +349,10 @@ Deno.test("handleEvent: state-changed event renders fromState → toState", () =
         lastMessage = next;
       },
       setLastError: () => {},
-      setFocusedTaskId: () => {},
     },
   );
   assertEquals(lastMessage, "task_x: INIT → CLONING_WORKTREE");
   assertEquals(known.has(makeTaskId("task_x")), true);
-});
-
-Deno.test("handleEvent: focused-task is auto-set on the first event only", () => {
-  let focused: ReturnType<typeof makeTaskId> | undefined;
-  // First event with t1 → focus snaps to t1.
-  handleEvent(
-    {
-      taskId: "t1",
-      atIso: "2026-04-26T12:00:00.000Z",
-      kind: "log",
-      data: { level: "info", message: "first" },
-    },
-    {
-      setKnownTaskIds: () => {},
-      setLastMessage: () => {},
-      setLastError: () => {},
-      setFocusedTaskId: (update) => {
-        focused = update(focused);
-      },
-    },
-  );
-  assertEquals(focused, makeTaskId("t1"));
-  // Second event from a different task — focus must NOT jump.
-  handleEvent(
-    {
-      taskId: "t2",
-      atIso: "2026-04-26T12:00:01.000Z",
-      kind: "log",
-      data: { level: "info", message: "second" },
-    },
-    {
-      setKnownTaskIds: () => {},
-      setLastMessage: () => {},
-      setLastError: () => {},
-      setFocusedTaskId: (update) => {
-        focused = update(focused);
-      },
-    },
-  );
-  assertEquals(focused, makeTaskId("t1"));
 });
 
 Deno.test("handleEvent: agent-message event truncates long text", () => {
@@ -417,7 +371,6 @@ Deno.test("handleEvent: agent-message event truncates long text", () => {
         lastMessage = next;
       },
       setLastError: () => {},
-      setFocusedTaskId: () => {},
     },
   );
   assertEquals(lastMessage?.endsWith("…"), true);
@@ -442,7 +395,6 @@ Deno.test("handleEvent: github-call event renders method + endpoint", () => {
         lastMessage = next;
       },
       setLastError: () => {},
-      setFocusedTaskId: () => {},
     },
   );
   assertEquals(lastMessage, "github GET /repos/o/r/issues/1");
@@ -463,7 +415,6 @@ Deno.test("handleEvent: error event sets lastError", () => {
       setLastError: (next) => {
         lastError = next;
       },
-      setFocusedTaskId: () => {},
     },
   );
   assertEquals(lastError, "boom");
@@ -490,7 +441,6 @@ Deno.test("handleEvent: invalid task id surfaces as an error and bails", () => {
       setLastError: (next) => {
         lastError = next;
       },
-      setFocusedTaskId: () => {},
     },
   );
   assertEquals(lastError?.startsWith("event with invalid task id"), true);
@@ -514,7 +464,6 @@ Deno.test("handleEvent: duplicate task id leaves the known set unchanged", () =>
       },
       setLastMessage: () => {},
       setLastError: () => {},
-      setFocusedTaskId: () => {},
     },
   );
   assertEquals(known.size, 1);
