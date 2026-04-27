@@ -18,7 +18,7 @@
  * Both flows are delegated to `@octokit/auth-app` per
  * {@link "../../docs/adrs/005-no-jose-using-octokit-auth-app.md" | ADR-005}
  * and
- * {@link "../../docs/adrs/024-app-level-github-client-for-setup-wizard.md" | ADR-024}:
+ * {@link "../../docs/adrs/025-app-level-github-client-for-setup-wizard.md" | ADR-025}:
  * the JWT is minted via `auth({ type: "app" })` and the installation
  * token via `auth({ type: "installation", installationId, refresh: true })`.
  * We do not reimplement either primitive — the audited path lives inside
@@ -103,7 +103,7 @@ export interface InstallationRepository {
  * `AppClient` — once `setup` is done, every supervisor call is
  * installation-scoped through `GitHubClient`.
  *
- * @see {@link "../../docs/adrs/024-app-level-github-client-for-setup-wizard.md" | ADR-024}
+ * @see {@link "../../docs/adrs/025-app-level-github-client-for-setup-wizard.md" | ADR-025}
  */
 export interface AppClient {
   /**

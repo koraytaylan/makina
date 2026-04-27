@@ -1,4 +1,4 @@
-# ADR-024: App-level GitHub client for the setup wizard
+# ADR-025: App-level GitHub client for the setup wizard
 
 ## Status
 

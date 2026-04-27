@@ -3,8 +3,9 @@
 > Agentic CLI that drives a GitHub issue end-to-end: implement, open the PR, request a Copilot
 > review, drive the PR to a stable mergeable state, then merge.
 
-**Status:** under construction. The skeleton, CI, release pipeline, and issue catalog are in place;
-feature work tracks the [open issues](https://github.com/koraytaylan/makina/issues).
+**Status:** Wave 5 complete. The daemon, TUI, supervisor, and stabilize loop are wired end-to-end;
+the v0.1.0 release is cut from `main`. Track future work via the
+[open issues](https://github.com/koraytaylan/makina/issues).
 
 ## Concept
 
@@ -35,16 +36,16 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture,
 
 ## Quick start
 
-> Not yet — the daemon and TUI are implemented in waves 1–4. Track progress on the
-> [milestones](https://github.com/koraytaylan/makina/milestones).
-
-When ready:
-
 ```bash
 deno install --allow-all --name makina --force https://raw.githubusercontent.com/koraytaylan/makina/main/main.ts
 makina setup     # one-time GitHub App + default repo configuration
 makina           # launch the TUI
 ```
+
+`makina setup` walks you through the GitHub App configuration, discovers the installations the App
+can see, and writes `config.json` to the platform-appropriate path (see
+[`docs/configuration.md`](docs/configuration.md)). After that, launching `makina` auto-spawns the
+daemon if it is not already running and connects the TUI; type `/issue <number>` and walk away.
 
 ## Development
 

@@ -1,17 +1,18 @@
 # Configuration
 
-> Wave 1 freezes the typed shape (`src/config/schema.ts`); the loader (file IO, `~/` expansion,
-> error pretty-printing) lands with Wave 2.
+`src/config/schema.ts` defines the typed shape; `src/config/load.ts` reads, expands `~/`,
+JSONC-parses, and validates the file. Errors include the failing field path.
 
 ## Location
 
 - macOS: `~/Library/Application Support/makina/config.json`
 - Linux: `~/.config/makina/config.json`
 
-The file is parsed and validated by zod on every daemon start; errors include the failing field
-path.
+The file is parsed and validated on every daemon start; the daemon also tolerates a missing file by
+binding a fallback `${TMPDIR:-/tmp}/makina.sock` so `--version` and the smoke test still work before
+`makina setup` has run.
 
-## Shape (target)
+## Shape
 
 ```jsonc
 {
@@ -55,13 +56,8 @@ path.
 makina setup
 ```
 
-Walks through the App ID, private-key path, installation discovery, and default repo. See
-`docs/setup-github-app.md` for App creation.
-
-> **Status (this PR):** the wizard's interactive flow is implemented and runs unconditionally. The
-> GitHub App client used for installation discovery lands with `[W2-github-app-auth]` (#4); until
-> then, `makina setup` fails at the discovery step with a clear "GitHub App auth not yet implemented
-> (#4)" error (after the App ID and private-key path have been collected).
+Walks through the App ID, private-key path, installation discovery, and default repo, then writes
+`config.json` to the platform-appropriate path. See `docs/setup-github-app.md` for App creation.
 
 ## Loader behavior
 
