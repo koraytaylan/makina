@@ -21,7 +21,12 @@ import { INSTALLATION_TOKEN_REFRESH_LEAD_MILLISECONDS } from "../../src/constant
 
 import { InMemoryGitHubAuth } from "../helpers/in_memory_github_auth.ts";
 import { InMemoryGitHubClient } from "../helpers/in_memory_github_client.ts";
-import { InMemoryDaemonClient } from "../helpers/in_memory_daemon_client.ts";
+import {
+  type AckEnvelope,
+  InMemoryDaemonClient,
+  type PingEnvelope,
+  type RequestEnvelope,
+} from "../helpers/in_memory_daemon_client.ts";
 import { MockAgentRunner } from "../helpers/mock_agent_runner.ts";
 
 const ONE_HOUR_MILLISECONDS = 60 * 60 * 1_000;
@@ -265,12 +270,21 @@ Deno.test("InMemoryDaemonClient: non-ping requests get an ack", async () => {
 
 Deno.test("InMemoryDaemonClient: setRequestHandler customizes ack payloads", async () => {
   const client = new InMemoryDaemonClient();
-  client.setRequestHandler((envelope) => {
+  // Implement the overloaded `RequestHandler` contract: `ping` →
+  // `PongPayload`, every other request envelope → `AckPayload`. The
+  // implementation signature uses `RequestEnvelope` and a runtime
+  // discriminant, mirroring the helper's own default handler.
+  function handler(envelope: PingEnvelope): Promise<PongPayload>;
+  function handler(envelope: AckEnvelope): Promise<AckPayload>;
+  function handler(
+    envelope: RequestEnvelope,
+  ): Promise<PongPayload | AckPayload> {
     if (envelope.type === "ping") {
-      return Promise.resolve({ daemonVersion: "test" });
+      return Promise.resolve<PongPayload>({ daemonVersion: "test" });
     }
-    return Promise.resolve({ ok: false, error: "denied" });
-  });
+    return Promise.resolve<AckPayload>({ ok: false, error: "denied" });
+  }
+  client.setRequestHandler(handler);
   const ack = await client.send({
     id: "3",
     type: "command",

@@ -112,29 +112,52 @@ export function encode(envelope: MessageEnvelope): Uint8Array {
  * State machine for the streaming decoder. Holds the unconsumed tail of
  * the byte stream between calls so frames split across `chunk` boundaries
  * are stitched together correctly.
+ *
+ * **Storage strategy.** The decoder keeps an array of chunks plus a
+ * running total length, and only collapses the queue into one contiguous
+ * `Uint8Array` when the next frame is being inspected. Appending a chunk
+ * is therefore O(1) regardless of how the bytes are split — a stream
+ * that delivers a 64 KiB frame as 64 separate 1 KiB writes does 64 cheap
+ * pushes plus a single concat per frame, instead of the O(n²) repeated
+ * concat the prior implementation suffered from when frames arrive in
+ * many small chunks. After a frame is extracted, the consumed bytes are
+ * dropped and the remaining tail (if any) is copied into a fresh
+ * `Uint8Array` so the codec does not retain the original chunks'
+ * backing `ArrayBuffer`s, which can be much larger than the tail.
  */
 class DecoderState {
   /**
-   * Pending bytes that have not been fully consumed into a frame yet.
-   * Initially empty; grows when a chunk supplies less than a complete
-   * frame, shrinks when whole frames are extracted.
+   * Pending chunks that together form the unconsumed byte stream. Empty
+   * when the decoder has nothing buffered. Each element is a view into
+   * the bytes the transport handed us, in arrival order.
    */
-  private buffer: Uint8Array = new Uint8Array(0);
+  private chunks: Uint8Array[] = [];
+  /**
+   * Total byte length across {@link DecoderState.chunks}. Maintained
+   * incrementally so we can answer "do we have enough bytes for this
+   * frame yet?" without re-scanning the chunk list.
+   */
+  private totalLength = 0;
+  /**
+   * Cached collapsed view of {@link DecoderState.chunks}. Built lazily by
+   * {@link DecoderState.materialize} when a frame is being inspected and
+   * invalidated whenever {@link DecoderState.chunks} is mutated.
+   */
+  private collapsed: Uint8Array | undefined;
 
   /**
-   * Append `chunk` to the pending buffer.
+   * Append `chunk` to the pending byte stream. O(1) — no copy. Empty
+   * chunks are dropped to keep the chunk list short.
    *
    * @param chunk Bytes pulled from the underlying transport.
    */
   push(chunk: Uint8Array): void {
-    if (this.buffer.byteLength === 0) {
-      this.buffer = chunk;
+    if (chunk.byteLength === 0) {
       return;
     }
-    const merged = new Uint8Array(this.buffer.byteLength + chunk.byteLength);
-    merged.set(this.buffer, 0);
-    merged.set(chunk, this.buffer.byteLength);
-    this.buffer = merged;
+    this.chunks.push(chunk);
+    this.totalLength += chunk.byteLength;
+    this.collapsed = undefined;
   }
 
   /**
@@ -145,7 +168,10 @@ class DecoderState {
    * @throws {IpcCodecError} On any framing or schema problem.
    */
   next(): MessageEnvelope | undefined {
-    const view = this.buffer;
+    if (this.totalLength === 0) {
+      return undefined;
+    }
+    const view = this.materialize();
     const newlineIndex = indexOfNewline(view);
     if (newlineIndex === -1) {
       if (view.byteLength > MAX_IPC_LENGTH_PREFIX_DIGITS) {
@@ -211,8 +237,22 @@ class DecoderState {
       throw new IpcCodecError("frame payload failed schema validation", validation.issues);
     }
 
-    // Drop the consumed bytes (prefix + newline + payload + trailing newline).
-    this.buffer = view.subarray(trailerEnd);
+    // Drop the consumed bytes (prefix + newline + payload + trailing
+    // newline). Copy the remaining tail into a fresh `Uint8Array` so we
+    // do not retain the full backing `ArrayBuffer` of a large
+    // previously-decoded frame: `subarray` keeps a reference to the
+    // entire underlying buffer, which can be tens of MiB.
+    const tail = view.subarray(trailerEnd);
+    if (tail.byteLength === 0) {
+      this.chunks = [];
+      this.totalLength = 0;
+      this.collapsed = undefined;
+    } else {
+      const owned = new Uint8Array(tail);
+      this.chunks = [owned];
+      this.totalLength = owned.byteLength;
+      this.collapsed = owned;
+    }
     return validation.data;
   }
 
@@ -223,7 +263,45 @@ class DecoderState {
    * @returns `true` iff there is at least one buffered byte.
    */
   hasPendingBytes(): boolean {
-    return this.buffer.byteLength > 0;
+    return this.totalLength > 0;
+  }
+
+  /**
+   * Collapse {@link DecoderState.chunks} into a single contiguous
+   * `Uint8Array`. Cached so two `next()` calls in a row do not pay the
+   * concat cost twice; invalidated whenever a chunk is appended.
+   *
+   * Single-chunk fast path: when there is exactly one pending chunk,
+   * return it without copying — the typical case once a frame fits in
+   * one transport read.
+   */
+  private materialize(): Uint8Array {
+    if (this.collapsed !== undefined) {
+      return this.collapsed;
+    }
+    if (this.chunks.length === 1) {
+      const sole = this.chunks[0];
+      if (sole === undefined) {
+        // Defensive: chunks.length === 1 but chunks[0] is undefined is
+        // impossible under normal control flow, so fall through to the
+        // empty-array case rather than asserting non-null.
+        return new Uint8Array(0);
+      }
+      this.collapsed = sole;
+      return sole;
+    }
+    const combined = new Uint8Array(this.totalLength);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    // Replace the chunk list with the combined view so subsequent
+    // `next()` calls can short-circuit on the single-chunk fast path,
+    // and so `push()` does not have to walk a long chunk list.
+    this.chunks = [combined];
+    this.collapsed = combined;
+    return combined;
   }
 }
 

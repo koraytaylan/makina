@@ -91,8 +91,12 @@ export const MAX_IPC_LENGTH_PREFIX_DIGITS = 8;
  * Default capacity of the in-process event-bus per-subscriber queue.
  *
  * Subscribers consume events through a bounded `ReadableStream`; once the
- * buffer fills the publisher applies backpressure (Wave 2 picks the exact
- * policy). The cap keeps a slow TUI from holding the daemon hostage.
+ * buffer fills, the publisher drops newly published events for that
+ * subscriber rather than blocking, and a single warning is emitted per
+ * overflow episode (further warnings are suppressed until the queue drains
+ * again, to avoid log spam). The cap keeps a slow TUI from holding the
+ * daemon hostage. See `docs/adrs/012-event-bus-backpressure-and-sync-callbacks.md`
+ * and `src/daemon/event-bus.ts` for the full policy.
  */
 export const EVENT_BUS_DEFAULT_BUFFER_SIZE = 256;
 
