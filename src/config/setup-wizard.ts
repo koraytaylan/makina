@@ -33,6 +33,8 @@ import { exists } from "@std/fs";
 import { type Config, type GitHubConfig, parseConfig } from "./schema.ts";
 import { defaultEnvLookup, type EnvLookup, expandHome } from "./load.ts";
 import {
+  DEFAULT_COMMAND_PALETTE_KEYBINDING,
+  DEFAULT_TASK_SWITCHER_KEYBINDING,
   MAX_TASK_ITERATIONS,
   POLL_INTERVAL_MILLISECONDS,
   RADIX_DECIMAL,
@@ -540,7 +542,10 @@ function buildConfig(seeds: ConfigSeeds): unknown {
       autoStart: true,
     },
     tui: {
-      keybindings: { commandPalette: "ctrl+p", taskSwitcher: "ctrl+g" },
+      keybindings: {
+        commandPalette: DEFAULT_COMMAND_PALETTE_KEYBINDING,
+        taskSwitcher: DEFAULT_TASK_SWITCHER_KEYBINDING,
+      },
     },
   };
 }

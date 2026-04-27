@@ -58,16 +58,28 @@ export interface KeystrokeFlags {
  * The `key` field carries the bare key name (e.g. `"p"`, `"tab"`,
  * `"escape"`). Modifier booleans report whether the chord requires
  * each modifier to be held.
+ *
+ * **No separate `alt`.** Ink's `useInput` only exposes a `meta` flag —
+ * its terminal layer collapses Alt and Cmd/Super/Win into the same
+ * boolean (xterm-style terminals deliver both as ESC-prefixed
+ * sequences, so the underlying signal is the same byte stream). A
+ * chord written as `alt+x` is treated as an alias for `meta+x`; the
+ * `alt` modifier name is accepted by the parser for ergonomics but
+ * does not produce a distinct field here. If a future Ink upgrade
+ * splits Alt off from Meta we can re-introduce `alt` without breaking
+ * existing config files.
  */
 export interface ParsedKeybinding {
   /** `ctrl` modifier required. */
   readonly ctrl: boolean;
   /** `shift` modifier required. */
   readonly shift: boolean;
-  /** `meta` modifier required. */
+  /**
+   * `meta` modifier required. Set when the chord uses either `meta+`
+   * or `alt+` (Ink does not distinguish the two — see the type-level
+   * comment).
+   */
   readonly meta: boolean;
-  /** `alt` modifier required (synonym for `meta` on most terminals). */
-  readonly alt: boolean;
   /** Bare key (lowercased; named keys preserved literally). */
   readonly key: string;
 }
@@ -108,7 +120,7 @@ const MODIFIER_NAMES = new Set(["ctrl", "shift", "meta", "alt"]);
  * @example
  * ```ts
  * const parsed = parseKeybinding("ctrl+p");
- * // → { ctrl: true, shift: false, meta: false, alt: false, key: "p" }
+ * // → { ctrl: true, shift: false, meta: false, key: "p" }
  * ```
  */
 export function parseKeybinding(chord: string): ParsedKeybinding {
@@ -141,11 +153,14 @@ export function parseKeybinding(chord: string): ParsedKeybinding {
       );
     }
   }
+  // Ink does not distinguish Alt and Meta (its terminal layer collapses
+  // both into `key.meta`); the chord syntax accepts `alt+` as a synonym
+  // and folds it into the `meta` flag here. See the JSDoc on
+  // `ParsedKeybinding` for the rationale.
   return {
     ctrl: modifiers.includes("ctrl"),
     shift: modifiers.includes("shift"),
-    meta: modifiers.includes("meta"),
-    alt: modifiers.includes("alt"),
+    meta: modifiers.includes("meta") || modifiers.includes("alt"),
     key,
   };
 }
@@ -214,11 +229,11 @@ export function matchesKeybinding(
     return false;
   }
   if (parsed.ctrl !== flags.ctrl) return false;
-  // `alt` is treated as the meta synonym Ink already exposes; the
-  // chord-side flag is folded into `meta` so the modifier check below
-  // matches the keystroke's flag bag uniformly.
-  const requiresMeta = parsed.meta || parsed.alt;
-  if (requiresMeta !== flags.meta) return false;
+  // `parsed.meta` is already true for both `meta+` and `alt+` chords
+  // (the parser folds Alt into Meta — see the JSDoc on
+  // `ParsedKeybinding`), so a single equality check matches the
+  // keystroke's flag bag uniformly.
+  if (parsed.meta !== flags.meta) return false;
   // Shift behaviour: enforce strict equality so the JSDoc contract
   // ("must match exactly") is the truth. A chord without `shift+` will
   // not fire while shift is held, and a `ctrl+shift+x` chord will not

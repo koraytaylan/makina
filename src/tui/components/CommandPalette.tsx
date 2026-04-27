@@ -119,10 +119,18 @@ export function CommandPalette(props: CommandPaletteProps): ReactElement {
     if (input.trim().length === 0) {
       return;
     }
+    // The overlay renders a leading `/` placeholder when `input` is
+    // empty, but `input` itself is the source of truth. If the user
+    // types the command name without an explicit `/` (relying on the
+    // visual hint) reconstruct the canonical `/<name>` form before
+    // parsing so the captured payload matches what the user saw on
+    // screen. A user who typed an explicit `/` keeps it verbatim.
+    const trimmed = input.trim();
+    const canonical = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
     try {
-      const payload = parseSlashCommand(input);
+      const payload = parseSlashCommand(canonical);
       setParseError(undefined);
-      onSubmit(payload, input.trim());
+      onSubmit(payload, canonical);
     } catch (error) {
       if (error instanceof SlashCommandParseError) {
         setParseError(error.message);

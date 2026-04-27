@@ -500,12 +500,17 @@ Deno.test("formatAgeBetween: clamps negative deltas to 0s", () => {
 
 Deno.test("parseKeybinding: accepts ctrl+p", () => {
   const parsed = parseKeybinding("ctrl+p");
-  assertEquals(parsed, { ctrl: true, shift: false, meta: false, alt: false, key: "p" });
+  assertEquals(parsed, { ctrl: true, shift: false, meta: false, key: "p" });
 });
 
 Deno.test("parseKeybinding: accepts ctrl+shift+tab", () => {
   const parsed = parseKeybinding("ctrl+shift+tab");
-  assertEquals(parsed, { ctrl: true, shift: true, meta: false, alt: false, key: "tab" });
+  assertEquals(parsed, { ctrl: true, shift: true, meta: false, key: "tab" });
+});
+
+Deno.test("parseKeybinding: alt+ folds into the meta flag (no separate alt field)", () => {
+  const parsed = parseKeybinding("alt+x");
+  assertEquals(parsed, { ctrl: false, shift: false, meta: true, key: "x" });
 });
 
 Deno.test("parseKeybinding: trims surrounding whitespace and lowercases components", () => {
