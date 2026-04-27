@@ -58,7 +58,16 @@
 
 import { dirname } from "@std/path";
 
-import { MERGE_MODES, type Persistence, type Task, TASK_STATES, type TaskId } from "../types.ts";
+import {
+  makeIssueNumber,
+  makeRepoFullName,
+  makeTaskId,
+  MERGE_MODES,
+  type Persistence,
+  type Task,
+  TASK_STATES,
+  type TaskId,
+} from "../types.ts";
 
 /** Suffix appended to the live path to form the temp file used for atomic writes. */
 const TEMP_FILE_SUFFIX = ".tmp";
@@ -564,18 +573,69 @@ const REQUIRED_TASK_FIELDS = [
 ] as const satisfies readonly (keyof Task)[];
 
 /**
+ * Run `produce()` and rethrow any exception as a {@link PersistenceError}
+ * naming the failing record's `livePath[index].field` location.
+ *
+ * Used to wrap brand constructors (`makeTaskId`, `makeRepoFullName`,
+ * `makeIssueNumber`) so a corrupt on-disk value (e.g. `id: ""`,
+ * `issueNumber: 0`, `repo: "no-slash"`) surfaces with the same
+ * `persistence: <path>[<i>].<field> ...` shape as the primitive checks
+ * around it. The original `RangeError` from the constructor is preserved
+ * via `cause` for log forensics.
+ */
+function brandedField<T>(
+  livePath: string,
+  index: number,
+  field: string,
+  produce: () => T,
+): T {
+  try {
+    return produce();
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    throw new PersistenceError(
+      `persistence: ${livePath}[${index}].${field} fails brand invariant: ${message}`,
+      { cause },
+    );
+  }
+}
+
+/**
+ * Error type thrown by {@link coerceTask} when a record on disk fails
+ * structural or brand-invariant validation. Carries the original
+ * constructor `RangeError` (when present) on `cause` so the underlying
+ * reason — empty `TaskId`, malformed `RepoFullName`, non-positive
+ * `IssueNumber` — is visible to log readers without reformatting.
+ *
+ * Subclassing `Error` (rather than tagging `Error` instances) lets tests
+ * assert the failure category with `assertRejects(_, PersistenceError)`
+ * separately from generic JSON / primitive-type failures, even though all
+ * three currently surface as `Error` to callers.
+ */
+export class PersistenceError extends Error {
+  /** Discriminator visible in stack traces and `error.name === ...` checks. */
+  override readonly name = "PersistenceError";
+}
+
+/**
  * Validate that `entry` matches the {@link Task} shape closely enough to
  * be handed to the daemon as a `Task`.
  *
- * The check is intentionally narrow — we verify presence and primitive
- * type of every required persistence field, plus the discriminant unions
- * (`state`, `mergeMode`) that the supervisor switches on. We do not
- * re-validate brand invariants (`makeTaskId` etc.); a value that survived
- * a previous serialization must have already passed those.
+ * The check verifies presence and primitive type of every required
+ * persistence field, the discriminant unions (`state`, `mergeMode`) that
+ * the supervisor switches on, **and** the brand invariants
+ * (`makeTaskId`, `makeRepoFullName`, `makeIssueNumber`). Routing the
+ * branded fields through their constructors closes a corruption gap: a
+ * hand-edited or legacy store could otherwise carry `id: ""`,
+ * `issueNumber: 0`, or `repo: "no-slash"` and survive `loadAll()`,
+ * handing the supervisor a value typed as `Task` whose runtime shape
+ * violates invariants the rest of the daemon relies on.
  *
  * @throws If `entry` is not an object, is missing a required field, or
- *   carries the wrong type for one. The error names the live path and
- *   element index so an operator can locate the bad record with `jq`.
+ *   carries the wrong type or a brand-invalid value for one. The error
+ *   names the live path and element index so an operator can locate the
+ *   bad record with `jq`. Brand-invariant failures throw
+ *   {@link PersistenceError} with the original `RangeError` on `cause`.
  */
 function coerceTask(entry: unknown, index: number, livePath: string): Task {
   if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
@@ -644,5 +704,23 @@ function coerceTask(entry: unknown, index: number, livePath: string): Task {
       } is not a MergeMode`,
     );
   }
-  return record as unknown as Task;
+  // Re-run the branded constructors so a corrupt store cannot smuggle
+  // values that violate `id`/`repo`/`issueNumber` invariants past the
+  // primitive checks above. Each constructor's `RangeError` is wrapped
+  // in a `PersistenceError` that names the failing field path so an
+  // operator can `jq` straight to the bad record.
+  const id = brandedField(livePath, index, "id", () => makeTaskId(record.id as string));
+  const repo = brandedField(
+    livePath,
+    index,
+    "repo",
+    () => makeRepoFullName(record.repo as string),
+  );
+  const issueNumber = brandedField(
+    livePath,
+    index,
+    "issueNumber",
+    () => makeIssueNumber(record.issueNumber as number),
+  );
+  return { ...record, id, repo, issueNumber } as unknown as Task;
 }

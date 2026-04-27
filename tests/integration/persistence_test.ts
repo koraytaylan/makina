@@ -380,6 +380,77 @@ Deno.test("loadAll rejects an element with an unknown TaskState", async () => {
   }
 });
 
+Deno.test("loadAll rejects an element whose issueNumber violates IssueNumber's positive-integer brand invariant", async () => {
+  // The primitive check accepts `issueNumber: 0` (it is an integer), but
+  // `makeIssueNumber` rejects it because GitHub issue numbers start at 1.
+  // Without re-running the brand constructor, a hand-edited or legacy
+  // store could hand the supervisor a `Task` whose `issueNumber` is
+  // typed as `IssueNumber` but violates the very invariant the brand
+  // exists to guarantee. This regression pins that gap closed.
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    await Deno.mkdir(dirname(path), { recursive: true });
+    const malformed = {
+      id: "task_zero_issue",
+      repo: "koraytaylan/makina",
+      issueNumber: 0,
+      state: "INIT",
+      mergeMode: "squash",
+      model: "claude-sonnet-4-6",
+      iterationCount: 0,
+      createdAtIso: "2026-04-26T12:00:00.000Z",
+      updatedAtIso: "2026-04-26T12:00:00.000Z",
+    };
+    await Deno.writeTextFile(path, JSON.stringify([malformed]));
+    const persistence = createPersistence({ path });
+    const error = await assertRejects(
+      () => persistence.loadAll(),
+      Error,
+      "issueNumber fails brand invariant",
+    );
+    // The error must name the failing field path so an operator can
+    // `jq` straight to the bad record.
+    assertEquals(error.message.includes("[0].issueNumber"), true);
+    assertEquals(error.message.includes("positive integer"), true);
+  } finally {
+    await cleanup();
+  }
+});
+
+Deno.test("loadAll rejects an element whose repo violates RepoFullName's `<owner>/<name>` brand invariant", async () => {
+  // The primitive check accepts any non-empty string for `repo`, but
+  // `makeRepoFullName` requires exactly one `/` separator with non-empty
+  // owner and name segments. A value like `"orphan"` slips past the
+  // primitive guard and would otherwise reach the supervisor as a
+  // `RepoFullName` whose runtime shape is invalid.
+  const { path, cleanup } = await makeTempStorePath();
+  try {
+    await Deno.mkdir(dirname(path), { recursive: true });
+    const malformed = {
+      id: "task_bad_repo",
+      repo: "orphan",
+      issueNumber: 7,
+      state: "INIT",
+      mergeMode: "squash",
+      model: "claude-sonnet-4-6",
+      iterationCount: 0,
+      createdAtIso: "2026-04-26T12:00:00.000Z",
+      updatedAtIso: "2026-04-26T12:00:00.000Z",
+    };
+    await Deno.writeTextFile(path, JSON.stringify([malformed]));
+    const persistence = createPersistence({ path });
+    const error = await assertRejects(
+      () => persistence.loadAll(),
+      Error,
+      "repo fails brand invariant",
+    );
+    assertEquals(error.message.includes("[0].repo"), true);
+    assertEquals(error.message.includes("<owner>/<name>"), true);
+  } finally {
+    await cleanup();
+  }
+});
+
 Deno.test("loadAll surfaces non-array root rather than silently coercing", async () => {
   const { path, cleanup } = await makeTempStorePath();
   try {
