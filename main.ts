@@ -91,11 +91,23 @@ if (subcommand === "daemon") {
 
   let eventBus: import("./src/types.ts").EventBus | undefined;
   try {
+    // The event-bus module exports a `createEventBus()` factory, not a
+    // class. The dynamic import keeps the "module-missing → unimplemented"
+    // fallback while the real factory binding is the load-bearing line: a
+    // stale lookup for a non-existent class export would silently leave
+    // the daemon without an event bus and bury subscribe behind
+    // `unimplemented`. Once the dynamic-import fallback is no longer
+    // needed (TODO below), this becomes a direct top-level import.
     const busModule = await import("./src/daemon/event-bus.ts");
-    const ctor = (busModule as { InProcessEventBus?: new () => unknown })
-      .InProcessEventBus;
-    if (typeof ctor === "function") {
-      eventBus = new ctor() as import("./src/types.ts").EventBus;
+    const factory = (busModule as {
+      createEventBus?: () => import("./src/types.ts").EventBus;
+    }).createEventBus;
+    if (typeof factory === "function") {
+      eventBus = factory();
+    } else {
+      console.error(
+        "[daemon] note: src/daemon/event-bus.ts does not export createEventBus; subscribe will reply unimplemented",
+      );
     }
   } catch (error) {
     if (isModuleNotFoundError(error)) {

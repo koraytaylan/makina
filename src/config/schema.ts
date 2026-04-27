@@ -215,12 +215,18 @@ const installationIdSchema = z
   .int()
   .gte(MIN_GITHUB_INSTALLATION_ID);
 
+// Each `z.object(...)` is `.strict()` so that a typo in `config.json`
+// (e.g. `privKeyPath` instead of `privateKeyPath`) raises a
+// `unrecognized_keys` issue with the offending field path rather than
+// being silently stripped. The loader documents that it surfaces
+// "helpful field paths"; strict objects are what makes that promise hold
+// for typos as well as for out-of-range values.
 const githubConfigSchema: z.ZodType<GitHubConfig, z.ZodTypeDef, unknown> = z.object({
   appId: z.number().int().gte(MIN_GITHUB_APP_ID),
   privateKeyPath: z.string().min(1),
   installations: z.record(repoFullNameSchema, installationIdSchema),
   defaultRepo: repoFullNameSchema,
-});
+}).strict();
 
 const agentConfigSchema: z.ZodType<AgentConfig, z.ZodTypeDef, unknown> = z.object({
   model: z.string().min(1),
@@ -231,7 +237,7 @@ const agentConfigSchema: z.ZodType<AgentConfig, z.ZodTypeDef, unknown> = z.objec
     .gte(MIN_MAX_TASK_ITERATIONS)
     .lte(MAX_MAX_TASK_ITERATIONS)
     .default(MAX_TASK_ITERATIONS),
-});
+}).strict();
 
 const lifecycleConfigSchema: z.ZodType<LifecycleConfig, z.ZodTypeDef, unknown> = z.object({
   mergeMode: z.enum(["squash", "rebase", "manual"]),
@@ -248,25 +254,26 @@ const lifecycleConfigSchema: z.ZodType<LifecycleConfig, z.ZodTypeDef, unknown> =
     .lte(MAX_POLL_INTERVAL_MILLISECONDS)
     .default(POLL_INTERVAL_MILLISECONDS),
   preserveWorktreeOnMerge: z.boolean().default(false),
-});
+}).strict();
 
 const daemonConfigSchema: z.ZodType<DaemonConfig, z.ZodTypeDef, unknown> = z.object({
   socketPath: z.string().min(1),
   autoStart: z.boolean().default(true),
-});
+}).strict();
 
 const keybindingsConfigSchema: z.ZodType<KeybindingsConfig, z.ZodTypeDef, unknown> = z
   .object({
     commandPalette: z.string().min(1).default("ctrl+p"),
     taskSwitcher: z.string().min(1).default("ctrl+g"),
-  });
+  })
+  .strict();
 
 const tuiConfigSchema: z.ZodType<TuiConfig, z.ZodTypeDef, unknown> = z.object({
   keybindings: keybindingsConfigSchema.default({
     commandPalette: "ctrl+p",
     taskSwitcher: "ctrl+g",
   }),
-});
+}).strict();
 
 const configSchema: z.ZodType<Config, z.ZodTypeDef, unknown> = z
   .object({
@@ -279,6 +286,7 @@ const configSchema: z.ZodType<Config, z.ZodTypeDef, unknown> = z
       keybindings: { commandPalette: "ctrl+p", taskSwitcher: "ctrl+g" },
     }),
   })
+  .strict()
   .superRefine((value, context) => {
     const installations = value.github.installations;
     const defaultRepo = value.github.defaultRepo;

@@ -80,8 +80,10 @@ export const MAX_IPC_FRAME_BYTES = 1_048_576;
  *
  * `MAX_IPC_FRAME_BYTES` plus a small overhead, expressed as the largest
  * decimal-string length the framer will read before declaring the frame
- * malformed. Six digits caps the prefix at 999,999 bytes which is below
- * `MAX_IPC_FRAME_BYTES` — both bounds are checked at decode time.
+ * malformed. Eight digits cap the prefix at 99,999,999 bytes which is well
+ * above `MAX_IPC_FRAME_BYTES` — both bounds are checked at decode time, so
+ * the byte-count cap is the tight bound and the digit cap protects the
+ * framer from reading an unbounded run of digits before the newline.
  */
 export const MAX_IPC_LENGTH_PREFIX_DIGITS = 8;
 
@@ -314,3 +316,44 @@ export const POLLER_BACKOFF_JITTER_WINDOW_MULTIPLIER = 2;
  * Ink renderer when a surrogate pair lands on the boundary.
  */
 export const AGENT_MESSAGE_TEXT_TRUNCATION_CODE_UNITS = 8_192;
+
+/**
+ * Length, in characters, of the random suffix appended to a {@link TaskId}.
+ *
+ * The supervisor mints task ids of the form
+ * `task_<isoDate>_<rand>` where `<rand>` is six lower-case hex
+ * characters. Six characters keep the id readable in logs while leaving
+ * 16,777,216 distinct values per ISO-second — enough that an accidental
+ * collision in a single tick is implausible without coordination.
+ */
+export const TASK_ID_RANDOM_SUFFIX_LENGTH_CHARACTERS = 6;
+
+/**
+ * Number of bytes drawn from `crypto.getRandomValues` to produce a single
+ * task-id suffix.
+ *
+ * Three bytes encode to six hex characters, matching
+ * {@link TASK_ID_RANDOM_SUFFIX_LENGTH_CHARACTERS}. Centralised so the
+ * supervisor's id-mint helper keeps the bytes-to-characters relationship
+ * explicit rather than hard-coding the `3 * 2 = 6` arithmetic at the
+ * call site.
+ */
+export const TASK_ID_RANDOM_SUFFIX_BYTES = 3;
+
+/**
+ * Radix used when projecting `task-id` random bytes into hex characters.
+ *
+ * Hex is base-16; centralising the value makes the
+ * `byte.toString(HEX_RADIX)` call site self-documenting and consistent
+ * with the rule that bare numeric literals do not appear in `src/`.
+ */
+export const HEX_RADIX = 16;
+
+/**
+ * Width, in characters, of a single zero-padded hex byte.
+ *
+ * Each byte rendered with `padStart(HEX_BYTE_WIDTH_CHARACTERS, "0")`
+ * yields a stable two-character pair regardless of value. Pairs with
+ * {@link HEX_RADIX} for the supervisor's id-mint helper.
+ */
+export const HEX_BYTE_WIDTH_CHARACTERS = 2;
