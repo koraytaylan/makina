@@ -422,3 +422,41 @@ export const HOURS_PER_DAY = 24;
  * dominant content of the open palette.
  */
 export const COMMAND_PALETTE_SUGGESTION_WIDTH_CODE_UNITS = 160;
+
+/**
+ * Exit code that `git` (and POSIX processes generally) report on
+ * successful invocations.
+ *
+ * Centralised so the rebase phase reads
+ * `result.exitCode === STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE`
+ * instead of a bare `0`, matching the bare-numeric-literal rule at
+ * the top of this file.
+ */
+export const STABILIZE_REBASE_GIT_NULL_SUCCESS_EXIT_CODE = 0;
+
+/**
+ * Maximum number of bytes of each conflicting file the rebase-phase
+ * conflict prompt embeds for the agent.
+ *
+ * Conflict markers and surrounding context fit comfortably inside 16 KiB
+ * for nearly every codebase file the daemon will see; larger files are
+ * truncated with an ellipsis token so the agent prompt stays bounded.
+ * The agent can read the full file via its tools if it needs to.
+ */
+export const STABILIZE_REBASE_CONFLICT_FILE_PREVIEW_BYTES = 16_384;
+
+/**
+ * First line of the conflict-context prompt sent to the agent during
+ * the rebase phase. Centralised so the unit tests can match against
+ * the same string the production code emits.
+ *
+ * The agent is told it is mid-rebase, that conflict markers in the
+ * worktree need resolving, and that it must not run any git commands
+ * itself. The daemon will resume the rebase once the agent settles.
+ */
+export const STABILIZE_REBASE_CONFLICT_PROMPT_HEAD: string =
+  "You are resolving merge conflicts during a `git rebase`. " +
+  "The worktree has files with conflict markers (<<<<<<<, =======, >>>>>>>). " +
+  "Edit each file to resolve the conflicts, preserving the intent of both sides where possible. " +
+  "Do NOT run `git add`, `git commit`, or `git rebase` — the daemon will continue the rebase " +
+  "after you settle.";

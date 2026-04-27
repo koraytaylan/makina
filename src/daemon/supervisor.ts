@@ -76,6 +76,13 @@ import {
   type TaskId,
   type TaskState,
 } from "../types.ts";
+import {
+  type ConflictFileReader,
+  type RebasePhaseResult,
+  runRebasePhase,
+  type StabilizeGitInvoker,
+  StabilizeRebaseError,
+} from "./stabilize.ts";
 import type { WorktreeManagerImpl } from "./worktree-manager.ts";
 
 /**
@@ -193,6 +200,22 @@ export interface TaskSupervisorOptions {
    * `crypto.getRandomValues`.
    */
   readonly randomSource?: SupervisorRandomSource;
+  /**
+   * Optional override for the git invoker used by the stabilize-rebase
+   * phase ({@link runRebasePhase}). Production leaves this unset and
+   * the rebase phase backs onto `Deno.Command("git", …)`; unit tests
+   * inject a scripted double so the rebase loop is deterministic without
+   * touching real git.
+   */
+  readonly gitInvoker?: StabilizeGitInvoker;
+  /**
+   * Optional override for the conflict-file reader used by the
+   * stabilize-rebase phase. Production leaves this unset and the phase
+   * backs onto `Deno.readTextFile`; unit tests inject a scripted reader
+   * so the conflict-marker branch can be exercised without a real
+   * filesystem.
+   */
+  readonly conflictFileReader?: ConflictFileReader;
 }
 
 /**
@@ -348,6 +371,8 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
   const random: SupervisorRandomSource = opts.randomSource ?? defaultRandomSource();
   const cloneUrlFor = opts.cloneUrlFor ??
     ((repo: RepoFullName) => `https://github.com/${repo}.git`);
+  const stabilizeGitInvoker = opts.gitInvoker;
+  const stabilizeConflictReader = opts.conflictFileReader;
 
   /**
    * In-memory task table. Wave 3's daemon hydrates this on boot via
@@ -661,11 +686,40 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
   }
 
   async function runStabilizing(task: Task): Promise<Task> {
-    // Stub bodies for the three stabilize sub-phases. Each one walks
-    // through `REBASE → CI → CONVERSATIONS` so observers see the
-    // expected timeline; Wave 4 fills in the per-phase logic.
-    let current = task;
-    for (const phase of ["REBASE", "CI", "CONVERSATIONS"] as const) {
+    // Wave 4 fills in the rebase sub-phase. The CI and CONVERSATIONS
+    // sub-phases are still stubs and surface a `STABILIZING(<phase>)`
+    // self-transition so observers see the expected timeline; sibling
+    // Wave 4 issues replace each stub with the real per-phase logic.
+    //
+    // The rebase phase publishes a `STABILIZING(REBASE)` self-transition
+    // before any work begins so a subscriber that watches for the
+    // start-of-phase event has the same observable as the CI and
+    // CONVERSATIONS stubs do today.
+    const rebaseStart = await transition(
+      task,
+      { state: "STABILIZING", stabilizePhase: "REBASE" },
+      "stabilize phase REBASE",
+    );
+    let current: Task;
+    try {
+      current = await runRebaseSubPhase(rebaseStart);
+    } catch (error) {
+      logger.warn(
+        `supervisor: stabilize-rebase failed for task ${task.id}: ${errorMessage(error)}`,
+      );
+      const operation = error instanceof StabilizeRebaseError
+        ? `stabilize-rebase-${error.operation}`
+        : "stabilize-rebase";
+      return await fail(rebaseStart, error, operation);
+    }
+    if (current.state === "NEEDS_HUMAN") {
+      return current;
+    }
+    // CI and CONVERSATIONS are still stubs; sibling Wave 4 issues
+    // replace each with the real per-phase logic. Each stub emits the
+    // matching `STABILIZING(<phase>)` self-transition so the observable
+    // timeline matches the contract the integration test asserts.
+    for (const phase of ["CI", "CONVERSATIONS"] as const) {
       current = await transition(
         current,
         { state: "STABILIZING", stabilizePhase: phase },
@@ -677,6 +731,47 @@ export function createTaskSupervisor(opts: TaskSupervisorOptions): TaskSuperviso
       { state: "READY_TO_MERGE" },
       "stabilize loop settled",
     );
+  }
+
+  /**
+   * Run the rebase sub-phase against `task`'s worktree. On a clean
+   * rebase, returns `task` unchanged so the caller can advance to the
+   * next sub-phase. On `needs-human`, transitions the task to
+   * `NEEDS_HUMAN` with a `terminalReason` listing the conflicting
+   * files; the worktree is preserved by {@link runRebasePhase} (it
+   * runs `git rebase --abort` so the worktree is back on the feature
+   * branch) so an operator can inspect.
+   */
+  async function runRebaseSubPhase(task: Task): Promise<Task> {
+    if (task.worktreePath === undefined) {
+      throw new StabilizeRebaseError(
+        "STABILIZING entered without a worktree path",
+        "precondition",
+      );
+    }
+    const rebaseOptions = {
+      taskId: task.id,
+      issueNumber: task.issueNumber,
+      worktreePath: task.worktreePath,
+      baseBranch: DEFAULT_BASE_BRANCH,
+      model: task.model,
+      agentRunner: opts.agentRunner,
+      ...(task.sessionId !== undefined ? { sessionId: task.sessionId } : {}),
+      ...(stabilizeGitInvoker !== undefined ? { gitInvoker: stabilizeGitInvoker } : {}),
+      ...(stabilizeConflictReader !== undefined
+        ? { conflictFileReader: stabilizeConflictReader }
+        : {}),
+    };
+    const result: RebasePhaseResult = await runRebasePhase(rebaseOptions);
+    if (result.kind === "needs-human") {
+      const reason = formatRebaseNeedsHumanReason(result.conflictingFiles);
+      return await transition(
+        task,
+        { state: "NEEDS_HUMAN", terminalReason: reason },
+        reason,
+      );
+    }
+    return task;
   }
 
   async function runReadyToMerge(task: Task): Promise<Task> {
@@ -953,6 +1048,36 @@ export function prBodyFor(issueNumber: IssueNumber): string {
  */
 export function buildInitialDraftPrompt(title: string, body: string): string {
   return `# ${title}\n\n${body}`;
+}
+
+/**
+ * Format the `terminalReason` recorded on a task that the rebase phase
+ * surrendered to `NEEDS_HUMAN` after exhausting its iteration budget.
+ *
+ * The reason names every conflicting file the agent could not resolve,
+ * one per line under a single-sentence summary, so the TUI's status bar
+ * (and any operator inspecting persistence) sees the actionable file
+ * list without parsing the rebase phase's internal state. Centralised
+ * so unit tests can assert against the same constant the production
+ * code emits.
+ *
+ * @param conflictingFiles Worktree-relative paths still carrying
+ *   conflict markers when the iteration budget exhausted.
+ * @returns Human-readable summary suitable for `Task.terminalReason`.
+ *
+ * @example
+ * ```ts
+ * formatRebaseNeedsHumanReason(["src/a.ts", "src/b.ts"]);
+ * // "stabilize-rebase: conflicts unresolved after agent iteration budget; files: src/a.ts, src/b.ts"
+ * ```
+ */
+export function formatRebaseNeedsHumanReason(
+  conflictingFiles: readonly string[],
+): string {
+  const filesPart = conflictingFiles.length === 0
+    ? "no files reported"
+    : `files: ${conflictingFiles.join(", ")}`;
+  return `stabilize-rebase: conflicts unresolved after agent iteration budget; ${filesPart}`;
 }
 
 /**
