@@ -41,6 +41,11 @@
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/core";
 
+import {
+  APP_INSTALLATION_REPOSITORIES_MAX_PAGES,
+  APP_INSTALLATION_REPOSITORIES_PAGE_SIZE,
+} from "../constants.ts";
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -358,21 +363,21 @@ export function createAppClient(opts: CreateAppClientOptions): AppClient {
       // caps a page at 100; an installation with hundreds of repos is
       // possible (an org installation with `selected = "all"`), and the
       // wizard's downstream flattener relies on the full list to populate
-      // its picker. The `since`/`per_page` parameters are GitHub-
-      // documented and supported.
+      // its picker. The `page`/`per_page` parameters are GitHub-
+      // documented and supported. Page size and the defensive max-page
+      // cap are centralised in `src/constants.ts` so this module carries
+      // no bare numeric literals.
       const aggregated: InstallationRepository[] = [];
-      const PER_PAGE = 100;
-      // Bound the loop defensively. The realistic ceiling on an
-      // installation's repository count is in the thousands; capping at
-      // 1,000 pages (= 100,000 repos) protects against a malformed
-      // `total_count` driving an unbounded loop while staying well above
-      // every plausible real-world installation.
-      const MAX_PAGES = 1_000;
-      for (let page = 1; page <= MAX_PAGES; page += 1) {
+      let sawShortPage = false;
+      for (
+        let page = 1;
+        page <= APP_INSTALLATION_REPOSITORIES_MAX_PAGES;
+        page += 1
+      ) {
         let response: { data: unknown };
         try {
           response = await octokit.request("GET /installation/repositories", {
-            per_page: PER_PAGE,
+            per_page: APP_INSTALLATION_REPOSITORIES_PAGE_SIZE,
             page,
             headers: { authorization: `token ${installationAuth.token}` },
           });
@@ -383,11 +388,26 @@ export function createAppClient(opts: CreateAppClientOptions): AppClient {
         for (const repo of projected) {
           aggregated.push(repo);
         }
-        if (projected.length < PER_PAGE) {
+        if (projected.length < APP_INSTALLATION_REPOSITORIES_PAGE_SIZE) {
           // Short page → final page. Saves an extra round-trip for the
           // common case of an installation with under 100 repos.
+          sawShortPage = true;
           break;
         }
+      }
+      if (!sawShortPage) {
+        // The cap was hit without a short page, which means the list is
+        // almost certainly truncated. Surface this loudly rather than
+        // silently returning a partial repository set: the wizard's
+        // downstream flow trusts the projection to be exhaustive.
+        throw new GitHubAppClientError(
+          "pagination-overflow",
+          new Error(
+            `exceeded MAX_PAGES (${APP_INSTALLATION_REPOSITORIES_MAX_PAGES}) ` +
+              `walking GET /installation/repositories without observing a ` +
+              `short page; refusing to silently truncate`,
+          ),
+        );
       }
       return aggregated;
     },

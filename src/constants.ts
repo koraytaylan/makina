@@ -528,3 +528,31 @@ export const HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
  * See {@link https://github.com/koraytaylan/makina/blob/develop/docs/adrs/021-merge-modes-failure-classification.md ADR-021}.
  */
 export const HTTP_STATUS_CONFLICT = 409;
+
+/**
+ * Page size used by the App-level GitHub client when walking
+ * `GET /installation/repositories` during the setup wizard.
+ *
+ * GitHub caps a page at 100 for this endpoint; using the documented maximum
+ * minimises the round-trip count for the wizard's one-shot enumeration. The
+ * value is centralised here so neither `src/github/app-client.ts` nor its
+ * pagination tests carry a bare numeric literal, matching the rule at the
+ * top of this file.
+ */
+export const APP_INSTALLATION_REPOSITORIES_PAGE_SIZE = 100;
+
+/**
+ * Defensive upper bound on pages walked by the App-level GitHub client when
+ * paginating `GET /installation/repositories`.
+ *
+ * The realistic ceiling on an installation's repository count is in the
+ * thousands; capping at one thousand pages (= one hundred thousand repos at
+ * {@link APP_INSTALLATION_REPOSITORIES_PAGE_SIZE} per page) protects against
+ * a malformed `total_count` or an API behaviour change driving an unbounded
+ * loop while staying well above every plausible real-world installation. If
+ * the cap is hit without a short page, the client surfaces a
+ * `pagination-overflow` `GitHubAppClientError` rather than silently
+ * truncating the repository list — the wizard should fail loudly so the
+ * developer knows discovery was incomplete.
+ */
+export const APP_INSTALLATION_REPOSITORIES_MAX_PAGES = 1_000;

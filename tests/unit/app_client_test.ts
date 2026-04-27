@@ -23,8 +23,12 @@
  * strategy that returns deterministic tokens.
  */
 
-import { assertEquals, assertRejects } from "@std/assert";
+import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
 
+import {
+  APP_INSTALLATION_REPOSITORIES_MAX_PAGES,
+  APP_INSTALLATION_REPOSITORIES_PAGE_SIZE,
+} from "../../src/constants.ts";
 import {
   type AppClientAuthStrategy,
   createAppClient,
@@ -571,4 +575,51 @@ Deno.test("listInstallationRepositories: hook rejection propagates as mintInstal
   );
   assertEquals(error.operation, "mintInstallationToken");
   assertEquals(harness.recordedRequests.length, 0);
+});
+
+Deno.test("listInstallationRepositories: rejects with pagination-overflow when MAX_PAGES is reached without a short page", async () => {
+  // Regression: an installation that returns a full page on every request
+  // for `APP_INSTALLATION_REPOSITORIES_MAX_PAGES` consecutive pages used to
+  // silently truncate the repository list once the loop hit the cap. We now
+  // throw a `pagination-overflow` `GitHubAppClientError` so the wizard
+  // surfaces the incomplete enumeration instead of presenting a partial
+  // picker.
+  const harness = new FakeFetchHarness();
+  // A single shared full page reused for every response: the harness only
+  // serialises this once per enqueue, but it keeps the test cheap because
+  // every page is structurally identical.
+  const fullPage = Array.from(
+    { length: APP_INSTALLATION_REPOSITORIES_PAGE_SIZE },
+    (_value, index) => ({ name: `repo-${index}`, owner: { login: "org" } }),
+  );
+  for (let page = 1; page <= APP_INSTALLATION_REPOSITORIES_MAX_PAGES; page += 1) {
+    harness.enqueueResponse(200, {
+      total_count: APP_INSTALLATION_REPOSITORIES_MAX_PAGES *
+        APP_INSTALLATION_REPOSITORIES_PAGE_SIZE,
+      repositories: fullPage,
+    });
+  }
+  const { strategy } = createStubStrategy();
+  const client = createAppClient({
+    ...COMMON_OPTS,
+    createAppAuthStrategy: strategy,
+    fetch: harness.fetch,
+  });
+
+  const error = await assertRejects(
+    () => client.listInstallationRepositories(42),
+    GitHubAppClientError,
+  );
+  assertEquals(error.operation, "pagination-overflow");
+  // The wrapped cause names the cap so logs are scannable.
+  assertStringIncludes(
+    error.message,
+    String(APP_INSTALLATION_REPOSITORIES_MAX_PAGES),
+  );
+  // Every page-budget request was issued before the overflow fired —
+  // we did not bail early on a transient short read.
+  assertEquals(
+    harness.recordedRequests.length,
+    APP_INSTALLATION_REPOSITORIES_MAX_PAGES,
+  );
 });
