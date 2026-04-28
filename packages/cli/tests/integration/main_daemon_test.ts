@@ -174,7 +174,7 @@ Deno.test("main.ts daemon: expands ~/ in daemon.socketPath before binding", asyn
     }
 
     const command = new Deno.Command(Deno.execPath(), {
-      args: ["run", "-A", "main.ts", "daemon"],
+      args: ["run", "-A", "packages/cli/main.ts", "daemon"],
       env: spawnEnv,
       clearEnv: true,
       cwd: Deno.cwd(),

@@ -33,7 +33,7 @@ import {
   type HarnessEventWaiter,
   type HarnessReplyWaiter,
   runHarnessReadLoop,
-} from "../../tests/e2e/_e2e_harness.ts";
+} from "./_e2e_harness.ts";
 
 /**
  * Spin up a one-shot Unix socket server that writes the supplied

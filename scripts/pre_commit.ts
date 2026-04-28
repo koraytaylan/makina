@@ -8,7 +8,7 @@
  * Steps (in order; first failure stops the run):
  *   1. deno fmt --check
  *   2. deno lint
- *   3. deno check main.ts
+ *   3. deno check packages/cli/main.ts
  */
 
 interface Step {
@@ -19,7 +19,7 @@ interface Step {
 const steps: readonly Step[] = [
   { name: "deno fmt --check", args: ["fmt", "--check"] },
   { name: "deno lint", args: ["lint"] },
-  { name: "deno check main.ts", args: ["check", "main.ts"] },
+  { name: "deno check packages/cli/main.ts", args: ["check", "packages/cli/main.ts"] },
 ];
 
 const EXIT_FAILURE = 1;

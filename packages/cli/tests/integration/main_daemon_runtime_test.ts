@@ -152,7 +152,7 @@ async function spawnDaemon(fixture: RuntimeFixture): Promise<{
   }
 
   const command = new Deno.Command(Deno.execPath(), {
-    args: ["run", "-A", "main.ts", "daemon"],
+    args: ["run", "-A", "packages/cli/main.ts", "daemon"],
     env: spawnEnv,
     clearEnv: true,
     cwd: Deno.cwd(),

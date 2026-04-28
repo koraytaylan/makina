@@ -431,7 +431,7 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
 
     const spawnEnv = buildSpawnEnv(home);
     const command = new Deno.Command(Deno.execPath(), {
-      args: ["run", "-A", "main.ts", "daemon"],
+      args: ["run", "-A", "packages/cli/main.ts", "daemon"],
       env: spawnEnv,
       clearEnv: true,
       cwd: Deno.cwd(),
