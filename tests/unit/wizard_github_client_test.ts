@@ -27,7 +27,7 @@
 
 import { assertEquals, assertRejects } from "@std/assert";
 
-import { type AppClient, GitHubAppClientError } from "../../src/github/app-client.ts";
+import { type AppClient, GitHubAppClientError } from "@makina/core";
 import { createWizardGitHubClient } from "../../src/config/wizard-github-client.ts";
 import { SetupWizardError } from "../../src/config/setup-wizard.ts";
 

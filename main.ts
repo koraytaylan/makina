@@ -15,19 +15,19 @@
 import { ensureDir } from "@std/fs";
 import { dirname, join } from "@std/path";
 
-import { MAKINA_VERSION } from "./src/constants.ts";
-import { type Config } from "./src/config/schema.ts";
-import { ConfigLoadError, expandHome, loadConfig } from "./src/config/load.ts";
-import { createEventBus } from "./src/daemon/event-bus.ts";
-import { startDaemon } from "./src/daemon/server.ts";
-import { createPersistence } from "./src/daemon/persistence.ts";
-import { createWorktreeManager } from "./src/daemon/worktree-manager.ts";
-import { createPoller } from "./src/daemon/poller.ts";
-import { createAgentRunner } from "./src/daemon/agent-runner.ts";
-import { createTaskSupervisor } from "./src/daemon/supervisor.ts";
-import { createDaemonHandlers } from "./src/daemon/handlers.ts";
-import { createGitHubAppAuth } from "./src/github/app-auth.ts";
-import { GitHubClientImpl } from "./src/github/client.ts";
+import { MAKINA_VERSION } from "@makina/core";
+import { type Config } from "@makina/core";
+import { ConfigLoadError, expandHome, loadConfig } from "@makina/core";
+import { createEventBus } from "@makina/core";
+import { startDaemon } from "@makina/core";
+import { createPersistence } from "@makina/core";
+import { createWorktreeManager } from "@makina/core";
+import { createPoller } from "@makina/core";
+import { createAgentRunner } from "@makina/core";
+import { createTaskSupervisor } from "@makina/core";
+import { createDaemonHandlers } from "@makina/core";
+import { createGitHubAppAuth } from "@makina/core";
+import { GitHubClientImpl } from "@makina/core";
 import {
   type GitHubAuth,
   type GitHubClient,
@@ -35,7 +35,7 @@ import {
   makeInstallationId,
   makeRepoFullName,
   type RepoFullName,
-} from "./src/types.ts";
+} from "@makina/core";
 import {
   createStdioWizardIo,
   defaultConfigPath,
@@ -160,7 +160,7 @@ if (subcommand === "daemon") {
   // the {@link WizardGitHubClient} to enumerate installations. The
   // production client (lives in `src/config/wizard-github-client.ts`)
   // bridges that narrow interface to the App-level
-  // {@link "./src/github/app-client.ts".AppClient}: it reads the PEM
+  // {@link "@makina/core".AppClient}: it reads the PEM
   // key from disk (with `~/` expansion), mints a JWT via
   // `@octokit/auth-app`, walks `/app/installations` +
   // `/installation/repositories`, and projects the join into the

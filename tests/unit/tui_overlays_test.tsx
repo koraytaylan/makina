@@ -20,9 +20,9 @@ import { Box, render as inkRender } from "ink";
 import { dispatchCommand, trimHistory } from "../../src/tui/App.tsx";
 import { CommandPalette, filterSuggestions } from "../../src/tui/components/CommandPalette.tsx";
 import { TaskSwitcher } from "../../src/tui/components/TaskSwitcher.tsx";
-import type { MessageEnvelope } from "../../src/ipc/protocol.ts";
+import type { MessageEnvelope } from "@makina/core";
 import type { DaemonReply } from "../../src/tui/ipc-client.ts";
-import { COMMAND_PALETTE_HISTORY_LIMIT } from "../../src/constants.ts";
+import { COMMAND_PALETTE_HISTORY_LIMIT } from "@makina/core";
 import {
   formatAgeBetween,
   formatTaskAge,
@@ -34,7 +34,7 @@ import {
   matchesKeybinding,
   parseKeybinding,
 } from "../../src/tui/keybindings.ts";
-import { makeTaskId, type TaskId } from "../../src/types.ts";
+import { makeTaskId, type TaskId } from "@makina/core";
 import { SLASH_COMMAND_NAMES } from "../../src/tui/slash-command-parser.ts";
 
 // ---------------------------------------------------------------------------

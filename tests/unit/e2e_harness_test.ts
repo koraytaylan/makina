@@ -26,8 +26,8 @@
 
 import { assertEquals, assertInstanceOf, assertRejects } from "@std/assert";
 
-import { encode } from "../../src/ipc/codec.ts";
-import { type EventPayload, type MessageEnvelope } from "../../src/ipc/protocol.ts";
+import { encode } from "@makina/core";
+import { type EventPayload, type MessageEnvelope } from "@makina/core";
 import {
   HarnessError,
   type HarnessEventWaiter,

@@ -14,8 +14,8 @@
 
 import { assert, assertEquals, assertRejects } from "@std/assert";
 
-import { type EnvLookup } from "../../src/config/load.ts";
-import { parseConfig } from "../../src/config/schema.ts";
+import { type EnvLookup } from "@makina/core";
+import { parseConfig } from "@makina/core";
 import {
   type ByteReader,
   type ByteWriter,

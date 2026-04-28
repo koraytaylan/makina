@@ -31,11 +31,11 @@ import { DaemonHookError, useDaemonConnection } from "../../src/tui/hooks/useDae
 import { Header } from "../../src/tui/components/Header.tsx";
 import { MainPane } from "../../src/tui/components/MainPane.tsx";
 import { StatusBar } from "../../src/tui/components/StatusBar.tsx";
-import { type EventPayload, type MessageEnvelope, parseEnvelope } from "../../src/ipc/protocol.ts";
-import { encode } from "../../src/ipc/codec.ts";
-import { makeTaskId } from "../../src/types.ts";
+import { type EventPayload, type MessageEnvelope, parseEnvelope } from "@makina/core";
+import { encode } from "@makina/core";
+import { makeTaskId } from "@makina/core";
 
-import { InMemoryDaemonClient } from "../helpers/in_memory_daemon_client.ts";
+import { InMemoryDaemonClient } from "@makina/core/test-helpers";
 
 /**
  * Minimal `NodeJS.WriteStream`-shaped object that captures every

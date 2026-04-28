@@ -40,9 +40,9 @@ import {
   MERGE_MODES,
   type MergeMode,
   type RepoFullName,
-} from "../types.ts";
-import type { CommandPayload } from "../ipc/protocol.ts";
-import { RADIX_DECIMAL } from "../constants.ts";
+} from "@makina/core";
+import type { CommandPayload } from "@makina/core";
+import { RADIX_DECIMAL } from "@makina/core";
 
 // ---------------------------------------------------------------------------
 // Public type contracts

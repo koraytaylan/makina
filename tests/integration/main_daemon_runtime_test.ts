@@ -33,14 +33,14 @@
 
 import { assert, assertEquals } from "@std/assert";
 
-import { decode, encode } from "../../src/ipc/codec.ts";
+import { decode, encode } from "@makina/core";
 import {
   type AckPayload,
   type EventPayload,
   type MessageEnvelope,
   type PongPayload,
-} from "../../src/ipc/protocol.ts";
-import { makeIssueNumber } from "../../src/types.ts";
+} from "@makina/core";
+import { makeIssueNumber } from "@makina/core";
 
 const STARTUP_LISTEN_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;

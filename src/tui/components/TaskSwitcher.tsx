@@ -18,7 +18,7 @@ import { Box, Text, useInput } from "ink";
 import { type ReactElement, useCallback, useEffect, useState } from "react";
 
 import { formatTaskAge, type TaskSummary } from "../hooks/useFocusedTask.ts";
-import type { TaskId, TaskState } from "../../types.ts";
+import type { TaskId, TaskState } from "@makina/core";
 
 /**
  * Props accepted by {@link TaskSwitcher}.

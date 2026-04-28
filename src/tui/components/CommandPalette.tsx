@@ -7,7 +7,7 @@
  * input field plus an autocomplete dropdown filtered against
  * {@link "../slash-command-parser.ts".SLASH_COMMAND_SPECS}; `Enter`
  * parses the line and forwards the resulting
- * {@link "../../ipc/protocol.ts".CommandPayload} to {@link CommandPaletteProps.onSubmit}.
+ * {@link "@makina/core".CommandPayload} to {@link CommandPaletteProps.onSubmit}.
  *
  * History is kept in-memory only — Wave 3 does not persist it across
  * runs (#14 explicitly out-of-scope). Up/Down without a typed prefix
@@ -26,11 +26,11 @@ import {
   SlashCommandParseError,
   type SlashCommandSpec,
 } from "../slash-command-parser.ts";
-import type { CommandPayload } from "../../ipc/protocol.ts";
+import type { CommandPayload } from "@makina/core";
 import {
   COMMAND_PALETTE_HISTORY_LIMIT,
   COMMAND_PALETTE_SUGGESTION_WIDTH_CODE_UNITS,
-} from "../../constants.ts";
+} from "@makina/core";
 
 /**
  * Props accepted by {@link CommandPalette}.

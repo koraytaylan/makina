@@ -16,7 +16,7 @@ import {
   SLASH_COMMAND_SPECS,
   SlashCommandParseError,
 } from "../../src/tui/slash-command-parser.ts";
-import { makeIssueNumber, makeRepoFullName } from "../../src/types.ts";
+import { makeIssueNumber, makeRepoFullName } from "@makina/core";
 
 // ---------------------------------------------------------------------------
 // Recognised commands — happy paths

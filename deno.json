@@ -32,8 +32,8 @@
     "setup": "deno run -A main.ts setup",
     "test": "deno test -A --parallel",
     "test:coverage": "rm -rf cov cov.lcov && deno test -A --parallel --coverage=cov && deno coverage cov --lcov --output=cov.lcov && deno run -A scripts/check_coverage.ts cov.lcov 80",
-    "doc:lint": "deno doc --lint main.ts src/ tests/e2e/",
-    "doc:html": "deno doc --html --name=makina --output=docs/api main.ts src/",
+    "doc:lint": "deno doc --lint packages/core/mod.ts packages/core/src/ main.ts src/ tests/e2e/",
+    "doc:html": "deno doc --html --name=makina --output=docs/api packages/core/mod.ts packages/core/src/ main.ts src/",
     "build:smoke": "deno compile -A --output=/tmp/makina-smoke main.ts && /tmp/makina-smoke --version",
     "ci": "deno fmt --check && deno lint && deno task doc:lint && deno check main.ts && deno task test:coverage && deno task build:smoke"
   },

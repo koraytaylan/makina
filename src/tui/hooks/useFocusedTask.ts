@@ -27,14 +27,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { EventPayload } from "../../ipc/protocol.ts";
-import { makeTaskId, type TaskEvent, type TaskId, type TaskState } from "../../types.ts";
+import type { EventPayload } from "@makina/core";
+import { makeTaskId, type TaskEvent, type TaskId, type TaskState } from "@makina/core";
 import {
   HOURS_PER_DAY,
   MILLISECONDS_PER_SECOND,
   MINUTES_PER_HOUR,
   SECONDS_PER_MINUTE,
-} from "../../constants.ts";
+} from "@makina/core";
 
 /**
  * Snapshot of one task as the TUI knows it. Built up from the events
@@ -407,7 +407,7 @@ function formatAgeMilliseconds(deltaMilliseconds: number): string {
 
 /**
  * Re-export so the matching shape on the daemon side
- * ({@link "../../types.ts".TaskEvent}) does not need to be imported
+ * ({@link "@makina/core".TaskEvent}) does not need to be imported
  * separately when consumers wire up listeners against this hook.
  */
 export type { TaskEvent };

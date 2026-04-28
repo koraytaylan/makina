@@ -31,8 +31,8 @@ import {
   type MessageEnvelope,
   parseEnvelope,
   type PongPayload,
-} from "../ipc/protocol.ts";
-import { decode, encode, IpcCodecError } from "../ipc/codec.ts";
+} from "@makina/core";
+import { decode, encode, IpcCodecError } from "@makina/core";
 
 /**
  * Envelopes the daemon emits as a reply to a client request. `pong`

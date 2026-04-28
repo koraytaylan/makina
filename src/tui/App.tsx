@@ -25,15 +25,15 @@ import { type DaemonClient, type DaemonReply, SocketDaemonClient } from "./ipc-c
 import { type ConnectionLifecycle, useDaemonConnection } from "./hooks/useDaemonConnection.ts";
 import { useFocusedTask } from "./hooks/useFocusedTask.ts";
 import { matchesKeybinding } from "./keybindings.ts";
-import type { CommandPayload, EventPayload, MessageEnvelope } from "../ipc/protocol.ts";
-import { makeTaskId, type TaskId } from "../types.ts";
+import type { CommandPayload, EventPayload, MessageEnvelope } from "@makina/core";
+import { makeTaskId, type TaskId } from "@makina/core";
 import {
   COMMAND_PALETTE_HISTORY_LIMIT,
   DEFAULT_COMMAND_PALETTE_KEYBINDING,
   DEFAULT_TASK_SWITCHER_KEYBINDING,
   MAKINA_VERSION,
   STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS,
-} from "../constants.ts";
+} from "@makina/core";
 
 /**
  * Default Unix-socket path the daemon listens on.

@@ -5,7 +5,7 @@
  * be defaulted: the GitHub App id, the path to its private key, the
  * installation ids granting access to each repository, and which
  * repository is the default. The remaining config is filled with the
- * documented defaults from {@link "../constants.ts"}.
+ * documented defaults from {@link "@makina/core"}.
  *
  * The wizard's collaborators (stdin reader, stdout writer, and the
  * narrow GitHub client used for installation discovery) are
@@ -30,8 +30,8 @@
 
 import { exists } from "@std/fs";
 
-import { type Config, type GitHubConfig, parseConfig } from "./schema.ts";
-import { defaultEnvLookup, type EnvLookup, expandHome } from "./load.ts";
+import { type Config, type GitHubConfig, parseConfig } from "@makina/core";
+import { defaultEnvLookup, type EnvLookup, expandHome } from "@makina/core";
 import {
   DEFAULT_COMMAND_PALETTE_KEYBINDING,
   DEFAULT_TASK_SWITCHER_KEYBINDING,
@@ -40,7 +40,7 @@ import {
   RADIX_DECIMAL,
   SETTLING_WINDOW_MILLISECONDS,
   WIZARD_READ_CHUNK_BYTES,
-} from "../constants.ts";
+} from "@makina/core";
 
 /**
  * One installation reachable from the GitHub App.
@@ -61,7 +61,7 @@ export interface WizardInstallation {
 /**
  * Narrow, wizard-only GitHub client surface.
  *
- * The full {@link "../types.ts".GitHubClient} contract is per-installation
+ * The full {@link "@makina/core".GitHubClient} contract is per-installation
  * (it expects an installation token); the wizard runs **before** any
  * installation is selected, so it needs an App-level call to discover
  * installations. We declare a separate one-method surface here rather
@@ -590,7 +590,7 @@ function defaultSocketPath(): string {
  *
  * @example
  * ```ts
- * import { expandHome } from "./load.ts";
+ * import { expandHome } from "@makina/core";
  * import { defaultConfigPath } from "./setup-wizard.ts";
  *
  * const path = expandHome(defaultConfigPath());

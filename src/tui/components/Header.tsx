@@ -13,7 +13,7 @@ import { Box, Text } from "ink";
 import type { ReactElement } from "react";
 
 import type { DaemonConnectionStatus } from "../hooks/useDaemonConnection.ts";
-import type { TaskId } from "../../types.ts";
+import type { TaskId } from "@makina/core";
 
 /**
  * Props accepted by {@link Header}.

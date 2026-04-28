@@ -1,7 +1,7 @@
 /**
  * config/wizard-github-client.ts — production
  * {@link "./setup-wizard.ts".WizardGitHubClient} backed by an
- * {@link "../github/app-client.ts".AppClient}.
+ * {@link "@makina/core".AppClient}.
  *
  * The wizard's `WizardGitHubClient` interface is intentionally narrow —
  * one method, `getInstallations({ appId, privateKeyPath })` — so the
@@ -10,7 +10,7 @@
  * wiring that bridges that narrow interface to the real GitHub API:
  *
  *   1. Read the PEM private key from disk (with `~/` expansion via
- *      {@link "./load.ts".expandHome}).
+ *      {@link "@makina/core".expandHome}).
  *   2. Construct an {@link AppClient} bound to the App credentials.
  *   3. Call {@link AppClient.listAppInstallations} to enumerate every
  *      installation the App can see.
@@ -36,13 +36,9 @@
  * @module
  */
 
-import { WIZARD_INSTALLATIONS_MAX_PARALLELISM } from "../constants.ts";
-import {
-  type AppClient,
-  createAppClient,
-  type CreateAppClientOptions,
-} from "../github/app-client.ts";
-import { defaultEnvLookup, type EnvLookup, expandHome } from "./load.ts";
+import { WIZARD_INSTALLATIONS_MAX_PARALLELISM } from "@makina/core";
+import { type AppClient, createAppClient, type CreateAppClientOptions } from "@makina/core";
+import { defaultEnvLookup, type EnvLookup, expandHome } from "@makina/core";
 import {
   SetupWizardError,
   type WizardGitHubClient,

@@ -34,7 +34,7 @@ import {
 } from "react";
 
 import type { DaemonClient, DaemonEventSubscription, DaemonReply } from "../ipc-client.ts";
-import type { EventPayload, MessageEnvelope } from "../../ipc/protocol.ts";
+import type { EventPayload, MessageEnvelope } from "@makina/core";
 
 /**
  * Lifecycle states the hook walks through.
