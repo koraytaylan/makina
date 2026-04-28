@@ -1,4 +1,5 @@
 {
+  "workspace": ["./packages/core", "./packages/cli"],
   "compilerOptions": {
     "jsx": "react-jsx",
     "jsxImportSource": "npm:react@18",

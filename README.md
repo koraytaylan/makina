@@ -1,5 +1,7 @@
 # makina
-An AI agent orchestrator that streamlines planning and implementation flows through parallel, rule-based execution.
+
+An AI agent orchestrator that streamlines planning and implementation flows through parallel,
+rule-based execution.
 
 **Status:** Wave 5 complete. The daemon, TUI, supervisor, and stabilize loop are wired end-to-end;
 the v0.1.0 release is cut from `main`. Track future work via the
