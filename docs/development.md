@@ -24,14 +24,14 @@ deno task ci                           # confirm the gate is green locally
 
 | Task                      | What it does                                                                            |
 | ------------------------- | --------------------------------------------------------------------------------------- |
-| `deno task dev`           | `deno run -A --watch main.ts` — re-runs on edit.                                        |
+| `deno task dev`           | `deno run -A --watch packages/cli/main.ts` — re-runs on edit.                           |
 | `deno task daemon`        | Starts the daemon foregrounded (mostly for debugging; the TUI auto-spawns it normally). |
 | `deno task setup`         | First-run GitHub-App configuration wizard.                                              |
 | `deno task test`          | Runs every `*_test.ts` file in parallel.                                                |
 | `deno task test:coverage` | Same as `test` plus an LCOV report and the ≥ 80% gate.                                  |
 | `deno task doc:lint`      | Fails on missing/malformed JSDoc on exported symbols.                                   |
 | `deno task doc:html`      | Generates a static API site under `docs/api/`.                                          |
-| `deno task build:smoke`   | Compiles `main.ts` for the host target and runs `--version`. Used by CI.                |
+| `deno task build:smoke`   | Compiles `packages/cli/main.ts` for the host target and runs `--version`. Used by CI.   |
 | `deno task ci`            | Full quality gate (the same one CI runs).                                               |
 
 ## Branching
@@ -87,8 +87,8 @@ deno test -A --no-check tests/e2e/
 ```
 
 The harness builds a synthetic `HOME`, writes `config.json` pointed at the sandbox repo, spawns
-`main.ts daemon`, and drives `/issue <n>` over the daemon's Unix socket. It tears the daemon down
-(SIGTERM → SIGKILL fallback) and removes the temp directory after each scenario.
+`packages/cli/main.ts daemon`, and drives `/issue <n>` over the daemon's Unix socket. It tears the
+daemon down (SIGTERM → SIGKILL fallback) and removes the temp directory after each scenario.
 
 ## Common pitfalls
 

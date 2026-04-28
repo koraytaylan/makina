@@ -1,7 +1,7 @@
 # Configuration
 
-`src/config/schema.ts` defines the typed shape; `src/config/load.ts` reads, expands `~/`,
-JSONC-parses, and validates the file. Errors include the failing field path.
+`packages/core/src/config/schema.ts` defines the typed shape; `packages/core/src/config/load.ts`
+reads, expands `~/`, JSONC-parses, and validates the file. Errors include the failing field path.
 
 ## Location
 
@@ -61,8 +61,8 @@ Walks through the App ID, private-key path, installation discovery, and default 
 
 ## Loader behavior
 
-`src/config/load.ts` is the only place the daemon and TUI read the file. It expands a single leading
-`~/` against `$HOME` and then parses the file as JSONC, so `// line comments`,
+`packages/core/src/config/load.ts` is the only place the daemon and TUI read the file. It expands a
+single leading `~/` against `$HOME` and then parses the file as JSONC, so `// line comments`,
 `/* block comments */`, and trailing commas are tolerated. Validation goes through the same
 `parseConfig` the W1 schema exposes; failures raise a `ConfigLoadError` whose `message` embeds the
 failing field path (e.g. `github.installations["owner/repo"]`) and whose `kind` discriminates
