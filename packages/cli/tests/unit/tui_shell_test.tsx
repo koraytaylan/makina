@@ -273,7 +273,12 @@ Deno.test({
         patchConsole: false,
       },
     );
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // Wait for the App's useEffect-driven event subscriptions
+    // (`useDaemonConnection` + `useFocusedTask`) to register on the
+    // client. A fixed `setTimeout(0)` raced effect-flush on the Linux
+    // CI runner under `deno test --parallel`, so `simulateEvent` would
+    // fire with zero listeners and no React state ever updated.
+    await waitFor(() => client.activeSubscriptionCount() >= 2);
     const initialVisible = stdout.lastVisibleFrame();
     client.simulateEvent({
       taskId: "task_2026-04-26T12-00-00_abc123",
@@ -281,12 +286,8 @@ Deno.test({
       kind: "state-changed",
       data: { fromState: "INIT", toState: "CLONING_WORKTREE" },
     });
-    // Poll for the post-event frame instead of using a fixed
-    // `setTimeout`. A fixed delay raced React's scheduler under
-    // `deno test --parallel` on the Linux CI runner — the post-event
-    // commit landed after the test had moved on. Polling with a 10ms
-    // interval gives the scheduler room to pick up its own
-    // MessageChannel callbacks between iterations.
+    // Wait until React commits the state update and Ink writes a frame
+    // whose content differs from the initial render.
     await waitFor(() => stdout.lastVisibleFrame() !== initialVisible);
     instance.unmount();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
