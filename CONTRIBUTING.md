@@ -59,13 +59,14 @@ The PR template reproduces this list. Don't merge with anything unchecked.
 
 The project is structured so that many agents can ship work concurrently without conflict:
 
-1. **Contract-first.** Each wave produces or consumes typed interfaces (`src/types.ts`,
-   `src/ipc/protocol.ts`, `src/config/schema.ts`). New work imports the contract; it does not
-   redefine it. Contract changes need their own focused PR before any consumer changes.
+1. **Contract-first.** Each wave produces or consumes typed interfaces
+   (`packages/core/src/types.ts`, `packages/core/src/ipc/protocol.ts`,
+   `packages/core/src/config/schema.ts`). New work imports the contract; it does not redefine it.
+   Contract changes need their own focused PR before any consumer changes.
 2. **In-memory doubles co-located with the contract** so a parallel agent building a _consumer_ can
    run tests immediately, without waiting for the _provider_ to land. Example:
-   `tests/helpers/in_memory_github_client.ts` ships with the `GitHubClient` interface in the same
-   wave.
+   `packages/core/tests/helpers/in_memory_github_client.ts` ships with the `GitHubClient` interface
+   in the same wave.
 3. **One feature branch per task.** Branch name: `feature/<wave>-<topic>` (e.g.,
    `feature/w2-worktree-manager`). One PR per branch. Squash-merge into `develop`.
 4. **Each PR is independently mergeable.** It includes its own tests, JSDoc, ADR (if any), and docs

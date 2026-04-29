@@ -33,19 +33,15 @@
  * @module
  */
 
-import { expandHome } from "../../src/config/load.ts";
-import { decode, encode } from "../../src/ipc/codec.ts";
-import {
-  type AckPayload,
-  type EventPayload,
-  type MessageEnvelope,
-} from "../../src/ipc/protocol.ts";
+import { expandHome } from "@makina/core";
+import { decode, encode } from "@makina/core";
+import { type AckPayload, type EventPayload, type MessageEnvelope } from "@makina/core";
 import {
   type IssueNumber,
   makeIssueNumber,
   makeRepoFullName,
   type RepoFullName,
-} from "../../src/types.ts";
+} from "@makina/core";
 
 /**
  * Environment variable that gates the entire e2e suite.
@@ -435,7 +431,7 @@ export async function bootHarness(env: ResolvedE2eEnv): Promise<Harness> {
 
     const spawnEnv = buildSpawnEnv(home);
     const command = new Deno.Command(Deno.execPath(), {
-      args: ["run", "-A", "main.ts", "daemon"],
+      args: ["run", "-A", "packages/cli/main.ts", "daemon"],
       env: spawnEnv,
       clearEnv: true,
       cwd: Deno.cwd(),

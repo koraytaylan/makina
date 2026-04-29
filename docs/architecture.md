@@ -1,54 +1,55 @@
 # Architecture
 
-The contracts in `src/types.ts`, `src/ipc/protocol.ts`, and `src/config/schema.ts` are the
-foundation; the daemon, TUI, and the stabilize loop implement them. Every component is wired in
-production by `main.ts daemon` (see ADR-024).
+The contracts in `packages/core/src/types.ts`, `packages/core/src/ipc/protocol.ts`, and
+`packages/core/src/config/schema.ts` are the foundation; the daemon, TUI, and the stabilize loop
+implement them. Every component is wired in production by `packages/cli/main.ts daemon` (see
+ADR-024).
 
 ## Process model
 
 Two cooperating processes communicate over a Unix domain socket using a length-prefixed framed JSON
-wire format (`<decimal-length>\n<utf8-json>\n`, see `src/ipc/codec.ts`):
+wire format (`<decimal-length>\n<utf8-json>\n`, see `packages/core/src/ipc/codec.ts`):
 
 - **`makina daemon`** — long-running supervisor. Owns agents, worktrees, GitHub App auth, polling,
   and persisted state. Survives TUI exit; restarts replay persisted task projections.
 - **`makina`** (TUI) — Ink-based React app. Connects to the daemon over the socket; auto-spawns the
   daemon when not running.
 
-`main.ts` is an argv-dispatch shell: `daemon`, `setup`, or default → TUI.
+`packages/cli/main.ts` is an argv-dispatch shell: `daemon`, `setup`, or default → TUI.
 
 ## Daemon internals
 
-| Component       | File                             | Purpose                                                     |
-| --------------- | -------------------------------- | ----------------------------------------------------------- |
-| TaskSupervisor  | `src/daemon/supervisor.ts`       | Per-issue state machine (see ADR-016).                      |
-| Stabilize loop  | `src/daemon/supervisor.ts`       | Rebase → CI → conversations sub-phases after each push.     |
-| AgentRunner     | `src/daemon/agent-runner.ts`     | Wraps `@anthropic-ai/claude-agent-sdk` (see ADR-015).       |
-| WorktreeManager | `src/daemon/worktree-manager.ts` | Bare clone + per-task worktrees (see ADR-007).              |
-| GitHubClient    | `src/github/client.ts`           | High-level methods over `@octokit/core` (see ADR-011).      |
-| Poller          | `src/daemon/poller.ts`           | Per-task polling with backoff (see ADR-017).                |
-| Persistence     | `src/daemon/persistence.ts`      | Atomic JSON state store (see ADR-014).                      |
-| EventBus        | `src/daemon/event-bus.ts`        | In-process pub/sub (see ADR-012).                           |
-| Daemon server   | `src/daemon/server.ts`           | Unix socket listener + dispatch (see ADR-013).              |
-| Handlers        | `src/daemon/handlers.ts`         | IPC `command`/`prompt` routing onto the supervisor surface. |
-| Runtime wiring  | `main.ts` (`wireDaemonRuntime`)  | Boot-time DI for all of the above (see ADR-024).            |
+| Component       | File                                           | Purpose                                                     |
+| --------------- | ---------------------------------------------- | ----------------------------------------------------------- |
+| TaskSupervisor  | `packages/core/src/daemon/supervisor.ts`       | Per-issue state machine (see ADR-016).                      |
+| Stabilize loop  | `packages/core/src/daemon/supervisor.ts`       | Rebase → CI → conversations sub-phases after each push.     |
+| AgentRunner     | `packages/core/src/daemon/agent-runner.ts`     | Wraps `@anthropic-ai/claude-agent-sdk` (see ADR-015).       |
+| WorktreeManager | `packages/core/src/daemon/worktree-manager.ts` | Bare clone + per-task worktrees (see ADR-007).              |
+| GitHubClient    | `packages/core/src/github/client.ts`           | High-level methods over `@octokit/core` (see ADR-011).      |
+| Poller          | `packages/core/src/daemon/poller.ts`           | Per-task polling with backoff (see ADR-017).                |
+| Persistence     | `packages/core/src/daemon/persistence.ts`      | Atomic JSON state store (see ADR-014).                      |
+| EventBus        | `packages/core/src/daemon/event-bus.ts`        | In-process pub/sub (see ADR-012).                           |
+| Daemon server   | `packages/core/src/daemon/server.ts`           | Unix socket listener + dispatch (see ADR-013).              |
+| Handlers        | `packages/core/src/daemon/handlers.ts`         | IPC `command`/`prompt` routing onto the supervisor surface. |
+| Runtime wiring  | `packages/cli/main.ts` (`wireDaemonRuntime`)   | Boot-time DI for all of the above (see ADR-024).            |
 
 ## TUI
 
-| Component                           | File                              |
-| ----------------------------------- | --------------------------------- |
-| `App`                               | `src/tui/App.tsx`                 |
-| `Header` / `MainPane` / `StatusBar` | `src/tui/components/`             |
-| `CommandPalette` / `TaskSwitcher`   | `src/tui/components/`             |
-| `useFocusedTask`                    | `src/tui/hooks/useFocusedTask.ts` |
-| Slash-command parser                | `src/tui/slash-command-parser.ts` |
-| Keybindings parser                  | `src/tui/keybindings.ts`          |
+| Component                           | File                                           |
+| ----------------------------------- | ---------------------------------------------- |
+| `App`                               | `packages/cli/src/tui/App.tsx`                 |
+| `Header` / `MainPane` / `StatusBar` | `packages/cli/src/tui/components/`             |
+| `CommandPalette` / `TaskSwitcher`   | `packages/cli/src/tui/components/`             |
+| `useFocusedTask`                    | `packages/cli/src/tui/hooks/useFocusedTask.ts` |
+| Slash-command parser                | `packages/cli/src/tui/slash-command-parser.ts` |
+| Keybindings parser                  | `packages/cli/src/tui/keybindings.ts`          |
 
 ### Slash commands
 
-The command palette parses leading-`/` lines through `src/tui/slash-command-parser.ts` and
-dispatches the resulting `CommandPayload` over the daemon socket. The parser only validates shape;
-per-command behaviour lives in `src/daemon/handlers.ts` (which routes `command` envelopes onto
-`TaskSupervisor` methods).
+The command palette parses leading-`/` lines through `packages/cli/src/tui/slash-command-parser.ts`
+and dispatches the resulting `CommandPayload` over the daemon socket. The parser only validates
+shape; per-command behaviour lives in `packages/core/src/daemon/handlers.ts` (which routes `command`
+envelopes onto `TaskSupervisor` methods).
 
 | Command                                             | Behaviour                               |
 | --------------------------------------------------- | --------------------------------------- |
@@ -72,34 +73,35 @@ implemented" }`. Wiring those onto supervisor methods is tracked
 as v0.2.0 work.
 
 Default overlay toggles: `Ctrl+P` (palette), `Ctrl+G` (switcher); both are configurable via
-`tui.keybindings` in `config.json`. The chord parser in `src/tui/keybindings.ts` accepts
-`<modifier>+<key>` strings (`ctrl+p`, `ctrl+shift+tab`) and matches Ink's `useInput` flag bag
-uniformly across macOS and Linux.
+`tui.keybindings` in `config.json`. The chord parser in `packages/cli/src/tui/keybindings.ts`
+accepts `<modifier>+<key>` strings (`ctrl+p`, `ctrl+shift+tab`) and matches Ink's `useInput` flag
+bag uniformly across macOS and Linux.
 
 ## IPC protocol
 
-Length-prefixed framed envelopes `{ id, type, payload }` with zod schemas in `src/ipc/protocol.ts`.
-Each frame is `<decimal-length>\n<utf8-json>\n`; the trailing newline keeps the wire format
-human-readable for ad-hoc tooling. The framer lives in `src/ipc/codec.ts` and rejects malformed
-frames (oversize, partial, schema-mismatched, non-UTF8) with a typed `IpcCodecError`. Client →
-Daemon: `subscribe`, `unsubscribe`, `command`, `prompt`, `ping`. Daemon → Client: `event`, `ack`,
-`pong`.
+Length-prefixed framed envelopes `{ id, type, payload }` with zod schemas in
+`packages/core/src/ipc/protocol.ts`. Each frame is `<decimal-length>\n<utf8-json>\n`; the trailing
+newline keeps the wire format human-readable for ad-hoc tooling. The framer lives in
+`packages/core/src/ipc/codec.ts` and rejects malformed frames (oversize, partial, schema-mismatched,
+non-UTF8) with a typed `IpcCodecError`. Client → Daemon: `subscribe`, `unsubscribe`, `command`,
+`prompt`, `ping`. Daemon → Client: `event`, `ack`, `pong`.
 
-Consumers do not import zod directly: `src/ipc/protocol.ts` exposes typed interfaces and a
-`parseEnvelope(raw): ParseEnvelopeResult` function; the same idiom in `src/config/schema.ts` exposes
-`parseConfig`. This keeps the public API zod-free so `deno doc --lint` reflects the contract, not
-the validator implementation.
+Consumers do not import zod directly: `packages/core/src/ipc/protocol.ts` exposes typed interfaces
+and a `parseEnvelope(raw): ParseEnvelopeResult` function; the same idiom in
+`packages/core/src/config/schema.ts` exposes `parseConfig`. This keeps the public API zod-free so
+`deno doc --lint` reflects the contract, not the validator implementation.
 
 ## TUI client
 
-`src/tui/ipc-client.ts` exports a `DaemonClient` interface plus a `SocketDaemonClient` that opens a
-Unix-domain socket via `Deno.connect({ transport: "unix" })`, encodes outgoing envelopes through
-`src/ipc/codec.ts`, and decodes pushed envelopes back into typed values. Reply correlation is by
-envelope id; pushed `event` envelopes fan out through `subscribeEvents`. The interface surface
-mirrors `tests/helpers/in_memory_daemon_client.ts` so consumers can swap the real client for the
-in-memory double in tests with no other change.
+`packages/cli/src/tui/ipc-client.ts` exports a `DaemonClient` interface plus a `SocketDaemonClient`
+that opens a Unix-domain socket via `Deno.connect({ transport: "unix" })`, encodes outgoing
+envelopes through `packages/core/src/ipc/codec.ts`, and decodes pushed envelopes back into typed
+values. Reply correlation is by envelope id; pushed `event` envelopes fan out through
+`subscribeEvents`. The interface surface mirrors
+`packages/core/tests/helpers/in_memory_daemon_client.ts` so consumers can swap the real client for
+the in-memory double in tests with no other change.
 
-`src/tui/hooks/useDaemonConnection.ts` wraps the client in a React hook that exposes
+`packages/cli/src/tui/hooks/useDaemonConnection.ts` wraps the client in a React hook that exposes
 `{ status, lastError, send, subscribe, connect, disconnect }` and walks the lifecycle
 `idle → connecting → connected → disconnected | error`. The hook is transport-agnostic: a client
 without `connect`/`close` methods (the in-memory double) starts directly in `connected`.
@@ -120,8 +122,8 @@ of `sanitizeOps`/`sanitizeResources` (component-level tests keep both on).
 naming the sandbox repo, GitHub App credentials, and per-scenario issue numbers (see
 `tests/e2e/_e2e_harness.ts`). When the gate is off the tests register cleanly and skip with a
 single-line note, so `deno task ci` continues to run on every push without a sandbox dependency.
-When the gate is on the harness spawns `main.ts daemon` against a synthetic `HOME`, drives the
-supervisor through real GitHub, and observes the FSM via the wildcard event subscription.
+When the gate is on the harness spawns `packages/cli/main.ts daemon` against a synthetic `HOME`,
+drives the supervisor through real GitHub, and observes the FSM via the wildcard event subscription.
 
 Three scenarios cover the verification matrix:
 

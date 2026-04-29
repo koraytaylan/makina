@@ -1,5 +1,7 @@
 # makina
-An AI agent orchestrator that streamlines planning and implementation flows through parallel, rule-based execution.
+
+An AI agent orchestrator that streamlines planning and implementation flows through parallel,
+rule-based execution.
 
 **Status:** Wave 5 complete. The daemon, TUI, supervisor, and stabilize loop are wired end-to-end;
 the v0.1.0 release is cut from `main`. Track future work via the
@@ -32,10 +34,28 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture,
 [`docs/lifecycle.md`](docs/lifecycle.md) for the per-PR stabilize loop, and
 [`docs/configuration.md`](docs/configuration.md) for every config knob.
 
+## Repository layout
+
+This is a Deno workspace with two packages:
+
+```
+packages/core/   # @makina/core — the orchestration engine (supervisor, GitHub
+                 #   client, IPC, persistence, worktrees). Environment-agnostic;
+                 #   intended for future consumption from a separate cloud
+                 #   web app via JSR.
+packages/cli/    # @makina/cli — the TUI shell, setup wizard, and daemon entry
+                 #   point. Distributed as a deno-compiled binary via GitHub
+                 #   releases; consumes @makina/core via the workspace link.
+tests/e2e/       # End-to-end suite that spans both packages (env-gated).
+```
+
+See [ADR-026](docs/adrs/026-monorepo-restructure.md) for the rationale behind the split and what
+stays open source vs private.
+
 ## Quick start
 
 ```bash
-deno install --allow-all --name makina --force https://raw.githubusercontent.com/koraytaylan/makina/main/main.ts
+deno install --allow-all --name makina --force https://raw.githubusercontent.com/koraytaylan/makina/main/packages/cli/main.ts
 makina setup     # one-time GitHub App + default repo configuration
 makina           # launch the TUI
 ```

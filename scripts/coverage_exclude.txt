@@ -3,8 +3,9 @@
 # start with #. Add justifications inline so future maintainers (and code
 # reviewers) understand why a file is exempt.
 #
-# main.ts — Wave 0 stub. The only behavior is the `--version` short-circuit
-# used by the release pipeline's compile-smoke step. Wave 1 turns it into a
-# thin argv-dispatch shell over `src/`; the substantive logic lives in
-# `src/` modules that are fully covered.
+# main.ts — argv-dispatch shell at packages/cli/main.ts. The substantive
+# logic lives in @makina/core (packages/core/src/) where it is fully
+# covered; the CLI entry point itself is just wiring. The exclude pattern
+# matches any path ending in "/main.ts", which today resolves only to the
+# CLI entry point.
 main.ts

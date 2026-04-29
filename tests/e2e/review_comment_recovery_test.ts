@@ -37,8 +37,8 @@
 
 import { assert, assertEquals } from "@std/assert";
 
-import { type AckPayload } from "../../src/ipc/protocol.ts";
-import { makeIssueNumber } from "../../src/types.ts";
+import { type AckPayload } from "@makina/core";
+import { makeIssueNumber } from "@makina/core";
 import { type Harness, registerE2eTest, type ResolvedE2eEnv } from "./_e2e_harness.ts";
 
 registerE2eTest(

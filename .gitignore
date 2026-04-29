@@ -27,3 +27,6 @@ Thumbs.db
 
 # Claude Code session state (lock files for scheduled tasks etc.)
 .claude/
+
+# Per-developer behavioral guidelines for Claude Code agents (local, not project state)
+CLAUDE.md

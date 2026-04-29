@@ -1,8 +1,9 @@
 # Lifecycle
 
-The supervisor (`src/daemon/supervisor.ts`) walks every issue through a per-task FSM. The three
-stabilize sub-phases — rebase, CI, and conversations — are all wired end-to-end and bounded by
-`MAX_TASK_ITERATIONS` (default 8): exhaustion in any phase escalates the task to `NEEDS_HUMAN`.
+The supervisor (`packages/core/src/daemon/supervisor.ts`) walks every issue through a per-task FSM.
+The three stabilize sub-phases — rebase, CI, and conversations — are all wired end-to-end and
+bounded by `MAX_TASK_ITERATIONS` (default 8): exhaustion in any phase escalates the task to
+`NEEDS_HUMAN`.
 
 Every transition the supervisor performs follows the **persist → emit → act** ordering documented in
 [ADR-016](adrs/016-supervisor-persist-then-emit-then-act.md): the new state is durably on disk

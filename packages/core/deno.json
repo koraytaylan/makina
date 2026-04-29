@@ -1,0 +1,11 @@
+{
+  "name": "@makina/core",
+  "version": "0.1.0",
+  "exports": {
+    ".": "./mod.ts",
+    "./test-helpers": "./tests/helpers/mod.ts"
+  },
+  "tasks": {
+    "test": "deno test -A --parallel ./tests/"
+  }
+}

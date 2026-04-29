@@ -1,0 +1,11 @@
+{
+  "name": "@makina/cli",
+  "version": "0.1.0",
+  "exports": "./main.ts",
+  "tasks": {
+    "dev": "deno run -A --watch ./main.ts",
+    "daemon": "deno run -A ./main.ts daemon",
+    "setup": "deno run -A ./main.ts setup",
+    "build:smoke": "deno compile -A --output=/tmp/makina-smoke ./main.ts && /tmp/makina-smoke --version"
+  }
+}
