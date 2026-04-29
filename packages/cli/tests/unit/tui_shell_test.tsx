@@ -152,6 +152,46 @@ class FakeStream {
 }
 
 /**
+ * Poll `predicate` until it returns truthy or `timeoutMs` elapses.
+ *
+ * Used by the App-level snapshot tests to wait for an Ink frame to
+ * commit without relying on a fixed `setTimeout`. The previous
+ * fixed-timeout approach was sensitive to scheduler latency under
+ * `deno test --parallel` on CI runners — see the comment at the call
+ * site for details.
+ *
+ * @param predicate Condition that becomes `true` when the awaited
+ *   frame has been written.
+ * @param timeoutMs Maximum total wait, in milliseconds. Defaults to
+ *   1000ms — generous on CI but well under the per-test default.
+ * @param intervalMs Per-iteration sleep, in milliseconds. Defaults to
+ *   10ms — short enough to keep the test snappy, long enough to give
+ *   React's scheduler (which posts work via `MessageChannel`) a
+ *   chance to commit between iterations rather than getting starved
+ *   by a tighter timer cadence.
+ * @throws Error When `predicate` never becomes truthy within
+ *   `timeoutMs`. The test fails fast with a clear message instead of
+ *   silently producing a stale snapshot.
+ */
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 1000,
+  intervalMs = 10,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+  if (predicate()) {
+    return;
+  }
+  throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+}
+
+/**
  * Render an Ink element to a fake stdout and return the recorded frame
  * sink. Synchronous unmount keeps the test free of stray timers.
  *
@@ -234,14 +274,20 @@ Deno.test({
       },
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const initialVisible = stdout.lastVisibleFrame();
     client.simulateEvent({
       taskId: "task_2026-04-26T12-00-00_abc123",
       atIso: "2026-04-26T12:00:01.000Z",
       kind: "state-changed",
       data: { fromState: "INIT", toState: "CLONING_WORKTREE" },
     });
-    // Yield so React commits the state update triggered by the event.
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    // Poll for the post-event frame instead of using a fixed
+    // `setTimeout`. A fixed delay raced React's scheduler under
+    // `deno test --parallel` on the Linux CI runner — the post-event
+    // commit landed after the test had moved on. Polling with a 10ms
+    // interval gives the scheduler room to pick up its own
+    // MessageChannel callbacks between iterations.
+    await waitFor(() => stdout.lastVisibleFrame() !== initialVisible);
     instance.unmount();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     await assertSnapshot(t, stdout.lastVisibleFrame());
