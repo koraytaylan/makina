@@ -43,6 +43,7 @@ import {
   SetupWizardError,
 } from "./src/config/setup-wizard.ts";
 import { createWizardGitHubClient } from "./src/config/wizard-github-client.ts";
+import { ensureDaemonRunning } from "./src/daemon-launcher.ts";
 
 if (Deno.args.includes("--version")) {
   console.log(MAKINA_VERSION);
@@ -185,8 +186,47 @@ if (subcommand === "daemon") {
     throw error;
   }
 } else {
-  // Default branch → launch the Ink-based TUI.
-  await import("./src/tui/App.tsx").then((module) => module.launch());
+  // Default branch → ensure the daemon is up, then launch the TUI.
+  //
+  // The TUI used to construct a `SocketDaemonClient` against a
+  // hardcoded `~/.makina/daemon.sock` path and surface any connection
+  // failure as a one-line "Connection error" in the status bar. That
+  // contradicted the README's promise that launching `makina`
+  // auto-spawns the daemon when it is not already running. We now
+  // mirror the daemon branch's config-load logic to discover the
+  // configured socket (with the same `${TMPDIR}/makina.sock` fallback
+  // used by the daemon when no config exists yet), then call
+  // `ensureDaemonRunning` to either confirm a peer is already on the
+  // socket or fork a detached daemon child and wait for it to bind.
+  // Only after that do we hand the resolved socket path to `launch`.
+  const tmpDir = Deno.env.get("TMPDIR") ?? "/tmp";
+  const fallbackSocketPath = `${tmpDir.replace(/\/$/, "")}/makina.sock`;
+  let socketPath = fallbackSocketPath;
+  let autoStart = true;
+  try {
+    const tuiConfig = await loadConfig(defaultConfigPath());
+    socketPath = expandHome(tuiConfig.daemon.socketPath);
+    autoStart = tuiConfig.daemon.autoStart;
+  } catch (error) {
+    if (!(error instanceof ConfigLoadError) || error.kind !== "not-found") {
+      // A missing config is the normal first-run state: the TUI
+      // boots against the same `${TMPDIR}/makina.sock` fallback the
+      // daemon uses, the user sees the UI, and the inevitable
+      // "no config; run `makina setup`" reply only surfaces when
+      // they actually try `/issue` etc. Any *other* config error
+      // (permissions, malformed JSON, schema-invalid) is a real
+      // misconfiguration the user must fix before we boot.
+      console.error(`failed to load configuration: ${formatError(error)}`);
+      Deno.exit(1);
+    }
+  }
+  try {
+    await ensureDaemonRunning({ socketPath, autoStart });
+  } catch (error) {
+    console.error(`failed to start daemon: ${formatError(error)}`);
+    Deno.exit(1);
+  }
+  await import("./src/tui/App.tsx").then((module) => module.launch({ socketPath }));
 }
 
 /** Render an arbitrary error value to a single-line diagnostic. */

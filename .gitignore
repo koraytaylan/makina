@@ -2,6 +2,9 @@
 cov/
 cov.lcov
 
+# Local build artifact produced by `deno task build`
+bin/
+
 # Release build artifacts produced by `release.yml`
 dist/
 

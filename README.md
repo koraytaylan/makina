@@ -54,16 +54,27 @@ stays open source vs private.
 
 ## Quick start
 
+`makina` is a Deno workspace (the CLI imports `@makina/core` via the workspace link), so
+`deno install --global` cannot resolve the import map. Build a self-contained binary instead and put
+it on your `PATH`:
+
 ```bash
-deno install --allow-all --name makina --force https://raw.githubusercontent.com/koraytaylan/makina/main/packages/cli/main.ts
-makina setup     # one-time GitHub App + default repo configuration
-makina           # launch the TUI
+git clone git@github.com:koraytaylan/makina.git
+cd makina
+deno task install            # compiles `makina` directly into ~/.local/bin
+makina setup                 # one-time GitHub App + default repo configuration
+makina                       # launch the TUI (auto-spawns the daemon)
 ```
+
+`deno task install` writes the binary to `${MAKINA_INSTALL_DIR:-$HOME/.local/bin}/makina`; override
+the env var if you prefer a different directory on your `$PATH`. If you only want a local build,
+`deno task build` produces `bin/makina` at the repo root.
 
 `makina setup` walks you through the GitHub App configuration, discovers the installations the App
 can see, and writes `config.json` to the platform-appropriate path (see
 [`docs/configuration.md`](docs/configuration.md)). After that, launching `makina` auto-spawns the
-daemon if it is not already running and connects the TUI; type `/issue <number>` and walk away.
+daemon if it is not already running and connects the TUI; type `/issue <number>` and walk away. Quit
+the TUI with `Ctrl+C` — the daemon stays running so you can reattach later.
 
 ## Development
 

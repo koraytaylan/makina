@@ -13,7 +13,7 @@
  * @module
  */
 
-import { Box, render, Text, useApp, useInput } from "ink";
+import { Box, render, useInput } from "ink";
 import { type ReactElement, useCallback, useEffect, useMemo, useState } from "react";
 
 import { CommandPalette } from "./components/CommandPalette.tsx";
@@ -34,14 +34,6 @@ import {
   MAKINA_VERSION,
   STATUS_BAR_TRUNCATION_WIDTH_CODE_UNITS,
 } from "@makina/core";
-
-/**
- * Default Unix-socket path the daemon listens on.
- *
- * The path is intentionally local to {@link launch}; setup wizard /
- * config loader can supply a different one.
- */
-const DEFAULT_DAEMON_SOCKET_PATH = `${Deno.env.get("HOME") ?? "/tmp"}/.makina/daemon.sock`;
 
 /**
  * Subset of TUI keybindings the App reads. Only the overlay toggles
@@ -453,60 +445,36 @@ function truncate(text: string, limit: number): string {
 }
 
 /**
- * Inner component used by {@link launch} to register a Ctrl+C exit
- * handler against Ink's app context. Kept separate so {@link App}
- * remains a pure render component (and therefore trivial to test).
- */
-function CtrlCExit(): ReactElement {
-  const app = useApp();
-  useEffect(() => {
-    const onSignal = () => {
-      app.exit();
-    };
-    Deno.addSignalListener("SIGINT", onSignal);
-    return () => {
-      try {
-        Deno.removeSignalListener("SIGINT", onSignal);
-      } catch {
-        // Already removed.
-      }
-    };
-  }, [app]);
-  return <Text></Text>;
-}
-
-/**
  * Production launch entrypoint wired in by `main.ts`.
  *
- * Builds a {@link SocketDaemonClient} pointing at the default daemon
- * socket and renders the {@link App} into Ink's default `process.stdout`
- * stream. The resolved promise settles when the app exits (Ctrl+C or
- * `useApp().exit()`).
+ * Builds a {@link SocketDaemonClient} pointing at `socketPath` and
+ * renders the {@link App} into Ink's default `process.stdout` stream.
+ * Ink's `exitOnCtrlC` flag handles Ctrl+C natively — Deno-level SIGINT
+ * listeners do not fire while Ink holds stdin in raw mode (the kernel's
+ * `^C → SIGINT` translation is suppressed by the raw-mode termios), so
+ * we let Ink intercept the byte and call `app.exit()` itself.
  *
- * @param overrides Optional overrides for the socket path and the
- *   client (the latter exists so an integration test can drive the real
- *   render with a non-default client).
+ * @param overrides Socket path (must match the daemon's bind path) and
+ *   an optional client (the latter exists so an integration test can
+ *   drive the real render with a non-default client).
  * @returns A promise that settles when the app exits.
  *
  * @example
  * ```ts
  * import { launch } from "./src/tui/App.tsx";
- * await launch();
+ * await launch({ socketPath: "/tmp/makina.sock" });
  * ```
  */
-export async function launch(overrides?: {
-  readonly socketPath?: string;
+export async function launch(overrides: {
+  readonly socketPath: string;
   readonly client?: DaemonClient & ConnectionLifecycle;
 }): Promise<void> {
-  const socketPath = overrides?.socketPath ?? DEFAULT_DAEMON_SOCKET_PATH;
-  const client = overrides?.client ?? new SocketDaemonClient(socketPath);
-  const instance = render(
-    <Box flexDirection="column">
-      <App client={client} />
-      <CtrlCExit />
-    </Box>,
-    { exitOnCtrlC: false, patchConsole: false },
-  );
+  const { socketPath } = overrides;
+  const client = overrides.client ?? new SocketDaemonClient(socketPath);
+  const instance = render(<App client={client} />, {
+    exitOnCtrlC: true,
+    patchConsole: false,
+  });
   try {
     await instance.waitUntilExit();
   } finally {
