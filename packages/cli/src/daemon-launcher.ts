@@ -67,20 +67,27 @@ export class DaemonNotRunningError extends Error {
 /**
  * Thrown when an autospawned daemon does not bind its socket within
  * the configured timeout. The child has already been detached; the
- * caller may retry or surface the error to the user.
+ * caller may retry or surface the error to the user. The error
+ * message embeds the tail of the daemon's stderr log when one is
+ * available so the user has something to act on.
  */
 export class DaemonStartTimeoutError extends Error {
   /**
-   * Construct a start-timeout error referencing the probed socket path
-   * and the elapsed budget.
+   * Construct a start-timeout error referencing the probed socket
+   * path, the elapsed budget, and (optionally) the tail of the
+   * daemon's stderr log.
    *
    * @param socketPath The Unix-domain socket the launcher polled.
    * @param timeoutMs The bind deadline that elapsed without success.
+   * @param logTail Tail of the daemon's stderr log file, when one
+   *   was captured. Appended to the error message verbatim.
    */
-  constructor(socketPath: string, timeoutMs: number) {
-    super(
-      `spawned daemon did not bind ${socketPath} within ${timeoutMs}ms`,
-    );
+  constructor(socketPath: string, timeoutMs: number, logTail?: string) {
+    const base = `spawned daemon did not bind ${socketPath} within ${timeoutMs}ms`;
+    const decorated = logTail !== undefined && logTail.length > 0
+      ? `${base}\n--- daemon log tail ---\n${logTail}\n--- end log tail ---`
+      : base;
+    super(decorated);
     this.name = "DaemonStartTimeoutError";
   }
 }
@@ -116,8 +123,21 @@ export async function ensureDaemonRunning(
   }
   const spawn = opts.spawn ?? spawnDaemon;
   spawn();
-  const timeoutMs = opts.timeoutMs ?? 5000;
-  await waitForSocket(opts.socketPath, timeoutMs);
+  // 15s default. A `deno compile`d binary's cold start runs the
+  // embedded archive's inflate-and-link step before the daemon
+  // branch even runs, which is comfortably under 5s on a warm
+  // FS but flirts with that budget on a cold one. The integration
+  // tests use 10s and 30s for the same reason.
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  try {
+    await waitForSocket(opts.socketPath, timeoutMs);
+  } catch (error) {
+    if (error instanceof DaemonStartTimeoutError) {
+      const logTail = await readDaemonLogTail();
+      throw new DaemonStartTimeoutError(opts.socketPath, timeoutMs, logTail);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -174,21 +194,73 @@ async function waitForSocket(socketPath: string, timeoutMs: number): Promise<voi
  * Spawn a detached daemon child, mirroring the current invocation
  * mode (`deno compile`d binary or `deno run` script).
  *
- * The child is fully detached — stdio handles are nulled and `unref()`
- * is called so the parent process (the TUI) can exit independently.
- * The daemon's own SIGINT/SIGTERM handlers ({@link main.ts}) take
- * over its lifecycle from there.
+ * The daemon's stdout is sent to `/dev/null` and its stderr is
+ * redirected (truncate + write) to {@link daemonLogPath} via a
+ * `sh -c "exec ... 2>file"` wrapper. Going through `sh` is what
+ * lets the daemon write directly to the file even after the parent
+ * (the TUI) exits — a `Deno.Command` `"piped"` stderr would block
+ * once the parent stops draining it. The `exec` keyword makes `sh`
+ * replace itself with the daemon, so no extra shell process lingers.
+ *
+ * The child is detached via `unref()` so the TUI can exit
+ * independently; the daemon's own SIGINT/SIGTERM handlers
+ * ({@link main.ts}) take over its lifecycle.
  */
 function spawnDaemon(): void {
   const { execPath, args } = resolveDaemonInvocation();
-  const command = new Deno.Command(execPath, {
-    args: [...args],
+  const logFile = daemonLogPath();
+  const cmdline = [execPath, ...args].map(shellQuote).join(" ");
+  const command = new Deno.Command("sh", {
+    args: ["-c", `exec ${cmdline} >/dev/null 2>${shellQuote(logFile)}`],
     stdout: "null",
     stderr: "null",
     stdin: "null",
   });
   const child = command.spawn();
   child.unref();
+}
+
+/**
+ * Filesystem path the daemon's stderr log lands at when the launcher
+ * spawns it. Lives under `$TMPDIR` (with `/tmp` as the cross-platform
+ * fallback) so the user can `tail -f` it for live diagnostics.
+ */
+export function daemonLogPath(): string {
+  const tmpDir = (Deno.env.get("TMPDIR") ?? "/tmp").replace(/\/$/, "");
+  return `${tmpDir}/makina-daemon.log`;
+}
+
+/**
+ * Read the last `maxLines` lines of the daemon's stderr log, or
+ * `undefined` if the log does not exist yet (a missing log is the
+ * normal case when the launcher has never autospawned a daemon).
+ *
+ * Used by {@link ensureDaemonRunning} to enrich the timeout error
+ * with whatever the daemon child managed to write before giving up.
+ */
+async function readDaemonLogTail(maxLines = 30): Promise<string | undefined> {
+  let text: string;
+  try {
+    text = await Deno.readTextFile(daemonLogPath());
+  } catch {
+    return undefined;
+  }
+  const lines = text.split("\n").filter((line) => line.length > 0);
+  if (lines.length === 0) {
+    return undefined;
+  }
+  return lines.slice(-maxLines).join("\n");
+}
+
+/**
+ * Single-quote `s` for use inside a `sh -c` argument: every embedded
+ * single quote becomes `'\''` and the whole thing is wrapped in
+ * single quotes. Sufficient for our two callers (an absolute exec
+ * path and a fixed log path); not a general-purpose POSIX shell
+ * escaper.
+ */
+function shellQuote(s: string): string {
+  return `'${s.replaceAll("'", `'\\''`)}'`;
 }
 
 /**
