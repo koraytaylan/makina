@@ -15,7 +15,7 @@
  *
  * @module
  */
-import { fromFileUrl } from "@std/path";
+import { basename, fromFileUrl } from "@std/path";
 
 /**
  * Options accepted by {@link ensureDaemonRunning}.
@@ -272,9 +272,17 @@ function shellQuote(s: string): string {
  *   with `run -A <mainModule> daemon` so the same workspace
  *   (`deno.json` autodiscovery) resolves the `@makina/core` import.
  *
- * Detection: if `Deno.mainModule` resolves to a real file on disk,
- * we are in `deno run` mode. A `deno compile`d binary's `mainModule`
- * is an internal virtual path that does not stat.
+ * Detection: if `Deno.execPath()`'s basename is `deno` (the
+ * canonical CLI name), we are running via `deno run`. Anything else
+ * is the compiled binary. We deliberately do **not** key off
+ * `Deno.mainModule`: a `deno compile`d binary extracts its embedded
+ * archive into `${TMPDIR}/deno-compile-<name>/...` and reports that
+ * path as `Deno.mainModule`, so `Deno.statSync(mainModule)` succeeds
+ * inside a compiled binary too — relying on it caused a real
+ * fork-bomb (the compiled binary spawned itself with `run -A
+ * <extracted>/main.ts daemon`, which has no `run` subcommand and
+ * fell back to the default TUI branch, which spawned another
+ * "daemon" the same way…).
  *
  * Exported for unit-test reuse.
  */
@@ -283,18 +291,32 @@ export function resolveDaemonInvocation(): {
   readonly args: readonly string[];
 } {
   const execPath = Deno.execPath();
-  const scriptPath = mainModulePathOnDisk();
-  if (scriptPath !== undefined) {
-    return { execPath, args: ["run", "-A", scriptPath, "daemon"] };
+  if (isDenoRunMode(execPath)) {
+    const scriptPath = mainModulePathOnDisk();
+    if (scriptPath !== undefined) {
+      return { execPath, args: ["run", "-A", scriptPath, "daemon"] };
+    }
   }
   return { execPath, args: ["daemon"] };
 }
 
 /**
+ * `true` iff `execPath`'s basename is `deno` (or `deno.exe` on
+ * Windows) — i.e. we are running via `deno run`, not a compiled
+ * binary.
+ */
+function isDenoRunMode(execPath: string): boolean {
+  const name = basename(execPath);
+  const stripped = name.endsWith(".exe") ? name.slice(0, -".exe".length) : name;
+  return stripped === "deno";
+}
+
+/**
  * Return the on-disk path of `Deno.mainModule` when it points at a
- * real file (i.e. running via `deno run`); `undefined` otherwise
- * (i.e. running a `deno compile`d binary, where mainModule is an
- * internal virtual path).
+ * real file. Used only after {@link isDenoRunMode} confirms we are
+ * actually running via `deno run`; the stat is otherwise unreliable
+ * because a compiled binary also extracts its `mainModule` to a
+ * real path under `${TMPDIR}/deno-compile-<name>/...`.
  */
 function mainModulePathOnDisk(): string | undefined {
   let url: URL;

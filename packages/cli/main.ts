@@ -208,11 +208,14 @@ if (subcommand === "daemon") {
     socketPath = expandHome(tuiConfig.daemon.socketPath);
     autoStart = tuiConfig.daemon.autoStart;
   } catch (error) {
-    if (error instanceof ConfigLoadError && error.kind === "not-found") {
-      console.error(
-        `note: no config.json yet (run \`makina setup\`); using fallback socket ${socketPath}`,
-      );
-    } else {
+    if (!(error instanceof ConfigLoadError) || error.kind !== "not-found") {
+      // A missing config is the normal first-run state: the TUI
+      // boots against the same `${TMPDIR}/makina.sock` fallback the
+      // daemon uses, the user sees the UI, and the inevitable
+      // "no config; run `makina setup`" reply only surfaces when
+      // they actually try `/issue` etc. Any *other* config error
+      // (permissions, malformed JSON, schema-invalid) is a real
+      // misconfiguration the user must fix before we boot.
       console.error(`failed to load configuration: ${formatError(error)}`);
       Deno.exit(1);
     }
