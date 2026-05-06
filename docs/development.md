@@ -32,6 +32,7 @@ deno task ci                           # confirm the gate is green locally
 | `deno task doc:lint`      | Fails on missing/malformed JSDoc on exported symbols.                                       |
 | `deno task doc:html`      | Generates a static API site under `docs/api/`.                                              |
 | `deno task build`         | Compiles `packages/cli/main.ts` to `bin/makina`. Copy/symlink the binary onto your `$PATH`. |
+| `deno task install`       | Compiles `makina` directly into `${MAKINA_INSTALL_DIR:-$HOME/.local/bin}/makina`.           |
 | `deno task build:smoke`   | Compiles `packages/cli/main.ts` for the host target and runs `--version`. Used by CI.       |
 | `deno task ci`            | Full quality gate (the same one CI runs).                                                   |
 

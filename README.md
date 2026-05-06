@@ -61,11 +61,14 @@ it on your `PATH`:
 ```bash
 git clone git@github.com:koraytaylan/makina.git
 cd makina
-deno task build              # compiles bin/makina via `deno compile`
-cp bin/makina ~/.local/bin/  # or any directory on $PATH
+deno task install            # compiles `makina` directly into ~/.local/bin
 makina setup                 # one-time GitHub App + default repo configuration
 makina                       # launch the TUI (auto-spawns the daemon)
 ```
+
+`deno task install` writes the binary to `${MAKINA_INSTALL_DIR:-$HOME/.local/bin}/makina`; override
+the env var if you prefer a different directory on your `$PATH`. If you only want a local build,
+`deno task build` produces `bin/makina` at the repo root.
 
 `makina setup` walks you through the GitHub App configuration, discovers the installations the App
 can see, and writes `config.json` to the platform-appropriate path (see
