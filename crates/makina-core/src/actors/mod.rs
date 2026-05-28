@@ -22,13 +22,16 @@
 //! spawn the `Supervisor` hub first, then pass its `ActorRef` into each spoke's
 //! `Args`.
 //!
-//! # Skeleton status
+//! # Planner interpreter injection
 //!
-//! All actors are **skeletons**.  Message handlers store state and return
-//! placeholder replies.  Real orchestration logic will be added per later tasks:
-//! - Task 14 (`planner-actor`): real task-list interpretation in `Planner`.
-//! - Task 21 (`develop-review-loop`): real develop/review orchestration loop in
-//!   `Supervisor`, `Developer`, and `Reviewer`.
+//! Task 14 (`planner-actor`) replaced the skeleton `Planner` handler with a
+//! real implementation.  The interpreter is injected via [`PlannerArgs`] as an
+//! `Arc<dyn TaskListInterpreter>`.  Use
+//! [`StructuredTextInterpreter`](crate::interpreter::StructuredTextInterpreter)
+//! in tests; task 18 will plug in a model-backed interpreter.
+//!
+//! Task 21 (`develop-review-loop`) will add real orchestration to `Supervisor`,
+//! `Developer`, and `Reviewer`.
 
 pub mod developer;
 pub mod planner;
@@ -55,7 +58,7 @@ mod tests {
     //! — the test cannot observe a reply before the handler runs, so the ordering is
     //! deterministic.
 
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
     use chrono::Utc;
 
@@ -64,6 +67,7 @@ mod tests {
             Develop, Developer, DeveloperArgs, InterpretTaskList, Planner, PlannerArgs, Review,
             ReviewVerdict, Reviewer, ReviewerArgs, SetTaskGraph, Supervisor, TaskGraphSnapshot,
         },
+        interpreter::StructuredTextInterpreter,
         supervision::{RestartConfig, RootSupervisor},
         task::{Task, TaskGraph, TaskId, TaskState},
     };
@@ -126,11 +130,12 @@ mod tests {
 
         // ── Step 3: spawn spokes with the hub ref ────────────────────────────
 
-        // Planner
+        // Planner — inject the deterministic reference interpreter (no model call).
         let planner_ref = RootSupervisor::spawn_child::<Planner>(
             &root,
             PlannerArgs {
                 supervisor: supervisor_ref.clone(),
+                interpreter: Arc::new(StructuredTextInterpreter::new()),
             },
             RestartConfig::default(),
         )
