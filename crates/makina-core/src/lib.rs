@@ -9,6 +9,7 @@ pub mod actors;
 pub mod api;
 pub mod backend;
 pub mod config;
+pub mod dependency;
 pub mod interpreter;
 pub mod state_machine;
 pub mod supervision;
