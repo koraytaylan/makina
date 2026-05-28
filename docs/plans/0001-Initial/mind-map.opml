@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>Makina — Plan 0001 (MVP)</title>
+  </head>
+  <body>
+    <outline text="Makina (MVP)">
+      <outline text="Vision">
+        <outline text="Multi-agent software factory in Rust"/>
+        <outline text="Input: structured text task list"/>
+        <outline text="Planner: model call → .tasks/{slug}.json; flags cross-task deps"/>
+        <outline text="Star topology: Supervisor is the hub"/>
+        <outline text="Supervisor → Developer (gates) → Reviewer → squash-merge to develop"/>
+        <outline text="Concurrency: parallel tasks, single Developer per task"/>
+        <outline text="TUI is entry point: file browser opens a task list as a Run"/>
+        <outline text="TUI streams ACP prompts/answers live"/>
+        <outline text="Fault tolerance: structural via kameo supervision"/>
+        <outline text="MVP: test-drive yourself, judge from there"/>
+      </outline>
+
+      <outline text="Principles">
+        <outline text="Maximalist core, thin shell"/>
+        <outline text="Failures are scoped (kameo supervision)"/>
+        <outline text="Work state is a tracked artifact (in-repo)"/>
+        <outline text="Agents external via agent-backend trait (Planner = possible exception)"/>
+        <outline text="ACP CLIs self-authenticate (Zed model; Makina stores no model creds)"/>
+        <outline text="Open-core trajectory (license deferred)"/>
+      </outline>
+
+      <outline text="Architecture">
+        <outline text="Foundations">
+          <outline text="Rust"/>
+          <outline text="Tokio (async runtime)"/>
+          <outline text="kameo (actor framework on Tokio)"/>
+          <outline text="ratatui (TUI library)"/>
+        </outline>
+
+        <outline text="Crates">
+          <outline text="makina-core (actors, state machine, agent-backend trait, api)"/>
+          <outline text="makina-acp (ACP impl of agent-backend trait; swappable)"/>
+          <outline text="makina (TUI; entry point; file browser + Runs sidebar)"/>
+        </outline>
+
+        <outline text="Actors (star topology; Supervisor is hub)">
+          <outline text="Supervisor (hub; mix of deterministic steps + agent prompts; worktree+branch lifecycle; .tasks/ writer; squash-merge)"/>
+          <outline text="Planner (structured text → task graph; flags cross-cutting deps; hands to Supervisor)"/>
+          <outline text="Developer (pool; works task in worktree; runs gates)"/>
+          <outline text="Reviewer (per task; shares Developer's worktree; approve/reject to Supervisor)"/>
+          <outline text="Spokes talk only to Supervisor, never each other"/>
+        </outline>
+
+        <outline text="Gates (project config makina.toml; exit-0 required before review)"/>
+
+        <outline text="Configuration (two-layer TOML; project overrides global)">
+          <outline text="~/.makina/config.toml (global: agent CLI, Planner model, default caps, concurrency)"/>
+          <outline text="makina.toml (repo root, committed: gates, base branch, overrides)"/>
+          <outline text="Runtime state separate: .tasks/ (committed), .worktrees/ (gitignored)"/>
+        </outline>
+
+        <outline text="Task lifecycle (FSM)">
+          <outline text="States: new, ready, in-progress, in-review, done, failed"/>
+          <outline text="Developer self-iterates on gate failure (in-progress loop)"/>
+          <outline text="Reviewer rejects → back to in-progress (iterate)"/>
+          <outline text="Termination: max gate iter, max review iter, wall-clock cap → failed"/>
+        </outline>
+
+        <outline text="Concurrency">
+          <outline text="Parallel across tasks; single Developer per task"/>
+          <outline text="Worktree + branch per task (.worktrees/{task-id}/, task/{task-id})"/>
+          <outline text="Developer + Reviewer share the worktree until merge"/>
+          <outline text="Planner-encoded deps prevent same-file parallel conflicts"/>
+          <outline text="Supervisor owns worktree+branch lifecycle"/>
+          <outline text="Dev ↔ Supervisor ↔ Reviewer cycle is sequential within a task"/>
+        </outline>
+
+        <outline text="Key boundaries">
+          <outline text="All logic in makina-core; TUI is API consumer"/>
+          <outline text="Agents external, behind agent-backend trait (makina-acp swappable)"/>
+          <outline text="Supervisor is the hub; spokes never talk to each other"/>
+          <outline text="Worktree+branch-per-task = unit of isolation"/>
+          <outline text="kameo supervision = structural fault tolerance"/>
+          <outline text="Only Supervisor writes .tasks/"/>
+        </outline>
+      </outline>
+
+      <outline text="Roadmap (MVP)">
+        <outline text="0002 Architecture &amp; Workspace (3-crate split)"/>
+        <outline text="0003 Core Skeleton (+ state machine, 4 actor traits, config loading)"/>
+        <outline text="0004 Planner (structured text → JSON; cross-task deps)"/>
+        <outline text="0005 Agent Backend (makina-acp)"/>
+        <outline text="0006 Orchestration + Worktrees (Supervisor hub)"/>
+        <outline text="0007 TUI (entry point; file browser; Runs sidebar; live streaming)"/>
+        <outline text="0008 End-to-End Trial"/>
+      </outline>
+
+      <outline text="Future directions (FUTURE.md)">
+        <outline text="Deterministic governance (gateway, policy, audit)"/>
+        <outline text="Qualifier (entry-gate quality checks)"/>
+        <outline text="Multiple task sources (GitHub, JIRA, CSV)"/>
+        <outline text="Cost-tiered routing + multiple backends"/>
+        <outline text="PR + external review integration"/>
+        <outline text="Hard enforcement via sandboxing"/>
+        <outline text="Fresh hosted SaaS"/>
+        <outline text="License decision"/>
+        <outline text="Plugin distribution mechanism"/>
+        <outline text="Multi-user concurrency"/>
+        <outline text="Crash recovery (WAL)"/>
+        <outline text="Cost accounting + budget caps"/>
+        <outline text="Hang detection subsystem"/>
+        <outline text="State machine extensions"/>
+        <outline text="Direct API agent backends (alongside ACP)"/>
+      </outline>
+    </outline>
+  </body>
+</opml>
