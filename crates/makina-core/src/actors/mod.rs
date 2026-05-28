@@ -197,7 +197,7 @@ mod tests {
         // `()` (the inner Ok value) directly.
         planner_ref
             .ask(InterpretTaskList {
-                path: PathBuf::from("/dev/null"), // placeholder path; handler ignores it
+                path: PathBuf::from("/dev/null"), // /dev/null reads as empty string -> empty but valid TaskGraph
             })
             .send()
             .await

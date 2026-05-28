@@ -156,14 +156,11 @@ impl kameo::message::Message<InterpretTaskList> for Planner {
             .unwrap_or("tasks")
             .to_string();
 
-        // Step 2: read the file.
-        // We use the synchronous `std::fs::read_to_string` here because `tokio`
-        // is compiled without the `fs` feature in this workspace.  Task list files
-        // are small (< 100 KB in practice) so a blocking read does not block the
-        // executor for a meaningful duration.  If this becomes a concern, enabling
-        // `tokio/fs` and switching to `tokio::fs::read_to_string` is a one-line
-        // change.
-        let text = std::fs::read_to_string(&msg.path)
+        // Step 2: read the file asynchronously so we don't block a Tokio worker
+        // thread.  `tokio::fs::read_to_string` is available because the workspace
+        // enables the `tokio/fs` feature.
+        let text = tokio::fs::read_to_string(&msg.path)
+            .await
             .map_err(|e| format!("failed to read `{}`: {e}", msg.path.display()))?;
 
         // Step 3: interpret.
