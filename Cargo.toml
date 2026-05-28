@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Koray Taylan Davgana"]
+# Source-available (NOT OSI open source). See LICENSE. A crate intended as a
+# freely-embeddable SDK/client may override this with `license = "Apache-2.0"`.
+license = "Elastic-2.0"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+
+# Actor framework
+kameo = "0.20"
+
+# TUI
+ratatui = "0.30"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# Config / data format
+toml = "1.1"
+
+# Internal crates
+makina-core = { path = "crates/makina-core" }
+makina-acp = { path = "crates/makina-acp" }

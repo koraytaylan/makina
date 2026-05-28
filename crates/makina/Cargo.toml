@@ -1,0 +1,17 @@
+[package]
+name = "makina"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Makina — multi-agent software-factory orchestrator (ratatui TUI entry point)"
+
+[[bin]]
+name = "makina"
+path = "src/main.rs"
+
+[dependencies]
+makina-core = { workspace = true }
+makina-acp = { workspace = true }
+tokio = { workspace = true }
+ratatui = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "makina-acp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ACP (agent client protocol) backend implementation for Makina — subprocesses an ACP-compatible CLI over stdio"
+
+[dependencies]
+makina-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
