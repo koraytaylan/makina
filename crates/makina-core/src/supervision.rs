@@ -278,6 +278,21 @@ mod tests {
 
     use super::{PlaceholderWorker, QueryStartCount, RestartConfig, RootSupervisor, TriggerCrash};
 
+    /// Poll a shared counter until it reaches `target`, with a bounded 2s deadline.
+    /// Avoids fixed sleeps so the assertion is robust under loaded CI.
+    async fn poll_until(counter: &Arc<AtomicU32>, target: u32, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if counter.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting: {what} (counter never reached {target})");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Prove that `RootSupervisor` restarts a child that panics.
     ///
     /// # How determinism is achieved
@@ -303,28 +318,14 @@ mod tests {
         )
         .await;
 
-        // Wait for initial start.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(
-            start_count.load(Ordering::SeqCst),
-            1,
-            "child should have started once"
-        );
+        // Wait for initial start — poll (no fixed sleep) so this is CI-robust.
+        poll_until(&start_count, 1, "child should have started once").await;
 
         // Trigger crash (fire-and-forget; the actor will panic processing this message).
         let _ = child.tell(TriggerCrash).await;
 
         // Poll for restart — deterministic bounded wait (no fixed sleep required).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if start_count.load(Ordering::SeqCst) >= 2 {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("timed out waiting for child restart after crash");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        poll_until(&start_count, 2, "child should have restarted after crash").await;
 
         // The child is now restarted — confirm it is responsive.
         let count = child
