@@ -1,0 +1,504 @@
+//! The high-level ACP client: spawn → connect → prompt → teardown.
+//!
+//! [`AcpClient`] is the public surface task 15 (`acp-backend-impl`) wraps to
+//! implement `makina_core::backend::AgentBackend` / `AgentSession`. It owns the
+//! agent subprocess and a [`Transport`], drives the `initialize`/`session/new`
+//! handshake, and turns a `session/prompt` into an incremental stream of
+//! [`AcpResponseChunk`]s assembled from `session/update` notifications.
+//!
+//! # Lifecycle
+//!
+//! ```text
+//!  AcpClient::connect(AcpCommand)        // spawn subprocess + initialize + session/new
+//!        │
+//!        ▼
+//!  client.prompt("…") ──► PromptStream ──► [Text, Text, …, TurnComplete]
+//!        │
+//!        ▼ client.shutdown()  (or drop)   // kill subprocess, abort reader task
+//! ```
+//!
+//! # Testability
+//!
+//! The protocol logic is decoupled from process spawning. [`AcpClient::connect`]
+//! spawns a real subprocess, but [`AcpClient::with_transport`] accepts any
+//! [`Transport`] over a generic byte stream, so the entire handshake + prompt
+//! exchange can be exercised over an in-memory [`tokio::io::duplex`] pipe with a
+//! mock agent — no binary required (see the crate's `tests/`).
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::process::Stdio;
+use std::task::{Context, Poll};
+
+use futures::Stream;
+use futures::future::BoxFuture;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::process::{Child, Command};
+
+use crate::error::{AcpError, Result};
+use crate::protocol::{
+    self, ContentBlock, Implementation, InitializeParams, InitializeResult, NewSessionParams,
+    NewSessionResult, PromptParams, PromptResult, SessionUpdate, StopReason,
+};
+use crate::transport::Transport;
+
+/// Boxed write half used by the production (subprocess) transport, so
+/// [`AcpClient`] is not generic over the stream type.
+type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
+
+/// Default client identity reported to the agent during `initialize`.
+const CLIENT_NAME: &str = "makina";
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── Command description ──────────────────────────────────────────────────────────
+
+/// How to launch an ACP agent CLI as a subprocess.
+///
+/// Follows the **Zed authentication model**: Makina inherits the parent process
+/// environment (so the CLI's existing sign-in is reused) and never injects model
+/// credentials. Additional env vars set here are *added on top of* the inherited
+/// environment, not a replacement.
+#[derive(Debug, Clone)]
+pub struct AcpCommand {
+    /// The program to execute (e.g. `npx`, `claude-code-acp`, `gemini`).
+    pub program: PathBuf,
+    /// Arguments passed to the program.
+    pub args: Vec<String>,
+    /// Working directory for the subprocess and the session's `cwd`.
+    pub working_dir: PathBuf,
+    /// Extra environment variables layered on top of the inherited environment.
+    pub env: Vec<(String, String)>,
+}
+
+impl AcpCommand {
+    /// Build a command for `program` running in `working_dir`.
+    pub fn new(program: impl Into<PathBuf>, working_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            working_dir: working_dir.into(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Append CLI arguments.
+    #[must_use]
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add one extra environment variable (layered on the inherited env).
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+}
+
+// ── Response chunk ───────────────────────────────────────────────────────────────
+
+/// One item produced by a [`PromptStream`].
+///
+/// A turn yields zero or more [`AcpResponseChunk::Text`] items (assembled from
+/// `agent_message_chunk` `session/update` notifications) followed by exactly one
+/// [`AcpResponseChunk::TurnComplete`]. This mirrors the shape of
+/// `makina_core::backend::ResponseEvent` so task 15's adapter is a thin mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpResponseChunk {
+    /// A fragment of the agent's assistant message text (never empty).
+    Text(String),
+    /// The turn finished; carries the agent's stop reason.
+    TurnComplete(StopReason),
+}
+
+// ── The client ───────────────────────────────────────────────────────────────────
+
+/// A connected ACP client over a subprocess (or, in tests, any transport).
+///
+/// Holds the agent's child-process handle (if spawned) and the JSON-RPC
+/// [`Transport`]. A session has been created during [`connect`](Self::connect);
+/// call [`prompt`](Self::prompt) to run a turn and [`shutdown`](Self::shutdown)
+/// (or drop) to tear everything down.
+pub struct AcpClient {
+    /// The agent subprocess, when this client owns one. `None` for transports
+    /// injected directly in tests.
+    child: Option<Child>,
+    /// JSON-RPC transport over the agent's stdio.
+    transport: Transport<BoxedWriter>,
+    /// The session created at connect time.
+    session_id: String,
+    /// Negotiated protocol version reported by the agent.
+    protocol_version: u16,
+    /// Agent name/version from `initialize`, if provided.
+    agent_info: Option<Implementation>,
+    /// Set once [`shutdown`](Self::shutdown) has run, to make it idempotent.
+    closed: bool,
+}
+
+// Manual `Debug` (the boxed writer in `Transport` is not `Debug`); prints the
+// useful client state without exposing the transport internals.
+impl std::fmt::Debug for AcpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpClient")
+            .field("has_subprocess", &self.child.is_some())
+            .field("session_id", &self.session_id)
+            .field("protocol_version", &self.protocol_version)
+            .field("agent_info", &self.agent_info)
+            .field("closed", &self.closed)
+            .finish()
+    }
+}
+
+impl AcpClient {
+    /// Spawn the agent described by `command`, perform the `initialize`
+    /// handshake, and create a session.
+    ///
+    /// On success the returned client has an active session and is ready for
+    /// [`prompt`](Self::prompt). Spawn failures surface as [`AcpError::Spawn`];
+    /// handshake/transport failures as [`AcpError::Transport`] /
+    /// [`AcpError::Protocol`] / [`AcpError::Rpc`].
+    ///
+    /// The subprocess inherits the parent environment (Zed auth model); any
+    /// `command.env` entries are layered on top.
+    pub async fn connect(command: AcpCommand) -> Result<Self> {
+        let (child, transport) = spawn_transport(&command)?;
+        // Build atop the generic constructor so spawn + protocol stay separable.
+        let mut client = Self::from_parts(Some(child), transport);
+        client.handshake(&command.working_dir).await?;
+        Ok(client)
+    }
+
+    /// Build a client over an arbitrary [`Transport`] **and** run the
+    /// `initialize` + `session/new` handshake against it.
+    ///
+    /// This is the seam used by tests: pass a transport built over a
+    /// [`tokio::io::duplex`] pipe whose other end is a mock agent. No subprocess
+    /// is involved, so the full protocol exchange is exercised deterministically.
+    pub async fn with_transport<R, W>(reader: R, writer: W, cwd: impl AsRef<Path>) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let transport = Transport::new(reader, Box::pin(writer) as BoxedWriter);
+        let mut client = Self::from_parts(None, transport);
+        client.handshake(cwd.as_ref()).await?;
+        Ok(client)
+    }
+
+    /// Assemble a not-yet-handshaked client from its parts.
+    fn from_parts(child: Option<Child>, transport: Transport<BoxedWriter>) -> Self {
+        Self {
+            child,
+            transport,
+            session_id: String::new(),
+            protocol_version: 0,
+            agent_info: None,
+            closed: false,
+        }
+    }
+
+    /// Drive `initialize` then `session/new`, populating session state.
+    async fn handshake(&mut self, cwd: &Path) -> Result<()> {
+        // 1. initialize — capability negotiation.
+        let init_params = InitializeParams {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            client_capabilities: Default::default(),
+            client_info: Implementation {
+                name: CLIENT_NAME.to_string(),
+                version: CLIENT_VERSION.to_string(),
+            },
+        };
+        let init_value = self
+            .transport
+            .send_request(protocol::METHOD_INITIALIZE, &init_params)
+            .await?;
+        let init: InitializeResult = serde_json::from_value(init_value)
+            .map_err(|e| AcpError::protocol(format!("invalid initialize result: {e}")))?;
+        self.protocol_version = init.protocol_version;
+        self.agent_info = init.agent_info;
+
+        // 2. session/new — create the session in the requested working dir.
+        let new_session_params = NewSessionParams {
+            cwd: cwd.to_path_buf(),
+            mcp_servers: Vec::new(),
+        };
+        let session_value = self
+            .transport
+            .send_request(protocol::METHOD_SESSION_NEW, &new_session_params)
+            .await?;
+        let session: NewSessionResult = serde_json::from_value(session_value)
+            .map_err(|e| AcpError::protocol(format!("invalid session/new result: {e}")))?;
+        self.session_id = session.session_id;
+
+        Ok(())
+    }
+
+    /// The session id assigned by the agent.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The protocol version the agent agreed to.
+    pub fn protocol_version(&self) -> u16 {
+        self.protocol_version
+    }
+
+    /// The agent's reported name/version, if it sent any.
+    pub fn agent_info(&self) -> Option<&Implementation> {
+        self.agent_info.as_ref()
+    }
+
+    /// Send `text` as a single user turn and return an incremental stream of
+    /// the agent's response.
+    ///
+    /// The returned [`PromptStream`] borrows the client for the duration of the
+    /// turn; drain it (to [`AcpResponseChunk::TurnComplete`] or an error) before
+    /// issuing another prompt. Yields:
+    /// * [`AcpResponseChunk::Text`] for each assistant `agent_message_chunk`;
+    /// * [`AcpResponseChunk::TurnComplete`] once the `session/prompt` response
+    ///   arrives;
+    /// * an [`AcpError`] if the transport breaks or the agent exits mid-turn,
+    ///   after which the stream ends.
+    pub fn prompt(&mut self, text: impl Into<String>) -> Result<PromptStream<'_>> {
+        if self.closed {
+            return Err(AcpError::Closed);
+        }
+        if let Some(err) = self.transport.sender().ended_error() {
+            return Err(err);
+        }
+
+        let params = PromptParams {
+            session_id: self.session_id.clone(),
+            prompt: vec![ContentBlock::text(text)],
+        };
+
+        // The prompt request runs on a cloned (owned, 'static) sender so the
+        // future does not borrow `self`; meanwhile we keep `&mut` access to the
+        // notification receiver to interleave chunk delivery. No aliasing.
+        let sender = self.transport.sender().clone();
+        let response: BoxFuture<'static, Result<PromptResult>> = Box::pin(async move {
+            let value = sender
+                .send_request(protocol::METHOD_SESSION_PROMPT, &params)
+                .await?;
+            serde_json::from_value::<PromptResult>(value)
+                .map_err(|e| AcpError::protocol(format!("invalid session/prompt result: {e}")))
+        });
+
+        Ok(PromptStream {
+            transport: &mut self.transport,
+            state: StreamState::Streaming(response),
+            buffered: VecDeque::new(),
+        })
+    }
+
+    /// Gracefully terminate the client: kill the agent subprocess (if any) and
+    /// stop the reader task.
+    ///
+    /// Idempotent — calling it again returns `Ok(())`. The subprocess is also
+    /// killed on drop, so calling `shutdown` is optional but lets callers await
+    /// the kill and observe errors.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+
+        if let Some(child) = self.child.as_mut() {
+            // Send SIGKILL; a process that already exited yields a benign error
+            // we ignore (it's already gone).
+            let _ = child.start_kill();
+            // Reap so no zombie lingers. Ignore the status — we are tearing down.
+            let _ = child.wait().await;
+        }
+        Ok(())
+    }
+}
+
+/// Best-effort synchronous teardown if the caller never called
+/// [`AcpClient::shutdown`]. Tokio's `Child` is configured (below) to kill the
+/// process when its handle drops, so this guarantees no leaked subprocess.
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        // `Child` is created with `kill_on_drop(true)`, so dropping `self.child`
+        // here sends SIGKILL. The `Transport`'s own `Drop` aborts the reader
+        // task. Nothing further is required, but we make the intent explicit.
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+// ── Subprocess spawning ──────────────────────────────────────────────────────────
+
+/// Spawn the agent subprocess with piped stdio and wrap its stdout/stdin in a
+/// [`Transport`]. Stderr is captured and forwarded line-by-line to this
+/// process's stderr (useful for surfacing agent diagnostics / auth prompts).
+fn spawn_transport(command: &AcpCommand) -> Result<(Child, Transport<BoxedWriter>)> {
+    let mut cmd = Command::new(&command.program);
+    cmd.args(&command.args)
+        .current_dir(&command.working_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Reap the process if the handle is dropped without an explicit kill —
+        // this is the leak-prevention guarantee.
+        .kill_on_drop(true);
+    // Zed auth model: inherit the parent environment; only *add* extras.
+    for (key, value) in &command.env {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        AcpError::Spawn(format!(
+            "could not spawn `{}`: {e}",
+            command.program.display()
+        ))
+    })?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AcpError::Spawn("child stdin was not captured".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AcpError::Spawn("child stdout was not captured".into()))?;
+
+    // Forward the agent's stderr to ours so operators can see auth/errors. This
+    // task ends when stderr closes (process exit); it holds no client state.
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(forward_stderr(stderr));
+    }
+
+    let reader = Box::pin(stdout) as Pin<Box<dyn AsyncRead + Send>>;
+    let writer = Box::pin(stdin) as BoxedWriter;
+    let transport = Transport::new(reader, writer);
+    Ok((child, transport))
+}
+
+/// Drain the child's stderr line-by-line to this process's stderr.
+async fn forward_stderr(stderr: tokio::process::ChildStderr) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        eprintln!("[acp-agent] {line}");
+    }
+}
+
+// ── Prompt stream ────────────────────────────────────────────────────────────────
+
+/// State machine driving a single prompt turn to completion.
+enum StreamState {
+    /// Awaiting the `session/prompt` response while forwarding chunks. The
+    /// boxed future is `'static` (built from a cloned sender), so it does not
+    /// alias the borrowed transport.
+    Streaming(BoxFuture<'static, Result<PromptResult>>),
+    /// Response received; emit `TurnComplete` next, then finish.
+    Completing(StopReason),
+    /// Terminal: the stream has ended.
+    Done,
+}
+
+/// An incremental stream of one prompt turn's response.
+///
+/// Implements [`futures::Stream`]; consume with `StreamExt` (`while let Some(..)
+/// = stream.next().await`). Borrows the [`AcpClient`] until the turn ends. See
+/// [`AcpClient::prompt`].
+pub struct PromptStream<'a> {
+    /// Borrowed transport — its notification receiver feeds text chunks.
+    transport: &'a mut Transport<BoxedWriter>,
+    /// Turn progress.
+    state: StreamState,
+    /// Text chunks observed after the response resolved, queued to emit before
+    /// `TurnComplete` (insurance against any chunk/response reordering).
+    buffered: VecDeque<String>,
+}
+
+impl PromptStream<'_> {
+    /// Pull the next text chunk out of an already-delivered notification, if it
+    /// is an assistant `agent_message_chunk` with non-empty text. Other update
+    /// kinds (thoughts, tool calls, …) return `None` and are skipped.
+    fn chunk_text(update: SessionUpdate) -> Option<String> {
+        match update {
+            SessionUpdate::AgentMessageChunk(chunk) => chunk
+                .content
+                .as_text()
+                .map(str::to_string)
+                .filter(|t| !t.is_empty()),
+            _ => None,
+        }
+    }
+}
+
+impl Stream for PromptStream<'_> {
+    type Item = Result<AcpResponseChunk>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            // Emit any buffered post-response chunks before TurnComplete.
+            if let Some(text) = this.buffered.pop_front() {
+                return Poll::Ready(Some(Ok(AcpResponseChunk::Text(text))));
+            }
+
+            match &mut this.state {
+                StreamState::Streaming(response) => {
+                    // 1. Prefer delivering a ready notification chunk first, so
+                    //    text streams out incrementally as it arrives.
+                    match this.transport.notifications_mut().poll_recv(cx) {
+                        Poll::Ready(Some(notif)) => {
+                            if let Some(text) = Self::chunk_text(notif.update) {
+                                return Poll::Ready(Some(Ok(AcpResponseChunk::Text(text))));
+                            }
+                            // Non-text update: loop to check for more.
+                            continue;
+                        }
+                        Poll::Ready(None) => {
+                            // The agent disconnected. Resolve via the response
+                            // future, which will carry the terminal error.
+                        }
+                        Poll::Pending => {}
+                    }
+
+                    // 2. Poll the prompt response. Only reached when no chunk is
+                    //    immediately buffered.
+                    match response.as_mut().poll(cx) {
+                        Poll::Ready(Ok(result)) => {
+                            // Drain any chunks that landed before the response so
+                            // none are dropped, then move to Completing.
+                            while let Ok(notif) = this.transport.notifications_mut().try_recv() {
+                                if let Some(text) = Self::chunk_text(notif.update) {
+                                    this.buffered.push_back(text);
+                                }
+                            }
+                            this.state = StreamState::Completing(result.stop_reason);
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            this.state = StreamState::Done;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                StreamState::Completing(_) => {
+                    // Take the stop reason and finish.
+                    let StreamState::Completing(reason) =
+                        std::mem::replace(&mut this.state, StreamState::Done)
+                    else {
+                        unreachable!("state checked in match arm")
+                    };
+                    return Poll::Ready(Some(Ok(AcpResponseChunk::TurnComplete(reason))));
+                }
+                StreamState::Done => return Poll::Ready(None),
+            }
+        }
+    }
+}
