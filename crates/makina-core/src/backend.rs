@@ -236,6 +236,10 @@ pub trait AgentSession: Send {
     async fn terminate(&mut self) -> Result<(), BackendError>;
 }
 
+// ── Submodules ────────────────────────────────────────────────────────────────
+
+pub mod noop;
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
