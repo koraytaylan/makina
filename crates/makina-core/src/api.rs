@@ -442,14 +442,19 @@ pub enum Event {
         review_iterations: u32,
     },
 
-    /// A live agent exchange event for the focused task.
+    /// A live agent exchange event from any in-flight task/agent.
     ///
-    /// The TUI renders these events in the exchange panel as a scrolling
-    /// prompt/answer conversation.  Only the *focused* task's exchanges are
-    /// emitted; the orchestrator is responsible for filtering by focus.  (If
-    /// focus changes, the TUI re-subscribes or the orchestrator sends events
-    /// for the newly focused task — this protocol is defined by the
-    /// implementation, not the type system.)
+    /// The orchestrator emits `AgentExchange` events for **all** in-flight
+    /// tasks and agents; it does **not** filter by any notion of "focus".
+    /// Each event carries `run`, `task`, and `role` so that consumers can
+    /// identify its source.
+    ///
+    /// Focus is a **presentation concern** that belongs in the TUI layer, not
+    /// in this core API surface.  There is intentionally no focus command in
+    /// this interface for the MVP.  The TUI (task 26, tui-scaffold) and the
+    /// prompt/answer stream layer (task 30, prompt-answer-stream) MUST filter
+    /// these events client-side based on whichever task the user is currently
+    /// viewing.
     AgentExchange {
         /// The Run the exchange belongs to.
         run: RunId,
@@ -469,6 +474,18 @@ pub enum Event {
 /// The TUI drives this stream from its render/event loop.  The stream is
 /// infinite for as long as the orchestrator is running; it ends only when the
 /// orchestrator shuts down.
+///
+/// # Infallibility — deliberate asymmetry with `backend::ResponseStream`
+///
+/// `EventStream` yields plain [`Event`] values, not `Result<Event, _>`.  This
+/// is an intentional departure from `backend::ResponseStream`, which yields
+/// `Result` because it models a fallible network/process boundary.
+/// `EventStream` is the orchestrator's *outward-facing* view stream: internal
+/// errors are absorbed by the orchestrator and surfaced as state changes (e.g.
+/// a task transitioning to [`TaskState::Failed`] or a run reaching
+/// [`RunStatus::Failed`]); the stream itself simply terminates on shutdown.
+/// Consumers therefore do **not** need to handle transport errors on this
+/// stream — a `None` from the stream means clean shutdown, not a failure.
 ///
 /// Use `futures::StreamExt` combinators to consume the stream:
 ///
@@ -547,7 +564,10 @@ pub trait Api: Send + Sync {
     /// of the call.  Past events are NOT replayed.  The TUI typically calls
     /// this once at startup and fans out events to its render loop.
     ///
-    /// The stream ends when the orchestrator shuts down.
+    /// The stream ends when the orchestrator shuts down.  Because [`EventStream`]
+    /// is infallible (yields [`Event`], not `Result`), a `None` from the stream
+    /// always means clean shutdown — consumers do not handle transport errors
+    /// here.  See the [`EventStream`] type-alias doc for the full rationale.
     fn subscribe(&self) -> EventStream;
 }
 
