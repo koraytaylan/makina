@@ -1,0 +1,938 @@
+//! Two-layer TOML configuration for Makina.
+//!
+//! Makina uses two configuration files merged at startup, with the project
+//! layer winning over the global layer:
+//!
+//! - **Global** `~/.makina/config.toml` — machine/user-level settings:
+//!   the agent backend command, the Planner model and call mechanism, default
+//!   termination caps, and max concurrency.
+//! - **Project** `makina.toml` — repository-level settings (committed to
+//!   version control): gates (toolchain-specific shell commands), base branch,
+//!   and optional per-project overrides of caps and concurrency.
+//!
+//! # Usage pattern
+//!
+//! ```rust,no_run
+//! use makina_core::config::Config;
+//!
+//! # fn main() -> Result<(), makina_core::config::ConfigError> {
+//! // Load with default real paths.
+//! let config = Config::load_defaults()?;
+//! println!("backend command: {}", config.backend.command);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For testing, use [`GlobalConfig::from_toml_str`] and
+//! [`ProjectConfig::from_toml_str`] with in-memory TOML strings, then
+//! [`Config::resolve`] and [`Config::validate`].
+
+use std::path::Path;
+
+use serde::Deserialize;
+use thiserror::Error;
+
+// ── Error type ────────────────────────────────────────────────────────────────
+
+/// Errors that can occur while loading, parsing, or validating Makina's
+/// configuration.
+///
+/// The variants provide specific, actionable messages so that operators can
+/// quickly identify and fix configuration problems.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// A TOML source string (global or project config) could not be parsed.
+    ///
+    /// The wrapped message is from the `toml` crate and includes the line/col
+    /// of the first parse error.
+    #[error("TOML parse error in {file}: {message}")]
+    Parse {
+        /// Human-readable label for the file that failed (e.g. `"~/.makina/config.toml"`).
+        file: String,
+        /// The underlying `toml::de::Error` message.
+        message: String,
+    },
+
+    /// A config file could not be read from disk.
+    #[error("I/O error reading `{path}`: {message}")]
+    Io {
+        /// Path that could not be read.
+        path: String,
+        /// The underlying `std::io::Error` message.
+        message: String,
+    },
+
+    /// The merged, resolved config failed semantic validation.
+    ///
+    /// `reason` is a precise, human-readable description of the violation
+    /// (e.g. `"backend.command must not be empty"`).
+    #[error("invalid config: {reason}")]
+    Validation {
+        /// Description of the specific validation rule that was violated.
+        reason: String,
+    },
+}
+
+// ── Backend config ────────────────────────────────────────────────────────────
+
+/// Configuration for the external agent backend CLI.
+///
+/// The backend is spawned as a subprocess.  `command` is the binary (or shell
+/// command) and `args` are the arguments passed to it.
+///
+/// # Defaults
+///
+/// `command` defaults to an empty string; [`Config::validate`] will reject a
+/// config whose `backend.command` is empty.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BackendConfig {
+    /// The binary or command to spawn for agent sessions (e.g. `"acp-cli"`).
+    ///
+    /// Must be non-empty after merging; [`Config::validate`] enforces this.
+    pub command: String,
+
+    /// Arguments to pass to `command` when spawning agent sessions.
+    pub args: Vec<String>,
+}
+
+// ── Planner config ────────────────────────────────────────────────────────────
+
+/// **Provisional** — the Planner model and call mechanism configuration.
+///
+/// This struct and [`PlannerMechanism`] are intentionally minimal.  The
+/// `planner-model-mechanism` task (task 18) will finalise the exact mechanism
+/// variants and the integration details.  Fields added here should not be
+/// treated as stable API.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PlannerConfig {
+    /// The model identifier used by the Planner (e.g. `"claude-opus-4-5"`).
+    ///
+    /// Defaults to an empty string; a later task will add validation.
+    pub model: String,
+
+    /// How the Planner calls the model.  See [`PlannerMechanism`].
+    pub mechanism: PlannerMechanism,
+}
+
+/// **Provisional** — the mechanism the Planner uses to call the model.
+///
+/// This enum will be finalised in the `planner-model-mechanism` task (task 18).
+/// Only two variants exist for now; additional variants (e.g. streaming,
+/// batch) may be added later without breaking existing configs because
+/// `serde(rename_all = "kebab-case")` is used and unknown variants in TOML
+/// would become parse errors.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlannerMechanism {
+    /// The Planner sends a single request and awaits the complete response.
+    ///
+    /// Suitable for smaller planning operations.  This is the default.
+    #[default]
+    OneShotAgent,
+
+    /// The Planner calls the model API directly (no agent subprocess).
+    ///
+    /// Useful when no ACP agent is needed for planning.
+    DirectApi,
+}
+
+// ── Caps config ───────────────────────────────────────────────────────────────
+
+/// Termination caps applied to every task.
+///
+/// These caps protect against runaway tasks.  All values must be ≥ 1;
+/// [`Config::validate`] enforces this.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CapsConfig {
+    /// Maximum number of gate iterations before a task is failed.
+    ///
+    /// A gate iteration is one round of: Developer finishes → gates run → at
+    /// least one gate fails → Developer is given another attempt.
+    pub gate_iterations: u32,
+
+    /// Maximum number of Reviewer feedback cycles before a task is failed.
+    ///
+    /// A reviewer iteration is one round of: Reviewer requests changes →
+    /// Developer addresses them.
+    pub reviewer_iterations: u32,
+
+    /// Per-task wall-clock limit in seconds.
+    ///
+    /// If a task is still in-progress after this many seconds it is forcibly
+    /// failed.
+    pub wall_clock_secs: u64,
+}
+
+impl Default for CapsConfig {
+    fn default() -> Self {
+        Self {
+            gate_iterations: 5,
+            reviewer_iterations: 5,
+            wall_clock_secs: 1800, // 30 minutes
+        }
+    }
+}
+
+// ── GlobalConfig ──────────────────────────────────────────────────────────────
+
+/// Returns the default concurrency (3) for serde field-level default.
+fn default_concurrency() -> usize {
+    3
+}
+
+/// User/machine-level configuration, stored at `~/.makina/config.toml`.
+///
+/// All sections are optional in the TOML file; absent sections fall back to
+/// [`Default`] implementations.  This means a completely empty global config
+/// file is valid at parse time (though it may fail [`Config::validate`] if, for
+/// example, `backend.command` remains empty and no project override supplies it).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GlobalConfig {
+    /// The ACP agent CLI to spawn for Developer and Reviewer sessions.
+    pub backend: BackendConfig,
+
+    /// **Provisional** Planner model and mechanism.  See [`PlannerConfig`].
+    pub planner: PlannerConfig,
+
+    /// Termination caps applied to all tasks unless overridden by the project.
+    pub caps: CapsConfig,
+
+    /// Maximum number of tasks that may run concurrently.
+    ///
+    /// Defaults to `3`.  Must be ≥ 1 after merging.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            backend: BackendConfig::default(),
+            planner: PlannerConfig::default(),
+            caps: CapsConfig::default(),
+            concurrency: 3,
+        }
+    }
+}
+
+impl GlobalConfig {
+    /// Parse a `GlobalConfig` from a TOML string.
+    ///
+    /// `source_label` is used only in error messages (e.g. `"~/.makina/config.toml"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] if the TOML is malformed or contains
+    /// type mismatches.
+    pub fn from_toml_str(toml: &str, source_label: &str) -> Result<Self, ConfigError> {
+        toml::from_str(toml).map_err(|e| ConfigError::Parse {
+            file: source_label.to_string(),
+            message: e.to_string(),
+        })
+    }
+}
+
+// ── ProjectConfig ─────────────────────────────────────────────────────────────
+
+/// A single gate: a shell command that must exit 0 for a task to pass.
+///
+/// Gates are toolchain-specific and therefore belong in the project config
+/// (`makina.toml`), not the global config.  They cannot be defaulted globally
+/// because the commands differ per repository/language.
+///
+/// # Example
+///
+/// ```toml
+/// [[gates]]
+/// name    = "tests"
+/// command = "cargo test --workspace"
+///
+/// [[gates]]
+/// name    = "lint"
+/// command = "cargo clippy --all-targets -- -D warnings"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct GateConfig {
+    /// Short human-readable name for the gate (e.g. `"tests"`, `"lint"`).
+    ///
+    /// Must be non-empty; [`Config::validate`] enforces this.
+    pub name: String,
+
+    /// Shell command that must exit 0.  Run in the task's working directory.
+    ///
+    /// Must be non-empty; [`Config::validate`] enforces this.
+    pub command: String,
+}
+
+/// Optional per-field overrides of [`CapsConfig`] that a project can set.
+///
+/// Only the fields present in `makina.toml` override the global values; `None`
+/// fields leave the global value unchanged.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct CapsOverride {
+    /// Override [`CapsConfig::gate_iterations`] if `Some`.
+    pub gate_iterations: Option<u32>,
+
+    /// Override [`CapsConfig::reviewer_iterations`] if `Some`.
+    pub reviewer_iterations: Option<u32>,
+
+    /// Override [`CapsConfig::wall_clock_secs`] if `Some`.
+    pub wall_clock_secs: Option<u64>,
+}
+
+/// Project-level configuration, stored at `makina.toml` in the repo root.
+///
+/// This file is typically committed to version control.  It specifies the
+/// gates (toolchain-specific pass/fail commands), the base branch, and
+/// optional overrides of global termination caps and concurrency.
+///
+/// All fields are optional in the TOML; absent fields use [`Default`].
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectConfig {
+    /// Gates that must pass for a task to be considered done.
+    ///
+    /// Evaluated in order; the first failure stops gate evaluation.
+    pub gates: Vec<GateConfig>,
+
+    /// The base branch for worktrees and pull requests.
+    ///
+    /// Defaults to `"develop"` during [`Config::resolve`] if left empty.
+    pub base_branch: String,
+
+    /// Optional per-field overrides of the global [`CapsConfig`].
+    pub caps: Option<CapsOverride>,
+
+    /// Optional override of the global `concurrency` setting.
+    pub concurrency: Option<usize>,
+}
+
+impl ProjectConfig {
+    /// Parse a `ProjectConfig` from a TOML string.
+    ///
+    /// `source_label` is used only in error messages (e.g. `"makina.toml"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] if the TOML is malformed or contains
+    /// type mismatches.
+    pub fn from_toml_str(toml: &str, source_label: &str) -> Result<Self, ConfigError> {
+        toml::from_str(toml).map_err(|e| ConfigError::Parse {
+            file: source_label.to_string(),
+            message: e.to_string(),
+        })
+    }
+}
+
+// ── Config (resolved/merged) ──────────────────────────────────────────────────
+
+/// The resolved, merged configuration used at runtime.
+///
+/// This is the type the rest of the system uses.  Obtain it via
+/// [`Config::load`] (which reads real files) or by composing
+/// [`GlobalConfig::from_toml_str`] + [`ProjectConfig::from_toml_str`] +
+/// [`Config::resolve`] + [`Config::validate`] (testable without I/O).
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// The agent backend CLI command and arguments.
+    pub backend: BackendConfig,
+
+    /// **Provisional** Planner configuration.  See [`PlannerConfig`].
+    pub planner: PlannerConfig,
+
+    /// Effective termination caps (global defaults merged with project overrides).
+    pub caps: CapsConfig,
+
+    /// Effective maximum task concurrency.
+    pub concurrency: usize,
+
+    /// Gates that must exit 0 for a task to pass.  From the project layer only.
+    pub gates: Vec<GateConfig>,
+
+    /// Base branch for worktrees and pull requests.  From the project layer.
+    pub base_branch: String,
+}
+
+impl Config {
+    /// Merge a `GlobalConfig` and a `ProjectConfig` into a resolved `Config`.
+    ///
+    /// The **project layer wins**: any `Some` field in the project's `caps`
+    /// override replaces the corresponding global value; `concurrency` is
+    /// similarly overridden if present.  `gates` and `base_branch` always come
+    /// from the project layer.
+    ///
+    /// This function does **not** validate the result; call [`Config::validate`]
+    /// after `resolve` to surface semantic errors.
+    pub fn resolve(global: GlobalConfig, project: ProjectConfig) -> Self {
+        // Merge caps: start with global, apply project overrides field-by-field.
+        let caps = if let Some(ref ov) = project.caps {
+            CapsConfig {
+                gate_iterations: ov.gate_iterations.unwrap_or(global.caps.gate_iterations),
+                reviewer_iterations: ov
+                    .reviewer_iterations
+                    .unwrap_or(global.caps.reviewer_iterations),
+                wall_clock_secs: ov.wall_clock_secs.unwrap_or(global.caps.wall_clock_secs),
+            }
+        } else {
+            global.caps.clone()
+        };
+
+        // Project concurrency wins if present.
+        let concurrency = project.concurrency.unwrap_or(global.concurrency);
+
+        // base_branch: use project value if non-empty, else default.
+        let base_branch = if project.base_branch.is_empty() {
+            "develop".to_string()
+        } else {
+            project.base_branch
+        };
+
+        Self {
+            backend: global.backend,
+            planner: global.planner,
+            caps,
+            concurrency,
+            gates: project.gates,
+            base_branch,
+        }
+    }
+
+    /// Validate the resolved config for semantic correctness.
+    ///
+    /// Checks performed:
+    ///
+    /// - `backend.command` is non-empty.
+    /// - `caps.gate_iterations` ≥ 1.
+    /// - `caps.reviewer_iterations` ≥ 1.
+    /// - `caps.wall_clock_secs` ≥ 1.
+    /// - `concurrency` ≥ 1.
+    /// - Each gate has a non-empty `name`.
+    /// - Each gate has a non-empty `command`.
+    /// - `base_branch` is non-empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] with a precise `reason` string on
+    /// the first violation found.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.backend.command.is_empty() {
+            return Err(ConfigError::Validation {
+                reason: "backend.command must not be empty".to_string(),
+            });
+        }
+
+        if self.caps.gate_iterations == 0 {
+            return Err(ConfigError::Validation {
+                reason: "caps.gate_iterations must be at least 1".to_string(),
+            });
+        }
+
+        if self.caps.reviewer_iterations == 0 {
+            return Err(ConfigError::Validation {
+                reason: "caps.reviewer_iterations must be at least 1".to_string(),
+            });
+        }
+
+        if self.caps.wall_clock_secs == 0 {
+            return Err(ConfigError::Validation {
+                reason: "caps.wall_clock_secs must be at least 1".to_string(),
+            });
+        }
+
+        if self.concurrency == 0 {
+            return Err(ConfigError::Validation {
+                reason: "concurrency must be at least 1".to_string(),
+            });
+        }
+
+        if self.base_branch.is_empty() {
+            return Err(ConfigError::Validation {
+                reason: "base_branch must not be empty".to_string(),
+            });
+        }
+
+        for (i, gate) in self.gates.iter().enumerate() {
+            if gate.name.is_empty() {
+                return Err(ConfigError::Validation {
+                    reason: format!("gates[{i}].name must not be empty"),
+                });
+            }
+            if gate.command.is_empty() {
+                return Err(ConfigError::Validation {
+                    reason: format!(
+                        "gates[{i}].command must not be empty (gate: {:?})",
+                        gate.name
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load config from explicit file paths, parse, resolve, and validate.
+    ///
+    /// Each path is optional:
+    /// - `None` → that layer uses its [`Default`].
+    /// - `Some(path)` where the file does **not exist** → that layer uses its
+    ///   [`Default`] (missing file is not an error).
+    /// - `Some(path)` where the file **exists** → parsed from TOML; I/O or
+    ///   parse errors are returned as [`ConfigError`].
+    ///
+    /// The project layer wins on merge; the result is validated before
+    /// returning.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::Io`] — file exists but could not be read.
+    /// - [`ConfigError::Parse`] — file was read but TOML is invalid.
+    /// - [`ConfigError::Validation`] — merged config fails semantic validation.
+    pub fn load(
+        global_path: Option<&Path>,
+        project_path: Option<&Path>,
+    ) -> Result<Config, ConfigError> {
+        let global = match global_path {
+            None => GlobalConfig::default(),
+            Some(path) => {
+                if path.exists() {
+                    let toml_str = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+                        path: path.display().to_string(),
+                        message: e.to_string(),
+                    })?;
+                    GlobalConfig::from_toml_str(&toml_str, &path.display().to_string())?
+                } else {
+                    GlobalConfig::default()
+                }
+            }
+        };
+
+        let project = match project_path {
+            None => ProjectConfig::default(),
+            Some(path) => {
+                if path.exists() {
+                    let toml_str = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+                        path: path.display().to_string(),
+                        message: e.to_string(),
+                    })?;
+                    ProjectConfig::from_toml_str(&toml_str, &path.display().to_string())?
+                } else {
+                    ProjectConfig::default()
+                }
+            }
+        };
+
+        let config = Config::resolve(global, project);
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Convenience wrapper that resolves the real default paths and calls
+    /// [`Config::load`].
+    ///
+    /// - Global:  `~/.makina/config.toml`
+    /// - Project: `./makina.toml` (current working directory)
+    ///
+    /// Prefer this in production entry points.  In tests, use [`Config::load`]
+    /// with explicit paths so tests don't depend on the operator's home
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::load`].
+    pub fn load_defaults() -> Result<Config, ConfigError> {
+        let global_path = home_dir().map(|h| h.join(".makina").join("config.toml"));
+        let project_path = Some(std::path::PathBuf::from("makina.toml"));
+
+        Config::load(global_path.as_deref(), project_path.as_deref())
+    }
+}
+
+/// Resolve the user's home directory via the `HOME` environment variable.
+///
+/// Returns `None` if `HOME` is unset or not valid UTF-8 (e.g. in some
+/// container environments).  In that case [`Config::load_defaults`] skips the
+/// global config file and uses defaults for the global layer.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Config loading, merging, and validation tests.
+    //!
+    //! All required acceptance-criterion tests use in-memory TOML strings; no
+    //! home-directory lookups occur in this module.
+
+    use super::*;
+
+    // ── Sample TOML strings ───────────────────────────────────────────────────
+
+    /// A complete global config.  Includes all sections.
+    const GLOBAL_TOML: &str = r#"
+        concurrency = 4
+
+        [backend]
+        command = "acp-cli"
+        args    = ["--verbose"]
+
+        [planner]
+        model     = "claude-opus-4-5"
+        mechanism = "one-shot-agent"
+
+        [caps]
+        gate_iterations     = 8
+        reviewer_iterations = 6
+        wall_clock_secs     = 3600
+    "#;
+
+    /// A project config that overrides concurrency, one cap, adds gates, and
+    /// sets a non-default base_branch.
+    const PROJECT_TOML: &str = r#"
+        base_branch = "main"
+        concurrency = 2
+
+        [[gates]]
+        name    = "build"
+        command = "cargo build --workspace"
+
+        [[gates]]
+        name    = "test"
+        command = "cargo test --workspace"
+
+        [caps]
+        gate_iterations = 10
+    "#;
+
+    // ── Merge-correctness test ────────────────────────────────────────────────
+
+    /// **Acceptance criterion — merge correctness**
+    ///
+    /// Given a global config and a project config where the project overrides
+    /// `concurrency`, one cap (`gate_iterations`), adds gates, and sets a
+    /// non-default `base_branch`, the resolved `Config` must:
+    ///
+    /// - Use the project value for overridden fields.
+    /// - Retain the global value for fields not overridden by the project.
+    #[test]
+    fn merge_project_wins_for_overridden_fields() {
+        let global =
+            GlobalConfig::from_toml_str(GLOBAL_TOML, "global").expect("global TOML is valid");
+        let project =
+            ProjectConfig::from_toml_str(PROJECT_TOML, "project").expect("project TOML is valid");
+
+        let config = Config::resolve(global, project);
+
+        // ── Project-layer fields ──────────────────────────────────────────────
+
+        // base_branch: project sets "main".
+        assert_eq!(
+            config.base_branch, "main",
+            "base_branch should be overridden by project"
+        );
+
+        // concurrency: project sets 2 (global had 4).
+        assert_eq!(
+            config.concurrency, 2,
+            "concurrency should be overridden by project"
+        );
+
+        // gate_iterations: project caps override sets 10 (global had 8).
+        assert_eq!(
+            config.caps.gate_iterations, 10,
+            "caps.gate_iterations should be overridden by project"
+        );
+
+        // gates: come from project.
+        assert_eq!(
+            config.gates.len(),
+            2,
+            "should have 2 gates from the project layer"
+        );
+        assert_eq!(config.gates[0].name, "build");
+        assert_eq!(config.gates[0].command, "cargo build --workspace");
+        assert_eq!(config.gates[1].name, "test");
+        assert_eq!(config.gates[1].command, "cargo test --workspace");
+
+        // ── Global-layer fields (not overridden) ──────────────────────────────
+
+        // reviewer_iterations: project did NOT override → keep global value 6.
+        assert_eq!(
+            config.caps.reviewer_iterations, 6,
+            "caps.reviewer_iterations should come from global config"
+        );
+
+        // wall_clock_secs: project did NOT override → keep global value 3600.
+        assert_eq!(
+            config.caps.wall_clock_secs, 3600,
+            "caps.wall_clock_secs should come from global config"
+        );
+
+        // backend: comes from global.
+        assert_eq!(
+            config.backend.command, "acp-cli",
+            "backend.command should come from global config"
+        );
+        assert_eq!(config.backend.args, vec!["--verbose"]);
+
+        // planner: comes from global.
+        assert_eq!(config.planner.model, "claude-opus-4-5");
+        assert_eq!(config.planner.mechanism, PlannerMechanism::OneShotAgent);
+
+        // Validate should pass for this fully-resolved config.
+        config
+            .validate()
+            .expect("fully-resolved sample config should be valid");
+    }
+
+    // ── Invalid-config tests ──────────────────────────────────────────────────
+
+    /// **Acceptance criterion — invalid config fails clearly (a): validation failure**
+    ///
+    /// A config with `concurrency = 0` fails [`Config::validate`] with
+    /// [`ConfigError::Validation`] and a message mentioning "concurrency".
+    #[test]
+    fn validation_fails_for_zero_concurrency() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            concurrency = 0
+
+            [backend]
+            command = "acp-cli"
+            "#,
+            "test-global",
+        )
+        .expect("TOML itself is valid");
+
+        let project = ProjectConfig::default();
+        let config = Config::resolve(global, project);
+
+        let err = config
+            .validate()
+            .expect_err("concurrency = 0 should fail validation");
+
+        assert!(
+            matches!(err, ConfigError::Validation { .. }),
+            "error should be ConfigError::Validation, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("concurrency"),
+            "error message should mention 'concurrency', got: {err}"
+        );
+    }
+
+    /// **Acceptance criterion — invalid config fails clearly (a, second case):**
+    /// empty `backend.command` fails validation with a clear message.
+    #[test]
+    fn validation_fails_for_empty_backend_command() {
+        // Global with explicitly empty command.
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            concurrency = 1
+
+            [backend]
+            command = ""
+            "#,
+            "test-global",
+        )
+        .expect("TOML itself is valid");
+
+        let project = ProjectConfig::default();
+        let config = Config::resolve(global, project);
+
+        let err = config
+            .validate()
+            .expect_err("empty backend.command should fail validation");
+
+        assert!(
+            matches!(err, ConfigError::Validation { .. }),
+            "error should be ConfigError::Validation, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("backend.command"),
+            "error message should mention 'backend.command', got: {err}"
+        );
+    }
+
+    /// **Acceptance criterion — invalid config fails clearly (b): malformed TOML**
+    ///
+    /// Passing a syntactically invalid TOML string to
+    /// [`GlobalConfig::from_toml_str`] returns [`ConfigError::Parse`].
+    #[test]
+    fn parse_error_for_malformed_global_toml() {
+        let bad_toml = "this is not valid = = toml!!!";
+
+        let err = GlobalConfig::from_toml_str(bad_toml, "test-global")
+            .expect_err("malformed TOML should return an error");
+
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "error should be ConfigError::Parse, got: {err:?}"
+        );
+        // The error message should identify the source.
+        assert!(
+            err.to_string().contains("test-global"),
+            "error message should contain the source label, got: {err}"
+        );
+    }
+
+    /// Malformed project TOML also returns [`ConfigError::Parse`].
+    #[test]
+    fn parse_error_for_malformed_project_toml() {
+        let bad_toml = "[gates\nname = broken";
+
+        let err = ProjectConfig::from_toml_str(bad_toml, "makina.toml")
+            .expect_err("malformed TOML should return an error");
+
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "error should be ConfigError::Parse"
+        );
+        assert!(
+            err.to_string().contains("makina.toml"),
+            "error should name the source file"
+        );
+    }
+
+    /// An empty gate command fails validation with a message naming the gate.
+    #[test]
+    fn validation_fails_for_gate_with_empty_command() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            concurrency = 1
+            [backend]
+            command = "acp-cli"
+            "#,
+            "test-global",
+        )
+        .expect("valid");
+
+        let project = ProjectConfig::from_toml_str(
+            r#"
+            [[gates]]
+            name    = "my-gate"
+            command = ""
+            "#,
+            "test-project",
+        )
+        .expect("valid TOML");
+
+        let config = Config::resolve(global, project);
+        let err = config
+            .validate()
+            .expect_err("gate with empty command should fail");
+
+        assert!(
+            matches!(err, ConfigError::Validation { .. }),
+            "should be a validation error"
+        );
+        assert!(
+            err.to_string().contains("command"),
+            "error should mention 'command'"
+        );
+    }
+
+    // ── Default-value tests ───────────────────────────────────────────────────
+
+    /// Defaults from both layers produce sane initial values.
+    #[test]
+    fn default_caps_are_within_expected_range() {
+        let caps = CapsConfig::default();
+        assert_eq!(caps.gate_iterations, 5);
+        assert_eq!(caps.reviewer_iterations, 5);
+        assert_eq!(caps.wall_clock_secs, 1800);
+    }
+
+    /// Global default concurrency is 3.
+    #[test]
+    fn default_concurrency_is_three() {
+        // An empty global TOML parses to defaults.
+        let global = GlobalConfig::from_toml_str("", "empty").expect("empty TOML is valid");
+        assert_eq!(global.concurrency, 3);
+    }
+
+    /// Project default base_branch falls back to "develop" during resolve.
+    #[test]
+    fn default_base_branch_is_develop() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+            "#,
+            "g",
+        )
+        .expect("valid");
+        let project = ProjectConfig::from_toml_str("", "p").expect("empty project TOML is valid");
+
+        let config = Config::resolve(global, project);
+        assert_eq!(
+            config.base_branch, "develop",
+            "empty project base_branch should fall back to 'develop'"
+        );
+    }
+
+    // ── load() with temp files ────────────────────────────────────────────────
+
+    /// **Nice-to-have:** `Config::load` with a missing global path falls back
+    /// to global defaults and uses the project file.
+    #[test]
+    fn load_missing_global_falls_back_to_defaults() {
+        use std::io::Write;
+
+        // Write a valid project config to a temp file.
+        let mut project_file = tempfile::NamedTempFile::new().expect("should create temp file");
+        write!(
+            project_file,
+            r#"
+            base_branch = "feature"
+
+            [[gates]]
+            name    = "check"
+            command = "cargo check"
+
+            [caps]
+            gate_iterations = 3
+            "#
+        )
+        .expect("write project TOML");
+
+        // Point global_path at a file that definitely does not exist.
+        let nonexistent_global = std::path::Path::new("/tmp/__makina_does_not_exist_config.toml");
+
+        let result = Config::load(Some(nonexistent_global), Some(project_file.path()));
+        // Should fail validation because backend.command is empty (global default).
+        // This confirms the missing-global fallback occurred without error, and
+        // the validation error is the only problem.
+        match result {
+            Err(ConfigError::Validation { reason }) => {
+                assert!(
+                    reason.contains("backend.command"),
+                    "validation should fail on empty backend.command, got: {reason}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    /// `Config::load` with both paths missing returns validation error (empty
+    /// backend command from all-defaults).
+    #[test]
+    fn load_both_missing_returns_defaults_then_validation_error() {
+        let nonexistent_global = std::path::Path::new("/tmp/__makina_no_global.toml");
+        let nonexistent_project = std::path::Path::new("/tmp/__makina_no_project.toml");
+
+        let result = Config::load(Some(nonexistent_global), Some(nonexistent_project));
+        match result {
+            Err(ConfigError::Validation { reason }) => {
+                assert!(reason.contains("backend.command"), "{reason}");
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+}
