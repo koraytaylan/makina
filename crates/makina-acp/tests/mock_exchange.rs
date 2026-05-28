@@ -37,6 +37,7 @@ async fn full_handshake_and_streamed_prompt_response() {
         chunks: vec!["The ".into(), "answer ".into(), "is ".into(), "42.".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
@@ -81,6 +82,7 @@ async fn non_text_updates_are_ignored_during_turn() {
         chunks: vec!["clean ".into(), "text".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 3,
+        ..MockBehavior::default()
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
@@ -107,6 +109,7 @@ async fn two_sequential_turns_on_one_session() {
         chunks: vec!["pong".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 

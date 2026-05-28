@@ -15,3 +15,4 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 tokio-stream = { workspace = true }
+tracing = { workspace = true }

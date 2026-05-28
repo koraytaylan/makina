@@ -78,5 +78,5 @@ pub mod transport;
 pub use backend::{AcpBackend, AcpSession};
 pub use client::{AcpClient, AcpCommand, AcpResponseChunk, PromptStream};
 pub use error::{AcpError, Result};
-pub use protocol::StopReason;
+pub use protocol::{AuthMethod, StopReason};
 pub use transport::{Transport, TransportSender};

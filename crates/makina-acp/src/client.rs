@@ -38,8 +38,8 @@ use tokio::process::{Child, Command};
 
 use crate::error::{AcpError, Result};
 use crate::protocol::{
-    self, ContentBlock, Implementation, InitializeParams, InitializeResult, NewSessionParams,
-    NewSessionResult, PromptParams, PromptResult, SessionUpdate, StopReason,
+    self, AuthMethod, ContentBlock, Implementation, InitializeParams, InitializeResult,
+    NewSessionParams, NewSessionResult, PromptParams, PromptResult, SessionUpdate, StopReason,
 };
 use crate::transport::Transport;
 
@@ -137,6 +137,11 @@ pub struct AcpClient {
     protocol_version: u16,
     /// Agent name/version from `initialize`, if provided.
     agent_info: Option<Implementation>,
+    /// Authentication methods advertised by the agent in the `initialize` response.
+    ///
+    /// Retained for observability (Zed model: Makina never calls `authenticate`).
+    /// An empty list means the agent requires no auth or is already authenticated.
+    auth_methods: Vec<AuthMethod>,
     /// Set once [`shutdown`](Self::shutdown) has run, to make it idempotent.
     closed: bool,
 }
@@ -150,6 +155,7 @@ impl std::fmt::Debug for AcpClient {
             .field("session_id", &self.session_id)
             .field("protocol_version", &self.protocol_version)
             .field("agent_info", &self.agent_info)
+            .field("auth_methods_count", &self.auth_methods.len())
             .field("closed", &self.closed)
             .finish()
     }
@@ -199,6 +205,7 @@ impl AcpClient {
             session_id: String::new(),
             protocol_version: 0,
             agent_info: None,
+            auth_methods: Vec::new(),
             closed: false,
         }
     }
@@ -222,6 +229,18 @@ impl AcpClient {
             .map_err(|e| AcpError::protocol(format!("invalid initialize result: {e}")))?;
         self.protocol_version = init.protocol_version;
         self.agent_info = init.agent_info;
+        self.auth_methods = init.auth_methods;
+        // Log advertised auth methods so operators can verify the Zed model is
+        // working: a signed-in CLI typically advertises no methods or just notes
+        // the mechanism it already used.
+        if self.auth_methods.is_empty() {
+            tracing::debug!(
+                "ACP initialize: agent advertises no authMethods (already authenticated or auth-free)"
+            );
+        } else {
+            let kinds: Vec<&str> = self.auth_methods.iter().map(|m| m.kind.as_str()).collect();
+            tracing::debug!(?kinds, "ACP initialize: agent advertises authMethods");
+        }
 
         // 2. session/new — create the session in the requested working dir.
         let new_session_params = NewSessionParams {
@@ -252,6 +271,31 @@ impl AcpClient {
     /// The agent's reported name/version, if it sent any.
     pub fn agent_info(&self) -> Option<&Implementation> {
         self.agent_info.as_ref()
+    }
+
+    /// The authentication methods the agent advertised in the `initialize` response.
+    ///
+    /// This is an observability accessor only. Per the **Zed auth-inheritance model**,
+    /// Makina **never calls the ACP `authenticate` method** — the agent CLI is expected
+    /// to already be signed in via its own flow (e.g. `gemini` oauth, `claude` login)
+    /// before Makina spawns it. Makina then inherits the CLI's session via the inherited
+    /// environment; no credentials are passed through Makina.
+    ///
+    /// An empty slice means the agent requires no explicit auth or is already
+    /// authenticated. A non-empty slice is diagnostic information; operators should
+    /// sign the CLI in via its own flow (e.g. `gemini auth login`) rather than
+    /// expecting Makina to drive an auth flow.
+    ///
+    /// # Misconfiguration signal
+    ///
+    /// If the agent surfaces an error during `initialize` or `session/prompt` that
+    /// suggests it is not authenticated, check that the CLI is signed in independently
+    /// (`gemini auth login`, `claude` login, etc.) and re-run. The error will surface
+    /// as [`AcpError::Rpc`] or [`AcpError::AgentExited`]; the agent's stderr (forwarded
+    /// to this process's stderr as `[acp-agent] …` lines) typically contains the
+    /// human-readable reason.
+    pub fn auth_methods(&self) -> &[crate::protocol::AuthMethod] {
+        &self.auth_methods
     }
 
     /// Send `text` as a single user turn and return an incremental stream of

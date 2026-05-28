@@ -76,6 +76,7 @@ async fn prompt_round_trips_through_the_trait() {
         chunks: vec!["The ".into(), "answer ".into(), "is ".into(), "42.".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     // Drive everything through the trait object.
     let mut session = session_over_mock(behavior, "").await;
@@ -105,6 +106,7 @@ async fn non_text_updates_are_skipped_behind_the_trait() {
         chunks: vec!["clean ".into(), "text".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 3,
+        ..MockBehavior::default()
     };
     let mut session = session_over_mock(behavior, "").await;
 
@@ -125,6 +127,7 @@ async fn two_sequential_turns_through_the_trait() {
         chunks: vec!["pong".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     let mut session = session_over_mock(behavior, "").await;
 
@@ -256,6 +259,7 @@ async fn early_drop_of_response_stream_reclaims_client() {
         chunks: (0..100).map(|i| format!("chunk-{i} ")).collect(),
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     let mut session = session_over_mock(behavior, "").await;
 
@@ -290,6 +294,7 @@ async fn prompt_after_early_drop_still_works() {
         chunks: vec!["a ".into(), "b ".into(), "c".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     let mut session = session_over_mock(behavior, "").await;
 
@@ -317,6 +322,7 @@ async fn system_prompt_is_prepended_to_first_turn_only() {
         chunks: vec!["ok".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     let (reader, writer, _mock) = spawn_mock_agent_recording(behavior, Arc::clone(&log));
     let client = AcpClient::with_transport(reader, writer, "/tmp/repo")
@@ -350,6 +356,7 @@ async fn empty_system_prompt_adds_no_prelude() {
         chunks: vec!["ok".into()],
         stop_reason: "end_turn".into(),
         leading_noise_updates: 0,
+        ..MockBehavior::default()
     };
     let (reader, writer, _mock) = spawn_mock_agent_recording(behavior, Arc::clone(&log));
     let client = AcpClient::with_transport(reader, writer, "/tmp/repo")

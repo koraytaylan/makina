@@ -46,6 +46,9 @@ tokio-stream = "0.1"
 # Derive-based error types
 thiserror = "2.0"
 
+# Structured logging / diagnostics
+tracing = "0.1"
+
 # Internal crates
 makina-core = { path = "crates/makina-core" }
 makina-acp = { path = "crates/makina-acp" }

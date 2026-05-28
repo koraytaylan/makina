@@ -232,6 +232,33 @@ pub struct InitializeResult {
     /// Agent name/version, if provided.
     #[serde(default)]
     pub agent_info: Option<Implementation>,
+    /// Authentication methods advertised by the agent.
+    ///
+    /// Per the Zed model, Makina **never calls the ACP `authenticate` method** —
+    /// the CLI must already be signed in via its own flow before Makina spawns
+    /// it. This field is retained for observability: it lets callers log what
+    /// auth the agent uses and detect misconfigured (un-authenticated) agents
+    /// early. An empty list means the agent requires no auth or is already
+    /// authenticated.
+    #[serde(default)]
+    pub auth_methods: Vec<AuthMethod>,
+}
+
+/// An authentication method advertised in the `initialize` response.
+///
+/// The ACP spec allows an extensible set of auth method descriptors. Makina
+/// surfaces the raw `type` string (camelCase, e.g. `"oauth"`, `"apiKey"`) and
+/// preserves the rest of the fields as unstructured JSON for forward
+/// compatibility. Callers MUST NOT use this to drive an auth flow; it is for
+/// logging and diagnostics only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthMethod {
+    /// The auth method type identifier (e.g. `"oauth"`, `"apiKey"`).
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    /// Any additional fields in the auth-method descriptor — preserved opaquely.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// `session/new` params (client → agent).
@@ -481,6 +508,47 @@ mod tests {
         let r: InitializeResult = serde_json::from_value(v).unwrap();
         assert_eq!(r.protocol_version, 1);
         assert_eq!(r.agent_info.unwrap().name, "claude-code-acp");
+        assert!(
+            r.auth_methods.is_empty(),
+            "empty authMethods should parse as empty vec"
+        );
+    }
+
+    #[test]
+    fn initialize_result_parses_auth_methods() {
+        // Agents may advertise one or more auth methods; each carries at least a type.
+        let v = serde_json::json!({
+            "protocolVersion": 1,
+            "authMethods": [
+                { "type": "oauth", "authorizationUrl": "https://example.com/auth" },
+                { "type": "apiKey" }
+            ],
+            "agentInfo": { "name": "test-agent", "version": "0.1.0" }
+        });
+        let r: InitializeResult = serde_json::from_value(v).unwrap();
+        assert_eq!(r.auth_methods.len(), 2);
+        assert_eq!(r.auth_methods[0].kind, "oauth");
+        assert_eq!(
+            r.auth_methods[0]
+                .extra
+                .get("authorizationUrl")
+                .and_then(|v| v.as_str()),
+            Some("https://example.com/auth")
+        );
+        assert_eq!(r.auth_methods[1].kind, "apiKey");
+    }
+
+    #[test]
+    fn initialize_result_without_auth_methods_defaults_to_empty() {
+        // Older agents may omit authMethods entirely; the default must be an empty vec.
+        let v = serde_json::json!({
+            "protocolVersion": 1
+        });
+        let r: InitializeResult = serde_json::from_value(v).unwrap();
+        assert!(
+            r.auth_methods.is_empty(),
+            "missing authMethods field must default to an empty vec"
+        );
     }
 
     #[test]

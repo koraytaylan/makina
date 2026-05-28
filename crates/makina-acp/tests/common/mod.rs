@@ -45,6 +45,12 @@ pub struct MockBehavior {
     /// If set, the mock injects this many non-text updates (a tool-call update)
     /// before the text chunks, to prove the client ignores them.
     pub leading_noise_updates: usize,
+    /// Authentication methods advertised in the `initialize` response.
+    ///
+    /// Each entry is a `{ "type": "…", … }` JSON object, mirroring the ACP wire
+    /// format. Defaults to a single `oauth` method so the Zed-model test can
+    /// assert that `AcpClient::auth_methods()` returns a non-empty slice.
+    pub auth_methods: Vec<Value>,
 }
 
 impl Default for MockBehavior {
@@ -54,6 +60,8 @@ impl Default for MockBehavior {
             chunks: vec!["Hello".into(), ", ".into(), "world!".into()],
             stop_reason: "end_turn".to_string(),
             leading_noise_updates: 0,
+            // Default: advertise one auth method so tests can assert observability.
+            auth_methods: vec![json!({ "type": "oauth" })],
         }
     }
 }
@@ -128,7 +136,7 @@ async fn run_mock<R, W>(
                         "result": {
                             "protocolVersion": 1,
                             "agentCapabilities": {},
-                            "authMethods": [],
+                            "authMethods": behavior.auth_methods,
                             "agentInfo": { "name": "mock-acp-agent", "version": "0.0.1" }
                         }
                     }),
