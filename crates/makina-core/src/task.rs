@@ -77,7 +77,7 @@ impl std::fmt::Display for TaskId {
 /// # Default
 ///
 /// A freshly created task begins in [`TaskState::New`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskState {
     /// Registered in the graph; one or more `depends_on` prerequisites have not
