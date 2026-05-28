@@ -66,9 +66,11 @@ done-field      = "- **Done when:** " done-text
 done-text       = TEXT (newline SPACE SPACE TEXT)* (* continuation allowed *)
 
 em-dash         = "—"   (* Unicode U+2014 *)
-kebab-id        = [a-z] ([a-z0-9] | "-")* [a-z0-9]
-                  (* lowercase letters, digits, hyphens; must start/end with
-                     a lowercase letter or digit; minimum 2 characters *)
+kebab-id        = [a-z0-9] ("-"? [a-z0-9])* 
+                  (* one or more segments of [a-z0-9]+ joined by single hyphens;
+                     consecutive hyphens are not permitted;
+                     must start and end with a lowercase letter or digit;
+                     minimum 2 characters *)
 ```
 
 > **Note on soft-wrapping.** In TASKS.md the `Depends on` line for tasks with multiple dependencies wraps naturally at the column limit. The Planner treats any text after `**Depends on:**` up to — but not including — the next `**Done when:**` bullet as part of the dependency value. Comma-separated ids that appear on the wrapped portion of the line are still part of the same field.
@@ -76,7 +78,7 @@ kebab-id        = [a-z] ([a-z0-9] | "-")* [a-z0-9]
 ### 3.2 Document-level rules
 
 1. **Title (H1):** Exactly one `# …` heading at the top of the file. Required.
-2. **Preamble:** Free-form paragraphs and/or bullet lists between the title and the first `---` separator. Required; must include a `**Conventions**` block that restates (or defers to) the semantics in §6.
+2. **Preamble:** Free-form paragraphs and/or bullet lists between the title and the first `---` separator. Required. Authors SHOULD include a `**Conventions**` block that restates (or defers to) the semantics in §6; its absence is a lint warning, not a parser error.
 3. **Section separators:** A `---` rule appears *between* sections (i.e., after all tasks in a section and before the next `## …` heading). The **final section has no trailing separator**.
 4. **Section order:** Sections are ordered by their four-digit numeric id, ascending.
 5. **Task order within a section:** Tasks appear in the order the author judges appropriate for narrative clarity. No ordering constraint is enforced by this spec.
@@ -111,13 +113,14 @@ A **task id** is the stable, kebab-case identifier for a task.
 |----------|------|
 | Character set | Lowercase ASCII letters (`a–z`), digits (`0–9`), hyphens (`-`) |
 | Start / end | Must start and end with a lowercase letter or digit (not a hyphen) |
+| Consecutive hyphens | Prohibited; each hyphen must be surrounded by `[a-z0-9]` segments |
 | Minimum length | 2 characters |
 | Case | Always lowercase; no uppercase letters |
 | Uniqueness | Must be unique across **all sections of all task-list files** in the project |
 | Stability | Once published, a task id must not be renamed (it becomes the branch name `task/{id}` and worktree path `.worktrees/{id}/`) |
 
 Examples of valid ids: `workspace-scaffold`, `task-model`, `e2e-run`  
-Examples of invalid ids: `WorkspaceScaffold` (uppercase), `-task` (leading hyphen), `t` (single character), `task--model` (double hyphen is technically valid per the grammar but discouraged)
+Examples of invalid ids: `WorkspaceScaffold` (uppercase), `-task` (leading hyphen), `t` (single character), `task--model` (consecutive hyphens are prohibited)
 
 ---
 
@@ -233,13 +236,13 @@ tests.
 |------|---------------------|
 | H1 title | Line 1 |
 | Preamble with `**Conventions**` block | Lines 3–10 |
-| `---` separator between sections | Lines 12 and 26 |
-| Section heading `## NNNN — Title` | Lines 14, 28 |
-| Task heading `### {id} — {title}` | Lines 16, 21, 30 |
-| `Depends on: —` (no dependencies) | Line 19 |
+| `---` separator between sections | Lines 12 and 27 |
+| Section heading `## NNNN — Title` | Lines 14, 29 |
+| Task heading `### {id} — {title}` | Lines 16, 22, 31 |
+| `Depends on: —` (no dependencies) | Line 18 |
 | Single dependency | Line 24 |
 | Multiple dependencies | Line 34 |
-| Soft-wrapped `Done when` | Lines 18–20 |
+| Soft-wrapped `Done when` | Lines 19–20 |
 | No trailing separator after last section | (absent after `## 0002`) |
 
 ---
@@ -252,7 +255,7 @@ A reviewer (human or automated) verifies conformance by checking each item.
 
 - [ ] Exactly one H1 (`# …`) title at the top.
 - [ ] Preamble present between the title and the first `---`.
-- [ ] Preamble includes a `**Conventions**` block.
+- [ ] (Lint) Preamble includes a `**Conventions**` block (recommended, not required).
 - [ ] Sections are separated by `---` rules (no trailing `---` after the last section).
 - [ ] Section ids are four-digit, zero-padded, and appear in ascending order.
 
@@ -264,7 +267,7 @@ A reviewer (human or automated) verifies conformance by checking each item.
 ### 8.3 Task level
 
 - [ ] Each task heading matches `### {task-id} — {title}`.
-- [ ] `{task-id}` is kebab-case (lowercase, no leading/trailing hyphen).
+- [ ] `{task-id}` is kebab-case (lowercase, no leading/trailing hyphen, no consecutive hyphens).
 - [ ] Each task id is unique across all sections.
 - [ ] At least one description paragraph is present.
 - [ ] `- **Depends on:**` field is present; value is `—` or a comma-separated list of valid task ids.
