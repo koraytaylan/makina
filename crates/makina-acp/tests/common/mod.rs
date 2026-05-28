@@ -16,12 +16,22 @@
 
 #![allow(dead_code)]
 
+use std::sync::{Arc, Mutex};
+
 use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf,
     WriteHalf,
 };
 use tokio::task::JoinHandle;
+
+/// Shared, thread-safe recorder of the prompt texts the mock agent received.
+///
+/// Cloning shares the same underlying buffer (it is an `Arc`), so a test can
+/// hand one clone to [`spawn_mock_agent_recording`] and keep another to read
+/// back what the client sent. Used by the task-15 backend tests to verify the
+/// system-prompt prepend end-to-end through the trait.
+pub type PromptLog = Arc<Mutex<Vec<String>>>;
 
 /// How the mock agent should behave for the single `session/prompt` it answers.
 #[derive(Clone)]
@@ -63,13 +73,38 @@ pub fn spawn_mock_agent(
     let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
     let (client_read, client_write) = tokio::io::split(client_io);
     let (peer_read, peer_write) = tokio::io::split(peer_io);
-    let handle = tokio::spawn(run_mock(peer_read, peer_write, behavior));
+    let handle = tokio::spawn(run_mock(peer_read, peer_write, behavior, None));
     (client_read, client_write, handle)
 }
 
-/// The mock agent's protocol loop.
-async fn run_mock<R, W>(reader: R, mut writer: W, behavior: MockBehavior)
-where
+/// Like [`spawn_mock_agent`], but every `session/prompt`'s text content block is
+/// appended (in order) to `log`.
+///
+/// Lets a test assert *what* the client actually sent — e.g. that the task-15
+/// backend prepends the system prompt only to the first turn.
+pub fn spawn_mock_agent_recording(
+    behavior: MockBehavior,
+    log: PromptLog,
+) -> (
+    ReadHalf<DuplexStream>,
+    WriteHalf<DuplexStream>,
+    JoinHandle<()>,
+) {
+    let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let (peer_read, peer_write) = tokio::io::split(peer_io);
+    let handle = tokio::spawn(run_mock(peer_read, peer_write, behavior, Some(log)));
+    (client_read, client_write, handle)
+}
+
+/// The mock agent's protocol loop. When `prompt_log` is `Some`, each
+/// `session/prompt`'s concatenated text content is recorded into it.
+async fn run_mock<R, W>(
+    reader: R,
+    mut writer: W,
+    behavior: MockBehavior,
+    prompt_log: Option<PromptLog>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -116,6 +151,22 @@ where
                     .as_str()
                     .unwrap_or("")
                     .to_string();
+
+                // Record the sent prompt text (concatenation of text blocks) if
+                // a log was supplied.
+                if let Some(log) = &prompt_log {
+                    let mut sent = String::new();
+                    if let Some(blocks) = req["params"]["prompt"].as_array() {
+                        for block in blocks {
+                            if block["type"] == "text"
+                                && let Some(t) = block["text"].as_str()
+                            {
+                                sent.push_str(t);
+                            }
+                        }
+                    }
+                    log.lock().expect("mock prompt log poisoned").push(sent);
+                }
 
                 // Optional leading non-text updates the client must ignore.
                 for n in 0..behavior.leading_noise_updates {

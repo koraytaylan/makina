@@ -11,11 +11,12 @@
 //!
 //! # Scope
 //!
-//! This is the **low-level client only** (Task 13 — `acp-client`). It does *not*
-//! implement `makina_core::backend::AgentBackend`; that adapter is Task 15
-//! (`acp-backend-impl`), which wraps [`AcpClient`]. Credential handling is
-//! deliberately **out of scope** (the Zed model: the CLI is already signed in and
-//! Makina inherits its environment — see [`AcpCommand`]).
+//! This crate provides both the **low-level client** (Task 13 — `acp-client`,
+//! [`AcpClient`]) and the **`makina-core` backend adapter** (Task 15 —
+//! `acp-backend-impl`, [`AcpBackend`] / [`AcpSession`] in [`backend`]) that maps
+//! the client onto `makina_core::backend::AgentBackend` / `AgentSession`.
+//! Credential handling is deliberately **out of scope** (the Zed model: the CLI
+//! is already signed in and Makina inherits its environment — see [`AcpCommand`]).
 //!
 //! # Protocol subset
 //!
@@ -68,11 +69,13 @@
 //! mock agent over a [`tokio::io::duplex`] pipe — no real CLI required (see the
 //! crate's integration tests).
 
+pub mod backend;
 pub mod client;
 pub mod error;
 pub mod protocol;
 pub mod transport;
 
+pub use backend::{AcpBackend, AcpSession};
 pub use client::{AcpClient, AcpCommand, AcpResponseChunk, PromptStream};
 pub use error::{AcpError, Result};
 pub use protocol::StopReason;

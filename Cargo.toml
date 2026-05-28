@@ -38,6 +38,11 @@ async-trait = "0.1"
 # Stream / futures combinators — provides the Stream trait used in ResponseStream
 futures = "0.3"
 
+# tokio-stream — `ReceiverStream` adapts a tokio mpsc receiver into a `Stream`
+# (used by the ACP backend to bridge a borrowing PromptStream to an owned
+# ResponseStream over an mpsc channel).
+tokio-stream = "0.1"
+
 # Derive-based error types
 thiserror = "2.0"
 
