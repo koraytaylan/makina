@@ -118,12 +118,13 @@ Lifecycle diagram (from [`task.rs`](../../crates/makina-core/src/task.rs) module
 
 ```
 new ──► ready ──► in-progress ──► in-review ──► done
-                                      │
-                            (changes requested)
-                                      │
-                                      ▼
-                            back to in-progress
-                                  (or failed)
+                      │  ▲            │
+                      │  └────────────┘
+                      │  (changes requested: in-review → in-progress)
+                      │
+                      ▼
+                   failed  ◄── in-progress  (gate-cap reached / hard error)
+                   failed  ◄── in-review    (review-cap reached)
 ```
 
 State-transition logic lives in the `task-state-machine` task; this document specifies the state **values** only.

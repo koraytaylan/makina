@@ -17,7 +17,7 @@ fn sample_artifact_deserializes() {
         .expect("sample-run.tasks.json must deserialize into TaskGraph");
 
     assert_eq!(graph.slug, "sample-run", "slug must match file stem");
-    assert_eq!(graph.tasks.len(), 4, "sample must contain exactly 4 tasks");
+    assert_eq!(graph.tasks.len(), 5, "sample must contain exactly 5 tasks");
 }
 
 /// `TaskGraph::validate()` must return `Ok` for the sample artifact.
@@ -37,19 +37,19 @@ fn sample_artifact_passes_validate() {
 fn in_progress_task_has_correct_state_and_gate_iterations() {
     let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
 
-    let task_model_id = TaskId::new("task-model");
+    let id = TaskId::new("agent-backend-trait");
     let task = graph
-        .get(&task_model_id)
-        .expect("task-model must be present in the sample");
+        .get(&id)
+        .expect("agent-backend-trait must be present in the sample");
 
     assert_eq!(
         task.state,
         TaskState::InProgress,
-        "task-model state must be InProgress"
+        "agent-backend-trait state must be InProgress"
     );
     assert!(
         task.gate_iterations > 0,
-        "task-model gate_iterations must be > 0 in the sample"
+        "agent-backend-trait gate_iterations must be > 0 in the sample"
     );
 }
 
@@ -58,22 +58,20 @@ fn in_progress_task_has_correct_state_and_gate_iterations() {
 fn depends_on_edge_resolves_via_get() {
     let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
 
-    // `runtime-artifact-schema` depends on `task-model`.
-    let ras_id = TaskId::new("runtime-artifact-schema");
-    let ras = graph
-        .get(&ras_id)
-        .expect("runtime-artifact-schema must be present");
+    // `core-api-surface` depends on `workspace-scaffold`.
+    let id = TaskId::new("core-api-surface");
+    let task = graph.get(&id).expect("core-api-surface must be present");
 
     assert!(
-        !ras.depends_on.is_empty(),
-        "runtime-artifact-schema must have at least one dependency"
+        !task.depends_on.is_empty(),
+        "core-api-surface must have at least one dependency"
     );
 
-    for dep_id in &ras.depends_on {
+    for dep_id in &task.depends_on {
         let resolved = graph.get(dep_id);
         assert!(
             resolved.is_some(),
-            "dependency '{dep_id}' of runtime-artifact-schema must resolve in the graph"
+            "dependency '{dep_id}' of core-api-surface must resolve in the graph"
         );
     }
 }
@@ -127,18 +125,68 @@ fn optional_fields_absent_on_new_task() {
 fn ready_task_has_correct_state_and_no_started_at() {
     let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
 
-    let id = TaskId::new("runtime-artifact-schema");
-    let task = graph
-        .get(&id)
-        .expect("runtime-artifact-schema must be present");
+    let id = TaskId::new("core-api-surface");
+    let task = graph.get(&id).expect("core-api-surface must be present");
 
     assert_eq!(
         task.state,
         TaskState::Ready,
-        "runtime-artifact-schema must be Ready"
+        "core-api-surface must be Ready"
     );
     assert!(
         task.started_at.is_none(),
         "ready task must not yet have started_at"
+    );
+}
+
+/// The `ready` rule holds: every `ready` task has all deps in `done` state.
+#[test]
+fn ready_tasks_have_all_deps_done() {
+    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
+
+    for task in &graph.tasks {
+        if task.state == TaskState::Ready {
+            for dep_id in &task.depends_on {
+                let dep = graph.get(dep_id).expect("dependency must resolve in graph");
+                assert_eq!(
+                    dep.state,
+                    TaskState::Done,
+                    "ready task '{}' has dep '{}' in state {:?}, expected Done",
+                    task.id,
+                    dep_id,
+                    dep.state
+                );
+            }
+        }
+    }
+}
+
+/// The diamond dependency: `planner-actor` depends on both `task-model` and
+/// `core-api-surface`; since `core-api-surface` is `ready` (not `done`),
+/// `planner-actor` correctly remains `new`.
+#[test]
+fn diamond_dep_keeps_planner_actor_new() {
+    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
+
+    let id = TaskId::new("planner-actor");
+    let task = graph.get(&id).expect("planner-actor must be present");
+
+    assert_eq!(task.state, TaskState::New, "planner-actor must be New");
+    assert_eq!(
+        task.depends_on.len(),
+        2,
+        "planner-actor must have exactly 2 dependencies (diamond)"
+    );
+
+    // Confirm at least one dep is not done (which is why it stays new).
+    let any_not_done = task.depends_on.iter().any(|dep_id| {
+        graph
+            .get(dep_id)
+            .map(|d| d.state != TaskState::Done)
+            .unwrap_or(false)
+    });
+    assert!(
+        any_not_done,
+        "planner-actor should have at least one dep not yet done, keeping it new"
     );
 }

@@ -7,7 +7,7 @@
       "description": "Set up the Cargo workspace with the initial crate layout, .gitignore, and CI configuration.",
       "done_when": "cargo build passes from the workspace root and CI is green.",
       "depends_on": [],
-      "section": "0001",
+      "section": "0002",
       "state": "done",
       "gate_iterations": 0,
       "review_iterations": 0,
@@ -24,23 +24,40 @@
       "depends_on": [
         "workspace-scaffold"
       ],
+      "section": "0003",
+      "state": "done",
+      "gate_iterations": 1,
+      "review_iterations": 0,
+      "created_at": "2026-05-01T09:00:00Z",
+      "updated_at": "2026-05-03T11:00:00Z",
+      "started_at": "2026-05-02T08:00:00Z",
+      "finished_at": "2026-05-03T11:00:00Z"
+    },
+    {
+      "id": "agent-backend-trait",
+      "title": "Agent backend trait",
+      "description": "Define the AgentBackend async trait that abstracts over LLM provider integrations, with a mock implementation for testing.",
+      "done_when": "The AgentBackend trait is defined, a MockBackend is provided, and unit tests pass against it.",
+      "depends_on": [
+        "workspace-scaffold"
+      ],
       "section": "0002",
       "state": "in-progress",
       "gate_iterations": 2,
       "review_iterations": 1,
       "created_at": "2026-05-01T09:00:00Z",
-      "updated_at": "2026-05-03T11:00:00Z",
-      "started_at": "2026-05-02T08:00:00Z"
+      "updated_at": "2026-05-04T09:30:00Z",
+      "started_at": "2026-05-03T08:00:00Z"
     },
     {
-      "id": "runtime-artifact-schema",
-      "title": "Runtime artifact schema doc and sample",
-      "description": "Document the .tasks/{slug}.json JSON schema, produce a canonical sample artifact, and add a validation integration test.",
-      "done_when": "The schema is documented at docs/spec/runtime-artifact-schema.md, a sample artifact exists at docs/spec/examples/sample-run.tasks.json, and an integration test loads the sample, deserializes it into TaskGraph, and asserts validate() is Ok.",
+      "id": "core-api-surface",
+      "title": "Core API surface",
+      "description": "Expose the stable public API for makina-core: re-export key types, write doc-tests, and publish a crate-level lib.rs documentation comment.",
+      "done_when": "cargo doc --no-deps builds without warnings and the public API surface is documented.",
       "depends_on": [
-        "task-model"
+        "workspace-scaffold"
       ],
-      "section": "0004",
+      "section": "0002",
       "state": "ready",
       "gate_iterations": 0,
       "review_iterations": 0,
@@ -53,8 +70,8 @@
       "description": "Implement the Planner kameo actor that reads a structured-text task list, infers dependency edges, and writes the initial .tasks/{slug}.json artifact.",
       "done_when": "Given a well-formed TASKS.md, the Planner actor produces a valid .tasks/{slug}.json that passes TaskGraph::validate().",
       "depends_on": [
-        "runtime-artifact-schema",
-        "task-model"
+        "task-model",
+        "core-api-surface"
       ],
       "state": "new",
       "gate_iterations": 0,
