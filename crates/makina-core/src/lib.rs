@@ -8,3 +8,4 @@
 pub mod api;
 pub mod backend;
 pub mod supervision;
+pub mod task;

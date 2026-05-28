@@ -26,6 +26,12 @@ serde = { version = "1.0", features = ["derive"] }
 # Config / data format
 toml = "1.1"
 
+# JSON serialization (artifact format for .tasks/*.json)
+serde_json = "1.0"
+
+# Date/time with serde support (RFC3339 timestamps in task artifacts)
+chrono = { version = "0.4", features = ["serde"] }
+
 # Object-safe async traits (needed for Box<dyn AgentBackend> / Box<dyn AgentSession>)
 async-trait = "0.1"
 
