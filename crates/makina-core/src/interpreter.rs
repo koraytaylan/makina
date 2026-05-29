@@ -769,10 +769,11 @@ impl TaskListInterpreter for ModelInterpreter {
 /// - [`InterpretError::ValidationFailed`] — deserialization succeeded but
 ///   [`TaskGraph::validate()`] failed.
 pub(crate) fn parse_model_response(raw: &str) -> Result<TaskGraph, InterpretError> {
-    let json_str =
-        extract_json_object(raw).ok_or_else(|| InterpretError::ModelResponseInvalid {
+    let json_str = crate::json::extract_json_object(raw).ok_or_else(|| {
+        InterpretError::ModelResponseInvalid {
             reason: "no JSON object found in model response".to_string(),
-        })?;
+        }
+    })?;
 
     let graph: TaskGraph =
         serde_json::from_str(json_str).map_err(|e| InterpretError::ModelResponseInvalid {
@@ -781,52 +782,6 @@ pub(crate) fn parse_model_response(raw: &str) -> Result<TaskGraph, InterpretErro
 
     graph.validate()?;
     Ok(graph)
-}
-
-/// Find and return the first outermost `{ … }` JSON object substring in `text`.
-///
-/// Strips leading/trailing prose and ` ```json ``` ` code fences.  Handles
-/// nested braces by tracking brace depth.  Returns `None` if no `{` is found.
-fn extract_json_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        if in_string {
-            match b {
-                b'\\' => escape_next = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => {
-                if start.is_none() {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0
-                    && let Some(s) = start
-                {
-                    return Some(&text[s..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 // ── Mechanism builder ─────────────────────────────────────────────────────────
@@ -1366,43 +1321,6 @@ Description of third.
             err.to_string().contains("ghost-task"),
             "error message should mention the missing id: {err}"
         );
-    }
-
-    // ── extract_json_object unit tests ────────────────────────────────────────
-
-    #[test]
-    fn extract_json_object_finds_bare_object() {
-        let text = r#"{"slug":"x","tasks":[]}"#;
-        let extracted = extract_json_object(text).unwrap();
-        assert_eq!(extracted, text);
-    }
-
-    #[test]
-    fn extract_json_object_strips_leading_prose() {
-        let text = r#"Here you go: {"slug":"x","tasks":[]}"#;
-        let extracted = extract_json_object(text).unwrap();
-        assert_eq!(extracted, r#"{"slug":"x","tasks":[]}"#);
-    }
-
-    #[test]
-    fn extract_json_object_handles_nested_braces() {
-        let text = r#"{"slug":"x","tasks":[{"id":"a","title":"T"}]}"#;
-        let extracted = extract_json_object(text).unwrap();
-        assert_eq!(extracted, text);
-    }
-
-    #[test]
-    fn extract_json_object_returns_none_for_no_object() {
-        let text = "No JSON here at all.";
-        assert!(extract_json_object(text).is_none());
-    }
-
-    #[test]
-    fn extract_json_object_handles_string_containing_braces() {
-        // A JSON string value containing `{` and `}` must not confuse the parser.
-        let text = r#"{"slug":"x{y}","tasks":[]}"#;
-        let extracted = extract_json_object(text).unwrap();
-        assert_eq!(extracted, text);
     }
 
     // ── build_planner_interpreter tests ──────────────────────────────────────

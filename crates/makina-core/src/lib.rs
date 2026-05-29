@@ -12,6 +12,7 @@ pub mod config;
 pub mod dependency;
 pub mod gate;
 pub mod interpreter;
+pub(crate) mod json;
 pub mod merge;
 pub mod orchestrator;
 pub mod roles;

@@ -259,7 +259,7 @@ pub enum VerdictParseError {
 ///
 /// The parser is **tolerant**: it strips leading/trailing prose and
 /// ` ```json … ``` ` fences before locating the outermost `{ … }` JSON object
-/// (same approach as [`crate::interpreter`]'s `extract_json_object`).
+/// (same approach as [`crate::json::extract_json_object`]).
 ///
 /// # Case tolerance
 ///
@@ -283,7 +283,8 @@ pub enum VerdictParseError {
 ///   [`VerdictParseError::UnknownVerdict`].
 pub fn parse_review_verdict(model_output: &str) -> Result<ReviewVerdict, VerdictParseError> {
     // Step 1: extract the outermost { … } JSON object, tolerating fences and prose.
-    let json_str = extract_json_object(model_output).ok_or(VerdictParseError::NoJsonObject)?;
+    let json_str =
+        crate::json::extract_json_object(model_output).ok_or(VerdictParseError::NoJsonObject)?;
 
     // Step 2: deserialize into a loosely-typed map to allow case-insensitive
     // verdict matching and optional fields.
@@ -311,56 +312,6 @@ pub fn parse_review_verdict(model_output: &str) -> Result<ReviewVerdict, Verdict
         }
         other => Err(VerdictParseError::UnknownVerdict(other.to_string())),
     }
-}
-
-// ── JSON extraction (local copy, mirrors interpreter::extract_json_object) ────
-
-/// Find and return the first outermost `{ … }` JSON object substring in `text`.
-///
-/// Handles nested braces and ignores `{` / `}` inside JSON string literals.
-/// Returns `None` if no `{` is found.  Strips surrounding prose and
-/// ` ```json … ``` ` code fences transparently (the brace scanner naturally
-/// skips anything outside the braces).
-fn extract_json_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        if in_string {
-            match b {
-                b'\\' => escape_next = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => {
-                if start.is_none() {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0
-                    && let Some(s) = start
-                {
-                    return Some(&text[s..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
