@@ -6,12 +6,105 @@
 //! Keeping `update` a synchronous, pure function means every state transition
 //! is unit-testable without a real terminal or async runtime.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use makina_core::api::{Api, Event, RunView};
+use makina_core::api::{AgentRole, Api, Event, RunView, TaskId};
 
 use crate::browser::{DirEntry, FileBrowser};
+
+// ── Exchange log ─────────────────────────────────────────────────────────────
+
+/// Maximum number of exchange entries retained per task.
+///
+/// When more turns arrive the oldest entries are dropped so the buffer stays
+/// bounded and cannot cause unbounded memory growth.
+pub const EXCHANGE_LOG_CAP: usize = 100;
+
+/// A single turn in a live agent exchange: either a prompt from the
+/// orchestrator or a (possibly still-streaming) response from the agent.
+#[derive(Debug, Clone)]
+pub struct ExchangeEntry {
+    /// The agent role that produced this turn.
+    pub role: AgentRole,
+    /// `true` → this is a prompt sent TO the agent; `false` → response.
+    pub is_prompt: bool,
+    /// Accumulated text.  For prompts this is the full text of
+    /// [`ExchangeEvent::PromptSent`].  For responses each
+    /// [`ExchangeEvent::ResponseChunk`] is appended here as it arrives.
+    pub text: String,
+    /// Whether [`ExchangeEvent::TurnComplete`] has been received for the
+    /// current response turn.  Always `true` for prompt entries.
+    pub complete: bool,
+}
+
+/// Per-task bounded ring of exchange entries.
+///
+/// The buffer caps at [`EXCHANGE_LOG_CAP`] entries by dropping the oldest
+/// when the cap is exceeded.  This prevents unbounded memory growth even when
+/// a task generates many prompt/response turns.
+#[derive(Debug, Default, Clone)]
+pub struct ExchangeLog {
+    pub entries: Vec<ExchangeEntry>,
+}
+
+impl ExchangeLog {
+    /// Push a new entry, evicting the oldest when over cap.
+    fn push(&mut self, entry: ExchangeEntry) {
+        self.entries.push(entry);
+        if self.entries.len() > EXCHANGE_LOG_CAP {
+            // Drop the oldest entry to maintain the bound.
+            self.entries.remove(0);
+        }
+    }
+
+    /// Start a new prompt entry for the given role.
+    pub fn add_prompt(&mut self, role: AgentRole, text: String) {
+        self.push(ExchangeEntry {
+            role,
+            is_prompt: true,
+            text,
+            complete: true,
+        });
+    }
+
+    /// Start a new (in-progress) response entry for the given role, or
+    /// append to the last incomplete response.
+    ///
+    /// Design decision: a `ResponseChunk` arriving without a preceding
+    /// `PromptSent` in this log still needs to go somewhere — we create an
+    /// implicit incomplete response entry rather than silently dropping data.
+    pub fn append_chunk(&mut self, role: AgentRole, chunk: String) {
+        // Look for the last incomplete response entry with the same role so we
+        // can accumulate streaming chunks.
+        if let Some(last) = self.entries.last_mut()
+            && !last.is_prompt
+            && !last.complete
+            && last.role == role
+        {
+            last.text.push_str(&chunk);
+            return;
+        }
+        // No open response entry for this role — start a new one.
+        self.push(ExchangeEntry {
+            role,
+            is_prompt: false,
+            text: chunk,
+            complete: false,
+        });
+    }
+
+    /// Mark the last incomplete response entry as complete.
+    pub fn complete_turn(&mut self) {
+        if let Some(last) = self.entries.last_mut()
+            && !last.is_prompt
+            && !last.complete
+        {
+            last.complete = true;
+        }
+    }
+}
 
 // ── View mode ───────────────────────────────────────────────────────────────────
 
@@ -162,6 +255,20 @@ pub struct App {
     /// `None` when `runs` is empty.
     pub selected_run: Option<usize>,
 
+    /// Index into the selected Run's task list identifying the focused task.
+    ///
+    /// Navigating Up/Down when [`Panel::Main`] is focused moves this.  The
+    /// exchange pane renders the focused task's exchange log.  `None` when
+    /// the selected run has no tasks.
+    pub selected_task: Option<usize>,
+
+    /// Per-task exchange logs, keyed by [`TaskId`].
+    ///
+    /// The orchestrator emits [`Event::AgentExchange`] for ALL in-flight
+    /// tasks; the TUI stores logs for every task it hears about and filters to
+    /// the currently focused task when rendering the exchange pane.
+    pub exchange_logs: HashMap<TaskId, ExchangeLog>,
+
     /// Last api event received — stored for test assertions and status-bar
     /// display.  Will be used by tasks 27–31 for richer updates.
     pub last_event: Option<Event>,
@@ -177,6 +284,10 @@ impl App {
         } else {
             Some(0)
         };
+        // Auto-select the first task of the first run (if any).
+        let selected_task = initial_runs
+            .first()
+            .and_then(|r| if r.tasks.is_empty() { None } else { Some(0) });
         Self {
             should_quit: false,
             api,
@@ -185,6 +296,8 @@ impl App {
             browser: None,
             runs: initial_runs,
             selected_run,
+            selected_task,
+            exchange_logs: HashMap::new(),
             last_event: None,
         }
     }
@@ -206,6 +319,16 @@ impl App {
     #[allow(dead_code)] // public seam for tasks 29 and 31; not yet called from main.rs
     pub fn selected_run(&self) -> Option<&RunView> {
         self.selected_run.and_then(|i| self.runs.get(i))
+    }
+
+    /// Return the [`TaskId`] of the currently focused task within the selected
+    /// Run, if any.
+    ///
+    /// Used by the exchange pane to determine which task's log to display.
+    pub fn selected_task_id(&self) -> Option<&TaskId> {
+        self.selected_run()
+            .and_then(|run| self.selected_task.and_then(|i| run.tasks.get(i)))
+            .map(|tv| &tv.id)
     }
 
     /// Apply one [`AppEvent`] to the App state.
@@ -234,21 +357,51 @@ impl App {
                 true
             }
             AppEvent::SelectUp => {
-                // Navigation only applies when the sidebar owns focus.
-                if self.focused_panel == Panel::Sidebar
-                    && let Some(current) = self.selected_run
-                {
-                    self.selected_run = Some(current.saturating_sub(1));
+                match self.focused_panel {
+                    Panel::Sidebar => {
+                        // Sidebar focus: navigate runs.
+                        if let Some(current) = self.selected_run {
+                            let new_idx = current.saturating_sub(1);
+                            if new_idx != current {
+                                self.selected_run = Some(new_idx);
+                                // Re-clamp selected_task to the new run's task list.
+                                self.clamp_selected_task();
+                            }
+                        }
+                    }
+                    Panel::Main => {
+                        // Main focus: navigate tasks within the selected run.
+                        if let Some(current) = self.selected_task {
+                            self.selected_task = Some(current.saturating_sub(1));
+                        }
+                    }
                 }
                 true
             }
             AppEvent::SelectDown => {
-                // Navigation only applies when the sidebar owns focus.
-                if self.focused_panel == Panel::Sidebar
-                    && let Some(current) = self.selected_run
-                {
-                    let last = self.runs.len().saturating_sub(1);
-                    self.selected_run = Some((current + 1).min(last));
+                match self.focused_panel {
+                    Panel::Sidebar => {
+                        // Sidebar focus: navigate runs.
+                        if let Some(current) = self.selected_run {
+                            let last = self.runs.len().saturating_sub(1);
+                            let new_idx = (current + 1).min(last);
+                            if new_idx != current {
+                                self.selected_run = Some(new_idx);
+                                // Re-clamp selected_task to the new run's task list.
+                                self.clamp_selected_task();
+                            }
+                        }
+                    }
+                    Panel::Main => {
+                        // Main focus: navigate tasks within the selected run.
+                        if let Some(current) = self.selected_task {
+                            let last = self
+                                .selected_run()
+                                .map(|r| r.tasks.len().saturating_sub(1))
+                                .unwrap_or(0);
+                            self.selected_task = Some((current + 1).min(last));
+                        }
+                    }
                 }
                 true
             }
@@ -267,6 +420,11 @@ impl App {
                 // the api.  If an entry with the same id already exists (i.e. the
                 // placeholder inserted by RunOpened), replace it in-place so the
                 // sidebar index / selection stays stable.
+                let is_selected = self
+                    .selected_run
+                    .and_then(|i| self.runs.get(i))
+                    .map(|r| r.id == full_run.id)
+                    .unwrap_or(false);
                 if let Some(existing) = self.runs.iter_mut().find(|r| r.id == full_run.id) {
                     *existing = full_run;
                 } else {
@@ -274,6 +432,11 @@ impl App {
                     if self.selected_run.is_none() {
                         self.selected_run = Some(0);
                     }
+                }
+                // When the currently selected run's tasks arrive (or change),
+                // clamp selected_task so it points to a valid slot.
+                if is_selected || self.selected_run == Some(self.runs.len().saturating_sub(1)) {
+                    self.clamp_selected_task();
                 }
                 true
             }
@@ -319,6 +482,19 @@ impl App {
                 true
             }
         }
+    }
+
+    /// Clamp `selected_task` to the currently selected run's task list.
+    ///
+    /// Called after changing `selected_run` or after a run's task list is
+    /// (re)loaded so the task index always points to a valid slot.
+    fn clamp_selected_task(&mut self) {
+        let task_count = self.selected_run().map(|r| r.tasks.len()).unwrap_or(0);
+        self.selected_task = if task_count == 0 {
+            None
+        } else {
+            Some(self.selected_task.unwrap_or(0).min(task_count - 1))
+        };
     }
 
     /// Apply a core api [`Event`] to the App state.
@@ -389,9 +565,29 @@ impl App {
                     tv.review_iterations = *review_iterations;
                 }
             }
-            // AgentExchange events are displayed by task 30 (prompt-answer-stream).
-            // The scaffold stores the last event for status-bar hints.
-            Event::AgentExchange { .. } => {}
+            // AgentExchange events accumulate into the per-task exchange log
+            // (task 30: prompt-answer-stream).  The TUI stores ALL tasks' logs
+            // and filters to the focused task at render time.
+            Event::AgentExchange {
+                task,
+                role,
+                event: exchange_ev,
+                ..
+            } => {
+                use makina_core::api::ExchangeEvent;
+                let log = self.exchange_logs.entry(task.clone()).or_default();
+                match exchange_ev {
+                    ExchangeEvent::PromptSent { text } => {
+                        log.add_prompt(role.clone(), text.clone());
+                    }
+                    ExchangeEvent::ResponseChunk { text } => {
+                        log.append_chunk(role.clone(), text.clone());
+                    }
+                    ExchangeEvent::TurnComplete => {
+                        log.complete_turn();
+                    }
+                }
+            }
         }
 
         self.last_event = Some(event);
@@ -1167,5 +1363,417 @@ mod tests {
         app.update(AppEvent::OpenBrowser);
         assert_eq!(app.mode, Mode::Normal, "OpenBrowser alone changes nothing");
         assert!(app.browser.is_none());
+    }
+
+    // ── prompt-answer-stream (task 30) ────────────────────────────────────────
+
+    /// Helper: build a run with tasks A and B, and an App focused on it.
+    fn make_app_with_tasks() -> App {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/x.json"),
+            status: RunStatus::Running,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("task-a"),
+                    title: "Task A".into(),
+                    state: TaskState::InProgress,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("task-b"),
+                    title: "Task B".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        App::new(api, vec![run])
+    }
+
+    /// **Live streaming (the done-when):** Feed PromptSent, several
+    /// ResponseChunks, and TurnComplete for the focused task and assert the
+    /// exchange log accumulates correctly — prompt present + chunks concatenated
+    /// into the answer.
+    #[test]
+    fn live_streaming_prompt_chunks_and_turn_complete() {
+        use makina_core::api::{AgentRole, Event, ExchangeEvent, RunId, TaskId};
+        let mut app = make_app_with_tasks();
+
+        // Default: task-a is at index 0 (auto-selected).
+        assert_eq!(app.selected_task, Some(0));
+        let focused_id = TaskId::new("task-a");
+
+        // Feed PromptSent.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: focused_id.clone(),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "implement X".into(),
+            },
+        }));
+
+        // Feed several ResponseChunks.
+        for chunk in &["work", "ing", " on it"] {
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: focused_id.clone(),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::ResponseChunk {
+                    text: (*chunk).into(),
+                },
+            }));
+        }
+
+        // Feed TurnComplete.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: focused_id.clone(),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        // Assert the log.
+        let log = app.exchange_logs.get(&focused_id).expect("log must exist");
+        assert_eq!(log.entries.len(), 2, "expect prompt + response entries");
+
+        // Entry 0: prompt.
+        assert!(log.entries[0].is_prompt, "first entry must be a prompt");
+        assert_eq!(log.entries[0].text, "implement X");
+        assert_eq!(log.entries[0].role, AgentRole::Developer);
+
+        // Entry 1: concatenated response.
+        assert!(!log.entries[1].is_prompt, "second entry must be a response");
+        assert_eq!(
+            log.entries[1].text, "working on it",
+            "chunks must concatenate in order"
+        );
+        assert!(
+            log.entries[1].complete,
+            "TurnComplete must mark entry complete"
+        );
+    }
+
+    /// Feed a second turn (interleaved Reviewer) and assert ordering + role labels.
+    #[test]
+    fn live_streaming_second_turn_and_reviewer_role() {
+        use makina_core::api::{AgentRole, Event, ExchangeEvent, RunId, TaskId};
+        let mut app = make_app_with_tasks();
+        let tid = TaskId::new("task-a");
+
+        // First turn: Developer prompt + response.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: tid.clone(),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "dev prompt".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: tid.clone(),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::ResponseChunk {
+                text: "dev reply".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: tid.clone(),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        // Second turn: Reviewer prompt + response.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: tid.clone(),
+            role: AgentRole::Reviewer,
+            event: ExchangeEvent::PromptSent {
+                text: "review prompt".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: tid.clone(),
+            role: AgentRole::Reviewer,
+            event: ExchangeEvent::ResponseChunk {
+                text: "lgtm".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: tid.clone(),
+            role: AgentRole::Reviewer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        let log = app.exchange_logs.get(&tid).expect("log must exist");
+        assert_eq!(log.entries.len(), 4, "2 prompts + 2 responses");
+        // Ordering.
+        assert!(log.entries[0].is_prompt);
+        assert_eq!(log.entries[0].role, AgentRole::Developer);
+        assert_eq!(log.entries[0].text, "dev prompt");
+        assert!(!log.entries[1].is_prompt);
+        assert_eq!(log.entries[1].role, AgentRole::Developer);
+        assert_eq!(log.entries[1].text, "dev reply");
+        assert!(log.entries[2].is_prompt);
+        assert_eq!(log.entries[2].role, AgentRole::Reviewer);
+        assert_eq!(log.entries[2].text, "review prompt");
+        assert!(!log.entries[3].is_prompt);
+        assert_eq!(log.entries[3].role, AgentRole::Reviewer);
+        assert_eq!(log.entries[3].text, "lgtm");
+    }
+
+    /// **Focus filtering:** feed AgentExchange for task-a and task-b; focused
+    /// on task-a (index 0), only task-a's log must be non-empty; switching to
+    /// task-b (index 1) must reveal task-b's log.
+    #[test]
+    fn focus_filtering_exchange_per_task() {
+        use makina_core::api::{AgentRole, Event, ExchangeEvent, RunId, TaskId};
+        let mut app = make_app_with_tasks();
+
+        // Switch to Main panel so task navigation works.
+        app.update(AppEvent::FocusNext);
+        assert_eq!(app.focused_panel, Panel::Main);
+
+        let id_a = TaskId::new("task-a");
+        let id_b = TaskId::new("task-b");
+
+        // Feed exchange for task-a.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: id_a.clone(),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "task-a prompt".into(),
+            },
+        }));
+
+        // Feed exchange for task-b.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: id_b.clone(),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "task-b prompt".into(),
+            },
+        }));
+
+        // Both logs are stored.
+        assert!(
+            app.exchange_logs.contains_key(&id_a),
+            "task-a log must be stored"
+        );
+        assert!(
+            app.exchange_logs.contains_key(&id_b),
+            "task-b log must be stored"
+        );
+
+        // Focus is on task-a (index 0).
+        assert_eq!(app.selected_task, Some(0));
+        assert_eq!(app.selected_task_id(), Some(&id_a));
+
+        // Only task-a's log is "shown" by the focus query.
+        let focused_log = app
+            .exchange_logs
+            .get(app.selected_task_id().unwrap())
+            .unwrap();
+        assert_eq!(focused_log.entries[0].text, "task-a prompt");
+
+        // Navigate to task-b.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_task, Some(1));
+        assert_eq!(app.selected_task_id(), Some(&id_b));
+
+        let focused_log_b = app
+            .exchange_logs
+            .get(app.selected_task_id().unwrap())
+            .unwrap();
+        assert_eq!(focused_log_b.entries[0].text, "task-b prompt");
+    }
+
+    /// **Task selection:** Up/Down moves the focused task when Main is focused
+    /// (clamped at both ends).
+    #[test]
+    fn task_selection_up_down_main_panel() {
+        let mut app = make_app_with_tasks();
+
+        // Switch to Main panel.
+        app.update(AppEvent::FocusNext);
+        assert_eq!(app.focused_panel, Panel::Main);
+        assert_eq!(app.selected_task, Some(0));
+
+        // Down: moves to index 1.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(
+            app.selected_task,
+            Some(1),
+            "SelectDown must move task selection"
+        );
+
+        // Down again: clamps at last (index 1 with 2 tasks).
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_task, Some(1), "must clamp at last task");
+
+        // Up: moves back to index 0.
+        app.update(AppEvent::SelectUp);
+        assert_eq!(
+            app.selected_task,
+            Some(0),
+            "SelectUp must move task selection"
+        );
+
+        // Up again: clamps at 0.
+        app.update(AppEvent::SelectUp);
+        assert_eq!(app.selected_task, Some(0), "must clamp at first task");
+    }
+
+    /// Task selection: run navigation (Sidebar focus) must NOT change
+    /// `selected_task` beyond what the new run's task count allows.
+    #[test]
+    fn task_selection_sidebar_nav_does_not_touch_run_selection() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        // Two runs, each with tasks.
+        let run1 = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/r1.json"),
+            status: RunStatus::Running,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("t1"),
+                    title: "T1".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("t2"),
+                    title: "T2".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        let run2 = RunView {
+            id: RunId(2),
+            task_list_path: PathBuf::from(".tasks/r2.json"),
+            status: RunStatus::Pending,
+            tasks: vec![TaskView {
+                id: TaskId::new("ta"),
+                title: "TA".into(),
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            }],
+        };
+        let mut app = App::new(api, vec![run1, run2]);
+
+        // Initially: sidebar focused, run index 0, task index 0.
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+        assert_eq!(app.selected_run, Some(0));
+        assert_eq!(app.selected_task, Some(0));
+
+        // Navigate to run 1 via sidebar.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_run, Some(1), "run selection must move");
+        // task index should be clamped to the new run's bounds (run1 has 1 task).
+        assert_eq!(
+            app.selected_task,
+            Some(0),
+            "task selection clamped to new run's bounds"
+        );
+    }
+
+    /// **Bounding:** feeding many chunks/turns must cap the exchange log at
+    /// [`EXCHANGE_LOG_CAP`] entries (no unbounded growth).
+    #[test]
+    fn exchange_log_bounded_at_cap() {
+        use crate::app::EXCHANGE_LOG_CAP;
+        use makina_core::api::{AgentRole, Event, ExchangeEvent, RunId, TaskId};
+        let mut app = make_app_with_tasks();
+        let tid = TaskId::new("task-a");
+
+        // Feed more than EXCHANGE_LOG_CAP entries (each prompt + response is 2).
+        let total_turns = EXCHANGE_LOG_CAP + 10;
+        for i in 0..total_turns {
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: tid.clone(),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::PromptSent {
+                    text: format!("prompt {i}"),
+                },
+            }));
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: tid.clone(),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::ResponseChunk {
+                    text: format!("resp {i}"),
+                },
+            }));
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: tid.clone(),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::TurnComplete,
+            }));
+        }
+
+        let log = app.exchange_logs.get(&tid).expect("log must exist");
+        assert!(
+            log.entries.len() <= EXCHANGE_LOG_CAP,
+            "log must be capped at EXCHANGE_LOG_CAP={} but has {} entries",
+            EXCHANGE_LOG_CAP,
+            log.entries.len()
+        );
+    }
+
+    /// ExchangeLog direct unit tests — PromptSent, ResponseChunk, TurnComplete.
+    #[test]
+    fn exchange_log_prompt_and_chunk_accumulation() {
+        use crate::app::ExchangeLog;
+        use makina_core::api::AgentRole;
+
+        let mut log = ExchangeLog::default();
+        log.add_prompt(AgentRole::Developer, "hello".into());
+        assert_eq!(log.entries.len(), 1);
+        assert!(log.entries[0].is_prompt);
+        assert_eq!(log.entries[0].text, "hello");
+        assert!(log.entries[0].complete);
+
+        log.append_chunk(AgentRole::Developer, "chunk1".into());
+        assert_eq!(log.entries.len(), 2);
+        assert!(!log.entries[1].is_prompt);
+        assert_eq!(log.entries[1].text, "chunk1");
+        assert!(!log.entries[1].complete);
+
+        log.append_chunk(AgentRole::Developer, " chunk2".into());
+        assert_eq!(
+            log.entries.len(),
+            2,
+            "chunks must accumulate, not add new entries"
+        );
+        assert_eq!(log.entries[1].text, "chunk1 chunk2");
+
+        log.complete_turn();
+        assert!(
+            log.entries[1].complete,
+            "TurnComplete must mark response complete"
+        );
     }
 }

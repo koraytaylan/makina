@@ -10,11 +10,12 @@
 //! ┌──────────────────────────────────────────────────────┐
 //! │ Title bar: "Makina vX.Y — multi-agent factory"      │
 //! ├─────────────────┬────────────────────────────────────┤
-//! │                 │                                    │
-//! │  Sidebar        │  Main content                      │
-//! │  (Runs list)    │  (task-status / prompt-answer)     │
-//! │  task 27 ─────► │  tasks 29–31 ──────────────────►  │
-//! │                 │                                    │
+//! │                 │  Header (run path + status)        │
+//! │  Sidebar        ├────────────────────────────────────┤
+//! │  (Runs list)    │  Task table (task 29)              │
+//! │  task 27 ─────► ├────────────────────────────────────┤
+//! │                 │  Exchange pane (task 30)            │
+//! │                 │  (focused task prompts/answers)     │
 //! ├─────────────────┴────────────────────────────────────┤
 //! │ Status bar: panel focus + last event hint            │
 //! └──────────────────────────────────────────────────────┘
@@ -29,7 +30,8 @@
 //!   that iterates `app.runs`.
 //! * Task 29 (task-status-view): render task state badges inside the main area.
 //! * Task 30 (prompt-answer-stream): stream agent exchange text into the main
-//!   area for the focused task.
+//!   area for the focused task.  The exchange pane is rendered below the task
+//!   table and shows the focused task's prompts and streamed answers in order.
 //! * Task 31 (run-control): add keybind hints to the status bar.
 
 use ratatui::{
@@ -39,11 +41,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph,
-        Row, Table,
+        Row, Table, Wrap,
     },
 };
 
-use crate::app::{App, Panel};
+use crate::app::{App, ExchangeEntry, Panel};
 
 /// Render the full TUI layout into `frame`.
 ///
@@ -187,7 +189,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             frame.render_widget(hint_para, main_area);
         }
         Some(run) => {
-            // Split main_area inside the block: header lines + task table.
+            // Split main_area inside the block: header lines + task table + exchange pane.
             let inner = main_block.inner(main_area);
             frame.render_widget(main_block, main_area);
 
@@ -219,13 +221,29 @@ pub fn render(app: &App, frame: &mut Frame) {
             ];
             let header_height = header_lines.len() as u16;
 
+            // Reserve space: header + task table (up to ~40% of remaining) +
+            // exchange pane (rest).  We cap the task table at a sensible height
+            // so the exchange pane always has room.
+            let task_count = run.tasks.len() as u16;
+            // Table header (1 row) + task rows + 1 spare row.
+            let table_rows = if task_count == 0 {
+                1 // "Loading…" hint
+            } else {
+                (task_count + 1).min(10) // cap at 10 visible rows + header
+            };
+
             let split = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(header_height), Constraint::Min(0)])
+                .constraints([
+                    Constraint::Length(header_height),
+                    Constraint::Length(table_rows),
+                    Constraint::Min(3), // exchange pane — always at least 3 rows
+                ])
                 .split(inner);
 
             let header_area = split[0];
             let table_area = split[1];
+            let exchange_area = split[2];
 
             let header_para = Paragraph::new(header_lines).style(Style::default().fg(Color::White));
             frame.render_widget(header_para, header_area);
@@ -305,8 +323,14 @@ pub fn render(app: &App, frame: &mut Frame) {
                     )
                     .column_spacing(1);
 
-                frame.render_widget(task_table, table_area);
+                // Use stateful rendering to highlight the focused task row.
+                let mut table_state = ratatui::widgets::TableState::default();
+                table_state.select(app.selected_task);
+                frame.render_stateful_widget(task_table, table_area, &mut table_state);
             }
+
+            // ── Exchange pane (task 30) ────────────────────────────────────
+            render_exchange_pane(app, frame, exchange_area, main_focused);
         }
     }
 
@@ -332,6 +356,151 @@ pub fn render(app: &App, frame: &mut Frame) {
     {
         render_file_browser(browser, frame, area);
     }
+}
+
+// ── Exchange pane (task 30: prompt-answer-stream) ─────────────────────────────
+
+/// Render the live agent exchange pane for the currently focused task.
+///
+/// Shows the focused task's prompts (labelled with role) and the streamed
+/// responses accumulated so far, in order, auto-scrolled to the latest entry.
+///
+/// # Filtering
+///
+/// The App stores exchange logs for ALL in-flight tasks.  This function reads
+/// only the log for `app.selected_task_id()` — focus filtering happens here at
+/// render time, not in the event-handling layer.
+fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool) {
+    let block = Block::default()
+        .title(" Exchange ")
+        .borders(Borders::TOP)
+        .border_style(if focused {
+            Style::default().fg(Color::Blue)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Determine which task's log to display.
+    let task_id = app.selected_task_id();
+
+    let log_opt = task_id.and_then(|id| app.exchange_logs.get(id));
+
+    match log_opt {
+        None => {
+            // No task focused or no exchange yet.
+            let hint = if task_id.is_none() {
+                "  No task focused."
+            } else {
+                "  No exchange yet."
+            };
+            let para = Paragraph::new(Line::from(vec![Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            )]));
+            frame.render_widget(para, inner);
+        }
+        Some(log) if log.entries.is_empty() => {
+            let para = Paragraph::new(Line::from(vec![Span::styled(
+                "  No exchange yet.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            frame.render_widget(para, inner);
+        }
+        Some(log) => {
+            // Build the exchange lines.
+            let mut lines: Vec<Line> = Vec::new();
+            for entry in &log.entries {
+                lines.extend(exchange_entry_lines(entry));
+            }
+
+            // Auto-scroll: compute scroll offset so the last lines are visible.
+            let pane_height = inner.height as usize;
+            let total_lines = lines.len();
+            let scroll_offset = if total_lines > pane_height {
+                (total_lines - pane_height) as u16
+            } else {
+                0
+            };
+
+            let para = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll_offset, 0));
+            frame.render_widget(para, inner);
+        }
+    }
+}
+
+/// Convert a single [`ExchangeEntry`] into display [`Line`]s.
+///
+/// Prompt entries get a role-coloured label header; response entries are
+/// indented and shown in a lighter colour.  An in-progress streaming response
+/// (not yet complete) gets a trailing `▌` cursor indicator.
+fn exchange_entry_lines(entry: &ExchangeEntry) -> Vec<Line<'static>> {
+    use makina_core::api::AgentRole;
+
+    let mut lines = Vec::new();
+
+    if entry.is_prompt {
+        // Role label + prompt text on separate lines.
+        let (label, label_color) = match entry.role {
+            AgentRole::Developer => ("▶ Developer prompt", Color::Green),
+            AgentRole::Reviewer => ("▶ Reviewer prompt", Color::Yellow),
+        };
+        lines.push(Line::from(vec![Span::styled(
+            label,
+            Style::default()
+                .fg(label_color)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        // Render prompt text lines (split on newlines).
+        for text_line in entry.text.lines() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {text_line}"),
+                Style::default().fg(Color::White),
+            )]));
+        }
+        if entry.text.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "  (empty)",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+    } else {
+        // Response entry.
+        let (resp_label, resp_color) = match entry.role {
+            AgentRole::Developer => ("◀ Developer response", Color::Cyan),
+            AgentRole::Reviewer => ("◀ Reviewer response", Color::Magenta),
+        };
+        lines.push(Line::from(vec![Span::styled(
+            resp_label,
+            Style::default().fg(resp_color).add_modifier(Modifier::BOLD),
+        )]));
+        // Response text.
+        let text_to_show = if entry.complete {
+            entry.text.clone()
+        } else {
+            // Still streaming — append cursor.
+            format!("{}▌", entry.text)
+        };
+        for text_line in text_to_show.lines() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {text_line}"),
+                Style::default().fg(Color::White),
+            )]));
+        }
+        if entry.text.is_empty() && !entry.complete {
+            lines.push(Line::from(vec![Span::styled(
+                "  ▌",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+    }
+    // Blank separator line between entries.
+    lines.push(Line::from(""));
+    lines
 }
 
 /// Render the modal file browser overlay centred within `area`.
@@ -1249,6 +1418,208 @@ mod tests {
             app.runs[0].status,
             makina_core::api::RunStatus::Completed,
             "aggregate RunStatus must be Completed when all tasks are Done"
+        );
+    }
+
+    // ── prompt-answer-stream (task 30) ────────────────────────────────────────
+
+    /// Build an App with a run/task set up for exchange tests.
+    fn exchange_app() -> App {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/exchange-test.json"),
+            status: RunStatus::Running,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("task-a"),
+                    title: "Task A".into(),
+                    state: TaskState::InProgress,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("task-b"),
+                    title: "Task B".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        let mut app = App::new(api, vec![run]);
+
+        // Feed task-a: PromptSent + ResponseChunks + TurnComplete.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-a"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "implement X".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-a"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::ResponseChunk {
+                text: "work".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-a"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::ResponseChunk { text: "ing".into() },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-a"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::ResponseChunk {
+                text: " on it".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-a"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        // Feed task-b: a separate prompt (different task).
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-b"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "task-b only".into(),
+            },
+        }));
+
+        app
+    }
+
+    /// **Live streaming (done-when):** after feeding PromptSent + chunks +
+    /// TurnComplete, the exchange pane must show the prompt AND the
+    /// concatenated streamed answer.
+    #[test]
+    fn render_exchange_pane_shows_prompt_and_concatenated_answer() {
+        let mut terminal = make_terminal(120, 40);
+        let app = exchange_app();
+
+        // task-a is focused (index 0).
+        assert_eq!(app.selected_task, Some(0));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Prompt label and text must appear.
+        assert!(
+            screen.contains("Developer prompt") || screen.contains("prompt"),
+            "exchange pane must show the prompt label"
+        );
+        assert!(
+            screen.contains("implement X"),
+            "exchange pane must show the prompt text"
+        );
+        // Concatenated answer must appear.
+        assert!(
+            screen.contains("working on it"),
+            "exchange pane must show the concatenated response 'working on it'"
+        );
+    }
+
+    /// **Focus filtering (done-when):** with task-a focused, only task-a's
+    /// exchange appears; switching to task-b shows task-b's exchange instead.
+    #[test]
+    fn render_exchange_pane_focus_filter() {
+        use crate::app::AppEvent;
+
+        let mut terminal = make_terminal(120, 40);
+        let mut app = exchange_app();
+
+        // task-a focused (index 0): assert task-a's prompt visible, task-b's not.
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_a = screen_of(&terminal);
+        assert!(
+            screen_a.contains("implement X"),
+            "task-a exchange must be visible when task-a is focused"
+        );
+        assert!(
+            !screen_a.contains("task-b only"),
+            "task-b exchange must NOT appear when task-a is focused"
+        );
+
+        // Switch Main panel focus and navigate to task-b (index 1).
+        app.update(AppEvent::FocusNext); // focus → Main
+        app.update(AppEvent::SelectDown); // task selection → index 1
+        assert_eq!(app.selected_task, Some(1));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_b = screen_of(&terminal);
+        assert!(
+            screen_b.contains("task-b only"),
+            "task-b exchange must be visible when task-b is focused"
+        );
+        assert!(
+            !screen_b.contains("implement X"),
+            "task-a exchange must NOT appear when task-b is focused"
+        );
+    }
+
+    /// **Task row highlight:** when Main panel is focused the focused task row
+    /// must be highlighted (Cyan background).
+    #[test]
+    fn render_focused_task_row_is_highlighted() {
+        let mut terminal = make_terminal(120, 40);
+        let app = exchange_app();
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let has_cyan = buf
+            .content()
+            .iter()
+            .any(|cell| cell.bg == ratatui::style::Color::Cyan);
+        assert!(
+            has_cyan,
+            "focused task row must use Cyan highlight background"
+        );
+    }
+
+    /// **No exchange yet placeholder:** when a task has no exchange log
+    /// entry the pane must show a sane placeholder.
+    #[test]
+    fn render_exchange_pane_no_exchange_placeholder() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let mut terminal = make_terminal(120, 40);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/no-exchange.json"),
+            status: RunStatus::Running,
+            tasks: vec![TaskView {
+                id: TaskId::new("t1"),
+                title: "T1".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            }],
+        };
+        let app = App::new(api, vec![run]);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("No exchange yet") || screen.contains("exchange"),
+            "exchange pane must show 'No exchange yet' placeholder when log is empty"
         );
     }
 }
