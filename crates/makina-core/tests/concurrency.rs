@@ -665,8 +665,15 @@ async fn merges_into_develop_are_serialized_and_clean() {
     );
 
     // develop is CLEAN (no half-staged squash / conflict markers left behind).
+    // The `.tasks/` directory is intentionally untracked (supervisor persistence
+    // artifacts); filter it out so the merge-cleanliness check stays meaningful.
+    let dirty: String = status_porcelain(&repo_root)
+        .lines()
+        .filter(|line| !line.contains(".tasks/"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        status_porcelain(&repo_root).is_empty(),
+        dirty.is_empty(),
         "develop must be clean after concurrent merges; status:\n{}",
         status_porcelain(&repo_root)
     );

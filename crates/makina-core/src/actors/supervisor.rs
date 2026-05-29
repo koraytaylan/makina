@@ -152,6 +152,7 @@ use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::gate::{GateOutcome, GateRunner};
 use crate::merge::{MergeOutcome, SquashMerger};
+use crate::persist::persist_graph;
 use crate::state_machine::{TaskEvent, transition};
 use crate::supervision::{RestartConfig, RootSupervisor};
 use crate::task::{Task, TaskGraph, TaskId, TaskState};
@@ -454,6 +455,37 @@ impl DriverContext {
             gate_iterations,
             review_iterations,
         });
+    }
+
+    /// Snapshot the graph under the lock and write it to `.tasks/{slug}.json`
+    /// outside the lock (best-effort: logs on failure, never fails the run).
+    ///
+    /// # Design
+    ///
+    /// 1. Acquires the graph mutex for the minimal duration needed to clone the
+    ///    current state (a tight, non-awaiting critical section).
+    /// 2. Releases the lock **before** the async write, keeping the lock-hold
+    ///    span minimal (architecture invariant: no `.await` while holding the
+    ///    graph lock).
+    /// 3. Persists the clone via [`persist_graph`] with `repo_root` derived from
+    ///    the worktree manager.
+    /// 4. On any I/O error: logs a `tracing::warn!` and returns — the run
+    ///    continues unaffected (best-effort persistence).
+    async fn persist(&self) {
+        // Clone the graph under the lock (tight critical section; no await).
+        let snapshot = {
+            let g = self.graph.lock().await;
+            g.clone()
+        };
+        // Write outside the lock.
+        let repo_root = &self.worktree_manager.repo_root;
+        if let Err(e) = persist_graph(&snapshot, repo_root).await {
+            tracing::warn!(
+                slug = %snapshot.slug,
+                error = %e,
+                "supervisor: persist_graph failed (best-effort, run continues)"
+            );
+        }
     }
 }
 
@@ -865,6 +897,17 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
     // Once a fatal error is seen we stop *launching* but keep draining in-flight.
     let mut stop_launching = false;
 
+    // ── Seed persist: write the initial graph snapshot so the file exists from
+    // t=0 (best-effort; the lock is released before the write — no await while
+    // holding the graph mutex).
+    //
+    // The graph is guaranteed non-None here: the `take()` guard in the
+    // `RunReadyTasks` handler ensures `ctx.graph` is populated before the
+    // scheduler is entered.  This call creates `.tasks/{slug}.json` at run
+    // start, so the file is present even if every task is skipped or fails
+    // immediately.
+    ctx.persist().await;
+
     loop {
         // ── Cancellation: stop launching + abort everything in flight ──────────
         //
@@ -918,6 +961,9 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                         // Emit the New→Ready transition the scheduler just applied
                         // (outside the graph lock — the task is now `Ready`).
                         ctx.emit_task_state(&id, TaskState::Ready);
+                        // Persist the New→Ready advance (best-effort; lock already
+                        // released above).
+                        ctx.persist().await;
                         in_flight.insert(id.clone());
                         let driver_ctx = ctx.clone();
                         let driver_id = id.clone();
@@ -1018,6 +1064,8 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                         }
                     }
                 }; // guard dropped before emit.
+                // Persist WallClockCapReached → Failed (best-effort).
+                ctx.persist().await;
                 ctx.emit_task_state(&id, final_state);
                 outcomes.push((id, final_state));
             }
@@ -1165,7 +1213,9 @@ impl Drop for DriverGuard {
 /// `task_state_locked`, `apply_event_locked`, `task_clone_locked`, the
 /// iteration-count bumps, and the `mark_*` stamps each take the lock, do their
 /// synchronous work, and release it before the next await point.  This keeps the
-/// graph live for the future TUI without serializing the drivers.
+/// graph live for the future TUI without serializing the drivers.  Any new
+/// graph-mutation block must be followed by `ctx.persist().await` AFTER the lock
+/// guard is dropped, so on-disk state stays in sync with in-memory state.
 ///
 /// # Merge-lock span & lock ordering (no deadlock)
 ///
@@ -1238,6 +1288,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
             apply_event_locked(&mut graph, task_id, TaskEvent::DependenciesSatisfied)?;
         }
     } // graph guard dropped before any await.
+    // Persist New→Ready (if the task was New; no-op cost otherwise).
+    ctx.persist().await;
 
     // ── Step 2: create the worktree, then Ready → InProgress (Dispatched) ──────
     //
@@ -1252,6 +1304,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                 mark_finished_locked(&mut graph, task_id);
             }
+            // Persist Ready→Failed (best-effort; lock released above).
+            ctx.persist().await;
             // No worktree was created, so there is nothing to remove; mark the
             // guard so it does not attempt a redundant best-effort teardown.
             guard.worktree_removed = true;
@@ -1263,6 +1317,9 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
         apply_event_locked(&mut graph, task_id, TaskEvent::Dispatched)?;
         mark_started_locked(&mut graph, task_id);
     } // guard dropped before emit.
+    // Persist Ready→InProgress + started_at stamp (best-effort; lock released
+    // above).
+    ctx.persist().await;
     // Ready → InProgress (an intermediate transition; the scheduler owns the
     // terminal-state emission, the driver owns the intermediate ones — task 31).
     ctx.emit_task_state(task_id, TaskState::InProgress);
@@ -1321,6 +1378,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                     mark_finished_locked(&mut graph, task_id);
                 }
+                // Persist InReview→Failed (best-effort; lock released above).
+                ctx.persist().await;
                 remove_worktree(ctx, task_id).await;
                 guard.worktree_removed = true;
                 return Err(format!("reviewer dispatch failed for {task_id}: {e}"));
@@ -1368,6 +1427,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                             apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                             mark_finished_locked(&mut graph, task_id);
                         }
+                        // Persist InReview→Failed (best-effort; lock released above).
+                        ctx.persist().await;
                         remove_worktree(ctx, task_id).await;
                         guard.worktree_removed = true;
                         return Err(format!("squash-merge failed for {task_id}: {e}"));
@@ -1382,6 +1443,9 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                             apply_event_locked(&mut graph, task_id, TaskEvent::ReviewerApproved)?;
                             mark_finished_locked(&mut graph, task_id);
                         }
+                        // Persist InReview→Done + finished_at stamp (best-effort;
+                        // lock released above).
+                        ctx.persist().await;
                         // Tear down the worktree + branch (the work has landed).
                         remove_worktree(ctx, task_id).await;
                         guard.worktree_removed = true;
@@ -1404,6 +1468,9 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                             apply_event_locked(&mut graph, task_id, TaskEvent::MergeConflict)?;
                             mark_finished_locked(&mut graph, task_id);
                         }
+                        // Persist InReview→Failed (MergeConflict; best-effort; lock
+                        // released above).
+                        ctx.persist().await;
                         remove_worktree(ctx, task_id).await;
                         guard.worktree_removed = true;
                         terminal_state = TaskState::Failed;
@@ -1444,6 +1511,9 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                             review_iterations_locked(&graph, task_id)?,
                         )
                     }; // guard dropped before emit.
+                    // Persist InReview→Failed (ReviewCapReached; best-effort; lock
+                    // released above).
+                    ctx.persist().await;
                     // Emit the final iteration count (the terminal Failed state is
                     // emitted by the scheduler when this driver returns Ok(Failed)).
                     ctx.emit_task_iterations(task_id, gate_iters, review_iters);
@@ -1464,6 +1534,9 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         review_iterations_locked(&graph, task_id)?,
                     )
                 }; // guard dropped before emit.
+                // Persist InReview→InProgress + bumped review count (best-effort;
+                // lock released above).
+                ctx.persist().await;
                 // InReview → InProgress (intermediate) + the bumped review count.
                 ctx.emit_task_state(task_id, TaskState::InProgress);
                 ctx.emit_task_iterations(task_id, gate_iters, review_iters);
@@ -1531,6 +1604,8 @@ async fn develop_until_gates_pass(
                 apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                 mark_finished_locked(&mut graph, task_id);
             }
+            // Persist InProgress→Failed (best-effort; lock released above).
+            ctx.persist().await;
             remove_worktree(ctx, task_id).await;
             return Err(format!("developer dispatch failed for {task_id}: {e}"));
         }
@@ -1548,6 +1623,8 @@ async fn develop_until_gates_pass(
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::GatesPassed)?;
                 } // guard dropped before emit.
+                // Persist InProgress→InReview (best-effort; lock released above).
+                ctx.persist().await;
                 // InProgress → InReview (intermediate transition — task 31).
                 ctx.emit_task_state(task_id, TaskState::InReview);
                 return Ok(DevelopGateOutcome::ReadyForReview);
@@ -1568,6 +1645,9 @@ async fn develop_until_gates_pass(
                         review_iterations_locked(&graph, task_id)?,
                     )
                 }; // guard dropped before emit.
+                // Persist InProgress self-loop + bumped gate count (best-effort;
+                // lock released above).
+                ctx.persist().await;
                 // InProgress --GateFailed--> InProgress (self-loop) + the bumped
                 // gate count.  The TUI re-affirms InProgress and updates the
                 // counter (task 31).
@@ -1583,6 +1663,9 @@ async fn develop_until_gates_pass(
                         apply_event_locked(&mut graph, task_id, TaskEvent::GateCapReached)?;
                         mark_finished_locked(&mut graph, task_id);
                     }
+                    // Persist InProgress→Failed (GateCapReached; best-effort; lock
+                    // released above).
+                    ctx.persist().await;
                     remove_worktree(ctx, task_id).await;
                     return Ok(DevelopGateOutcome::GateCapReached);
                 }
@@ -1601,6 +1684,9 @@ async fn develop_until_gates_pass(
                     apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                     mark_finished_locked(&mut graph, task_id);
                 }
+                // Persist InProgress→Failed (gate launch HardError; best-effort;
+                // lock released above).
+                ctx.persist().await;
                 remove_worktree(ctx, task_id).await;
                 return Err(format!("gate launch failed for {task_id}: {e}"));
             }

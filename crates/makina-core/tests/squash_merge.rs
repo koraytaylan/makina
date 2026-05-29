@@ -491,10 +491,17 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
         "task/land-it branch must be gone after the run"
     );
 
-    // develop's working tree is clean.
+    // develop's working tree is clean (excluding .tasks/ which the supervisor
+    // persistence writes as an intentionally-untracked artifact).
+    let dirty: String = status_porcelain(&repo_root)
+        .lines()
+        .filter(|line| !line.contains(".tasks/"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        status_porcelain(&repo_root).is_empty(),
-        "develop must be clean after the run"
+        dirty.is_empty(),
+        "develop must be clean after the run; status:\n{}",
+        status_porcelain(&repo_root)
     );
 
     root.kill();

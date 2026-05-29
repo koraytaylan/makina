@@ -120,8 +120,11 @@ fn temp_path(repo_root: &Path, slug: &str) -> PathBuf {
 ///
 /// # Concurrency
 ///
-/// Callers are expected to serialize writes per slug (e.g. via a mutex); the
-/// unique temp filename prevents temp-path collisions regardless.
+/// Concurrent writes for the same slug are safe: each call writes to a unique
+/// temp file (distinct PID + sequence) and atomically renames it into place, so
+/// a reader always sees a complete, consistent snapshot.  Ordering is
+/// last-writer-wins, which is acceptable for this durability aid — no
+/// caller-side mutex is required.
 ///
 /// # Errors
 ///

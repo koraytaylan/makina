@@ -21,6 +21,7 @@ tokio-stream = { workspace = true, features = ["sync"] }
 # (task 31, run-control) to signal a background Supervisor scheduler to abort.
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
