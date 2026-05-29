@@ -69,6 +69,15 @@ pub enum AppEvent {
     /// Periodic tick — triggers a redraw without other state changes.
     Tick,
 
+    // ── Task-status view (task 29) ────────────────────────────────────────────
+    /// A full [`RunView`] (with its task list) was fetched from the api and
+    /// should be merged into [`App::runs`], replacing any placeholder entry.
+    ///
+    /// The async event layer calls `api.run(id).await` when a `RunOpened` event
+    /// arrives (or when the selection changes to a Run with no tasks yet) and
+    /// feeds the result back as this event so that [`App::update`] stays pure.
+    RunLoaded(RunView),
+
     // ── File browser (task 28) ────────────────────────────────────────────────
     //
     // Opening, navigating, and reading directories is IO; those reads live in
@@ -249,6 +258,23 @@ impl App {
             }
             AppEvent::Tick => {
                 // Tick drives the redraw loop; no state changes needed here.
+                true
+            }
+
+            // ── Task-status view (task 29) ────────────────────────────────────
+            AppEvent::RunLoaded(full_run) => {
+                // Replace or insert the RunView with the fully-populated one from
+                // the api.  If an entry with the same id already exists (i.e. the
+                // placeholder inserted by RunOpened), replace it in-place so the
+                // sidebar index / selection stays stable.
+                if let Some(existing) = self.runs.iter_mut().find(|r| r.id == full_run.id) {
+                    *existing = full_run;
+                } else {
+                    self.runs.push(full_run);
+                    if self.selected_run.is_none() {
+                        self.selected_run = Some(0);
+                    }
+                }
                 true
             }
 
@@ -840,6 +866,187 @@ mod tests {
         app.update(AppEvent::ApiEvent(ev));
         assert_eq!(app.runs[0].tasks[0].gate_iterations, 2);
         assert_eq!(app.runs[0].tasks[0].review_iterations, 1);
+    }
+
+    // ── Task-status view (task 29): RunLoaded ────────────────────────────────
+
+    /// `AppEvent::RunLoaded` with a full RunView replaces the placeholder entry.
+    #[test]
+    fn run_loaded_replaces_placeholder_with_full_run_view() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        // Start with a placeholder (empty tasks) inserted by RunOpened.
+        let placeholder = RunView {
+            id: RunId(42),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Pending,
+            tasks: vec![],
+        };
+        let mut app = App::new(api, vec![placeholder]);
+        assert!(
+            app.runs[0].tasks.is_empty(),
+            "placeholder should have no tasks"
+        );
+
+        // Now feed a RunLoaded event with the full RunView (with tasks).
+        let full_run = RunView {
+            id: RunId(42),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Pending,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("t1"),
+                    title: "First task".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("t2"),
+                    title: "Second task".into(),
+                    state: TaskState::New,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![TaskId::new("t1")],
+                },
+            ],
+        };
+        app.update(AppEvent::RunLoaded(full_run));
+
+        // The placeholder must be replaced (not appended).
+        assert_eq!(app.runs.len(), 1, "must still have exactly one run entry");
+        assert_eq!(
+            app.runs[0].tasks.len(),
+            2,
+            "tasks must be populated after RunLoaded"
+        );
+        assert_eq!(app.runs[0].tasks[0].id.0, "t1");
+        assert_eq!(app.runs[0].tasks[1].id.0, "t2");
+        // Selection must be stable.
+        assert_eq!(app.selected_run, Some(0));
+    }
+
+    /// `AppEvent::RunLoaded` for an unknown id inserts a new entry.
+    #[test]
+    fn run_loaded_inserts_new_run_when_id_unknown() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![]);
+        assert!(app.runs.is_empty());
+
+        let full_run = RunView {
+            id: RunId(7),
+            task_list_path: PathBuf::from(".tasks/new.json"),
+            status: RunStatus::Pending,
+            tasks: vec![TaskView {
+                id: TaskId::new("only"),
+                title: "Only task".into(),
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            }],
+        };
+        app.update(AppEvent::RunLoaded(full_run));
+
+        assert_eq!(app.runs.len(), 1);
+        assert_eq!(app.runs[0].tasks.len(), 1);
+        assert_eq!(app.selected_run, Some(0), "auto-selects first run");
+    }
+
+    /// `TaskStateChanged` updates the task state and recomputes the aggregate
+    /// `RunStatus`, keeping the sidebar badge consistent.
+    #[test]
+    fn task_state_changed_updates_state_and_aggregate_status() {
+        use makina_core::api::{Event, RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/x.json"),
+            status: RunStatus::Running,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("t1"),
+                    title: "Task 1".into(),
+                    state: TaskState::Done,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("t2"),
+                    title: "Task 2".into(),
+                    state: TaskState::InProgress,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        let mut app = App::new(api, vec![run]);
+
+        // Transition t2 to Done → all tasks Done → Completed.
+        app.update(AppEvent::ApiEvent(Event::TaskStateChanged {
+            run: RunId(1),
+            task: TaskId::new("t2"),
+            state: TaskState::Done,
+        }));
+
+        assert_eq!(
+            app.runs[0].tasks[1].state,
+            TaskState::Done,
+            "t2 state must be updated"
+        );
+        assert_eq!(
+            app.runs[0].status,
+            RunStatus::Completed,
+            "aggregate status must be Completed when all tasks Done"
+        );
+    }
+
+    /// `TaskIterationsUpdated` updates only the specified task's counters.
+    #[test]
+    fn task_iterations_updated_updates_only_targeted_task() {
+        use makina_core::api::{Event, RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/x.json"),
+            status: RunStatus::Running,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("t1"),
+                    title: "Task 1".into(),
+                    state: TaskState::InProgress,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("t2"),
+                    title: "Task 2".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        let mut app = App::new(api, vec![run]);
+
+        app.update(AppEvent::ApiEvent(Event::TaskIterationsUpdated {
+            run: RunId(1),
+            task: TaskId::new("t1"),
+            gate_iterations: 2,
+            review_iterations: 1,
+        }));
+
+        assert_eq!(app.runs[0].tasks[0].gate_iterations, 2, "t1 gate iters");
+        assert_eq!(app.runs[0].tasks[0].review_iterations, 1, "t1 review iters");
+        // t2 must be unchanged.
+        assert_eq!(app.runs[0].tasks[1].gate_iterations, 0, "t2 unchanged");
+        assert_eq!(app.runs[0].tasks[1].review_iterations, 0, "t2 unchanged");
     }
 
     // ── File browser update logic (task 28) ───────────────────────────────────

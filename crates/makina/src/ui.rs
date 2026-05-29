@@ -37,7 +37,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph,
+        Row, Table,
+    },
 };
 
 use crate::app::{App, Panel};
@@ -155,71 +158,157 @@ pub fn render(app: &App, frame: &mut Frame) {
         frame.render_stateful_widget(sidebar_list, sidebar_area, &mut list_state);
     }
 
-    // ── Main content ──────────────────────────────────────────────────────────
+    // ── Main content — per-task status view (task 29) ────────────────────────
     let main_focused = app.focused_panel == Panel::Main;
     let main_block = panel_block("Detail", main_focused);
 
-    // Placeholder: show selected run info, or a hint.
-    // Tasks 29–31 replace this with real task-status / prompt-answer widgets.
-    let main_content = match app.selected_run.and_then(|i| app.runs.get(i)) {
-        None => vec![
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "  Select a run from the sidebar.",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "  [Tab] — switch focus",
-                Style::default().fg(Color::DarkGray),
-            )]),
-            Line::from(vec![Span::styled(
-                "  [q / Esc / Ctrl-C] — quit",
-                Style::default().fg(Color::DarkGray),
-            )]),
-        ],
-        Some(run) => {
-            let mut lines = vec![
+    match app.selected_run() {
+        None => {
+            // No run selected: show a hint paragraph.
+            let hint_lines = vec![
                 Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  Select a run from the sidebar.",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  [Tab] — switch focus",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(vec![Span::styled(
+                    "  [q / Esc / Ctrl-C] — quit",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+            ];
+            let hint_para = Paragraph::new(hint_lines)
+                .block(main_block)
+                .style(Style::default().fg(Color::White));
+            frame.render_widget(hint_para, main_area);
+        }
+        Some(run) => {
+            // Split main_area inside the block: header lines + task table.
+            let inner = main_block.inner(main_area);
+            frame.render_widget(main_block, main_area);
+
+            // Header: run path and aggregate status.
+            let header_lines: Vec<Line> = vec![
                 Line::from(vec![
-                    Span::styled("  Run:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Run: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         run.task_list_path.display().to_string(),
                         Style::default().fg(Color::Cyan),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Status: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        format!("{:?}", run.status),
+                        status_label(&run.status),
                         Style::default().fg(status_color(&run.status)),
                     ),
+                    Span::styled(
+                        format!(
+                            "  ({} task{})",
+                            run.tasks.len(),
+                            if run.tasks.len() == 1 { "" } else { "s" }
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]),
-                Line::from(vec![Span::styled(
-                    format!("  Tasks:  {}", run.tasks.len()),
-                    Style::default().fg(Color::DarkGray),
-                )]),
                 Line::from(""),
             ];
-            // Task-list placeholder — task 29 (task-status-view) fills this in.
-            for task in &run.tasks {
-                lines.push(Line::from(vec![
-                    Span::styled("  • ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(task.title.clone(), Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("  [{:?}]", task.state),
-                        Style::default().fg(task_state_color(&task.state)),
-                    ),
-                ]));
-            }
-            lines
-        }
-    };
+            let header_height = header_lines.len() as u16;
 
-    let main_para = Paragraph::new(main_content)
-        .block(main_block)
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(main_para, main_area);
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(header_height), Constraint::Min(0)])
+                .split(inner);
+
+            let header_area = split[0];
+            let table_area = split[1];
+
+            let header_para = Paragraph::new(header_lines).style(Style::default().fg(Color::White));
+            frame.render_widget(header_para, header_area);
+
+            if run.tasks.is_empty() {
+                // Run opened but tasks not yet loaded (fetching in progress).
+                let waiting = Paragraph::new(Line::from(vec![Span::styled(
+                    "  Loading tasks…",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+                frame.render_widget(waiting, table_area);
+            } else {
+                // Build a Table with columns: Task | State | G: | R:
+                // Column widths: task title fills remainder; state fixed 12;
+                // gate and review counters fixed 6 each.
+                let col_title = Constraint::Min(10);
+                let col_state = Constraint::Length(12);
+                let col_gates = Constraint::Length(6);
+                let col_reviews = Constraint::Length(6);
+
+                let table_header = Row::new(vec![
+                    Cell::from("Task").style(
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                    Cell::from("State").style(
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                    Cell::from("G").style(
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                    Cell::from("R").style(
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                ]);
+
+                let rows: Vec<Row> = run
+                    .tasks
+                    .iter()
+                    .map(|task| {
+                        let (badge, badge_color) = task_state_badge(&task.state);
+                        Row::new(vec![
+                            Cell::from(task.title.clone()).style(Style::default().fg(Color::White)),
+                            Cell::from(badge).style(Style::default().fg(badge_color)),
+                            Cell::from(task.gate_iterations.to_string()).style(
+                                Style::default().fg(if task.gate_iterations > 0 {
+                                    Color::Yellow
+                                } else {
+                                    Color::DarkGray
+                                }),
+                            ),
+                            Cell::from(task.review_iterations.to_string()).style(
+                                Style::default().fg(if task.review_iterations > 0 {
+                                    Color::Yellow
+                                } else {
+                                    Color::DarkGray
+                                }),
+                            ),
+                        ])
+                    })
+                    .collect();
+
+                let task_table = Table::new(rows, [col_title, col_state, col_gates, col_reviews])
+                    .header(table_header)
+                    .row_highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .column_spacing(1);
+
+                frame.render_widget(task_table, table_area);
+            }
+        }
+    }
 
     // ── Status bar ────────────────────────────────────────────────────────────
     let focus_label = match app.focused_panel {
@@ -396,15 +485,32 @@ fn status_color(s: &makina_core::api::RunStatus) -> Color {
     }
 }
 
-fn task_state_color(s: &makina_core::api::TaskState) -> Color {
+/// Return a fixed-width status badge text and its display colour for a [`TaskState`].
+///
+/// Badge format is a short bracketed label (≤12 chars) consistent with the
+/// RunStatus badges in the sidebar.  Colours reuse the same palette as
+/// [`task_state_color`].
+fn task_state_badge(s: &makina_core::api::TaskState) -> (&'static str, Color) {
     use makina_core::api::TaskState;
     match s {
-        TaskState::New => Color::DarkGray,
-        TaskState::Ready => Color::White,
-        TaskState::InProgress => Color::Green,
-        TaskState::InReview => Color::Yellow,
-        TaskState::Done => Color::Cyan,
-        TaskState::Failed => Color::Red,
+        TaskState::New => ("[new]", Color::DarkGray),
+        TaskState::Ready => ("[ready]", Color::White),
+        TaskState::InProgress => ("[▶ working]", Color::Green),
+        TaskState::InReview => ("[⧗ review]", Color::Yellow),
+        TaskState::Done => ("[✓ done]", Color::Cyan),
+        TaskState::Failed => ("[✗ failed]", Color::Red),
+    }
+}
+
+/// Human-readable label for a [`RunStatus`] (used in the main-panel header).
+fn status_label(s: &makina_core::api::RunStatus) -> &'static str {
+    use makina_core::api::RunStatus;
+    match s {
+        RunStatus::Pending => "Pending",
+        RunStatus::Running => "Running",
+        RunStatus::Paused => "Paused",
+        RunStatus::Completed => "Completed",
+        RunStatus::Failed => "Failed",
     }
 }
 
@@ -880,6 +986,269 @@ mod tests {
         assert!(
             !screen.contains("Open task list"),
             "browser overlay must not render in Normal mode"
+        );
+    }
+
+    // ── Task-status view (task 29) ────────────────────────────────────────────
+
+    /// Build an `App` with one selected run that has varied task states and
+    /// non-zero iteration counts — used by the per-task status-view render tests.
+    fn task_status_app() -> App {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/status-test.json"),
+            status: RunStatus::Running,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("alpha"),
+                    title: "Alpha task".into(),
+                    state: TaskState::Done,
+                    gate_iterations: 0,
+                    review_iterations: 2,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("beta"),
+                    title: "Beta task".into(),
+                    state: TaskState::InProgress,
+                    gate_iterations: 1,
+                    review_iterations: 0,
+                    depends_on: vec![TaskId::new("alpha")],
+                },
+                TaskView {
+                    id: TaskId::new("gamma"),
+                    title: "Gamma task".into(),
+                    state: TaskState::New,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![TaskId::new("beta")],
+                },
+                TaskView {
+                    id: TaskId::new("delta"),
+                    title: "Delta task".into(),
+                    state: TaskState::Failed,
+                    gate_iterations: 3,
+                    review_iterations: 1,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        App::new(api, vec![run])
+    }
+
+    /// Render the task-status view and assert all task titles appear.
+    #[test]
+    fn render_task_status_shows_all_task_titles() {
+        let mut terminal = make_terminal(120, 30);
+        let app = task_status_app();
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(screen.contains("Alpha task"), "should show 'Alpha task'");
+        assert!(screen.contains("Beta task"), "should show 'Beta task'");
+        assert!(screen.contains("Gamma task"), "should show 'Gamma task'");
+        assert!(screen.contains("Delta task"), "should show 'Delta task'");
+    }
+
+    /// State badges for each TaskState variant must appear in the rendered output.
+    #[test]
+    fn render_task_status_shows_state_badges() {
+        let mut terminal = make_terminal(120, 30);
+        let app = task_status_app();
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // done badge
+        assert!(screen.contains("done"), "Done badge must appear");
+        // working/InProgress badge
+        assert!(screen.contains("working"), "InProgress badge must appear");
+        // new badge
+        assert!(screen.contains("new"), "New badge must appear");
+        // failed badge
+        assert!(screen.contains("failed"), "Failed badge must appear");
+    }
+
+    /// Non-zero gate and review iteration counts must appear in the rendered output.
+    #[test]
+    fn render_task_status_shows_iteration_counts() {
+        let mut terminal = make_terminal(120, 30);
+        let app = task_status_app();
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Beta task has gate_iterations=1; Delta has gate_iterations=3.
+        assert!(screen.contains('1'), "gate iteration count 1 must appear");
+        assert!(screen.contains('3'), "gate iteration count 3 must appear");
+        // Alpha task has review_iterations=2.
+        assert!(screen.contains('2'), "review iteration count 2 must appear");
+    }
+
+    /// Done-state badge must use Cyan foreground; Failed must use Red.
+    #[test]
+    fn render_task_status_badge_colors() {
+        let mut terminal = make_terminal(120, 30);
+        let app = task_status_app();
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Cyan for Done.
+        let has_cyan = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Cyan);
+        assert!(has_cyan, "Done badge must use Cyan foreground");
+
+        // Red for Failed.
+        let has_red = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Red);
+        assert!(has_red, "Failed badge must use Red foreground");
+
+        // Green for InProgress.
+        let has_green = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Green);
+        assert!(has_green, "InProgress badge must use Green foreground");
+    }
+
+    /// When no run is selected the main panel must show the hint text.
+    #[test]
+    fn render_no_run_selected_shows_hint() {
+        let mut terminal = make_terminal(120, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![]);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Select a run"),
+            "no-run state must show 'Select a run' hint"
+        );
+    }
+
+    /// When a run is selected but has no tasks yet (placeholder) the panel
+    /// must show the "Loading tasks…" hint rather than an empty table.
+    #[test]
+    fn render_run_with_no_tasks_shows_loading_hint() {
+        let mut terminal = make_terminal(120, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = makina_core::api::RunView {
+            id: makina_core::api::RunId(1),
+            task_list_path: PathBuf::from(".tasks/empty-run.json"),
+            status: makina_core::api::RunStatus::Pending,
+            tasks: vec![],
+        };
+        let app = App::new(api, vec![run]);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Loading tasks"),
+            "run with no tasks must show 'Loading tasks' hint"
+        );
+    }
+
+    /// **Live update (done-when):** Feed `TaskStateChanged` and
+    /// `TaskIterationsUpdated` events through `App::update` and assert the
+    /// main panel reflects the new state and counts.
+    ///
+    /// This proves "task states update in the TUI as the loop progresses."
+    #[test]
+    fn live_update_task_state_and_iterations_reflect_in_panel() {
+        use crate::app::AppEvent;
+        use makina_core::api::{Event, RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+
+        let mut terminal = make_terminal(120, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        // Start with one task in New state, zero iterations.
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/live.json"),
+            status: RunStatus::Pending,
+            tasks: vec![TaskView {
+                id: TaskId::new("live-task"),
+                title: "Live task".into(),
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            }],
+        };
+        let mut app = App::new(api, vec![run]);
+
+        // Feed TaskStateChanged: New → InProgress.
+        app.update(AppEvent::ApiEvent(Event::TaskStateChanged {
+            run: RunId(1),
+            task: TaskId::new("live-task"),
+            state: TaskState::InProgress,
+        }));
+
+        // Feed TaskIterationsUpdated: gate=1, review=0.
+        app.update(AppEvent::ApiEvent(Event::TaskIterationsUpdated {
+            run: RunId(1),
+            task: TaskId::new("live-task"),
+            gate_iterations: 1,
+            review_iterations: 0,
+        }));
+
+        // Render and assert the InProgress badge and gate count appear.
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Live task"),
+            "task title must appear after update"
+        );
+        assert!(
+            screen.contains("working"),
+            "InProgress badge must appear after TaskStateChanged"
+        );
+        // '1' is the gate iteration count.
+        assert!(
+            screen.contains('1'),
+            "gate iteration count must appear after TaskIterationsUpdated"
+        );
+
+        // Now transition to Done and update review iterations.
+        app.update(AppEvent::ApiEvent(Event::TaskStateChanged {
+            run: RunId(1),
+            task: TaskId::new("live-task"),
+            state: TaskState::Done,
+        }));
+        app.update(AppEvent::ApiEvent(Event::TaskIterationsUpdated {
+            run: RunId(1),
+            task: TaskId::new("live-task"),
+            gate_iterations: 1,
+            review_iterations: 2,
+        }));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen2 = screen_of(&terminal);
+
+        assert!(
+            screen2.contains("done"),
+            "Done badge must appear after state transition to Done"
+        );
+        assert!(
+            screen2.contains('2'),
+            "review iteration count 2 must appear after update"
+        );
+        // Run aggregate status must also have updated to Completed.
+        assert_eq!(
+            app.runs[0].status,
+            makina_core::api::RunStatus::Completed,
+            "aggregate RunStatus must be Completed when all tasks are Done"
         );
     }
 }

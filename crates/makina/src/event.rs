@@ -96,7 +96,7 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> std::io::Result<()> {
 
             maybe_api = api_stream.next() => {
                 match maybe_api {
-                    Some(ev) => Some(AppEvent::ApiEvent(ev)),
+                    Some(ev) => Some(resolve_api_event(&app.api, ev).await),
                     // api stream ended → orchestrator shut down; quit cleanly.
                     None => Some(AppEvent::Quit),
                 }
@@ -125,6 +125,35 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+// ── Api event resolution (task 29: task-status-view) ─────────────────────────
+
+/// Resolve a core api [`makina_core::api::Event`] into an [`AppEvent`].
+///
+/// For most events this is just a direct `AppEvent::ApiEvent` wrap.  The
+/// special case is [`makina_core::api::Event::RunOpened`]: when a Run is
+/// first opened the event carries only the `RunId` and `task_list_path` —
+/// NOT the task list.  So we immediately call `api.run(id).await` to fetch
+/// the full [`RunView`] (with its tasks) and return it as
+/// [`AppEvent::RunLoaded`].  This keeps `App::update` pure (no async) while
+/// ensuring the task-status panel has data to render as soon as a Run opens.
+///
+/// If `api.run(id)` returns `None` (race between open and cancel) we fall
+/// back to a plain `AppEvent::ApiEvent(RunOpened{..})` so the placeholder
+/// entry is still created — the panel will show "no tasks yet" until the run
+/// appears.
+async fn resolve_api_event(
+    api: &std::sync::Arc<dyn makina_core::api::Api>,
+    ev: makina_core::api::Event,
+) -> AppEvent {
+    use makina_core::api::Event;
+    if let Event::RunOpened { run, .. } = &ev
+        && let Some(full_run) = api.run(*run).await
+    {
+        return AppEvent::RunLoaded(full_run);
+    }
+    AppEvent::ApiEvent(ev)
 }
 
 // ── File-browser IO ─────────────────────────────────────────────────────────────
@@ -611,5 +640,146 @@ mod tests {
             "the opened Run must appear in app.runs via the RunOpened event"
         );
         assert_eq!(app.runs[0].task_list_path, file_path);
+    }
+
+    // ── Task-population test (task 29): RunOpened → api.run() → RunLoaded ─────
+
+    /// **Task population:** When a `RunOpened` core event is received by
+    /// `resolve_api_event`, it must call `api.run(id).await` and return an
+    /// `AppEvent::RunLoaded` carrying the full `RunView` (with tasks).
+    ///
+    /// This proves the async data-flow: `Event::RunOpened` → `resolve_api_event`
+    /// → fetch full `RunView` → `AppEvent::RunLoaded` → `App::update` → tasks
+    /// populated in `app.runs`.
+    #[tokio::test]
+    async fn run_opened_event_resolves_to_run_loaded_with_tasks() {
+        use crate::app::{App, AppEvent};
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::api::{
+            Event as CoreEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+        use std::sync::Arc;
+
+        // Seed the PlaceholderApi with a run that already has tasks (simulates
+        // what CoreApi returns from `api.run(id)`).
+        let _api = Arc::new(PlaceholderApi::empty());
+        // Manually push a RunView with tasks into the PlaceholderApi so that
+        // `api.run(id)` returns it.
+        {
+            let run = RunView {
+                id: RunId(5),
+                task_list_path: std::path::PathBuf::from(".tasks/pop.json"),
+                status: RunStatus::Pending,
+                tasks: vec![
+                    TaskView {
+                        id: TaskId::new("first"),
+                        title: "First task".into(),
+                        state: TaskState::Ready,
+                        gate_iterations: 0,
+                        review_iterations: 0,
+                        depends_on: vec![],
+                    },
+                    TaskView {
+                        id: TaskId::new("second"),
+                        title: "Second task".into(),
+                        state: TaskState::New,
+                        gate_iterations: 0,
+                        review_iterations: 0,
+                        depends_on: vec![TaskId::new("first")],
+                    },
+                ],
+            };
+            // Use execute(OpenRun) is not ideal here since it creates an empty run;
+            // instead we directly call the public `execute` and rely on the test
+            // seeding approach — OR we use PlaceholderApi::execute(OpenRun) then
+            // observe the side effect. Since PlaceholderApi::execute(OpenRun)
+            // creates a run with empty tasks, we can't easily seed tasks through it.
+            //
+            // Instead, we create a stub using the `CoreApi` via tempfile (the
+            // real path), which correctly interprets the task list and exposes
+            // tasks via `api.run(id)`.  We test only the resolve_api_event step.
+            //
+            // For this unit test, we construct the api separately so we can
+            // directly verify the resolve_api_event path. We use PlaceholderApi
+            // with a workaround: call execute to register the run, then it won't
+            // have tasks (empty PlaceholderApi behaviour). We still verify the
+            // resolve path returns RunLoaded regardless of empty tasks.
+            let _ = run; // The reasoning is documented above; see the CoreApi test below.
+        }
+
+        // Use the real CoreApi for a proper end-to-end population test.
+        use makina_core::dependency::EdgeInferrer;
+        use makina_core::interpreter::StructuredTextInterpreter;
+        use makina_core::orchestrator::CoreApi;
+
+        let source = "# Pop Test\n\nPreamble.\n\n---\n\n## 0001 — S\n\n\
+### first — First task\nDoes something.\n- **Depends on:** —\n\
+- **Done when:** done.\n\n\
+### second — Second task\nDoes more.\n- **Depends on:** first\n\
+- **Done when:** done too.\n";
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("pop-test.md");
+        std::fs::write(&file_path, source).unwrap();
+
+        let interpreter = Arc::new(EdgeInferrer::new(
+            Arc::new(StructuredTextInterpreter::new()),
+        ));
+        let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::new(interpreter));
+
+        // Subscribe BEFORE the execute to capture the RunOpened broadcast.
+        let mut sub = api.subscribe();
+
+        // Open the run — CoreApi interprets it and exposes tasks via api.run(id).
+        let outcome = api
+            .execute(makina_core::api::Command::OpenRun {
+                task_list_path: file_path.clone(),
+            })
+            .await
+            .expect("OpenRun must succeed");
+        let run_id = match outcome {
+            makina_core::api::CommandOutcome::RunOpened { run } => run,
+            _ => panic!("unexpected outcome"),
+        };
+
+        // Drain the RunOpened event from the subscription.
+        let core_ev = tokio::time::timeout(std::time::Duration::from_secs(1), sub.next())
+            .await
+            .expect("timed out waiting for RunOpened event")
+            .expect("stream ended unexpectedly");
+        assert!(matches!(core_ev, CoreEvent::RunOpened { .. }));
+
+        // NOW invoke resolve_api_event — this is the function under test.
+        // It should call api.run(run_id) and return AppEvent::RunLoaded with tasks.
+        let resolved = resolve_api_event(&api, core_ev).await;
+
+        match &resolved {
+            AppEvent::RunLoaded(full_run) => {
+                assert_eq!(
+                    full_run.id, run_id,
+                    "RunLoaded must carry the correct RunId"
+                );
+                assert!(
+                    !full_run.tasks.is_empty(),
+                    "RunLoaded must carry the populated task list"
+                );
+            }
+            other => panic!("expected AppEvent::RunLoaded, got {:?}", other),
+        }
+
+        // Apply to App — verifies the full pipeline end-to-end.
+        let mut app = App::new(Arc::clone(&api), vec![]);
+        app.update(resolved);
+
+        assert_eq!(
+            app.runs.len(),
+            1,
+            "app.runs must have one entry after RunLoaded"
+        );
+        let loaded = app.selected_run().expect("first run must be selected");
+        assert_eq!(loaded.id, run_id);
+        assert!(
+            !loaded.tasks.is_empty(),
+            "selected_run().tasks must be non-empty after RunLoaded"
+        );
     }
 }
