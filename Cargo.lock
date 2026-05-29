@@ -830,6 +830,7 @@ dependencies = [
  "makina-acp",
  "makina-core",
  "ratatui",
+ "tempfile",
  "tokio",
  "tokio-stream",
 ]
@@ -862,6 +863,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "toml",
 ]
 

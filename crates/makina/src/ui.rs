@@ -34,15 +34,18 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph},
 };
 
 use crate::app::{App, Panel};
 
 /// Render the full TUI layout into `frame`.
+///
+/// When the modal file browser is active ([`App::is_browsing`]) it is drawn as
+/// an overlay on top of the normal layout (task 28).
 pub fn render(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
@@ -227,10 +230,122 @@ pub fn render(app: &App, frame: &mut Frame) {
         None => String::new(),
         Some(ev) => format!("  │  last: {}", event_short_name(ev)),
     };
-    let status_text = format!(" [Tab] switch panel  [q/Esc/^C] quit  {focus_label}{event_hint}");
+    let status_text =
+        format!(" [o] open  [Tab] switch panel  [q/Esc/^C] quit  {focus_label}{event_hint}");
     let status_bar =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     frame.render_widget(status_bar, status_area);
+
+    // ── File-browser overlay ────────────────────────────────────────────────────
+    // Drawn LAST so it sits on top of the normal layout (task 28).
+    if app.is_browsing()
+        && let Some(browser) = app.browser.as_ref()
+    {
+        render_file_browser(browser, frame, area);
+    }
+}
+
+/// Render the modal file browser overlay centred within `area`.
+///
+/// Shows the current directory in the title, one row per [`crate::browser::DirEntry`]
+/// (directories suffixed with `/`), the highlighted selection, and a footer of
+/// key hints.  Drawn over a [`Clear`]ed region so the underlying layout does not
+/// bleed through.
+fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame, area: Rect) {
+    // Centre a box ~80% wide / 80% tall.
+    let popup = centered_rect(80, 80, area);
+
+    // Clear the region first so the popup is opaque.
+    frame.render_widget(Clear, popup);
+
+    let title = format!(" Open task list — {} ", browser.cwd.display());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Magenta))
+        .padding(Padding::horizontal(1));
+
+    // Split the popup into a list area + a 1-row footer of hints.
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let list_area = chunks[0];
+    let footer_area = chunks[1];
+
+    if browser.entries.is_empty() {
+        let empty = Paragraph::new(Line::from(vec![Span::styled(
+            "(empty directory)",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        frame.render_widget(empty, list_area);
+    } else {
+        let items: Vec<ListItem> = browser
+            .entries
+            .iter()
+            .map(|entry| {
+                let (icon, name_color) = if entry.is_dir {
+                    ("▸ ", Color::Cyan)
+                } else {
+                    ("  ", Color::White)
+                };
+                let suffix = if entry.is_dir { "/" } else { "" };
+                let line = Line::from(vec![
+                    Span::styled(icon, Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}{}", entry.name, suffix),
+                        Style::default().fg(name_color),
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+
+        let highlight_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+
+        let list = List::new(items)
+            .highlight_style(highlight_style)
+            .highlight_symbol("▶ ");
+
+        let mut state = ListState::default();
+        state.select(Some(browser.selected));
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "[Enter] open/enter  [Backspace] up  [↑↓/jk] move  [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(footer, footer_area);
+}
+
+/// Compute a [`Rect`] centred within `area`, sized to `percent_x` × `percent_y`
+/// of it.  Used to position the modal file-browser popup.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -630,6 +745,141 @@ mod tests {
         assert!(
             screen_main.contains("focus: main"),
             "status bar should say 'focus: main' when Main is focused"
+        );
+    }
+
+    // ── File browser overlay (task 28) ────────────────────────────────────────
+
+    use crate::app::Mode;
+    use crate::browser::{DirEntry, FileBrowser};
+
+    fn browsing_app(entries: Vec<DirEntry>, selected: usize) -> App {
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![]);
+        app.mode = Mode::FileBrowser;
+        let mut browser = FileBrowser::new(PathBuf::from("/home/user/project"), entries);
+        browser.selected = selected;
+        app.browser = Some(browser);
+        app
+    }
+
+    fn screen_of(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn render_file_browser_lists_entries_and_dir_marker() {
+        let mut terminal = make_terminal(100, 30);
+        let app = browsing_app(
+            vec![
+                DirEntry {
+                    name: "..".into(),
+                    path: PathBuf::from("/home/user"),
+                    is_dir: true,
+                },
+                DirEntry {
+                    name: "src".into(),
+                    path: PathBuf::from("/home/user/project/src"),
+                    is_dir: true,
+                },
+                DirEntry {
+                    name: "my-feature.md".into(),
+                    path: PathBuf::from("/home/user/project/my-feature.md"),
+                    is_dir: false,
+                },
+            ],
+            0,
+        );
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The popup title shows the current directory.
+        assert!(
+            screen.contains("Open task list"),
+            "browser title must be shown"
+        );
+        // Directory entries render with a trailing slash; files do not.
+        assert!(
+            screen.contains("src/"),
+            "directory entry should show 'src/'"
+        );
+        assert!(
+            screen.contains("my-feature.md"),
+            "file entry should be listed"
+        );
+        // Footer key hints.
+        assert!(
+            screen.contains("Enter"),
+            "browser footer should mention Enter"
+        );
+    }
+
+    #[test]
+    fn render_file_browser_highlights_selection() {
+        let mut terminal = make_terminal(100, 30);
+        // Select the second entry.
+        let app = browsing_app(
+            vec![
+                DirEntry {
+                    name: "alpha".into(),
+                    path: PathBuf::from("/home/user/project/alpha"),
+                    is_dir: true,
+                },
+                DirEntry {
+                    name: "beta.md".into(),
+                    path: PathBuf::from("/home/user/project/beta.md"),
+                    is_dir: false,
+                },
+            ],
+            1,
+        );
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The highlighted row uses a Magenta background in our palette.
+        let has_highlight = buf
+            .content()
+            .iter()
+            .any(|cell| cell.bg == ratatui::style::Color::Magenta);
+        assert!(
+            has_highlight,
+            "selected browser row must use the Magenta highlight background"
+        );
+    }
+
+    #[test]
+    fn render_file_browser_empty_directory_shows_hint() {
+        let mut terminal = make_terminal(80, 24);
+        let app = browsing_app(vec![], 0);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("empty directory"),
+            "empty browser must show an '(empty directory)' hint"
+        );
+    }
+
+    #[test]
+    fn normal_mode_does_not_render_browser() {
+        // Without browsing, the browser title must NOT appear.
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![]);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            !screen.contains("Open task list"),
+            "browser overlay must not render in Normal mode"
         );
     }
 }

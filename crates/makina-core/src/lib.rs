@@ -13,6 +13,7 @@ pub mod dependency;
 pub mod gate;
 pub mod interpreter;
 pub mod merge;
+pub mod orchestrator;
 pub mod roles;
 pub mod state_machine;
 pub mod supervision;

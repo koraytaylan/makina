@@ -85,12 +85,13 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> std::io::Result<()> {
     tui.draw(|frame| ui::render(app, frame))?;
 
     loop {
+        let browsing = app.is_browsing();
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
             biased;
 
             maybe_term = term_rx.recv() => {
-                maybe_term.map(translate_terminal_event)
+                maybe_term.map(|ev| translate_terminal_event(ev, browsing))
             }
 
             maybe_api = api_stream.next() => {
@@ -107,6 +108,12 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> std::io::Result<()> {
         };
 
         if let Some(event) = app_event {
+            // Browser IO events (open / enter dir / parent / select file) require
+            // filesystem reads or an async `execute`; resolve them here, in the
+            // IO layer, into the concrete state-mutating event that `update`
+            // consumes.  This keeps `App::update` pure.
+            let event = resolve_browser_io(app, event).await;
+
             let needs_redraw = app.update(event);
             if app.should_quit {
                 break;
@@ -120,37 +127,165 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── File-browser IO ─────────────────────────────────────────────────────────────
+
+/// Resolve a file-browser intent event into a concrete state-mutating event by
+/// performing the necessary IO (directory reads / `api.execute(OpenRun)`).
+///
+/// Non-browser events (and browser events that need no IO, e.g. navigation) pass
+/// through unchanged.  This is the single place where the file browser touches
+/// the filesystem and the api; [`App::update`] never does.
+///
+/// Returns the event that should be fed to [`App::update`]:
+/// - [`AppEvent::OpenBrowser`] → read the CWD → [`AppEvent::BrowserOpened`]
+///   (or [`AppEvent::Tick`] if the CWD can't be read).
+/// - [`AppEvent::BrowserActivate`] on a directory → read it →
+///   [`AppEvent::BrowserOpened`]; on a file → `execute(OpenRun)` →
+///   [`AppEvent::CloseBrowser`].
+/// - [`AppEvent::BrowserParent`] → read the parent dir → [`AppEvent::BrowserOpened`].
+async fn resolve_browser_io(app: &App, event: AppEvent) -> AppEvent {
+    match event {
+        AppEvent::OpenBrowser => {
+            // Start from the process CWD (fall back to "." if unavailable).
+            let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            read_dir_event(&start).await
+        }
+        AppEvent::BrowserParent => match app.browser.as_ref().and_then(|b| b.parent()) {
+            Some(parent) => read_dir_event(parent).await,
+            // Already at the root — nothing to do; just redraw.
+            None => AppEvent::Tick,
+        },
+        AppEvent::BrowserActivate => {
+            match app.browser.as_ref().and_then(|b| b.selected_entry()) {
+                Some(entry) if entry.is_dir => read_dir_event(&entry.path).await,
+                Some(entry) => {
+                    // It's a file: open a Run for it, then close the browser.
+                    // We ignore the outcome here — the resulting `RunOpened`
+                    // event flows back through `api.subscribe()` and updates the
+                    // sidebar; an error is surfaced via the api's event stream /
+                    // future status handling (task 31).
+                    let _ = app
+                        .api
+                        .execute(makina_core::api::Command::OpenRun {
+                            task_list_path: entry.path.clone(),
+                        })
+                        .await;
+                    AppEvent::CloseBrowser
+                }
+                // No selection (empty dir) — ignore.
+                None => AppEvent::Tick,
+            }
+        }
+        // Everything else passes straight through.
+        other => other,
+    }
+}
+
+/// Read `dir` and build a [`AppEvent::BrowserOpened`] event from its entries.
+///
+/// Entries are sorted directories-first, then alphabetically (case-insensitive),
+/// so the listing is stable and predictable.  A `..` parent entry is prepended
+/// when `dir` has a parent, giving a visible "go up" affordance.  On a read
+/// error the browser is still opened on `dir` with an empty listing (so the user
+/// can back out) rather than failing silently.
+async fn read_dir_event(dir: &std::path::Path) -> AppEvent {
+    use crate::browser::DirEntry;
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+
+    // Prepend a ".." entry when a parent exists.
+    if let Some(parent) = dir.parent() {
+        entries.push(DirEntry {
+            name: "..".to_string(),
+            path: parent.to_path_buf(),
+            is_dir: true,
+        });
+    }
+
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        let mut items: Vec<DirEntry> = Vec::new();
+        while let Ok(Some(de)) = rd.next_entry().await {
+            let path = de.path();
+            let name = de.file_name().to_string_lossy().to_string();
+            // Skip hidden dotfiles to keep the listing focused (the `..` entry
+            // above is added explicitly).
+            if name.starts_with('.') {
+                continue;
+            }
+            let is_dir = de.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
+            items.push(DirEntry { name, path, is_dir });
+        }
+        // Directories first, then case-insensitive name order.
+        items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        entries.extend(items);
+    }
+
+    AppEvent::BrowserOpened {
+        dir: dir.to_path_buf(),
+        entries,
+    }
+}
+
 // ── Translation helpers ───────────────────────────────────────────────────────
 
 /// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
 ///
-/// Returns `None` for events the scaffold doesn't handle yet (e.g. mouse
-/// events); those are silently dropped.
-fn translate_terminal_event(ev: CrosstermEvent) -> AppEvent {
+/// `browsing` selects the keymap: the modal file browser (task 28) captures
+/// navigation keys (Enter / Backspace / Esc) differently from the normal view.
+///
+/// Returns [`AppEvent::Tick`] for events the TUI doesn't handle (e.g. mouse
+/// events); those simply trigger a harmless redraw.
+fn translate_terminal_event(ev: CrosstermEvent, browsing: bool) -> AppEvent {
     match ev {
-        // Quit keys
-        CrosstermEvent::Key(key) => translate_key(key),
+        CrosstermEvent::Key(key) => translate_key(key, browsing),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse, paste, focus, etc. — ignored for now (task 31 may handle some).
         _ => AppEvent::Tick,
     }
 }
 
-fn translate_key(key: crossterm::event::KeyEvent) -> AppEvent {
+/// Translate a key press into an [`AppEvent`], honouring the current view mode.
+fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
     if key.kind != KeyEventKind::Press {
         return AppEvent::Tick;
     }
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::Quit,
-        KeyCode::Esc => AppEvent::Quit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => AppEvent::Quit,
-        KeyCode::Tab => AppEvent::FocusNext,
-        // Sidebar navigation: arrow keys and vim-style j/k.
-        KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
-        KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
-        _ => AppEvent::Tick,
+
+    // Ctrl-C always quits, in any mode.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return AppEvent::Quit;
+    }
+
+    if browsing {
+        // ── File-browser keymap ──────────────────────────────────────────────
+        // Esc closes the browser (does NOT quit the app); Enter activates the
+        // selection; Backspace goes to the parent dir; j/k/arrows navigate.
+        match key.code {
+            KeyCode::Esc => AppEvent::CloseBrowser,
+            KeyCode::Enter => AppEvent::BrowserActivate,
+            KeyCode::Backspace => AppEvent::BrowserParent,
+            KeyCode::Up | KeyCode::Char('k') => AppEvent::BrowserUp,
+            KeyCode::Down | KeyCode::Char('j') => AppEvent::BrowserDown,
+            _ => AppEvent::Tick,
+        }
+    } else {
+        // ── Normal keymap ────────────────────────────────────────────────────
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::Quit,
+            KeyCode::Esc => AppEvent::Quit,
+            KeyCode::Tab => AppEvent::FocusNext,
+            // Open the file browser to pick a task list.
+            KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
+            // Sidebar navigation: arrow keys and vim-style j/k.
+            KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
+            KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
+            _ => AppEvent::Tick,
+        }
     }
 }
 
@@ -173,25 +308,37 @@ mod tests {
     #[test]
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::Quit));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::Quit
+        ));
     }
 
     #[test]
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::Quit));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::Quit
+        ));
     }
 
     #[test]
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::Quit));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::Quit
+        ));
     }
 
     #[test]
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::FocusNext));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::FocusNext
+        ));
     }
 
     #[test]
@@ -204,14 +351,17 @@ mod tests {
             kind: KeyEventKind::Release,
             state: KeyEventState::NONE,
         });
-        assert!(matches!(translate_terminal_event(ev), AppEvent::Tick));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::Tick
+        ));
     }
 
     #[test]
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(ev),
+            translate_terminal_event(ev, false),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -219,25 +369,104 @@ mod tests {
     #[test]
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectUp));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::SelectUp
+        ));
     }
 
     #[test]
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectDown));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::SelectDown
+        ));
     }
 
     #[test]
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectUp));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::SelectUp
+        ));
     }
 
     #[test]
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectDown));
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::SelectDown
+        ));
+    }
+
+    // ── File-browser keymap (task 28) ─────────────────────────────────────────
+
+    #[test]
+    fn o_key_opens_browser_in_normal_mode() {
+        let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::OpenBrowser
+        ));
+    }
+
+    #[test]
+    fn enter_in_browser_activates_selection() {
+        let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, true),
+            AppEvent::BrowserActivate
+        ));
+    }
+
+    #[test]
+    fn esc_in_browser_closes_not_quits() {
+        let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
+        // In browser mode, Esc must close the browser, NOT quit the app.
+        assert!(matches!(
+            translate_terminal_event(ev, true),
+            AppEvent::CloseBrowser
+        ));
+    }
+
+    #[test]
+    fn backspace_in_browser_goes_to_parent() {
+        let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, true),
+            AppEvent::BrowserParent
+        ));
+    }
+
+    #[test]
+    fn jk_in_browser_navigate_browser_not_sidebar() {
+        let down = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(down, true),
+            AppEvent::BrowserDown
+        ));
+        let up = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(up, true),
+            AppEvent::BrowserUp
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_in_browser_mode() {
+        let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(translate_terminal_event(ev, true), AppEvent::Quit));
+    }
+
+    #[test]
+    fn q_in_browser_is_not_quit() {
+        // `q` is a normal-mode quit key; inside the browser it must not quit
+        // (it falls through to Tick so the user can keep browsing).
+        let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(matches!(translate_terminal_event(ev, true), AppEvent::Tick));
     }
 
     /// Verify the full quit path: translate key → update App → should_quit.
@@ -250,7 +479,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![]);
 
-        let ev = translate_terminal_event(key_press(KeyCode::Char('q'), KeyModifiers::NONE));
+        let ev = translate_terminal_event(key_press(KeyCode::Char('q'), KeyModifiers::NONE), false);
         app.update(ev);
         assert!(app.should_quit);
     }
@@ -276,5 +505,111 @@ mod tests {
         assert_eq!(app.runs.len(), 1);
         assert_eq!(app.runs[0].id, RunId(42));
         assert_eq!(app.runs[0].status, RunStatus::Pending);
+    }
+
+    // ── File-browser IO resolution (task 28) ──────────────────────────────────
+
+    /// `resolve_browser_io(OpenBrowser)` reads the CWD and yields a
+    /// `BrowserOpened` event with entries (the makina crate dir always has
+    /// `src/` + `Cargo.toml`).
+    #[tokio::test]
+    async fn open_browser_io_reads_cwd_entries() {
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![]);
+
+        let resolved = resolve_browser_io(&app, AppEvent::OpenBrowser).await;
+        match resolved {
+            AppEvent::BrowserOpened { entries, .. } => {
+                assert!(
+                    !entries.is_empty(),
+                    "CWD listing should be non-empty (has a `..` entry at minimum)"
+                );
+            }
+            other => panic!("expected BrowserOpened, got {other:?}"),
+        }
+    }
+
+    /// **TUI ↔ CoreApi flow (the done-when through the event layer).**
+    ///
+    /// Drive the exact event-loop step that opens a file against the REAL
+    /// `CoreApi`: set up a browser whose selection is a sample task-list file,
+    /// call `resolve_browser_io(BrowserActivate)` (which performs
+    /// `api.execute(OpenRun)`), then drain `api.subscribe()` and feed the
+    /// resulting `RunOpened` into `App::update` — asserting the Run appears in
+    /// `app.runs`.
+    #[tokio::test]
+    async fn browser_activate_file_opens_run_via_core_api_and_appears_in_app() {
+        use crate::app::{App, AppEvent, Mode};
+        use crate::browser::{DirEntry, FileBrowser};
+        use makina_core::dependency::EdgeInferrer;
+        use makina_core::interpreter::StructuredTextInterpreter;
+        use makina_core::orchestrator::CoreApi;
+        use std::sync::Arc;
+
+        // A valid task list written to a tempfile.
+        let source = "# Flow — Task List\n\nPreamble.\n\n---\n\n## 0001 — S\n\n\
+### only — Only task\nDoes a thing in `lib.rs`.\n- **Depends on:** —\n\
+- **Done when:** it works.\n";
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("flow-feature.md");
+        std::fs::write(&file_path, source).unwrap();
+
+        // Real CoreApi with the deterministic interpreter (what main.rs uses).
+        let interpreter = Arc::new(EdgeInferrer::new(
+            Arc::new(StructuredTextInterpreter::new()),
+        ));
+        let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::new(interpreter));
+
+        // Subscribe BEFORE acting so we capture the RunOpened broadcast.
+        let mut sub = api.subscribe();
+
+        // Build an App whose browser has the sample file selected.
+        let mut app = App::new(Arc::clone(&api), vec![]);
+        app.mode = Mode::FileBrowser;
+        app.browser = Some(FileBrowser::new(
+            dir.path().to_path_buf(),
+            vec![DirEntry {
+                name: "flow-feature.md".to_string(),
+                path: file_path.clone(),
+                is_dir: false,
+            }],
+        ));
+        assert!(app.runs.is_empty());
+
+        // The event-loop step: activating a file selection performs the async
+        // OpenRun against CoreApi and returns CloseBrowser.
+        let resolved = resolve_browser_io(&app, AppEvent::BrowserActivate).await;
+        assert!(
+            matches!(resolved, AppEvent::CloseBrowser),
+            "selecting a file must resolve to CloseBrowser"
+        );
+        app.update(resolved);
+        assert_eq!(app.mode, Mode::Normal, "browser should close after opening");
+
+        // The CoreApi created the Run (direct query proves OpenRun happened).
+        let runs = api.runs().await;
+        assert_eq!(runs.len(), 1, "CoreApi must have created exactly one run");
+        assert_eq!(runs[0].task_list_path, file_path);
+        assert_eq!(runs[0].tasks.len(), 1, "the task must be interpreted");
+
+        // The RunOpened event flows back through subscribe(); feeding it into
+        // App::update makes the Run appear in app.runs (the sidebar source).
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), sub.next())
+            .await
+            .expect("timed out waiting for RunOpened")
+            .expect("stream ended unexpectedly");
+        assert!(matches!(ev, makina_core::api::Event::RunOpened { .. }));
+        app.update(AppEvent::ApiEvent(ev));
+
+        assert_eq!(
+            app.runs.len(),
+            1,
+            "the opened Run must appear in app.runs via the RunOpened event"
+        );
+        assert_eq!(app.runs[0].task_list_path, file_path);
     }
 }

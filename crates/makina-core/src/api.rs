@@ -79,13 +79,31 @@ impl std::fmt::Display for TaskId {
     }
 }
 
+/// Map the domain [`crate::task::TaskId`] onto the view-level [`TaskId`].
+///
+/// The two newtypes are intentionally distinct (see the type docs): the domain
+/// type is the persisted source of truth, the view type is what the TUI sees.
+/// This conversion is the single, documented bridge used by the orchestrator
+/// when projecting a [`crate::task::TaskGraph`] into [`RunView`]s.
+impl From<crate::task::TaskId> for TaskId {
+    fn from(id: crate::task::TaskId) -> Self {
+        TaskId(id.0)
+    }
+}
+
+impl From<&crate::task::TaskId> for TaskId {
+    fn from(id: &crate::task::TaskId) -> Self {
+        TaskId(id.0.clone())
+    }
+}
+
 // ── View / DTO types ──────────────────────────────────────────────────────────
 
 /// The lifecycle state of a single task, as seen by the TUI.
 ///
-/// This is a **view mirror** of the internal task state machine defined in a
-/// later task.  A `From<internal::TaskState>` conversion will be added when the
-/// internal state machine is introduced; do NOT add that mapping here yet.
+/// This is a **view mirror** of the internal task state machine
+/// ([`crate::task::TaskState`]).  The `From<crate::task::TaskState>` conversion
+/// below is the documented bridge from the domain enum to this view enum.
 ///
 /// # State meanings
 ///
@@ -112,6 +130,26 @@ pub enum TaskState {
     Done,
     /// Task permanently failed (gate/review limit exceeded or fatal error).
     Failed,
+}
+
+/// Map the domain [`crate::task::TaskState`] onto the view-level [`TaskState`].
+///
+/// The two enums mirror each other variant-for-variant.  This is the single,
+/// documented bridge the orchestrator uses when projecting a
+/// [`crate::task::TaskGraph`] into [`RunView`]s; keeping the view enum separate
+/// preserves the rule that the TUI never depends on domain types directly.
+impl From<crate::task::TaskState> for TaskState {
+    fn from(state: crate::task::TaskState) -> Self {
+        use crate::task::TaskState as Domain;
+        match state {
+            Domain::New => TaskState::New,
+            Domain::Ready => TaskState::Ready,
+            Domain::InProgress => TaskState::InProgress,
+            Domain::InReview => TaskState::InReview,
+            Domain::Done => TaskState::Done,
+            Domain::Failed => TaskState::Failed,
+        }
+    }
 }
 
 /// A snapshot of one task suitable for rendering in the TUI.

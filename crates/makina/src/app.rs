@@ -6,9 +6,27 @@
 //! Keeping `update` a synchronous, pure function means every state transition
 //! is unit-testable without a real terminal or async runtime.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use makina_core::api::{Api, Event, RunView};
+
+use crate::browser::{DirEntry, FileBrowser};
+
+// ── View mode ───────────────────────────────────────────────────────────────────
+
+/// Which top-level view the TUI is currently showing.
+///
+/// The file browser is modal: while [`Mode::FileBrowser`] is active it overlays
+/// the normal sidebar/main layout and captures navigation keys.  Closing it
+/// (Esc, or after selecting a file) returns to [`Mode::Normal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// The normal runs-sidebar + detail layout (task 27).
+    Normal,
+    /// The modal file browser for picking a task-list file to open.
+    FileBrowser,
+}
 
 // ── Panel focus ───────────────────────────────────────────────────────────────
 
@@ -50,6 +68,46 @@ pub enum AppEvent {
     ApiEvent(Event),
     /// Periodic tick — triggers a redraw without other state changes.
     Tick,
+
+    // ── File browser (task 28) ────────────────────────────────────────────────
+    //
+    // Opening, navigating, and reading directories is IO; those reads live in
+    // [`crate::event`].  The IO layer reads a directory off-thread and feeds the
+    // result back as [`AppEvent::BrowserOpened`], keeping `update` pure.
+    /// User requested to open the file browser (e.g. pressed `o`).
+    ///
+    /// Translated to a key intent here; the IO layer reacts by reading the
+    /// starting directory and emitting [`AppEvent::BrowserOpened`].  `update`
+    /// itself does nothing for this variant (no state to mutate without a
+    /// listing) — it is handled entirely in the event loop.
+    OpenBrowser,
+    /// A directory was read by the IO layer: switch to / refresh the browser
+    /// with this listing.  Carries the directory and its entries.
+    BrowserOpened {
+        /// The directory that was listed.
+        dir: PathBuf,
+        /// The entries under `dir`, in display order.
+        entries: Vec<DirEntry>,
+    },
+    /// Move the browser selection one row up.
+    BrowserUp,
+    /// Move the browser selection one row down.
+    BrowserDown,
+    /// Activate the highlighted browser entry (Enter).
+    ///
+    /// The IO layer interprets the current selection: entering a directory
+    /// triggers a fresh read (→ [`AppEvent::BrowserOpened`]); choosing a file
+    /// triggers `api.execute(OpenRun{..})` and then [`AppEvent::CloseBrowser`].
+    /// `update` does not mutate state for this variant.
+    BrowserActivate,
+    /// Go up to the parent directory (Backspace).
+    ///
+    /// Like [`AppEvent::BrowserActivate`], the actual read happens in the IO
+    /// layer, which then emits [`AppEvent::BrowserOpened`] for the parent.
+    BrowserParent,
+    /// Close the file browser and return to the normal view (Esc, or after a
+    /// file was opened).
+    CloseBrowser,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -78,6 +136,15 @@ pub struct App {
     /// The panel that currently owns keyboard focus.
     pub focused_panel: Panel,
 
+    /// Which top-level view is showing.  [`Mode::FileBrowser`] overlays a modal
+    /// file picker; [`Mode::Normal`] shows the runs sidebar + detail panel.
+    pub mode: Mode,
+
+    /// File-browser view state.  `Some` only while [`App::mode`] is
+    /// [`Mode::FileBrowser`]; the IO layer populates it via
+    /// [`AppEvent::BrowserOpened`].
+    pub browser: Option<FileBrowser>,
+
     /// The list of open Runs, seeded from `api.runs()` at startup and
     /// incrementally updated from api events.
     pub runs: Vec<RunView>,
@@ -105,10 +172,17 @@ impl App {
             should_quit: false,
             api,
             focused_panel: Panel::Sidebar,
+            mode: Mode::Normal,
+            browser: None,
             runs: initial_runs,
             selected_run,
             last_event: None,
         }
+    }
+
+    /// Whether the modal file browser is currently active.
+    pub fn is_browsing(&self) -> bool {
+        self.mode == Mode::FileBrowser
     }
 
     /// Return the currently selected [`RunView`], if any.
@@ -175,6 +249,47 @@ impl App {
             }
             AppEvent::Tick => {
                 // Tick drives the redraw loop; no state changes needed here.
+                true
+            }
+
+            // ── File browser ──────────────────────────────────────────────────
+            // OpenBrowser / BrowserActivate / BrowserParent are intent signals
+            // handled by the IO layer (it does the directory read / OpenRun call
+            // and feeds back BrowserOpened / CloseBrowser).  `update` stays pure.
+            AppEvent::OpenBrowser => {
+                // No state change here; the IO layer reads the start dir and
+                // emits BrowserOpened.  Returning true is harmless (redraw).
+                true
+            }
+            AppEvent::BrowserOpened { dir, entries } => {
+                // A directory listing arrived: enter (or refresh) the browser.
+                self.mode = Mode::FileBrowser;
+                self.browser = Some(FileBrowser::new(dir, entries));
+                true
+            }
+            AppEvent::BrowserUp => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.select_up();
+                }
+                true
+            }
+            AppEvent::BrowserDown => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.select_down();
+                }
+                true
+            }
+            AppEvent::BrowserActivate => {
+                // Handled by the IO layer (enter dir or open file). No-op here.
+                true
+            }
+            AppEvent::BrowserParent => {
+                // Handled by the IO layer (read parent dir). No-op here.
+                true
+            }
+            AppEvent::CloseBrowser => {
+                self.mode = Mode::Normal;
+                self.browser = None;
                 true
             }
         }
@@ -725,5 +840,125 @@ mod tests {
         app.update(AppEvent::ApiEvent(ev));
         assert_eq!(app.runs[0].tasks[0].gate_iterations, 2);
         assert_eq!(app.runs[0].tasks[0].review_iterations, 1);
+    }
+
+    // ── File browser update logic (task 28) ───────────────────────────────────
+
+    fn browser_entries() -> Vec<DirEntry> {
+        vec![
+            DirEntry {
+                name: "src".into(),
+                path: PathBuf::from("/p/src"),
+                is_dir: true,
+            },
+            DirEntry {
+                name: "a.md".into(),
+                path: PathBuf::from("/p/a.md"),
+                is_dir: false,
+            },
+            DirEntry {
+                name: "b.md".into(),
+                path: PathBuf::from("/p/b.md"),
+                is_dir: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn app_starts_in_normal_mode_without_browser() {
+        let app = make_app();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.browser.is_none());
+        assert!(!app.is_browsing());
+    }
+
+    #[test]
+    fn browser_opened_enters_browser_mode_with_entries() {
+        let mut app = make_app();
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/p"),
+            entries: browser_entries(),
+        });
+        assert!(app.is_browsing());
+        assert_eq!(app.mode, Mode::FileBrowser);
+        let b = app.browser.as_ref().expect("browser must be set");
+        assert_eq!(b.cwd, PathBuf::from("/p"));
+        assert_eq!(b.entries.len(), 3);
+        assert_eq!(b.selected, 0);
+    }
+
+    #[test]
+    fn browser_navigation_moves_and_clamps_selection() {
+        let mut app = make_app();
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/p"),
+            entries: browser_entries(),
+        });
+
+        app.update(AppEvent::BrowserDown);
+        assert_eq!(app.browser.as_ref().unwrap().selected, 1);
+        app.update(AppEvent::BrowserDown);
+        assert_eq!(app.browser.as_ref().unwrap().selected, 2);
+        // Clamp at last.
+        app.update(AppEvent::BrowserDown);
+        assert_eq!(app.browser.as_ref().unwrap().selected, 2);
+
+        app.update(AppEvent::BrowserUp);
+        assert_eq!(app.browser.as_ref().unwrap().selected, 1);
+        app.update(AppEvent::BrowserUp);
+        app.update(AppEvent::BrowserUp);
+        // Clamp at zero.
+        assert_eq!(app.browser.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn close_browser_returns_to_normal_mode() {
+        let mut app = make_app();
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/p"),
+            entries: browser_entries(),
+        });
+        assert!(app.is_browsing());
+
+        app.update(AppEvent::CloseBrowser);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.browser.is_none());
+        assert!(!app.is_browsing());
+    }
+
+    #[test]
+    fn browser_opened_refreshes_listing_on_navigation_into_dir() {
+        // Simulate entering a subdirectory: a second BrowserOpened replaces the
+        // listing and resets the selection (the IO layer drives this).
+        let mut app = make_app();
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/p"),
+            entries: browser_entries(),
+        });
+        app.update(AppEvent::BrowserDown);
+        assert_eq!(app.browser.as_ref().unwrap().selected, 1);
+
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/p/src"),
+            entries: vec![DirEntry {
+                name: "deep.md".into(),
+                path: PathBuf::from("/p/src/deep.md"),
+                is_dir: false,
+            }],
+        });
+        let b = app.browser.as_ref().unwrap();
+        assert_eq!(b.cwd, PathBuf::from("/p/src"));
+        assert_eq!(b.entries.len(), 1);
+        assert_eq!(b.selected, 0, "selection resets when entering a new dir");
+    }
+
+    #[test]
+    fn open_browser_event_is_noop_for_state() {
+        // OpenBrowser is an IO-layer intent; update() itself must not mutate
+        // state (no listing is available yet).
+        let mut app = make_app();
+        app.update(AppEvent::OpenBrowser);
+        assert_eq!(app.mode, Mode::Normal, "OpenBrowser alone changes nothing");
+        assert!(app.browser.is_none());
     }
 }

@@ -21,3 +21,7 @@ ratatui = { workspace = true }
 # Direct crossterm dependency to enable the `event-stream` feature (async input events).
 # ratatui re-exports crossterm but does not enable event-stream in its feature flags.
 crossterm = { version = "0.29", features = ["event-stream"] }
+
+[dev-dependencies]
+# Temporary files/dirs for the file-browser IO + TUI↔CoreApi flow tests.
+tempfile = "3"

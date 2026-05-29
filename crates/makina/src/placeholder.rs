@@ -1,28 +1,22 @@
-//! Placeholder `Api` implementation.
+//! Test-only `Api` double.
 //!
-//! # PLACEHOLDER — replace with the real core-backed `Api` in the e2e task
+//! # `#[cfg(test)]` — the binary uses the real [`makina_core::orchestrator::CoreApi`]
 //!
-//! This module provides a minimal in-process [`Api`] implementation that drives
-//! the TUI scaffold **without** requiring the real orchestrator.  It exists
-//! solely to prove that the TUI ↔ api boundary works end-to-end:
+//! As of task 28 (file-browser) the production binary wires the **real**
+//! core-backed `Api` ([`makina_core::orchestrator::CoreApi`]) in `main.rs`.  This
+//! module is therefore gated behind `#[cfg(test)]` and exists only as a
+//! lightweight, controllable [`Api`] double for the TUI's unit/integration
+//! tests (app-state, rendering, key-translation) that do **not** need a real
+//! interpreter or filesystem reads:
 //!
-//! * `runs()` returns a single sample [`RunView`] so the sidebar has something
-//!   to render.
-//! * `subscribe()` returns a stream that emits a handful of sample events and
-//!   then stays open (simulates a long-running session by following the samples
-//!   with a channel that never produces further events — it only closes when the
-//!   `PlaceholderApi` is dropped).
+//! * `runs()` returns a single sample [`RunView`] so rendering tests have data.
+//! * `subscribe()` emits a handful of sample events, then stays open on a live
+//!   broadcast channel.
 //! * `execute()` accepts all commands and returns plausible outcomes.
 //!
-//! The placeholder holds **no orchestration logic**.  It is a test double at
-//! the process level, not a real coordinator.
-//!
-//! # When to replace
-//!
-//! Replace the `PlaceholderApi` with the real core-backed implementation when
-//! the e2e integration task (task 33) wires the TUI to a live `makina-core`
-//! orchestrator.  The replacement is a one-line change in `main.rs`
-//! (`PlaceholderApi::new()` → `CoreApi::new(…)`); the TUI code is untouched.
+//! It holds **no orchestration logic**; it is a test double, not a coordinator.
+//! Tests that need the real `OpenRun` → interpret → register → broadcast path
+//! (e.g. the TUI↔CoreApi flow test in [`crate::event`]) use `CoreApi` directly.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -40,11 +34,10 @@ use tokio_stream::wrappers::BroadcastStream;
 
 // ── PlaceholderApi ────────────────────────────────────────────────────────────
 
-/// A minimal stand-in for the real core-backed [`Api`].
+/// A minimal, test-only stand-in for the real core-backed [`Api`].
 ///
-/// Used by `main.rs` at startup and by unit/integration tests.
-///
-/// # PLACEHOLDER — see module-level doc for replacement guidance
+/// Used by the TUI's unit/integration tests.  The production binary uses
+/// [`makina_core::orchestrator::CoreApi`]; see the module-level doc.
 pub struct PlaceholderApi {
     runs: Mutex<Vec<RunView>>,
     next_id: AtomicU64,

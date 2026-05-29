@@ -14,6 +14,9 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+# `sync` feature provides `BroadcastStream`, used by `orchestrator::CoreApi` to
+# adapt a `tokio::sync::broadcast` receiver into the infallible `EventStream`.
+tokio-stream = { workspace = true, features = ["sync"] }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 
