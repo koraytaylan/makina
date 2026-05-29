@@ -51,11 +51,12 @@ use std::sync::Arc;
 use futures::StreamExt;
 use kameo::actor::ActorRef;
 
+use crate::api;
 use crate::backend::{AgentBackend, Prompt, ResponseEvent};
 use crate::roles::{Role, session_config_for};
 use crate::task::Task;
 
-use super::supervisor::Supervisor;
+use super::supervisor::{EventSink, Supervisor};
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
 
@@ -127,6 +128,13 @@ impl kameo::actor::Actor for Developer {
 /// `feedback` carries the Reviewer's rejection feedback on a retry attempt, or
 /// `None` on the first attempt.  When present, the feedback is appended to the
 /// prompt so the agent can address the requested changes.
+///
+/// `run` + `sink` (task 31) let the handler publish the live
+/// [`api::Event::AgentExchange`] stream the TUI consumes — `PromptSent` when the
+/// prompt is dispatched, one `ResponseChunk` per streamed `TextChunk`, and
+/// `TurnComplete` at the turn's end.  Both default to a no-op/`RunId(0)` for the
+/// task-21–25 ask paths via the helper constructors; the scheduler threads the
+/// real values from its [`RunControl`].
 pub struct Develop {
     /// The task to implement.
     pub task: Task,
@@ -134,6 +142,10 @@ pub struct Develop {
     pub worktree: PathBuf,
     /// Reviewer feedback to address on a retry; `None` on the first attempt.
     pub feedback: Option<String>,
+    /// The Run this exchange belongs to (for `AgentExchange` events).
+    pub run: api::RunId,
+    /// Live-event sink: where `AgentExchange` events are published.
+    pub sink: EventSink,
 }
 
 /// Successful outcome of a [`Develop`] turn.
@@ -177,6 +189,17 @@ impl kameo::message::Message<Develop> for Developer {
         // 3. Build the prompt describing the task (and any reviewer feedback).
         let prompt_text = build_develop_prompt(&msg.task, msg.feedback.as_deref());
 
+        // Publish the outgoing prompt as the Developer "user turn" (task 31).
+        let task_id = api::TaskId(msg.task.id.0.clone());
+        (msg.sink)(api::Event::AgentExchange {
+            run: msg.run,
+            task: task_id.clone(),
+            role: api::AgentRole::Developer,
+            event: api::ExchangeEvent::PromptSent {
+                text: prompt_text.clone(),
+            },
+        });
+
         let stream = match session.prompt(Prompt::new(prompt_text)).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -187,13 +210,31 @@ impl kameo::message::Message<Develop> for Developer {
         };
 
         // 4. Drain the response stream, concatenating TextChunk text until
-        //    TurnComplete (or surfacing a transport error).
+        //    TurnComplete (or surfacing a transport error).  Each chunk is also
+        //    published as a live `ResponseChunk`, and the turn end as
+        //    `TurnComplete` (task 31).
         let mut output = String::new();
         let mut events = stream;
         while let Some(item) = events.next().await {
             match item {
-                Ok(ResponseEvent::TextChunk { text }) => output.push_str(&text),
-                Ok(ResponseEvent::TurnComplete) => break,
+                Ok(ResponseEvent::TextChunk { text }) => {
+                    (msg.sink)(api::Event::AgentExchange {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Developer,
+                        event: api::ExchangeEvent::ResponseChunk { text: text.clone() },
+                    });
+                    output.push_str(&text);
+                }
+                Ok(ResponseEvent::TurnComplete) => {
+                    (msg.sink)(api::Event::AgentExchange {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Developer,
+                        event: api::ExchangeEvent::TurnComplete,
+                    });
+                    break;
+                }
                 Err(e) => {
                     drop(events);
                     let _ = session.terminate().await;

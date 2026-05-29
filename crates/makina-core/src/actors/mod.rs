@@ -54,8 +54,8 @@ pub use developer::{Develop, DevelopAck, DevelopOutcome, Developer, DeveloperArg
 pub use planner::{InterpretTaskList, InterpretTaskListAck, Planner, PlannerArgs};
 pub use reviewer::{Review, ReviewReply, ReviewVerdict, Reviewer, ReviewerArgs};
 pub use supervisor::{
-    RunReadyTasks, RunReport, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs,
-    TaskGraphSnapshot,
+    EventSink, RunControl, RunReadyTasks, RunReport, SetSpokes, SetTaskGraph, Supervisor,
+    SupervisorArgs, TaskGraphSnapshot, run_graph,
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -284,6 +284,9 @@ mod tests {
                 task: task.clone(),
                 worktree: dev_worktree.path().to_path_buf(),
                 feedback: None,
+                // Smoke test: no run context; a no-op sink (events are additive).
+                run: crate::api::RunId(0),
+                sink: std::sync::Arc::new(|_| {}),
             })
             .send()
             .await
@@ -306,6 +309,8 @@ mod tests {
             .ask(Review {
                 task: task.clone(),
                 worktree: PathBuf::from("/tmp/test-worktree"),
+                run: crate::api::RunId(0),
+                sink: std::sync::Arc::new(|_| {}),
             })
             .send()
             .await

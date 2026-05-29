@@ -99,7 +99,8 @@ pub fn render(app: &App, frame: &mut Frame) {
     let sidebar_block = panel_block("Runs", sidebar_focused);
 
     if app.runs.is_empty() {
-        // Empty state: show a hint instead of an empty list.
+        // Empty state: show a hint instead of an empty list.  The `[o]` file
+        // browser exists (task 28); guide the user to it.
         let empty_text = vec![
             Line::from(""),
             Line::from(vec![Span::styled(
@@ -108,11 +109,11 @@ pub fn render(app: &App, frame: &mut Frame) {
             )]),
             Line::from(""),
             Line::from(vec![Span::styled(
-                "  Open a run via",
+                "  Press [o] to open a",
                 Style::default().fg(Color::DarkGray),
             )]),
             Line::from(vec![Span::styled(
-                "  run-control (task 31).",
+                "  task-list file.",
                 Style::default().fg(Color::DarkGray),
             )]),
         ];
@@ -335,16 +336,27 @@ pub fn render(app: &App, frame: &mut Frame) {
     }
 
     // ── Status bar ────────────────────────────────────────────────────────────
+    // Key hints reflect the REAL keys: [o] open file browser, [s/p/c] run
+    // control (start/pause/cancel the selected run — task 31), [Tab] switch
+    // focus, [q/Esc/^C] quit.  A transient command-outcome message (set on the
+    // most recent `api.execute(...)`) is shown when present; otherwise the focus
+    // label + last-event hint are shown.
     let focus_label = match app.focused_panel {
         Panel::Sidebar => "focus: sidebar",
         Panel::Main => "focus: main",
     };
-    let event_hint = match &app.last_event {
-        None => String::new(),
-        Some(ev) => format!("  │  last: {}", event_short_name(ev)),
+    let trailer = match &app.status_message {
+        Some(msg) => format!("  │  {msg}"),
+        None => {
+            let event_hint = match &app.last_event {
+                None => String::new(),
+                Some(ev) => format!("  │  last: {}", event_short_name(ev)),
+            };
+            format!("  {focus_label}{event_hint}")
+        }
     };
     let status_text =
-        format!(" [o] open  [Tab] switch panel  [q/Esc/^C] quit  {focus_label}{event_hint}");
+        format!(" [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [q/^C] quit{trailer}");
     let status_bar =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     frame.render_widget(status_bar, status_area);
@@ -739,6 +751,63 @@ mod tests {
         // Status bar keybinds
         assert!(screen.contains("Tab"), "status bar must show Tab hint");
         assert!(screen.contains("quit"), "status bar must mention quit");
+    }
+
+    // ── Render: hint fix + run-control status bar (task 31) ───────────────────
+
+    /// The empty-sidebar hint must guide the user to `[o]` (the real key) and
+    /// must NOT contain the stale "run-control (task 31)" copy.
+    #[test]
+    fn render_empty_sidebar_hint_points_to_o_not_stale_copy() {
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![]);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("[o]"),
+            "empty-sidebar hint must mention the [o] open key"
+        );
+        assert!(
+            !screen.contains("task 31"),
+            "stale 'run-control (task 31)' copy must be gone"
+        );
+    }
+
+    /// The status bar must show the run-control key hints (`[o]`, `[s/p/c]`).
+    #[test]
+    fn render_status_bar_shows_run_control_hints() {
+        let mut terminal = make_terminal(100, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![]);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(screen.contains("[o]"), "status bar must show [o] open");
+        assert!(
+            screen.contains("[s/p/c]"),
+            "status bar must show the [s/p/c] start/pause/cancel hints"
+        );
+    }
+
+    /// When `app.status_message` is set, it is rendered in the status bar.
+    #[test]
+    fn render_status_bar_shows_status_message() {
+        let mut terminal = make_terminal(100, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![]);
+        app.update(crate::app::AppEvent::StatusMessage("Start run:1".into()));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Start run:1"),
+            "status bar must render the transient status_message"
+        );
     }
 
     // ── Render: with runs ─────────────────────────────────────────────────────

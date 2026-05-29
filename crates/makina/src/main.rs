@@ -35,26 +35,56 @@ mod ui;
 
 use std::sync::Arc;
 
+use makina_acp::AcpBackend;
+use makina_core::backend::AgentBackend;
+use makina_core::config::Config;
 use makina_core::dependency::EdgeInferrer;
 use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::orchestrator::CoreApi;
+use makina_core::worktree::WorktreeManager;
 
 #[tokio::main]
 async fn main() {
+    // ── Config ──────────────────────────────────────────────────────────────────
+    // Load the resolved two-layer config (global ~/.makina/config.toml + project
+    // ./makina.toml).  Supplies the agent backend command, the gates, the caps,
+    // the concurrency limit, and the base branch the orchestrator drives runs
+    // with.  A load/validation failure is fatal (we cannot run without it).
+    let config = match Config::load_defaults() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load configuration: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // ── Execution dependencies (task 31: run-control) ─────────────────────────
+    // The orchestrator drives Runs (StartRun → Supervisor scheduler) using:
+    //  - the agent BACKEND: the ACP CLI from `config.backend` (the e2e/task-33
+    //    seam swaps this for any other `AgentBackend`; tests inject NoopBackend);
+    //  - a WORKTREE MANAGER rooted at the repo (CWD) on `config.base_branch`;
+    //  - the resolved CONFIG (gates, caps, concurrency).
+    let backend: Arc<dyn AgentBackend> = Arc::new(AcpBackend::new(
+        config.backend.command.clone(),
+        config.backend.args.clone(),
+    ));
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let worktree_manager = WorktreeManager::new(repo_root, config.base_branch.clone());
+
     // ── Api ───────────────────────────────────────────────────────────────────
     // The real, core-backed orchestrator Api.  It opens Runs by reading a
     // task-list file and interpreting it with the DETERMINISTIC interpreter
     // (`StructuredTextInterpreter`) wrapped in the cross-cutting `EdgeInferrer`
-    // decorator — so the TUI can open runs with no model/auth.
+    // decorator — so the TUI can open runs with no model/auth — then drives them
+    // with the injected backend + worktree manager + config (task 31).
     //
     // Seam for the e2e (task 33): swap `StructuredTextInterpreter` for a
-    // `ModelInterpreter` over the real ACP backend to get model-backed planning.
-    // Seam for task 31 (run-control): CoreApi's Start/Pause/Cancel are wired but
-    // do not yet drive the Supervisor execution loop.
+    // `ModelInterpreter` over the ACP backend to get model-backed planning.
     let interpreter = Arc::new(EdgeInferrer::new(
         Arc::new(StructuredTextInterpreter::new()),
     ));
-    let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::new(interpreter));
+    let api: Arc<dyn makina_core::api::Api> =
+        Arc::new(CoreApi::new(interpreter, backend, worktree_manager, config));
 
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;

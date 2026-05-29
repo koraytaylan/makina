@@ -108,13 +108,19 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> std::io::Result<()> {
         };
 
         if let Some(event) = app_event {
-            // Browser IO events (open / enter dir / parent / select file) require
-            // filesystem reads or an async `execute`; resolve them here, in the
-            // IO layer, into the concrete state-mutating event that `update`
-            // consumes.  This keeps `App::update` pure.
-            let event = resolve_browser_io(app, event).await;
+            // IO-layer resolution: browser intents (open / enter dir / select
+            // file) need filesystem reads or an async `execute`; run controls
+            // (start/pause/cancel) need an async `execute` against the selected
+            // run.  Resolve them here into the concrete state-mutating event
+            // `update` consumes — plus an OPTIONAL transient status message to
+            // surface the command outcome/error (task 31).  Keeping the async
+            // work here keeps `App::update` pure.
+            let (event, status) = resolve_io(app, event).await;
 
-            let needs_redraw = app.update(event);
+            let mut needs_redraw = app.update(event);
+            if let Some(msg) = status {
+                needs_redraw |= app.update(AppEvent::StatusMessage(msg));
+            }
             if app.should_quit {
                 break;
             }
@@ -156,57 +162,100 @@ async fn resolve_api_event(
     AppEvent::ApiEvent(ev)
 }
 
-// ── File-browser IO ─────────────────────────────────────────────────────────────
+// ── IO resolution: file browser + run control (task 28 + 31) ──────────────────
 
-/// Resolve a file-browser intent event into a concrete state-mutating event by
-/// performing the necessary IO (directory reads / `api.execute(OpenRun)`).
+/// Resolve an intent event into a concrete state-mutating event by performing
+/// the necessary IO, returning that event plus an OPTIONAL transient status
+/// message to surface the command outcome/error in the status bar.
 ///
-/// Non-browser events (and browser events that need no IO, e.g. navigation) pass
-/// through unchanged.  This is the single place where the file browser touches
-/// the filesystem and the api; [`App::update`] never does.
+/// This is the single place where the TUI touches the filesystem and the api;
+/// [`App::update`] never does.  Handles:
+/// - **File browser** (task 28): `OpenBrowser` → read CWD; `BrowserActivate` on
+///   a dir → read it, on a file → `execute(OpenRun)` (outcome → status message)
+///   → `CloseBrowser`; `BrowserParent` → read parent dir.
+/// - **Run control** (task 31): `StartRun`/`PauseRun`/`CancelRun` →
+///   `execute(...)` for `app.selected_run()` (outcome/error → status message);
+///   the run-state changes themselves flow back via `api.subscribe()`.
 ///
-/// Returns the event that should be fed to [`App::update`]:
-/// - [`AppEvent::OpenBrowser`] → read the CWD → [`AppEvent::BrowserOpened`]
-///   (or [`AppEvent::Tick`] if the CWD can't be read).
-/// - [`AppEvent::BrowserActivate`] on a directory → read it →
-///   [`AppEvent::BrowserOpened`]; on a file → `execute(OpenRun)` →
-///   [`AppEvent::CloseBrowser`].
-/// - [`AppEvent::BrowserParent`] → read the parent dir → [`AppEvent::BrowserOpened`].
-async fn resolve_browser_io(app: &App, event: AppEvent) -> AppEvent {
+/// Non-IO events pass straight through with no status message.
+async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
     match event {
         AppEvent::OpenBrowser => {
             // Start from the process CWD (fall back to "." if unavailable).
             let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            read_dir_event(&start).await
+            (read_dir_event(&start).await, None)
         }
         AppEvent::BrowserParent => match app.browser.as_ref().and_then(|b| b.parent()) {
-            Some(parent) => read_dir_event(parent).await,
+            Some(parent) => (read_dir_event(parent).await, None),
             // Already at the root — nothing to do; just redraw.
-            None => AppEvent::Tick,
+            None => (AppEvent::Tick, None),
         },
         AppEvent::BrowserActivate => {
             match app.browser.as_ref().and_then(|b| b.selected_entry()) {
-                Some(entry) if entry.is_dir => read_dir_event(&entry.path).await,
+                Some(entry) if entry.is_dir => (read_dir_event(&entry.path).await, None),
                 Some(entry) => {
                     // It's a file: open a Run for it, then close the browser.
-                    // We ignore the outcome here — the resulting `RunOpened`
-                    // event flows back through `api.subscribe()` and updates the
-                    // sidebar; an error is surfaced via the api's event stream /
-                    // future status handling (task 31).
-                    let _ = app
+                    // Capture the outcome/error and surface it (resolves the
+                    // task-28 outcome-surfacing note): the resulting `RunOpened`
+                    // event also flows back through `api.subscribe()` and updates
+                    // the sidebar.
+                    let result = app
                         .api
                         .execute(makina_core::api::Command::OpenRun {
                             task_list_path: entry.path.clone(),
                         })
                         .await;
-                    AppEvent::CloseBrowser
+                    let msg = match result {
+                        Ok(makina_core::api::CommandOutcome::RunOpened { run }) => {
+                            format!("Opened {run}")
+                        }
+                        Ok(_) => "Run opened".to_string(),
+                        Err(e) => format!("Open failed: {e}"),
+                    };
+                    (AppEvent::CloseBrowser, Some(msg))
                 }
                 // No selection (empty dir) — ignore.
-                None => AppEvent::Tick,
+                None => (AppEvent::Tick, None),
             }
         }
+        // ── Run control (task 31) ─────────────────────────────────────────────
+        AppEvent::StartRun => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
+        AppEvent::PauseRun => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
+        AppEvent::CancelRun => (AppEvent::Tick, run_control(app, ControlKind::Cancel).await),
         // Everything else passes straight through.
-        other => other,
+        other => (other, None),
+    }
+}
+
+/// Which run-control command a key intent maps to.
+#[derive(Debug, Clone, Copy)]
+enum ControlKind {
+    Start,
+    Pause,
+    Cancel,
+}
+
+/// Issue a run-control command for the currently selected Run and return a
+/// status message describing the outcome (or `None` if there is no selection).
+///
+/// The actual run-state changes (status, task progress, agent exchanges) flow
+/// back through `api.subscribe()`; this only surfaces the command's immediate
+/// acknowledgement / error in the status bar.
+async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
+    use makina_core::api::Command;
+
+    let run = match app.selected_run() {
+        Some(r) => r.id,
+        None => return Some("No run selected".to_string()),
+    };
+    let (command, verb) = match kind {
+        ControlKind::Start => (Command::StartRun { run }, "Start"),
+        ControlKind::Pause => (Command::PauseRun { run }, "Pause"),
+        ControlKind::Cancel => (Command::CancelRun { run }, "Cancel"),
+    };
+    match app.api.execute(command).await {
+        Ok(_) => Some(format!("{verb} {run}")),
+        Err(e) => Some(format!("{verb} failed: {e}")),
     }
 }
 
@@ -310,6 +359,12 @@ fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
             KeyCode::Tab => AppEvent::FocusNext,
             // Open the file browser to pick a task list.
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
+            // ── Run control (task 31): act on the selected Run ────────────────
+            // s = Start/resume, p = Pause, c = Cancel.  These are intents; the IO
+            // layer resolves them into the async `api.execute(...)` call.
+            KeyCode::Char('s') | KeyCode::Char('S') => AppEvent::StartRun,
+            KeyCode::Char('p') | KeyCode::Char('P') => AppEvent::PauseRun,
+            KeyCode::Char('c') | KeyCode::Char('C') => AppEvent::CancelRun,
             // Sidebar navigation: arrow keys and vim-style j/k.
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
@@ -442,6 +497,49 @@ mod tests {
         ));
     }
 
+    // ── Run-control key translation (task 31) ─────────────────────────────────
+
+    #[test]
+    fn s_key_translates_to_start_run() {
+        let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::StartRun
+        ));
+    }
+
+    #[test]
+    fn p_key_translates_to_pause_run() {
+        let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::PauseRun
+        ));
+    }
+
+    #[test]
+    fn c_key_translates_to_cancel_run() {
+        // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
+        let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, false),
+            AppEvent::CancelRun
+        ));
+    }
+
+    #[test]
+    fn control_keys_do_nothing_in_browser_mode() {
+        // s/p/c are normal-mode keys; inside the browser they fall through to a
+        // harmless Tick (the browser keymap owns navigation).
+        for ch in ['s', 'p', 'c'] {
+            let ev = key_press(KeyCode::Char(ch), KeyModifiers::NONE);
+            assert!(
+                matches!(translate_terminal_event(ev, true), AppEvent::Tick),
+                "'{ch}' must be inert in browser mode"
+            );
+        }
+    }
+
     #[test]
     fn enter_in_browser_activates_selection() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
@@ -536,6 +634,135 @@ mod tests {
         assert_eq!(app.runs[0].status, RunStatus::Pending);
     }
 
+    // ── Run-control IO resolution + outcome surfacing (task 31) ───────────────
+
+    /// `resolve_io` on `StartRun`/`PauseRun`/`CancelRun` must issue the matching
+    /// `Command` against the api for the SELECTED run and return a status
+    /// message; feeding that message through `App::update` sets
+    /// `app.status_message`.  Uses a recording stub api to assert the exact
+    /// command issued.
+    #[tokio::test]
+    async fn control_keys_issue_commands_and_set_status_message() {
+        use crate::app::{App, AppEvent};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunStatus, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        /// A stub api that records every `Command` it executes.
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command.clone());
+                match command {
+                    Command::OpenRun { .. } => Ok(CommandOutcome::RunOpened { run: RunId(1) }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                vec![]
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+        // Build an App with one selected run (id 7).
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+        });
+        let run = RunView {
+            id: RunId(7),
+            task_list_path: std::path::PathBuf::from(".tasks/control.json"),
+            status: RunStatus::Pending,
+            tasks: vec![],
+        };
+        let mut app = App::new(Arc::clone(&api) as Arc<dyn Api>, vec![run]);
+        assert_eq!(app.selected_run().unwrap().id, RunId(7));
+
+        // Start.
+        let (ev, status) = resolve_io(&app, AppEvent::StartRun).await;
+        assert!(
+            matches!(ev, AppEvent::Tick),
+            "control resolves to a no-op event"
+        );
+        let msg = status.expect("StartRun must produce a status message");
+        assert!(
+            msg.contains("Start"),
+            "status must mention Start; got {msg:?}"
+        );
+        app.update(AppEvent::StatusMessage(msg.clone()));
+        assert_eq!(app.status_message.as_deref(), Some(msg.as_str()));
+
+        // Pause.
+        let (_ev, status) = resolve_io(&app, AppEvent::PauseRun).await;
+        assert!(status.unwrap().contains("Pause"));
+
+        // Cancel.
+        let (_ev, status) = resolve_io(&app, AppEvent::CancelRun).await;
+        assert!(status.unwrap().contains("Cancel"));
+
+        // The exact commands were issued against the api, all targeting run 7.
+        let cmds = api.commands.lock().unwrap().clone();
+        assert!(
+            matches!(cmds[0], Command::StartRun { run: RunId(7) }),
+            "first command must be StartRun{{run:7}}; got {:?}",
+            cmds[0]
+        );
+        assert!(matches!(cmds[1], Command::PauseRun { run: RunId(7) }));
+        assert!(matches!(cmds[2], Command::CancelRun { run: RunId(7) }));
+    }
+
+    /// With NO run selected, a control key surfaces a "No run selected" message
+    /// and issues no command.
+    #[tokio::test]
+    async fn control_key_with_no_selection_reports_and_issues_nothing() {
+        use crate::app::{App, AppEvent};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![]);
+        assert!(app.selected_run().is_none());
+
+        let (ev, status) = resolve_io(&app, AppEvent::StartRun).await;
+        assert!(matches!(ev, AppEvent::Tick));
+        assert_eq!(status.as_deref(), Some("No run selected"));
+    }
+
+    /// A command error from the api is surfaced as a status message (not dropped).
+    #[tokio::test]
+    async fn control_command_error_is_surfaced() {
+        use crate::app::{App, AppEvent};
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::api::{RunId, RunStatus, RunView};
+        use std::sync::Arc;
+
+        // PlaceholderApi::empty() has no runs, so a StartRun for a run that
+        // exists in the App view but NOT in the api returns UnknownRun.
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(999),
+            task_list_path: std::path::PathBuf::from(".tasks/ghost.json"),
+            status: RunStatus::Pending,
+            tasks: vec![],
+        };
+        let app = App::new(api, vec![run]);
+
+        let (_ev, status) = resolve_io(&app, AppEvent::StartRun).await;
+        let msg = status.expect("an error must still produce a status message");
+        assert!(
+            msg.contains("failed"),
+            "command error must be surfaced as a 'failed' message; got {msg:?}"
+        );
+    }
+
     // ── File-browser IO resolution (task 28) ──────────────────────────────────
 
     /// `resolve_browser_io(OpenBrowser)` reads the CWD and yields a
@@ -550,7 +777,8 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let app = App::new(api, vec![]);
 
-        let resolved = resolve_browser_io(&app, AppEvent::OpenBrowser).await;
+        let (resolved, status) = resolve_io(&app, AppEvent::OpenBrowser).await;
+        assert!(status.is_none(), "OpenBrowser has no status message");
         match resolved {
             AppEvent::BrowserOpened { entries, .. } => {
                 assert!(
@@ -591,7 +819,21 @@ mod tests {
         let interpreter = Arc::new(EdgeInferrer::new(
             Arc::new(StructuredTextInterpreter::new()),
         ));
-        let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::new(interpreter));
+        // Execution deps (task 31): these tests only exercise OpenRun, so a
+        // NoopBackend + a temp-dir WorktreeManager + a default Config suffice
+        // (no Run is started, so they are never driven).
+        let backend: Arc<dyn makina_core::backend::AgentBackend> =
+            Arc::new(makina_core::backend::noop::NoopBackend::new());
+        let wm = makina_core::worktree::WorktreeManager::new(
+            tempfile::tempdir().unwrap().keep(),
+            "develop".into(),
+        );
+        let config = makina_core::config::Config::resolve(
+            makina_core::config::GlobalConfig::default(),
+            makina_core::config::ProjectConfig::default(),
+        );
+        let api: Arc<dyn makina_core::api::Api> =
+            Arc::new(CoreApi::new(interpreter, backend, wm, config));
 
         // Subscribe BEFORE acting so we capture the RunOpened broadcast.
         let mut sub = api.subscribe();
@@ -610,13 +852,20 @@ mod tests {
         assert!(app.runs.is_empty());
 
         // The event-loop step: activating a file selection performs the async
-        // OpenRun against CoreApi and returns CloseBrowser.
-        let resolved = resolve_browser_io(&app, AppEvent::BrowserActivate).await;
+        // OpenRun against CoreApi and returns CloseBrowser + a status message.
+        let (resolved, status) = resolve_io(&app, AppEvent::BrowserActivate).await;
         assert!(
             matches!(resolved, AppEvent::CloseBrowser),
             "selecting a file must resolve to CloseBrowser"
         );
+        assert!(
+            status.as_deref().is_some_and(|m| m.contains("Opened")),
+            "opening a file must surface an 'Opened …' status message; got {status:?}"
+        );
         app.update(resolved);
+        if let Some(msg) = status {
+            app.update(AppEvent::StatusMessage(msg));
+        }
         assert_eq!(app.mode, Mode::Normal, "browser should close after opening");
 
         // The CoreApi created the Run (direct query proves OpenRun happened).
@@ -724,7 +973,21 @@ mod tests {
         let interpreter = Arc::new(EdgeInferrer::new(
             Arc::new(StructuredTextInterpreter::new()),
         ));
-        let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::new(interpreter));
+        // Execution deps (task 31): these tests only exercise OpenRun, so a
+        // NoopBackend + a temp-dir WorktreeManager + a default Config suffice
+        // (no Run is started, so they are never driven).
+        let backend: Arc<dyn makina_core::backend::AgentBackend> =
+            Arc::new(makina_core::backend::noop::NoopBackend::new());
+        let wm = makina_core::worktree::WorktreeManager::new(
+            tempfile::tempdir().unwrap().keep(),
+            "develop".into(),
+        );
+        let config = makina_core::config::Config::resolve(
+            makina_core::config::GlobalConfig::default(),
+            makina_core::config::ProjectConfig::default(),
+        );
+        let api: Arc<dyn makina_core::api::Api> =
+            Arc::new(CoreApi::new(interpreter, backend, wm, config));
 
         // Subscribe BEFORE the execute to capture the RunOpened broadcast.
         let mut sub = api.subscribe();

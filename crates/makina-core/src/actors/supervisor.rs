@@ -138,13 +138,16 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kameo::actor::ActorRef;
 use kameo::message::Context;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
+use crate::api;
 use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::gate::{GateOutcome, GateRunner};
@@ -156,6 +159,71 @@ use crate::worktree::WorktreeManager;
 
 use super::developer::{Develop, Developer, DeveloperArgs};
 use super::reviewer::{Review, ReviewVerdict, Reviewer, ReviewerArgs};
+
+// ── Live event emission (task 31: run-control) ──────────────────────────────────
+
+/// A sink for the live [`api::Event`]s the Supervisor scheduler/drivers emit.
+///
+/// The orchestrator (`CoreApi`) wires this to its broadcast so the TUI observes
+/// execution.  It is an `Arc<dyn Fn(api::Event) + Send + Sync>` — a cheap,
+/// `Clone`able callback chosen over a concrete `broadcast::Sender` so the engine
+/// stays decoupled from *how* events are delivered (the orchestrator can adapt
+/// it to a broadcast, an mpsc, or a test recorder).
+///
+/// Emission is **additive** and best-effort: dropping events (no live receiver)
+/// is fine, and the engine NEVER holds the graph lock across an emit (the sink
+/// is called only outside the tight locked sections).  See [`RunControl`].
+pub type EventSink = Arc<dyn Fn(api::Event) + Send + Sync>;
+
+/// Per-run control + observability bundle threaded through the scheduler.
+///
+/// Bundles the four things a *controlled* run needs beyond the static driver
+/// resources:
+///
+/// - `run` — the [`api::RunId`] every emitted event is tagged with.
+/// - `sink` — where live events go (see [`EventSink`]).
+/// - `pause` — when `true`, the scheduler stops launching NEW task drivers
+///   (in-flight tasks finish); clearing it and re-running resumes.  (Task 31
+///   pause semantics: "stop launching new tasks".)
+/// - `cancel` — a [`CancellationToken`]; when cancelled the scheduler stops
+///   launching and `abort_all()`s the in-flight `JoinSet` (each aborted
+///   driver's [`DriverGuard`] still tears down its worktree/spokes — no leak).
+///
+/// The `RunReadyTasks` ask path (the task-21–25 tests) uses
+/// [`RunControl::silent`]: a no-op sink, never paused, never cancelled — so the
+/// existing behavior is byte-for-byte unchanged (events are purely additive).
+#[derive(Clone)]
+pub struct RunControl {
+    /// The Run these events/controls belong to.
+    pub run: api::RunId,
+    /// Where live [`api::Event`]s are published.
+    pub sink: EventSink,
+    /// Cooperative pause flag: while `true`, no NEW drivers are launched.
+    pub pause: Arc<AtomicBool>,
+    /// Cancellation signal: stops launching + aborts in-flight drivers.
+    pub cancel: CancellationToken,
+}
+
+impl RunControl {
+    /// A control that emits nothing, never pauses, and never cancels.
+    ///
+    /// Used by the `RunReadyTasks` ask path so the engine behaves exactly as it
+    /// did before task 31 (events are additive; the scheduler's pause/cancel
+    /// checks are inert).
+    pub fn silent() -> Self {
+        Self {
+            run: api::RunId(0),
+            sink: Arc::new(|_| {}),
+            pause: Arc::new(AtomicBool::new(false)),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// Emit one event to the sink (best-effort; never panics).
+    fn emit(&self, event: api::Event) {
+        (self.sink)(event);
+    }
+}
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
 
@@ -353,6 +421,40 @@ struct DriverContext {
 
     /// The shared agent backend, cloned into each per-task Developer/Reviewer.
     backend: Arc<dyn AgentBackend>,
+
+    /// Per-run control + live-event sink (task 31).  Threaded into the scheduler
+    /// (pause/cancel checks) and every [`task_driver`] (event emission +
+    /// Developer/Reviewer `AgentExchange`).  The `RunReadyTasks` ask path passes
+    /// [`RunControl::silent`] so behavior is unchanged there.
+    control: RunControl,
+}
+
+impl DriverContext {
+    /// Emit `TaskStateChanged{run, task, state}` for this run (task 31).
+    ///
+    /// Maps the domain [`TaskState`] to its [`api::TaskState`] mirror and calls
+    /// the control sink.  Called **after** the graph guard is dropped (never
+    /// while holding the lock — the no-lock-across-emit rule), reading the state
+    /// the just-applied transition produced.  A no-op under the silent control.
+    fn emit_task_state(&self, task_id: &TaskId, state: TaskState) {
+        self.control.emit(api::Event::TaskStateChanged {
+            run: self.control.run,
+            task: api::TaskId(task_id.0.clone()),
+            state: state.into(),
+        });
+    }
+
+    /// Emit `TaskIterationsUpdated{run, task, gate, review}` for this run.
+    ///
+    /// Called after a gate/review counter bump, outside the graph lock.
+    fn emit_task_iterations(&self, task_id: &TaskId, gate_iterations: u32, review_iterations: u32) {
+        self.control.emit(api::Event::TaskIterationsUpdated {
+            run: self.control.run,
+            task: api::TaskId(task_id.0.clone()),
+            gate_iterations,
+            review_iterations,
+        });
+    }
 }
 
 // ── SetTaskGraph ────────────────────────────────────────────────────────────────
@@ -484,8 +586,9 @@ impl Supervisor {
         let shared_graph = Arc::new(Mutex::new(graph));
 
         // Build the shared driver context.  Missing wiring is a hard error — the
-        // scheduler cannot spawn per-task spokes without it.
-        let ctx = match self.driver_context(Arc::clone(&shared_graph)) {
+        // scheduler cannot spawn per-task spokes without it.  The `RunReadyTasks`
+        // ask path is uncontrolled: no events, never paused/cancelled.
+        let ctx = match self.driver_context(Arc::clone(&shared_graph), RunControl::silent()) {
             Ok(ctx) => ctx,
             Err(e) => {
                 // Restore the graph before bailing so self stays consistent.
@@ -506,7 +609,13 @@ impl Supervisor {
     ///
     /// Errors if the concurrency dependencies (root ref / self ref / backend)
     /// were not injected via [`SetSpokes`], or if the worktree manager is absent.
-    fn driver_context(&self, graph: Arc<Mutex<TaskGraph>>) -> Result<DriverContext, String> {
+    /// `control` carries the per-run event sink + pause/cancel signals (task 31);
+    /// pass [`RunControl::silent`] for the uncontrolled ask path.
+    fn driver_context(
+        &self,
+        graph: Arc<Mutex<TaskGraph>>,
+        control: RunControl,
+    ) -> Result<DriverContext, String> {
         let worktree_manager = self
             .worktree_manager
             .clone()
@@ -534,6 +643,7 @@ impl Supervisor {
             root,
             supervisor,
             backend,
+            control,
         })
     }
 
@@ -552,6 +662,120 @@ impl Supervisor {
             }
         }
     }
+}
+
+// ── Public controlled entrypoint (task 31: run-control) ─────────────────────────
+
+/// Run a whole [`TaskGraph`] to terminal states under a [`RunControl`], emitting
+/// live [`api::Event`]s and honouring pause/cancel — the entrypoint the
+/// orchestrator (`CoreApi`) spawns on a background task.
+///
+/// This builds a fresh actor tree (a [`RootSupervisor`] plus one [`Supervisor`]
+/// hub, wired via [`SetSpokes`]) over the shared graph, then runs the SAME
+/// concurrent [`scheduler`] the `RunReadyTasks` ask path uses — only with a real
+/// (non-silent) `control` so it publishes events and reacts to pause/cancel.
+/// The actor tree is torn down (`root.kill()`) on every exit path.
+///
+/// Lifecycle events emitted here (the scheduler/drivers emit the per-task ones):
+/// - `RunStatusChanged{run, Running}` once, at the start;
+/// - `RunStatusChanged{run, Completed|Failed}` at the end, derived from the
+///   final graph — UNLESS the run was cancelled (the caller owns the cancelled
+///   status so an explicit Cancel shows as `Failed`/cancelled, not `Completed`).
+///
+/// The graph-lock-never-across-await invariant and the per-task [`DriverGuard`]
+/// teardown are unchanged; this only wraps the scheduler with wiring + the two
+/// aggregate `RunStatusChanged` emissions.
+pub async fn run_graph(
+    graph: Arc<Mutex<TaskGraph>>,
+    worktree_manager: WorktreeManager,
+    config: Config,
+    backend: Arc<dyn AgentBackend>,
+    control: RunControl,
+) -> Result<RunReport, String> {
+    // Announce the run is now executing.
+    control.emit(api::Event::RunStatusChanged {
+        run: control.run,
+        status: api::RunStatus::Running,
+    });
+
+    // Build the actor tree: fault-tolerance root + domain hub, then wire the
+    // per-task-spawn deps into the hub (the same shape as the test harness).
+    let root = RootSupervisor::start();
+    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
+        &root,
+        SupervisorArgs {
+            worktree_manager: worktree_manager.clone(),
+            config: config.clone(),
+        },
+        RestartConfig::default(),
+    )
+    .await;
+    supervisor_ref
+        .ask(SetSpokes {
+            root: root.clone(),
+            supervisor: supervisor_ref.clone(),
+            backend: Arc::clone(&backend),
+        })
+        .send()
+        .await
+        .map_err(|e| format!("failed to wire supervisor spokes: {e}"))?;
+
+    // Build the driver context directly (we drive the `scheduler` ourselves so
+    // we keep ownership of the shared graph for the final status derivation).
+    let squash_merger = SquashMerger::new(
+        worktree_manager.repo_root.clone(),
+        worktree_manager.base_branch.clone(),
+    );
+    let ctx = DriverContext {
+        graph: Arc::clone(&graph),
+        merge_lock: Arc::new(Mutex::new(())),
+        worktree_manager,
+        gate_runner: GateRunner::new(),
+        squash_merger,
+        config: config.clone(),
+        root: root.clone(),
+        supervisor: supervisor_ref.clone(),
+        backend,
+        control: control.clone(),
+    };
+
+    let result = scheduler(ctx, config.concurrency).await;
+
+    // Tear down the actor tree (kills the hub + any lingering supervised spokes).
+    root.kill();
+
+    // Derive + emit the aggregate terminal status — but NOT when cancelled: a
+    // cancelled run's status is owned by the caller (Cancel sets it explicitly),
+    // and we must not overwrite it with a misleading Completed/Failed.
+    if !control.cancel.is_cancelled() {
+        let status = {
+            let g = graph.lock().await;
+            aggregate_run_status(&g)
+        };
+        control.emit(api::Event::RunStatusChanged {
+            run: control.run,
+            status,
+        });
+    }
+
+    result
+}
+
+/// Derive the aggregate [`api::RunStatus`] from the final task states.
+///
+/// `Completed` iff every task is `Done`; otherwise `Failed` if any task is
+/// `Failed`; otherwise `Running` (defensive — a finished scheduler normally
+/// leaves only terminal tasks, but a paused/cancelled run may have non-terminal
+/// ones, which the caller's explicit status covers).
+fn aggregate_run_status(graph: &TaskGraph) -> api::RunStatus {
+    let all_done = graph.tasks.iter().all(|t| t.state == TaskState::Done);
+    if all_done {
+        return api::RunStatus::Completed;
+    }
+    if graph.tasks.iter().any(|t| t.state == TaskState::Failed) {
+        return api::RunStatus::Failed;
+    }
+    api::RunStatus::Running
 }
 
 // ── Concurrent scheduler ────────────────────────────────────────────────────────
@@ -607,13 +831,20 @@ impl Supervisor {
 /// the task-21 posture that a partial failure does not silently satisfy
 /// downstream deps.
 ///
-/// # Cancellation seam (task 31)
+/// # Run control: pause + cancel (task 31)
 ///
-/// Run-control (pause/cancel) is a later task.  The clean seam here: a cancel
-/// signal would (a) stop the fill phase from launching new drivers and (b)
-/// `abort_all()` the `JoinSet` (each aborted driver drops its permit *and* its
-/// `DriverGuard`, which still tears the worktree/spokes down — see
-/// [`task_driver`]).  No cancellation is performed today.
+/// The scheduler honours [`DriverContext::control`]:
+///
+/// - **Pause** (`control.pause == true`): the **fill** phase launches NO new
+///   drivers while paused; in-flight drivers keep running and are drained
+///   normally.  (Resume = clear the flag and run again — `CoreApi` does this by
+///   re-issuing `StartRun`, which spawns a fresh `run_graph`.)  The ask path's
+///   silent control never sets this, so that path is unchanged.
+/// - **Cancel** (`control.cancel` cancelled): the fill phase stops launching and
+///   the in-flight `JoinSet` is `abort_all()`ed.  Each aborted driver drops its
+///   permit *and* its [`DriverGuard`] (which still tears down the worktree/spokes
+///   — no leak).  The scheduler then drains the aborted joins and returns.  The
+///   drain loop also `select!`s on cancellation so a cancel mid-wait is prompt.
 async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, String> {
     let semaphore = Arc::new(Semaphore::new(concurrency));
     // Each driver future yields either its terminal `Result<TaskState, String>`
@@ -635,8 +866,23 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
     let mut stop_launching = false;
 
     loop {
+        // ── Cancellation: stop launching + abort everything in flight ──────────
+        //
+        // Checked at the top of each scheduler iteration.  On cancel we stop the
+        // fill phase and abort the JoinSet; each aborted driver's DriverGuard
+        // still runs (worktree + spokes torn down — no leak).  We then fall
+        // through to the drain phase to reap the aborted joins.
+        if ctx.control.cancel.is_cancelled() && !stop_launching {
+            stop_launching = true;
+            join_set.abort_all();
+        }
+
         // ── Fill: launch ready tasks until the cap is hit or none remain ───────
-        if !stop_launching {
+        //
+        // Paused runs (task 31) launch NO new drivers — in-flight ones still
+        // drain below.  `stop_launching` covers cancel + fatal-error.
+        let paused = ctx.control.pause.load(Ordering::SeqCst);
+        if !stop_launching && !paused {
             loop {
                 // Try to grab a permit WITHOUT awaiting while holding the graph
                 // lock: acquire the permit first (await), then take the graph
@@ -669,6 +915,9 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
 
                 match next {
                     Some(id) if !stop_launching => {
+                        // Emit the New→Ready transition the scheduler just applied
+                        // (outside the graph lock — the task is now `Ready`).
+                        ctx.emit_task_state(&id, TaskState::Ready);
                         in_flight.insert(id.clone());
                         let driver_ctx = ctx.clone();
                         let driver_id = id.clone();
@@ -708,18 +957,38 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
             break;
         }
 
-        // Await the next completed driver.  `join_next` yields the JoinSet's
-        // results as they finish (completion order).
-        match join_set.join_next().await {
+        // Await the next completed driver — but also wake promptly on a cancel so
+        // an in-flight wait does not block the abort.  When cancel fires mid-wait
+        // we loop back to the top, which aborts the JoinSet, then drains the
+        // (now-aborted) joins via this same match on the next iteration.
+        let joined = tokio::select! {
+            biased;
+            _ = ctx.control.cancel.cancelled(), if !ctx.control.cancel.is_cancelled() => {
+                // Re-evaluate at the top of the loop (aborts the JoinSet).
+                continue;
+            }
+            j = join_set.join_next() => j,
+        };
+
+        match joined {
             Some(Ok((id, Some(Ok(state))))) => {
                 in_flight.remove(&id);
+                ctx.emit_task_state(&id, state);
                 outcomes.push((id, state));
                 // A Done task may have unlocked dependents → loop to fill again.
             }
             Some(Ok((id, Some(Err(e))))) => {
                 // Hard error in a driver: the driver already moved its task to a
-                // terminal state and tore down its resources where possible.
+                // terminal state (Failed) and tore down its resources where
+                // possible.  Read + emit that terminal state so the TUI reflects
+                // it (the driver only emits the NON-terminal transitions; the
+                // scheduler owns the single terminal emission on every arm).
                 in_flight.remove(&id);
+                let terminal = {
+                    let graph = ctx.graph.lock().await;
+                    task_state_locked(&graph, &id).unwrap_or(TaskState::Failed)
+                };
+                ctx.emit_task_state(&id, terminal);
                 fatal_error.get_or_insert(e);
                 stop_launching = true; // stop launching new work; drain the rest.
             }
@@ -748,16 +1017,24 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                             task_state_locked(&graph, &id).unwrap_or(TaskState::Failed)
                         }
                     }
-                };
+                }; // guard dropped before emit.
+                ctx.emit_task_state(&id, final_state);
                 outcomes.push((id, final_state));
             }
             Some(Err(join_err)) => {
-                // The driver task panicked (or was aborted).  Record a fatal
-                // error and stop launching; remaining drivers still drain.  The
-                // panicking driver's permit was released by the JoinSet, and its
-                // `DriverGuard` ran on unwind (worktree/spokes torn down).
-                fatal_error.get_or_insert(format!("task driver panicked: {join_err}"));
-                stop_launching = true;
+                // The driver task ended abnormally.  Two cases:
+                //  - **Cancelled (task 31)**: we `abort_all()`ed it; this is the
+                //    EXPECTED outcome of a cancel, NOT a failure.  Its DriverGuard
+                //    ran on the abort unwind (worktree/spokes torn down — no leak).
+                //    We simply drop it (no fatal error, no outcome recorded).
+                //  - **Panicked**: a genuine bug.  Record a fatal error and stop
+                //    launching; remaining drivers still drain.
+                if join_err.is_cancelled() {
+                    // Expected during cancellation; nothing to record.
+                } else {
+                    fatal_error.get_or_insert(format!("task driver panicked: {join_err}"));
+                    stop_launching = true;
+                }
             }
             None => break, // JoinSet drained.
         }
@@ -985,7 +1262,10 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
         let mut graph = ctx.graph.lock().await;
         apply_event_locked(&mut graph, task_id, TaskEvent::Dispatched)?;
         mark_started_locked(&mut graph, task_id);
-    }
+    } // guard dropped before emit.
+    // Ready → InProgress (an intermediate transition; the scheduler owns the
+    // terminal-state emission, the driver owns the intermediate ones — task 31).
+    ctx.emit_task_state(task_id, TaskState::InProgress);
 
     // ── Step 3–6: the develop → gate → review loop (bounded retry) ─────────────
     let mut feedback: Option<String> = None;
@@ -1023,6 +1303,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
             .ask(Review {
                 task: review_task,
                 worktree: worktree.path.clone(),
+                run: ctx.control.run,
+                sink: Arc::clone(&ctx.control.sink),
             })
             .send()
             .await;
@@ -1156,12 +1438,19 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     // this final rejection in `review_iterations` first (so the
                     // recorded count equals the cap), then transition InReview →
                     // Failed via ReviewCapReached.
-                    {
+                    let (gate_iters, review_iters) = {
                         let mut graph = ctx.graph.lock().await;
                         increment_review_iterations_locked(&mut graph, task_id);
                         apply_event_locked(&mut graph, task_id, TaskEvent::ReviewCapReached)?;
                         mark_finished_locked(&mut graph, task_id);
-                    }
+                        (
+                            gate_iterations_locked(&graph, task_id)?,
+                            review_iterations_locked(&graph, task_id)?,
+                        )
+                    }; // guard dropped before emit.
+                    // Emit the final iteration count (the terminal Failed state is
+                    // emitted by the scheduler when this driver returns Ok(Failed)).
+                    ctx.emit_task_iterations(task_id, gate_iters, review_iters);
                     remove_worktree(ctx, task_id).await;
                     guard.worktree_removed = true;
                     terminal_state = TaskState::Failed;
@@ -1170,11 +1459,18 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
 
                 // ── Below the cap: InReview → InProgress (ReviewerRejected) ─────
                 // Count the rejection and loop back for a re-work attempt.
-                {
+                let (gate_iters, review_iters) = {
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::ReviewerRejected)?;
                     increment_review_iterations_locked(&mut graph, task_id);
-                }
+                    (
+                        gate_iterations_locked(&graph, task_id)?,
+                        review_iterations_locked(&graph, task_id)?,
+                    )
+                }; // guard dropped before emit.
+                // InReview → InProgress (intermediate) + the bumped review count.
+                ctx.emit_task_state(task_id, TaskState::InProgress);
+                ctx.emit_task_iterations(task_id, gate_iters, review_iters);
 
                 // Relay the feedback to the Developer on the next iteration.
                 feedback = Some(fb);
@@ -1226,6 +1522,8 @@ async fn develop_until_gates_pass(
                 task,
                 worktree: worktree_path.to_path_buf(),
                 feedback: feedback.take(),
+                run: ctx.control.run,
+                sink: Arc::clone(&ctx.control.sink),
             })
             .send()
             .await;
@@ -1253,7 +1551,9 @@ async fn develop_until_gates_pass(
                 {
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::GatesPassed)?;
-                }
+                } // guard dropped before emit.
+                // InProgress → InReview (intermediate transition — task 31).
+                ctx.emit_task_state(task_id, TaskState::InReview);
                 return Ok(DevelopGateOutcome::ReadyForReview);
             }
             Ok(GateOutcome::Failed {
@@ -1263,15 +1563,25 @@ async fn develop_until_gates_pass(
             }) => {
                 // A gate failed → self-loop and count the iteration; enforce the
                 // per-task GATE cap.
-                let iterations = {
+                let (iterations, review_iters) = {
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::GateFailed)?;
                     increment_gate_iterations_locked(&mut graph, task_id);
-                    gate_iterations_locked(&graph, task_id)?
-                };
+                    (
+                        gate_iterations_locked(&graph, task_id)?,
+                        review_iterations_locked(&graph, task_id)?,
+                    )
+                }; // guard dropped before emit.
+                // InProgress --GateFailed--> InProgress (self-loop) + the bumped
+                // gate count.  The TUI re-affirms InProgress and updates the
+                // counter (task 31).
+                ctx.emit_task_state(task_id, TaskState::InProgress);
+                ctx.emit_task_iterations(task_id, iterations, review_iters);
 
                 if iterations >= ctx.config.caps.gate_iterations {
-                    // GateCapReached: InProgress → Failed (terminal).
+                    // GateCapReached: InProgress → Failed (terminal).  The terminal
+                    // Failed state is emitted by the scheduler when this driver
+                    // returns Ok(GateCapReached) → Ok(Failed).
                     {
                         let mut graph = ctx.graph.lock().await;
                         apply_event_locked(&mut graph, task_id, TaskEvent::GateCapReached)?;

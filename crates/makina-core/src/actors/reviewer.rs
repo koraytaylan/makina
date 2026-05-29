@@ -48,11 +48,12 @@ use std::sync::Arc;
 use futures::StreamExt;
 use kameo::actor::ActorRef;
 
+use crate::api;
 use crate::backend::{AgentBackend, Prompt, ResponseEvent};
 use crate::roles::{Role, parse_review_verdict, session_config_for};
 use crate::task::Task;
 
-use super::supervisor::Supervisor;
+use super::supervisor::{EventSink, Supervisor};
 
 // ── ReviewVerdict re-export ───────────────────────────────────────────────────
 
@@ -115,11 +116,20 @@ impl kameo::actor::Actor for Reviewer {
 
 /// Instruct the Reviewer to evaluate the Developer's output for `task` inside
 /// the given `worktree`.
+///
+/// `run` + `sink` (task 31) mirror [`Develop`](super::developer::Develop): the
+/// handler publishes the live `AgentExchange` stream for the **Reviewer** role
+/// (`PromptSent` / `ResponseChunk` / `TurnComplete`) so the TUI shows the
+/// review turn alongside the develop turn.
 pub struct Review {
     /// The task being reviewed.
     pub task: Task,
     /// Path to the git worktree containing the Developer's output.
     pub worktree: PathBuf,
+    /// The Run this exchange belongs to (for `AgentExchange` events).
+    pub run: api::RunId,
+    /// Live-event sink: where `AgentExchange` events are published.
+    pub sink: EventSink,
 }
 
 /// Reply returned by the [`Review`] handler.
@@ -156,6 +166,17 @@ impl kameo::message::Message<Review> for Reviewer {
         // 3. Prompt for a structured review verdict.
         let prompt_text = build_review_prompt(&msg.task);
 
+        // Publish the outgoing prompt as the Reviewer "user turn" (task 31).
+        let task_id = api::TaskId(msg.task.id.0.clone());
+        (msg.sink)(api::Event::AgentExchange {
+            run: msg.run,
+            task: task_id.clone(),
+            role: api::AgentRole::Reviewer,
+            event: api::ExchangeEvent::PromptSent {
+                text: prompt_text.clone(),
+            },
+        });
+
         let stream = match session.prompt(Prompt::new(prompt_text)).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -164,13 +185,30 @@ impl kameo::message::Message<Review> for Reviewer {
             }
         };
 
-        // 4. Drain the response stream into the raw verdict text.
+        // 4. Drain the response stream into the raw verdict text, publishing each
+        //    chunk as a live `ResponseChunk` and the turn end as `TurnComplete`.
         let mut output = String::new();
         let mut events = stream;
         while let Some(item) = events.next().await {
             match item {
-                Ok(ResponseEvent::TextChunk { text }) => output.push_str(&text),
-                Ok(ResponseEvent::TurnComplete) => break,
+                Ok(ResponseEvent::TextChunk { text }) => {
+                    (msg.sink)(api::Event::AgentExchange {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Reviewer,
+                        event: api::ExchangeEvent::ResponseChunk { text: text.clone() },
+                    });
+                    output.push_str(&text);
+                }
+                Ok(ResponseEvent::TurnComplete) => {
+                    (msg.sink)(api::Event::AgentExchange {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Reviewer,
+                        event: api::ExchangeEvent::TurnComplete,
+                    });
+                    break;
+                }
                 Err(e) => {
                     drop(events);
                     let _ = session.terminate().await;

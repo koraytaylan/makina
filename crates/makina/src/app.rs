@@ -210,6 +210,27 @@ pub enum AppEvent {
     /// Close the file browser and return to the normal view (Esc, or after a
     /// file was opened).
     CloseBrowser,
+
+    // ── Run control (task 31) ─────────────────────────────────────────────────
+    //
+    // Start/Pause/Cancel are INTENT signals (like the browser intents): the IO
+    // layer in [`crate::event`] performs the async `api.execute(...)` for
+    // `app.selected_run()`'s `RunId` and feeds the result back as a
+    // [`AppEvent::StatusMessage`].  `update` itself does nothing for these
+    // variants (it cannot issue the async command), keeping `update` pure.
+    /// User pressed `s` — start (or resume) the selected Run.
+    StartRun,
+    /// User pressed `p` — pause the selected Run.
+    PauseRun,
+    /// User pressed `c` — cancel the selected Run.
+    CancelRun,
+
+    /// A transient status-bar message to display (command outcome or error).
+    ///
+    /// Set by the IO layer after an `api.execute(...)` resolves so the user sees
+    /// feedback (success or failure) instead of a silently-dropped result
+    /// (resolves the task-28 outcome-surfacing note).
+    StatusMessage(String),
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -272,6 +293,12 @@ pub struct App {
     /// Last api event received — stored for test assertions and status-bar
     /// display.  Will be used by tasks 27–31 for richer updates.
     pub last_event: Option<Event>,
+
+    /// A transient status-bar message surfacing the most recent command outcome
+    /// or error (task 31).  Set by [`AppEvent::StatusMessage`] (emitted by the
+    /// IO layer after an `api.execute(...)` resolves) and rendered in the status
+    /// bar.  `None` until the first command is issued.
+    pub status_message: Option<String>,
 }
 
 impl App {
@@ -299,6 +326,7 @@ impl App {
             selected_task,
             exchange_logs: HashMap::new(),
             last_event: None,
+            status_message: None,
         }
     }
 
@@ -479,6 +507,18 @@ impl App {
             AppEvent::CloseBrowser => {
                 self.mode = Mode::Normal;
                 self.browser = None;
+                true
+            }
+
+            // ── Run control (task 31) ─────────────────────────────────────────
+            // Start/Pause/Cancel are IO-layer intents: the event loop issues the
+            // async `api.execute(...)` for the selected run and feeds back a
+            // StatusMessage.  `update` itself does not mutate state here (no
+            // async), so these are no-ops that simply request a redraw.
+            AppEvent::StartRun | AppEvent::PauseRun | AppEvent::CancelRun => true,
+
+            AppEvent::StatusMessage(msg) => {
+                self.status_message = Some(msg);
                 true
             }
         }
@@ -1243,6 +1283,34 @@ mod tests {
         // t2 must be unchanged.
         assert_eq!(app.runs[0].tasks[1].gate_iterations, 0, "t2 unchanged");
         assert_eq!(app.runs[0].tasks[1].review_iterations, 0, "t2 unchanged");
+    }
+
+    // ── Run control + status message (task 31) ────────────────────────────────
+
+    #[test]
+    fn status_message_event_sets_field() {
+        let mut app = make_app();
+        assert!(app.status_message.is_none());
+        let redraw = app.update(AppEvent::StatusMessage("Cancel run:3".into()));
+        assert!(redraw, "StatusMessage must trigger a redraw");
+        assert_eq!(app.status_message.as_deref(), Some("Cancel run:3"));
+    }
+
+    #[test]
+    fn control_intents_are_pure_noops_in_update() {
+        // Start/Pause/Cancel are IO-layer intents; `update` must not mutate
+        // state for them (the async execute + status flow lives in the event
+        // loop).  They only request a redraw.
+        let mut app = make_app();
+        for ev in [AppEvent::StartRun, AppEvent::PauseRun, AppEvent::CancelRun] {
+            let before = app.status_message.clone();
+            let redraw = app.update(ev);
+            assert!(redraw);
+            assert_eq!(
+                app.status_message, before,
+                "control intents must not change status_message in update()"
+            );
+        }
     }
 
     // ── File browser update logic (task 28) ───────────────────────────────────

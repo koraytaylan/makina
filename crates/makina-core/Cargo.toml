@@ -17,6 +17,9 @@ futures = { workspace = true }
 # `sync` feature provides `BroadcastStream`, used by `orchestrator::CoreApi` to
 # adapt a `tokio::sync::broadcast` receiver into the infallible `EventStream`.
 tokio-stream = { workspace = true, features = ["sync"] }
+# `tokio-util` provides `CancellationToken`, used by `orchestrator::CoreApi`
+# (task 31, run-control) to signal a background Supervisor scheduler to abort.
+tokio-util = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 

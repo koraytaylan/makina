@@ -43,6 +43,10 @@ futures = "0.3"
 # ResponseStream over an mpsc channel).
 tokio-stream = "0.1"
 
+# tokio-util — `CancellationToken` is used by `CoreApi` (task 31, run-control)
+# to signal a background Supervisor scheduler to abort (cancel) a Run.
+tokio-util = "0.7"
+
 # Derive-based error types
 thiserror = "2.0"
 
