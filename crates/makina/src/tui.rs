@@ -1,0 +1,124 @@
+//! Terminal lifecycle: setup, teardown, and panic-safe restoration.
+//!
+//! # Responsibilities
+//!
+//! This module owns the terminal's raw mode and alternate screen state.  It
+//! provides:
+//!
+//! * [`Tui::init`] — enables raw mode, enters the alternate screen, hides the
+//!   cursor, and installs a panic hook that restores the terminal before the
+//!   default panic handler prints its message (so a panic never leaves the
+//!   user's shell in an unreadable state).
+//! * [`Tui::restore`] — disables raw mode, leaves the alternate screen, shows
+//!   the cursor.  Called explicitly on clean exit and from the panic hook.
+//! * [`Drop`] impl — calls [`Tui::restore`] so the terminal is always cleaned
+//!   up, even if the caller forgets.
+//!
+//! # Design
+//!
+//! `Tui` wraps a `Terminal<CrosstermBackend<Stdout>>` — the standard ratatui
+//! terminal type for crossterm.  It is the single owner of the terminal handle,
+//! preventing accidental double-initialisation.
+
+use std::io::{self, Stdout};
+use std::panic;
+
+use ratatui::Terminal;
+use ratatui::crossterm::{
+    cursor, execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::prelude::CrosstermBackend;
+
+// ── Tui wrapper ───────────────────────────────────────────────────────────────
+
+/// Owns the ratatui `Terminal` handle and manages the terminal lifecycle.
+pub struct Tui {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl Tui {
+    /// Initialise the terminal.
+    ///
+    /// 1. Enables raw mode.
+    /// 2. Enters the alternate screen.
+    /// 3. Hides the cursor.
+    /// 4. Installs a panic hook that calls [`restore_terminal`] before the
+    ///    default panic handler runs, so a panic never leaves the shell in a
+    ///    garbled state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if any of the terminal setup steps fail.
+    pub fn init() -> io::Result<Self> {
+        install_panic_hook();
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self { terminal })
+    }
+
+    /// Restore the terminal to its state before [`Tui::init`] was called.
+    ///
+    /// Safe to call multiple times; subsequent calls after the first are no-ops
+    /// from the OS perspective (raw mode disabled, alternate screen left) even if
+    /// they technically re-run the escape sequences.
+    ///
+    /// Called explicitly by the event loop on clean exit, and by the panic hook
+    /// and [`Drop`] as safety nets.
+    pub fn restore(&mut self) {
+        // Best-effort: ignore errors during teardown.
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            cursor::Show
+        );
+    }
+
+    /// Draw one frame using the provided closure.
+    ///
+    /// A thin wrapper around [`Terminal::draw`] so callers don't need to hold a
+    /// separate `Terminal` handle.
+    pub fn draw<F>(&mut self, render_fn: F) -> io::Result<ratatui::CompletedFrame<'_>>
+    where
+        F: FnOnce(&mut ratatui::Frame),
+    {
+        self.terminal.draw(render_fn)
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+// ── Panic hook ────────────────────────────────────────────────────────────────
+
+/// Install a panic hook that restores the terminal before the default handler.
+///
+/// If a panic occurs while raw mode or the alternate screen is active, the
+/// default handler's message would be invisible (raw mode) or printed to the
+/// alternate screen (which then disappears immediately on process exit).
+/// Installing this hook ensures the terminal is always restored first.
+///
+/// # Idempotent
+///
+/// Calling this function multiple times simply re-installs the hook; the last
+/// call wins.  In practice `Tui::init` calls it exactly once.
+fn install_panic_hook() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+}
+
+/// Restore the terminal outside of a [`Tui`] instance (used by the panic hook).
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+}
