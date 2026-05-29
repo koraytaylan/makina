@@ -15,3 +15,4 @@ pub mod roles;
 pub mod state_machine;
 pub mod supervision;
 pub mod task;
+pub mod worktree;
