@@ -47,7 +47,7 @@ async fn agent_eof_during_handshake_is_typed_error() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let err = AcpClient::with_transport(client_read, client_write, "/tmp")
+    let err = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
         .await
         .expect_err("handshake against a dead agent must fail");
     assert!(
@@ -95,7 +95,7 @@ async fn handshake_tolerates_non_jsonrpc_preamble() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let client = AcpClient::with_transport(client_read, client_write, "/tmp")
+    let client = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
         .await
         .expect("handshake must succeed despite non-JSON preamble");
     assert_eq!(client.session_id(), "noisy-sess");
@@ -129,7 +129,7 @@ async fn handshake_with_invalid_result_payload_is_protocol_error() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let err = AcpClient::with_transport(client_read, client_write, "/tmp")
+    let err = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
         .await
         .expect_err("an invalid initialize result must fail");
     assert!(
@@ -176,7 +176,7 @@ async fn agent_disconnect_mid_turn_yields_error_then_ends() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let mut client = AcpClient::with_transport(client_read, client_write, "/tmp")
+    let mut client = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
         .await
         .expect("handshake ok");
 

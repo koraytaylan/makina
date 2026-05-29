@@ -27,6 +27,7 @@ use futures::StreamExt;
 use makina_acp::AcpClient;
 use makina_acp::backend::AcpSession;
 use makina_core::backend::{AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream};
+use makina_core::governance::{AuditDecision, AuditEntry, AuditSink};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -35,7 +36,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// `Box<dyn AgentSession>` so tests only touch the trait surface.
 async fn session_over_mock(behavior: MockBehavior, system_prompt: &str) -> Box<dyn AgentSession> {
     let (reader, writer, _mock) = spawn_mock_agent(behavior);
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .expect("handshake should succeed");
     Box::new(AcpSession::from_client(client, system_prompt))
@@ -212,7 +213,7 @@ async fn mid_turn_disconnect_surfaces_transport_error_no_false_turn_complete() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let client = AcpClient::with_transport(client_read, client_write, "/tmp")
+    let client = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
         .await
         .expect("handshake ok");
     let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
@@ -325,7 +326,7 @@ async fn system_prompt_is_prepended_to_first_turn_only() {
         ..MockBehavior::default()
     };
     let (reader, writer, _mock) = spawn_mock_agent_recording(behavior, Arc::clone(&log));
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .unwrap();
     let mut session: Box<dyn AgentSession> =
@@ -359,7 +360,7 @@ async fn empty_system_prompt_adds_no_prelude() {
         ..MockBehavior::default()
     };
     let (reader, writer, _mock) = spawn_mock_agent_recording(behavior, Arc::clone(&log));
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .unwrap();
     let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
@@ -369,4 +370,101 @@ async fn empty_system_prompt_adds_no_prelude() {
 
     let sent = log.lock().unwrap().clone();
     assert_eq!(sent, vec!["just the task"], "no stray leading blank line");
+}
+
+// ── gateway-threading acceptance: interleaved permission + audit recording ────
+
+/// A capturing [`AuditSink`] that records all entries into a shared `Vec`.
+///
+/// `Clone` shares the same buffer (arc-backed), so one clone can be injected
+/// and another kept to assert recorded entries after the turn.
+#[derive(Clone, Default)]
+struct CapturingAuditSink {
+    entries: Arc<Mutex<Vec<AuditEntry>>>,
+}
+
+impl AuditSink for CapturingAuditSink {
+    fn record(&self, entry: AuditEntry) {
+        self.entries.lock().unwrap().push(entry);
+    }
+}
+
+/// Gateway-threading acceptance test (task `gateway-threading`).
+///
+/// Exercises the transport-level half of the injection seam end-to-end at the
+/// trait level:
+/// 1. A capturing [`AuditSink`] is passed directly to `AcpClient::with_transport`
+///    (the same sink that `AcpBackend::command_for` would supply; the
+///    `AcpBackend → command_for → AcpCommand → transport` wiring is covered by
+///    the in-crate unit test
+///    `gateway_threading_audit_sink_flows_through_backend_command_to_transport`
+///    in `backend.rs`).
+/// 2. The mock peer sends a `session/request_permission` mid-turn.
+/// 3. The transport's reader loop answers using the default [`WorktreePolicy`]
+///    (auto-allow with `allow_once`), exactly as it would in production.
+/// 4. The turn completes normally (text chunks + `TurnComplete`).
+/// 5. Exactly one [`AuditEntry`] with [`AuditDecision::Allow`] was recorded.
+#[tokio::test]
+async fn interleaved_permission_request_completes_turn_and_records_audit_entry() {
+    let worktree = std::env::temp_dir().join("makina-backend-trait-perm-test");
+
+    // Build the capturing sink; keep the concrete Arc to read entries back.
+    let capturing = Arc::new(CapturingAuditSink::default());
+    let entries_handle = Arc::clone(&capturing.entries);
+
+    // Behavior: one text chunk, with a permission request injected before it.
+    let behavior = MockBehavior {
+        session_id: "sess-perm-backend".into(),
+        chunks: vec!["work done".into()],
+        stop_reason: "end_turn".into(),
+        leading_noise_updates: 0,
+        inject_permission_request: Some("write_file__test_1".into()),
+        ..MockBehavior::default()
+    };
+
+    // Connect client with the capturing sink injected directly.
+    // WorktreePolicy is built from worktree (the default for `None` policy).
+    let (reader, writer, _mock) = spawn_mock_agent(behavior);
+    let client = AcpClient::with_transport(
+        reader,
+        writer,
+        &worktree,
+        None,
+        Some(Arc::clone(&capturing) as Arc<dyn AuditSink>),
+    )
+    .await
+    .expect("handshake should succeed");
+
+    // Drive the full turn through the AgentSession trait.
+    let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
+
+    let stream = session
+        .prompt(Prompt::new("do the work"))
+        .await
+        .expect("prompt should be accepted");
+    let (text, completes) = drain_ok(stream).await;
+
+    assert_eq!(text, "work done", "text chunk should pass through");
+    assert_eq!(completes, 1, "exactly one TurnComplete");
+
+    // Terminate so the transport is fully wound down before we read the sink.
+    session.terminate().await.expect("terminate ok");
+
+    // Exactly one audit entry with an allow decision.
+    let recorded = entries_handle.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one audit entry must be recorded for the permission request"
+    );
+    assert_eq!(
+        recorded[0].decision,
+        AuditDecision::Allow,
+        "the WorktreePolicy should auto-allow the request"
+    );
+    assert_eq!(
+        recorded[0].option_id.as_deref(),
+        Some("proceed_once"),
+        "WorktreePolicy selects the allow_once option"
+    );
 }

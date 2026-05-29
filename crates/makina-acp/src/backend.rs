@@ -54,11 +54,13 @@
 //! can refine role-specific prompting without touching the bridge.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
 };
+use makina_core::governance::{AuditSink, NoopAuditSink};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -107,7 +109,16 @@ fn map_error(err: AcpError) -> BackendError {
 ///
 /// `AcpBackend` is cheap to clone-by-reference (`Send + Sync`) and may back many
 /// concurrent sessions; sessions are fully independent.
-#[derive(Debug, Clone)]
+///
+/// The **audit sink** is run-level: one `Arc<dyn AuditSink>` shared across all
+/// sessions spawned by this backend.  Inject it via
+/// [`AcpBackend::with_audit_sink`]; the default is [`NoopAuditSink`].
+///
+/// The **permission policy** is session-scoped (it depends on `working_dir`).
+/// By default a [`crate::permission::WorktreePolicy`] is built from the session's
+/// `working_dir` at connect time.  The policy flows through [`AcpCommand`], so
+/// per-session overrides are possible via
+/// [`AcpCommand::with_policy`] when constructing a command directly.
 pub struct AcpBackend {
     /// The agent program to execute (e.g. `gemini`, `npx`).
     program: PathBuf,
@@ -116,6 +127,32 @@ pub struct AcpBackend {
     /// Extra environment variables layered on top of the inherited environment
     /// (Zed auth model — credentials are never injected here).
     env: Vec<(String, String)>,
+    /// Run-level audit sink, shared by all sessions.
+    audit_sink: Arc<dyn AuditSink>,
+}
+
+// Manual Clone: Arc<dyn AuditSink> is Clone but not derived without a bound.
+impl Clone for AcpBackend {
+    fn clone(&self) -> Self {
+        Self {
+            program: self.program.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            audit_sink: Arc::clone(&self.audit_sink),
+        }
+    }
+}
+
+// Manual Debug: Arc<dyn AuditSink> may not be Debug.
+// `finish_non_exhaustive` signals that `audit_sink` is intentionally omitted.
+impl std::fmt::Debug for AcpBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpBackend")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("env", &self.env)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcpBackend {
@@ -133,6 +170,7 @@ impl AcpBackend {
             program: program.into(),
             args,
             env: Vec::new(),
+            audit_sink: Arc::new(NoopAuditSink),
         }
     }
 
@@ -144,14 +182,64 @@ impl AcpBackend {
         self
     }
 
+    /// Set the audit sink that records every permission decision across all
+    /// sessions spawned by this backend.  The same `Arc` is shared across all
+    /// sessions (clone-by-reference), so a capturing test sink can be read back
+    /// after the backend is used.
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit_sink = sink;
+        self
+    }
+
     /// Build the [`AcpCommand`] for a session in `working_dir`.
+    ///
+    /// The command carries the backend's audit sink and no policy override (the
+    /// default [`crate::permission::WorktreePolicy`] will be built from
+    /// `working_dir` at connect time).
     fn command_for(&self, working_dir: PathBuf) -> AcpCommand {
-        let mut command =
-            AcpCommand::new(self.program.clone(), working_dir).args(self.args.clone());
+        let mut command = AcpCommand::new(self.program.clone(), working_dir)
+            .args(self.args.clone())
+            .with_audit_sink(Arc::clone(&self.audit_sink));
         for (key, value) in &self.env {
             command = command.env(key.clone(), value.clone());
         }
         command
+    }
+
+    /// Test-only seam: connect a client over `reader`/`writer` using the policy
+    /// and audit sink that `spawn` would thread through for `working_dir`.
+    ///
+    /// This is the acceptance-test entry point for `gateway-threading`: it calls
+    /// `command_for(working_dir)` (the same path as `spawn`) and then calls
+    /// `AcpClient::with_transport` with the command's `effective_policy()` and
+    /// `audit_sink`, so the test's capturing sink reaches the transport through
+    /// the real `AcpBackend → command_for → AcpCommand` wiring rather than being
+    /// injected directly.
+    #[cfg(test)]
+    pub(crate) async fn spawn_with_transport<R, W>(
+        &self,
+        reader: R,
+        writer: W,
+        working_dir: PathBuf,
+    ) -> crate::error::Result<AcpClient>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let command = self.command_for(working_dir);
+        // Use the single shared derivation (same path as spawn_transport) so the
+        // test seam and the production path always agree on which policy/sink to
+        // thread through (see `AcpCommand::transport_inputs`).
+        let (policy, sink) = command.transport_inputs();
+        AcpClient::with_transport(
+            reader,
+            writer,
+            &command.working_dir,
+            Some(policy),
+            Some(sink),
+        )
+        .await
     }
 }
 
@@ -498,5 +586,188 @@ mod tests {
             system_prompt: None,
         };
         assert_eq!(session.compose_first_turn("hello".into()), "hello");
+    }
+
+    /// Gateway-threading unit test (task `gateway-threading`).
+    ///
+    /// Proves that the `AcpBackend::with_audit_sink` → `command_for` →
+    /// `AcpCommand.audit_sink` injection seam reaches the transport:
+    ///
+    /// 1. A capturing sink is injected via `AcpBackend::with_audit_sink`.
+    /// 2. `command_for` carries the *exact same* `Arc` (`ptr_eq`).
+    /// 3. `spawn_with_transport` builds a client using the command's policy and
+    ///    sink (the same path as real `spawn`, minus the subprocess).
+    /// 4. A mock peer sends `session/request_permission` mid-turn.
+    /// 5. After the turn, the capturing sink holds exactly one `Allow` entry.
+    ///
+    /// This is an in-crate test so it can reach the private `command_for`.
+    #[tokio::test]
+    async fn gateway_threading_audit_sink_flows_through_backend_command_to_transport() {
+        use futures::StreamExt as _;
+        use makina_core::backend::AgentSession;
+        use makina_core::governance::{AuditDecision, AuditEntry, AuditSink};
+        use serde_json::json;
+        use std::sync::Mutex;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        // ── sentinel id for the injected permission request ─────────────────
+        // Distinct from the normal request id sequence (0, 1, 2 …) so the mock
+        // peer and the transport both refer to the same well-known value.
+        // NOTE: this is a deliberate twin of the same sentinel in
+        // `tests/common/mod.rs`; the in-crate test cannot reach that module.
+        const PERMISSION_REQUEST_ID: u64 = 9999;
+
+        // ── capturing sink ──────────────────────────────────────────────────
+        // Deliberate twin of `CapturingAuditSink` in `tests/backend_trait.rs`:
+        // the in-crate test cannot use `tests/common/` so it defines its own.
+        #[derive(Clone, Default)]
+        struct CapturingSink {
+            entries: Arc<Mutex<Vec<AuditEntry>>>,
+        }
+        impl AuditSink for CapturingSink {
+            fn record(&self, entry: AuditEntry) {
+                self.entries.lock().unwrap().push(entry);
+            }
+        }
+
+        let sink = CapturingSink::default();
+        let entries_handle = Arc::clone(&sink.entries);
+        let sink_arc: Arc<dyn AuditSink> = Arc::new(sink);
+
+        // ── backend with injected sink ──────────────────────────────────────
+        let worktree = std::env::temp_dir().join("makina-backend-unit-perm-test");
+        // Best-effort: ensure the directory exists so WorktreePolicy can stat it
+        // if it ever needs to, keeping the test deterministic regardless.
+        let _ = std::fs::create_dir_all(&worktree);
+        let backend =
+            AcpBackend::new("echo", vec!["--acp".into()]).with_audit_sink(Arc::clone(&sink_arc));
+
+        // Prove the Arc flows into the command (same pointer, not a copy).
+        let command = backend.command_for(worktree.clone());
+        assert!(
+            Arc::ptr_eq(&sink_arc, &command.audit_sink),
+            "command_for must carry the exact Arc injected into the backend"
+        );
+        drop(command); // we'll use spawn_with_transport below
+
+        // ── mock peer ───────────────────────────────────────────────────────
+        let session_id = "sess-gw-unit";
+        let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        let peer = tokio::spawn(async move {
+            let mut lines = BufReader::new(peer_read).lines();
+
+            macro_rules! send {
+                ($v:expr) => {{
+                    let mut bytes = serde_json::to_vec(&$v).unwrap();
+                    bytes.push(b'\n');
+                    peer_write.write_all(&bytes).await.unwrap();
+                    peer_write.flush().await.unwrap();
+                }};
+            }
+
+            // initialize
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({
+                "jsonrpc": "2.0", "id": 0,
+                "result": { "protocolVersion": 1, "agentCapabilities": {},
+                            "authMethods": [], "agentInfo": { "name": "mock", "version": "0" } }
+            }));
+
+            // session/new
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({ "jsonrpc": "2.0", "id": 1,
+                          "result": { "sessionId": session_id } }));
+
+            // session/prompt: read it
+            let _ = lines.next_line().await.unwrap();
+
+            // inject permission request before the text chunk
+            send!(json!({
+                "jsonrpc": "2.0", "id": PERMISSION_REQUEST_ID,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": session_id,
+                    "options": [
+                        { "optionId": "proceed_always", "name": "Always", "kind": "allow_always" },
+                        { "optionId": "proceed_once",   "name": "Allow",  "kind": "allow_once"  }
+                    ],
+                    "toolCall": {
+                        "toolCallId": "write_file__unit_test_1",
+                        "title": "Write file"
+                    }
+                }
+            }));
+
+            // read the client's permission response
+            if let Ok(Some(resp_line)) = lines.next_line().await {
+                let resp: serde_json::Value = serde_json::from_str(resp_line.trim()).unwrap();
+                assert_eq!(
+                    resp["id"], PERMISSION_REQUEST_ID,
+                    "permission response id mismatch"
+                );
+            }
+
+            // send one text chunk and complete
+            send!(json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": { "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "unit work done" } }
+                }
+            }));
+            send!(json!({ "jsonrpc": "2.0", "id": 2,
+                          "result": { "stopReason": "end_turn" } }));
+        });
+
+        // ── connect through the backend seam, not bare with_transport ───────
+        let client = backend
+            .spawn_with_transport(client_read, client_write, worktree)
+            .await
+            .expect("spawn_with_transport handshake must succeed");
+
+        // ── drive one full turn through the trait ───────────────────────────
+        let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
+        let stream = session
+            .prompt(makina_core::backend::Prompt::new("do the unit work"))
+            .await
+            .expect("prompt accepted");
+
+        let mut text = String::new();
+        let mut completes = 0usize;
+        let mut stream = stream;
+        while let Some(item) = stream.next().await {
+            match item.expect("no error expected") {
+                makina_core::backend::ResponseEvent::TextChunk { text: chunk } => {
+                    text.push_str(&chunk)
+                }
+                makina_core::backend::ResponseEvent::TurnComplete => completes += 1,
+            }
+        }
+        assert_eq!(text, "unit work done");
+        assert_eq!(completes, 1);
+        session.terminate().await.expect("terminate ok");
+        peer.await.expect("mock peer task panicked");
+
+        // ── audit assertion: the backend-threaded sink recorded the entry ───
+        let recorded = entries_handle.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one AuditEntry must be recorded through the backend→command path"
+        );
+        assert_eq!(
+            recorded[0].decision,
+            AuditDecision::Allow,
+            "WorktreePolicy auto-allows inside the worktree"
+        );
+        assert_eq!(
+            recorded[0].option_id.as_deref(),
+            Some("proceed_once"),
+            "WorktreePolicy must select the allow_once option"
+        );
     }
 }

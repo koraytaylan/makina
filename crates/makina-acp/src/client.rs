@@ -64,7 +64,7 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// environment (so the CLI's existing sign-in is reused) and never injects model
 /// credentials. Additional env vars set here are *added on top of* the inherited
 /// environment, not a replacement.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AcpCommand {
     /// The program to execute (e.g. `npx`, `claude-code-acp`, `gemini`).
     pub program: PathBuf,
@@ -74,6 +74,27 @@ pub struct AcpCommand {
     pub working_dir: PathBuf,
     /// Extra environment variables layered on top of the inherited environment.
     pub env: Vec<(String, String)>,
+    /// Optional policy override; when `None` a [`WorktreePolicy`] built from
+    /// `working_dir` is used at connect time.
+    pub(crate) policy: Option<Arc<dyn crate::permission::PermissionPolicy>>,
+    /// Audit sink that receives one entry per permission decision.
+    /// Defaults to [`makina_core::governance::NoopAuditSink`].
+    pub(crate) audit_sink: Arc<dyn makina_core::governance::AuditSink>,
+}
+
+// Manual Debug: the Arc<dyn …> impls are not guaranteed Debug.
+// `finish_non_exhaustive` signals that `audit_sink` (and the resolved policy)
+// are intentionally omitted from the output.
+impl std::fmt::Debug for AcpCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("working_dir", &self.working_dir)
+            .field("env", &self.env)
+            .field("has_policy_override", &self.policy.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcpCommand {
@@ -84,6 +105,8 @@ impl AcpCommand {
             args: Vec::new(),
             working_dir: working_dir.into(),
             env: Vec::new(),
+            policy: None,
+            audit_sink: Arc::new(NoopAuditSink),
         }
     }
 
@@ -103,6 +126,47 @@ impl AcpCommand {
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
+    }
+
+    /// Override the permission policy used for `session/request_permission`
+    /// requests on this command's session.  When not called the default
+    /// [`WorktreePolicy`] is built from `working_dir` at connect time.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Arc<dyn crate::permission::PermissionPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Set the audit sink that records every permission decision for this
+    /// command's session.
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Arc<dyn makina_core::governance::AuditSink>) -> Self {
+        self.audit_sink = sink;
+        self
+    }
+
+    /// Resolve the effective policy: the override if set, otherwise a fresh
+    /// [`WorktreePolicy`] scoped to `working_dir`.
+    pub(crate) fn effective_policy(&self) -> Arc<dyn crate::permission::PermissionPolicy> {
+        match &self.policy {
+            Some(p) => Arc::clone(p),
+            None => Arc::new(WorktreePolicy::new(self.working_dir.clone())),
+        }
+    }
+
+    /// Return the `(policy, sink)` pair that any transport built from this
+    /// command must use.
+    ///
+    /// This is the **single authoritative derivation** shared by both
+    /// `spawn_transport` (production path) and `AcpBackend::spawn_with_transport`
+    /// (test seam), so a change here propagates to both without divergence.
+    pub(crate) fn transport_inputs(
+        &self,
+    ) -> (
+        Arc<dyn crate::permission::PermissionPolicy>,
+        Arc<dyn makina_core::governance::AuditSink>,
+    ) {
+        (self.effective_policy(), Arc::clone(&self.audit_sink))
     }
 }
 
@@ -191,15 +255,28 @@ impl AcpClient {
     /// This is the seam used by tests: pass a transport built over a
     /// [`tokio::io::duplex`] pipe whose other end is a mock agent. No subprocess
     /// is involved, so the full protocol exchange is exercised deterministically.
-    pub async fn with_transport<R, W>(reader: R, writer: W, cwd: impl AsRef<Path>) -> Result<Self>
+    ///
+    /// `policy` and `audit_sink` are injected into the transport so that
+    /// `session/request_permission` requests are answered and audited exactly as
+    /// they would be in production.  Pass `None` for `policy` to get the default
+    /// [`WorktreePolicy`] scoped to `cwd`; pass `None` for `audit_sink` for a
+    /// silent [`makina_core::governance::NoopAuditSink`].
+    pub async fn with_transport<R, W>(
+        reader: R,
+        writer: W,
+        cwd: impl AsRef<Path>,
+        policy: Option<Arc<dyn crate::permission::PermissionPolicy>>,
+        audit_sink: Option<Arc<dyn makina_core::governance::AuditSink>>,
+    ) -> Result<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let cwd = cwd.as_ref().to_path_buf();
         let policy: Arc<dyn crate::permission::PermissionPolicy> =
-            Arc::new(WorktreePolicy::new(cwd.clone()));
-        let sink: Arc<dyn makina_core::governance::AuditSink> = Arc::new(NoopAuditSink);
+            policy.unwrap_or_else(|| Arc::new(WorktreePolicy::new(cwd.clone())));
+        let sink: Arc<dyn makina_core::governance::AuditSink> =
+            audit_sink.unwrap_or_else(|| Arc::new(NoopAuditSink));
         let transport = Transport::new(
             reader,
             Box::pin(writer) as BoxedWriter,
@@ -438,9 +515,9 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Transport<BoxedWriter
     let reader = Box::pin(stdout) as Pin<Box<dyn AsyncRead + Send>>;
     let writer = Box::pin(stdin) as BoxedWriter;
     let cwd = command.working_dir.clone();
-    let policy: Arc<dyn crate::permission::PermissionPolicy> =
-        Arc::new(WorktreePolicy::new(cwd.clone()));
-    let sink: Arc<dyn makina_core::governance::AuditSink> = Arc::new(NoopAuditSink);
+    // Use the single shared derivation so the production and test paths are
+    // always in sync (see `AcpCommand::transport_inputs`).
+    let (policy, sink) = command.transport_inputs();
     let transport = Transport::new(reader, writer, policy, cwd, sink);
     Ok((child, transport))
 }

@@ -51,6 +51,11 @@ pub struct MockBehavior {
     /// format. Defaults to a single `oauth` method so the Zed-model test can
     /// assert that `AcpClient::auth_methods()` returns a non-empty slice.
     pub auth_methods: Vec<Value>,
+    /// If `Some`, the mock emits one `session/request_permission` inbound request
+    /// **before** the first text chunk, waits to read the client's response, then
+    /// continues the turn normally.  The value is the `toolCallId` to use in the
+    /// permission request, with a single `allow_once` option offered.
+    pub inject_permission_request: Option<String>,
 }
 
 impl Default for MockBehavior {
@@ -62,6 +67,7 @@ impl Default for MockBehavior {
             leading_noise_updates: 0,
             // Default: advertise one auth method so tests can assert observability.
             auth_methods: vec![json!({ "type": "oauth" })],
+            inject_permission_request: None,
         }
     }
 }
@@ -194,6 +200,57 @@ async fn run_mock<R, W>(
                         }),
                     )
                     .await;
+                }
+
+                // Optional interleaved permission request (inbound from agent).
+                // The mock sends a `session/request_permission` request, then
+                // reads back exactly one response before continuing.
+                if let Some(ref tool_call_id) = behavior.inject_permission_request {
+                    // Sentinel id: distinct from the normal request sequence (0, 1, 2 …)
+                    // so both sides can unambiguously identify the permission response.
+                    // NOTE: mirrored as PERMISSION_REQUEST_ID in `src/backend.rs` tests.
+                    const PERMISSION_REQUEST_ID: u64 = 9999;
+                    send(
+                        &mut writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": PERMISSION_REQUEST_ID,
+                            "method": "session/request_permission",
+                            "params": {
+                                "sessionId": session_id,
+                                "options": [
+                                    {
+                                        "optionId": "proceed_always",
+                                        "name": "Always",
+                                        "kind": "allow_always"
+                                    },
+                                    {
+                                        "optionId": "proceed_once",
+                                        "name": "Allow",
+                                        "kind": "allow_once"
+                                    }
+                                ],
+                                "toolCall": {
+                                    "toolCallId": tool_call_id,
+                                    "title": format!("Executing {tool_call_id}")
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                    // Read the client's response to the permission request.
+                    // The transport reader task handles this independently, so
+                    // we just drain it here to keep the mock in sync.
+                    if let Ok(Some(resp_line)) = lines.next_line().await {
+                        let resp: Value = serde_json::from_str(resp_line.trim())
+                            .expect("mock: client sent invalid JSON for perm response");
+                        // Validate the response has our id; the actual outcome is
+                        // determined by the injected policy on the client side.
+                        assert_eq!(
+                            resp["id"], PERMISSION_REQUEST_ID,
+                            "mock: expected permission response with id {PERMISSION_REQUEST_ID}"
+                        );
+                    }
                 }
 
                 // Stream the assistant text as agent_message_chunk updates.

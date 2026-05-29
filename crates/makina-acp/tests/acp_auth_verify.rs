@@ -40,7 +40,7 @@ async fn auth_methods_are_surfaced_from_initialize() {
     let behavior = MockBehavior::default();
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .expect("handshake should succeed");
 
@@ -68,7 +68,7 @@ async fn empty_auth_methods_surfaces_empty_slice() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .expect("handshake should succeed");
 
@@ -93,7 +93,7 @@ async fn multiple_auth_methods_with_extra_fields_are_surfaced() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .expect("handshake should succeed");
 

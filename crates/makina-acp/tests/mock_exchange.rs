@@ -42,7 +42,7 @@ async fn full_handshake_and_streamed_prompt_response() {
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
     // connect() performs initialize + session/new against the mock.
-    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .expect("handshake should succeed");
 
@@ -86,7 +86,7 @@ async fn non_text_updates_are_ignored_during_turn() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .unwrap();
 
@@ -113,7 +113,7 @@ async fn two_sequential_turns_on_one_session() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo")
+    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
         .await
         .unwrap();
 
