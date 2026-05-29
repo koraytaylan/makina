@@ -27,19 +27,30 @@
 //! modify the same file simultaneously.  The heuristic therefore errs toward
 //! adding an edge whenever areas overlap.
 //!
+//! Note: high-frequency tokens like `` `makina-core` `` are weak discriminators
+//! and may over-serialize a real TASKS.md by linking many unrelated tasks.  This
+//! is acceptable for the deterministic baseline but worth flagging; a future
+//! model-backed area extractor can narrow the signal.
+//!
 //! # Edge-inference rule
 //!
 //! For every pair of tasks (A, B) that share at least one area:
-//! - If A appears before B in `tasks` order, add B → A (B depends on A).
+//! - If A appears before B in `tasks` order, add B → A (B depends on A),
+//!   **unless** adding that edge would create a cycle.
 //! - Edges are only added, never removed.  All explicit `Depends on` edges are
 //!   preserved.
 //! - Duplicate edges are suppressed (no edge is added if one already exists).
 //! - Self-edges are never added.
 //!
-//! Because edges always run from a later task to an earlier one (in authored
-//! order), the resulting graph is acyclic by construction: any cycle would
-//! require an edge from an earlier task to a later one, which this rule never
-//! produces.
+//! # Acyclicity guarantee
+//!
+//! The resulting graph is acyclic because [`infer_edges`] applies a **reachability
+//! guard** before adding any inferred edge: it only adds "later depends on earlier"
+//! if `earlier` does not already transitively depend on `later` (which would close
+//! a cycle).  Explicit forward `Depends on` edges are handled correctly — if a
+//! task authored earlier explicitly depends on a later-authored task, the two are
+//! already serialized in the opposite order, so the would-be inferred backward edge
+//! is safely skipped.
 //!
 //! # Future work
 //!
@@ -155,15 +166,8 @@ fn task_text(task: &crate::task::Task) -> String {
 /// Add inferred dependency edges to `graph` for tasks that share at least one
 /// area (backtick span).
 ///
-/// See the [module documentation](self) for the full rule and conservative-bias
-/// rationale.
-///
-/// # Acyclicity guarantee
-///
-/// Edges are added in the form "later task depends on earlier task" (where
-/// "earlier" and "later" refer to position in `graph.tasks`).  This total order
-/// means a cycle is impossible: any cycle would require an edge pointing from an
-/// earlier index to a later one, which this function never produces.
+/// See the [module documentation](self) for the full rule, conservative-bias
+/// rationale, and the acyclicity guarantee.
 pub fn infer_edges(graph: &mut TaskGraph) {
     let n = graph.tasks.len();
     if n < 2 {
@@ -177,19 +181,11 @@ pub fn infer_edges(graph: &mut TaskGraph) {
         .map(|t| extract_areas(&task_text(t)))
         .collect();
 
-    // Build a quick lookup: TaskId → index in `graph.tasks`.
-    let index_of: HashMap<&TaskId, usize> = graph
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (&t.id, i))
-        .collect();
-
-    // For each pair (i < j), if they share an area, add j → i (j depends on i).
-    // We collect additions here to avoid borrowing `graph.tasks` mutably while
-    // we read it.
-    let mut additions: Vec<(usize, TaskId)> = Vec::new(); // (task_index, dep_to_add)
-
+    // For each pair (i < j), if they share an area, add j → i (j depends on i),
+    // subject to the reachability guard below.
+    //
+    // We apply additions one at a time (not batched) so that reachability checks
+    // account for edges inferred earlier in this same pass.
     for i in 0..n {
         for j in (i + 1)..n {
             // Skip if they share no areas.
@@ -198,6 +194,7 @@ pub fn infer_edges(graph: &mut TaskGraph) {
             }
 
             let earlier_id = graph.tasks[i].id.clone();
+            let later_id = graph.tasks[j].id.clone();
 
             // Skip if the edge j → i already exists (explicit or previously inferred).
             let already_exists = graph.tasks[j]
@@ -205,20 +202,64 @@ pub fn infer_edges(graph: &mut TaskGraph) {
                 .iter()
                 .any(|dep| dep == &earlier_id);
 
-            if !already_exists {
-                // Also verify the "earlier" task is indeed in the graph (it is, since
-                // we built `index_of` from the same `tasks` slice, but be defensive).
-                if index_of.contains_key(&earlier_id) {
-                    additions.push((j, earlier_id));
+            if already_exists {
+                continue;
+            }
+
+            // Reachability guard: adding "later depends on earlier" is only safe
+            // (acyclic) if `earlier` does NOT already transitively depend on `later`.
+            // If earlier ⇒ ... ⇒ later already exists, the two tasks are serialized
+            // in the opposite order by explicit edges, so the inferred backward edge
+            // is both unnecessary and would close a cycle — skip it.
+            if transitive_depends_on(graph, &earlier_id, &later_id) {
+                continue;
+            }
+
+            graph.tasks[j].depends_on.push(earlier_id);
+        }
+    }
+}
+
+/// Returns `true` if `start` transitively depends on `target` by following
+/// `depends_on` edges in the current state of `graph` (DFS).
+///
+/// Used by [`infer_edges`] as a reachability guard to prevent cycles.
+fn transitive_depends_on(graph: &TaskGraph, start: &TaskId, target: &TaskId) -> bool {
+    // Build a quick id→task index map for efficient lookup.
+    let index_of: HashMap<&TaskId, usize> = graph
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (&t.id, i))
+        .collect();
+
+    // Iterative DFS using an explicit stack.
+    let mut visited: HashSet<&TaskId> = HashSet::new();
+    let mut stack: Vec<&TaskId> = Vec::new();
+
+    // Seed the stack with start's direct dependencies.
+    if let Some(&idx) = index_of.get(start) {
+        for dep in &graph.tasks[idx].depends_on {
+            stack.push(dep);
+        }
+    }
+
+    while let Some(current) = stack.pop() {
+        if current == target {
+            return true;
+        }
+        if visited.insert(current)
+            && let Some(&idx) = index_of.get(current)
+        {
+            for dep in &graph.tasks[idx].depends_on {
+                if !visited.contains(dep) {
+                    stack.push(dep);
                 }
             }
         }
     }
 
-    // Apply the collected additions.
-    for (task_idx, dep_id) in additions {
-        graph.tasks[task_idx].depends_on.push(dep_id);
-    }
+    false
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -572,5 +613,206 @@ mod tests {
         assert!(!alpha.depends_on.contains(&TaskId::new("beta")));
 
         graph.validate().expect("graph must still validate");
+    }
+
+    // ── Regression: explicit forward edge + shared area must not produce a cycle ──
+
+    /// **Cycle scenario regression test.**
+    ///
+    /// Task A (authored index 0) has an explicit `Depends on: task-b` (forward
+    /// reference — task-b is at index 1).  A and B both mention `` `lib.rs` ``.
+    ///
+    /// Without the reachability guard, `infer_edges` would add B→A (later depends
+    /// on earlier) to complement A→B, producing a cycle.  With the guard the B→A
+    /// edge must be skipped.
+    ///
+    /// Asserts:
+    /// - The explicit A→B edge is preserved.
+    /// - The inferred B→A edge is NOT added.
+    /// - The graph is acyclic (verified via DFS cycle detection, not just
+    ///   `validate()` which cannot detect cycles).
+    #[tokio::test]
+    async fn explicit_forward_edge_plus_shared_area_no_cycle() {
+        // task-a (index 0) explicitly depends on task-b (index 1) — forward ref.
+        // Both share the `lib.rs` area.
+        let source = build_source_with_deps(&[
+            (
+                "task-a",
+                "First task",
+                "Implement the public API in `lib.rs`.",
+                "`lib.rs` compiles without errors.",
+                "task-b", // explicit forward edge A → B
+            ),
+            (
+                "task-b",
+                "Second task",
+                "Add the module skeleton to `lib.rs`.",
+                "`lib.rs` has the module skeleton in place.",
+                "—", // no explicit deps
+            ),
+        ]);
+
+        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
+        let graph = interpreter
+            .interpret("test", &source)
+            .await
+            .expect("interpretation must succeed (forward ref is valid)");
+
+        // 1. Explicit edge A→B must be present.
+        let task_a = graph.tasks.iter().find(|t| t.id.0 == "task-a").unwrap();
+        assert!(
+            task_a.depends_on.contains(&TaskId::new("task-b")),
+            "task-a must retain its explicit dep on task-b; got: {:?}",
+            task_a.depends_on
+        );
+
+        // 2. Inferred edge B→A must NOT be added (would create A→B + B→A cycle).
+        let task_b = graph.tasks.iter().find(|t| t.id.0 == "task-b").unwrap();
+        assert!(
+            !task_b.depends_on.contains(&TaskId::new("task-a")),
+            "task-b must NOT depend on task-a (would be a cycle); got: {:?}",
+            task_b.depends_on
+        );
+
+        // 3. Full cycle detection via DFS — must find no cycle.
+        assert!(
+            !graph_has_cycle(&graph),
+            "the combined explicit+inferred graph must be acyclic"
+        );
+
+        // 4. validate() must also pass (resolves references, unique ids).
+        graph.validate().expect("graph must pass validate()");
+    }
+
+    /// Mixed graph: several tasks with both explicit forward edges and shared
+    /// areas.  The combined explicit+inferred graph must remain acyclic.
+    ///
+    /// Layout:
+    /// - task-p (idx 0): mentions `` `core.rs` ``
+    /// - task-q (idx 1): mentions `` `core.rs` ``, explicit `Depends on: task-r`
+    /// - task-r (idx 2): mentions `` `core.rs` `` and `` `util.rs` ``
+    /// - task-s (idx 3): mentions `` `util.rs` ``
+    ///
+    /// Explicit edge: task-q→task-r (forward reference, idx 1 → idx 2).
+    /// Potential inferred edges (all subject to reachability guard):
+    ///   - task-q → task-p (shares `core.rs`; safe — no existing q⇒p path)
+    ///   - task-r → task-p (shares `core.rs`; safe)
+    ///   - task-r → task-q (shares `core.rs`; safe? — q already depends on r,
+    ///                       so r transitively reaches q via q→r, meaning adding
+    ///                       r→q would CYCLE — must be skipped)
+    ///   - task-s → task-r (shares `util.rs`; safe)
+    #[tokio::test]
+    async fn mixed_explicit_forward_and_shared_areas_acyclic() {
+        let source = build_source_with_deps(&[
+            (
+                "task-p",
+                "P task",
+                "Foundation work on `core.rs`.",
+                "`core.rs` has its skeleton.",
+                "—",
+            ),
+            (
+                "task-q",
+                "Q task",
+                "Extend `core.rs` with error types.",
+                "Error types in `core.rs` compile.",
+                "task-r", // explicit forward edge Q → R
+            ),
+            (
+                "task-r",
+                "R task",
+                "Scaffold `core.rs` and `util.rs`.",
+                "`core.rs` and `util.rs` are present.",
+                "—",
+            ),
+            (
+                "task-s",
+                "S task",
+                "Add helpers to `util.rs`.",
+                "`util.rs` helpers are documented.",
+                "—",
+            ),
+        ]);
+
+        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
+        let graph = interpreter
+            .interpret("test", &source)
+            .await
+            .expect("interpretation must succeed");
+
+        // Real cycle detection — must be acyclic.
+        assert!(
+            !graph_has_cycle(&graph),
+            "mixed explicit+inferred graph must be acyclic"
+        );
+
+        graph.validate().expect("graph must pass validate()");
+
+        // Explicit forward edge Q→R must be preserved.
+        let task_q = graph.tasks.iter().find(|t| t.id.0 == "task-q").unwrap();
+        assert!(
+            task_q.depends_on.contains(&TaskId::new("task-r")),
+            "task-q must retain explicit dep on task-r; got: {:?}",
+            task_q.depends_on
+        );
+
+        // The would-be inferred edge task-r → task-q would cycle (q already
+        // depends on r). It must NOT be added.
+        let task_r = graph.tasks.iter().find(|t| t.id.0 == "task-r").unwrap();
+        assert!(
+            !task_r.depends_on.contains(&TaskId::new("task-q")),
+            "task-r must NOT depend on task-q (would cycle with q→r); got: {:?}",
+            task_r.depends_on
+        );
+    }
+
+    // ── Cycle-detection helper (DFS) used by the regression tests above ────────
+
+    /// Returns `true` if `graph` contains at least one cycle when following
+    /// `depends_on` edges (i.e. treating each "X depends on Y" as an edge X→Y).
+    ///
+    /// Uses a standard DFS with three-colour marking:
+    ///   white (0) = unvisited, grey (1) = in current DFS path, black (2) = done.
+    /// A back-edge (reaching a grey node) signals a cycle.
+    fn graph_has_cycle(graph: &TaskGraph) -> bool {
+        // Map TaskId → index for O(1) lookup.
+        let id_to_idx: HashMap<&TaskId, usize> = graph
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (&t.id, i))
+            .collect();
+
+        let n = graph.tasks.len();
+        // 0 = white, 1 = grey, 2 = black
+        let mut color = vec![0u8; n];
+
+        fn dfs(
+            node: usize,
+            graph: &TaskGraph,
+            id_to_idx: &HashMap<&TaskId, usize>,
+            color: &mut Vec<u8>,
+        ) -> bool {
+            color[node] = 1; // grey — in current path
+            for dep in &graph.tasks[node].depends_on {
+                if let Some(&dep_idx) = id_to_idx.get(dep) {
+                    if color[dep_idx] == 1 {
+                        return true; // back-edge → cycle
+                    }
+                    if color[dep_idx] == 0 && dfs(dep_idx, graph, id_to_idx, color) {
+                        return true;
+                    }
+                }
+            }
+            color[node] = 2; // black — fully explored
+            false
+        }
+
+        for start in 0..n {
+            if color[start] == 0 && dfs(start, graph, &id_to_idx, &mut color) {
+                return true;
+            }
+        }
+        false
     }
 }
