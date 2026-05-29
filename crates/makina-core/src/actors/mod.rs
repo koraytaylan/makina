@@ -94,6 +94,26 @@ mod tests {
         Config::resolve(GlobalConfig::default(), ProjectConfig::default())
     }
 
+    /// Initialise a minimal git repo in `path` so the Developer's commit step
+    /// (task 23: `git add -A` + `git commit`) has a real working tree to commit
+    /// into.  The smoke test only exercises message acceptance, so a bare init +
+    /// identity + one commit is enough (no `develop`/worktree dance needed).
+    fn init_git_repo(path: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .expect("git must be available");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+    }
+
     /// Build a minimal [`TaskGraph`] with one task for use in assertions.
     fn minimal_graph() -> TaskGraph {
         let now = Utc::now();
@@ -251,10 +271,15 @@ mod tests {
         // ask().send() for `Result<DevelopOutcome, String>` reply gives back the
         // `DevelopOutcome` on success (SendError is unwrapped by `.expect()`).
         // The NoopBackend returns "developer output" for the first prompt.
+        //
+        // The Developer commits the worktree (task 23: `git add -A` + `git
+        // commit`), so it needs a real git working tree — give it a temp repo.
+        let dev_worktree = tempfile::tempdir().expect("temp worktree dir");
+        init_git_repo(dev_worktree.path());
         let outcome = developer_ref
             .ask(Develop {
                 task: task.clone(),
-                worktree: PathBuf::from("/tmp/test-worktree"),
+                worktree: dev_worktree.path().to_path_buf(),
                 feedback: None,
             })
             .send()

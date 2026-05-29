@@ -32,8 +32,10 @@
 //!                          --GateCapReached--> Failed ; teardown ; task fails
 //!                        else: feedback = gate output ; re-dispatch
 //!     ask Reviewer.Review{task, worktree}
-//!       Approve  --ReviewerApproved--> Done             [seam: task 23 squash-merges BEFORE teardown]
-//!                 WorktreeManager::remove ; next ready task
+//!       Approve  squash_merge(task/{id} → develop)      (task 23 — BEFORE teardown)
+//!                 Merged   --ReviewerApproved--> Done ; WorktreeManager::remove
+//!                 Conflict develop already restored clean by merger ;
+//!                          --ReviewCapReached--> Failed ; teardown   (safe-fail; agent-reconcile seam)
 //!       Reject{feedback} --ReviewerRejected--> InProgress
 //!                 review_iterations += 1 ; relay feedback ; re-develop+gate (bounded retry)
 //! ```
@@ -59,13 +61,28 @@
 //! does the fixing; the gate EXECUTION is the reusable [`crate::gate::GateRunner`].
 //! This keeps FSM ownership in the Supervisor (consistent with task 21).
 //!
+//! ## Squash-merge (task 23 — implemented)
+//!
+//! On approval the Supervisor squash-merges `task/{id}` into the base branch via
+//! [`SquashMerger::squash_merge`], **before** tearing down the worktree.  A clean
+//! merge lands the task's work as ONE squashed commit on `develop`, then the FSM
+//! advances `InReview --ReviewerApproved--> Done` and the worktree is removed.  A
+//! straggler **conflict** is reconciled rather than hard-failed-into-corruption:
+//! the merger restores `develop` to a clean state (its hard invariant), and the
+//! Supervisor drives the task to a SAFE terminal `Failed` (via `ReviewCapReached`
+//! — the only legal `InReview→Failed` event today) without ever leaving `develop`
+//! broken.  The architecture's intended **agent-driven reconciliation** (spawn an
+//! agent in the worktree, resolve, retry the merge once) is left as a documented
+//! seam in the approve path; with the `NoopBackend` the agent cannot resolve
+//! conflicts, so the deterministic test asserts the SAFE handling (develop
+//! intact), not a successful agent resolution.
+//!
 //! ## Deferred seams (do NOT implement here)
 //!
-//! - **Squash-merge** (task 23): on approve the Supervisor does NOT merge — it
-//!   only transitions to `Done` and tears down the worktree.  Task 23 inserts the
-//!   squash-merge at the marked seam, BEFORE the teardown.
 //! - **Concurrency** (task 24): tasks run strictly sequentially (one at a time).
-//!   No parallel scheduler is built here.
+//!   No parallel scheduler is built here.  NOTE: the squash-merge mutates the
+//!   shared `develop` checkout, so task 24 must **serialize merges** even when
+//!   tasks otherwise run in parallel (see [`crate::merge`]).
 //! - **Termination caps** (task 25): the **gate** cap is already enforced from
 //!   `config.caps.gate_iterations` (task 22, above).  The **reviewer** reject→retry
 //!   loop still uses a SIMPLE bounded retry ([`MAX_REVIEWER_ITERATIONS`]) only so
@@ -88,6 +105,7 @@ use kameo::{actor::ActorRef, message::Context};
 
 use crate::config::Config;
 use crate::gate::{GateOutcome, GateRunner};
+use crate::merge::{MergeOutcome, SquashMerger};
 use crate::state_machine::{TaskEvent, transition};
 use crate::task::{Task, TaskGraph, TaskId, TaskState};
 use crate::worktree::WorktreeManager;
@@ -145,6 +163,14 @@ pub struct Supervisor {
     /// Stateless and reused across all tasks/iterations.  See [`GateRunner`] and
     /// the Supervisor-coordinated placement note on [`Supervisor::develop_until_gates_pass`].
     gate_runner: GateRunner,
+
+    /// Squash-merges an approved task's branch into the base branch (task 23).
+    ///
+    /// Built from the same `repo_root` + `base_branch` as the
+    /// [`WorktreeManager`] (the main checkout has `base_branch` checked out, the
+    /// worktrees hold the `task/{id}` branches).  Stateless beyond its config, so
+    /// it is reused for every task's merge.  See [`SquashMerger`].
+    squash_merger: SquashMerger,
 }
 
 /// Construction arguments for [`Supervisor`].
@@ -174,6 +200,14 @@ impl kameo::actor::Actor for Supervisor {
     type Error = std::convert::Infallible;
 
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // The squash-merger operates in the SAME main repo the worktree manager
+        // branches off, merging into the SAME base branch.  Derive it from the
+        // worktree manager's config so there is a single source of truth (no extra
+        // Args field, no chance of the two disagreeing on repo_root/base_branch).
+        let squash_merger = SquashMerger::new(
+            args.worktree_manager.repo_root.clone(),
+            args.worktree_manager.base_branch.clone(),
+        );
         Ok(Supervisor {
             graph: None,
             worktree_manager: Some(args.worktree_manager),
@@ -181,6 +215,7 @@ impl kameo::actor::Actor for Supervisor {
             reviewer: None,
             config: args.config,
             gate_runner: GateRunner::new(),
+            squash_merger,
         })
     }
 }
@@ -471,22 +506,99 @@ impl Supervisor {
 
             match verdict {
                 ReviewVerdict::Approve => {
-                    // ── Approve: InReview → Done (ReviewerApproved) ─────────────
-                    self.apply_event(task_id, TaskEvent::ReviewerApproved)?;
-                    self.mark_finished(task_id);
-
-                    // ── Seam: squash-merge to `develop` (task 23) ───────────────
+                    // ── Approve: squash-merge `task/{id}` into `develop` (task 23) ─
                     //
-                    // The real flow squash-merges `task/{id}` into `develop` HERE,
-                    // BEFORE tearing down the worktree (the branch carries the
-                    // committed work).  Merging is FORBIDDEN in this task (task 23
-                    // owns it); we go straight to teardown.
+                    // The merge happens HERE — while still in `InReview`, BEFORE
+                    // tearing down the worktree (the branch carries the committed
+                    // work) and BEFORE the FSM approve transition.  Sequencing the
+                    // merge before the transition is what lets a conflict drive the
+                    // task to a non-corrupting failure: `InReview --ReviewerApproved
+                    // --> Done` is only applied once the merge actually lands.
+                    let branch = format!("task/{task_id}");
+                    let message = self.squash_commit_message(task_id)?;
 
-                    // Tear down the worktree + branch.
-                    self.remove_worktree(task_id).await;
+                    let merge_outcome = self
+                        .squash_merger
+                        .squash_merge(&branch, &message)
+                        .await
+                        .map_err(|e| {
+                            // A hard infrastructure failure during the merge.  The
+                            // merger has already best-effort-restored `develop`
+                            // (its invariant), so `develop` is not left broken.
+                            format!("squash-merge failed for {task_id}: {e}")
+                        });
 
-                    terminal_state = TaskState::Done;
-                    break;
+                    let merge_outcome = match merge_outcome {
+                        Ok(o) => o,
+                        Err(e) => {
+                            // Clean up the worktree, then propagate.  We do NOT
+                            // attempt an FSM transition here (we are in InReview;
+                            // InReview --HardError--> Failed is illegal — task 25
+                            // owns that path, mirroring the reviewer-dispatch
+                            // error handling above).  `develop` is already clean.
+                            self.remove_worktree(task_id).await;
+                            return Err(e);
+                        }
+                    };
+
+                    match merge_outcome {
+                        MergeOutcome::Merged => {
+                            // ── Merged: InReview → Done (ReviewerApproved) ──────
+                            // Exactly one squashed commit now sits on `develop`.
+                            self.apply_event(task_id, TaskEvent::ReviewerApproved)?;
+                            self.mark_finished(task_id);
+
+                            // Tear down the worktree + branch (the work has landed).
+                            self.remove_worktree(task_id).await;
+
+                            terminal_state = TaskState::Done;
+                            break;
+                        }
+                        MergeOutcome::Conflict { details } => {
+                            // ── Conflict: reconcile, do NOT corrupt `develop` ───
+                            //
+                            // `develop` is ALREADY safely restored to a clean,
+                            // unbroken state by the merger (its hard invariant) —
+                            // no conflict markers, no half-staged index, HEAD
+                            // unchanged.  The Planner's dependency detection
+                            // serializes overlapping tasks so this is a rare
+                            // straggler.
+                            //
+                            // ── Agent-reconciliation seam (architecture) ────────
+                            //
+                            // The intended resolution is AGENT-DRIVEN: spawn an
+                            // agent in the task's worktree, hand it `details`, let
+                            // it resolve the conflict + re-commit on `task/{id}`,
+                            // then retry `squash_merge` ONCE.  This is deliberately
+                            // NOT built in the MVP:
+                            //   * with the `NoopBackend` the agent cannot actually
+                            //     resolve a conflict (it makes no edits), so a
+                            //     "retry" could not succeed deterministically; and
+                            //   * a bounded best-effort retry belongs with the
+                            //     unified termination caps (task 25), which owns
+                            //     the InReview→Failed hard-error path and the
+                            //     retry budgeting.
+                            // When implemented, the loop is: re-dispatch the
+                            // Developer with the conflict as feedback (it re-commits
+                            // the worktree), then call `squash_merge` again; on a
+                            // second conflict, fail as below.
+                            //
+                            // MVP: drive the task to a SAFE terminal Failed without
+                            // ever leaving `develop` broken.  `InReview → Failed`
+                            // is reached via `ReviewCapReached` — the only legal
+                            // InReview→Failed FSM event today (task 25 will add a
+                            // dedicated merge-conflict/hard-error terminal event).
+                            let _ = details; // surfaced to the seam above; logged by a later task.
+                            self.apply_event(task_id, TaskEvent::ReviewCapReached)?;
+                            self.mark_finished(task_id);
+
+                            // Tear down the worktree + branch.  `develop` is clean.
+                            self.remove_worktree(task_id).await;
+
+                            terminal_state = TaskState::Failed;
+                            break;
+                        }
+                    }
                 }
                 ReviewVerdict::Reject { feedback: fb } => {
                     // ── Reject: InReview → InProgress (ReviewerRejected) ────────
@@ -665,6 +777,23 @@ impl Supervisor {
             .and_then(|g| g.get(task_id))
             .map(|t| t.state)
             .ok_or_else(|| format!("task {task_id} not found in graph"))
+    }
+
+    /// Build the squash-merge commit message for a task: `task({id}): {title}`.
+    ///
+    /// References the task so the single squashed commit on `develop` is
+    /// traceable back to the task it landed.
+    fn squash_commit_message(&self, task_id: &TaskId) -> Result<String, String> {
+        let task = self
+            .graph
+            .as_ref()
+            .and_then(|g| g.get(task_id))
+            .ok_or_else(|| format!("task {task_id} not found in graph"))?;
+        Ok(format!(
+            "task({id}): {title}",
+            id = task.id,
+            title = task.title
+        ))
     }
 
     /// Clone a task out of the graph (to hand a stable snapshot to a spoke).

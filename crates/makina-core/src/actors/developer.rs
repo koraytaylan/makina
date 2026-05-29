@@ -35,8 +35,11 @@
 //! 3. Sends a single prompt describing the task (title/description/`done_when`,
 //!    plus any reviewer feedback on a retry).
 //! 4. Drains the [`ResponseStream`], concatenating the agent's text output.
-//! 5. Terminates the session and hands the collected output back to the
-//!    Supervisor (as the reply).
+//! 5. Terminates the session.
+//! 6. Commits the worktree's changes to `task/{id}` (`git add -A` + `git commit
+//!    --allow-empty`) so task 23's squash-merge has the work to land on
+//!    `develop`.  Hands the collected output back to the Supervisor (as the
+//!    reply).
 //!
 //! [`session_config_for(Role::Developer, …)`]: crate::roles::session_config_for
 //! [`SessionConfig`]: crate::backend::SessionConfig
@@ -137,8 +140,9 @@ pub struct Develop {
 ///
 /// Carries the agent's collected text output.  Task 22 (gate-runner) will extend
 /// this with gate results and iteration counts; task 23 (squash-merge) relies on
-/// the branch carrying the committed work (with the `NoopBackend` there are no
-/// file changes, so no commit is made here — see the handler's seam comment).
+/// the branch carrying the committed work — so after the agent turn the handler
+/// commits the worktree to `task/{id}` (`--allow-empty`, so the `NoopBackend`
+/// no-change case still produces a commit; see the handler's commit step).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevelopOutcome {
     /// The concatenated text the agent produced for this turn.
@@ -202,16 +206,82 @@ impl kameo::message::Message<Develop> for Developer {
         // 5. Terminate the session (idempotent).
         let _ = session.terminate().await;
 
-        // ── Seam: commit the agent's changes to the task branch ───────────────
+        // ── Commit the agent's changes to the task branch (task 23) ───────────
         //
-        // The real flow commits the worktree's changes to `task/{id}` here so
-        // that task 23 (squash-merge) has the work to merge into `develop`.  With
-        // the `NoopBackend` there are NO file changes, so committing is a no-op
-        // and is intentionally skipped — keeping this task focused on the loop.
-        // When a real backend lands, add a `git -C {worktree} commit -am …` step
-        // (or fold it into the gate-runner of task 22) before handing back.
+        // The squash-merge (task 23) merges `task/{id}` into `develop`, so the
+        // agent's work must be COMMITTED to the branch first.  We stage everything
+        // and commit in the worktree:
+        //
+        //   git -C {worktree} add -A
+        //   git -C {worktree} commit --allow-empty -m "..."
+        //
+        // `--allow-empty` is deliberate: with the `NoopBackend` there are NO file
+        // changes, so without it `commit` would fail ("nothing to commit") and the
+        // squash-merge would have nothing — and no commit — to land.  Allowing an
+        // empty commit means a no-op task still produces a branch commit that the
+        // squash-merge records on `develop` (uniform audit trail); real agent
+        // edits are captured the same way (a non-empty commit).
+        //
+        // Placement choice: the commit lives in the Developer handler (right after
+        // the agent turn) rather than in the Supervisor.  Rationale — committing
+        // is intrinsically part of "the Developer produced work"; the Supervisor
+        // then runs gates against the committed worktree and later squash-merges
+        // the branch.  A failed commit is surfaced as a hard error for the task.
+        //
+        // NOTE (gate loop, task 22): the Supervisor re-dispatches this handler on a
+        // gate failure or reviewer rejection.  Each re-dispatch commits again, so a
+        // re-worked branch may carry MULTIPLE commits — which is fine: the squash
+        // collapses them all into one commit on `develop`.
+        if let Err(e) = commit_worktree(&msg.worktree, &msg.task).await {
+            return Err(format!("developer commit failed: {e}"));
+        }
 
         Ok(DevelopOutcome { output })
+    }
+}
+
+// ── Worktree commit ───────────────────────────────────────────────────────────
+
+/// Stage and commit the worktree's changes to the task branch.
+///
+/// Runs, in `worktree`:
+/// - `git add -A` — stage all changes (new/modified/deleted files).
+/// - `git commit --allow-empty -m "task({id}): {title}"` — record them as a
+///   commit on the checked-out `task/{id}` branch.  `--allow-empty` ensures a
+///   no-op (NoopBackend) task still produces a commit for the squash-merge to
+///   land (see the handler's commit-step comment).
+///
+/// Returns `Err(String)` (with captured stderr) if either git command fails or
+/// could not be launched; the handler maps that to a hard error for the task.
+async fn commit_worktree(worktree: &std::path::Path, task: &Task) -> Result<(), String> {
+    run_git_in(worktree, &["add", "-A"]).await?;
+
+    let message = format!("task({id}): {title}", id = task.id, title = task.title);
+    run_git_in(worktree, &["commit", "--allow-empty", "-m", &message]).await?;
+
+    Ok(())
+}
+
+/// Run a `git -C {worktree} {args}` command, returning `Err(String)` (with
+/// captured stderr) on a non-zero exit or a spawn failure.
+async fn run_git_in(worktree: &std::path::Path, args: &[&str]) -> Result<(), String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("failed to launch `git {}`: {e}", args.join(" ")))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`git {}` failed in {}: {}",
+            args.join(" "),
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
