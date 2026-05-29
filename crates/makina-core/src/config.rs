@@ -98,43 +98,57 @@ pub struct BackendConfig {
 
 // ── Planner config ────────────────────────────────────────────────────────────
 
-/// **Provisional** — the Planner model and call mechanism configuration.
+/// Planner model and call mechanism configuration.
 ///
-/// This struct and [`PlannerMechanism`] are intentionally minimal.  The
-/// `planner-model-mechanism` task (task 18) will finalise the exact mechanism
-/// variants and the integration details.  Fields added here should not be
-/// treated as stable API.
+/// Configures which model identifier the Planner uses and how it makes model
+/// calls.  Decision finalised in `planner-model-mechanism` (task 18):
+/// `OneShotAgent` is the implemented MVP path; `DirectApi` is deferred.
+///
+/// See `docs/spec/planner-model-mechanism.md` for the full decision and rationale.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PlannerConfig {
-    /// The model identifier used by the Planner (e.g. `"claude-opus-4-5"`).
+    /// The model identifier used by the Planner (e.g. `"gemini-2.0-flash"`).
     ///
-    /// Defaults to an empty string; a later task will add validation.
+    /// Passed through to the agent backend when relevant.  Defaults to an
+    /// empty string (the backend uses its own default model).
     pub model: String,
 
     /// How the Planner calls the model.  See [`PlannerMechanism`].
+    ///
+    /// Defaults to [`PlannerMechanism::OneShotAgent`] — the implemented MVP
+    /// path.  Setting `DirectApi` returns a clear "not supported in MVP" error.
     pub mechanism: PlannerMechanism,
 }
 
-/// **Provisional** — the mechanism the Planner uses to call the model.
+/// The mechanism the Planner uses to call the model.
 ///
-/// This enum will be finalised in the `planner-model-mechanism` task (task 18).
-/// Only two variants exist for now; additional variants (e.g. streaming,
-/// batch) may be added later without breaking existing configs because
-/// `serde(rename_all = "kebab-case")` is used and unknown variants in TOML
-/// would become parse errors.
+/// Decision finalised in task 18 (`planner-model-mechanism`):
+/// `OneShotAgent` is **implemented**; `DirectApi` is **deferred** (not
+/// implemented in the MVP — selecting it returns a clear error, not a silent
+/// fallback).
+///
+/// Serde strings are stable: `"one-shot-agent"` and `"direct-api"`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlannerMechanism {
-    /// The Planner sends a single request and awaits the complete response.
+    /// **Implemented (MVP path).** The Planner spawns a one-shot agent session
+    /// via the `AgentBackend` trait, sends a single prompt, and collects the
+    /// JSON response.
     ///
-    /// Suitable for smaller planning operations.  This is the default.
+    /// Inherits the **Zed auth model**: the agent CLI is pre-authenticated by
+    /// the user; Makina holds no credentials.  This is the default.
     #[default]
     OneShotAgent,
 
-    /// The Planner calls the model API directly (no agent subprocess).
+    /// **Deferred — not implemented in the MVP.**  The Planner would call the
+    /// model API directly without an ACP subprocess.
     ///
-    /// Useful when no ACP agent is needed for planning.
+    /// Selecting this variant returns
+    /// [`crate::interpreter::InterpretError::MechanismNotSupported`] with a
+    /// clear message.  Implementing it would require Makina to manage an API
+    /// key — the one credential exception explicitly deferred by the
+    /// architecture.  See `docs/spec/planner-model-mechanism.md` §5.
     DirectApi,
 }
 
@@ -195,7 +209,9 @@ pub struct GlobalConfig {
     /// The ACP agent CLI to spawn for Developer and Reviewer sessions.
     pub backend: BackendConfig,
 
-    /// **Provisional** Planner model and mechanism.  See [`PlannerConfig`].
+    /// Planner model and mechanism.  See [`PlannerConfig`].
+    ///
+    /// Defaults to `OneShotAgent` (implemented MVP path).
     pub planner: PlannerConfig,
 
     /// Termination caps applied to all tasks unless overridden by the project.
@@ -342,7 +358,7 @@ pub struct Config {
     /// The agent backend CLI command and arguments.
     pub backend: BackendConfig,
 
-    /// **Provisional** Planner configuration.  See [`PlannerConfig`].
+    /// Planner configuration (model + mechanism).  See [`PlannerConfig`].
     pub planner: PlannerConfig,
 
     /// Effective termination caps (global defaults merged with project overrides).

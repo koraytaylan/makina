@@ -1,4 +1,5 @@
-//! Task-list interpreter seam and deterministic reference implementation.
+//! Task-list interpreter seam, deterministic reference implementation, and
+//! model-backed interpreter.
 //!
 //! # Seam
 //!
@@ -8,12 +9,14 @@
 //! [`TaskGraph`].
 //!
 //! The seam exists so that:
-//! - **Task 14 (this task)** ships a deterministic, zero-cost reference
-//!   implementation ([`StructuredTextInterpreter`]) that parses the markdown
-//!   directly.  No network, no model, fully deterministic — safe for tests.
-//! - **Task 18 (`planner-model-mechanism`)** adds a model-backed implementation
-//!   behind the same trait by calling a language model to produce the graph.
-//!   Swapping interpreters is a one-line change in [`PlannerArgs`].
+//! - **Task 14** ships a deterministic, zero-cost reference implementation
+//!   ([`StructuredTextInterpreter`]) that parses the markdown directly.  No
+//!   network, no model, fully deterministic — safe for tests.
+//! - **Task 18 (`planner-model-mechanism`, this task)** adds [`ModelInterpreter`]:
+//!   a model-backed implementation that calls a language-model agent via an
+//!   injected `Arc<dyn AgentBackend>` and parses its JSON response.  The
+//!   mechanism decision and the auth path are documented in
+//!   `docs/spec/planner-model-mechanism.md`.
 //! - **Task 17 (`dependency-detection`)** augments the `depends_on` arrays with
 //!   inferred edges by wrapping or extending an existing interpreter.  The trait
 //!   boundary keeps task 17 isolated from the parser.
@@ -32,10 +35,14 @@
 //!   not, wrap the error in [`InterpretError::ValidationFailed`].
 //! - Return [`InterpretError`] on any parse or semantic failure; never panic.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::StreamExt;
 use thiserror::Error;
 
+use crate::backend::{AgentBackend, BackendError, Prompt, ResponseEvent, SessionConfig};
 use crate::task::{Task, TaskGraph, TaskGraphError, TaskId, TaskState};
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -64,6 +71,35 @@ pub enum InterpretError {
     /// This covers duplicate task ids and dangling `depends_on` references.
     #[error("task graph validation failed: {0}")]
     ValidationFailed(#[from] TaskGraphError),
+
+    /// A model-backend call failed at the transport/session level.
+    ///
+    /// Wraps a [`BackendError`] from the injected `AgentBackend`.  This occurs
+    /// when the agent session cannot be spawned, the transport fails mid-stream,
+    /// or the session is already terminated.
+    #[error("model backend error: {0}")]
+    BackendError(#[from] BackendError),
+
+    /// The model returned a response that could not be parsed as a valid
+    /// `TaskGraph` JSON object.
+    ///
+    /// `reason` is a human-readable description of the parsing failure (e.g.
+    /// `"no JSON object found in response"`, `"serde_json: missing field 'id'"`).
+    #[error("model response could not be parsed as a task graph: {reason}")]
+    ModelResponseInvalid {
+        /// Description of why the response was rejected.
+        reason: String,
+    },
+
+    /// The requested `PlannerMechanism` variant is not implemented in the MVP.
+    ///
+    /// `DirectApi` is documented but deliberately not implemented; selecting it
+    /// returns this error rather than silently falling back.
+    #[error("planner mechanism not supported in MVP: {mechanism}; use one-shot-agent instead")]
+    MechanismNotSupported {
+        /// The unsupported mechanism name (e.g. `"direct-api"`).
+        mechanism: String,
+    },
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -75,22 +111,22 @@ pub enum InterpretError {
 /// | Type | Added in | Notes |
 /// |------|----------|-------|
 /// | [`StructuredTextInterpreter`] | Task 14 | Deterministic markdown parser; no model. |
-/// | `ModelInterpreter` (pending)  | Task 18 | Makes a real model call to produce the graph. |
+/// | [`ModelInterpreter`]          | Task 18 | One-shot agent backend call; parses JSON response. |
 ///
 /// # Seam for task 17
 ///
-/// Task 17 (`dependency-detection`) will augment `depends_on` arrays with
-/// inferred edges.  The recommended approach is a decorator that wraps any
-/// existing `TaskListInterpreter` and post-processes its output — the trait
-/// boundary makes this composable without modifying the base implementation.
+/// Task 17 (`dependency-detection`) augments `depends_on` arrays with inferred
+/// edges by wrapping any existing interpreter in an `EdgeInferrer` decorator.
+/// The trait boundary makes this composable: a `ModelInterpreter` composes
+/// under `EdgeInferrer` exactly like `StructuredTextInterpreter` does.
 ///
 /// # Seam for task 18
 ///
-/// Task 18 (`planner-model-mechanism`) will provide a `ModelInterpreter` that
-/// calls a language model and returns a `TaskGraph`.  The [`Planner`] actor
-/// receives its interpreter via dependency injection (`Arc<dyn
-/// TaskListInterpreter>` in [`PlannerArgs`]); replacing the interpreter is a
-/// one-line change at the call site.
+/// [`ModelInterpreter`] is the model-backed implementation added by task 18.
+/// The [`Planner`] actor receives its interpreter via dependency injection
+/// (`Arc<dyn TaskListInterpreter>` in [`PlannerArgs`]); the builder
+/// [`build_planner_interpreter`] selects between `StructuredTextInterpreter`
+/// and `ModelInterpreter` based on the configured [`PlannerMechanism`].
 ///
 /// [`Planner`]: crate::actors::planner::Planner
 #[async_trait]
@@ -554,6 +590,301 @@ fn parse_depends_on_field(
     Ok(ids)
 }
 
+// ── ModelInterpreter ──────────────────────────────────────────────────────────
+
+/// The Planner's system prompt sent to the model agent at session-start.
+///
+/// This is the Planner's "role prompt" — it identifies the agent as the
+/// task-graph-extraction function of Makina and instructs it to emit **only**
+/// JSON conforming to the `.tasks/{slug}.json` schema.
+///
+/// Distinct from Developer and Reviewer role prompts (task 19).  Override by
+/// passing a custom value to [`ModelInterpreter::with_system_prompt`].
+pub const PLANNER_SYSTEM_PROMPT: &str = "\
+You are the Planner component of Makina, a multi-agent software-factory \
+orchestrator. Your sole function is to convert a structured-text task list \
+(Markdown, following the Makina convention) into a JSON task graph that \
+conforms to the Makina runtime-artifact schema.
+
+Output ONLY the JSON object — no prose, no markdown fences, no explanation. \
+The schema is:
+
+{
+  \"slug\": \"<string>\",
+  \"tasks\": [
+    {
+      \"id\": \"<kebab-case string>\",
+      \"title\": \"<string>\",
+      \"description\": \"<string>\",
+      \"done_when\": \"<string>\",
+      \"depends_on\": [\"<task-id>\", ...],
+      \"section\": \"<optional 4-digit string — omit if absent>\",
+      \"state\": \"new\",
+      \"gate_iterations\": 0,
+      \"review_iterations\": 0,
+      \"created_at\": \"<RFC3339 UTC timestamp>\",
+      \"updated_at\": \"<RFC3339 UTC timestamp>\"
+    }
+  ]
+}
+
+Rules:
+- Every new task starts with state \"new\", gate_iterations 0, review_iterations 0.
+- Do NOT include started_at or finished_at fields.
+- Do NOT include null values for any optional fields — omit them entirely.
+- Preserve all depends_on edges from the source; the orchestrator will add more.
+- created_at and updated_at must be the current UTC time in RFC3339 format.
+- The slug must match the file-stem identifier supplied in the user prompt.
+- Output ONLY the JSON object. No markdown code fences. No surrounding text.";
+
+/// Model-backed implementation of [`TaskListInterpreter`].
+///
+/// Sends the task-list source text to a language-model agent via an injected
+/// [`AgentBackend`] and parses the model's JSON response into a [`TaskGraph`].
+///
+/// # Design
+///
+/// This is the **one-shot-agent** mechanism (see `docs/spec/planner-model-mechanism.md`):
+/// one session is spawned per `interpret` call, a single prompt is sent, and the
+/// session is terminated after the response is collected.  The mechanism reuses
+/// the existing `AgentBackend`/`AgentSession` trait (and therefore inherits the
+/// **Zed auth model**: the agent CLI is pre-authenticated; Makina holds no
+/// credentials).
+///
+/// # Composition with `EdgeInferrer`
+///
+/// `ModelInterpreter` composes *under* [`crate::dependency::EdgeInferrer`]:
+///
+/// ```rust,ignore
+/// let interpreter = EdgeInferrer::new(Arc::new(ModelInterpreter::new(backend)));
+/// ```
+///
+/// Cross-cutting edge inference remains a separate concern in `EdgeInferrer`.
+///
+/// # JSON extraction
+///
+/// Real models often wrap output in prose or ` ```json ` fences.  Before
+/// `serde_json` parsing, [`ModelInterpreter`] strips code fences and extracts
+/// the outermost `{ … }` object.  If no JSON object is found, or if
+/// deserialization fails, [`InterpretError::ModelResponseInvalid`] is returned.
+/// After deserialization, [`TaskGraph::validate()`] is called and its result
+/// surfaced as [`InterpretError::ValidationFailed`].
+pub struct ModelInterpreter {
+    /// The agent backend used to spawn sessions.
+    backend: Arc<dyn AgentBackend>,
+    /// The system prompt sent to the agent at session-start.
+    system_prompt: String,
+    /// Working directory supplied to [`SessionConfig`].  Defaults to `/tmp`.
+    working_dir: std::path::PathBuf,
+}
+
+impl ModelInterpreter {
+    /// Create a new `ModelInterpreter` using the default Planner system prompt
+    /// ([`PLANNER_SYSTEM_PROMPT`]) and working directory `/tmp`.
+    pub fn new(backend: Arc<dyn AgentBackend>) -> Self {
+        Self {
+            backend,
+            system_prompt: PLANNER_SYSTEM_PROMPT.to_string(),
+            working_dir: std::path::PathBuf::from("/tmp"),
+        }
+    }
+
+    /// Override the system prompt (e.g. for testing or custom Planner roles).
+    #[must_use]
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = prompt.into();
+        self
+    }
+
+    /// Override the working directory passed to [`SessionConfig`].
+    #[must_use]
+    pub fn with_working_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.working_dir = dir.into();
+        self
+    }
+}
+
+#[async_trait]
+impl TaskListInterpreter for ModelInterpreter {
+    /// Call the model agent once (one-shot) to interpret the task list.
+    ///
+    /// # Steps
+    ///
+    /// 1. Spawn a session via the backend with [`PLANNER_SYSTEM_PROMPT`].
+    /// 2. Send one prompt: "Interpret the following task list for slug `{slug}`:"
+    ///    followed by the source text.
+    /// 3. Collect all [`ResponseEvent::TextChunk`] events until
+    ///    [`ResponseEvent::TurnComplete`].
+    /// 4. Extract the outermost JSON `{ … }` object (strips fences and prose).
+    /// 5. Deserialize into [`TaskGraph`] via `serde_json`.
+    /// 6. Run [`TaskGraph::validate()`]; return errors as
+    ///    [`InterpretError::ValidationFailed`].
+    /// 7. Terminate the session.
+    async fn interpret(&self, slug: &str, source_text: &str) -> Result<TaskGraph, InterpretError> {
+        // 1. Spawn a session.
+        let config = SessionConfig {
+            working_dir: self.working_dir.clone(),
+            system_prompt: self.system_prompt.clone(),
+            extra: None,
+        };
+        let mut session = self.backend.spawn(config).await?;
+
+        // 2. Build and send the prompt.
+        let prompt_text = format!(
+            "Interpret the following task list for slug `{slug}` and output ONLY \
+             the JSON task graph object — no prose, no markdown fences:\n\n{source_text}"
+        );
+        let mut stream = session.prompt(Prompt::new(prompt_text)).await?;
+
+        // 3. Collect all TextChunk events.
+        let mut raw_response = String::new();
+        while let Some(item) = stream.next().await {
+            match item? {
+                ResponseEvent::TextChunk { text } => raw_response.push_str(&text),
+                ResponseEvent::TurnComplete => break,
+            }
+        }
+        // Ensure the stream is dropped before we terminate the session.
+        drop(stream);
+        // 7. Terminate the session (best-effort; ignore terminate errors).
+        let _ = session.terminate().await;
+
+        // 4–6. Extract, deserialize, validate.
+        parse_model_response(&raw_response)
+    }
+}
+
+// ── JSON extraction helpers ───────────────────────────────────────────────────
+
+/// Extract, deserialize, and validate a [`TaskGraph`] from a raw model response.
+///
+/// Handles the common case where the model wraps the JSON in prose or a
+/// ` ```json ``` ` code fence.  Only the outermost `{ … }` JSON object is
+/// considered.
+///
+/// # Errors
+///
+/// - [`InterpretError::ModelResponseInvalid`] — no JSON object found, or
+///   `serde_json` failed to deserialize the extracted text.
+/// - [`InterpretError::ValidationFailed`] — deserialization succeeded but
+///   [`TaskGraph::validate()`] failed.
+pub(crate) fn parse_model_response(raw: &str) -> Result<TaskGraph, InterpretError> {
+    let json_str =
+        extract_json_object(raw).ok_or_else(|| InterpretError::ModelResponseInvalid {
+            reason: "no JSON object found in model response".to_string(),
+        })?;
+
+    let graph: TaskGraph =
+        serde_json::from_str(json_str).map_err(|e| InterpretError::ModelResponseInvalid {
+            reason: format!("serde_json: {e}"),
+        })?;
+
+    graph.validate()?;
+    Ok(graph)
+}
+
+/// Find and return the first outermost `{ … }` JSON object substring in `text`.
+///
+/// Strips leading/trailing prose and ` ```json ``` ` code fences.  Handles
+/// nested braces by tracking brace depth.  Returns `None` if no `{` is found.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(s) = start
+                {
+                    return Some(&text[s..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ── Mechanism builder ─────────────────────────────────────────────────────────
+
+/// Build the Planner's [`TaskListInterpreter`] from a [`PlannerMechanism`] and
+/// an optional [`AgentBackend`].
+///
+/// # Variants
+///
+/// | `mechanism` | `backend` | Result |
+/// |-------------|-----------|--------|
+/// | `OneShotAgent` | `Some(b)` | `ModelInterpreter::new(b)` |
+/// | `OneShotAgent` | `None` | `StructuredTextInterpreter::new()` (fallback for tests / no-model mode) |
+/// | `DirectApi` | any | `Err(InterpretError::MechanismNotSupported)` |
+///
+/// The [`crate::dependency::EdgeInferrer`] decorator is NOT applied here — the
+/// caller (e.g. the orchestrator wiring the Planner) is responsible for wrapping
+/// the returned interpreter in `EdgeInferrer::new(Arc::new(...))` if cross-cutting
+/// edge inference is required.
+///
+/// # Auth path
+///
+/// When `OneShotAgent` + `Some(backend)` → `ModelInterpreter` is returned, the
+/// auth path is: **Zed model via the agent backend** — the agent CLI is spawned
+/// and inherits the parent's environment (pre-authenticated by the user).  Makina
+/// holds no credentials.  See `docs/spec/planner-model-mechanism.md` and
+/// `docs/spec/acp-auth.md`.
+///
+/// # DirectApi deferred
+///
+/// `PlannerMechanism::DirectApi` is documented as a future option but is NOT
+/// implemented in the MVP.  Selecting it returns
+/// [`InterpretError::MechanismNotSupported`] with a clear message rather than
+/// silently falling back.  Wiring it would require Makina to manage an API key
+/// — the one credential exception explicitly deferred by the architecture.
+///
+/// [`PlannerMechanism`]: crate::config::PlannerMechanism
+pub fn build_planner_interpreter(
+    mechanism: &crate::config::PlannerMechanism,
+    backend: Option<Arc<dyn AgentBackend>>,
+) -> Result<Arc<dyn TaskListInterpreter>, InterpretError> {
+    use crate::config::PlannerMechanism;
+    match mechanism {
+        PlannerMechanism::OneShotAgent => {
+            if let Some(b) = backend {
+                Ok(Arc::new(ModelInterpreter::new(b)))
+            } else {
+                // No backend provided — fall back to deterministic parser
+                // (useful in test / offline / no-model environments).
+                Ok(Arc::new(StructuredTextInterpreter::new()))
+            }
+        }
+        PlannerMechanism::DirectApi => Err(InterpretError::MechanismNotSupported {
+            mechanism: "direct-api".to_string(),
+        }),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -874,5 +1205,247 @@ Description of third.
 
         let second = graph.tasks.iter().find(|t| t.id.0 == "second").unwrap();
         assert_eq!(second.depends_on, vec![TaskId::new("third")]);
+    }
+
+    // ── ModelInterpreter + JSON-extraction tests ──────────────────────────────
+
+    use crate::backend::noop::NoopBackend;
+
+    /// Canonical valid task-graph JSON that `ModelInterpreter` must parse.
+    fn valid_task_graph_json(slug: &str) -> String {
+        format!(
+            r#"{{
+  "slug": "{slug}",
+  "tasks": [
+    {{
+      "id": "task-alpha",
+      "title": "Alpha task",
+      "description": "Implements the alpha feature.",
+      "done_when": "alpha tests pass.",
+      "depends_on": [],
+      "section": "0001",
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }},
+    {{
+      "id": "task-beta",
+      "title": "Beta task",
+      "description": "Implements the beta feature.",
+      "done_when": "beta tests pass.",
+      "depends_on": ["task-alpha"],
+      "section": "0001",
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }}
+  ]
+}}"#
+        )
+    }
+
+    /// **Acceptance: ModelInterpreter parses a bare JSON response into a valid
+    /// TaskGraph.**
+    ///
+    /// Uses `NoopBackend::with_responses` to supply a valid task-graph JSON as
+    /// the canned response.  Asserts that `interpret` returns the correct graph
+    /// with the expected slug, tasks, edges, and state, and that `validate()`
+    /// passes.
+    #[tokio::test]
+    async fn model_interpreter_parses_bare_json_into_valid_graph() {
+        let json = valid_task_graph_json("my-feature");
+        let backend = Arc::new(NoopBackend::with_responses(vec![json]));
+        let interpreter = ModelInterpreter::new(backend);
+
+        let graph = interpreter
+            .interpret("my-feature", "# Dummy source text")
+            .await
+            .expect("must parse successfully");
+
+        assert_eq!(graph.slug, "my-feature");
+        assert_eq!(graph.tasks.len(), 2);
+        graph.validate().expect("graph must pass validate()");
+
+        let alpha = graph.tasks.iter().find(|t| t.id.0 == "task-alpha").unwrap();
+        assert_eq!(alpha.title, "Alpha task");
+        assert_eq!(alpha.state, TaskState::New);
+        assert_eq!(alpha.gate_iterations, 0);
+        assert_eq!(alpha.review_iterations, 0);
+        assert!(alpha.depends_on.is_empty());
+
+        let beta = graph.tasks.iter().find(|t| t.id.0 == "task-beta").unwrap();
+        assert_eq!(beta.depends_on, vec![TaskId::new("task-alpha")]);
+    }
+
+    /// **Acceptance: ModelInterpreter strips ` ```json ``` ` fences and prose.**
+    ///
+    /// Real model output often wraps JSON in a code fence and adds explanatory
+    /// prose.  The interpreter must strip both and extract only the JSON object.
+    #[tokio::test]
+    async fn model_interpreter_strips_fences_and_prose() {
+        let json_body = valid_task_graph_json("fenced-slug");
+        // Wrap the JSON in a ` ```json ``` ` fence with surrounding prose.
+        let fenced_response = format!(
+            "Here is the task graph you requested:\n\n```json\n{json_body}\n```\n\nLet me know if you need changes."
+        );
+        let backend = Arc::new(NoopBackend::with_responses(vec![fenced_response]));
+        let interpreter = ModelInterpreter::new(backend);
+
+        let graph = interpreter
+            .interpret("fenced-slug", "# source")
+            .await
+            .expect("must extract JSON from fenced response");
+
+        assert_eq!(graph.slug, "fenced-slug");
+        assert_eq!(graph.tasks.len(), 2);
+        graph.validate().expect("graph must pass validate()");
+    }
+
+    /// **Acceptance: ModelInterpreter rejects a malformed response.**
+    ///
+    /// When the model returns something that cannot be parsed as a `TaskGraph`,
+    /// `interpret` must return a clear `InterpretError::ModelResponseInvalid`.
+    #[tokio::test]
+    async fn model_interpreter_returns_error_for_malformed_response() {
+        let backend = Arc::new(NoopBackend::with_responses(vec![
+            "Sorry, I cannot help with that.".to_string(),
+        ]));
+        let interpreter = ModelInterpreter::new(backend);
+
+        let err = interpreter
+            .interpret("test", "# source")
+            .await
+            .expect_err("malformed response must return an error");
+
+        assert!(
+            matches!(err, InterpretError::ModelResponseInvalid { .. }),
+            "expected ModelResponseInvalid, got: {err:?}"
+        );
+    }
+
+    /// **Acceptance: ModelInterpreter validates the parsed graph.**
+    ///
+    /// A JSON response that parses as a `TaskGraph` but contains a dangling
+    /// `depends_on` reference must return `InterpretError::ValidationFailed`.
+    #[tokio::test]
+    async fn model_interpreter_fails_validation_for_dangling_dep() {
+        let bad_json = r#"{
+  "slug": "test",
+  "tasks": [
+    {
+      "id": "task-only",
+      "title": "Only task",
+      "description": "Does something.",
+      "done_when": "done.",
+      "depends_on": ["ghost-task"],
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }
+  ]
+}"#;
+        let backend = Arc::new(NoopBackend::with_responses(vec![bad_json.to_string()]));
+        let interpreter = ModelInterpreter::new(backend);
+
+        let err = interpreter
+            .interpret("test", "# source")
+            .await
+            .expect_err("dangling dep must cause validation failure");
+
+        assert!(
+            matches!(err, InterpretError::ValidationFailed(_)),
+            "expected ValidationFailed, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("ghost-task"),
+            "error message should mention the missing id: {err}"
+        );
+    }
+
+    // ── extract_json_object unit tests ────────────────────────────────────────
+
+    #[test]
+    fn extract_json_object_finds_bare_object() {
+        let text = r#"{"slug":"x","tasks":[]}"#;
+        let extracted = extract_json_object(text).unwrap();
+        assert_eq!(extracted, text);
+    }
+
+    #[test]
+    fn extract_json_object_strips_leading_prose() {
+        let text = r#"Here you go: {"slug":"x","tasks":[]}"#;
+        let extracted = extract_json_object(text).unwrap();
+        assert_eq!(extracted, r#"{"slug":"x","tasks":[]}"#);
+    }
+
+    #[test]
+    fn extract_json_object_handles_nested_braces() {
+        let text = r#"{"slug":"x","tasks":[{"id":"a","title":"T"}]}"#;
+        let extracted = extract_json_object(text).unwrap();
+        assert_eq!(extracted, text);
+    }
+
+    #[test]
+    fn extract_json_object_returns_none_for_no_object() {
+        let text = "No JSON here at all.";
+        assert!(extract_json_object(text).is_none());
+    }
+
+    #[test]
+    fn extract_json_object_handles_string_containing_braces() {
+        // A JSON string value containing `{` and `}` must not confuse the parser.
+        let text = r#"{"slug":"x{y}","tasks":[]}"#;
+        let extracted = extract_json_object(text).unwrap();
+        assert_eq!(extracted, text);
+    }
+
+    // ── build_planner_interpreter tests ──────────────────────────────────────
+
+    #[test]
+    fn build_planner_interpreter_one_shot_with_backend_returns_model_interpreter() {
+        use crate::config::PlannerMechanism;
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::new());
+        let interpreter = build_planner_interpreter(&PlannerMechanism::OneShotAgent, Some(backend))
+            .expect("must succeed");
+        // The Arc<dyn TaskListInterpreter> is opaque; we verify it was constructed
+        // (no panic) and can be cloned (Arc::clone is the standard operation).
+        let _clone = Arc::clone(&interpreter);
+    }
+
+    #[test]
+    fn build_planner_interpreter_one_shot_without_backend_returns_structured_text() {
+        use crate::config::PlannerMechanism;
+        let interpreter = build_planner_interpreter(&PlannerMechanism::OneShotAgent, None)
+            .expect("must succeed without a backend (fallback to StructuredTextInterpreter)");
+        let _clone = Arc::clone(&interpreter);
+    }
+
+    #[test]
+    fn build_planner_interpreter_direct_api_returns_not_supported_error() {
+        use crate::config::PlannerMechanism;
+        let result = build_planner_interpreter(&PlannerMechanism::DirectApi, None);
+        match result {
+            Err(InterpretError::MechanismNotSupported { mechanism }) => {
+                assert!(
+                    mechanism.contains("direct-api"),
+                    "mechanism string should mention 'direct-api': {mechanism}"
+                );
+                // Reconstruct to check the Display string.
+                let err = InterpretError::MechanismNotSupported { mechanism };
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("direct-api"),
+                    "error message should mention 'direct-api': {msg}"
+                );
+            }
+            Err(other) => panic!("expected MechanismNotSupported, got: {other:?}"),
+            Ok(_) => panic!("DirectApi must not succeed"),
+        }
     }
 }
