@@ -20,11 +20,14 @@
 //! [`crate::supervision::RootSupervisor`] via
 //! [`crate::supervision::RootSupervisor::spawn_child`].  Spawn order matters:
 //! spawn the `Supervisor` hub first, then pass its `ActorRef` into each spoke's
-//! `Args`.  Because the hub also needs to dispatch work *to* the Developer and
-//! Reviewer, the resulting construction cycle is broken by a post-spawn
-//! [`SetSpokes`](supervisor::SetSpokes) message that hands the spoke refs back to
-//! the hub.  (The previous unsupervised `Supervisor::start()` helper has been
-//! removed — it was a footgun, and `spawn_child` is the canonical path.)
+//! `Args`.  Because a Developer/Reviewer needs the hub's `ActorRef` to be
+//! constructed (a construction cycle), and because the concurrent scheduler
+//! (task 24) spawns a **per-task** Developer/Reviewer pair on demand, the hub is
+//! given the *means to spawn* those spokes via a post-spawn
+//! [`SetSpokes`](supervisor::SetSpokes) message (the `RootSupervisor` ref, the
+//! hub's own ref, and the shared backend).  (The previous unsupervised
+//! `Supervisor::start()` helper has been removed — it was a footgun, and
+//! `spawn_child` is the canonical path.)
 //!
 //! # Planner interpreter injection
 //!

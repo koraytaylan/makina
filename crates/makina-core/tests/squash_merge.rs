@@ -34,8 +34,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use makina_core::actors::{
-    Developer, DeveloperArgs, Reviewer, ReviewerArgs, RunReadyTasks, SetSpokes, SetTaskGraph,
-    Supervisor, SupervisorArgs, TaskGraphSnapshot,
+    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
 };
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
@@ -369,7 +368,8 @@ fn task(id: &str, done_when: &str, deps: &[&str]) -> Task {
     }
 }
 
-/// Spawn the full actor tree over `repo_root` with `backend` and wire the spokes.
+/// Spawn the actor tree over `repo_root` with `backend` and wire the per-task
+/// spawn deps into the hub (task 24: the hub spawns spokes per task).
 async fn build_actor_tree(
     repo_root: std::path::PathBuf,
     backend: Arc<dyn AgentBackend>,
@@ -391,30 +391,11 @@ async fn build_actor_tree(
     )
     .await;
 
-    let developer_ref = RootSupervisor::spawn_child::<Developer>(
-        &root,
-        DeveloperArgs {
-            supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    let reviewer_ref = RootSupervisor::spawn_child::<Reviewer>(
-        &root,
-        ReviewerArgs {
-            supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
     supervisor_ref
         .ask(SetSpokes {
-            developer: developer_ref,
-            reviewer: reviewer_ref,
+            root: root.clone(),
+            supervisor: supervisor_ref.clone(),
+            backend: Arc::clone(&backend),
         })
         .send()
         .await

@@ -30,8 +30,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use makina_core::actors::{
-    Developer, DeveloperArgs, Reviewer, ReviewerArgs, RunReadyTasks, SetSpokes, SetTaskGraph,
-    Supervisor, SupervisorArgs, TaskGraphSnapshot,
+    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
 };
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
@@ -145,9 +144,13 @@ fn task(id: &str) -> Task {
 
 // ── Actor-tree builder ───────────────────────────────────────────────────────────
 
-/// Spawn the full actor tree over `repo_root` with the given `backend` and
-/// `config`, wire the spokes into the hub via `SetSpokes`, and return
+/// Spawn the actor tree over `repo_root` with the given `backend` and `config`,
+/// wire the concurrency deps into the hub via `SetSpokes`, and return
 /// `(root, supervisor_ref)`.
+///
+/// Under task 24 the hub spawns a Developer/Reviewer pair **per task** itself, so
+/// the helper only wires the means to do so (root ref, hub ref, shared backend);
+/// it no longer pre-spawns a shared spoke pair.
 async fn build_actor_tree(
     repo_root: std::path::PathBuf,
     backend: Arc<dyn AgentBackend>,
@@ -168,30 +171,11 @@ async fn build_actor_tree(
     )
     .await;
 
-    let developer_ref = RootSupervisor::spawn_child::<Developer>(
-        &root,
-        DeveloperArgs {
-            supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    let reviewer_ref = RootSupervisor::spawn_child::<Reviewer>(
-        &root,
-        ReviewerArgs {
-            supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
     supervisor_ref
         .ask(SetSpokes {
-            developer: developer_ref,
-            reviewer: reviewer_ref,
+            root: root.clone(),
+            supervisor: supervisor_ref.clone(),
+            backend: Arc::clone(&backend),
         })
         .send()
         .await
