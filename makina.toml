@@ -1,0 +1,63 @@
+# Makina — project configuration (`makina.toml`)
+#
+# This is the *project* layer of Makina's two-layer config (see
+# `crates/makina-core/src/config.rs` and `docs/spec/runtime-artifact-schema.md`).
+# It is committed to version control because it is repository-specific: it pins
+# the base branch every task branches off and the toolchain-specific quality
+# gates a task must pass before it can be reviewed and squash-merged.
+#
+# The *global* layer (`~/.makina/config.toml`, machine-specific, NOT committed)
+# supplies the agent backend command, the Planner model/mechanism, and the
+# default termination caps. The project layer wins on merge. A minimal global
+# config for driving this repo interactively looks like:
+#
+#   [backend]
+#   command = "gemini"
+#   args    = ["--acp"]
+#
+#   [planner]
+#   mechanism = "one-shot-agent"
+#
+# See `docs/trial/e2e-run.md` for the full setup + run recipe.
+
+# The branch new task branches (`task/{id}`) are cut from, and the branch
+# approved work is squash-merged back into. Makina never commits to it directly
+# except via the squash-merge of an approved, gate-passing task branch.
+base_branch = "develop"
+
+# How many tasks may run concurrently (each in its own worktree). Kept
+# conservative for this repo: agent turns drive real model calls and each gate
+# pass compiles the whole workspace, so a low ceiling keeps machine load and
+# the merge-lock contention sane. Raise it on a beefier machine.
+concurrency = 2
+
+# Termination caps (project overrides of the global defaults). Generous on
+# iterations because a real agent may need a couple of rounds to make the gates
+# pass; bounded wall-clock so a wedged task cannot run forever. A full workspace
+# `cargo` compile from cold plus several agent turns can take a while, hence the
+# 20-minute ceiling.
+[caps]
+gate_iterations     = 5
+reviewer_iterations = 3
+wall_clock_secs     = 1200
+
+# ── Quality gates ────────────────────────────────────────────────────────────
+#
+# Each gate is a shell command run (via `sh -c`) in the task's worktree. A gate
+# "passes" iff it exits 0. They are evaluated top-to-bottom; the first failure
+# is fed back to the Developer agent to fix, then ALL gates are re-run from the
+# top on the next iteration. These are the same three checks this project's
+# contribution hygiene requires, so a task that passes them is genuinely
+# mergeable.
+
+[[gates]]
+name    = "test"
+command = "cargo test"
+
+[[gates]]
+name    = "clippy"
+command = "cargo clippy -- -D warnings"
+
+[[gates]]
+name    = "fmt"
+command = "cargo fmt --check"
