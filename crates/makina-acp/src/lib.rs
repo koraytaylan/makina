@@ -72,11 +72,15 @@
 pub mod backend;
 pub mod client;
 pub mod error;
+pub mod permission;
 pub mod protocol;
 pub mod transport;
 
 pub use backend::{AcpBackend, AcpSession};
 pub use client::{AcpClient, AcpCommand, AcpResponseChunk, PromptStream};
 pub use error::{AcpError, Result};
+pub use permission::{
+    PermissionDecision, PermissionPolicy, PermissionRequestContext, WorktreePolicy,
+};
 pub use protocol::{AuthMethod, StopReason};
 pub use transport::{Transport, TransportSender};
