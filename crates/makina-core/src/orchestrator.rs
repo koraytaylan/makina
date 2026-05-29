@@ -365,6 +365,18 @@ impl CoreApi {
                 reason: format!("could not interpret task list `{slug}`: {e}"),
             })?;
 
+        // 3a. Seed-persist the freshly-interpreted graph so the artifact exists
+        //     immediately (before StartRun).  Best-effort: a failure only warns;
+        //     opening a run must not break because the disk is unwritable.
+        let repo_root = self.state.worktree_manager.repo_root.clone();
+        if let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await {
+            tracing::warn!(
+                slug = %slug,
+                error = %e,
+                "seed-persist failed for freshly-opened run; continuing without artifact",
+            );
+        }
+
         // 4. Allocate an id and register the Run.  Lock → insert → DROP guard
         //    before any further await/broadcast.
         let id = self.state.alloc_id();
@@ -1013,6 +1025,89 @@ Does a thing.
         let (api, _repo) = execution_core_api();
         assert!(api.runs().await.is_empty());
         assert!(api.run(RunId(1)).await.is_none());
+    }
+
+    // ── Seed-persist (task orchestrator-seed-write) ───────────────────────────
+
+    /// **Acceptance (orchestrator-seed-write):**
+    /// Opening a run on a task list in a temp repo with no pre-existing
+    /// `.tasks/{slug}.json` creates the file with all tasks in the `new` state,
+    /// asserted BEFORE any StartRun command.
+    #[tokio::test]
+    async fn open_run_seeds_artifact_before_start_run() {
+        // Build a CoreApi backed by a fresh temp repo so persist_graph has a
+        // real filesystem to write to.
+        let (api, repo_dir) = execution_core_api();
+        let repo_root = repo_dir.path().to_path_buf();
+
+        // Write a small task-list file (slug will be "seed-test").
+        let task_list = r#"# Seed — Task List
+
+A minimal list to verify seed-persist.
+
+---
+
+## 0001 — Foundation
+
+### alpha — Alpha task
+Create alpha.
+- **Depends on:** —
+- **Done when:** alpha done.
+
+### beta — Beta task
+Create beta.
+- **Depends on:** alpha
+- **Done when:** beta done.
+"#;
+        let task_list_dir = tempfile::tempdir().expect("create tempdir");
+        let task_list_path = task_list_dir.path().join("seed-test.md");
+        std::fs::write(&task_list_path, task_list).expect("write task list");
+
+        // Verify no artifact exists yet.
+        let artifact_path = crate::persist::tasks_path(&repo_root, "seed-test");
+        assert!(
+            !artifact_path.exists(),
+            ".tasks/seed-test.json must not exist before OpenRun"
+        );
+
+        // Issue OpenRun — do NOT issue StartRun.
+        let outcome = api
+            .execute(Command::OpenRun {
+                task_list_path: task_list_path.clone(),
+            })
+            .await
+            .expect("OpenRun must succeed");
+        assert!(
+            matches!(outcome, CommandOutcome::RunOpened { .. }),
+            "expected RunOpened, got {outcome:?}"
+        );
+
+        // Assert: the artifact now exists on disk.
+        assert!(
+            artifact_path.exists(),
+            ".tasks/seed-test.json must exist immediately after OpenRun, before StartRun"
+        );
+
+        // Assert: all tasks are in the `new` state.
+        let loaded = crate::persist::load_graph(&repo_root, "seed-test")
+            .await
+            .expect("load_graph must not error")
+            .expect(".tasks/seed-test.json must be loadable");
+
+        assert_eq!(
+            loaded.slug, "seed-test",
+            "persisted graph slug must match the file stem"
+        );
+        assert_eq!(loaded.tasks.len(), 2, "both tasks must be persisted");
+        for task in &loaded.tasks {
+            assert_eq!(
+                task.state,
+                crate::task::TaskState::New,
+                "task `{}` must be in `new` state before StartRun; got {:?}",
+                task.id,
+                task.state
+            );
+        }
     }
 
     // ── StartRun executes the Run (the done-when) ─────────────────────────────
