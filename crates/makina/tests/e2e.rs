@@ -37,7 +37,7 @@
 //! fast without it. Run it manually:
 //!
 //! ```bash
-//! MAKINA_ACP_CMD=gemini MAKINA_ACP_ARGS=--acp,--yolo \
+//! MAKINA_ACP_CMD=gemini MAKINA_ACP_ARGS=--acp \
 //!     cargo test -p makina --test e2e -- --ignored --nocapture
 //! ```
 //!
@@ -46,19 +46,25 @@
 //! authenticated — Makina inherits the environment and holds no credentials
 //! (the Zed auth model).
 //!
-//! ## Why `--yolo` for gemini
+//! ## Permission handling — the ACP gateway
 //!
-//! gemini in its *default* mode prompts for approval before editing files: it
-//! sends a `session/request_permission` server→client request. Makina's MVP ACP
-//! client advertises empty `clientCapabilities` and ignores inbound requests, so
-//! a default-mode Developer turn **hangs** waiting for a permission answer that
-//! never comes. Passing gemini's `--yolo` (auto-approve all tool calls) makes it
-//! write files via plain `session/update` notifications with no permission
-//! round-trip — which the existing client handles. This is pure agent CLI
-//! configuration (no engine change); see `docs/trial/e2e-run.md` §6 for the full
-//! finding and the proper follow-up (implement the permission flow in the ACP
-//! client). With plain `--acp` this test will hang until the per-task
-//! `wall_clock_secs` cap fires and then fail (no task reaches Done).
+//! Default-mode agents (gemini without `--yolo`) send a
+//! `session/request_permission` server→client request before editing files.
+//! Makina's permission gateway handles this transparently: the ACP transport
+//! intercepts the `session/request_permission` message, a `WorktreePolicy`
+//! auto-allows any tool call rooted inside the per-task worktree (selecting the
+//! *allow-once* option), replies to the agent, and records an `AuditEntry` to
+//! the Supervisor-owned `JsonlAuditSink` (`.tasks/{slug}/audit.jsonl`). The
+//! agent receives its approval and continues normally.
+//!
+//! The deterministic asserting gate for this behaviour is the in-crate test
+//! `gateway_threading_audit_sink_flows_through_backend_command_to_transport`
+//! in `crates/makina-acp/src/backend.rs` (`#[cfg(test)] mod tests`), with the
+//! companion integration test
+//! `interleaved_permission_request_completes_turn_and_records_audit_entry` in
+//! `crates/makina-acp/tests/backend_trait.rs`. Those tests prove that a
+//! `session/request_permission` is answered and the turn completes, all without
+//! `--yolo`. The `--yolo` bypass is no longer needed or used.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
