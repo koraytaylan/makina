@@ -1394,18 +1394,14 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         // `develop` is ALREADY safely restored by the merger (its
                         // hard invariant).  The architecture's agent-driven
                         // reconciliation is a documented seam (see task 23 notes);
-                        // the MVP drives the task to a SAFE terminal Failed.  A
-                        // straggler conflict is a *recoverable* class (not a hard
-                        // tool crash), so it keeps using `ReviewCapReached` (the
-                        // "the loop gave up safely" terminal) rather than
-                        // `HardError`, which task 25 reserves for genuinely hard
-                        // failures (worktree-create, reviewer-dispatch, hard merge).
-                        // A dedicated merge-conflict event + agent-reconcile retry
-                        // budget remains FUTURE work.
+                        // the MVP drives the task to a SAFE terminal Failed via the
+                        // dedicated `MergeConflict` event (InReview → Failed).
+                        // This distinguishes it from reviewer-cap exhaustion
+                        // (still ReviewCapReached) and hard merge errors (HardError).
                         let _ = details; // surfaced to the seam; logged by a later task.
                         {
                             let mut graph = ctx.graph.lock().await;
-                            apply_event_locked(&mut graph, task_id, TaskEvent::ReviewCapReached)?;
+                            apply_event_locked(&mut graph, task_id, TaskEvent::MergeConflict)?;
                             mark_finished_locked(&mut graph, task_id);
                         }
                         remove_worktree(ctx, task_id).await;

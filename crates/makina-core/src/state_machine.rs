@@ -42,6 +42,7 @@
 //! │ InReview     │ ReviewerRejected     │ InProgress  │ ← reject loop
 //! │ InReview     │ ReviewerApproved     │ Done        │
 //! │ InReview     │ ReviewCapReached     │ Failed      │
+//! │ InReview     │ MergeConflict        │ Failed      │ ← squash-merge conflict (dedicated event)
 //! │ InReview     │ HardError            │ Failed      │ ← review-time/merge hard error (task 25)
 //! │ InReview     │ WallClockCapReached  │ Failed      │ ← deadline (task 25)
 //! └──────────────┴──────────────────────┴─────────────┘
@@ -128,6 +129,11 @@ pub enum TaskEvent {
     /// (terminal).  The cap is enforced externally to this FSM.
     ReviewCapReached,
 
+    /// A squash-merge on reviewer approval hit a conflict (distinct from a hard
+    /// merge error). The merger already restored `develop` clean. Moves only
+    /// [`TaskState::InReview`] → [`TaskState::Failed`] (terminal).
+    MergeConflict,
+
     /// The per-task wall-clock deadline (`config.caps.wall_clock_secs`) elapsed
     /// while the task was still active.
     ///
@@ -209,7 +215,8 @@ pub fn transition(from: TaskState, event: TaskEvent) -> Result<TaskState, Illega
         (InReview, ReviewerRejected) => Ok(InProgress), // reject loop
         (InReview, ReviewerApproved) => Ok(Done),
         (InReview, ReviewCapReached) => Ok(Failed),
-        (InReview, HardError) => Ok(Failed), // review-time / hard-merge error (task 25)
+        (InReview, MergeConflict) => Ok(Failed), // squash-merge conflict (dedicated)
+        (InReview, HardError) => Ok(Failed),     // review-time / hard-merge error (task 25)
         (InReview, WallClockCapReached) => Ok(Failed), // deadline (task 25)
 
         // ── Everything else (illegal) ─────────────────────────────────────────
@@ -249,6 +256,7 @@ pub fn legal_events(from: TaskState) -> Vec<TaskEvent> {
             ReviewerRejected,
             ReviewerApproved,
             ReviewCapReached,
+            MergeConflict,
             HardError,
             WallClockCapReached,
         ],
@@ -265,18 +273,14 @@ mod tests {
     //! # Coverage strategy
     //!
     //! The primary test (`exhaustive_transition_table`) iterates the full
-    //! Cartesian product of all 6 states × all 10 events (60 pairs total).
+    //! Cartesian product of all 6 states × all 11 events (66 pairs total).
     //! For each pair it asserts the exact expected outcome: `Ok(target)` for
-    //! the 14 legal transitions and `Err(IllegalTransition)` for the remaining
-    //! 46 pairs.  This single test is sufficient proof that the implementation
+    //! the 15 legal transitions and `Err(IllegalTransition)` for the remaining
+    //! 51 pairs.  This single test is sufficient proof that the implementation
     //! matches the architecture diagram exactly.
     //!
-    //! The legal count grew from 9 → 14 in task 25 (`termination-caps`), which
-    //! added the `WallClockCapReached` event (legal from `Ready`, `InProgress`,
-    //! `InReview`) and made `HardError` additionally legal from `Ready` and
-    //! `InReview` (it was already legal from `InProgress`):
-    //! +3 (`WallClockCapReached` × {Ready, InProgress, InReview})
-    //! +2 (`HardError` × {Ready, InReview}) = +5 legal transitions.
+    //! The legal count grew from 9 → 14 in task 25 (`termination-caps`) ...
+    //! This task adds `MergeConflict` (legal only from InReview) as the 11th event.
     //!
     //! Supporting tests cover `is_terminal` and `legal_events` independently.
 
@@ -286,8 +290,8 @@ mod tests {
     // ── Legal transition set ──────────────────────────────────────────────────
 
     /// The complete set of legal `(from, event, to)` triples from the
-    /// architecture state diagram.  Used both by `exhaustive_transition_table`
-    /// and as documentation of intent.
+    /// architecture state diagram (now 15 entries with MergeConflict).  Used both
+    /// by `exhaustive_transition_table` and as documentation of intent.
     fn legal_table() -> Vec<(TaskState, TaskEvent, TaskState)> {
         use TaskEvent::*;
         use TaskState::*;
@@ -305,7 +309,8 @@ mod tests {
             (InReview, ReviewerRejected, InProgress),  // reject loop
             (InReview, ReviewerApproved, Done),
             (InReview, ReviewCapReached, Failed),
-            (InReview, HardError, Failed), // review-time / hard-merge error (task 25)
+            (InReview, MergeConflict, Failed), // squash-merge conflict (dedicated)
+            (InReview, HardError, Failed),     // review-time / hard-merge error (task 25)
             (InReview, WallClockCapReached, Failed), // deadline (task 25)
         ]
     }
@@ -329,21 +334,21 @@ mod tests {
             ReviewerRejected,
             ReviewerApproved,
             ReviewCapReached,
+            MergeConflict,
             WallClockCapReached,
         ]
     }
 
     // ── Exhaustive Cartesian-product test ─────────────────────────────────────
 
-    /// For every `(state, event)` pair in the 6×10 Cartesian product:
+    /// For every `(state, event)` pair in the 6×11 Cartesian product:
     /// - If the pair is in the legal table → assert `Ok(expected_target)`.
     /// - Otherwise → assert `Err(IllegalTransition { from, event })`.
     ///
     /// This is the definitive proof that the FSM implementation matches the
-    /// architecture diagram: 14 legal transitions and 46 illegal ones, totalling
-    /// 60 assertions.  (Task 25 grew the table from 9/45/54 by adding
-    /// `WallClockCapReached` as a 10th event and 5 new legal edges — see the
-    /// module-level test docs.)
+    /// architecture diagram: 15 legal transitions and 51 illegal ones, totalling
+    /// 66 assertions. (Task 25 grew the table; this task adds MergeConflict as
+    /// the 11th event with 1 new legal edge + 5 new illegal pairs.)
     #[test]
     fn exhaustive_transition_table() {
         use std::collections::HashMap;
@@ -358,7 +363,7 @@ mod tests {
         let events = all_events();
 
         let total = states.len() * events.len();
-        assert_eq!(total, 60, "expected 6 states × 10 events = 60 pairs");
+        assert_eq!(total, 66, "expected 6 states × 11 events = 66 pairs");
 
         let mut legal_count = 0usize;
         let mut illegal_count = 0usize;
@@ -385,8 +390,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_count, 14, "expected exactly 14 legal transitions");
-        assert_eq!(illegal_count, 46, "expected exactly 46 illegal transitions");
+        assert_eq!(legal_count, 15, "expected exactly 15 legal transitions");
+        assert_eq!(illegal_count, 51, "expected exactly 51 illegal transitions");
     }
 
     // ── is_terminal ───────────────────────────────────────────────────────────
@@ -588,5 +593,32 @@ mod tests {
             msg.contains("Dispatched"),
             "display should mention the event: {msg}"
         );
+    }
+
+    // ── Task fsm-merge-conflict-event assertions (RED: expect these to fail until GREEN) ──
+
+    /// `(InReview, MergeConflict) → Failed` (the single legal transition for the new event).
+    #[test]
+    fn in_review_plus_merge_conflict_yields_failed() {
+        assert_eq!(
+            transition(TaskState::InReview, TaskEvent::MergeConflict),
+            Ok(TaskState::Failed)
+        );
+    }
+
+    /// `MergeConflict` is illegal from every non-InReview state (FSM totality).
+    #[test]
+    fn merge_conflict_is_illegal_from_non_in_review_states() {
+        use TaskState::*;
+        for &state in &[New, Ready, InProgress, Done, Failed] {
+            assert_eq!(
+                transition(state, TaskEvent::MergeConflict),
+                Err(IllegalTransition {
+                    from: state,
+                    event: TaskEvent::MergeConflict,
+                }),
+                "MergeConflict must be rejected from {state:?}"
+            );
+        }
     }
 }
