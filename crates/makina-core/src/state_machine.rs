@@ -14,8 +14,10 @@
 //!   helpers.
 //!
 //! **This module is NOT responsible for:**
-//! - Counting gate or review iterations (handled by a later `termination-caps`
-//!   task).
+//! - Counting gate or review iterations, or measuring wall-clock time (the caps
+//!   are enforced *externally* by the Supervisor — see `termination-caps`
+//!   (task 25)).  This module only defines the terminal transitions those caps
+//!   trigger (`GateCapReached`, `ReviewCapReached`, `WallClockCapReached`).
 //! - Deciding *when* to emit events (handled by `gate-runner`,
 //!   `develop-review-loop`, etc.).
 //! - Mutating [`crate::task::Task`] fields (`updated_at`, iteration counters,
@@ -30,18 +32,25 @@
 //! ├──────────────┼──────────────────────┼─────────────┤
 //! │ New          │ DependenciesSatisfied│ Ready       │
 //! │ Ready        │ Dispatched           │ InProgress  │
+//! │ Ready        │ HardError            │ Failed      │ ← worktree-create fail (task 25)
+//! │ Ready        │ WallClockCapReached  │ Failed      │ ← deadline (task 25)
 //! │ InProgress   │ GateFailed           │ InProgress  │ ← self-loop
 //! │ InProgress   │ GatesPassed          │ InReview    │
 //! │ InProgress   │ GateCapReached       │ Failed      │
 //! │ InProgress   │ HardError            │ Failed      │
+//! │ InProgress   │ WallClockCapReached  │ Failed      │ ← deadline (task 25)
 //! │ InReview     │ ReviewerRejected     │ InProgress  │ ← reject loop
 //! │ InReview     │ ReviewerApproved     │ Done        │
 //! │ InReview     │ ReviewCapReached     │ Failed      │
+//! │ InReview     │ HardError            │ Failed      │ ← review-time/merge hard error (task 25)
+//! │ InReview     │ WallClockCapReached  │ Failed      │ ← deadline (task 25)
 //! └──────────────┴──────────────────────┴─────────────┘
 //! ```
 //!
 //! `Done` and `Failed` are terminal: no outgoing transitions exist for any
-//! event.
+//! event.  `WallClockCapReached` is **not** legal from `New`: the per-task
+//! wall-clock deadline starts at dispatch (when the driver begins), so a task
+//! that has not been picked up yet cannot time out.
 
 use thiserror::Error;
 
@@ -85,11 +94,19 @@ pub enum TaskEvent {
     /// (terminal).  The cap is enforced externally to this FSM.
     GateCapReached,
 
-    /// An unrecoverable error occurred while the Developer was working on the
-    /// task (e.g. tool crash, invalid workspace state).
+    /// An unrecoverable error occurred at some point in the active lifecycle
+    /// (e.g. a worktree could not be created, a tool crashed, the Developer or
+    /// Reviewer session failed to dispatch/parse, or a hard — non-conflict —
+    /// merge failure).
     ///
-    /// Moves the task from [`TaskState::InProgress`] → [`TaskState::Failed`]
-    /// (terminal).
+    /// Legal from every *active* state, all moving the task to
+    /// [`TaskState::Failed`] (terminal):
+    /// - [`TaskState::Ready`] → `Failed` — a worktree-create failure before the
+    ///   Developer is ever dispatched.
+    /// - [`TaskState::InProgress`] → `Failed` — a Developer-dispatch failure or
+    ///   a gate that could not be launched.
+    /// - [`TaskState::InReview`] → `Failed` — a Reviewer dispatch/parse failure
+    ///   or a hard (non-conflict) squash-merge failure.
     HardError,
 
     /// The Reviewer requested changes; the Developer must iterate again.
@@ -110,6 +127,17 @@ pub enum TaskEvent {
     /// Moves the task from [`TaskState::InReview`] → [`TaskState::Failed`]
     /// (terminal).  The cap is enforced externally to this FSM.
     ReviewCapReached,
+
+    /// The per-task wall-clock deadline (`config.caps.wall_clock_secs`) elapsed
+    /// while the task was still active.
+    ///
+    /// Legal from any *active* state the task can be in when the deadline fires —
+    /// [`TaskState::Ready`], [`TaskState::InProgress`], or [`TaskState::InReview`]
+    /// — all moving it to [`TaskState::Failed`] (terminal).  **Not** legal from
+    /// [`TaskState::New`]: the clock starts when the driver picks the task up
+    /// (dispatch), so an un-started task cannot time out.  Enforced externally
+    /// (the scheduler wraps each driver in a `tokio::time::timeout`).
+    WallClockCapReached,
 }
 
 // ── IllegalTransition ─────────────────────────────────────────────────────────
@@ -167,17 +195,22 @@ pub fn transition(from: TaskState, event: TaskEvent) -> Result<TaskState, Illega
 
         // ── Ready ─────────────────────────────────────────────────────────────
         (Ready, Dispatched) => Ok(InProgress),
+        (Ready, HardError) => Ok(Failed), // worktree-create failure (task 25)
+        (Ready, WallClockCapReached) => Ok(Failed), // deadline before dispatch completes (task 25)
 
         // ── InProgress ────────────────────────────────────────────────────────
         (InProgress, GateFailed) => Ok(InProgress), // self-loop
         (InProgress, GatesPassed) => Ok(InReview),
         (InProgress, GateCapReached) => Ok(Failed),
         (InProgress, HardError) => Ok(Failed),
+        (InProgress, WallClockCapReached) => Ok(Failed), // deadline (task 25)
 
         // ── InReview ──────────────────────────────────────────────────────────
         (InReview, ReviewerRejected) => Ok(InProgress), // reject loop
         (InReview, ReviewerApproved) => Ok(Done),
         (InReview, ReviewCapReached) => Ok(Failed),
+        (InReview, HardError) => Ok(Failed), // review-time / hard-merge error (task 25)
+        (InReview, WallClockCapReached) => Ok(Failed), // deadline (task 25)
 
         // ── Everything else (illegal) ─────────────────────────────────────────
         _ => Err(IllegalTransition { from, event }),
@@ -204,9 +237,21 @@ pub fn legal_events(from: TaskState) -> Vec<TaskEvent> {
 
     match from {
         New => vec![DependenciesSatisfied],
-        Ready => vec![Dispatched],
-        InProgress => vec![GateFailed, GatesPassed, GateCapReached, HardError],
-        InReview => vec![ReviewerRejected, ReviewerApproved, ReviewCapReached],
+        Ready => vec![Dispatched, HardError, WallClockCapReached],
+        InProgress => vec![
+            GateFailed,
+            GatesPassed,
+            GateCapReached,
+            HardError,
+            WallClockCapReached,
+        ],
+        InReview => vec![
+            ReviewerRejected,
+            ReviewerApproved,
+            ReviewCapReached,
+            HardError,
+            WallClockCapReached,
+        ],
         Done | Failed => vec![],
     }
 }
@@ -220,11 +265,18 @@ mod tests {
     //! # Coverage strategy
     //!
     //! The primary test (`exhaustive_transition_table`) iterates the full
-    //! Cartesian product of all 6 states × all 9 events (54 pairs total).
+    //! Cartesian product of all 6 states × all 10 events (60 pairs total).
     //! For each pair it asserts the exact expected outcome: `Ok(target)` for
-    //! the 9 legal transitions and `Err(IllegalTransition)` for the remaining
-    //! 45 pairs.  This single test is sufficient proof that the implementation
+    //! the 14 legal transitions and `Err(IllegalTransition)` for the remaining
+    //! 46 pairs.  This single test is sufficient proof that the implementation
     //! matches the architecture diagram exactly.
+    //!
+    //! The legal count grew from 9 → 14 in task 25 (`termination-caps`), which
+    //! added the `WallClockCapReached` event (legal from `Ready`, `InProgress`,
+    //! `InReview`) and made `HardError` additionally legal from `Ready` and
+    //! `InReview` (it was already legal from `InProgress`):
+    //! +3 (`WallClockCapReached` × {Ready, InProgress, InReview})
+    //! +2 (`HardError` × {Ready, InReview}) = +5 legal transitions.
     //!
     //! Supporting tests cover `is_terminal` and `legal_events` independently.
 
@@ -243,13 +295,18 @@ mod tests {
         vec![
             (New, DependenciesSatisfied, Ready),
             (Ready, Dispatched, InProgress),
+            (Ready, HardError, Failed), // worktree-create failure (task 25)
+            (Ready, WallClockCapReached, Failed), // deadline (task 25)
             (InProgress, GateFailed, InProgress), // self-loop
             (InProgress, GatesPassed, InReview),
             (InProgress, GateCapReached, Failed),
             (InProgress, HardError, Failed),
-            (InReview, ReviewerRejected, InProgress), // reject loop
+            (InProgress, WallClockCapReached, Failed), // deadline (task 25)
+            (InReview, ReviewerRejected, InProgress),  // reject loop
             (InReview, ReviewerApproved, Done),
             (InReview, ReviewCapReached, Failed),
+            (InReview, HardError, Failed), // review-time / hard-merge error (task 25)
+            (InReview, WallClockCapReached, Failed), // deadline (task 25)
         ]
     }
 
@@ -272,18 +329,21 @@ mod tests {
             ReviewerRejected,
             ReviewerApproved,
             ReviewCapReached,
+            WallClockCapReached,
         ]
     }
 
     // ── Exhaustive Cartesian-product test ─────────────────────────────────────
 
-    /// For every `(state, event)` pair in the 6×9 Cartesian product:
+    /// For every `(state, event)` pair in the 6×10 Cartesian product:
     /// - If the pair is in the legal table → assert `Ok(expected_target)`.
     /// - Otherwise → assert `Err(IllegalTransition { from, event })`.
     ///
     /// This is the definitive proof that the FSM implementation matches the
-    /// architecture diagram: 9 legal transitions and 45 illegal ones, totalling
-    /// 54 assertions.
+    /// architecture diagram: 14 legal transitions and 46 illegal ones, totalling
+    /// 60 assertions.  (Task 25 grew the table from 9/45/54 by adding
+    /// `WallClockCapReached` as a 10th event and 5 new legal edges — see the
+    /// module-level test docs.)
     #[test]
     fn exhaustive_transition_table() {
         use std::collections::HashMap;
@@ -298,7 +358,7 @@ mod tests {
         let events = all_events();
 
         let total = states.len() * events.len();
-        assert_eq!(total, 54, "expected 6 states × 9 events = 54 pairs");
+        assert_eq!(total, 60, "expected 6 states × 10 events = 60 pairs");
 
         let mut legal_count = 0usize;
         let mut illegal_count = 0usize;
@@ -325,8 +385,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_count, 9, "expected exactly 9 legal transitions");
-        assert_eq!(illegal_count, 45, "expected exactly 45 illegal transitions");
+        assert_eq!(legal_count, 14, "expected exactly 14 legal transitions");
+        assert_eq!(illegal_count, 46, "expected exactly 46 illegal transitions");
     }
 
     // ── is_terminal ───────────────────────────────────────────────────────────
@@ -461,6 +521,52 @@ mod tests {
         assert_eq!(
             transition(TaskState::InReview, TaskEvent::ReviewCapReached),
             Ok(TaskState::Failed)
+        );
+    }
+
+    // ── Task 25 additions: HardError from Ready/InReview, WallClockCapReached ──
+
+    /// A worktree-create failure fails a still-`Ready` task (task 25).
+    #[test]
+    fn ready_plus_hard_error_yields_failed() {
+        assert_eq!(
+            transition(TaskState::Ready, TaskEvent::HardError),
+            Ok(TaskState::Failed)
+        );
+    }
+
+    /// A review-time / hard-merge error fails an `InReview` task (task 25).
+    #[test]
+    fn in_review_plus_hard_error_yields_failed() {
+        assert_eq!(
+            transition(TaskState::InReview, TaskEvent::HardError),
+            Ok(TaskState::Failed)
+        );
+    }
+
+    /// The wall-clock deadline fails a task from each active state (task 25).
+    #[test]
+    fn wall_clock_cap_reached_fails_from_each_active_state() {
+        for state in [TaskState::Ready, TaskState::InProgress, TaskState::InReview] {
+            assert_eq!(
+                transition(state, TaskEvent::WallClockCapReached),
+                Ok(TaskState::Failed),
+                "WallClockCapReached should fail an active {state:?} task"
+            );
+        }
+    }
+
+    /// `WallClockCapReached` is NOT legal from `New` — the deadline starts at
+    /// dispatch, so an un-started task cannot time out (task 25).
+    #[test]
+    fn wall_clock_cap_reached_is_illegal_from_new() {
+        assert_eq!(
+            transition(TaskState::New, TaskEvent::WallClockCapReached),
+            Err(IllegalTransition {
+                from: TaskState::New,
+                event: TaskEvent::WallClockCapReached,
+            }),
+            "the wall-clock deadline only applies once a task is dispatched"
         );
     }
 

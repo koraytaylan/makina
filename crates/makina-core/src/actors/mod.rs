@@ -38,11 +38,11 @@
 //! in tests; task 18 will plug in a model-backed interpreter.
 //!
 //! Task 21 (`develop-review-loop`) added the real orchestration: the
-//! `Supervisor` drives [`RunReadyTasks`](supervisor::RunReadyTasks) as a
-//! sequential `ask`-based develop→review loop, and the `Developer`/`Reviewer`
-//! drive an injected `Arc<dyn AgentBackend>`.  The gate loop (task 22),
-//! squash-merge (task 23), concurrency (task 24), and termination caps (task 25)
-//! are left as clearly-commented seams in `supervisor.rs`.
+//! `Supervisor` drives [`RunReadyTasks`](supervisor::RunReadyTasks) as an
+//! `ask`-based develop→review loop, and the `Developer`/`Reviewer` drive an
+//! injected `Arc<dyn AgentBackend>`.  The gate loop (task 22), squash-merge
+//! (task 23), concurrency (task 24), and termination caps (task 25 — gate +
+//! reviewer + wall-clock) are all implemented in `supervisor.rs`.
 
 pub mod developer;
 pub mod planner;
@@ -54,8 +54,8 @@ pub use developer::{Develop, DevelopAck, DevelopOutcome, Developer, DeveloperArg
 pub use planner::{InterpretTaskList, InterpretTaskListAck, Planner, PlannerArgs};
 pub use reviewer::{Review, ReviewReply, ReviewVerdict, Reviewer, ReviewerArgs};
 pub use supervisor::{
-    MAX_REVIEWER_ITERATIONS, RunReadyTasks, RunReport, SetSpokes, SetTaskGraph, Supervisor,
-    SupervisorArgs, TaskGraphSnapshot,
+    RunReadyTasks, RunReport, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs,
+    TaskGraphSnapshot,
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

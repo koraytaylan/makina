@@ -20,6 +20,7 @@
 //! pick ready task
 //!   --DependenciesSatisfied--> Ready
 //!   create worktree (WorktreeManager::create)
+//!     on create failure: --HardError--> Failed ; task fails   (task 25)
 //!   --Dispatched--> InProgress
 //!   loop:
 //!     develop_until_gates_pass(task, worktree, feedback):     (task 22)
@@ -32,13 +33,24 @@
 //!                          --GateCapReached--> Failed ; teardown ; task fails
 //!                        else: feedback = gate output ; re-dispatch
 //!     ask Reviewer.Review{task, worktree}
+//!       (dispatch/parse failure) --HardError--> Failed ; teardown   (task 25)
 //!       Approve  squash_merge(task/{id} → develop)      (task 23 — BEFORE teardown)
-//!                 Merged   --ReviewerApproved--> Done ; WorktreeManager::remove
-//!                 Conflict develop already restored clean by merger ;
-//!                          --ReviewCapReached--> Failed ; teardown   (safe-fail; agent-reconcile seam)
-//!       Reject{feedback} --ReviewerRejected--> InProgress
-//!                 review_iterations += 1 ; relay feedback ; re-develop+gate (bounded retry)
+//!                 Merged    --ReviewerApproved--> Done ; WorktreeManager::remove
+//!                 Conflict  develop already restored clean by merger ;
+//!                           --ReviewCapReached--> Failed ; teardown  (safe-fail; agent-reconcile seam)
+//!                 (hard merge err) --HardError--> Failed ; teardown  (task 25)
+//!       Reject{feedback}
+//!                 if review_iterations + 1 >= caps.reviewer_iterations:   (task 25)
+//!                   --ReviewCapReached--> Failed ; teardown ; task fails
+//!                 else: --ReviewerRejected--> InProgress ;
+//!                   review_iterations += 1 ; relay feedback ; re-develop+gate
 //! ```
+//!
+//! On top of the develop→review loop, the **scheduler** wraps each driver in a
+//! per-task `tokio::time::timeout(config.caps.wall_clock_secs)`.  If the deadline
+//! fires the driver future is cancelled (its [`DriverGuard`] tears down the
+//! worktree + spokes) and the scheduler applies `WallClockCapReached` → `Failed`
+//! under the graph lock (task 25).
 //!
 //! Every state change goes through [`crate::state_machine::transition`]; the
 //! Supervisor keeps each [`Task::state`] in the shared graph updated as the
@@ -83,18 +95,36 @@
 //! one").  See the [`scheduler`] / [`task_driver`] docs for the full design,
 //! lock discipline, and deadlock-freedom argument.
 //!
+//! ## Termination caps (task 25 — implemented)
+//!
+//! All three caps come from `config.caps` and each independently drives a task
+//! to terminal `Failed`:
+//!
+//! - **Gate cap** (`caps.gate_iterations`): enforced in [`develop_until_gates_pass`]
+//!   (task 22); on exhaustion emits `GateCapReached` (InProgress → Failed).
+//! - **Reviewer cap** (`caps.reviewer_iterations`): enforced in [`task_driver`]'s
+//!   reject branch.  The decision is made BEFORE the FSM transition: if this
+//!   rejection *reaches* the cap (`review_iterations + 1 >= cap`) the driver
+//!   emits `ReviewCapReached` (InReview → Failed) and terminates the task
+//!   instead of looping back to develop.  This uses `ReviewCapReached` from its
+//!   intended state (`InReview`) and replaced the old stand-in constant.
+//! - **Wall-clock cap** (`caps.wall_clock_secs`): enforced by the [`scheduler`],
+//!   which wraps each driver future in `tokio::time::timeout`.  On elapse the
+//!   driver is cancelled (its [`DriverGuard`] cleans up) and the scheduler emits
+//!   `WallClockCapReached` (Ready/InProgress/InReview → Failed) under the graph
+//!   lock.
+//!
+//! Concurrency keeps the iteration caps **per task** (each driver counts its own
+//! task's iterations under the graph lock — see [`task_driver`]); the wall-clock
+//! cap is per task because each driver future has its own timeout.
+//!
 //! ## Deferred seams (do NOT implement here)
 //!
-//! - **Termination caps** (task 25): the **gate** cap is already enforced from
-//!   `config.caps.gate_iterations` (task 22).  The **reviewer** reject→retry
-//!   loop still uses a SIMPLE bounded retry ([`MAX_REVIEWER_ITERATIONS`]) only so
-//!   tests can't infinite-loop; task 25 replaces it with
-//!   `config.caps.reviewer_iterations` and adds the wall-clock cap, unifying all
-//!   caps.  Concurrency keeps each cap **per task** (each driver counts its own
-//!   task's iterations under the graph lock — see [`task_driver`]).
 //! - **Run control** (task 31): pause/cancel is not implemented; the
 //!   [`scheduler`] leaves a documented cancellation seam (drop the `JoinSet` /
 //!   close the semaphore) but does not act on it.
+//! - **Idle / heartbeat detection** (FUTURE): only the three caps above exist;
+//!   there is no per-step idle timeout.
 //!
 //! # Messages
 //!
@@ -108,6 +138,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kameo::actor::ActorRef;
 use kameo::message::Context;
@@ -125,17 +156,6 @@ use crate::worktree::WorktreeManager;
 
 use super::developer::{Develop, Developer, DeveloperArgs};
 use super::reviewer::{Review, ReviewVerdict, Reviewer, ReviewerArgs};
-
-// ── Constants ───────────────────────────────────────────────────────────────────
-
-/// Simple bounded retry limit for the reject→re-develop loop.
-///
-/// This is a **placeholder safety bound**, NOT the real termination cap.  It
-/// exists only so an integration test cannot infinite-loop if a misconfigured
-/// backend always rejects.  Task 25 (`termination-caps`) replaces this with the
-/// configurable `Config::caps.reviewer_iterations` (plus the gate-iteration and
-/// wall-clock caps) and emits the `ReviewCapReached` FSM event on exhaustion.
-pub const MAX_REVIEWER_ITERATIONS: u32 = 8;
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
 
@@ -185,10 +205,11 @@ pub struct Supervisor {
 
     /// The resolved runtime configuration.
     ///
-    /// Supplies `config.gates` (gate command lines), `config.caps.gate_iterations`
-    /// (the gate cap), and `config.concurrency` (the parallel-task limit the
-    /// scheduler enforces).  The whole [`Config`] is injected so task 25 can read
-    /// the reviewer/wall-clock caps from the same place.
+    /// Supplies `config.gates` (gate command lines), all three termination caps
+    /// (`config.caps.{gate_iterations, reviewer_iterations, wall_clock_secs}` —
+    /// task 25), and `config.concurrency` (the parallel-task limit the scheduler
+    /// enforces).  The whole [`Config`] is injected so every cap reads from the
+    /// same place.
     config: Config,
 
     /// Executes the configured gates in a task's worktree.
@@ -221,10 +242,10 @@ pub struct SupervisorArgs {
 
     /// The resolved runtime [`Config`].
     ///
-    /// Supplies the gate command lines (`config.gates`), the gate-iteration cap
-    /// (`config.caps.gate_iterations`), and the concurrency limit
-    /// (`config.concurrency`).  `Config` is `Clone`, satisfying the
-    /// `Args: Clone + Sync` bound for supervised children.
+    /// Supplies the gate command lines (`config.gates`), the three termination
+    /// caps (`config.caps.{gate_iterations, reviewer_iterations, wall_clock_secs}`),
+    /// and the concurrency limit (`config.concurrency`).  `Config` is `Clone`,
+    /// satisfying the `Args: Clone + Sync` bound for supervised children.
     pub config: Config,
 }
 
@@ -562,6 +583,19 @@ impl Supervisor {
 /// set as belt-and-suspenders.  Thus each task is dispatched to **exactly one**
 /// driver (each driver owns its own Developer — "single Developer per task").
 ///
+/// # Wall-clock cap (task 25)
+///
+/// Each driver future is wrapped in
+/// `tokio::time::timeout(Duration::from_secs(config.caps.wall_clock_secs), …)`,
+/// so the cap bounds the **whole** per-task lifecycle (worktree create → develop
+/// → gate → review → merge → teardown).  If the deadline elapses, the timeout
+/// **cancels** the driver future: its [`DriverGuard`] drops, tearing down the
+/// worktree + per-task spokes (no leak), and its owned semaphore permit is
+/// released.  The scheduler — which is the only place that holds graph access at
+/// that point — then applies `WallClockCapReached` to that task under the graph
+/// lock, moving it to terminal `Failed`, records the outcome, and continues.
+/// (`caps.wall_clock_secs >= 1` is guaranteed by `Config::validate`.)
+///
 /// # Fail-fast
 ///
 /// If a driver reports a hard `Err`, the scheduler stops launching *new* work
@@ -582,7 +616,14 @@ impl Supervisor {
 /// [`task_driver`]).  No cancellation is performed today.
 async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, String> {
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut join_set: JoinSet<(TaskId, Result<TaskState, String>)> = JoinSet::new();
+    // Each driver future yields either its terminal `Result<TaskState, String>`
+    // OR `None` if the per-task wall-clock timeout elapsed (the inner driver was
+    // cancelled — its DriverGuard already cleaned up).  The scheduler turns a
+    // timeout into a `WallClockCapReached` → `Failed` transition (task 25).
+    let mut join_set: JoinSet<(TaskId, Option<Result<TaskState, String>>)> = JoinSet::new();
+
+    // Per-task wall-clock deadline (task 25).  Validated `>= 1` by Config.
+    let wall_clock = Duration::from_secs(ctx.config.caps.wall_clock_secs);
 
     // IDs currently dispatched to a driver (defensive against double-dispatch;
     // the FSM advance already removes a task from the ready scan).
@@ -632,11 +673,24 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                         let driver_ctx = ctx.clone();
                         let driver_id = id.clone();
                         // The permit is MOVED into the future; it drops (releasing
-                        // the slot) when the driver completes, on every path.
+                        // the slot) when the driver completes — on every path,
+                        // INCLUDING a wall-clock timeout (the whole future, permit
+                        // included, is dropped when `timeout` elapses).
                         join_set.spawn(async move {
-                            let _permit = permit; // released on completion/panic.
-                            let result = task_driver(&driver_ctx, &driver_id).await;
-                            (driver_id, result)
+                            let _permit = permit; // released on completion/cancel/panic.
+                            // Bound the WHOLE per-task lifecycle by the wall-clock
+                            // cap.  On elapse, `task_driver` is cancelled mid-await:
+                            // its DriverGuard drops → worktree + spokes torn down.
+                            // `None` signals "timed out" to the scheduler.
+                            match tokio::time::timeout(
+                                wall_clock,
+                                task_driver(&driver_ctx, &driver_id),
+                            )
+                            .await
+                            {
+                                Ok(result) => (driver_id, Some(result)),
+                                Err(_elapsed) => (driver_id, None),
+                            }
                         });
                     }
                     _ => {
@@ -657,17 +711,45 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
         // Await the next completed driver.  `join_next` yields the JoinSet's
         // results as they finish (completion order).
         match join_set.join_next().await {
-            Some(Ok((id, Ok(state)))) => {
+            Some(Ok((id, Some(Ok(state))))) => {
                 in_flight.remove(&id);
                 outcomes.push((id, state));
                 // A Done task may have unlocked dependents → loop to fill again.
             }
-            Some(Ok((id, Err(e)))) => {
+            Some(Ok((id, Some(Err(e))))) => {
                 // Hard error in a driver: the driver already moved its task to a
                 // terminal state and tore down its resources where possible.
                 in_flight.remove(&id);
                 fatal_error.get_or_insert(e);
                 stop_launching = true; // stop launching new work; drain the rest.
+            }
+            Some(Ok((id, None))) => {
+                // ── Wall-clock cap reached (task 25) ────────────────────────────
+                //
+                // The driver future was cancelled by the per-task timeout; its
+                // DriverGuard already tore down the worktree + spokes and its
+                // permit was released.  The scheduler holds graph access here, so
+                // it applies `WallClockCapReached` → `Failed` under the lock and
+                // records the outcome.  A timeout fails ONLY this task; it does
+                // NOT stop the scheduler launching independent ready tasks (a
+                // timed-out task is not `Done`, so its dependents never unlock).
+                in_flight.remove(&id);
+                let final_state = {
+                    let mut graph = ctx.graph.lock().await;
+                    match apply_event_locked(&mut graph, &id, TaskEvent::WallClockCapReached) {
+                        Ok(()) => {
+                            mark_finished_locked(&mut graph, &id);
+                            TaskState::Failed
+                        }
+                        Err(_) => {
+                            // The task already reached a terminal state in the
+                            // instant before the timeout fired (a benign race):
+                            // record its actual terminal state instead.
+                            task_state_locked(&graph, &id).unwrap_or(TaskState::Failed)
+                        }
+                    }
+                };
+                outcomes.push((id, final_state));
             }
             Some(Err(join_err)) => {
                 // The driver task panicked (or was aborted).  Record a fatal
@@ -881,11 +963,24 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     } // graph guard dropped before any await.
 
     // ── Step 2: create the worktree, then Ready → InProgress (Dispatched) ──────
-    let worktree = ctx
-        .worktree_manager
-        .create(&task_id.0)
-        .await
-        .map_err(|e| format!("worktree create failed for {task_id}: {e}"))?;
+    //
+    // A worktree-create failure happens while the task is still `Ready` (before
+    // the Developer is ever dispatched).  `Ready --HardError--> Failed` (task 25)
+    // moves it to a terminal state cleanly rather than leaving it stuck `Ready`.
+    let worktree = match ctx.worktree_manager.create(&task_id.0).await {
+        Ok(wt) => wt,
+        Err(e) => {
+            {
+                let mut graph = ctx.graph.lock().await;
+                apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
+                mark_finished_locked(&mut graph, task_id);
+            }
+            // No worktree was created, so there is nothing to remove; mark the
+            // guard so it does not attempt a redundant best-effort teardown.
+            guard.worktree_removed = true;
+            return Err(format!("worktree create failed for {task_id}: {e}"));
+        }
+    };
     {
         let mut graph = ctx.graph.lock().await;
         apply_event_locked(&mut graph, task_id, TaskEvent::Dispatched)?;
@@ -932,14 +1027,18 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
             .send()
             .await;
 
-        // On reviewer ask/parse failure, clean up the worktree before propagating.
-        // We are in InReview; InReview --HardError--> Failed is illegal (only
-        // ReviewCapReached exists), so — as in task 21 — we do NOT force an FSM
-        // transition; we clean up the resource and return the error. Task 25 owns
-        // the InReview→Failed hard-error path.
+        // On reviewer ask/parse failure we are in `InReview`.  Task 25 made
+        // `InReview --HardError--> Failed` legal, so we drive the task to a
+        // terminal `Failed` (instead of leaving it stuck `InReview`), tear down
+        // the worktree, and propagate the error.
         let verdict = match review_result {
             Ok(v) => v,
             Err(e) => {
+                {
+                    let mut graph = ctx.graph.lock().await;
+                    apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
+                    mark_finished_locked(&mut graph, task_id);
+                }
                 remove_worktree(ctx, task_id).await;
                 guard.worktree_removed = true;
                 return Err(format!("reviewer dispatch failed for {task_id}: {e}"));
@@ -976,8 +1075,17 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 let merge_outcome = match merge_outcome {
                     Ok(o) => o,
                     Err(e) => {
-                        // Hard merge failure; develop already best-effort-restored
-                        // by the merger. Clean up + propagate (no illegal FSM move).
+                        // Hard (non-conflict) merge failure; develop already
+                        // best-effort-restored by the merger.  We are in
+                        // `InReview`; task 25 made `InReview --HardError--> Failed`
+                        // legal, so drive the task terminal (HardError is reserved
+                        // for hard failures; ReviewCapReached stays the reviewer
+                        // cap).  Then clean up + propagate.
+                        {
+                            let mut graph = ctx.graph.lock().await;
+                            apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
+                            mark_finished_locked(&mut graph, task_id);
+                        }
                         remove_worktree(ctx, task_id).await;
                         guard.worktree_removed = true;
                         return Err(format!("squash-merge failed for {task_id}: {e}"));
@@ -1002,12 +1110,16 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         // ── Conflict: reconcile, do NOT corrupt `develop` ───────
                         //
                         // `develop` is ALREADY safely restored by the merger (its
-                        // hard invariant). The architecture's agent-driven
+                        // hard invariant).  The architecture's agent-driven
                         // reconciliation is a documented seam (see task 23 notes);
-                        // the MVP drives the task to a SAFE terminal Failed via
-                        // ReviewCapReached (the only legal InReview→Failed event
-                        // today). Task 25 adds a dedicated merge-conflict terminal
-                        // event + bounded retry budget.
+                        // the MVP drives the task to a SAFE terminal Failed.  A
+                        // straggler conflict is a *recoverable* class (not a hard
+                        // tool crash), so it keeps using `ReviewCapReached` (the
+                        // "the loop gave up safely" terminal) rather than
+                        // `HardError`, which task 25 reserves for genuinely hard
+                        // failures (worktree-create, reviewer-dispatch, hard merge).
+                        // A dedicated merge-conflict event + agent-reconcile retry
+                        // budget remains FUTURE work.
                         let _ = details; // surfaced to the seam; logged by a later task.
                         {
                             let mut graph = ctx.graph.lock().await;
@@ -1022,35 +1134,46 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 }
             }
             ReviewVerdict::Reject { feedback: fb } => {
-                // ── Reject: InReview → InProgress (ReviewerRejected) ────────────
-                let iterations = {
-                    let mut graph = ctx.graph.lock().await;
-                    apply_event_locked(&mut graph, task_id, TaskEvent::ReviewerRejected)?;
-                    increment_review_iterations_locked(&mut graph, task_id);
+                // ── Reject: enforce the REVIEWER cap (task 25) ──────────────────
+                //
+                // The decision is made BEFORE the FSM transition, while the task
+                // is still `InReview`.  We count the CURRENT (already-applied)
+                // rejections plus this one: if this rejection *reaches* the cap
+                // (`review_iterations + 1 >= caps.reviewer_iterations`) we do NOT
+                // loop back to develop — we emit `ReviewCapReached`
+                // (InReview → Failed) and terminate the task.  This uses
+                // `ReviewCapReached` from its intended state (`InReview`).
+                //
+                // Each driver counts its OWN task's `review_iterations` under the
+                // graph lock, so the per-task cap is correct under concurrency.
+                let prior_iterations = {
+                    let graph = ctx.graph.lock().await;
                     review_iterations_locked(&graph, task_id)?
                 };
 
-                // ── Seam: termination caps (task 25) ────────────────────────────
-                //
-                // The simple bounded retry exists ONLY so this loop can never spin
-                // forever in a test. Task 25 replaces it with
-                // config.caps.reviewer_iterations (+ gate + wall-clock caps),
-                // emitting ReviewCapReached on exhaustion. Each driver counts its
-                // OWN task's iterations (per-task cap under the graph lock), so the
-                // cap is correct under concurrency.
-                if iterations >= MAX_REVIEWER_ITERATIONS {
-                    // Bounded-retry safety stop. We are in InProgress after the
-                    // reject transition, so HardError → Failed is legal (the real
-                    // event is ReviewCapReached — task 25).
+                if prior_iterations + 1 >= ctx.config.caps.reviewer_iterations {
+                    // This rejection reaches the cap → fail the task.  We count
+                    // this final rejection in `review_iterations` first (so the
+                    // recorded count equals the cap), then transition InReview →
+                    // Failed via ReviewCapReached.
                     {
                         let mut graph = ctx.graph.lock().await;
-                        apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
+                        increment_review_iterations_locked(&mut graph, task_id);
+                        apply_event_locked(&mut graph, task_id, TaskEvent::ReviewCapReached)?;
                         mark_finished_locked(&mut graph, task_id);
                     }
                     remove_worktree(ctx, task_id).await;
                     guard.worktree_removed = true;
                     terminal_state = TaskState::Failed;
                     break;
+                }
+
+                // ── Below the cap: InReview → InProgress (ReviewerRejected) ─────
+                // Count the rejection and loop back for a re-work attempt.
+                {
+                    let mut graph = ctx.graph.lock().await;
+                    apply_event_locked(&mut graph, task_id, TaskEvent::ReviewerRejected)?;
+                    increment_review_iterations_locked(&mut graph, task_id);
                 }
 
                 // Relay the feedback to the Developer on the next iteration.
