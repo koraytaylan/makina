@@ -21,6 +21,24 @@
 //! The temp file is named `.{slug}.json.tmp.<pid>.<seq>`.  Using the process
 //! ID plus a per-call monotonic counter avoids collisions between concurrent
 //! Supervisor processes and between concurrent calls within the same process.
+//!
+//! # Commit policy
+//!
+//! This increment writes `.tasks/{slug}.json` on every FSM transition (and
+//! seeds it when the Supervisor handles `OpenRun`), but does **not**
+//! automatically `git add` or `git commit` the file.  Committing is left to
+//! the user, CI, or a future increment.
+//!
+//! Tradeoff: the live state is always inspectable via `git status` / `git diff`
+//! — the project's "reviewable via diff" property holds for human inspection —
+//! but the per-transition snapshots are **not** auto-committed into history.
+//! Skipping auto-commits avoids producing dozens of noisy micro-commits per
+//! task and eliminates merge-lock contention on a shared branch (e.g.
+//! `develop`) when multiple tasks run in parallel.
+//!
+//! `.tasks/` is intentionally **not** listed in `.gitignore`, so the artifact
+//! is committable whenever the user/CI wants a checkpoint.  `/.worktrees/` is
+//! gitignored because those checkouts are transient runtime state.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -496,6 +514,51 @@ mod tests {
             p,
             PathBuf::from("/some/repo/.tasks/plan-0002.json"),
             "tasks_path must produce repo/.tasks/slug.json"
+        );
+    }
+
+    // ── Test 6: .gitignore commit-policy invariants ───────────────────────────
+
+    /// Assert that the repo's `.gitignore` ignores `/.worktrees/` but does
+    /// **not** ignore `.tasks/` (i.e. `.tasks/` is committable).
+    ///
+    /// This test reads the `.gitignore` at the repo root (two levels above
+    /// `CARGO_MANIFEST_DIR`) and checks the rules by simple string matching.
+    /// It is intentionally kept to string-level checks rather than spawning
+    /// `git check-ignore` so that it works in any environment (including CI
+    /// sandboxes without a full git context).
+    #[test]
+    fn gitignore_worktrees_ignored_tasks_not_ignored() {
+        // CARGO_MANIFEST_DIR = .../crates/makina-core
+        // Repo root           = ../..
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .parent()
+            .expect("crates/")
+            .parent()
+            .expect("repo root");
+
+        let gitignore_path = repo_root.join(".gitignore");
+        let contents = std::fs::read_to_string(&gitignore_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", gitignore_path.display()));
+
+        // /.worktrees/ must appear as a gitignore rule.
+        assert!(
+            contents.lines().any(|l| l.trim() == "/.worktrees/"),
+            "/.worktrees/ must be listed in .gitignore — found:\n{contents}"
+        );
+
+        // No rule that would ignore .tasks/ or .tasks should be present.
+        let tasks_ignored = contents.lines().any(|l| {
+            let l = l.trim();
+            // Reject any non-comment line that would swallow .tasks paths:
+            // e.g. ".tasks", ".tasks/", "/.tasks", "/.tasks/"
+            !l.starts_with('#')
+                && (l == ".tasks" || l == ".tasks/" || l == "/.tasks" || l == "/.tasks/")
+        });
+        assert!(
+            !tasks_ignored,
+            ".tasks must NOT be in .gitignore — found an ignoring rule in:\n{contents}"
         );
     }
 
