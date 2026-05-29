@@ -82,11 +82,19 @@ use crate::actors::{EventSink, RunControl, run_graph};
 use crate::api::{
     Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunStatus, RunView, TaskView,
 };
+use crate::audit::{AuditRegistry, NoopAuditRegistry};
 use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::interpreter::TaskListInterpreter;
 use crate::task::TaskGraph;
 use crate::worktree::WorktreeManager;
+
+// ── Constants ────────────────────────────────────────────────────────────────────
+
+/// Fallback slug used when a task-list path has no file stem (e.g. a bare `/`
+/// or an OS string that cannot be decoded to UTF-8).  Both `open_run` and
+/// `start_run` use this value so it is defined once here.
+const SLUG_FALLBACK: &str = "task-list";
 
 // ── Broadcast capacity ──────────────────────────────────────────────────────────
 
@@ -203,6 +211,12 @@ struct CoreState {
     /// derives an independent receiver; the background scheduler's [`EventSink`]
     /// forwards engine events into this same sender.
     event_tx: broadcast::Sender<Event>,
+
+    /// Audit registry: the Supervisor calls this to associate each task's
+    /// `working_dir` with its run/slug/task context before dispatching a driver.
+    /// The registry is backed by [`crate::audit::JsonlAuditSink`] in production
+    /// and [`crate::audit::NoopAuditRegistry`] in tests.
+    audit_registry: Arc<dyn AuditRegistry>,
 }
 
 impl CoreState {
@@ -312,11 +326,39 @@ impl CoreApi {
     /// backend), a `WorktreeManager` pointed at the repo, and a resolved
     /// `Config`.  Tests pass `NoopBackend` + a temp-repo `WorktreeManager` + a
     /// trivial `Config`.
+    ///
+    /// `audit_registry` is the seam the Supervisor uses to register each task's
+    /// worktree context before dispatching a driver.  Pass
+    /// `Arc::new(NoopAuditRegistry)` (the default, available via
+    /// [`CoreApi::new`]) for tests that do not need the ledger; pass
+    /// `Arc<JsonlAuditSink>` in production (where `main.rs` wires the same
+    /// `Arc` into both `AcpBackend::with_audit_sink` and here).
     pub fn new(
         interpreter: Arc<dyn TaskListInterpreter>,
         backend: Arc<dyn AgentBackend>,
         worktree_manager: WorktreeManager,
         config: Config,
+    ) -> Self {
+        Self::with_audit_registry(
+            interpreter,
+            backend,
+            worktree_manager,
+            config,
+            Arc::new(NoopAuditRegistry),
+        )
+    }
+
+    /// Like [`CoreApi::new`] but with an explicit [`AuditRegistry`].
+    ///
+    /// Use this in production to inject the `JsonlAuditSink` so the Supervisor
+    /// can register each task's worktree context and audit entries are routed to
+    /// `.tasks/{slug}/audit.jsonl`.
+    pub fn with_audit_registry(
+        interpreter: Arc<dyn TaskListInterpreter>,
+        backend: Arc<dyn AgentBackend>,
+        worktree_manager: WorktreeManager,
+        config: Config,
+        audit_registry: Arc<dyn AuditRegistry>,
     ) -> Self {
         let (event_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
@@ -328,6 +370,7 @@ impl CoreApi {
                 runs: Mutex::new(BTreeMap::new()),
                 next_id: AtomicU64::new(1),
                 event_tx,
+                audit_registry,
             }),
         }
     }
@@ -352,7 +395,7 @@ impl CoreApi {
         let slug = task_list_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("task-list")
+            .unwrap_or(SLUG_FALLBACK)
             .to_string();
 
         // 3. Interpret the source into a TaskGraph (no lock held — this awaits).
@@ -418,9 +461,9 @@ impl CoreApi {
     /// spawns a fresh scheduler that continues launching ready tasks (done tasks
     /// are skipped).
     fn start_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
-        // Take everything we need out of the registry under the lock, then drop
+        // Take everything we need out of the registry under ONE lock, then drop
         // the guard before spawning (no lock across the spawn / await boundary).
-        let (graph, cancel, pause) = {
+        let (graph, cancel, pause, run_slug) = {
             let mut runs = self
                 .state
                 .runs
@@ -442,8 +485,17 @@ impl CoreApi {
             });
             entry.status = RunStatus::Running;
 
+            // Derive the slug here — inside the same lock — so we don't need a
+            // second lock acquisition below.
+            let slug = entry
+                .task_list_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(SLUG_FALLBACK)
+                .to_string();
+
             // Return the pieces the background task needs.
-            (Arc::clone(&entry.graph), cancel, pause)
+            (Arc::clone(&entry.graph), cancel, pause, slug)
         }; // registry guard dropped here.
 
         // Build the per-run control (sink → broadcast, pause flag, cancel token).
@@ -459,6 +511,7 @@ impl CoreApi {
         let worktree_manager = self.state.worktree_manager.clone();
         let config = self.state.config.clone();
         let backend = Arc::clone(&self.state.backend);
+        let audit_registry = Arc::clone(&self.state.audit_registry);
         let state = Arc::clone(&self.state);
 
         // Spawn the scheduler.  It emits RunStatusChanged{Running} at the start
@@ -468,7 +521,16 @@ impl CoreApi {
         // later `run()`/`runs()` snapshot reflects Completed/Failed.  The
         // JoinHandle is detached: the run drives itself to terminal + cleans up.
         tokio::spawn(async move {
-            let _ = run_graph(graph, worktree_manager, config, backend, control).await;
+            let _ = run_graph(
+                graph,
+                worktree_manager,
+                config,
+                backend,
+                control,
+                audit_registry,
+                run_slug,
+            )
+            .await;
             state.finalize_run_status(run).await;
         });
 

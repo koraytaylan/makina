@@ -36,6 +36,7 @@ mod ui;
 use std::sync::Arc;
 
 use makina_acp::AcpBackend;
+use makina_core::audit::JsonlAuditSink;
 use makina_core::backend::AgentBackend;
 use makina_core::config::Config;
 use makina_core::dependency::EdgeInferrer;
@@ -64,11 +65,24 @@ async fn main() {
     //    seam swaps this for any other `AgentBackend`; tests inject NoopBackend);
     //  - a WORKTREE MANAGER rooted at the repo (CWD) on `config.base_branch`;
     //  - the resolved CONFIG (gates, caps, concurrency).
-    let backend: Arc<dyn AgentBackend> = Arc::new(AcpBackend::new(
-        config.backend.command.clone(),
-        config.backend.args.clone(),
-    ));
     let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    // ── Audit sink (task supervisor-audit-writer) ─────────────────────────────
+    // The `JsonlAuditSink` is the Supervisor-owned ledger writer.  A single
+    // `Arc` is shared as both:
+    //  - the `AuditSink` injected into the ACP backend (transport fires it on
+    //    every permission decision), and
+    //  - the `AuditRegistry` passed into the orchestrator so the Supervisor can
+    //    register each task's worktree context before dispatching a driver.
+    // This guarantees the sink is the ONLY writer under `.tasks/{slug}/audit.jsonl`.
+    let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.clone()));
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(
+            AcpBackend::new(config.backend.command.clone(), config.backend.args.clone())
+                .with_audit_sink(
+                    Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>
+                ),
+        );
     let worktree_manager = WorktreeManager::new(repo_root, config.base_branch.clone());
 
     // ── Api ───────────────────────────────────────────────────────────────────
@@ -83,8 +97,13 @@ async fn main() {
     let interpreter = Arc::new(EdgeInferrer::new(
         Arc::new(StructuredTextInterpreter::new()),
     ));
-    let api: Arc<dyn makina_core::api::Api> =
-        Arc::new(CoreApi::new(interpreter, backend, worktree_manager, config));
+    let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
+        interpreter,
+        backend,
+        worktree_manager,
+        config,
+        audit_sink as Arc<dyn makina_core::audit::AuditRegistry>,
+    ));
 
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;

@@ -148,6 +148,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::api;
+use crate::audit::{AuditRegistry, NoopAuditRegistry};
 use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::gate::{GateOutcome, GateRunner};
@@ -428,6 +429,23 @@ struct DriverContext {
     /// Developer/Reviewer `AgentExchange`).  The `RunReadyTasks` ask path passes
     /// [`RunControl::silent`] so behavior is unchanged there.
     control: RunControl,
+
+    /// The audit registry: the Supervisor calls this to associate each task's
+    /// worktree `working_dir` with its `(run_id, slug, task_id)` context,
+    /// enabling the [`crate::audit::JsonlAuditSink`] to route audit entries to
+    /// the correct `.tasks/{slug}/audit.jsonl` file.
+    ///
+    /// The `RunReadyTasks` ask path passes [`crate::audit::NoopAuditRegistry`]
+    /// so the ask-path behavior is unchanged.
+    audit_registry: Arc<dyn AuditRegistry>,
+
+    /// The task-graph slug (file stem of the task-list file), used as the
+    /// sub-directory name under `.tasks/` when routing audit entries.
+    ///
+    /// Derived by the orchestrator from the task-list path when the run is
+    /// started; the `RunReadyTasks` ask path uses an empty string (no-op with
+    /// `NoopAuditRegistry`).
+    run_slug: String,
 }
 
 impl DriverContext {
@@ -619,8 +637,14 @@ impl Supervisor {
 
         // Build the shared driver context.  Missing wiring is a hard error — the
         // scheduler cannot spawn per-task spokes without it.  The `RunReadyTasks`
-        // ask path is uncontrolled: no events, never paused/cancelled.
-        let ctx = match self.driver_context(Arc::clone(&shared_graph), RunControl::silent()) {
+        // ask path is uncontrolled: no events, never paused/cancelled, no audit
+        // registry (noop).
+        let ctx = match self.driver_context(
+            Arc::clone(&shared_graph),
+            RunControl::silent(),
+            Arc::new(NoopAuditRegistry),
+            String::new(),
+        ) {
             Ok(ctx) => ctx,
             Err(e) => {
                 // Restore the graph before bailing so self stays consistent.
@@ -643,10 +667,14 @@ impl Supervisor {
     /// were not injected via [`SetSpokes`], or if the worktree manager is absent.
     /// `control` carries the per-run event sink + pause/cancel signals (task 31);
     /// pass [`RunControl::silent`] for the uncontrolled ask path.
+    /// `audit_registry` and `run_slug` are for the audit ledger; pass
+    /// `Arc::new(NoopAuditRegistry)` / `String::new()` for the ask path.
     fn driver_context(
         &self,
         graph: Arc<Mutex<TaskGraph>>,
         control: RunControl,
+        audit_registry: Arc<dyn AuditRegistry>,
+        run_slug: String,
     ) -> Result<DriverContext, String> {
         let worktree_manager = self
             .worktree_manager
@@ -676,6 +704,8 @@ impl Supervisor {
             supervisor,
             backend,
             control,
+            audit_registry,
+            run_slug,
         })
     }
 
@@ -723,6 +753,8 @@ pub async fn run_graph(
     config: Config,
     backend: Arc<dyn AgentBackend>,
     control: RunControl,
+    audit_registry: Arc<dyn AuditRegistry>,
+    run_slug: String,
 ) -> Result<RunReport, String> {
     // Announce the run is now executing.
     control.emit(api::Event::RunStatusChanged {
@@ -769,6 +801,8 @@ pub async fn run_graph(
         supervisor: supervisor_ref.clone(),
         backend,
         control: control.clone(),
+        audit_registry,
+        run_slug,
     };
 
     let result = scheduler(ctx, config.concurrency).await;
@@ -1312,6 +1346,20 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
             return Err(format!("worktree create failed for {task_id}: {e}"));
         }
     };
+
+    // ── Register the worktree context with the audit registry (task supervisor-audit-writer) ──
+    //
+    // The transport emits `AuditEntry` records with placeholder `run_id` /
+    // `task_id` and the real `working_dir`.  The `JsonlAuditSink` (if wired)
+    // uses this registration to enrich and route those entries.  The registry
+    // is `NoopAuditRegistry` on the ask path, so this is a no-op there.
+    ctx.audit_registry.register(
+        worktree.path.clone(),
+        ctx.control.run.to_string(),
+        ctx.run_slug.clone(),
+        task_id.0.clone(),
+    );
+
     {
         let mut graph = ctx.graph.lock().await;
         apply_event_locked(&mut graph, task_id, TaskEvent::Dispatched)?;
