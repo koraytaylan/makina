@@ -11,6 +11,7 @@ pub mod backend;
 pub mod config;
 pub mod dependency;
 pub mod interpreter;
+pub mod roles;
 pub mod state_machine;
 pub mod supervision;
 pub mod task;

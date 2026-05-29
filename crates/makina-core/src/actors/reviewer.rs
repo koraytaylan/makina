@@ -39,26 +39,13 @@ use crate::task::Task;
 
 use super::supervisor::Supervisor;
 
-// ── ReviewVerdict ─────────────────────────────────────────────────────────────
+// ── ReviewVerdict re-export ───────────────────────────────────────────────────
 
-/// The Reviewer's verdict on a Developer's output.
+/// Re-exported from [`crate::roles`] where the type now lives.
 ///
-/// Returned by the [`Review`] message.  The Supervisor uses this verdict to
-/// drive the FSM (task 21 will call [`crate::state_machine::transition`] with
-/// `ReviewerApproved` or `ReviewerRejected`).
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReviewVerdict {
-    /// The output meets the acceptance criteria; the task should advance to Done.
-    Approve,
-
-    /// The output does not meet the acceptance criteria; the Developer should
-    /// iterate.  The `feedback` string will be passed to the Developer in the
-    /// next iteration (task 21).
-    Reject {
-        /// Human-readable explanation of what must change.
-        feedback: String,
-    },
-}
+/// Kept here so that existing callers (`actors::reviewer::ReviewVerdict`) continue
+/// to compile without change.
+pub use crate::roles::ReviewVerdict;
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
 
