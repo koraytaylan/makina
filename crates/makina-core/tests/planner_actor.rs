@@ -20,6 +20,7 @@ use makina_core::{
     actors::{
         InterpretTaskList, Planner, PlannerArgs, Supervisor, SupervisorArgs, TaskGraphSnapshot,
     },
+    config::{Config, GlobalConfig, ProjectConfig},
     interpreter::StructuredTextInterpreter,
     supervision::{RestartConfig, RootSupervisor},
     worktree::WorktreeManager,
@@ -95,6 +96,9 @@ async fn planner_interprets_file_and_hands_graph_to_supervisor() {
                 std::path::PathBuf::from("/tmp/makina-planner-test"),
                 "develop".into(),
             ),
+            // This test only exercises SetTaskGraph/TaskGraphSnapshot (no gate
+            // loop), so a default no-gates config is sufficient.
+            config: Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
         },
         RestartConfig::default(),
     )
@@ -220,6 +224,9 @@ async fn planner_returns_error_for_missing_file() {
                 std::path::PathBuf::from("/tmp/makina-planner-test"),
                 "develop".into(),
             ),
+            // This test only exercises SetTaskGraph/TaskGraphSnapshot (no gate
+            // loop), so a default no-gates config is sufficient.
+            config: Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
         },
         RestartConfig::default(),
     )

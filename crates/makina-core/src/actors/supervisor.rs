@@ -22,33 +22,56 @@
 //!   create worktree (WorktreeManager::create)
 //!   --Dispatched--> InProgress
 //!   loop:
-//!     ask Developer.Develop{task, worktree, feedback}   (feedback=None first time)
-//!     --GatesPassed--> InReview        [seam: task 22 inserts the gate loop here]
+//!     develop_until_gates_pass(task, worktree, feedback):     (task 22)
+//!       loop:
+//!         ask Developer.Develop{task, worktree, feedback}     (feedback=None first time)
+//!         run gates in worktree
+//!           Passed       --GatesPassed--> InReview ; break
+//!           Failed{..}   --GateFailed--> InProgress (self-loop) ; gate_iterations += 1
+//!                        if gate_iterations >= caps.gate_iterations:
+//!                          --GateCapReached--> Failed ; teardown ; task fails
+//!                        else: feedback = gate output ; re-dispatch
 //!     ask Reviewer.Review{task, worktree}
 //!       Approve  --ReviewerApproved--> Done             [seam: task 23 squash-merges BEFORE teardown]
 //!                 WorktreeManager::remove ; next ready task
 //!       Reject{feedback} --ReviewerRejected--> InProgress
-//!                 review_iterations += 1 ; relay feedback ; re-dispatch (bounded retry)
+//!                 review_iterations += 1 ; relay feedback ; re-develop+gate (bounded retry)
 //! ```
 //!
 //! Every state change goes through [`crate::state_machine::transition`]; the
 //! Supervisor keeps each [`Task::state`] in the held graph updated as the source
 //! of truth.
 //!
+//! ## Gates (task 22 — implemented)
+//!
+//! Between the Developer hand-back and review, the work iterates against the
+//! configured gates ([`crate::config::Config::gates`]) via
+//! [`Supervisor::develop_until_gates_pass`].  On a gate failure the FSM
+//! self-loops (`InProgress --GateFailed--> InProgress`), the failing gate's
+//! output is fed back to the Developer, and ALL gates re-run; the work only
+//! advances to the Reviewer (`GatesPassed`) once every gate exits `0`.  A
+//! per-task gate-iteration cap (`config.caps.gate_iterations`) moves the task to
+//! `Failed` (`GateCapReached`) on exhaustion.
+//!
+//! **Placement choice**: the architecture frames gates as "Developer-side"; the
+//! MVP implements them **Supervisor-coordinated** (the Supervisor runs the gates
+//! and re-dispatches the Developer with the failure output).  The agent still
+//! does the fixing; the gate EXECUTION is the reusable [`crate::gate::GateRunner`].
+//! This keeps FSM ownership in the Supervisor (consistent with task 21).
+//!
 //! ## Deferred seams (do NOT implement here)
 //!
-//! - **Gates** (task 22): the Developer hand-back transitions directly
-//!   `InProgress → InReview` via `GatesPassed`; no gate commands run.  Task 22
-//!   inserts the gate-iteration loop at the marked seam.
 //! - **Squash-merge** (task 23): on approve the Supervisor does NOT merge — it
 //!   only transitions to `Done` and tears down the worktree.  Task 23 inserts the
 //!   squash-merge at the marked seam, BEFORE the teardown.
 //! - **Concurrency** (task 24): tasks run strictly sequentially (one at a time).
 //!   No parallel scheduler is built here.
-//! - **Termination caps** (task 25): the reject→retry loop uses a SIMPLE bounded
-//!   retry ([`MAX_REVIEWER_ITERATIONS`]) only so tests can't infinite-loop.  The
-//!   REAL configurable caps (gate/reviewer iteration + wall-clock) come from
-//!   [`crate::config::Config`] in task 25 at the marked seam.
+//! - **Termination caps** (task 25): the **gate** cap is already enforced from
+//!   `config.caps.gate_iterations` (task 22, above).  The **reviewer** reject→retry
+//!   loop still uses a SIMPLE bounded retry ([`MAX_REVIEWER_ITERATIONS`]) only so
+//!   tests can't infinite-loop; task 25 replaces it with
+//!   `config.caps.reviewer_iterations` and adds the wall-clock cap, unifying all
+//!   caps.  Task 22 deliberately does NOT touch the reviewer/wall-clock caps.
 //!
 //! # Messages
 //!
@@ -59,8 +82,12 @@
 //!   sequentially; reply [`RunReport`].
 //! - [`TaskGraphSnapshot`] — returns the current graph for introspection/testing.
 
+use std::path::Path;
+
 use kameo::{actor::ActorRef, message::Context};
 
+use crate::config::Config;
+use crate::gate::{GateOutcome, GateRunner};
 use crate::state_machine::{TaskEvent, transition};
 use crate::task::{Task, TaskGraph, TaskId, TaskState};
 use crate::worktree::WorktreeManager;
@@ -104,6 +131,20 @@ pub struct Supervisor {
 
     /// Reviewer spoke ref, injected post-spawn via [`SetSpokes`].
     reviewer: Option<ActorRef<Reviewer>>,
+
+    /// The resolved runtime configuration.
+    ///
+    /// Task 22 (`gate-runner`) reads `config.gates` (the gate command lines) and
+    /// `config.caps.gate_iterations` (the GATE cap).  The whole [`Config`] is
+    /// injected (not just those fields) so task 25 (`termination-caps`) can read
+    /// the reviewer/wall-clock caps from the same place without re-plumbing.
+    config: Config,
+
+    /// Executes the configured gates in a task's worktree.
+    ///
+    /// Stateless and reused across all tasks/iterations.  See [`GateRunner`] and
+    /// the Supervisor-coordinated placement note on [`Supervisor::develop_until_gates_pass`].
+    gate_runner: GateRunner,
 }
 
 /// Construction arguments for [`Supervisor`].
@@ -117,6 +158,15 @@ pub struct Supervisor {
 pub struct SupervisorArgs {
     /// The worktree manager the Supervisor uses to create/tear down worktrees.
     pub worktree_manager: WorktreeManager,
+
+    /// The resolved runtime [`Config`].
+    ///
+    /// Supplies the gate command lines (`config.gates`) and the gate-iteration
+    /// cap (`config.caps.gate_iterations`) the Supervisor's gate loop uses in
+    /// task 22.  `Config` is `Clone`, satisfying the `Args: Clone + Sync` bound
+    /// for supervised children.  The full config is passed (rather than just the
+    /// gate fields) so task 25 can read the other caps without re-plumbing.
+    pub config: Config,
 }
 
 impl kameo::actor::Actor for Supervisor {
@@ -129,6 +179,8 @@ impl kameo::actor::Actor for Supervisor {
             worktree_manager: Some(args.worktree_manager),
             developer: None,
             reviewer: None,
+            config: args.config,
+            gate_runner: GateRunner::new(),
         })
     }
 }
@@ -144,6 +196,23 @@ pub struct RunReport {
     /// `(task_id, final_state)` for every task driven to a terminal state during
     /// this run.
     pub outcomes: Vec<(TaskId, TaskState)>,
+}
+
+// ── DevelopGateOutcome ──────────────────────────────────────────────────────────
+
+/// Result of one [`Supervisor::develop_until_gates_pass`] round.
+///
+/// Either the work passed every gate and is ready for the Reviewer, or the
+/// gate-iteration cap fired and the task was already moved to `Failed` (with its
+/// worktree torn down).  A hard error is reported separately via `Err` on the
+/// helper, not as a variant here.
+enum DevelopGateOutcome {
+    /// All gates passed; the task is now `InReview` and ready for the Reviewer.
+    ReadyForReview,
+
+    /// The gate-iteration cap was reached; the helper has already emitted
+    /// `GateCapReached` (→ `Failed`) and torn down the worktree.
+    GateCapReached,
 }
 
 // ── SetTaskGraph ────────────────────────────────────────────────────────────────
@@ -328,47 +397,40 @@ impl Supervisor {
         // Record when the Developer first picked up the task.
         self.mark_started(task_id);
 
-        // ── Step 3–6: the develop → review loop (bounded retry) ────────────────
+        // ── Step 3–6: the develop → gate → review loop (bounded retry) ─────────
         let mut feedback: Option<String> = None;
         let terminal_state;
 
         loop {
-            // Snapshot the task to hand a stable copy to the spoke.
-            let task = self.task_clone(task_id)?;
-
-            // ── Developer turn ─────────────────────────────────────────────────
-            let developer = self
-                .developer
-                .clone()
-                .ok_or("supervisor has no Developer ref (call SetSpokes first)")?;
-
-            let develop_result = developer
-                .ask(Develop {
-                    task: task.clone(),
-                    worktree: worktree.path.clone(),
-                    feedback: feedback.take(),
-                })
-                .send()
-                .await;
-
-            if let Err(e) = develop_result {
-                // Hard error during development → InProgress → Failed (HardError).
-                self.apply_event(task_id, TaskEvent::HardError)?;
-                self.mark_finished(task_id);
-                // Tear down the worktree even on failure (best-effort).
-                self.remove_worktree(task_id).await;
-                return Err(format!("developer dispatch failed for {task_id}: {e}"));
-            }
-
-            // ── Seam: gate-iteration loop (task 22) ────────────────────────────
+            // ── Develop + gate loop (task 22) ──────────────────────────────────
             //
-            // In the real flow the Developer's changes are run against the
-            // configured gates here; on failure the FSM self-loops
-            // (InProgress --GateFailed--> InProgress) and the Developer iterates,
-            // up to `Config::caps.gate_iterations` (task 25).  Gates are FORBIDDEN
-            // in this task (task 22 owns shell-command execution), so we transition
-            // straight to review as if all gates passed.
-            self.apply_event(task_id, TaskEvent::GatesPassed)?;
+            // The Developer makes/fixes changes, then the configured gates run in
+            // the worktree.  On a gate failure the FSM self-loops
+            // (InProgress --GateFailed--> InProgress) and the failure output is
+            // fed back to the Developer to fix; ALL gates then re-run.  This
+            // repeats until gates pass (→ InReview) or the gate-iteration cap
+            // fires (→ Failed, worktree torn down).  See
+            // [`Supervisor::develop_until_gates_pass`].
+            match self
+                .develop_until_gates_pass(task_id, &worktree.path, feedback.take())
+                .await
+            {
+                Ok(DevelopGateOutcome::ReadyForReview) => {
+                    // Gates passed; the task is now InReview.  Fall through to
+                    // the Reviewer turn below.
+                }
+                Ok(DevelopGateOutcome::GateCapReached) => {
+                    // The gate cap fired: the helper already moved the task to
+                    // Failed and tore down the worktree.
+                    terminal_state = TaskState::Failed;
+                    break;
+                }
+                Err(e) => {
+                    // Hard error during development (the helper already moved the
+                    // task to Failed and tore down the worktree).
+                    return Err(e);
+                }
+            }
 
             // ── Reviewer turn ──────────────────────────────────────────────────
             let reviewer = self
@@ -461,6 +523,126 @@ impl Supervisor {
         Ok(terminal_state)
     }
 
+    /// Run the **develop + gate loop** for one review round (task 22).
+    ///
+    /// Drives: dispatch the Developer (with `initial_feedback`, which is the
+    /// Reviewer's feedback on a re-develop or `None` on the first attempt), then
+    /// run the configured gates in the worktree.  On a gate failure the FSM
+    /// self-loops (InProgress --GateFailed--> InProgress), `gate_iterations` is
+    /// bumped, and the gate's output is fed back to the Developer; **all** gates
+    /// then re-run from the top on the next turn (this is how the architecture's
+    /// "re-run ALL gates after each fix" is realised — [`GateRunner::run_gates`]
+    /// does one pass, and this loop re-invokes it).  Repeats until:
+    ///
+    /// - **gates pass** → emit `GatesPassed` (InProgress → InReview) and return
+    ///   [`DevelopGateOutcome::ReadyForReview`]; or
+    /// - **the gate cap is hit** (`gate_iterations >= config.caps.gate_iterations`)
+    ///   → emit `GateCapReached` (InProgress → Failed), tear down the worktree,
+    ///   and return [`DevelopGateOutcome::GateCapReached`].
+    ///
+    /// # Placement note (architecture)
+    ///
+    /// The architecture frames gates as "Developer-side".  For the MVP they are
+    /// **Supervisor-coordinated**: the Supervisor runs the gates and re-dispatches
+    /// the Developer with the failure output to fix.  The agent still does the
+    /// fixing; the gate EXECUTION is the reusable [`GateRunner`].  This keeps FSM
+    /// ownership in the Supervisor (consistent with task 21) — a faithful
+    /// realization of the requirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` on a hard error (Developer dispatch failure, or a
+    /// gate command that could not be **launched** at all — distinct from a gate
+    /// *failing*).  In the error case the task has already been moved to Failed
+    /// (HardError) and the worktree torn down, so the caller just propagates.
+    async fn develop_until_gates_pass(
+        &mut self,
+        task_id: &TaskId,
+        worktree_path: &Path,
+        initial_feedback: Option<String>,
+    ) -> Result<DevelopGateOutcome, String> {
+        let mut feedback = initial_feedback;
+
+        loop {
+            // ── Developer turn: make (or fix) the changes ──────────────────────
+            let task = self.task_clone(task_id)?;
+            let developer = self
+                .developer
+                .clone()
+                .ok_or("supervisor has no Developer ref (call SetSpokes first)")?;
+
+            let develop_result = developer
+                .ask(Develop {
+                    task,
+                    worktree: worktree_path.to_path_buf(),
+                    feedback: feedback.take(),
+                })
+                .send()
+                .await;
+
+            if let Err(e) = develop_result {
+                // Hard error during development → InProgress → Failed (HardError).
+                self.apply_event(task_id, TaskEvent::HardError)?;
+                self.mark_finished(task_id);
+                self.remove_worktree(task_id).await;
+                return Err(format!("developer dispatch failed for {task_id}: {e}"));
+            }
+
+            // ── Gate turn: run ALL configured gates in the worktree ────────────
+            let outcome = self
+                .gate_runner
+                .run_gates(&self.config.gates, worktree_path)
+                .await;
+
+            match outcome {
+                Ok(GateOutcome::Passed) => {
+                    // All gates passed → advance to review.
+                    self.apply_event(task_id, TaskEvent::GatesPassed)?;
+                    return Ok(DevelopGateOutcome::ReadyForReview);
+                }
+                Ok(GateOutcome::Failed {
+                    gate,
+                    output,
+                    exit_code,
+                }) => {
+                    // A gate failed → self-loop and count the iteration.
+                    self.apply_event(task_id, TaskEvent::GateFailed)?;
+                    self.increment_gate_iterations(task_id);
+
+                    // ── GATE cap (task 22 owns this one) ───────────────────────
+                    //
+                    // NOTE: this is the GATE cap only.  The reviewer/wall-clock
+                    // caps are task 25's concern and are left untouched.
+                    let iterations = self.gate_iterations(task_id)?;
+                    if iterations >= self.config.caps.gate_iterations {
+                        // GateCapReached: InProgress → Failed (terminal).
+                        self.apply_event(task_id, TaskEvent::GateCapReached)?;
+                        self.mark_finished(task_id);
+                        self.remove_worktree(task_id).await;
+                        return Ok(DevelopGateOutcome::GateCapReached);
+                    }
+
+                    // Feed the failing gate's output back to the Developer so the
+                    // next turn fixes it; then ALL gates re-run from the top.
+                    feedback = Some(format!(
+                        "Gate `{gate}` failed (exit code {exit_code}):\n{output}\n\
+                         Fix the issue so the gate passes."
+                    ));
+                    // Loop back to a fresh Developer turn.
+                }
+                Err(e) => {
+                    // The gate command could not be LAUNCHED (infrastructure
+                    // failure, not a gate result).  Treat as a hard error: we are
+                    // in InProgress, so HardError → Failed is legal.
+                    self.apply_event(task_id, TaskEvent::HardError)?;
+                    self.mark_finished(task_id);
+                    self.remove_worktree(task_id).await;
+                    return Err(format!("gate launch failed for {task_id}: {e}"));
+                }
+            }
+        }
+    }
+
     // ── Graph mutation helpers ──────────────────────────────────────────────────
 
     /// Apply an FSM `event` to the task, updating its state in the held graph.
@@ -519,6 +701,26 @@ impl Supervisor {
     fn increment_review_iterations(&mut self, task_id: &TaskId) {
         if let Ok(task) = self.task_mut(task_id) {
             task.review_iterations += 1;
+            task.updated_at = chrono::Utc::now();
+        }
+    }
+
+    /// Read a task's gate-iteration count.
+    fn gate_iterations(&self, task_id: &TaskId) -> Result<u32, String> {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.get(task_id))
+            .map(|t| t.gate_iterations)
+            .ok_or_else(|| format!("task {task_id} not found in graph"))
+    }
+
+    /// Increment a task's gate-iteration counter (FSM-external bookkeeping, per
+    /// the state-machine module's documented division of responsibility — the
+    /// FSM emits `GateFailed`, the Supervisor counts the iterations and enforces
+    /// the cap).
+    fn increment_gate_iterations(&mut self, task_id: &TaskId) {
+        if let Ok(task) = self.task_mut(task_id) {
+            task.gate_iterations += 1;
             task.updated_at = chrono::Utc::now();
         }
     }

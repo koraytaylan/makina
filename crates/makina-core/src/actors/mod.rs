@@ -80,6 +80,7 @@ mod tests {
             SupervisorArgs, TaskGraphSnapshot,
         },
         backend::{AgentBackend, noop::NoopBackend},
+        config::{Config, GlobalConfig, ProjectConfig},
         interpreter::StructuredTextInterpreter,
         supervision::{RestartConfig, RootSupervisor},
         task::{Task, TaskGraph, TaskId, TaskState},
@@ -87,6 +88,11 @@ mod tests {
     };
 
     // ── Helper ────────────────────────────────────────────────────────────────
+
+    /// Build a resolved [`Config`] with no gates (gate loop is a no-op).
+    fn test_config_no_gates() -> Config {
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default())
+    }
 
     /// Build a minimal [`TaskGraph`] with one task for use in assertions.
     fn minimal_graph() -> TaskGraph {
@@ -153,6 +159,9 @@ mod tests {
                     PathBuf::from("/tmp/makina-actor-smoke"),
                     "develop".into(),
                 ),
+                // No gates: this smoke test never runs the gate loop (it only
+                // exercises message acceptance, not RunReadyTasks).
+                config: test_config_no_gates(),
             },
             RestartConfig::default(),
         )

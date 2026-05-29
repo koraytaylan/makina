@@ -35,6 +35,7 @@ use makina_core::actors::{
 };
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
+use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::worktree::WorktreeManager;
@@ -138,6 +139,9 @@ async fn build_actor_tree(
         &root,
         SupervisorArgs {
             worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
+            // These task-21 tests configure NO gates, so the gate loop (task 22)
+            // is a no-op and the work advances straight to review.
+            config: Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
         },
         RestartConfig::default(),
     )

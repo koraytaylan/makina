@@ -1,0 +1,481 @@
+//! Integration tests for the **Developer-side gate-iteration loop** (task 22).
+//!
+//! # Acceptance criteria ("done when")
+//!
+//! 1. **Passing gates advance to review → done** — a gate that always exits `0`
+//!    lets the task reach `Done` (gates pass → review → approve).
+//! 2. **Gate failure loops, then passes** — a gate that fails the first time then
+//!    passes (a deterministic counter-file gate) still reaches `Done`, with
+//!    `gate_iterations` incremented and the gate-failure output relayed to the
+//!    Developer on the retry (verified via `recorded_prompts()`).
+//! 3. **Cap moves the task to failed** — an always-failing gate with a small
+//!    `caps.gate_iterations` drives the task to `Failed` (GateCapReached) and the
+//!    worktree is torn down (no leak).
+//!
+//! # Test-strategy compliance (see `docs/spec/testing-strategy.md`)
+//!
+//! - Backend is always `NoopBackend` — no real agent CLI, no model call.
+//! - The "gates" here are trivial deterministic shell builtins run in the temp
+//!   worktree (`true`, `false`, a counter-increment) — NOT the env-dependent,
+//!   slow toolchain commands (`cargo test`, `clippy`) the strategy forbids.  The
+//!   task's done-when criteria explicitly require real `sh -c` gates run in the
+//!   worktree; these builtins are fast, side-effect-confined, and deterministic.
+//! - Determinism via `ask`/await — no arbitrary sleeps.
+//! - Each test uses a fresh temporary git repo (`tempfile`); the real repo is
+//!   never touched.  The temp-repo setup mirrors `tests/develop_review_loop.rs`.
+
+use std::process::Command;
+use std::sync::Arc;
+
+use chrono::Utc;
+
+use makina_core::actors::{
+    Developer, DeveloperArgs, Reviewer, ReviewerArgs, RunReadyTasks, SetSpokes, SetTaskGraph,
+    Supervisor, SupervisorArgs, TaskGraphSnapshot,
+};
+use makina_core::backend::AgentBackend;
+use makina_core::backend::noop::NoopBackend;
+use makina_core::config::{BackendConfig, CapsConfig, Config, GateConfig, PlannerConfig};
+use makina_core::supervision::{RestartConfig, RootSupervisor};
+use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
+use makina_core::worktree::WorktreeManager;
+
+// ── Temp-repo helper (mirrors tests/develop_review_loop.rs) ──────────────────────
+
+/// Create a minimal git repository in a new temporary directory, on a `develop`
+/// branch with one initial commit (so `git worktree add -b … develop` works).
+fn setup_temp_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let path = dir.path();
+
+    run_git(path, &["init"]);
+    run_git(path, &["config", "user.email", "test@example.com"]);
+    run_git(path, &["config", "user.name", "Test User"]);
+    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
+
+    // Ensure the branch is named `develop` regardless of init.defaultBranch.
+    let current_branch = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &path.to_string_lossy()])
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("git rev-parse HEAD")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    if current_branch != "develop" {
+        run_git(path, &["branch", "-m", &current_branch, "develop"]);
+    }
+
+    dir
+}
+
+/// Run a `git -C {path}` command, asserting it exits 0.
+fn run_git(path: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
+    assert!(
+        status.success(),
+        "git {args:?} in {path:?} exited with {:?}",
+        status.code()
+    );
+}
+
+// ── Config builder ───────────────────────────────────────────────────────────────
+
+/// Build a resolved [`Config`] with the given `gates` and `gate_iterations` cap.
+///
+/// The backend command is a non-empty placeholder (the tests use `NoopBackend`,
+/// so it is never actually spawned) and `base_branch` is `develop` to match the
+/// temp repo.
+fn config_with_gates(gates: Vec<GateConfig>, gate_iterations: u32) -> Config {
+    Config {
+        backend: BackendConfig {
+            command: "noop".into(),
+            args: vec![],
+        },
+        planner: PlannerConfig::default(),
+        caps: CapsConfig {
+            gate_iterations,
+            reviewer_iterations: 5,
+            wall_clock_secs: 1800,
+        },
+        concurrency: 1,
+        gates,
+        base_branch: "develop".into(),
+    }
+}
+
+/// Convenience: a single gate `{name, command}`.
+fn gate(name: &str, command: &str) -> GateConfig {
+    GateConfig {
+        name: name.to_string(),
+        command: command.to_string(),
+    }
+}
+
+// ── Task builder ───────────────────────────────────────────────────────────────
+
+/// Build a `New` task with the given `id`.
+fn task(id: &str) -> Task {
+    let now = Utc::now();
+    Task {
+        id: TaskId::new(id),
+        title: format!("Task {id}"),
+        description: format!("Implement {id}."),
+        done_when: format!("{id} is done"),
+        depends_on: vec![],
+        section: None,
+        state: TaskState::New,
+        gate_iterations: 0,
+        review_iterations: 0,
+        created_at: now,
+        updated_at: now,
+        started_at: None,
+        finished_at: None,
+    }
+}
+
+// ── Actor-tree builder ───────────────────────────────────────────────────────────
+
+/// Spawn the full actor tree over `repo_root` with the given `backend` and
+/// `config`, wire the spokes into the hub via `SetSpokes`, and return
+/// `(root, supervisor_ref)`.
+async fn build_actor_tree(
+    repo_root: std::path::PathBuf,
+    backend: Arc<dyn AgentBackend>,
+    config: Config,
+) -> (
+    kameo::actor::ActorRef<RootSupervisor>,
+    kameo::actor::ActorRef<Supervisor>,
+) {
+    let root = RootSupervisor::start();
+
+    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
+        &root,
+        SupervisorArgs {
+            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
+            config,
+        },
+        RestartConfig::default(),
+    )
+    .await;
+
+    let developer_ref = RootSupervisor::spawn_child::<Developer>(
+        &root,
+        DeveloperArgs {
+            supervisor: supervisor_ref.clone(),
+            backend: Arc::clone(&backend),
+        },
+        RestartConfig::default(),
+    )
+    .await;
+
+    let reviewer_ref = RootSupervisor::spawn_child::<Reviewer>(
+        &root,
+        ReviewerArgs {
+            supervisor: supervisor_ref.clone(),
+            backend: Arc::clone(&backend),
+        },
+        RestartConfig::default(),
+    )
+    .await;
+
+    supervisor_ref
+        .ask(SetSpokes {
+            developer: developer_ref,
+            reviewer: reviewer_ref,
+        })
+        .send()
+        .await
+        .expect("SetSpokes must be accepted");
+
+    (root, supervisor_ref)
+}
+
+// ── Test 1: passing gates advance to review → done ───────────────────────────────
+
+/// **Done-when (1)** — a gate that always exits `0` lets the task pass gates,
+/// advance to review, get approved, and reach `Done`.
+#[tokio::test]
+async fn passing_gates_advance_to_review_and_done() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // 1st prompt (developer) → dev output; 2nd (reviewer) → approve.
+    let backend = NoopBackend::with_responses(vec![
+        "Implemented the feature.".into(),
+        r#"{"verdict":"approve"}"#.into(),
+    ]);
+
+    // A single gate that always passes.
+    let config = config_with_gates(vec![gate("true", "true")], 5);
+
+    let (root, supervisor_ref) = build_actor_tree(
+        repo_root.clone(),
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config,
+    )
+    .await;
+
+    supervisor_ref
+        .ask(SetTaskGraph(TaskGraph {
+            slug: "gate-pass".into(),
+            tasks: vec![task("build-thing")],
+        }))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = supervisor_ref
+        .ask(RunReadyTasks)
+        .send()
+        .await
+        .expect("RunReadyTasks must drive the loop without a hard error");
+
+    assert_eq!(
+        report.outcomes,
+        vec![(TaskId::new("build-thing"), TaskState::Done)],
+        "passing gates should let the task reach Done"
+    );
+
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask must not fail")
+        .expect("graph should be Some");
+    let t = snapshot
+        .get(&TaskId::new("build-thing"))
+        .expect("task present");
+    assert_eq!(t.state, TaskState::Done);
+    assert_eq!(
+        t.gate_iterations, 0,
+        "gates passed on the first try, so no gate iterations were counted"
+    );
+
+    // Worktree torn down after approval.
+    assert!(
+        !repo_root.join(".worktrees").join("build-thing").exists(),
+        "worktree must be gone after the run"
+    );
+
+    root.kill();
+}
+
+// ── Test 2: gate failure loops, then passes ──────────────────────────────────────
+
+/// **Done-when (2)** — a deterministic counter-file gate fails on the first run
+/// (count reaches 1, `< 2`) and passes on the second (count reaches 2, `>= 2`).
+///
+/// Asserts:
+/// - the task still reaches `Done`;
+/// - `gate_iterations == 1` (exactly one gate failure);
+/// - the Developer was re-dispatched WITH the gate-failure feedback — the retry
+///   developer prompt contains the gate name and output (proves the loop + the
+///   feedback path).
+#[tokio::test]
+async fn gate_failure_loops_then_passes_and_relays_feedback() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // Response cycle (one per prompt, in order):
+    //   1. developer  → dev output (attempt 1)  [then gate FAILS]
+    //   2. developer  → dev output (attempt 2)  [then gate PASSES]
+    //   3. reviewer   → approve
+    let backend = NoopBackend::with_responses(vec![
+        "First attempt.".into(),
+        "Second attempt after gate failure.".into(),
+        r#"{"verdict":"approve"}"#.into(),
+    ]);
+    let backend_probe = backend.clone();
+
+    // Deterministic gate: increment a counter file in the worktree; fail until
+    // it reaches 2.  Run #1: count=1 → `[ 1 -ge 2 ]` is false → exit 1 (fail).
+    // Run #2: count=2 → `[ 2 -ge 2 ]` is true → exit 0 (pass).
+    let counter_gate = gate(
+        "counter",
+        "count=$(cat .gatecount 2>/dev/null || echo 0); \
+         count=$((count+1)); echo $count > .gatecount; \
+         echo \"gate attempt $count\"; [ $count -ge 2 ]",
+    );
+    let config = config_with_gates(vec![counter_gate], 5);
+
+    let (root, supervisor_ref) = build_actor_tree(
+        repo_root.clone(),
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config,
+    )
+    .await;
+
+    supervisor_ref
+        .ask(SetTaskGraph(TaskGraph {
+            slug: "gate-retry".into(),
+            tasks: vec![task("fix-thing")],
+        }))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = supervisor_ref
+        .ask(RunReadyTasks)
+        .send()
+        .await
+        .expect("RunReadyTasks must drive the loop without a hard error");
+
+    // Despite the first gate failure, the task ends Done.
+    assert_eq!(
+        report.outcomes,
+        vec![(TaskId::new("fix-thing"), TaskState::Done)],
+        "the task should reach Done after the gate fails once then passes"
+    );
+
+    // Exactly one gate failure was counted.
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask must not fail")
+        .expect("graph should be Some");
+    let t = snapshot
+        .get(&TaskId::new("fix-thing"))
+        .expect("task present");
+    assert_eq!(t.state, TaskState::Done);
+    assert_eq!(
+        t.gate_iterations, 1,
+        "exactly one gate failure should bump gate_iterations to 1"
+    );
+
+    // Three prompts: dev1, dev2(retry with gate feedback), review(approve).
+    let prompts = backend_probe.recorded_prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "expected 3 prompts (2 dev + 1 review); got {prompts:?}"
+    );
+
+    // The retry developer prompt (2nd overall) must carry the gate-failure
+    // feedback: the gate name and its captured output.
+    assert!(
+        prompts[1].contains("counter"),
+        "the developer retry prompt must name the failing gate; got: {:?}",
+        prompts[1]
+    );
+    assert!(
+        prompts[1].contains("gate attempt 1"),
+        "the developer retry prompt must include the gate's output; got: {:?}",
+        prompts[1]
+    );
+    // The first developer prompt preceded the gate run, so it must NOT contain
+    // the gate feedback.
+    assert!(
+        !prompts[0].contains("Gate `counter` failed"),
+        "the first developer prompt must not contain gate feedback; got: {:?}",
+        prompts[0]
+    );
+
+    assert!(
+        !repo_root.join(".worktrees").join("fix-thing").exists(),
+        "worktree must be gone after the run"
+    );
+
+    root.kill();
+}
+
+// ── Test 3: cap moves the task to failed ─────────────────────────────────────────
+
+/// **Done-when (3)** — an always-failing gate with `caps.gate_iterations = 3`
+/// drives the task to `Failed` (GateCapReached) after the cap is hit, and the
+/// worktree is torn down (no leak).
+#[tokio::test]
+async fn always_failing_gate_hits_cap_and_fails_task() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // The developer always "succeeds" (produces output); the gate always fails,
+    // so the loop is driven purely by the gate cap.  NoopBackend cycles, so a
+    // single dev response covers every re-dispatch.
+    let backend = NoopBackend::with_responses(vec!["dev attempt".into()]);
+    let backend_probe = backend.clone();
+
+    let cap = 3u32;
+    let config = config_with_gates(vec![gate("false", "false")], cap);
+
+    let (root, supervisor_ref) = build_actor_tree(
+        repo_root.clone(),
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config,
+    )
+    .await;
+
+    supervisor_ref
+        .ask(SetTaskGraph(TaskGraph {
+            slug: "gate-cap".into(),
+            tasks: vec![task("doomed-thing")],
+        }))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = supervisor_ref
+        .ask(RunReadyTasks)
+        .send()
+        .await
+        .expect("RunReadyTasks must drive the loop without a hard error");
+
+    // The always-failing gate drives the task to Failed via GateCapReached.
+    assert_eq!(
+        report.outcomes,
+        vec![(TaskId::new("doomed-thing"), TaskState::Failed)],
+        "an always-failing gate should drive the task to Failed at the cap"
+    );
+
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask must not fail")
+        .expect("graph should be Some");
+    let t = snapshot
+        .get(&TaskId::new("doomed-thing"))
+        .expect("task present");
+    assert_eq!(t.state, TaskState::Failed, "task must end Failed");
+    assert_eq!(
+        t.gate_iterations, cap,
+        "gate_iterations should equal the cap when GateCapReached fires"
+    );
+    assert!(
+        t.finished_at.is_some(),
+        "finished_at must be stamped on terminal failure"
+    );
+
+    // The Developer was dispatched exactly `cap` times (one per gate iteration),
+    // and the Reviewer was NEVER reached (the task failed before review).
+    let prompts = backend_probe.recorded_prompts();
+    assert_eq!(
+        prompts.len(),
+        cap as usize,
+        "developer dispatched once per gate iteration, reviewer never reached; got {prompts:?}"
+    );
+    assert!(
+        prompts.iter().all(|p| !p
+            .to_lowercase()
+            .contains("respond with only the json verdict")),
+        "the reviewer must never be prompted when the gate cap fails the task"
+    );
+
+    // The worktree was torn down on the cap failure (no leak).
+    assert!(
+        !repo_root.join(".worktrees").join("doomed-thing").exists(),
+        "worktree must be torn down when the gate cap fails the task"
+    );
+
+    root.kill();
+}
