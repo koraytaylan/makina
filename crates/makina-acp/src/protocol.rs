@@ -46,6 +46,9 @@ pub const METHOD_SESSION_PROMPT: &str = "session/prompt";
 pub const METHOD_SESSION_UPDATE: &str = "session/update";
 /// `session/cancel` — cancel the in-flight turn (client → agent notification).
 pub const METHOD_SESSION_CANCEL: &str = "session/cancel";
+/// `session/request_permission` — agent→client request for tool-call approval
+/// (e.g. before a file write under default approval mode).
+pub const METHOD_SESSION_REQUEST_PERMISSION: &str = "session/request_permission";
 
 /// The protocol version Makina speaks (ACP v1).
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -184,6 +187,33 @@ impl<'a, P: Serialize> OutgoingNotification<'a, P> {
             jsonrpc: "2.0",
             method,
             params,
+        }
+    }
+}
+
+/// An outgoing JSON-RPC 2.0 **response** (reply to an inbound server→client
+/// request such as `session/request_permission`).
+///
+/// Unlike requests, responses have no `method`; they echo the request `id` and
+/// carry a `result` (permission decisions are always success results per the
+/// ACP shape; error replies use the error branch of [`IncomingMessage`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct OutgoingResponse<R: Serialize> {
+    /// Always `"2.0"`.
+    pub jsonrpc: &'static str,
+    /// The id of the request this response answers.
+    pub id: u64,
+    /// Success result payload.
+    pub result: R,
+}
+
+impl<R: Serialize> OutgoingResponse<R> {
+    /// Construct a response with the JSON-RPC `2.0` tag pre-filled.
+    pub fn new(id: u64, result: R) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result,
         }
     }
 }
@@ -400,6 +430,103 @@ pub struct ContentChunk {
     pub content: ContentBlock,
 }
 
+// ── ACP permission flow (server→client `session/request_permission`) ────────────
+
+/// `session/request_permission` params (agent → client request).
+///
+/// The agent emits this before performing a privileged action (write, terminal
+/// command, …) when running in a mode that requires user approval. Makina's
+/// policy engine will pick one of the offered options (or cancel) and reply via
+/// [`OutgoingResponse`]<[`PermissionResponse`]>.
+///
+/// Unknown fields under `toolCall` are preserved via a flattened map so that
+/// future schema additions or agent-specific data survive deserialization.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPermissionParams {
+    /// The session the permission request belongs to.
+    pub session_id: String,
+    /// The choices the user (or policy) may pick from.
+    pub options: Vec<PermissionOption>,
+    /// Description of the tool call that is pending approval.
+    pub tool_call: ToolCall,
+}
+
+/// A single choice offered in a permission request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionOption {
+    /// Stable id to echo back when selecting this option.
+    pub option_id: String,
+    /// Human label shown to the user.
+    pub name: String,
+    /// Semantic kind (drives icon / policy defaulting).
+    pub kind: PermissionOptionKind,
+}
+
+/// Discriminator for a [`PermissionOption`].
+///
+/// Matches the values observed from real agents (`gemini --acp`) and the
+/// `agent-client-protocol-schema` definition. Unknown future kinds map to
+/// `Other` rather than failing the request.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    #[serde(other)]
+    Other,
+}
+
+/// Partial view of the `toolCall` object inside [`RequestPermissionParams`].
+///
+/// Only the identity and common status fields are modelled directly. Every
+/// other key that appears under `toolCall` in the wire payload (content,
+/// locations, _meta, raw_input, kind-specific data, …) is retained verbatim
+/// inside `extra` via `#[serde(flatten)]`. This satisfies the requirement that
+/// an unknown tool-call field from a real payload must survive the round-trip.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCall {
+    pub tool_call_id: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Every field not explicitly named above is captured here.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Response returned to the agent for a `session/request_permission` request.
+///
+/// Serializes to the exact nested shape the ACP schema (and real agents)
+/// expect:
+///   `{ "outcome": { "outcome": "selected", "optionId": "..." } }`
+/// or
+///   `{ "outcome": { "outcome": "cancelled" } }`
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionResponse {
+    /// The decision envelope (double-"outcome" shape is required by ACP).
+    pub outcome: PermissionOutcome,
+}
+
+/// The inner outcome of a permission decision.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PermissionOutcome {
+    /// The policy selected one of the `optionId`s offered in the request.
+    #[serde(rename_all = "camelCase")]
+    Selected { option_id: String },
+    /// The prompt turn was cancelled (or the policy chose to reject).
+    Cancelled,
+}
+
 #[cfg(test)]
 mod tests {
     //! Wire-format proofs: every shape we serialize must match the ACP schema's
@@ -573,5 +700,126 @@ mod tests {
         let malformed: IncomingMessage =
             serde_json::from_value(serde_json::json!({ "jsonrpc": "2.0" })).unwrap();
         assert_eq!(malformed.classify(), IncomingKind::Malformed);
+    }
+
+    #[test]
+    fn request_permission_params_deserializes_real_payload_and_preserves_unknown_tool_call_fields()
+    {
+        // Real payload captured from gemini --acp (see real_cli.rs probe_permission_trigger).
+        // Includes several "unknown" (to our minimal model) fields under toolCall:
+        // content, locations, _meta, and an extra futureUnknownField.
+        let v = serde_json::json!({
+            "sessionId": "45efbc32-fa78-40ca-9637-5ea06d4c48e3",
+            "options": [
+                { "optionId": "proceed_always", "name": "Allow for this session", "kind": "allow_always" },
+                { "optionId": "proceed_once",  "name": "Allow",                   "kind": "allow_once" },
+                { "optionId": "cancel",        "name": "Reject",                  "kind": "reject_once" }
+            ],
+            "toolCall": {
+                "toolCallId": "write_file__write_file_1780041520414_0",
+                "status": "pending",
+                "title": "Writing to fs-probe.txt",
+                "content": [
+                    { "type": "diff", "path": "/tmp/fs-probe.txt", "oldText": "", "newText": "PROBE-FS-TEST" }
+                ],
+                "locations": [ { "path": "/tmp/fs-probe.txt" } ],
+                "kind": "edit",
+                "_meta": { "kind": "add" },
+                "futureUnknownField": "must survive round-trip"
+            }
+        });
+
+        let p: RequestPermissionParams = serde_json::from_value(v).unwrap();
+        assert_eq!(p.session_id, "45efbc32-fa78-40ca-9637-5ea06d4c48e3");
+        assert_eq!(p.options.len(), 3);
+        assert_eq!(p.options[0].option_id, "proceed_always");
+        assert_eq!(p.options[0].kind, PermissionOptionKind::AllowAlways);
+        assert_eq!(p.options[1].option_id, "proceed_once");
+        assert_eq!(p.options[1].kind, PermissionOptionKind::AllowOnce);
+        assert_eq!(p.options[2].option_id, "cancel");
+        assert_eq!(p.options[2].kind, PermissionOptionKind::RejectOnce);
+
+        // ToolCall identity fields
+        assert_eq!(
+            p.tool_call.tool_call_id,
+            "write_file__write_file_1780041520414_0"
+        );
+        assert_eq!(
+            p.tool_call.title.as_deref(),
+            Some("Writing to fs-probe.txt")
+        );
+        assert_eq!(p.tool_call.status.as_deref(), Some("pending"));
+
+        // Unknown/extra fields under toolCall must survive (the key requirement).
+        assert!(
+            p.tool_call.extra.contains_key("content"),
+            "content array must be preserved"
+        );
+        assert!(
+            p.tool_call.extra.contains_key("locations"),
+            "locations must be preserved"
+        );
+        assert!(
+            p.tool_call.extra.contains_key("_meta"),
+            "_meta must be preserved"
+        );
+        assert!(
+            p.tool_call
+                .extra
+                .get("futureUnknownField")
+                .and_then(|v| v.as_str())
+                == Some("must survive round-trip"),
+            "future unknown field must be retained in the flatten map"
+        );
+        // Known fields must NOT leak into extra.
+        assert!(!p.tool_call.extra.contains_key("toolCallId"));
+        assert!(!p.tool_call.extra.contains_key("title"));
+    }
+
+    #[test]
+    fn permission_response_serializes_to_exact_acp_outcome_shape() {
+        // Allow path — selected option.
+        let allow = PermissionResponse {
+            outcome: PermissionOutcome::Selected {
+                option_id: "proceed_once".into(),
+            },
+        };
+        let v = serde_json::to_value(&allow).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "outcome": { "outcome": "selected", "optionId": "proceed_once" }
+            })
+        );
+
+        // Cancel / reject path.
+        let cancel = PermissionResponse {
+            outcome: PermissionOutcome::Cancelled,
+        };
+        let v = serde_json::to_value(&cancel).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "outcome": { "outcome": "cancelled" }
+            })
+        );
+    }
+
+    #[test]
+    fn outgoing_response_envelope_serializes_with_id_and_result() {
+        // Sanity that the new envelope produces a well-formed JSON-RPC response.
+        let resp = OutgoingResponse::new(
+            42,
+            PermissionResponse {
+                outcome: PermissionOutcome::Selected {
+                    option_id: "allow".into(),
+                },
+            },
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(v["result"]["outcome"]["optionId"], "allow");
     }
 }
