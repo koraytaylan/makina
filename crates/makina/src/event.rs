@@ -147,6 +147,9 @@ fn translate_key(key: crossterm::event::KeyEvent) -> AppEvent {
         KeyCode::Esc => AppEvent::Quit,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => AppEvent::Quit,
         KeyCode::Tab => AppEvent::FocusNext,
+        // Sidebar navigation: arrow keys and vim-style j/k.
+        KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
+        KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
         _ => AppEvent::Tick,
     }
 }
@@ -211,6 +214,30 @@ mod tests {
             translate_terminal_event(ev),
             AppEvent::Resize(120, 40)
         ));
+    }
+
+    #[test]
+    fn up_arrow_translates_to_select_up() {
+        let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
+        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectUp));
+    }
+
+    #[test]
+    fn down_arrow_translates_to_select_down() {
+        let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
+        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectDown));
+    }
+
+    #[test]
+    fn k_key_translates_to_select_up() {
+        let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectUp));
+    }
+
+    #[test]
+    fn j_key_translates_to_select_down() {
+        let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(matches!(translate_terminal_event(ev), AppEvent::SelectDown));
     }
 
     /// Verify the full quit path: translate key → update App → should_quit.

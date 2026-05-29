@@ -42,6 +42,10 @@ pub enum AppEvent {
     Resize(u16, u16),
     /// Tab key — cycle focus between [`Panel::Sidebar`] and [`Panel::Main`].
     FocusNext,
+    /// Move the sidebar selection one row up (`↑` / `k`).
+    SelectUp,
+    /// Move the sidebar selection one row down (`↓` / `j`).
+    SelectDown,
     /// An event arrived from `api.subscribe()`.
     ApiEvent(Event),
     /// Periodic tick — triggers a redraw without other state changes.
@@ -107,6 +111,20 @@ impl App {
         }
     }
 
+    /// Return the currently selected [`RunView`], if any.
+    ///
+    /// The sidebar highlights this Run; the main panel displays its details.
+    /// Task 29 (task-status-view) and task 31 (run-control) read this to know
+    /// which Run to act on.
+    ///
+    /// This accessor is the primary seam between the sidebar and the detail
+    /// panel.  Task 29 (task-status-view) and task 31 (run-control) call this
+    /// to obtain the currently focused Run.
+    #[allow(dead_code)] // public seam for tasks 29 and 31; not yet called from main.rs
+    pub fn selected_run(&self) -> Option<&RunView> {
+        self.selected_run.and_then(|i| self.runs.get(i))
+    }
+
     /// Apply one [`AppEvent`] to the App state.
     ///
     /// This function is **pure** (no async, no IO) so it can be called from unit
@@ -130,6 +148,25 @@ impl App {
                     Panel::Sidebar => Panel::Main,
                     Panel::Main => Panel::Sidebar,
                 };
+                true
+            }
+            AppEvent::SelectUp => {
+                // Navigation only applies when the sidebar owns focus.
+                if self.focused_panel == Panel::Sidebar
+                    && let Some(current) = self.selected_run
+                {
+                    self.selected_run = Some(current.saturating_sub(1));
+                }
+                true
+            }
+            AppEvent::SelectDown => {
+                // Navigation only applies when the sidebar owns focus.
+                if self.focused_panel == Panel::Sidebar
+                    && let Some(current) = self.selected_run
+                {
+                    let last = self.runs.len().saturating_sub(1);
+                    self.selected_run = Some((current + 1).min(last));
+                }
                 true
             }
             AppEvent::ApiEvent(ev) => {
@@ -377,6 +414,287 @@ mod tests {
         };
         app.update(AppEvent::ApiEvent(ev));
         assert_eq!(app.runs[0].status, RunStatus::Completed);
+    }
+
+    // ── selected_run accessor ─────────────────────────────────────────────────
+
+    #[test]
+    fn selected_run_accessor_returns_correct_run() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let run = RunView {
+            id: RunId(7),
+            task_list_path: PathBuf::from(".tasks/accessor.json"),
+            status: RunStatus::Running,
+            tasks: vec![],
+        };
+        let app = App::new(api, vec![run]);
+        let selected = app.selected_run();
+        assert!(
+            selected.is_some(),
+            "accessor should return Some when a run exists"
+        );
+        assert_eq!(selected.unwrap().id, RunId(7));
+    }
+
+    #[test]
+    fn selected_run_accessor_returns_none_when_empty() {
+        let app = make_app();
+        assert!(app.selected_run().is_none());
+    }
+
+    // ── SelectUp / SelectDown navigation ─────────────────────────────────────
+
+    #[test]
+    fn select_down_moves_selection_forward() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/a.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/b.json"),
+                status: RunStatus::Running,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(3),
+                task_list_path: PathBuf::from(".tasks/c.json"),
+                status: RunStatus::Completed,
+                tasks: vec![],
+            },
+        ];
+        let mut app = App::new(api, runs);
+        assert_eq!(app.selected_run, Some(0));
+
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_run, Some(1));
+
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_run, Some(2));
+    }
+
+    #[test]
+    fn select_down_clamps_at_last() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/a.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/b.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+        ];
+        let mut app = App::new(api, runs);
+        // Move to last entry.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_run, Some(1));
+        // Attempting to move past the end must clamp.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_run, Some(1), "should clamp at last index");
+    }
+
+    #[test]
+    fn select_up_moves_selection_backward() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/a.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/b.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+        ];
+        let mut app = App::new(api, runs);
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_run, Some(1));
+        app.update(AppEvent::SelectUp);
+        assert_eq!(app.selected_run, Some(0));
+    }
+
+    #[test]
+    fn select_up_clamps_at_zero() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let runs = vec![RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/a.json"),
+            status: RunStatus::Pending,
+            tasks: vec![],
+        }];
+        let mut app = App::new(api, runs);
+        assert_eq!(app.selected_run, Some(0));
+        app.update(AppEvent::SelectUp);
+        assert_eq!(app.selected_run, Some(0), "should clamp at zero");
+    }
+
+    #[test]
+    fn navigation_ignored_when_main_panel_focused() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/a.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/b.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+        ];
+        let mut app = App::new(api, runs);
+        // Switch focus to main panel.
+        app.update(AppEvent::FocusNext);
+        assert_eq!(app.focused_panel, Panel::Main);
+        // Navigation events must be no-ops when main panel is focused.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(
+            app.selected_run,
+            Some(0),
+            "SelectDown must be ignored when main is focused"
+        );
+        app.update(AppEvent::SelectUp);
+        assert_eq!(
+            app.selected_run,
+            Some(0),
+            "SelectUp must be ignored when main is focused"
+        );
+    }
+
+    #[test]
+    fn select_down_no_op_when_runs_empty() {
+        let mut app = make_app();
+        assert_eq!(app.selected_run, None);
+        app.update(AppEvent::SelectDown);
+        assert_eq!(
+            app.selected_run, None,
+            "SelectDown on empty list must be a no-op"
+        );
+    }
+
+    // ── RunOpened keeps selection valid ───────────────────────────────────────
+
+    #[test]
+    fn run_opened_selects_first_when_list_was_empty() {
+        use makina_core::api::RunId;
+        let mut app = make_app();
+        assert_eq!(app.selected_run, None);
+
+        let ev = Event::RunOpened {
+            run: RunId(5),
+            task_list_path: PathBuf::from(".tasks/new.json"),
+        };
+        app.update(AppEvent::ApiEvent(ev));
+
+        assert_eq!(app.runs.len(), 1);
+        assert_eq!(
+            app.selected_run,
+            Some(0),
+            "first run should auto-select when list was empty"
+        );
+    }
+
+    #[test]
+    fn run_opened_keeps_existing_selection() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/a.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/b.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+        ];
+        let mut app = App::new(api, runs);
+        // Select second run.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.selected_run, Some(1));
+
+        // A new run opens — selection must NOT move.
+        let ev = Event::RunOpened {
+            run: RunId(9),
+            task_list_path: PathBuf::from(".tasks/new.json"),
+        };
+        app.update(AppEvent::ApiEvent(ev));
+
+        assert_eq!(app.runs.len(), 3, "new run must be added");
+        assert_eq!(
+            app.selected_run,
+            Some(1),
+            "existing selection must be preserved"
+        );
+    }
+
+    // ── RunStatusChanged updates displayed status ─────────────────────────────
+
+    #[test]
+    fn run_status_changed_updates_status() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/x.json"),
+            status: RunStatus::Pending,
+            tasks: vec![],
+        };
+        let mut app = App::new(api, vec![run]);
+
+        let ev = Event::RunStatusChanged {
+            run: RunId(1),
+            status: RunStatus::Running,
+        };
+        app.update(AppEvent::ApiEvent(ev));
+        assert_eq!(app.runs[0].status, RunStatus::Running);
+    }
+
+    #[test]
+    fn run_status_changed_to_failed() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let run = RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/x.json"),
+            status: RunStatus::Running,
+            tasks: vec![],
+        };
+        let mut app = App::new(api, vec![run]);
+
+        let ev = Event::RunStatusChanged {
+            run: RunId(1),
+            status: RunStatus::Failed,
+        };
+        app.update(AppEvent::ApiEvent(ev));
+        assert_eq!(app.runs[0].status, RunStatus::Failed);
     }
 
     #[test]

@@ -37,7 +37,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph},
 };
 
 use crate::app::{App, Panel};
@@ -83,13 +83,16 @@ pub fn render(app: &App, frame: &mut Frame) {
     frame.render_widget(title, title_area);
 
     // ── Sidebar ───────────────────────────────────────────────────────────────
+    // Render a real ratatui List with one row per Run.  Each row shows the
+    // run's file-stem (readable name) and its aggregate RunStatus with a
+    // colour-coded badge.  The selected row is highlighted with a contrasting
+    // style so the user can see which Run the main panel is detailing.
     let sidebar_focused = app.focused_panel == Panel::Sidebar;
     let sidebar_block = panel_block("Runs", sidebar_focused);
 
-    // Placeholder content: show run count, or a hint.
-    // Task 27 replaces this with a real list widget.
-    let sidebar_content = if app.runs.is_empty() {
-        vec![
+    if app.runs.is_empty() {
+        // Empty state: show a hint instead of an empty list.
+        let empty_text = vec![
             Line::from(""),
             Line::from(vec![Span::styled(
                 "  No runs open.",
@@ -104,36 +107,50 @@ pub fn render(app: &App, frame: &mut Frame) {
                 "  run-control (task 31).",
                 Style::default().fg(Color::DarkGray),
             )]),
-        ]
+        ];
+        let para = Paragraph::new(empty_text)
+            .block(sidebar_block)
+            .style(Style::default().fg(Color::White));
+        frame.render_widget(para, sidebar_area);
     } else {
-        let mut lines = vec![Line::from("")];
-        for (i, run) in app.runs.iter().enumerate() {
-            let selected = app.selected_run == Some(i);
-            let indicator = if selected { "▶ " } else { "  " };
-            let name = run
-                .task_list_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indicator}{name}"),
-                style,
-            )]));
-        }
-        lines
-    };
+        // Build one ListItem per Run: "<status-badge> <name>".
+        let items: Vec<ListItem> = app
+            .runs
+            .iter()
+            .map(|run| {
+                let name = run
+                    .task_list_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                let (badge, badge_color) = status_badge(&run.status);
+                let line = Line::from(vec![
+                    Span::styled(badge, Style::default().fg(badge_color)),
+                    Span::styled(" ", Style::default()),
+                    Span::raw(name),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
 
-    let sidebar_para = Paragraph::new(sidebar_content)
-        .block(sidebar_block)
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(sidebar_para, sidebar_area);
+        // Highlight style for the selected row.
+        let highlight_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+
+        let sidebar_list = List::new(items)
+            .block(sidebar_block)
+            .highlight_style(highlight_style)
+            .highlight_symbol("▶ ");
+
+        // ListState carries the selected index so ratatui knows which row to
+        // highlight.  It must be passed through render_stateful_widget.
+        let mut list_state = ListState::default();
+        list_state.select(app.selected_run);
+
+        frame.render_stateful_widget(sidebar_list, sidebar_area, &mut list_state);
+    }
 
     // ── Main content ──────────────────────────────────────────────────────────
     let main_focused = app.focused_panel == Panel::Main;
@@ -235,6 +252,22 @@ fn panel_block(title: &str, focused: bool) -> Block<'static> {
         })
         .border_style(border_style)
         .padding(Padding::horizontal(1))
+}
+
+/// Return the short status badge text and its display colour for a [`RunStatus`].
+///
+/// The badge is a fixed-width 3-character label shown in the sidebar List.
+/// Colours match the same palette used by [`status_color`] so they are
+/// consistent between the sidebar and the main-panel header.
+fn status_badge(s: &makina_core::api::RunStatus) -> (&'static str, Color) {
+    use makina_core::api::RunStatus;
+    match s {
+        RunStatus::Pending => ("[·]", Color::DarkGray),
+        RunStatus::Running => ("[▶]", Color::Green),
+        RunStatus::Paused => ("[‖]", Color::Yellow),
+        RunStatus::Completed => ("[✓]", Color::Cyan),
+        RunStatus::Failed => ("[✗]", Color::Red),
+    }
 }
 
 fn status_color(s: &makina_core::api::RunStatus) -> Color {
@@ -350,16 +383,216 @@ mod tests {
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        // The run's filename appears in the sidebar.
+        // The run's file stem appears in the sidebar (List uses file_stem).
         assert!(
-            screen.contains("my-feature.json"),
-            "sidebar should list the open run's filename"
+            screen.contains("my-feature"),
+            "sidebar should list the open run's file stem"
         );
         // The main area shows the first task's title.
         assert!(
             screen.contains("First task"),
             "main area should list the run's tasks"
         );
+    }
+
+    // ── Render: sidebar List — name and status badge per run ──────────────────
+
+    #[test]
+    fn render_sidebar_shows_run_name_and_status_badge() {
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/alpha.json"),
+                status: RunStatus::Running,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/beta.json"),
+                status: RunStatus::Failed,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(3),
+                task_list_path: PathBuf::from(".tasks/gamma.json"),
+                status: RunStatus::Completed,
+                tasks: vec![],
+            },
+        ];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        // Each run's file stem must appear.
+        assert!(screen.contains("alpha"), "sidebar must show 'alpha'");
+        assert!(screen.contains("beta"), "sidebar must show 'beta'");
+        assert!(screen.contains("gamma"), "sidebar must show 'gamma'");
+
+        // The status badges must appear.
+        // Running badge is "[▶]"
+        assert!(
+            screen.contains("[▶]"),
+            "Running badge must appear for alpha"
+        );
+        // Failed badge is "[✗]"
+        assert!(screen.contains("[✗]"), "Failed badge must appear for beta");
+        // Completed badge is "[✓]"
+        assert!(
+            screen.contains("[✓]"),
+            "Completed badge must appear for gamma"
+        );
+    }
+
+    #[test]
+    fn render_sidebar_shows_all_status_badges() {
+        // One run per RunStatus variant — all badges must appear.
+        let mut terminal = make_terminal(100, 40);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/pending.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/running.json"),
+                status: RunStatus::Running,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(3),
+                task_list_path: PathBuf::from(".tasks/paused.json"),
+                status: RunStatus::Paused,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(4),
+                task_list_path: PathBuf::from(".tasks/completed.json"),
+                status: RunStatus::Completed,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(5),
+                task_list_path: PathBuf::from(".tasks/failed.json"),
+                status: RunStatus::Failed,
+                tasks: vec![],
+            },
+        ];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        assert!(screen.contains("[·]"), "Pending badge must appear");
+        assert!(screen.contains("[▶]"), "Running badge must appear");
+        assert!(screen.contains("[‖]"), "Paused badge must appear");
+        assert!(screen.contains("[✓]"), "Completed badge must appear");
+        assert!(screen.contains("[✗]"), "Failed badge must appear");
+    }
+
+    // ── Render: selected row is highlighted ───────────────────────────────────
+
+    #[test]
+    fn render_selected_run_is_highlighted() {
+        // The selected row must have the highlight background (Cyan in our
+        // palette) and the highlight symbol "▶ " prepended by ratatui.
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![
+            RunView {
+                id: RunId(1),
+                task_list_path: PathBuf::from(".tasks/first.json"),
+                status: RunStatus::Running,
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(2),
+                task_list_path: PathBuf::from(".tasks/second.json"),
+                status: RunStatus::Pending,
+                tasks: vec![],
+            },
+        ];
+        // App::new selects index 0 by default.
+        let app = App::new(api, runs);
+        assert_eq!(app.selected_run, Some(0));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Find a cell with the Cyan background (the highlight colour) — there
+        // must be at least one such cell within the sidebar region (columns 0..30).
+        let has_highlight = buf
+            .content()
+            .iter()
+            .any(|cell| cell.bg == ratatui::style::Color::Cyan);
+        assert!(
+            has_highlight,
+            "selected row must use Cyan highlight background"
+        );
+    }
+
+    // ── Render: status indicator colours in the cell ──────────────────────────
+
+    #[test]
+    fn render_running_badge_uses_green_fg() {
+        let mut terminal = make_terminal(100, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/live.json"),
+            status: RunStatus::Running,
+            tasks: vec![],
+        }];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // At least one cell with Green fg must exist (the Running badge).
+        let has_green = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Green);
+        assert!(has_green, "Running status badge must use Green foreground");
+    }
+
+    #[test]
+    fn render_failed_badge_uses_red_fg() {
+        let mut terminal = make_terminal(100, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![RunView {
+            id: RunId(1),
+            task_list_path: PathBuf::from(".tasks/broken.json"),
+            status: RunStatus::Failed,
+            tasks: vec![],
+        }];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let has_red = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Red);
+        assert!(has_red, "Failed status badge must use Red foreground");
     }
 
     // ── Render: focus indicator ───────────────────────────────────────────────
