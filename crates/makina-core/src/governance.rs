@@ -96,6 +96,12 @@ pub trait AuditSink: Send + Sync {
     ///
     /// Implementations should be non-panicking; failures (e.g. disk full) are
     /// logged by the concrete sink but must not abort the caller.
+    ///
+    /// `record` is invoked synchronously on the caller's thread — which may be
+    /// an async-runtime worker (the ACP transport reader loop). Implementations
+    /// must therefore return quickly and avoid heavy blocking work on that
+    /// thread; offload to a background queue if a sink ever needs to do more
+    /// than a small, fast append.
     fn record(&self, entry: AuditEntry);
 }
 

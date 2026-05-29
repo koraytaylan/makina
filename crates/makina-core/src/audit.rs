@@ -214,7 +214,13 @@ impl AuditSink for JsonlAuditSink {
             }
         };
 
-        // ── Ensure the directory exists ───────────────────────────────────────
+        // ── Append to .tasks/{slug}/audit.jsonl ───────────────────────────────
+        // NOTE: the dir-create + open + append below are synchronous (blocking)
+        // `std::fs` calls run on the caller's thread — the ACP transport reader
+        // loop, an async worker. This is acceptable for the MVP because
+        // `record` fires at most once per permission prompt (a very low rate);
+        // if the audit rate ever grows, offload these writes to a background
+        // writer task (follow-up). See the `AuditSink` trait docs.
         let dir = self.repo_root.join(".tasks").join(&ctx.slug);
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!(
