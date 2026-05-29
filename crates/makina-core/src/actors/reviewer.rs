@@ -5,8 +5,8 @@
 //! The `Reviewer` is a spoke in the star topology.  It holds a reference to the
 //! domain [`Supervisor`] hub and communicates only with it.  Its job is to
 //! receive a review assignment from the Supervisor, evaluate the Developer's
-//! changes, and return a [`ReviewVerdict`] indicating approval or rejection with
-//! feedback.
+//! changes (by driving the injected [`AgentBackend`]), parse the agent's
+//! structured verdict, and return a [`ReviewVerdict`] to the Supervisor.
 //!
 //! # Star topology
 //!
@@ -20,21 +20,36 @@
 //! `RootSupervisor`, all spokes will hold a stale ref.  Resolving this is
 //! deferred to a later fault-tolerance task.
 //!
-//! # Skeleton
+//! # Backend injection
 //!
-//! This is a **skeleton** implementation.  Real review logic (model call,
-//! diff analysis, acceptance-criteria checking, feedback generation) is added in
-//! **task 21 (develop-review-loop)**.  The handler here returns a placeholder
-//! `ReviewVerdict::Approve` without calling any model.
+//! The agent backend is injected as `Arc<dyn AgentBackend>` via [`ReviewerArgs`]
+//! (mirroring the Developer).  Tests inject
+//! [`NoopBackend`](crate::backend::noop::NoopBackend) configured to return a
+//! verdict JSON; production injects the ACP backend.
 //!
-//! # Messages
+//! # The review turn (task 21)
 //!
-//! - [`Review`] — skeleton handler; real work is task 21.
+//! On [`Review`] the actor:
+//! 1. Builds a [`SessionConfig`] via [`session_config_for(Role::Reviewer, …)`].
+//! 2. Spawns a session on the backend with the task's worktree as the working dir.
+//! 3. Sends a prompt asking for a review of the task's work (per the
+//!    [`REVIEWER_SYSTEM_PROMPT`](crate::roles::REVIEWER_SYSTEM_PROMPT) contract).
+//! 4. Drains the [`ResponseStream`], then [`parse_review_verdict`]s the output.
+//! 5. Terminates the session and returns the [`ReviewVerdict`] to the Supervisor.
+//!
+//! [`session_config_for(Role::Reviewer, …)`]: crate::roles::session_config_for
+//! [`SessionConfig`]: crate::backend::SessionConfig
+//! [`ResponseStream`]: crate::backend::ResponseStream
+//! [`parse_review_verdict`]: crate::roles::parse_review_verdict
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use futures::StreamExt;
 use kameo::actor::ActorRef;
 
+use crate::backend::{AgentBackend, Prompt, ResponseEvent};
+use crate::roles::{Role, parse_review_verdict, session_config_for};
 use crate::task::Task;
 
 use super::supervisor::Supervisor;
@@ -53,28 +68,35 @@ pub use crate::roles::ReviewVerdict;
 /// [`ReviewVerdict`].
 ///
 /// Spawnable as a supervised child of [`crate::supervision::RootSupervisor`].
-/// The `Supervisor` ref is passed via [`ReviewerArgs`] and stored for outbound
-/// messages to the hub.
+/// The `Supervisor` ref and the [`AgentBackend`] are passed via
+/// [`ReviewerArgs`].
 pub struct Reviewer {
     /// Reference to the domain Supervisor hub.
     ///
-    /// All verdict reports and review-cap events go through this ref.
-    ///
-    /// Task 21 will use this ref to push `ReviewerApproved` / `ReviewerRejected` /
-    /// `ReviewCapReached` events; currently unused in the skeleton handler.
+    /// Retained as the star-topology anchor.  The current sequential loop
+    /// (task 21) drives the Reviewer via `ask` and reads the verdict reply, so
+    /// this ref is presently unused for outbound messages.
     #[allow(dead_code)]
     supervisor: ActorRef<Supervisor>,
+
+    /// The injected agent backend used to spawn reviewer sessions.
+    ///
+    /// Shared (`Arc`) with the Developer and the Supervisor's wiring.
+    backend: Arc<dyn AgentBackend>,
 }
 
 /// Construction arguments for [`Reviewer`].
 ///
-/// `ActorRef<Supervisor>` is `Clone + Send + Sync`, satisfying the
-/// `C::Args: Clone + Sync` bound required by
+/// Both fields are `Clone + Sync` (see [`DeveloperArgs`](super::developer::DeveloperArgs)
+/// for the reasoning), satisfying the `C::Args: Clone + Sync` bound required by
 /// [`crate::supervision::RootSupervisor::spawn_child`].
 #[derive(Clone)]
 pub struct ReviewerArgs {
     /// The domain Supervisor hub this Reviewer will report to.
     pub supervisor: ActorRef<Supervisor>,
+
+    /// The agent backend the Reviewer drives to produce a verdict.
+    pub backend: Arc<dyn AgentBackend>,
 }
 
 impl kameo::actor::Actor for Reviewer {
@@ -84,6 +106,7 @@ impl kameo::actor::Actor for Reviewer {
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         Ok(Reviewer {
             supervisor: args.supervisor,
+            backend: args.backend,
         })
     }
 }
@@ -92,17 +115,6 @@ impl kameo::actor::Actor for Reviewer {
 
 /// Instruct the Reviewer to evaluate the Developer's output for `task` inside
 /// the given `worktree`.
-///
-/// # Skeleton behaviour
-///
-/// This handler is a placeholder.  The real implementation (task 21) will:
-/// 1. Read the diff / changed files from `worktree`.
-/// 2. Call the model with the task's `done_when` acceptance criterion and the
-///    diff.
-/// 3. Return `ReviewVerdict::Approve` or `ReviewVerdict::Reject { feedback }`.
-/// 4. Optionally push review-cap events to the Supervisor.
-///
-/// For now the handler returns `ReviewVerdict::Approve` unconditionally.
 pub struct Review {
     /// The task being reviewed.
     pub task: Task,
@@ -110,25 +122,92 @@ pub struct Review {
     pub worktree: PathBuf,
 }
 
+/// Reply returned by the [`Review`] handler.
+///
+/// `Ok(ReviewVerdict)` carries the parsed verdict (approve / reject+feedback);
+/// `Err(String)` signals a handler-level failure (backend spawn/prompt/transport
+/// error, or a verdict that could not be parsed).  The `Result` wrapper also
+/// satisfies kameo's `Reply` bound via the blanket `impl Reply for Result<T, E>`
+/// (`ReviewVerdict` itself does not implement `Reply`).
+///
+/// This alias mirrors [`DevelopAck`](super::developer::DevelopAck) and
+/// [`InterpretTaskListAck`](super::planner::InterpretTaskListAck) for consistency
+/// across the spokes (addressing the actor-traits review note).
+pub type ReviewReply = Result<ReviewVerdict, String>;
+
 impl kameo::message::Message<Review> for Reviewer {
-    /// Wrapped in `Result` to satisfy kameo's `Reply` bound.
-    ///
-    /// `ReviewVerdict` itself does not implement `Reply` (kameo's trait is not
-    /// automatically derived for custom types).  Wrapping in `Result<ReviewVerdict, String>`
-    /// leverages the blanket `impl Reply for Result<T, E>` already provided by
-    /// kameo.  The `Err` arm is reserved for handler-level errors (e.g. model
-    /// unavailable); in this skeleton it is never used.
-    type Reply = Result<ReviewVerdict, String>;
+    type Reply = ReviewReply;
 
     async fn handle(
         &mut self,
-        _msg: Review,
+        msg: Review,
         _ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Skeleton: return placeholder approval.
-        // Task 21 will perform real review via model call and return the actual
-        // verdict.  The Supervisor will then use `transition()` to advance task
-        // state accordingly.
-        Ok(ReviewVerdict::Approve)
+        // 1. Build a reviewer session config rooted at the task's worktree.
+        let config = session_config_for(Role::Reviewer, msg.worktree.clone());
+
+        // 2. Spawn a session on the injected backend.
+        let mut session = self
+            .backend
+            .spawn(config)
+            .await
+            .map_err(|e| format!("reviewer backend spawn failed: {e}"))?;
+
+        // 3. Prompt for a structured review verdict.
+        let prompt_text = build_review_prompt(&msg.task);
+
+        let stream = match session.prompt(Prompt::new(prompt_text)).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let _ = session.terminate().await;
+                return Err(format!("reviewer prompt failed: {e}"));
+            }
+        };
+
+        // 4. Drain the response stream into the raw verdict text.
+        let mut output = String::new();
+        let mut events = stream;
+        while let Some(item) = events.next().await {
+            match item {
+                Ok(ResponseEvent::TextChunk { text }) => output.push_str(&text),
+                Ok(ResponseEvent::TurnComplete) => break,
+                Err(e) => {
+                    drop(events);
+                    let _ = session.terminate().await;
+                    return Err(format!("reviewer stream error: {e}"));
+                }
+            }
+        }
+        drop(events);
+
+        // 5. Terminate the session (idempotent).
+        let _ = session.terminate().await;
+
+        // 6. Parse the agent's output into a structured verdict.
+        parse_review_verdict(&output).map_err(|e| format!("failed to parse review verdict: {e}"))
     }
+}
+
+// ── Prompt construction ─────────────────────────────────────────────────────────
+
+/// Build the user prompt for a review turn.
+///
+/// Restates the task's intent and `done_when` criterion, and reminds the agent of
+/// the strict JSON-verdict output contract (also enforced by
+/// [`REVIEWER_SYSTEM_PROMPT`](crate::roles::REVIEWER_SYSTEM_PROMPT)).
+fn build_review_prompt(task: &Task) -> String {
+    format!(
+        "Review the work done in the current working directory for the following \
+         task. Decide whether it satisfies the acceptance criterion.\n\n\
+         Task ID: {id}\n\
+         Title: {title}\n\
+         Description: {description}\n\
+         Done when: {done_when}\n\n\
+         Respond with ONLY the JSON verdict object, e.g. {{\"verdict\":\"approve\"}} \
+         or {{\"verdict\":\"reject\",\"feedback\":\"<what must change>\"}}.",
+        id = task.id,
+        title = task.title,
+        description = task.description,
+        done_when = task.done_when,
+    )
 }

@@ -17,9 +17,12 @@
 use std::sync::Arc;
 
 use makina_core::{
-    actors::{InterpretTaskList, Planner, PlannerArgs, Supervisor, TaskGraphSnapshot},
+    actors::{
+        InterpretTaskList, Planner, PlannerArgs, Supervisor, SupervisorArgs, TaskGraphSnapshot,
+    },
     interpreter::StructuredTextInterpreter,
     supervision::{RestartConfig, RootSupervisor},
+    worktree::WorktreeManager,
 };
 use std::io::Write as _;
 use tempfile::NamedTempFile;
@@ -82,8 +85,20 @@ async fn planner_interprets_file_and_hands_graph_to_supervisor() {
     // ── Spawn actors ──────────────────────────────────────────────────────────
     let root = RootSupervisor::start();
 
-    let supervisor_ref =
-        RootSupervisor::spawn_child::<Supervisor>(&root, (), RestartConfig::default()).await;
+    // The Supervisor needs a WorktreeManager in its Args; this test only exercises
+    // SetTaskGraph/TaskGraphSnapshot (no worktree create/remove), so a manager
+    // over a dummy path is sufficient.
+    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
+        &root,
+        SupervisorArgs {
+            worktree_manager: WorktreeManager::new(
+                std::path::PathBuf::from("/tmp/makina-planner-test"),
+                "develop".into(),
+            ),
+        },
+        RestartConfig::default(),
+    )
+    .await;
 
     let planner_ref = RootSupervisor::spawn_child::<Planner>(
         &root,
@@ -195,8 +210,20 @@ async fn planner_interprets_file_and_hands_graph_to_supervisor() {
 async fn planner_returns_error_for_missing_file() {
     let root = RootSupervisor::start();
 
-    let supervisor_ref =
-        RootSupervisor::spawn_child::<Supervisor>(&root, (), RestartConfig::default()).await;
+    // The Supervisor needs a WorktreeManager in its Args; this test only exercises
+    // SetTaskGraph/TaskGraphSnapshot (no worktree create/remove), so a manager
+    // over a dummy path is sufficient.
+    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
+        &root,
+        SupervisorArgs {
+            worktree_manager: WorktreeManager::new(
+                std::path::PathBuf::from("/tmp/makina-planner-test"),
+                "develop".into(),
+            ),
+        },
+        RestartConfig::default(),
+    )
+    .await;
 
     let planner_ref = RootSupervisor::spawn_child::<Planner>(
         &root,

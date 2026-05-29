@@ -20,7 +20,11 @@
 //! [`crate::supervision::RootSupervisor`] via
 //! [`crate::supervision::RootSupervisor::spawn_child`].  Spawn order matters:
 //! spawn the `Supervisor` hub first, then pass its `ActorRef` into each spoke's
-//! `Args`.
+//! `Args`.  Because the hub also needs to dispatch work *to* the Developer and
+//! Reviewer, the resulting construction cycle is broken by a post-spawn
+//! [`SetSpokes`](supervisor::SetSpokes) message that hands the spoke refs back to
+//! the hub.  (The previous unsupervised `Supervisor::start()` helper has been
+//! removed — it was a footgun, and `spawn_child` is the canonical path.)
 //!
 //! # Planner interpreter injection
 //!
@@ -30,8 +34,12 @@
 //! [`StructuredTextInterpreter`](crate::interpreter::StructuredTextInterpreter)
 //! in tests; task 18 will plug in a model-backed interpreter.
 //!
-//! Task 21 (`develop-review-loop`) will add real orchestration to `Supervisor`,
-//! `Developer`, and `Reviewer`.
+//! Task 21 (`develop-review-loop`) added the real orchestration: the
+//! `Supervisor` drives [`RunReadyTasks`](supervisor::RunReadyTasks) as a
+//! sequential `ask`-based develop→review loop, and the `Developer`/`Reviewer`
+//! drive an injected `Arc<dyn AgentBackend>`.  The gate loop (task 22),
+//! squash-merge (task 23), concurrency (task 24), and termination caps (task 25)
+//! are left as clearly-commented seams in `supervisor.rs`.
 
 pub mod developer;
 pub mod planner;
@@ -39,10 +47,13 @@ pub mod reviewer;
 pub mod supervisor;
 
 // Convenience re-exports so callers can use `actors::Supervisor` etc.
-pub use developer::{Develop, DevelopAck, Developer, DeveloperArgs};
+pub use developer::{Develop, DevelopAck, DevelopOutcome, Developer, DeveloperArgs};
 pub use planner::{InterpretTaskList, InterpretTaskListAck, Planner, PlannerArgs};
-pub use reviewer::{Review, ReviewVerdict, Reviewer, ReviewerArgs};
-pub use supervisor::{SetTaskGraph, Supervisor, TaskGraphSnapshot};
+pub use reviewer::{Review, ReviewReply, ReviewVerdict, Reviewer, ReviewerArgs};
+pub use supervisor::{
+    MAX_REVIEWER_ITERATIONS, RunReadyTasks, RunReport, SetSpokes, SetTaskGraph, Supervisor,
+    SupervisorArgs, TaskGraphSnapshot,
+};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -64,12 +75,15 @@ mod tests {
 
     use crate::{
         actors::{
-            Develop, Developer, DeveloperArgs, InterpretTaskList, Planner, PlannerArgs, Review,
-            ReviewVerdict, Reviewer, ReviewerArgs, SetTaskGraph, Supervisor, TaskGraphSnapshot,
+            Develop, DevelopOutcome, Developer, DeveloperArgs, InterpretTaskList, Planner,
+            PlannerArgs, Review, ReviewVerdict, Reviewer, ReviewerArgs, SetTaskGraph, Supervisor,
+            SupervisorArgs, TaskGraphSnapshot,
         },
+        backend::{AgentBackend, noop::NoopBackend},
         interpreter::StructuredTextInterpreter,
         supervision::{RestartConfig, RootSupervisor},
         task::{Task, TaskGraph, TaskId, TaskState},
+        worktree::WorktreeManager,
     };
 
     // ── Helper ────────────────────────────────────────────────────────────────
@@ -113,22 +127,38 @@ mod tests {
     /// - `Supervisor`: `SetTaskGraph` accepted; `TaskGraphSnapshot` returns the
     ///   stored graph with the correct task count.
     /// - `Planner`: `InterpretTaskList` returns `Ok(())`.
-    /// - `Developer`: `Develop` returns `Ok(())`.
+    /// - `Developer`: `Develop` returns `Ok(DevelopOutcome)` with non-empty output.
     /// - `Reviewer`: `Review` returns `Ok(ReviewVerdict::Approve)`.
+    ///
+    /// This is a message-acceptance smoke test; the full develop→review loop is
+    /// exercised by the `develop_review_loop.rs` integration test.
     #[tokio::test]
     async fn all_actors_spawn_and_accept_messages_under_root_supervisor() {
         // ── Step 1: start fault-tolerance root ───────────────────────────────
         let root = RootSupervisor::start();
 
+        // A NoopBackend configured so the Reviewer parses an approve verdict.
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![
+            "developer output".into(),
+            r#"{"verdict":"approve"}"#.into(),
+        ]));
+
         // ── Step 2: spawn domain Supervisor hub ──────────────────────────────
         let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
             &root,
-            (), // Supervisor::Args = ()
+            SupervisorArgs {
+                // A no-op manager pointed at a dummy path; this smoke test never
+                // calls create/remove (it only exercises message acceptance).
+                worktree_manager: WorktreeManager::new(
+                    PathBuf::from("/tmp/makina-actor-smoke"),
+                    "develop".into(),
+                ),
+            },
             RestartConfig::default(),
         )
         .await;
 
-        // ── Step 3: spawn spokes with the hub ref ────────────────────────────
+        // ── Step 3: spawn spokes with the hub ref and backend ────────────────
 
         // Planner — inject the deterministic reference interpreter (no model call).
         let planner_ref = RootSupervisor::spawn_child::<Planner>(
@@ -146,6 +176,7 @@ mod tests {
             &root,
             DeveloperArgs {
                 supervisor: supervisor_ref.clone(),
+                backend: Arc::clone(&backend),
             },
             RestartConfig::default(),
         )
@@ -156,6 +187,7 @@ mod tests {
             &root,
             ReviewerArgs {
                 supervisor: supervisor_ref.clone(),
+                backend: Arc::clone(&backend),
             },
             RestartConfig::default(),
         )
@@ -207,21 +239,32 @@ mod tests {
 
         let task = stored.tasks[0].clone();
 
-        // Same pattern: ask().send() for `Result<(), String>` reply gives back
-        // `()` on success (SendError is unwrapped by `.expect()`).
-        developer_ref
+        // ask().send() for `Result<DevelopOutcome, String>` reply gives back the
+        // `DevelopOutcome` on success (SendError is unwrapped by `.expect()`).
+        // The NoopBackend returns "developer output" for the first prompt.
+        let outcome = developer_ref
             .ask(Develop {
                 task: task.clone(),
                 worktree: PathBuf::from("/tmp/test-worktree"),
+                feedback: None,
             })
             .send()
             .await
-            .expect("Develop skeleton must return Ok(())");
+            .expect("Develop must return Ok(DevelopOutcome)");
+
+        assert_eq!(
+            outcome,
+            DevelopOutcome {
+                output: "developer output".to_string()
+            },
+            "Developer should return the backend's canned output"
+        );
 
         // ── Step 7: exercise Reviewer message ────────────────────────────────
 
-        // ask().send() for `Result<ReviewVerdict, String>` reply gives back
-        // `ReviewVerdict` on success (the outer SendError is unwrapped by `.expect()`).
+        // ask().send() for `Result<ReviewVerdict, String>` reply gives back the
+        // `ReviewVerdict` on success.  The NoopBackend returns the approve JSON
+        // for the second prompt, which the Reviewer parses into `Approve`.
         let verdict = reviewer_ref
             .ask(Review {
                 task: task.clone(),
@@ -229,12 +272,12 @@ mod tests {
             })
             .send()
             .await
-            .expect("Review skeleton must return Ok(ReviewVerdict::Approve)");
+            .expect("Review must return Ok(ReviewVerdict)");
 
         assert_eq!(
             verdict,
             ReviewVerdict::Approve,
-            "Review skeleton should return Approve placeholder"
+            "Reviewer should parse the approve verdict from the backend"
         );
 
         // ── Clean shutdown ────────────────────────────────────────────────────
