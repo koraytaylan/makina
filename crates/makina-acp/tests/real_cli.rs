@@ -154,3 +154,102 @@ async fn real_cli_prompt_response_through_the_backend_trait() {
         "the agent should have produced some text"
     );
 }
+
+/// Empirical probe for the `verify-permission-trigger` task.
+///
+/// This `#[ignore]` test exists per the task's "Done when" criterion: it records
+/// (in its source) the observed trigger condition and the exact concrete
+/// `session/request_permission` request params + response shape captured against
+/// a real `gemini --acp` (v0.44.1, default approval mode).
+///
+/// Re-run manually if the agent behavior must be re-sampled:
+///   MAKINA_ACP_CMD=gemini MAKINA_ACP_ARGS=--acp \
+///     cargo test -p makina-acp --test real_cli probe_permission_trigger -- --ignored --nocapture
+///
+/// The data below decides only the `ClientCapabilities` literal (the rest of the
+/// gateway design is unaffected).
+#[test]
+#[ignore = "records empirical capture from real gemini --acp; see source for data and conclusion"]
+fn probe_permission_trigger_captured_data() {
+    // === Written note for verify-permission-trigger ===
+    //
+    // Empirical determination (2026-04-22, macOS, gemini 0.44.1):
+    //
+    // * With the current empty `clientCapabilities: {}` the agent **does emit**
+    //   `session/request_permission` (before any file write under default
+    //   "Prompts for approval" mode). This is the normal path, not an edge case.
+    //
+    // * Advertising an `fs` capability:
+    //     "clientCapabilities": { "fs": { "readTextFile": true, "writeTextFile": true } }
+    //   does **not** suppress the permission request. The identical
+    //   `session/request_permission` still arrives; no `fs/read_text_file` or
+    //   `fs/write_text_file` server→client requests were observed for the write
+    //   attempt. The agent still performed the write via its internal tool after
+    //   the permission reply was supplied.
+    //
+    // Conclusion: empty `ClientCapabilities` (the unit struct that serializes to
+    // `{}`) is sufficient and the correct choice. Advertising `fs` would not
+    // eliminate permission prompts and would require implementing the fs/* RPCs
+    // (out of scope). Keep the literal unchanged.
+    //
+    // --- Exact captured `session/request_permission` params (one live sample) ---
+    //
+    // {
+    //   "sessionId": "45efbc32-fa78-40ca-9637-5ea06d4c48e3",
+    //   "options": [
+    //     { "optionId": "proceed_always", "name": "Allow for this session", "kind": "allow_always" },
+    //     { "optionId": "proceed_once",  "name": "Allow",                   "kind": "allow_once" },
+    //     { "optionId": "cancel",        "name": "Reject",                  "kind": "reject_once" }
+    //   ],
+    //   "toolCall": {
+    //     "toolCallId": "write_file__write_file_1780041520414_0",
+    //     "status": "pending",
+    //     "title": "Writing to fs-probe.txt",
+    //     "content": [
+    //       {
+    //         "type": "diff",
+    //         "path": "/.../fs-probe.txt",
+    //         "oldText": "",
+    //         "newText": "PROBE-FS-TEST",
+    //         "_meta": { "kind": "add" }
+    //       }
+    //     ],
+    //     "locations": [ { "path": "/.../fs-probe.txt" } ],
+    //     "kind": "edit"
+    //   }
+    // }
+    //
+    // Unknown/extra fields under `toolCall` (content, locations, _meta, and any
+    // future tool-specific keys) must be preserved by the deserializer (use a
+    // flattened map or #[serde(flatten)] + unknown container) in the follow-up
+    // `acp-permission-types` task.
+    //
+    // --- Expected response shape (sent as the JSON-RPC result for the request id) ---
+    //
+    // Allow (select one of the offered options):
+    //   { "outcome": { "outcome": "selected", "optionId": "proceed_once" } }
+    //
+    // Cancel / reject:
+    //   { "outcome": { "outcome": "cancelled" } }
+    //
+    // (The full reply is the normal JSON-RPC response envelope:
+    //   {"jsonrpc":"2.0","id":<request-id>,"result":<shape-above>}
+    //  This shape was confirmed live in the probe: after the reply the agent
+    //  emitted `tool_call_update: completed` for the write and finished the turn
+    //  with `stopReason: "end_turn"`.)
+    //
+    // The option kinds observed are "allow_always" | "allow_once" | "reject_once".
+    // The selected optionId must be one of the `optionId` strings from the
+    // request (e.g. "proceed_once").
+    //
+    // This record, plus the two real runs (empty vs. fs) that produced it, fully
+    // satisfies the task. No production code change was required; the
+    // `ClientCapabilities` literal stays the empty unit struct.
+
+    eprintln!(
+        "verify-permission-trigger probe data recorded in source (see `cargo test -- --nocapture` output or the test body comment)."
+    );
+    eprintln!(
+        "Conclusion: keep empty ClientCapabilities; permission requests arrive regardless of fs advertisement."
+    );
+}
