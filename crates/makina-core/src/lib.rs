@@ -11,6 +11,7 @@ pub mod backend;
 pub mod config;
 pub mod dependency;
 pub mod gate;
+pub mod governance;
 pub mod interpreter;
 pub(crate) mod json;
 pub mod merge;
