@@ -131,6 +131,32 @@ the well-formed dogfood task list). The model-planning path has not been
 exercised inside the full orchestration loop. For task lists with ambiguous
 descriptions or implicit dependencies, this path is untested in practice.
 
+### `.tasks/{slug}.json` persistence never written — task graph is in-memory only
+
+**What the VISION and spec promise:** The VISION principle states "Work state is
+a tracked artifact … Task graph, progress, reviewer outcomes — all materialize
+as files in the repo … reviewable via diff, recoverable from history."
+`docs/spec/runtime-artifact-schema.md` designates `.tasks/{slug}.json` as the
+runtime "source of truth" that the Supervisor writes and owns; the "Supervisor is
+the only `.tasks/` writer" is a documented invariant.
+
+**What the implementation actually does:** The `TaskGraph` lives exclusively
+in-memory, held behind `Arc<Mutex<TaskGraph>>` inside `CoreApi` / the Supervisor.
+On every `OpenRun` call the engine re-parses the `.md` input from scratch. There
+is no write path: the Supervisor never serializes a `TaskStatus` update to
+`.tasks/{slug}.json`, and there is no read path on restart. The schema types and a
+sample file exist from the `runtime-artifact-schema` task; only the runtime
+write/read path is absent.
+
+**Consequences:**
+- No crash recovery: if the Supervisor actor panics or the process is killed
+  mid-run, all in-flight task state is lost.
+- No diff-reviewable state history: `.tasks/` stays empty, so `git diff` shows
+  nothing about task progress — the VISION "reviewable via diff" property is
+  vacuously false.
+- The "Supervisor is the only `.tasks/` writer" invariant holds only because
+  nobody writes it at all.
+
 ### `extract_json_object` helper duplicated
 
 The function is defined independently in both
@@ -198,7 +224,24 @@ This is the wedge the project is built around. The trial converts it from
 aspiration to next-step: without it, the engine requires `--yolo` for every
 supported agent that has a default-mode permission model.
 
-### 2. Hard enforcement via sandboxing [FUTURE: "Hard enforcement via sandboxing"]
+### 2. Task-graph persistence — write/read `.tasks/{slug}.json` at runtime [HIGH]
+
+**Trial evidence:** the VISION "tracked artifact / recoverable / diff-reviewable"
+guarantee is completely unmet. Every run is stateless: a crash loses all in-flight
+task progress, `git diff` shows nothing about task state, and there is no path
+back from a partial run without starting over. The schema and types are already
+designed (`docs/spec/runtime-artifact-schema.md`, the sample file); the only missing
+piece is the Supervisor serializing a `TaskStatus` update to `.tasks/{slug}.json`
+on every FSM transition, and reading those files back on `OpenRun` when they exist.
+
+**Why HIGH:** this closes the largest gap between the VISION spec and the running
+code. It is also a prerequisite for the "Multiple task sources" direction (item 8
+below): GitHub Issues → `.tasks/*.json` only makes sense once `.tasks/*.json` is
+a live, maintained artifact — not an empty directory. Crash recovery alone
+justifies the priority: any real workload risks losing agent turns to transient
+failures.
+
+### 3. Hard enforcement via sandboxing [FUTURE: "Hard enforcement via sandboxing"]
 
 **Trial evidence:** `--yolo` auto-approves tool calls globally inside a process
 that can reach the filesystem, the network, and spawned subprocesses. Safe
@@ -211,7 +254,7 @@ gateway handles the protocol; the sandbox provides the teeth.
 Linux-first implementation is the practical path; macOS sandbox primitives are
 weaker. This is the harder engineering problem — schedule after direction 1.
 
-### 3. Hang detection as an explicit subsystem [FUTURE: "Hang detection"]
+### 4. Hang detection as an explicit subsystem [FUTURE: "Hang detection"]
 
 **Trial evidence:** a hung `--acp` turn (the first real run without `--yolo`)
 consumed the wall-clock deadline silently. Even with the permission flow fixed,
@@ -220,7 +263,7 @@ subprocess crash, lost pipe). An idle-output timeout (e.g., 30s with no new
 stream chunk) would catch these cases 40x faster than the 1200s wall-clock cap
 and emit a useful event rather than a silent expiry.
 
-### 4. Cost accounting and budget caps [FUTURE: "Cost accounting and budget caps"]
+### 5. Cost accounting and budget caps [FUTURE: "Cost accounting and budget caps"]
 
 **Trial evidence:** the trial's single task was cheap, but the path to expensive
 is short: a task requiring gate iteration or reviewer rejection cycles spends
@@ -229,7 +272,7 @@ iteration cap. Adding per-task `UsageReport` reporting and a budget terminal
 condition transforms the cap from time-only to cost-aware — necessary before
 running larger task lists against paid APIs.
 
-### 5. Richer reviewer-side rule kinds [FUTURE: "Richer reviewer-side rule kinds"]
+### 6. Richer reviewer-side rule kinds [FUTURE: "Richer reviewer-side rule kinds"]
 
 **Trial evidence:** the Reviewer is LLM-based with no deterministic constraints
 on its verdict. The MVP gates (test/clippy/fmt) are deterministic and passed
@@ -240,18 +283,18 @@ be inconsistent or hallucinate an approval. Deterministic reviewer rules
 would make the governance pitch firmer and reduce reviewer-cap failures caused
 by LLM inconsistency rather than actual code quality problems.
 
-### 6. Agent-driven conflict reconciliation [FUTURE: "squash-merge" / orchestration]
+### 7. Agent-driven conflict reconciliation [FUTURE: "squash-merge" / orchestration]
 
 **Trial evidence:** the conflict path safely aborts today; `develop` was never
 corrupted. But for concurrent tasks that the EdgeInferrer did not serialize
 (e.g., tasks touching different files in the same module that both add a public
 symbol), straggler conflicts will occur as task volume grows. The agent-reconcile
 prompt path (already designed in supervisor comments) turns a `Failed` task into
-a recoverable one. Lower urgency than 1–5 since it requires more agent work per
+a recoverable one. Lower urgency than 1–6 since it requires more agent work per
 task and only fires on actual conflicts, but it becomes a real reliability gap
 at scale.
 
-### 7. Multiple task sources [FUTURE: "Multiple task sources"]
+### 8. Multiple task sources [FUTURE: "Multiple task sources"]
 
 **Trial evidence:** the dogfood list was hand-authored in the structured-text
 convention. The format is expressive enough for small lists but friction-heavy
@@ -270,10 +313,13 @@ full loop, deterministic governance via gates, and a clean TUI-over-api
 architecture. The `NoopBackend` approach paid off — 30+ integration tests pass
 without a model, and the real-agent run worked on the first engine-level attempt.
 
-The most important finding is the ACP permission gap: it is the concrete,
-operational form of the governance problem the project exists to solve. Plan
-0002's first priority should be the action gateway + permission flow in the ACP
-client, paired with the sandbox work that gives it enforcement power. The rest —
-hang detection, cost accounting, richer reviewer rules, conflict reconciliation
-— are meaningful improvements but lower urgency than getting the governance story
-right.
+The two most important findings are the ACP permission gap and the missing
+`.tasks/{slug}.json` persistence. The ACP gap is the concrete, operational form
+of the governance problem the project exists to solve; the persistence gap means
+the VISION "tracked artifact / recoverable / diff-reviewable" principle is
+completely unmet at runtime. Plan 0002's first two priorities should be (1) the
+action gateway + permission flow in the ACP client, and (2) the Supervisor
+write/read path for `.tasks/*.json` on every FSM transition, paired with the
+sandbox work that gives enforcement power. The rest — hang detection, cost
+accounting, richer reviewer rules, conflict reconciliation — are meaningful
+improvements but lower urgency than closing these two correctness gaps.

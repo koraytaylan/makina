@@ -344,7 +344,6 @@ impl App {
     /// This accessor is the primary seam between the sidebar and the detail
     /// panel.  Task 29 (task-status-view) and task 31 (run-control) call this
     /// to obtain the currently focused Run.
-    #[allow(dead_code)] // public seam for tasks 29 and 31; not yet called from main.rs
     pub fn selected_run(&self) -> Option<&RunView> {
         self.selected_run.and_then(|i| self.runs.get(i))
     }
