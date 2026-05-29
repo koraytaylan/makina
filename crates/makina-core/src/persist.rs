@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use crate::task::TaskGraph;
+use crate::task::{TaskGraph, TaskState};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -203,6 +203,51 @@ pub async fn load_graph(repo_root: &Path, slug: &str) -> Result<Option<TaskGraph
         })?;
 
     Ok(Some(graph))
+}
+
+// ── Resume recovery ───────────────────────────────────────────────────────────
+
+/// Reset in-flight tasks to [`TaskState::Ready`] so a restarted Supervisor can
+/// safely re-pick them up.
+///
+/// This is a **pure, synchronous** function — no I/O, no async.  It is intended
+/// to be called immediately after [`load_graph`] returns a persisted artifact,
+/// before the Supervisor begins scheduling work.
+///
+/// # State transitions applied
+///
+/// | Before               | After              |
+/// |----------------------|--------------------|
+/// | `InProgress`         | `Ready`            |
+/// | `InReview`           | `Ready`            |
+/// | `New` / `Ready` / `Done` / `Failed` | unchanged |
+///
+/// # What is preserved
+///
+/// - `gate_iterations` and `review_iterations` are **not** reset — they are
+///   cumulative counters that survive crashes and must not be lost.
+/// - `started_at` is left as-is (it records the first historical pickup time).
+/// - `finished_at` is only set on terminal states (`Done`/`Failed`), which are
+///   unchanged, so it is unaffected.
+/// - `updated_at` is intentionally **not** touched: this is a structural repair
+///   operation, not a domain event, so bumping it would pollute the audit trail
+///   with a spurious modification time.
+///
+/// # Note on FSM bypass
+///
+/// This function directly sets `task.state` rather than routing through the
+/// state machine's `transition`/`apply_event` path.  That is intentional —
+/// crash-resume recovery is an infrastructure concern, not a normal lifecycle
+/// event.
+pub fn recover_for_resume(graph: &mut TaskGraph) {
+    for task in &mut graph.tasks {
+        match task.state {
+            TaskState::InProgress | TaskState::InReview => {
+                task.state = TaskState::Ready;
+            }
+            TaskState::New | TaskState::Ready | TaskState::Done | TaskState::Failed => {}
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -451,6 +496,133 @@ mod tests {
             p,
             PathBuf::from("/some/repo/.tasks/plan-0002.json"),
             "tasks_path must produce repo/.tasks/slug.json"
+        );
+    }
+
+    // ── Tests for recover_for_resume ──────────────────────────────────────────
+
+    fn make_task(id: &str, state: TaskState, gate_iterations: u32, review_iterations: u32) -> Task {
+        let t0 = fixed_ts(2026, 5, 1);
+        Task {
+            id: TaskId::new(id),
+            title: id.to_string(),
+            description: String::new(),
+            done_when: String::new(),
+            depends_on: vec![],
+            section: None,
+            state,
+            gate_iterations,
+            review_iterations,
+            created_at: t0,
+            updated_at: t0,
+            started_at: if state == TaskState::InProgress || state == TaskState::InReview {
+                Some(t0)
+            } else {
+                None
+            },
+            finished_at: if state == TaskState::Done || state == TaskState::Failed {
+                Some(fixed_ts(2026, 5, 2))
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Build a graph containing one task in each of the six states, two of which
+    /// carry non-zero counters, then call `recover_for_resume` and verify:
+    ///
+    /// - `InProgress` → `Ready`
+    /// - `InReview`   → `Ready`
+    /// - `New`, `Ready`, `Done`, `Failed` → unchanged
+    /// - `gate_iterations` / `review_iterations` are preserved on every task
+    /// - `graph.validate()` returns `Ok`
+    #[test]
+    fn recover_for_resume_resets_in_flight_states() {
+        let mut graph = TaskGraph {
+            slug: "resume-test".to_string(),
+            tasks: vec![
+                make_task("t-new", TaskState::New, 0, 0),
+                make_task("t-ready", TaskState::Ready, 0, 0),
+                make_task("t-in-progress", TaskState::InProgress, 2, 1),
+                make_task("t-in-review", TaskState::InReview, 1, 3),
+                make_task("t-done", TaskState::Done, 1, 1),
+                make_task("t-failed", TaskState::Failed, 3, 0),
+            ],
+        };
+
+        super::recover_for_resume(&mut graph);
+
+        // InProgress → Ready
+        assert_eq!(
+            graph.tasks[2].state,
+            TaskState::Ready,
+            "InProgress must become Ready"
+        );
+        // InReview → Ready
+        assert_eq!(
+            graph.tasks[3].state,
+            TaskState::Ready,
+            "InReview must become Ready"
+        );
+
+        // Unchanged states
+        assert_eq!(graph.tasks[0].state, TaskState::New, "New must stay New");
+        assert_eq!(
+            graph.tasks[1].state,
+            TaskState::Ready,
+            "Ready must stay Ready"
+        );
+        assert_eq!(graph.tasks[4].state, TaskState::Done, "Done must stay Done");
+        assert_eq!(
+            graph.tasks[5].state,
+            TaskState::Failed,
+            "Failed must stay Failed"
+        );
+
+        // Counters preserved on originally-InProgress task
+        assert_eq!(
+            graph.tasks[2].gate_iterations, 2,
+            "gate_iterations must be preserved on ex-InProgress task"
+        );
+        assert_eq!(
+            graph.tasks[2].review_iterations, 1,
+            "review_iterations must be preserved on ex-InProgress task"
+        );
+
+        // Counters preserved on originally-InReview task
+        assert_eq!(
+            graph.tasks[3].gate_iterations, 1,
+            "gate_iterations must be preserved on ex-InReview task"
+        );
+        assert_eq!(
+            graph.tasks[3].review_iterations, 3,
+            "review_iterations must be preserved on ex-InReview task"
+        );
+
+        // Graph structural integrity must hold after the recovery pass.
+        graph
+            .validate()
+            .expect("graph must pass validate() after recover_for_resume");
+    }
+
+    /// A graph that is already clean (no in-flight tasks) must pass through
+    /// `recover_for_resume` without any state changes.
+    #[test]
+    fn recover_for_resume_is_idempotent_on_clean_graph() {
+        let mut graph = TaskGraph {
+            slug: "clean-test".to_string(),
+            tasks: vec![
+                make_task("t-new", TaskState::New, 0, 0),
+                make_task("t-done", TaskState::Done, 1, 0),
+            ],
+        };
+        let before = graph.clone();
+
+        super::recover_for_resume(&mut graph);
+
+        assert_eq!(
+            graph, before,
+            "a clean graph must be unchanged by recover_for_resume"
         );
     }
 }
