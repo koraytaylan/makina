@@ -23,16 +23,22 @@
 //!   wakes every pending request, so no caller blocks forever.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use chrono::Utc;
+use makina_core::governance::{AuditDecision, AuditEntry, AuditSink, PolicyInfo, ToolRef};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::{AcpError, Result};
+use crate::permission::{PermissionPolicy, PermissionRequestContext};
 use crate::protocol::{
-    IncomingKind, IncomingMessage, OutgoingNotification, OutgoingRequest, SessionNotificationParams,
+    IncomingKind, IncomingMessage, JsonRpcError, METHOD_SESSION_REQUEST_PERMISSION,
+    OutgoingErrorResponse, OutgoingNotification, OutgoingRequest, OutgoingResponse,
+    PermissionOutcome, PermissionResponse, RequestPermissionParams, SessionNotificationParams,
 };
 
 /// Why the reader task stopped — recorded so late callers get a precise error
@@ -107,6 +113,12 @@ struct SenderInner<W> {
     shared: Arc<Shared>,
     /// Monotonic request-id source.
     next_id: Mutex<u64>,
+    /// Injected policy used to answer `session/request_permission` requests.
+    policy: Arc<dyn PermissionPolicy>,
+    /// Session working directory (passed to policy context).
+    working_dir: PathBuf,
+    /// Sink for audit entries produced on permission decisions.
+    audit_sink: Arc<dyn AuditSink>,
 }
 
 /// The **send side** of a connected transport: issue requests/notifications and
@@ -198,6 +210,26 @@ where
         self.write_message(&notification).await
     }
 
+    /// Send a JSON-RPC success response to an inbound request (e.g. a
+    /// `session/request_permission` we decided via the injected policy).
+    pub async fn send_response<R: Serialize>(&self, id: u64, result: R) -> Result<()> {
+        if let Some(err) = self.inner.shared.ended_error() {
+            return Err(err);
+        }
+        let response = OutgoingResponse::new(id, result);
+        self.write_message(&response).await
+    }
+
+    /// Send a JSON-RPC error response to an inbound request we do not support.
+    /// This guarantees the peer never hangs waiting for a reply.
+    pub async fn send_error_response(&self, id: u64, error: JsonRpcError) -> Result<()> {
+        if let Some(err) = self.inner.shared.ended_error() {
+            return Err(err);
+        }
+        let response = OutgoingErrorResponse::new(id, error);
+        self.write_message(&response).await
+    }
+
     /// The terminal error, if the agent has disconnected.
     pub fn ended_error(&self) -> Option<AcpError> {
         self.inner.shared.ended_error()
@@ -236,25 +268,44 @@ where
 {
     /// Start driving the protocol over `reader`/`writer`.
     ///
-    /// Spawns the background reader task immediately. The returned handle is
-    /// ready to send via its [`sender`](Self::sender) and receive notifications
-    /// via [`next_notification`](Self::next_notification).
-    pub fn new<R>(reader: R, writer: W) -> Self
+    /// The `policy`, `working_dir` and `audit_sink` are threaded to the reader
+    /// so that inbound `session/request_permission` requests can be answered
+    /// deterministically and audited without blocking the turn driver.
+    pub fn new<R>(
+        reader: R,
+        writer: W,
+        policy: Arc<dyn PermissionPolicy>,
+        working_dir: PathBuf,
+        audit_sink: Arc<dyn AuditSink>,
+    ) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
         let shared = Arc::new(Shared::new());
         let (notif_tx, notif_rx) = mpsc::unbounded_channel();
-        let reader_task = tokio::spawn(read_loop(reader, Arc::clone(&shared), notif_tx));
+
+        let sender = TransportSender {
+            inner: Arc::new(SenderInner {
+                writer: tokio::sync::Mutex::new(writer),
+                shared: Arc::clone(&shared),
+                next_id: Mutex::new(0),
+                policy,
+                working_dir,
+                audit_sink,
+            }),
+        };
+
+        // Give the reader a sender clone so it can answer inbound requests
+        // (permission) and emit audit entries using the injected policy/sink.
+        let reader_task = tokio::spawn(read_loop(
+            reader,
+            Arc::clone(&shared),
+            notif_tx,
+            sender.clone(),
+        ));
 
         Self {
-            sender: TransportSender {
-                inner: Arc::new(SenderInner {
-                    writer: tokio::sync::Mutex::new(writer),
-                    shared,
-                    next_id: Mutex::new(0),
-                }),
-            },
+            sender,
             notifications: notif_rx,
             reader_task: Some(reader_task),
         }
@@ -303,12 +354,14 @@ impl<W> Drop for Transport<W> {
 }
 
 /// The background reader loop: decode newline-delimited JSON-RPC and route it.
-async fn read_loop<R>(
+async fn read_loop<R, W>(
     reader: R,
     shared: Arc<Shared>,
     notif_tx: mpsc::UnboundedSender<SessionNotificationParams>,
+    sender: TransportSender<W>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut lines = BufReader::new(reader).lines();
     loop {
@@ -333,7 +386,7 @@ async fn read_loop<R>(
                 // still caught: its pending requests are woken on EOF
                 // (`AgentExited`).
                 match serde_json::from_str::<IncomingMessage>(trimmed) {
-                    Ok(message) => route_message(message, &shared, &notif_tx),
+                    Ok(message) => route_message(message, &shared, &notif_tx, &sender).await,
                     Err(_) => {
                         eprintln!("[acp] ignoring non-JSON-RPC line: {trimmed}");
                     }
@@ -348,11 +401,14 @@ async fn read_loop<R>(
 }
 
 /// Route one decoded message to the waiting request or the notification channel.
-fn route_message(
+async fn route_message<W>(
     message: IncomingMessage,
     shared: &Arc<Shared>,
     notif_tx: &mpsc::UnboundedSender<SessionNotificationParams>,
-) {
+    sender: &TransportSender<W>,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     match message.classify() {
         IncomingKind::Response { id } => {
             let waiter = shared
@@ -388,9 +444,120 @@ fn route_message(
                 let _ = notif_tx.send(notif);
             }
         }
-        // Inbound server→client requests (e.g. permission prompts) are out of
-        // scope for the MVP turn; we neither answer nor fail on them.
-        IncomingKind::Request => {}
+        IncomingKind::Request => {
+            let req_id = message.id.expect("Request always carries an id");
+            let method = message.method.as_deref().unwrap_or("<unknown>");
+
+            if method == METHOD_SESSION_REQUEST_PERMISSION {
+                // Parse params, invoke policy (with session working dir),
+                // write JSON-RPC success response, and emit audit entry.
+                if let Some(params_val) = message.params {
+                    match serde_json::from_value::<RequestPermissionParams>(params_val) {
+                        Ok(params) => {
+                            let ctx = PermissionRequestContext {
+                                session_id: &params.session_id,
+                                working_dir: &sender.inner.working_dir,
+                                tool_call: &params.tool_call,
+                                options: &params.options,
+                            };
+                            let decision = sender.inner.policy.decide(&ctx);
+
+                            let perm_result = if decision.allow {
+                                if let Some(ref oid) = decision.option_id {
+                                    PermissionResponse {
+                                        outcome: PermissionOutcome::Selected {
+                                            option_id: oid.clone(),
+                                        },
+                                    }
+                                } else {
+                                    PermissionResponse {
+                                        outcome: PermissionOutcome::Cancelled,
+                                    }
+                                }
+                            } else {
+                                PermissionResponse {
+                                    outcome: PermissionOutcome::Cancelled,
+                                }
+                            };
+
+                            let _ = sender.send_response(req_id, perm_result).await;
+
+                            // Build and emit the audit entry to the injected sink.
+                            let tool = ToolRef {
+                                name: params
+                                    .tool_call
+                                    .kind
+                                    .clone()
+                                    .unwrap_or_else(|| "tool".to_string()),
+                                kind: params.tool_call.kind.clone(),
+                                id: params.tool_call.tool_call_id.clone(),
+                                title: params.tool_call.title.clone(),
+                            };
+                            let audit_decision = if decision.allow {
+                                AuditDecision::Allow
+                            } else {
+                                AuditDecision::Deny
+                            };
+                            let entry = AuditEntry {
+                                timestamp: Utc::now(),
+                                run_id: "acp-transport".to_string(),
+                                task_id: None,
+                                session_id: Some(params.session_id.clone()),
+                                tool,
+                                decision: audit_decision,
+                                option_id: decision.option_id.clone(),
+                                policy: PolicyInfo {
+                                    name: sender.inner.policy.name().to_string(),
+                                    reason: decision.reason.clone(),
+                                },
+                                working_dir: sender.inner.working_dir.clone(),
+                            };
+                            sender.inner.audit_sink.record(entry);
+                        }
+                        Err(e) => {
+                            eprintln!("[acp] malformed permission request params: {e}");
+                            let _ = sender
+                                .send_error_response(
+                                    req_id,
+                                    JsonRpcError {
+                                        code: -32602,
+                                        message: format!("invalid params: {e}"),
+                                        data: None,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                } else {
+                    let _ = sender
+                        .send_error_response(
+                            req_id,
+                            JsonRpcError {
+                                code: -32602,
+                                message: "missing params for request_permission".into(),
+                                data: None,
+                            },
+                        )
+                        .await;
+                }
+            } else {
+                // Other inbound requests (tools, etc.): log and reply with
+                // method-not-found so the peer's request never hangs.
+                eprintln!(
+                    "[acp] inbound request for unsupported method {method}; replying with error so caller does not hang"
+                );
+                let _ = sender
+                    .send_error_response(
+                        req_id,
+                        JsonRpcError {
+                            code: -32601,
+                            message: format!("method not found: {method}"),
+                            data: None,
+                        },
+                    )
+                    .await;
+            }
+        }
         // Valid JSON but not a usable JSON-RPC message (no id and no method) —
         // treat as benign noise and skip, consistent with the lenient line
         // handling in `read_loop`.
@@ -403,6 +570,13 @@ mod tests {
     //! Transport-level tests over an in-memory duplex pipe (no subprocess).
 
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use makina_core::governance::{AuditDecision, AuditEntry, AuditSink, NoopAuditSink};
+    use serde_json::{Value, json};
+
+    use crate::permission::WorktreePolicy;
     use crate::protocol::{METHOD_SESSION_UPDATE, SessionUpdate};
 
     /// Build a transport whose peer end is a raw duplex half we can script.
@@ -415,7 +589,14 @@ mod tests {
         let (client_io, peer_io) = tokio::io::duplex(8 * 1024);
         let (client_read, client_write) = tokio::io::split(client_io);
         let (peer_read, peer_write) = tokio::io::split(peer_io);
-        let transport = Transport::new(client_read, client_write);
+        let cwd = PathBuf::from("/test/duplex/workdir");
+        let transport = Transport::new(
+            client_read,
+            client_write,
+            Arc::new(WorktreePolicy::new(cwd.clone())),
+            cwd,
+            Arc::new(NoopAuditSink),
+        );
         (transport, peer_read, peer_write)
     }
 
@@ -544,5 +725,153 @@ mod tests {
         let result = transport.send_request("ping", ()).await.unwrap();
         assert_eq!(result["ok"], true);
         peer.await.unwrap();
+    }
+
+    /// Capturing sink for the permission-response test; records every
+    /// AuditEntry so the test can assert exactly one allow decision was emitted.
+    #[derive(Clone, Default)]
+    struct TestAuditSink {
+        entries: Arc<Mutex<Vec<AuditEntry>>>,
+    }
+
+    impl AuditSink for TestAuditSink {
+        fn record(&self, entry: AuditEntry) {
+            self.entries.lock().unwrap().push(entry);
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_request_mid_turn_is_answered_and_audited() {
+        // In-memory duplex (no subprocess). Scripted peer sends a
+        // session/request_permission while a prompt turn is in flight.
+        let (client_io, peer_io) = tokio::io::duplex(8 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (mut peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        let worktree = PathBuf::from("/tmp/makina-test-worktree-perm");
+        let policy: Arc<dyn PermissionPolicy> = Arc::new(WorktreePolicy::new(worktree.clone()));
+        let sink = Arc::new(TestAuditSink::default());
+        let entries = sink.entries.clone();
+
+        let transport = Transport::new(
+            client_read,
+            client_write,
+            policy,
+            worktree.clone(),
+            sink as Arc<dyn AuditSink>,
+        );
+
+        // Peer script: handshake, start prompt, inject one permission request,
+        // verify the client replied with the allow-once selection, then finish turn.
+        let peer = tokio::spawn(async move {
+            // initialize
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_u64().unwrap();
+            write_line(
+                &mut peer_write,
+                &json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}}).to_string(),
+            )
+            .await;
+
+            // session/new
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_u64().unwrap();
+            write_line(
+                &mut peer_write,
+                &json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"sess-perm-test"}})
+                    .to_string(),
+            )
+            .await;
+
+            // session/prompt (keep pending)
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["method"], "session/prompt");
+            let prompt_id = req["id"].as_u64().unwrap();
+
+            // Mid-turn: send inbound permission request
+            let perm_id = 42u64;
+            let perm_req = json!({
+                "jsonrpc": "2.0",
+                "id": perm_id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "sess-perm-test",
+                    "options": [
+                        {"optionId": "proceed_always", "name": "Always", "kind": "allow_always"},
+                        {"optionId": "proceed_once",  "name": "Allow",  "kind": "allow_once"}
+                    ],
+                    "toolCall": {
+                        "toolCallId": "write_file__42",
+                        "title": "Writing probe.txt"
+                    }
+                }
+            });
+            write_line(&mut peer_write, &perm_req.to_string()).await;
+
+            // Read the response the client (transport) wrote for the perm request
+            let resp_line = read_line(&mut peer_read).await;
+            let resp: Value = serde_json::from_str(&resp_line).unwrap();
+            assert_eq!(resp["jsonrpc"], "2.0");
+            assert_eq!(resp["id"], perm_id);
+            let outcome = &resp["result"]["outcome"];
+            assert_eq!(outcome["outcome"], "selected");
+            assert_eq!(outcome["optionId"], "proceed_once"); // WorktreePolicy picks allow_once
+
+            // Stream one text chunk (so turn has visible progress)
+            let chunk = json!({
+                "jsonrpc": "2.0",
+                "method": METHOD_SESSION_UPDATE,
+                "params": {
+                    "sessionId": "sess-perm-test",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "done" }
+                    }
+                }
+            });
+            write_line(&mut peer_write, &chunk.to_string()).await;
+
+            // Complete the original prompt
+            let done = json!({
+                "jsonrpc": "2.0",
+                "id": prompt_id,
+                "result": { "stopReason": "end_turn" }
+            });
+            write_line(&mut peer_write, &done.to_string()).await;
+        });
+
+        // Drive from client side using the transport directly (handshake + prompt).
+        // The inbound perm request is handled by the background reader while this
+        // prompt request is outstanding.
+        let _init = transport
+            .send_request(
+                "initialize",
+                json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"t","version":"0"}}),
+            )
+            .await
+            .unwrap();
+
+        let _new = transport
+            .send_request("session/new", json!({"cwd": worktree, "mcpServers":[]}))
+            .await
+            .unwrap();
+
+        let prompt_fut = transport.send_request(
+            "session/prompt",
+            json!({"sessionId":"sess-perm-test","prompt":[{"type":"text","text":"work"}]}),
+        );
+
+        let prompt_res = prompt_fut.await.unwrap();
+        assert_eq!(prompt_res["stopReason"], "end_turn");
+
+        peer.await.unwrap();
+
+        // Exactly one audit entry with an allow decision.
+        let captured = entries.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].decision, AuditDecision::Allow);
     }
 }

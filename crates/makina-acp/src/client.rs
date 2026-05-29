@@ -36,7 +36,12 @@ use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
 
+use std::sync::Arc;
+
+use makina_core::governance::NoopAuditSink;
+
 use crate::error::{AcpError, Result};
+use crate::permission::WorktreePolicy;
 use crate::protocol::{
     self, AuthMethod, ContentBlock, Implementation, InitializeParams, InitializeResult,
     NewSessionParams, NewSessionResult, PromptParams, PromptResult, SessionUpdate, StopReason,
@@ -191,9 +196,19 @@ impl AcpClient {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let transport = Transport::new(reader, Box::pin(writer) as BoxedWriter);
+        let cwd = cwd.as_ref().to_path_buf();
+        let policy: Arc<dyn crate::permission::PermissionPolicy> =
+            Arc::new(WorktreePolicy::new(cwd.clone()));
+        let sink: Arc<dyn makina_core::governance::AuditSink> = Arc::new(NoopAuditSink);
+        let transport = Transport::new(
+            reader,
+            Box::pin(writer) as BoxedWriter,
+            policy,
+            cwd.clone(),
+            sink,
+        );
         let mut client = Self::from_parts(None, transport);
-        client.handshake(cwd.as_ref()).await?;
+        client.handshake(&cwd).await?;
         Ok(client)
     }
 
@@ -422,7 +437,11 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Transport<BoxedWriter
 
     let reader = Box::pin(stdout) as Pin<Box<dyn AsyncRead + Send>>;
     let writer = Box::pin(stdin) as BoxedWriter;
-    let transport = Transport::new(reader, writer);
+    let cwd = command.working_dir.clone();
+    let policy: Arc<dyn crate::permission::PermissionPolicy> =
+        Arc::new(WorktreePolicy::new(cwd.clone()));
+    let sink: Arc<dyn makina_core::governance::AuditSink> = Arc::new(NoopAuditSink);
+    let transport = Transport::new(reader, writer, policy, cwd, sink);
     Ok((child, transport))
 }
 

@@ -218,6 +218,30 @@ impl<R: Serialize> OutgoingResponse<R> {
     }
 }
 
+/// An outgoing JSON-RPC 2.0 **error response** (reply to an inbound
+/// server→client request we do not implement). Sending this ensures the
+/// peer's request does not hang forever.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutgoingErrorResponse {
+    /// Always `"2.0"`.
+    pub jsonrpc: &'static str,
+    /// The id of the request this error answers.
+    pub id: u64,
+    /// The JSON-RPC error payload.
+    pub error: JsonRpcError,
+}
+
+impl OutgoingErrorResponse {
+    /// Construct an error response with the JSON-RPC `2.0` tag pre-filled.
+    pub fn new(id: u64, error: JsonRpcError) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            error,
+        }
+    }
+}
+
 // ── ACP method params / results ─────────────────────────────────────────────────
 
 /// `initialize` params (client → agent).

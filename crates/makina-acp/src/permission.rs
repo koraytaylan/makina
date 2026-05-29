@@ -59,6 +59,12 @@ pub trait PermissionPolicy: Send + Sync {
     /// Decide whether to allow the requested operation and, if so, which of
     /// the offered `optionId`s to select.
     fn decide(&self, ctx: &PermissionRequestContext<'_>) -> PermissionDecision;
+
+    /// Stable name used when emitting [`makina_core::governance::AuditEntry`]
+    /// records (e.g. `"WorktreePolicy"`).
+    fn name(&self) -> &str {
+        "PermissionPolicy"
+    }
 }
 
 /// The default MVP policy: auto-allow (picking the offered `allow_once`
@@ -122,6 +128,10 @@ impl PermissionPolicy for WorktreePolicy {
                 ctx.working_dir, self.worktree
             ),
         }
+    }
+
+    fn name(&self) -> &str {
+        "WorktreePolicy"
     }
 }
 
