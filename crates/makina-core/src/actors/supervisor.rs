@@ -314,6 +314,12 @@ impl Supervisor {
                 .worktree_manager
                 .as_ref()
                 .ok_or("supervisor has no worktree manager")?;
+            // TODO(task-25): worktree creation failure leaves the task in Ready with
+            // no worktree to clean up (nothing leaked), but there is no
+            // Ready → Failed FSM path. Task 25 (termination-caps) should add the
+            // Ready --HardError--> Failed transition or handle creation failure
+            // before Dispatched so the task reaches a terminal Failed state rather
+            // than being stuck in Ready.
             mgr.create(&task_id.0)
                 .await
                 .map_err(|e| format!("worktree create failed for {task_id}: {e}"))?
@@ -371,14 +377,35 @@ impl Supervisor {
                 .ok_or("supervisor has no Reviewer ref (call SetSpokes first)")?;
 
             let review_task = self.task_clone(task_id)?;
-            let verdict = reviewer
+            let review_result = reviewer
                 .ask(Review {
                     task: review_task,
                     worktree: worktree.path.clone(),
                 })
                 .send()
-                .await
-                .map_err(|e| format!("reviewer dispatch failed for {task_id}: {e}"))?;
+                .await;
+
+            // On reviewer ask/parse failure, clean up the worktree before
+            // propagating the error to prevent git worktree + branch leaks.
+            //
+            // The task is currently in InReview. We deliberately do NOT attempt
+            // an FSM transition here because InReview --HardError--> Failed is
+            // illegal (only InReview --ReviewCapReached--> Failed exists).
+            //
+            // TODO(task-25): task 25 (termination-caps) owns the
+            // InReview → Failed hard-error path. It should either add the
+            // InReview --HardError--> Failed transition to the FSM, or model
+            // reviewer-side failures via ReviewCapReached, so the task reaches
+            // a proper terminal Failed state instead of being left stuck in
+            // InReview. For now we clean up the resource leak and return the
+            // error without forcing an illegal transition.
+            let verdict = match review_result {
+                Ok(v) => v,
+                Err(e) => {
+                    self.remove_worktree(task_id).await;
+                    return Err(format!("reviewer dispatch failed for {task_id}: {e}"));
+                }
+            };
 
             match verdict {
                 ReviewVerdict::Approve => {
