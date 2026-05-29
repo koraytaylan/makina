@@ -375,52 +375,81 @@ impl CoreApi {
         }
     }
 
-    /// Implement the `OpenRun` command: read → interpret → register → broadcast.
+    /// Implement the `OpenRun` command: prefer the persisted artifact, fall back
+    /// to read → interpret → seed-persist.
     ///
-    /// Lock discipline: the file read and interpretation happen with **no lock
-    /// held**; the registry lock is taken only for the brief insert, then
-    /// dropped before the broadcast.
+    /// # Artifact-first path
+    ///
+    /// 1. Derive the slug from the task-list file stem (no I/O needed).
+    /// 2. Attempt [`crate::persist::load_graph`] for that slug.
+    ///    - `Ok(Some(graph))` → apply [`crate::persist::recover_for_resume`] then
+    ///      `graph.validate()`.  If validate succeeds, register this graph (the
+    ///      `.md` is **not** read — the JSON artifact is the source of truth).
+    ///    - Validate error **or** `Err` from `load_graph` (corrupt/unreadable) →
+    ///      warn and fall through to the fresh path.
+    ///    - `Ok(None)` (no file yet) → fall through to the fresh path.
+    ///
+    /// # Fresh path (fallback)
+    ///
+    /// Read the `.md`, interpret, seed-persist.  The `.md` is only read on this
+    /// path, so a resumed run does not require the file to be present.
+    ///
+    /// # Lock discipline
+    ///
+    /// All I/O (file read, persist load/write, interpret) happens with **no lock
+    /// held**; the registry lock is taken only for the brief insert, then dropped
+    /// before the broadcast.
     async fn open_run(&self, task_list_path: PathBuf) -> Result<CommandOutcome, ApiError> {
-        // 1. Read the task-list file (no lock held — this awaits).
-        let text = tokio::fs::read_to_string(&task_list_path)
-            .await
-            .map_err(|e| ApiError::InvalidCommand {
-                reason: format!(
-                    "could not read task list `{}`: {e}",
-                    task_list_path.display()
-                ),
-            })?;
-
-        // 2. Derive the slug from the file stem (fallback to the whole name).
+        // 1. Derive the slug from the file stem (no I/O — just path manipulation).
         let slug = task_list_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(SLUG_FALLBACK)
             .to_string();
 
-        // 3. Interpret the source into a TaskGraph (no lock held — this awaits).
-        let graph = self
-            .state
-            .interpreter
-            .interpret(&slug, &text)
-            .await
-            .map_err(|e| ApiError::InvalidCommand {
-                reason: format!("could not interpret task list `{slug}`: {e}"),
-            })?;
+        let repo_root = &self.state.worktree_manager.repo_root;
 
-        // 3a. Seed-persist the freshly-interpreted graph so the artifact exists
-        //     immediately (before StartRun).  Best-effort: a failure only warns;
-        //     opening a run must not break because the disk is unwritable.
-        let repo_root = self.state.worktree_manager.repo_root.clone();
-        if let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await {
-            tracing::warn!(
-                slug = %slug,
-                error = %e,
-                "seed-persist failed for freshly-opened run; continuing without artifact",
-            );
-        }
+        // 2. Try the persisted artifact first.
+        let graph = match crate::persist::load_graph(repo_root, &slug).await {
+            Ok(Some(mut loaded)) => {
+                // Apply the resume recovery rule: in-progress/in-review → ready.
+                crate::persist::recover_for_resume(&mut loaded);
+                // Validate structural integrity.
+                match loaded.validate() {
+                    Ok(()) => {
+                        // Artifact is usable — use it and skip the .md entirely.
+                        loaded
+                    }
+                    Err(e) => {
+                        // Corrupt artifact: warn and fall back to a fresh interpret.
+                        tracing::warn!(
+                            slug = %slug,
+                            error = %e,
+                            "persisted artifact failed validation; falling back to fresh interpret",
+                        );
+                        self.interpret_and_seed(&slug, &task_list_path, repo_root)
+                            .await?
+                    }
+                }
+            }
+            Ok(None) => {
+                // No artifact yet — fresh interpret + seed.
+                self.interpret_and_seed(&slug, &task_list_path, repo_root)
+                    .await?
+            }
+            Err(e) => {
+                // Unreadable / corrupt artifact — warn and fall back.
+                tracing::warn!(
+                    slug = %slug,
+                    error = %e,
+                    "failed to load persisted artifact; falling back to fresh interpret",
+                );
+                self.interpret_and_seed(&slug, &task_list_path, repo_root)
+                    .await?
+            }
+        };
 
-        // 4. Allocate an id and register the Run.  Lock → insert → DROP guard
+        // 3. Allocate an id and register the Run.  Lock → insert → DROP guard
         //    before any further await/broadcast.
         let id = self.state.alloc_id();
         {
@@ -440,13 +469,65 @@ impl CoreApi {
             );
         } // guard dropped here
 
-        // 5. Broadcast RunOpened (lock no longer held).
+        // 4. Broadcast RunOpened (lock no longer held).
         let _ = self.state.event_tx.send(Event::RunOpened {
             run: id,
             task_list_path,
         });
 
         Ok(CommandOutcome::RunOpened { run: id })
+    }
+
+    /// Read + interpret the task-list file at `task_list_path` and seed-persist
+    /// the resulting graph.
+    ///
+    /// This is the "fresh path" factored out of [`open_run`] so the artifact-first
+    /// branch can call it as a fallback without duplicating code.  Returns the
+    /// interpreted [`TaskGraph`] ready to register.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::InvalidCommand`] if the file cannot be read or the
+    /// content cannot be interpreted.  Seed-persist failure is best-effort (logs a
+    /// warning but does not fail `open_run`).
+    async fn interpret_and_seed(
+        &self,
+        slug: &str,
+        task_list_path: &std::path::Path,
+        repo_root: &std::path::Path,
+    ) -> Result<TaskGraph, ApiError> {
+        // Read the .md file.
+        let text = tokio::fs::read_to_string(task_list_path)
+            .await
+            .map_err(|e| ApiError::InvalidCommand {
+                reason: format!(
+                    "could not read task list `{}`: {e}",
+                    task_list_path.display()
+                ),
+            })?;
+
+        // Interpret into a fresh TaskGraph.
+        let graph = self
+            .state
+            .interpreter
+            .interpret(slug, &text)
+            .await
+            .map_err(|e| ApiError::InvalidCommand {
+                reason: format!("could not interpret task list `{slug}`: {e}"),
+            })?;
+
+        // Seed-persist the freshly-interpreted graph so the artifact exists
+        // immediately (before StartRun).  Best-effort: a failure only warns;
+        // opening a run must not break because the disk is unwritable.
+        if let Err(e) = crate::persist::persist_graph(&graph, repo_root).await {
+            tracing::warn!(
+                slug = %slug,
+                error = %e,
+                "seed-persist failed for freshly-opened run; continuing without artifact",
+            );
+        }
+
+        Ok(graph)
     }
 
     /// Implement `StartRun`: spawn the Supervisor scheduler in the background.
