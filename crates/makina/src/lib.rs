@@ -23,6 +23,7 @@
 //! through `api.subscribe()` (pushed) and initial snapshots are fetched from
 //! `api.runs()` (pulled once at startup).
 
+pub mod ansi;
 pub mod app;
 pub mod browser;
 pub mod event;
