@@ -388,9 +388,9 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_is_corrupt() {
     let slug = "corrupt-fallback";
 
     // 1. Write garbage to the artifact path (not valid JSON).
-    let tasks_dir = repo_root.join(".tasks");
-    std::fs::create_dir_all(&tasks_dir).expect("create .tasks dir");
     let artifact_path = tasks_path(&repo_root, slug);
+    let tasks_dir = artifact_path.parent().expect("artifact has parent dir");
+    std::fs::create_dir_all(tasks_dir).expect("create tasks dir");
     std::fs::write(&artifact_path, b"{ not json").expect("write corrupt artifact");
     assert!(
         artifact_path.exists(),
@@ -543,9 +543,9 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_fails_validation()
     );
 
     // Write the invalid but parseable JSON to disk.
-    let tasks_dir = repo_root.join(".tasks");
-    std::fs::create_dir_all(&tasks_dir).expect("create .tasks dir");
     let artifact_path = tasks_path(&repo_root, slug);
+    let tasks_dir = artifact_path.parent().expect("artifact has parent dir");
+    std::fs::create_dir_all(tasks_dir).expect("create tasks dir");
     let json =
         serde_json::to_string_pretty(&invalid_graph).expect("invalid_graph must serialize to JSON");
     std::fs::write(&artifact_path, json.as_bytes()).expect("write validate-failing artifact");

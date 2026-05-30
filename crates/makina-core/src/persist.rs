@@ -94,10 +94,10 @@ pub enum PersistError {
 /// # use std::path::Path;
 /// # use makina_core::persist::tasks_path;
 /// let p = tasks_path(Path::new("/repo"), "my-feature");
-/// assert_eq!(p, std::path::PathBuf::from("/repo/.tasks/my-feature.json"));
+/// assert_eq!(p, std::path::PathBuf::from("/repo/.makina/tasks/my-feature.json"));
 /// ```
 pub fn tasks_path(repo_root: &Path, slug: &str) -> PathBuf {
-    repo_root.join(".tasks").join(format!("{slug}.json"))
+    crate::paths::task_graph(repo_root, slug)
 }
 
 /// Returns the path of the temp file used during an atomic write:
@@ -114,7 +114,8 @@ fn temp_path(repo_root: &Path, slug: &str) -> PathBuf {
     let pid = std::process::id();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     repo_root
-        .join(".tasks")
+        .join(".makina")
+        .join("tasks")
         .join(format!(".{slug}.json.tmp.{pid}.{seq}"))
 }
 
@@ -148,7 +149,7 @@ fn temp_path(repo_root: &Path, slug: &str) -> PathBuf {
 ///
 /// Returns [`PersistError`] on serialization or I/O failure.
 pub async fn persist_graph(graph: &TaskGraph, repo_root: &Path) -> Result<(), PersistError> {
-    let tasks_dir = repo_root.join(".tasks");
+    let tasks_dir = repo_root.join(".makina").join("tasks");
 
     // 1. Ensure .tasks/ exists.
     tokio::fs::create_dir_all(&tasks_dir)
@@ -481,9 +482,9 @@ mod tests {
             "temp file must be gone after successful persist_graph"
         );
 
-        // Broader glob check: no .tmp. files anywhere in .tasks/.
-        let tasks_dir = root.join(".tasks");
-        for entry in std::fs::read_dir(&tasks_dir).expect("read .tasks dir") {
+        // Broader glob check: no .tmp. files anywhere in .makina/tasks/.
+        let tasks_dir = root.join(".makina").join("tasks");
+        for entry in std::fs::read_dir(&tasks_dir).expect("read .makina/tasks dir") {
             let name = entry
                 .expect("valid entry")
                 .file_name()
@@ -512,8 +513,8 @@ mod tests {
         let p = tasks_path(Path::new("/some/repo"), "plan-0002");
         assert_eq!(
             p,
-            PathBuf::from("/some/repo/.tasks/plan-0002.json"),
-            "tasks_path must produce repo/.tasks/slug.json"
+            PathBuf::from("/some/repo/.makina/tasks/plan-0002.json"),
+            "tasks_path must produce repo/.makina/tasks/slug.json"
         );
     }
 
