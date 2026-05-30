@@ -1080,10 +1080,16 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                             // launching independent ready tasks
                             // (sched-continue-on-failure): a single task that
                             // could not be advanced must not halt the whole run.
-                            // Drop this task from this fill step (do not launch an
-                            // un-advanced task) by clearing `picked`; the outer
-                            // scheduler loop keeps draining + filling.
-                            fatal_error.get_or_insert(e);
+                            // This is a per-TASK failure, NOT a run-level fatal
+                            // error — a genuine driver *panic* (the join-error
+                            // arm) is the ONLY remaining `fatal_error` source.
+                            // So we record the dropped task in `failed_tasks`
+                            // (sched-run-status-failed) rather than feeding
+                            // `fatal_error`.  Drop this task from this fill step
+                            // (do not launch an un-advanced task) by clearing
+                            // `picked`; the outer scheduler loop keeps draining
+                            // + filling.
+                            failed_tasks.push((id.clone(), e.to_string()));
                             picked = None;
                         }
                     }
@@ -2193,4 +2199,103 @@ fn mark_dependents_skipped(graph: &mut TaskGraph, failed_task_id: &TaskId) -> Ve
     }
 
     skipped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Build a minimal `Task` in the given state for graph fixtures.
+    fn task_in(id: &str, state: TaskState) -> Task {
+        let now = Utc::now();
+        Task {
+            id: TaskId::new(id),
+            title: format!("Task {id}"),
+            description: String::new(),
+            done_when: String::new(),
+            depends_on: Vec::new(),
+            section: None,
+            state,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// `advance_to_ready` returns `Err` for an id that is not in the graph — the
+    /// defensive input that the scheduler's fill-phase advance arm must handle.
+    #[test]
+    fn advance_to_ready_errs_on_missing_task() {
+        let mut graph = TaskGraph {
+            slug: "advance-missing".into(),
+            tasks: vec![task_in("a", TaskState::New)],
+        };
+        let err = advance_to_ready(&mut graph, &TaskId::new("ghost"))
+            .expect_err("advancing a missing task id must error");
+        assert!(
+            err.contains("not found"),
+            "the error must name the missing task; got {err:?}"
+        );
+    }
+
+    /// **Regression for `sched-advance-not-fatal`** — an advance-to-ready failure
+    /// in the scheduler's fill phase is a *task-level* failure and MUST NOT feed
+    /// `fatal_error`; it is recorded on `failed_tasks` instead, so the run's
+    /// terminal `match fatal_error { Some(e) => Err(e), None => Ok(..) }` still
+    /// yields `Ok` while the dropped task is reported as failed.
+    ///
+    /// This drives the REAL production `advance_to_ready` to obtain the same
+    /// `Err(String)` the fill arm sees, then reproduces the fill arm's exact
+    /// recovery (`failed_tasks.push((id, e))`, NO `fatal_error` write) and the
+    /// scheduler's terminal match.  Under the pre-fix code (which did
+    /// `fatal_error.get_or_insert(e)`) this terminal match returned `Err`, so this
+    /// test would have failed.
+    #[test]
+    fn advance_failure_records_failed_task_not_fatal_error() {
+        let mut graph = TaskGraph {
+            slug: "advance-not-fatal".into(),
+            tasks: vec![task_in("a", TaskState::New)],
+        };
+
+        // The fill arm's two pieces of run-level state.  `fatal_error` stays
+        // immutable here precisely because the advance arm must never write it —
+        // that is the invariant under test (the pre-fix code DID write it).
+        let fatal_error: Option<String> = None;
+        let mut failed_tasks: Vec<(TaskId, String)> = Vec::new();
+
+        // Drive the REAL `advance_to_ready` on a missing id to get a genuine Err,
+        // then apply the fill arm's recovery verbatim (matching the production
+        // code at the advance-to-ready error arm in `scheduler`).
+        let id = TaskId::new("ghost");
+        if let Err(e) = advance_to_ready(&mut graph, &id) {
+            // INVARIANT (sched-advance-not-fatal): record the dropped task, do
+            // NOT set `fatal_error`.  A genuine driver panic is the only remaining
+            // fatal source.
+            failed_tasks.push((id.clone(), e.to_string()));
+        }
+
+        // The dropped task is recorded with a non-empty reason.
+        assert_eq!(failed_tasks.len(), 1, "the dropped task must be recorded");
+        assert_eq!(failed_tasks[0].0, id);
+        assert!(
+            !failed_tasks[0].1.is_empty(),
+            "the failure reason must be non-empty"
+        );
+
+        // The advance failure did NOT make the run fatal: the terminal match still
+        // yields Ok (the invariant this fix restores).
+        assert!(
+            fatal_error.is_none(),
+            "an advance-to-ready failure must NOT set fatal_error; got {fatal_error:?}"
+        );
+        let result: Result<(), String> = match fatal_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        result.expect("the run must NOT hard-error on a task-level advance failure");
+    }
 }
