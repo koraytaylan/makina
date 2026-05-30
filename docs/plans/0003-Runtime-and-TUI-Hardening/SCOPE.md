@@ -21,23 +21,29 @@ Exactly the tasks in [TASKS.md](TASKS.md) (sections 0012–0015):
   `Skipped` terminal state; a parallelism root-cause probe.
 - **0015 — TUI presentation & views.** Error/log pane, ANSI/diff exchange
   rendering, mouse scroll, run label, `G`/`R` legend, dependency view.
+- **0016 — Run lifecycle.** Guarantee no orphaned agent processes on any exit
+  (process-group kill + reaper wired into quit/panic/signals); plan-scope the
+  worktree/branch namespace (`{plan_slug}--{task_id}`); make `create` reclaim its
+  own stale slots instead of failing the run.
 
 ## Findings → workstream mapping
 
 | Dogfood finding | Addressed by |
 |---|---|
-| System errors dumped over the frame | `tui-error-pane-*` (0015) + `log-subscriber` (0013) |
+| System errors dumped over the frame | `tui-error-pane-*` (0015) + `log-subscriber-*` (0013) |
 | Exchange pane garbles ANSI/diff output | `tui-ansi-parser` + `tui-diff-coloring` + `tui-exchange-render` (0015) |
 | Sidebar shows bare file stem ("TASKS") | `tui-sidebar-label` (0015) |
 | Mouse scroll switches tasks instead of scrolling | `tui-scroll-state` + `tui-mouse-scroll` (0015) |
 | `G`/`R` columns unexplained | `tui-gr-legend` (0015) |
-| No visible parallelism | `sched-parallelism-instrument`/`-verify` (0014) + `tui-dep-timeline` (0015) |
+| No visible parallelism | `sched-parallelism-*` (0014) + `tui-dep-timeline` (0015) |
 | No dependency display | `tui-dep-list`/`-toggle`/`-tree`/`-timeline` (0015) |
 | One task failure halts the whole run | `fsm-skipped-state` + `sched-skip-dependents` + `sched-continue-on-failure` + `sched-run-status-failed` (0014) |
-| No run logs on disk | `log-run-dir` + `log-subscriber` + `log-per-task-files` + `log-run-metadata` (0013), on `mk-run-id` + `mk-paths-module` (0012) |
+| No run logs on disk | `log-run-dir` + `log-subscriber-*` + `log-per-task-files` + `log-run-metadata-*` (0013), on `mk-run-id` + `mk-paths-module` (0012) |
 | Move `makina.toml` → `.makina/config.toml` | `mk-config-path` + `mk-gitignore` (0012) |
 | *(0002 follow-up)* audit sink blocks the async reader thread | `audit-async-write` (0013) |
 | *(0002 follow-up)* audit registry never evicts | `audit-registry-evict` (0013) |
+| Orphaned agent processes survive app quit | `acp-process-group-kill` + `acp-agent-registry` + `tui-exit-reaps-agents` (0016) |
+| Interrupted run's stale worktree/branch halts the next run | `worktree-plan-scoped-naming` + `worktree-reclaim-on-conflict` (0016) |
 
 VISION principles served: **"work state is a tracked artifact"** (a single,
 legible `.makina/` home with a committed/transient split), **"failures are

@@ -4,9 +4,10 @@
 > and plan 0002. File:line references were re-grounded against the just-merged
 > plan-0002 code (develop @ `e134161`); symbol names are the stable anchors.
 
-Four workstreams: **A. `.makina/` workspace + run identity**, **B. logging &
-diagnostics**, **C. scheduler robustness**, **D. TUI presentation & views**.
-B depends on A (run-id + paths); D's error pane depends on B; the rest are
+Five workstreams: **A. `.makina/` workspace + run identity**, **B. logging &
+diagnostics**, **C. scheduler robustness**, **D. TUI presentation & views**,
+**E. run lifecycle & cleanup**. B depends on A (run-id + paths); D's error pane
+depends on B; E's worktree naming depends on A (run-slug + paths); the rest are
 largely independent.
 
 ---
@@ -164,6 +165,44 @@ non-terminal forever. A normal `Failed` (gate/review cap) and wall-clock-cap do
 
 ---
 
+## E. Run lifecycle & cleanup
+
+### Today
+The ACP client kills only the **direct** child on teardown: `AcpClient::shutdown`
+(`client.rs:451`) and `Drop` (`client.rs:468`) call `child.start_kill()`, and the
+process is spawned with `kill_on_drop(true)` (`client.rs:487`). None of these
+reach grok's **descendants** (its MCP servers / model workers), and `Drop` does
+not run on an out-of-band `SIGINT`/`SIGTERM`/`SIGKILL` of the TUI — so a quit can
+leave live agent processes behind (observed in the dogfood). Separately,
+`WorktreeManager::create` (`worktree.rs:179`) guards against a pre-existing
+worktree path (`:190`) or branch (`:199`) by returning `GitCommandFailed` "rather
+than silently clobbering" — so a worktree+branch left by an interrupted run
+(`task/{id}` + `.worktrees/{id}/`) makes the **next** run fail in setup, which on
+current code halts the whole run.
+
+### No-orphan shutdown
+Spawn each agent as its **own process-group leader** (`process_group(0)`, Unix) so
+one pgid covers grok and every descendant; on teardown send the kill to the
+**negative pgid** (`killpg`, via a new `nix` dep) instead of just the child. A
+process-wide registry of live agent pgids plus a `kill_all_agents()` reaper (in
+`makina-acp`) is the single primitive every exit path calls: the clean `q` quit
+(after cancelling in-flight runs), the TUI panic hook (`tui.rs`), and new
+`SIGINT`/`SIGTERM` handlers (`main.rs`, `tokio::signal`). In-TUI Ctrl-C is already
+a clean quit (`event.rs:337`); the signal handlers cover external termination.
+
+### Plan-scoped worktrees + reclaim-on-conflict
+The worktree/branch namespace becomes plan-scoped: dir
+`.makina/worktrees/{plan_slug}--{task_id}` and branch `task/{plan_slug}--{task_id}`,
+where `plan_slug` is the lowercased-kebab of the task-list's parent dir
+(`0003-runtime-and-tui-hardening`), derived beside `run_slug` and threaded through
+the same `DriverContext` sites as `run_uid`. `--` is the delimiter (kebab parts
+never contain a double hyphen). Because that namespace is now unambiguously
+Makina-owned transient state, `create` is made **idempotent**: on a pre-existing
+slot it reclaims (`remove()` — already idempotent — then re-`add`) and recreates
+**fresh off the current `base_branch`** (reset, not resume), eliminating the
+stale-worktree poisoning. Reclaim is confined to the plan-scoped namespace, so it
+can never touch a user's branch.
+
 ## Decisions & open questions
 
 Locked (see SCOPE for rationale): unified `.makina/` with internal `.gitignore`
@@ -183,3 +222,16 @@ config back-compat fallback to `./makina.toml`; continue-independents +
 - **Logging volume/rotation (deferred):** per-task `.log` files are unbounded
   per run; acceptable for the MVP (transient, gitignored). Rotation/retention
   is a FUTURE concern.
+- **No-orphan mechanism (decided):** process-group spawn + `killpg` + a
+  `kill_all_agents()` reaper wired into every exit path — not bare
+  `kill_on_drop`, which leaves grok's descendants orphaned and never fires on a
+  signal.
+- **Worktree reclaim on conflict (decided):** Option A — **reset**. A
+  pre-existing plan-scoped slot is reclaimed and recreated fresh off the current
+  `base_branch`; the interrupted attempt's (never-merged) work is discarded.
+  Resuming the partial worktree (Option B) was rejected: stale base, possibly
+  dirty/half-written state, and coupling to FSM recovery.
+- **Start-time reclamation (out of scope, by choice):** there is no separate
+  startup sweep. After a hard `kill -9` that bypasses every exit hook, a stray
+  worktree is reclaimed lazily by `create` on the next run of that task — so no
+  poisoning persists, but a sweep is intentionally not built.

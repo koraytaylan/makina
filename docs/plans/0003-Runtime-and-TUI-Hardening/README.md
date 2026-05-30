@@ -6,7 +6,7 @@ agent): the TUI dumped raw errors over the frame, the exchange pane garbled
 agent diffs, a single task failure halted the whole run, parallelism wasn't
 visible, and runtime state was scattered at the repo root with no run logs.
 
-It does four things, in dependency order:
+It does five things, in dependency order:
 
 1. **Unify runtime state under `.makina/`** — relocate config, the task-graph
    artifact, worktrees, and the audit ledger into one repo-local `.makina/`
@@ -22,6 +22,9 @@ It does four things, in dependency order:
    scrolling, a meaningful run label, a `G`/`R` legend, and a
    list/tree/timeline dependency view (the timeline doubles as parallelism
    observability).
+5. **Harden the run lifecycle** — guarantee no orphaned agent processes when the
+   app quits, plan-scope the worktree/branch namespace, and let `create` reclaim
+   its own stale worktrees so an interrupted run never poisons the next one.
 
 ## Sections
 
