@@ -359,6 +359,12 @@ pub struct RunReport {
     /// `(task_id, final_state)` for every task driven to a terminal state during
     /// this run, in driver-completion order.
     pub outcomes: Vec<(TaskId, TaskState)>,
+    /// `(task_id, reason)` for every task that reached a `Failed` terminal during
+    /// this run (a completed-but-failed run keeps going — see
+    /// [`scheduler`] — so the report records *which* tasks failed and *why*).
+    /// The `String` is a short failure reason (a driver hard-error message, or a
+    /// synthesized cap literal such as `"wall-clock-cap-reached"`).
+    pub failed_tasks: Vec<(TaskId, String)>,
 }
 
 // ── DevelopGateOutcome ──────────────────────────────────────────────────────────
@@ -986,6 +992,11 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
     let mut in_flight: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
 
     let mut outcomes: Vec<(TaskId, TaskState)> = Vec::new();
+    // `(task_id, reason)` for every task that reaches a `Failed` terminal.  A
+    // completed-but-failed run is NOT a hard error (sched-continue-on-failure):
+    // the run keeps going, but the report records which tasks failed and why so
+    // `RunStatus::Failed` can be reported without halting (sched-run-status-failed).
+    let mut failed_tasks: Vec<(TaskId, String)> = Vec::new();
     // A genuine RUN-level fatal error (a driver-future panic; or, defensively, a
     // graph-advance failure).  A per-TASK failure is NOT fatal
     // (sched-continue-on-failure): it is recorded as a `Failed` outcome and the
@@ -1147,10 +1158,23 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // wall-clock arms, transitively `Skipped` its dependents so they do
                 // not dangle non-terminal (a non-`Done` dep never unlocks them).
                 if state == TaskState::Failed {
-                    let skipped = {
+                    // Derive WHICH cap fired from the task's iteration counts under
+                    // the lock so the report records *why* it failed
+                    // (sched-run-status-failed): a task that went through review
+                    // (`review_iterations > 0`) surfaced its terminal `Failed` via
+                    // the reviewer cap; otherwise the gate-iteration cap fired.
+                    let (skipped, reason) = {
                         let mut graph = ctx.graph.lock().await;
-                        mark_dependents_skipped(&mut graph, &id)
+                        let reviewed = review_iterations_locked(&graph, &id).unwrap_or(0) > 0;
+                        let reason = if reviewed {
+                            "review-cap-reached".to_string()
+                        } else {
+                            "gate-cap-reached".to_string()
+                        };
+                        let skipped = mark_dependents_skipped(&mut graph, &id);
+                        (skipped, reason)
                     };
+                    failed_tasks.push((id.clone(), reason));
                     if !skipped.is_empty() {
                         ctx.persist().await;
                         for skipped_id in skipped {
@@ -1161,7 +1185,7 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 }
                 // A Done task may have unlocked dependents → loop to fill again.
             }
-            Some(Ok((id, Some(Err(_e))))) => {
+            Some(Ok((id, Some(Err(e))))) => {
                 // Hard error in a driver: the driver already moved its task to a
                 // terminal state (Failed) and tore down its resources where
                 // possible.  Read + emit that terminal state so the TUI reflects
@@ -1186,8 +1210,12 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // its dependents `Skipped`, so the scheduler keeps launching the
                 // remaining independent ready tasks and the run completes (a
                 // completed-but-failed run, not a hard run-level error).  The
-                // driver error (`_e`) is intentionally dropped — only a genuine
-                // driver *panic* (the join-error arm) remains fatal.
+                // driver error `e` is no longer fatal, but it IS recorded as the
+                // failure reason on `failed_tasks` (sched-run-status-failed) — only
+                // a genuine driver *panic* (the join-error arm) remains fatal.
+                if terminal == TaskState::Failed {
+                    failed_tasks.push((id.clone(), e));
+                }
                 outcomes.push((id, terminal));
                 for skipped_id in skipped {
                     ctx.emit_task_state(&skipped_id, TaskState::Skipped);
@@ -1229,6 +1257,13 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // (best-effort).
                 ctx.persist().await;
                 ctx.emit_task_state(&id, final_state);
+                // Cap failures carry no driver reason string, so synthesize the
+                // literal for this arm (sched-run-status-failed).  Guard on
+                // `Failed` so a benign race that landed the task on another
+                // terminal does not record a spurious wall-clock reason.
+                if final_state == TaskState::Failed {
+                    failed_tasks.push((id.clone(), "wall-clock-cap-reached".to_string()));
+                }
                 outcomes.push((id, final_state));
                 for skipped_id in skipped {
                     ctx.emit_task_state(&skipped_id, TaskState::Skipped);
@@ -1256,7 +1291,10 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
 
     match fatal_error {
         Some(e) => Err(e),
-        None => Ok(RunReport { outcomes }),
+        None => Ok(RunReport {
+            outcomes,
+            failed_tasks,
+        }),
     }
 }
 

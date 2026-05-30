@@ -43,6 +43,7 @@ use futures::stream;
 
 use makina_core::actors::{
     RunReadyTasks, RunReport, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs,
+    TaskGraphSnapshot,
 };
 use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
@@ -405,6 +406,142 @@ async fn run_continues_after_one_independent_fails() {
             .contains(&(TaskId::new("b"), TaskState::Failed)),
         "b must be Failed in outcomes; got {:?}",
         report.outcomes
+    );
+
+    // The completed-but-failed run records WHICH task failed and WHY
+    // (sched-run-status-failed): `failed_tasks` carries the failed id with a
+    // non-empty failure reason (here the propagated driver hard-error message).
+    let failed = report
+        .failed_tasks
+        .iter()
+        .find(|(id, _)| *id == TaskId::new("b"))
+        .unwrap_or_else(|| {
+            panic!(
+                "b must appear in failed_tasks with a reason; got {:?}",
+                report.failed_tasks
+            )
+        });
+    assert!(
+        !failed.1.is_empty(),
+        "the failed task's reason must be non-empty; got {:?}",
+        failed
+    );
+    // The two independents did NOT fail, so they must not appear in failed_tasks.
+    assert!(
+        !report
+            .failed_tasks
+            .iter()
+            .any(|(id, _)| *id == TaskId::new("a") || *id == TaskId::new("c")),
+        "only the failed task may appear in failed_tasks; got {:?}",
+        report.failed_tasks
+    );
+
+    root.kill();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test 1b: a failed task records its reason while its dependent is Skipped
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// **A `Failed` run status is reported without halting** (sched-run-status-failed)
+/// — with two independents (one of which fails) and a dependent of the failed
+/// task, the completed-but-failed run records the failed task in
+/// `report.failed_tasks` with a **non-empty reason**, while `report.outcomes`
+/// shows the surviving independent as `Done`, the failed task as `Failed`, and
+/// its dependent as `Skipped` (the dependent never unlocks because its
+/// prerequisite is not `Done`).  The dependent's `Skipped` terminal is also
+/// visible in the final graph snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_task_reason_recorded_while_dependent_is_skipped() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // `b` fails; `a` succeeds + approves.  `d` depends on the failing `b`, so it
+    // must be transitively Skipped.
+    let backend = FailOneBackend::new("b", r#"{"verdict":"approve"}"#);
+
+    let (root, supervisor_ref) = build_actor_tree(
+        repo_root.clone(),
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config(2),
+    )
+    .await;
+
+    // Two independent ready tasks (a, b) plus d depending on the failing b.
+    supervisor_ref
+        .ask(SetTaskGraph(TaskGraph {
+            slug: "failed-reason-dependent-skipped".into(),
+            tasks: vec![task("a", &[]), task("b", &[]), task("d", &["b"])],
+        }))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    // The run must NOT hard-error even though `b` fails.
+    let report = run_with_timeout(&supervisor_ref).await;
+
+    // The surviving independent reached `Done`; the failed one is `Failed`.
+    assert!(
+        report
+            .outcomes
+            .contains(&(TaskId::new("a"), TaskState::Done)),
+        "a must be Done in outcomes; got {:?}",
+        report.outcomes
+    );
+    assert!(
+        report
+            .outcomes
+            .contains(&(TaskId::new("b"), TaskState::Failed)),
+        "b must be Failed in outcomes; got {:?}",
+        report.outcomes
+    );
+    // The dependent of the failed task must be Skipped.
+    assert!(
+        report
+            .outcomes
+            .contains(&(TaskId::new("d"), TaskState::Skipped)),
+        "d (dependent of failed b) must be Skipped in outcomes; got {:?}",
+        report.outcomes
+    );
+
+    // `failed_tasks` records the failed task with a non-empty reason; the Skipped
+    // dependent and the surviving independent are NOT recorded as failures.
+    let failed = report
+        .failed_tasks
+        .iter()
+        .find(|(id, _)| *id == TaskId::new("b"))
+        .unwrap_or_else(|| {
+            panic!(
+                "b must appear in failed_tasks with a reason; got {:?}",
+                report.failed_tasks
+            )
+        });
+    assert!(
+        !failed.1.is_empty(),
+        "the failed task's reason must be non-empty; got {:?}",
+        failed
+    );
+    assert!(
+        !report
+            .failed_tasks
+            .iter()
+            .any(|(id, _)| *id == TaskId::new("a") || *id == TaskId::new("d")),
+        "only the failed task may appear in failed_tasks; got {:?}",
+        report.failed_tasks
+    );
+
+    // The dependent's Skipped terminal is also visible in the final graph.
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask must not fail")
+        .expect("graph should be Some");
+    let d = snapshot.get(&TaskId::new("d")).expect("task d present");
+    assert_eq!(
+        d.state,
+        TaskState::Skipped,
+        "d must end Skipped in the final graph"
     );
 
     root.kill();
