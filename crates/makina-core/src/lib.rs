@@ -20,6 +20,7 @@ pub mod orchestrator;
 pub mod paths;
 pub mod persist;
 pub mod roles;
+pub mod run_metadata;
 pub mod state_machine;
 pub mod supervision;
 pub mod task;
