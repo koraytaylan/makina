@@ -111,6 +111,35 @@ fn apply_sgr(mut style: Style, params: &str) -> Style {
     style
 }
 
+/// Return the base [`Style`] for a unified-diff `line`, based on its prefix.
+///
+/// The line text is *never* modified — only its leading character(s) are
+/// inspected — so indentation and column alignment are preserved by
+/// construction.  The mapping is:
+///
+/// * a line starting with `+` (but not the `+++` file header) → green;
+/// * a line starting with `-` (but not the `---` file header) → red;
+/// * a line starting with `@@` (a hunk header) → cyan;
+/// * anything else (context lines, `+++`/`---` file headers) → [`None`].
+///
+/// The returned style carries only a foreground colour, acting as a *base*
+/// layer: consumers overlay [`parse_ansi`] SGR spans on top, so embedded ANSI
+/// styling wins where present and this diff colour applies otherwise.
+pub fn diff_line_style(line: &str) -> Option<Style> {
+    if line.starts_with("@@") {
+        Some(Style::default().fg(Color::Cyan))
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        // File headers are not added/removed lines.
+        None
+    } else if line.starts_with('+') {
+        Some(Style::default().fg(Color::Green))
+    } else if line.starts_with('-') {
+        Some(Style::default().fg(Color::Red))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +189,18 @@ mod tests {
             spans.iter().all(|s| !s.text.contains('\x1b')),
             "no AnsiSpan.text may contain a literal escape byte"
         );
+    }
+
+    #[test]
+    fn diff_line_style_colors_prefixes() {
+        assert_eq!(diff_line_style("+added").unwrap().fg, Some(Color::Green));
+        assert_eq!(diff_line_style("-removed").unwrap().fg, Some(Color::Red));
+        assert_eq!(
+            diff_line_style("@@ -1 +1 @@").unwrap().fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(diff_line_style("  context"), None);
+        // `+++`/`---` are file headers, not added/removed lines.
+        assert_eq!(diff_line_style("+++ b/file"), None);
     }
 }
