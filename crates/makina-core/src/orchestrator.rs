@@ -72,6 +72,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -87,6 +88,7 @@ use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::interpreter::TaskListInterpreter;
 use crate::paths;
+use crate::run_metadata::{RunMetadata, write_run_metadata};
 use crate::task::TaskGraph;
 use crate::worktree::WorktreeManager;
 
@@ -214,6 +216,14 @@ struct RunEntry {
     /// survives across processes.  Surfaced read-only on [`RunView::run_uid`] and
     /// threaded into the audit ledger.
     run_uid: String,
+    /// Plan-scoped, human-facing slug derived from the task-list path at open.
+    /// Cached here so run finalization can stamp it into `run.json` without
+    /// re-deriving it from the path.
+    run_slug: String,
+    /// When this Run transitioned to [`RunStatus::Running`] (set in
+    /// [`CoreApi::start_run`]).  `None` until the run is started; carried into the
+    /// finalization-time [`RunMetadata`].
+    started_at: Option<DateTime<Utc>>,
     /// The interpreted task graph, shared with the background scheduler.  Reads
     /// (`run`/`runs`) lock it briefly to snapshot; the scheduler mutates it as
     /// tasks progress.
@@ -336,8 +346,10 @@ impl CoreState {
     /// registry's snapshot status consistent with what the TUI was told.
     async fn finalize_run_status(&self, run: RunId) {
         // Snapshot the graph handle + whether this run was cancelled, under the
-        // registry lock; drop the guard before awaiting the graph lock.
-        let (graph, cancelled) = {
+        // registry lock; drop the guard before awaiting the graph lock.  Also
+        // snapshot the run's identity (run_uid/run_slug/started_at) so the
+        // finalization-time `run.json` can be built without re-taking the lock.
+        let (graph, cancelled, run_uid, run_slug, started_at) = {
             let runs = self.runs.lock().expect("runs registry mutex poisoned");
             match runs.get(&run.0) {
                 Some(entry) => {
@@ -346,7 +358,13 @@ impl CoreState {
                         .as_ref()
                         .map(|h| h.cancel.is_cancelled())
                         .unwrap_or(false);
-                    (Arc::clone(&entry.graph), cancelled)
+                    (
+                        Arc::clone(&entry.graph),
+                        cancelled,
+                        entry.run_uid.clone(),
+                        entry.run_slug.clone(),
+                        entry.started_at,
+                    )
                 }
                 None => return, // run was removed; nothing to finalize.
             }
@@ -368,16 +386,27 @@ impl CoreState {
             }
         }; // graph guard dropped before re-taking the registry lock.
 
-        let mut runs = self.runs.lock().expect("runs registry mutex poisoned");
-        if let Some(entry) = runs.get_mut(&run.0) {
-            // Only finalize if the run is still in the executing state we set on
-            // start (Running).  A concurrent Pause/Cancel/Start may have moved it
-            // on; respect that.
-            if entry.status == RunStatus::Running {
-                entry.status = status;
+        {
+            let mut runs = self.runs.lock().expect("runs registry mutex poisoned");
+            if let Some(entry) = runs.get_mut(&run.0) {
+                // Only finalize if the run is still in the executing state we set
+                // on start (Running).  A concurrent Pause/Cancel/Start may have
+                // moved it on; respect that.
+                if entry.status == RunStatus::Running {
+                    entry.status = status.clone();
+                }
+                // The scheduler has finished; the handle is spent.
+                entry.handle = None;
             }
-            // The scheduler has finished; the handle is spent.
-            entry.handle = None;
+        } // registry guard dropped before the best-effort async write.
+
+        // Persist the run's identity + lifecycle window to `run.json`,
+        // best-effort.  A failure here must never propagate or abort the run —
+        // mirror the seed-persist warn-only pattern in `interpret_and_seed`.
+        let started_at = started_at.unwrap_or_else(Utc::now);
+        let meta = RunMetadata::new(run_uid.clone(), run_slug, status, started_at, Utc::now());
+        if let Err(e) = write_run_metadata(&meta, &self.worktree_manager.repo_root).await {
+            tracing::warn!(run_uid = %run_uid, error = %e, "run.json write failed");
         }
     }
 }
@@ -547,6 +576,8 @@ impl CoreApi {
                 RunEntry {
                     task_list_path: task_list_path.clone(),
                     run_uid,
+                    run_slug: slug.clone(),
+                    started_at: None,
                     graph: Arc::new(AsyncMutex::new(graph)),
                     status: RunStatus::Pending,
                     handle: None,
@@ -650,6 +681,8 @@ impl CoreApi {
                 pause: Arc::clone(&pause),
             });
             entry.status = RunStatus::Running;
+            // Stamp the run's start instant for the finalization-time `run.json`.
+            entry.started_at = Some(Utc::now());
 
             // Derive the slug here — inside the same lock — so we don't need a
             // second lock acquisition below. Uses the same plan-scoped derivation

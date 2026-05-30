@@ -58,6 +58,31 @@ impl RunMetadata {
             ended_at,
         }
     }
+
+    /// The persistent, sortable 26-char run identity (the ULID minted at open).
+    pub fn run_uid(&self) -> &str {
+        &self.run_uid
+    }
+
+    /// The human-facing run slug (e.g. the plan slug the run was opened from).
+    pub fn run_slug(&self) -> &str {
+        &self.run_slug
+    }
+
+    /// The terminal status recorded for the run.
+    pub fn status(&self) -> &RunStatus {
+        &self.status
+    }
+
+    /// When the run transitioned to `Running`.
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+
+    /// When the run reached its terminal status.
+    pub fn ended_at(&self) -> DateTime<Utc> {
+        self.ended_at
+    }
 }
 
 /// Best-effort writer for [`RunMetadata`].
