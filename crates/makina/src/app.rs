@@ -200,6 +200,9 @@ pub enum AppEvent {
     Resize(u16, u16),
     /// Tab key — cycle focus between [`Panel::Sidebar`] and [`Panel::Main`].
     FocusNext,
+    /// `v` / `V` — cycle the dependency view between
+    /// [`DependencyViewMode::Off`], `List`, `Tree`, and `Timeline`.
+    CycleDependencyView,
     /// Move the sidebar selection one row up (`↑` / `k`).
     SelectUp,
     /// Move the sidebar selection one row down (`↓` / `j`).
@@ -520,6 +523,15 @@ impl App {
                 self.focused_panel = match self.focused_panel {
                     Panel::Sidebar => Panel::Main,
                     Panel::Main => Panel::Sidebar,
+                };
+                true
+            }
+            AppEvent::CycleDependencyView => {
+                self.dependency_view = match self.dependency_view {
+                    DependencyViewMode::Off => DependencyViewMode::List,
+                    DependencyViewMode::List => DependencyViewMode::Tree,
+                    DependencyViewMode::Tree => DependencyViewMode::Timeline,
+                    DependencyViewMode::Timeline => DependencyViewMode::Off,
                 };
                 true
             }
@@ -882,6 +894,20 @@ mod tests {
         assert_eq!(app.focused_panel, Panel::Main);
         app.update(AppEvent::FocusNext);
         assert_eq!(app.focused_panel, Panel::Sidebar);
+    }
+
+    #[test]
+    fn dependency_view_cycles() {
+        let mut app = make_app();
+        assert_eq!(app.dependency_view, DependencyViewMode::Off);
+        app.update(AppEvent::CycleDependencyView);
+        assert_eq!(app.dependency_view, DependencyViewMode::List);
+        app.update(AppEvent::CycleDependencyView);
+        assert_eq!(app.dependency_view, DependencyViewMode::Tree);
+        app.update(AppEvent::CycleDependencyView);
+        assert_eq!(app.dependency_view, DependencyViewMode::Timeline);
+        app.update(AppEvent::CycleDependencyView);
+        assert_eq!(app.dependency_view, DependencyViewMode::Off);
     }
 
     #[test]

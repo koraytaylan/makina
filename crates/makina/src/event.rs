@@ -404,6 +404,8 @@ fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
             KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::Quit,
             KeyCode::Esc => AppEvent::Quit,
             KeyCode::Tab => AppEvent::FocusNext,
+            // Cycle the dependency view (Off → List → Tree → Timeline → Off).
+            KeyCode::Char('v') | KeyCode::Char('V') => AppEvent::CycleDependencyView,
             // Toggle the error pane open/closed.
             KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
             // Open the file browser to pick a task list.
@@ -498,6 +500,14 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(ev, false),
             AppEvent::FocusNext
+        ));
+    }
+
+    #[test]
+    fn v_translates_to_cycle_dependency_view() {
+        assert!(matches!(
+            translate_terminal_event(key_press(KeyCode::Char('v'), KeyModifiers::NONE), false),
+            AppEvent::CycleDependencyView
         ));
     }
 
