@@ -86,6 +86,7 @@ use crate::audit::{AuditRegistry, NoopAuditRegistry};
 use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::interpreter::TaskListInterpreter;
+use crate::paths;
 use crate::task::TaskGraph;
 use crate::worktree::WorktreeManager;
 
@@ -671,6 +672,18 @@ impl CoreApi {
             pause,
             cancel,
         };
+
+        // Create the per-run logs directory up front (best-effort). `start_run`
+        // is synchronous, so use `std::fs::create_dir_all` (via the paths
+        // helper), not `tokio::fs`. On failure we warn and continue — never
+        // abort the run. Mirrors the best-effort dir-create+warn in `audit.rs`.
+        if let Err(e) = paths::run_logs_dir(&self.state.worktree_manager.repo_root, &run_uid) {
+            tracing::warn!(
+                run_uid = %run_uid,
+                error = %e,
+                "failed to create per-run logs dir; continuing"
+            );
+        }
 
         // Clone the static execution deps + the shared state for the background
         // task (so it can finalize the registry status when the scheduler ends).

@@ -86,6 +86,19 @@ pub fn task_log(repo_root: &Path, run_id: &str, task_slug: &str) -> PathBuf {
         .join(format!("{task_slug}.log"))
 }
 
+/// Creates (if needed) and returns the per-run log directory:
+/// `{repo_root}/.makina/runs/{run_id}/logs`.
+///
+/// Unlike the other helpers in this module — which are pure, no-I/O path
+/// builders ([`run_dir`], [`audit_log`], [`task_log`]) — this function performs
+/// I/O: it `create_dir_all`s the directory before returning it. Keep this the
+/// one clearly-separate I/O helper here.
+pub fn run_logs_dir(repo_root: &Path, run_id: &str) -> std::io::Result<PathBuf> {
+    let dir = run_dir(repo_root, run_id).join("logs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Returns the worktree directory for a task:
 /// `{repo_root}/.makina/worktrees/{task_id}`.
 ///
@@ -151,5 +164,24 @@ mod tests {
             worktree(Path::new("/repo"), "task-a"),
             PathBuf::from("/repo/.makina/worktrees/task-a")
         );
+    }
+
+    #[test]
+    fn run_logs_dir_creates_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let repo_root = tmp.path();
+        let run_id = "01ABC";
+
+        let dir = run_logs_dir(repo_root, run_id).expect("first run_logs_dir call");
+        assert!(
+            dir.ends_with(".makina/runs/01ABC/logs"),
+            "returned path should end with .makina/runs/{run_id}/logs, got {}",
+            dir.display()
+        );
+        assert!(dir.is_dir(), "directory should exist after the call");
+
+        // Second call on the same path must also succeed (idempotent).
+        let dir2 = run_logs_dir(repo_root, run_id).expect("second run_logs_dir call");
+        assert_eq!(dir, dir2);
     }
 }
