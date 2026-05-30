@@ -777,6 +777,40 @@ pub async fn run_graph(
     run_slug: String,
     run_uid: String,
 ) -> Result<RunReport, String> {
+    // Open the run-scoped tracing span so every event emitted while driving this
+    // graph carries the `run_uid` key. The `makina` binary's per-run file layer
+    // reads this field to route events to `.makina/runs/{run_uid}/logs/run.log`
+    // (task log-subscriber-file); under any other subscriber it is just an extra
+    // field. We `.instrument()` the whole async body (rather than holding an
+    // `.entered()` guard) so the future stays `Send` across `.await` points —
+    // `EnteredSpan` is `!Send` and this future is `tokio::spawn`ed.
+    use tracing::Instrument as _;
+    let run_span = tracing::info_span!("run_graph", run_uid = %run_uid);
+    run_graph_inner(
+        graph,
+        worktree_manager,
+        config,
+        backend,
+        control,
+        audit_registry,
+        run_slug,
+        run_uid,
+    )
+    .instrument(run_span)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_graph_inner(
+    graph: Arc<Mutex<TaskGraph>>,
+    worktree_manager: WorktreeManager,
+    config: Config,
+    backend: Arc<dyn AgentBackend>,
+    control: RunControl,
+    audit_registry: Arc<dyn AuditRegistry>,
+    run_slug: String,
+    run_uid: String,
+) -> Result<RunReport, String> {
     // Announce the run is now executing.
     control.emit(api::Event::RunStatusChanged {
         run: control.run,

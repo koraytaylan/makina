@@ -53,6 +53,13 @@ thiserror = "2.0"
 # Structured logging / diagnostics
 tracing = "0.1"
 
+# Tracing subscriber + non-blocking file appender (per-run file log layer).
+# The TUI binary installs the subscriber once at startup; the custom file layer
+# routes each event to `.makina/runs/{run_uid}/logs/` by the current span's
+# `run_uid` field (see `crates/makina/src/log.rs`).
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
+tracing-appender = "0.2"
+
 # Internal crates
 makina-core = { path = "crates/makina-core" }
 makina-acp = { path = "crates/makina-acp" }

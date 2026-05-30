@@ -1,16 +1,9 @@
-//! Makina — multi-agent software-factory orchestrator.
+//! Makina — multi-agent software-factory orchestrator (binary entry point).
 //!
-//! # Crate layout
-//!
-//! | Module | Responsibility |
-//! |--------|----------------|
-//! | `main` | Wires the components; no logic. |
-//! | `tui` | Terminal lifecycle: raw mode, alternate screen, panic hook. |
-//! | `event` | Async event loop: merges terminal input, periodic tick, and api events. |
-//! | `app` | All TUI state + pure `update(AppEvent)` function. |
-//! | `browser` | File-browser view state + pure navigation (no IO). |
-//! | `ui` | Pure rendering: `App` → `Frame` (uses `ratatui::TestBackend` in tests). |
-//! | `placeholder` | **test-only** `Api` double (`#[cfg(test)]`); the binary uses the real [`makina_core::orchestrator::CoreApi`]. |
+//! This file is the thin `makina` binary: it wires the components together and
+//! contains no logic. The TUI modules (`app`, `browser`, `event`, `tui`, `ui`)
+//! and the per-run file log layer (`log`) live in the sibling `makina` **library**
+//! crate (`src/lib.rs`) so integration tests can exercise them directly.
 //!
 //! # Architecture
 //!
@@ -25,16 +18,9 @@
 //! CI cannot drive an interactive terminal; the test suite uses `ratatui::TestBackend`
 //! for rendering tests and unit-tests for update logic.
 
-mod app;
-mod browser;
-mod event;
-#[cfg(test)]
-mod placeholder;
-mod tui;
-mod ui;
-
 use std::sync::Arc;
 
+use makina::{app, event, log, tui};
 use makina_acp::AcpBackend;
 use makina_core::audit::JsonlAuditSink;
 use makina_core::backend::AgentBackend;
@@ -76,6 +62,23 @@ async fn main() {
     //    register each task's worktree context before dispatching a driver.
     // This guarantees the sink is the ONLY writer under `.tasks/{slug}/audit.jsonl`.
     let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.clone()));
+
+    // ── Tracing subscriber: per-run file log layer (task log-subscriber-file) ──
+    // Installed ONCE here, after the audit-sink setup and before the event loop.
+    // Run ids are allocated lazily per OpenRun and many runs can be open at once,
+    // so the file destination cannot be a static path: the custom `RunFileLayer`
+    // resolves it per event from the current span's `run_uid` field, appending to
+    // `.makina/runs/{run_uid}/logs/run.log`. Events carry the key because
+    // `run_graph` opens a `tracing::info_span!(run_uid = …)`. There is no prior
+    // `tracing_subscriber` usage in the repo; this is the first install.
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        tracing_subscriber::registry()
+            .with(log::RunFileLayer::new(repo_root.clone()))
+            .init();
+    }
+
     let backend: Arc<dyn AgentBackend> =
         Arc::new(
             AcpBackend::new(config.backend.command.clone(), config.backend.args.clone())
