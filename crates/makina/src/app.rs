@@ -261,6 +261,16 @@ pub enum AppEvent {
     /// feedback (success or failure) instead of a silently-dropped result
     /// (resolves the task-28 outcome-surfacing note).
     StatusMessage(String),
+
+    /// A log record arrived on the tracing→TUI channel and should be appended
+    /// to the error pane.
+    ///
+    /// Emitted by the event loop's `log_rx` drain arm (task
+    /// `tui-error-pane-channel-wire`) after converting a
+    /// [`makina_core::log_record::LogRecord`] into an [`ErrorMessage`].
+    /// `update` pushes it via [`App::push_error`] (respecting
+    /// [`ERROR_MESSAGES_CAP`]).
+    ErrorMessageArrived { msg: ErrorMessage },
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -573,6 +583,11 @@ impl App {
 
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
+                true
+            }
+
+            AppEvent::ErrorMessageArrived { msg } => {
+                self.push_error(msg);
                 true
             }
         }

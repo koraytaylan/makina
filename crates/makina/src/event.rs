@@ -39,9 +39,28 @@ use makina_core::log_record::LogRecord;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::app::{App, AppEvent};
+use crate::app::{App, AppEvent, ErrorLevel, ErrorMessage};
 use crate::tui::Tui;
 use crate::ui;
+
+/// Convert a tracing→TUI [`LogRecord`] into the TUI's [`ErrorMessage`] shape.
+///
+/// Maps the verbosity level (`ERROR`→[`ErrorLevel::Error`], `WARN`→
+/// [`ErrorLevel::Warn`], anything quieter→[`ErrorLevel::Info`]), carries the
+/// flattened message text across, and converts the wall-clock `DateTime<Utc>`
+/// into a [`std::time::SystemTime`] for the error pane.
+fn error_message_from_log_record(rec: LogRecord) -> ErrorMessage {
+    let level = match rec.level {
+        tracing::Level::ERROR => ErrorLevel::Error,
+        tracing::Level::WARN => ErrorLevel::Warn,
+        _ => ErrorLevel::Info,
+    };
+    ErrorMessage {
+        timestamp: rec.timestamp.into(),
+        level,
+        text: rec.message,
+    }
+}
 
 // ── Tick interval ─────────────────────────────────────────────────────────────
 
@@ -58,13 +77,12 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// should call `tui.restore()` (though the [`Drop`] impl on `Tui` is a safety
 /// net).
 ///
-/// `_log_rx` is the receiving half of the bounded tracing→TUI channel
+/// `log_rx` is the receiving half of the bounded tracing→TUI channel
 /// (task `log-subscriber-tui-channel`): the `TuiLogLayer` `try_send`s a
-/// [`LogRecord`] per event onto it. It is threaded in here so plan-0015's
-/// `tui-error-pane-channel-wire` can add a drain arm to the `tokio::select!`
-/// below; until then it is held (the leading underscore marks it as not-yet
-/// consumed) so the channel sender stays alive and records are not lost to a
-/// closed receiver.
+/// [`LogRecord`] per event onto it. A dedicated `tokio::select!` arm below
+/// drains it, converts each record into an [`ErrorMessage`] via
+/// [`error_message_from_log_record`], and feeds it to `update` as
+/// [`AppEvent::ErrorMessageArrived`] so it lands in the error pane.
 ///
 /// # Errors
 ///
@@ -72,7 +90,7 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 pub async fn run(
     tui: &mut Tui,
     app: &mut App,
-    _log_rx: mpsc::Receiver<LogRecord>,
+    mut log_rx: mpsc::Receiver<LogRecord>,
 ) -> std::io::Result<()> {
     // Subscribe to api events once at startup.
     let mut api_stream = app.api.subscribe();
@@ -113,6 +131,12 @@ pub async fn run(
                     // api stream ended → orchestrator shut down; quit cleanly.
                     None => Some(AppEvent::Quit),
                 }
+            }
+
+            maybe_log = log_rx.recv() => {
+                maybe_log.map(|rec| AppEvent::ErrorMessageArrived {
+                    msg: error_message_from_log_record(rec),
+                })
             }
 
             _ = ticker.tick() => {
