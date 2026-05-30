@@ -594,9 +594,12 @@ impl kameo::message::Message<SetSpokes> for Supervisor {
 /// # Reply
 ///
 /// [`RunReport`] listing the terminal outcome of each task driven (in
-/// driver-completion order — tasks ran concurrently).  On a per-task hard error
-/// that task is recorded as `Failed` and the scheduler stops launching new work
-/// (in-flight drivers are still awaited), matching the MVP's fail-fast posture.
+/// driver-completion order — tasks ran concurrently).  A per-task hard error
+/// records that task as `Failed` (and transitively `Skipped`s its dependents)
+/// but does NOT halt the run (sched-continue-on-failure): the scheduler keeps
+/// launching the remaining independent ready tasks. Only a genuine driver
+/// *panic* (or a cancel) stops launching new work; in-flight drivers are always
+/// awaited.
 pub struct RunReadyTasks;
 
 impl kameo::message::Message<RunReadyTasks> for Supervisor {
@@ -983,8 +986,13 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
     let mut in_flight: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
 
     let mut outcomes: Vec<(TaskId, TaskState)> = Vec::new();
+    // A genuine RUN-level fatal error (a driver-future panic; or, defensively, a
+    // graph-advance failure).  A per-TASK failure is NOT fatal
+    // (sched-continue-on-failure): it is recorded as a `Failed` outcome and the
+    // run keeps going.
     let mut fatal_error: Option<String> = None;
-    // Once a fatal error is seen we stop *launching* but keep draining in-flight.
+    // We stop *launching* new work (but keep draining in-flight) only on a cancel
+    // or a genuine driver panic — a task-level failure no longer flips this.
     let mut stop_launching = false;
 
     // ── Seed persist: write the initial graph snapshot so the file exists from
@@ -1013,7 +1021,8 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
         // ── Fill: launch ready tasks until the cap is hit or none remain ───────
         //
         // Paused runs (task 31) launch NO new drivers — in-flight ones still
-        // drain below.  `stop_launching` covers cancel + fatal-error.
+        // drain below.  `stop_launching` covers cancel + a driver panic (NOT a
+        // task-level failure, which is non-fatal — sched-continue-on-failure).
         let paused = ctx.control.pause.load(Ordering::SeqCst);
         if !stop_launching && !paused {
             loop {
@@ -1031,16 +1040,22 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // .await occurs while the guard is held.
                 let next = {
                     let mut graph = ctx.graph.lock().await;
-                    let picked = next_ready_task_id(&graph, &in_flight);
+                    let mut picked = next_ready_task_id(&graph, &in_flight);
                     if let Some(ref id) = picked {
                         // Advance New→Ready if needed so the next scan won't
                         // re-pick this task (single dispatch).  Errors here are
                         // impossible for a freshly-picked New/Ready task, but we
                         // surface them defensively.
                         if let Err(e) = advance_to_ready(&mut graph, id) {
-                            // Put nothing in-flight; record fatal and stop.
+                            // Record the (task-level) error but DO NOT stop
+                            // launching independent ready tasks
+                            // (sched-continue-on-failure): a single task that
+                            // could not be advanced must not halt the whole run.
+                            // Drop this task from this fill step (do not launch an
+                            // un-advanced task) by clearing `picked`; the outer
+                            // scheduler loop keeps draining + filling.
                             fatal_error.get_or_insert(e);
-                            stop_launching = true;
+                            picked = None;
                         }
                     }
                     picked
@@ -1146,7 +1161,7 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 }
                 // A Done task may have unlocked dependents → loop to fill again.
             }
-            Some(Ok((id, Some(Err(e))))) => {
+            Some(Ok((id, Some(Err(_e))))) => {
                 // Hard error in a driver: the driver already moved its task to a
                 // terminal state (Failed) and tore down its resources where
                 // possible.  Read + emit that terminal state so the TUI reflects
@@ -1165,12 +1180,19 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // Persist the dependents' Skipped transitions (best-effort; lock
                 // already released above).
                 ctx.persist().await;
+                // Record the failed task's terminal outcome.  A task-level hard
+                // error no longer feeds `fatal_error` nor sets `stop_launching`
+                // (sched-continue-on-failure): the task is already `Failed` and
+                // its dependents `Skipped`, so the scheduler keeps launching the
+                // remaining independent ready tasks and the run completes (a
+                // completed-but-failed run, not a hard run-level error).  The
+                // driver error (`_e`) is intentionally dropped — only a genuine
+                // driver *panic* (the join-error arm) remains fatal.
+                outcomes.push((id, terminal));
                 for skipped_id in skipped {
                     ctx.emit_task_state(&skipped_id, TaskState::Skipped);
                     outcomes.push((skipped_id, TaskState::Skipped));
                 }
-                fatal_error.get_or_insert(e);
-                stop_launching = true; // stop launching new work; drain the rest.
             }
             Some(Ok((id, None))) => {
                 // ── Wall-clock cap reached (task 25) ────────────────────────────
