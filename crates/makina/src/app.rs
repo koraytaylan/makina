@@ -22,6 +22,34 @@ use crate::browser::{DirEntry, FileBrowser};
 /// bounded and cannot cause unbounded memory growth.
 pub const EXCHANGE_LOG_CAP: usize = 100;
 
+/// Maximum number of error-pane messages retained on [`App`].
+///
+/// When more messages arrive the oldest are evicted so the buffer stays
+/// bounded and cannot cause unbounded memory growth.
+pub const ERROR_MESSAGES_CAP: usize = 50;
+
+/// Severity of an error-pane message.
+///
+/// Kept self-contained (no `tracing`/`chrono` dependency) so the `makina`
+/// crate's dependency set stays minimal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorLevel {
+    Error,
+    Warn,
+    Info,
+}
+
+/// A single message shown in the error pane.
+#[derive(Debug, Clone)]
+pub struct ErrorMessage {
+    /// When the message was produced.
+    pub timestamp: std::time::SystemTime,
+    /// Severity of the message.
+    pub level: ErrorLevel,
+    /// Human-readable text.
+    pub text: String,
+}
+
 /// A single turn in a live agent exchange: either a prompt from the
 /// orchestrator or a (possibly still-streaming) response from the agent.
 #[derive(Debug, Clone)]
@@ -299,6 +327,13 @@ pub struct App {
     /// IO layer after an `api.execute(...)` resolves) and rendered in the status
     /// bar.  `None` until the first command is issued.
     pub status_message: Option<String>,
+
+    /// Whether the error pane is currently visible.
+    pub error_pane_open: bool,
+
+    /// Bounded ring of error-pane messages.  Capped at [`ERROR_MESSAGES_CAP`]
+    /// by evicting the oldest; see [`App::push_error`].
+    pub error_messages: Vec<ErrorMessage>,
 }
 
 impl App {
@@ -327,6 +362,20 @@ impl App {
             exchange_logs: HashMap::new(),
             last_event: None,
             status_message: None,
+            error_pane_open: false,
+            error_messages: Vec::new(),
+        }
+    }
+
+    /// Push a new error-pane message, evicting the oldest when over cap.
+    ///
+    /// Mirrors [`ExchangeLog::push`]: maintains the [`ERROR_MESSAGES_CAP`]
+    /// bound so the buffer cannot grow without limit.
+    pub fn push_error(&mut self, msg: ErrorMessage) {
+        self.error_messages.push(msg);
+        if self.error_messages.len() > ERROR_MESSAGES_CAP {
+            // Drop the oldest message to maintain the bound.
+            self.error_messages.remove(0);
         }
     }
 
@@ -646,6 +695,47 @@ mod tests {
     fn make_app() -> App {
         let api = Arc::new(PlaceholderApi::new());
         App::new(api, vec![])
+    }
+
+    // ── Error pane ────────────────────────────────────────────────────────────
+
+    /// `push_error` must keep the error-pane buffer bounded at
+    /// [`ERROR_MESSAGES_CAP`] by evicting the OLDEST message (FIFO), not merely
+    /// capping the length.  Stronger than `exchange_log_bounded_at_cap`.
+    #[test]
+    fn error_messages_bounded_at_cap() {
+        use crate::app::ERROR_MESSAGES_CAP;
+
+        let mut app = make_app();
+        let total = ERROR_MESSAGES_CAP + 5;
+        for i in 0..total {
+            app.push_error(ErrorMessage {
+                timestamp: std::time::SystemTime::now(),
+                level: ErrorLevel::Error,
+                text: format!("msg {i}"),
+            });
+        }
+
+        // Exactly capped.
+        assert_eq!(
+            app.error_messages.len(),
+            ERROR_MESSAGES_CAP,
+            "error_messages must be capped at ERROR_MESSAGES_CAP={ERROR_MESSAGES_CAP} but has {}",
+            app.error_messages.len()
+        );
+        // The 5 oldest were evicted: the first retained is the 6th pushed
+        // (index 5, "msg 5").
+        assert_eq!(
+            app.error_messages.first().unwrap().text,
+            "msg 5",
+            "oldest messages must be evicted, not the newest"
+        );
+        // The last retained is the most recently pushed.
+        assert_eq!(
+            app.error_messages.last().unwrap().text,
+            format!("msg {}", total - 1),
+            "most recent message must be retained"
+        );
     }
 
     // ── Quit logic ────────────────────────────────────────────────────────────
