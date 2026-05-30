@@ -66,7 +66,7 @@
 //! | model-backed interpreter + real ACP backend | injected, not wired | e2e (task 33) |
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -95,6 +95,78 @@ use crate::worktree::WorktreeManager;
 /// or an OS string that cannot be decoded to UTF-8).  Both `open_run` and
 /// `start_run` use this value so it is defined once here.
 const SLUG_FALLBACK: &str = "task-list";
+
+/// Derive a collision-free, plan-scoped run slug from a task-list path.
+///
+/// The slug is `"{parent_dir_name}-{file_stem}"`, lowercased and sanitized into
+/// a valid kebab id per `docs/spec/runtime-artifact-schema.md` §4.1: lowercase
+/// ASCII letters/digits/hyphens, starting and ending with an alphanumeric, no
+/// consecutive hyphens, minimum two characters. Including the parent directory
+/// makes the slug unique per plan, so opening different `TASKS.md` files no
+/// longer collide on the slug `TASKS` and shadow each other's persisted graphs.
+///
+/// When there is no usable parent directory the slug falls back to the
+/// lowercased stem alone; if even that is shorter than the §4.1 minimum of two
+/// characters, [`SLUG_FALLBACK`] is the single terminal fallback.
+///
+/// Exposed (`pub`) so that integration tests — and any future caller that
+/// pre-seeds a `.makina/tasks/{slug}.json` artifact for a given task-list path —
+/// can compute the exact same slug `open_run`/`start_run` derive, keeping a
+/// single source of truth for the derivation.
+pub fn run_slug(task_list_path: &Path) -> String {
+    // Lowercased file stem (e.g. "tasks" from "TASKS.md"). If the path has no
+    // decodable stem, there is nothing to scope on — return the fallback.
+    let stem = match task_list_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_lowercase(),
+        None => return SLUG_FALLBACK.to_string(),
+    };
+
+    // Lowercased parent directory name, if any (e.g. the plan dir).
+    let parent = task_list_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
+
+    // Prefer the plan-scoped form; sanitize and accept it only if it meets the
+    // §4.1 minimum. Otherwise fall back to the stem alone, then to SLUG_FALLBACK.
+    if let Some(parent) = parent {
+        let scoped = sanitize_kebab(&format!("{parent}-{stem}"));
+        if scoped.len() >= 2 {
+            return scoped;
+        }
+    }
+
+    let bare = sanitize_kebab(&stem);
+    if bare.len() >= 2 {
+        bare
+    } else {
+        SLUG_FALLBACK.to_string()
+    }
+}
+
+/// Sanitize `input` into a valid kebab id per `runtime-artifact-schema.md`
+/// §4.1: lowercase; map every maximal run of non-`[a-z0-9]` chars to a single
+/// `-`; trim leading/trailing `-`. The caller enforces the §4.1 length minimum.
+fn sanitize_kebab(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut pending_dash = false;
+    for ch in input.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            // Emit a single separating dash only between alphanumerics, never
+            // leading — this also collapses runs of non-alnum to one `-`.
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
+}
 
 // ── Broadcast capacity ──────────────────────────────────────────────────────────
 
@@ -400,12 +472,8 @@ impl CoreApi {
     /// held**; the registry lock is taken only for the brief insert, then dropped
     /// before the broadcast.
     async fn open_run(&self, task_list_path: PathBuf) -> Result<CommandOutcome, ApiError> {
-        // 1. Derive the slug from the file stem (no I/O — just path manipulation).
-        let slug = task_list_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(SLUG_FALLBACK)
-            .to_string();
+        // 1. Derive the plan-scoped slug (no I/O — just path manipulation).
+        let slug = run_slug(&task_list_path);
 
         let repo_root = &self.state.worktree_manager.repo_root;
 
@@ -567,13 +635,10 @@ impl CoreApi {
             entry.status = RunStatus::Running;
 
             // Derive the slug here — inside the same lock — so we don't need a
-            // second lock acquisition below.
-            let slug = entry
-                .task_list_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(SLUG_FALLBACK)
-                .to_string();
+            // second lock acquisition below. Uses the same plan-scoped derivation
+            // as `open_run` so the persisted artifact, audit ledger, and per-task
+            // logs all agree on one slug.
+            let slug = run_slug(&entry.task_list_path);
 
             // Return the pieces the background task needs.
             (Arc::clone(&entry.graph), cancel, pause, slug)
@@ -1107,6 +1172,131 @@ Do the thing in `lib.rs`.
         assert_eq!(all[1].id, RunId(2));
     }
 
+    // ── Plan-scoped run slug (mk-run-slug) ────────────────────────────────────
+
+    /// Returns whether `s` satisfies the §4.1 kebab predicate: starts and ends
+    /// with an alphanumeric, contains no consecutive hyphens, and is at least
+    /// two characters long.
+    fn is_valid_kebab(s: &str) -> bool {
+        s.len() >= 2
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && s.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
+            && !s.contains("--")
+    }
+
+    #[test]
+    fn run_slug_is_plan_scoped_and_valid() {
+        // (1) A real plan-style path is scoped by its parent directory.
+        let plan = run_slug(Path::new(
+            "/repo/docs/plans/0003-Runtime-and-TUI-Hardening/TASKS.md",
+        ));
+        assert_eq!(
+            plan, "0003-runtime-and-tui-hardening-tasks",
+            "slug must be the lowercased, kebab-sanitized `parent-stem`"
+        );
+
+        // (2) Two different plan dirs that each contain a `TASKS.md` yield
+        //     distinct slugs — the whole point of plan-scoping.
+        let a = run_slug(Path::new("/repo/docs/plans/0003-alpha/TASKS.md"));
+        let b = run_slug(Path::new("/repo/docs/plans/0004-beta/TASKS.md"));
+        assert_ne!(
+            a, b,
+            "two distinct plan dirs named TASKS.md must produce distinct slugs"
+        );
+
+        // (3) A path with no usable parent falls back to the lowercased stem.
+        let bare = run_slug(Path::new("TASKS.md"));
+        assert_eq!(bare, "tasks", "no usable parent → lowercased stem alone");
+        // …and to SLUG_FALLBACK if even that is shorter than the §4.1 minimum.
+        let too_short = run_slug(Path::new("a.md"));
+        assert_eq!(
+            too_short, SLUG_FALLBACK,
+            "a stem shorter than 2 chars must fall back to SLUG_FALLBACK"
+        );
+
+        // (4) Every produced slug satisfies the §4.1 kebab predicate.
+        for s in [&plan, &a, &b, &bare, &too_short] {
+            assert!(
+                is_valid_kebab(s),
+                "slug {s:?} must satisfy the §4.1 kebab predicate"
+            );
+        }
+    }
+
+    /// Modeled on `open_run_seeds_artifact_before_start_run` and
+    /// `multiple_open_runs_get_distinct_ids`: write a `TASKS.md` under a
+    /// plan-style dir, `OpenRun` it, and assert the persisted artifact resolves
+    /// via `persist::tasks_path` to the plan-scoped slug (location-agnostic, so
+    /// it tracks the `.makina/tasks/` relocation), and that no unrelated
+    /// `TASKS.json` is loaded.
+    #[tokio::test]
+    async fn open_run_uses_plan_scoped_slug() {
+        let (api, repo_dir) = execution_core_api();
+        let repo_root = repo_dir.path().to_path_buf();
+
+        // Write a `TASKS.md` under a plan-style directory.
+        let plan_dir = tempfile::tempdir().expect("create tempdir");
+        let task_list_dir = plan_dir.path().join("0003-Runtime-and-TUI-Hardening");
+        std::fs::create_dir_all(&task_list_dir).expect("create plan dir");
+        let task_list_path = task_list_dir.join("TASKS.md");
+        std::fs::write(&task_list_path, SAMPLE_TASK_LIST).expect("write task list");
+
+        let expected_slug = "0003-runtime-and-tui-hardening-tasks";
+        let scoped_path = crate::persist::tasks_path(&repo_root, expected_slug);
+        // The naive stem-only slug that this change is meant to avoid.
+        let naive_path = crate::persist::tasks_path(&repo_root, "tasks");
+
+        assert!(
+            !scoped_path.exists(),
+            "plan-scoped artifact must not exist before OpenRun"
+        );
+
+        let outcome = api
+            .execute(Command::OpenRun {
+                task_list_path: task_list_path.clone(),
+            })
+            .await
+            .expect("OpenRun must succeed");
+        assert!(
+            matches!(outcome, CommandOutcome::RunOpened { .. }),
+            "expected RunOpened, got {outcome:?}"
+        );
+
+        // The artifact is persisted under the plan-scoped slug…
+        assert!(
+            scoped_path.exists(),
+            "artifact must be persisted at the plan-scoped slug path {}",
+            scoped_path.display()
+        );
+        // …and NOT under the naive stem-only slug.
+        assert!(
+            !naive_path.exists(),
+            "no unrelated artifact must be written at the stem-only slug path {}",
+            naive_path.display()
+        );
+
+        // The graph loads back under the plan-scoped slug and carries it.
+        let loaded = crate::persist::load_graph(&repo_root, expected_slug)
+            .await
+            .expect("load_graph must not error")
+            .expect("plan-scoped artifact must be loadable");
+        assert_eq!(
+            loaded.slug, expected_slug,
+            "persisted graph slug must be the plan-scoped slug"
+        );
+
+        // No unrelated `TASKS.json` (stem-only slug) is loadable.
+        let naive_loaded = crate::persist::load_graph(&repo_root, "tasks")
+            .await
+            .expect("load_graph must not error");
+        assert!(
+            naive_loaded.is_none(),
+            "no unrelated stem-only `tasks` artifact must be loaded"
+        );
+    }
+
     #[tokio::test]
     async fn open_run_with_missing_file_returns_error() {
         let (api, _repo) = execution_core_api();
@@ -1206,11 +1396,15 @@ Create beta.
         let task_list_path = task_list_dir.path().join("seed-test.md");
         std::fs::write(&task_list_path, task_list).expect("write task list");
 
+        // Slug is plan-scoped (parent-dir + stem), so derive it from the path
+        // rather than hardcoding the stem — keeps this test location-agnostic.
+        let slug = run_slug(&task_list_path);
+
         // Verify no artifact exists yet.
-        let artifact_path = crate::persist::tasks_path(&repo_root, "seed-test");
+        let artifact_path = crate::persist::tasks_path(&repo_root, &slug);
         assert!(
             !artifact_path.exists(),
-            ".tasks/seed-test.json must not exist before OpenRun"
+            "task graph artifact must not exist before OpenRun"
         );
 
         // Issue OpenRun — do NOT issue StartRun.
@@ -1228,18 +1422,18 @@ Create beta.
         // Assert: the artifact now exists on disk.
         assert!(
             artifact_path.exists(),
-            ".tasks/seed-test.json must exist immediately after OpenRun, before StartRun"
+            "task graph artifact must exist immediately after OpenRun, before StartRun"
         );
 
         // Assert: all tasks are in the `new` state.
-        let loaded = crate::persist::load_graph(&repo_root, "seed-test")
+        let loaded = crate::persist::load_graph(&repo_root, &slug)
             .await
             .expect("load_graph must not error")
-            .expect(".tasks/seed-test.json must be loadable");
+            .expect("task graph artifact must be loadable");
 
         assert_eq!(
-            loaded.slug, "seed-test",
-            "persisted graph slug must match the file stem"
+            loaded.slug, slug,
+            "persisted graph slug must match the plan-scoped slug"
         );
         assert_eq!(loaded.tasks.len(), 2, "both tasks must be persisted");
         for task in &loaded.tasks {

@@ -32,7 +32,7 @@ use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::dependency::EdgeInferrer;
 use makina_core::interpreter::StructuredTextInterpreter;
-use makina_core::orchestrator::CoreApi;
+use makina_core::orchestrator::{CoreApi, run_slug};
 use makina_core::persist::{load_graph, persist_graph, tasks_path};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::worktree::WorktreeManager;
@@ -148,11 +148,18 @@ async fn open_run_resumes_from_artifact_and_ignores_md() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    let slug = "read-path-resume";
+    // 2. Write a `.md` whose content is DIFFERENT from the persisted graph.
+    //    If `open_run` re-interprets this file, it would produce a single task
+    //    `md-only-task` — which we can detect below.  The slug is plan-scoped
+    //    (parent-dir + stem), so derive it from the `.md` path — exactly as
+    //    `open_run` does — and persist the prior graph under that same slug.
+    let md_dir = tempfile::tempdir().expect("create md tempdir");
+    let md_path = md_dir.path().join("read-path-resume.md");
+    let slug = run_slug(&md_path);
 
-    // 1. Build and persist the "prior run" graph.
+    // 1. Build and persist the "prior run" graph under the derived slug.
     let persisted_graph = TaskGraph {
-        slug: slug.to_string(),
+        slug: slug.clone(),
         tasks: vec![
             make_task("task-done", TaskState::Done, vec![]),
             make_task("task-in-flight", TaskState::InProgress, vec!["task-done"]),
@@ -164,17 +171,11 @@ async fn open_run_resumes_from_artifact_and_ignores_md() {
         .expect("persist_graph must succeed");
 
     // Verify the artifact exists.
-    let artifact_path = tasks_path(&repo_root, slug);
+    let artifact_path = tasks_path(&repo_root, &slug);
     assert!(
         artifact_path.exists(),
-        ".tasks/{slug}.json must exist after persist_graph"
+        "task graph artifact must exist after persist_graph"
     );
-
-    // 2. Write a `.md` whose stem matches the slug but whose content is DIFFERENT
-    //    from the persisted graph.  If `open_run` re-interprets this file, it
-    //    would produce a single task `md-only-task` — which we can detect below.
-    let md_dir = tempfile::tempdir().expect("create md tempdir");
-    let md_path = md_dir.path().join(format!("{slug}.md"));
     let decoy_md = r#"# Decoy — Task List
 
 This file would produce a single task if re-interpreted.
@@ -292,18 +293,19 @@ async fn open_run_fresh_path_seeds_artifact_when_no_artifact_exists() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    let slug = "read-path-fresh";
+    // Write a valid .md.  The slug is plan-scoped (parent-dir + stem), so derive
+    // it from the `.md` path exactly as `open_run` does.
+    let md_dir = tempfile::tempdir().expect("create md tempdir");
+    let md_path = md_dir.path().join("read-path-fresh.md");
+    let slug = run_slug(&md_path);
 
     // Verify no artifact exists yet.
-    let artifact_path = tasks_path(&repo_root, slug);
+    let artifact_path = tasks_path(&repo_root, &slug);
     assert!(
         !artifact_path.exists(),
-        ".tasks/{slug}.json must not exist before OpenRun"
+        "task graph artifact must not exist before OpenRun"
     );
 
-    // Write a valid .md.
-    let md_dir = tempfile::tempdir().expect("create md tempdir");
-    let md_path = md_dir.path().join(format!("{slug}.md"));
     let md_content = r#"# Fresh — Task List
 
 A minimal list for the fresh-path test.
@@ -345,10 +347,10 @@ Create beta.
     );
 
     // All tasks must be in `New` state.
-    let loaded = load_graph(&repo_root, slug)
+    let loaded = load_graph(&repo_root, &slug)
         .await
         .expect("load_graph must not error")
-        .expect(".tasks/{slug}.json must be loadable");
+        .expect("task graph artifact must be loadable");
 
     assert_eq!(loaded.slug, slug);
     assert_eq!(loaded.tasks.len(), 2, "both tasks must be persisted");
@@ -385,10 +387,16 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_is_corrupt() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    let slug = "corrupt-fallback";
+    // 2. Write a valid .md whose interpreted content is distinct from any
+    //    artifact: two tasks `cf-task-one` and `cf-task-two`.  The slug is
+    //    plan-scoped, so derive it from the `.md` path exactly as `open_run`
+    //    does, and write the corrupt artifact at that same derived slug.
+    let md_dir = tempfile::tempdir().expect("create md tempdir");
+    let md_path = md_dir.path().join("corrupt-fallback.md");
+    let slug = run_slug(&md_path);
 
     // 1. Write garbage to the artifact path (not valid JSON).
-    let artifact_path = tasks_path(&repo_root, slug);
+    let artifact_path = tasks_path(&repo_root, &slug);
     let tasks_dir = artifact_path.parent().expect("artifact has parent dir");
     std::fs::create_dir_all(tasks_dir).expect("create tasks dir");
     std::fs::write(&artifact_path, b"{ not json").expect("write corrupt artifact");
@@ -397,10 +405,6 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_is_corrupt() {
         "corrupt artifact must exist before OpenRun"
     );
 
-    // 2. Write a valid .md whose interpreted content is distinct from any
-    //    artifact: two tasks `cf-task-one` and `cf-task-two`.
-    let md_dir = tempfile::tempdir().expect("create md tempdir");
-    let md_path = md_dir.path().join(format!("{slug}.md"));
     let md_content = r#"# Corrupt-Fallback — Task List
 
 A list whose artifact is corrupt; open_run must fall back to this .md.
@@ -473,7 +477,7 @@ Do the second thing.
     }
 
     // 6. Assert: the artifact was overwritten by seed-persist and is now valid.
-    let reloaded = load_graph(&repo_root, slug)
+    let reloaded = load_graph(&repo_root, &slug)
         .await
         .expect("load_graph must succeed after seed-persist overwrote the corrupt artifact")
         .expect("artifact must exist after seed-persist");
@@ -510,14 +514,19 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_fails_validation()
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    let slug = "validate-fail";
+    // The slug is plan-scoped, so derive it from the `.md` path exactly as
+    // `open_run` does, and seed the validate-failing artifact at that same slug
+    // so the fallback path is genuinely exercised.
+    let md_dir = tempfile::tempdir().expect("create md tempdir");
+    let md_path = md_dir.path().join("validate-fail.md");
+    let slug = run_slug(&md_path);
 
     // 1. Build a structurally-valid JSON TaskGraph that fails validate():
     //    `vf-task-a` has a depends_on referencing `ghost-task` which is absent.
     //    This trips TaskGraphError::UnresolvedDependency.
     let now = chrono::Utc::now();
     let invalid_graph = TaskGraph {
-        slug: slug.to_string(),
+        slug: slug.clone(),
         tasks: vec![Task {
             id: TaskId::new("vf-task-a"),
             title: "VF Task A".to_string(),
@@ -543,7 +552,7 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_fails_validation()
     );
 
     // Write the invalid but parseable JSON to disk.
-    let artifact_path = tasks_path(&repo_root, slug);
+    let artifact_path = tasks_path(&repo_root, &slug);
     let tasks_dir = artifact_path.parent().expect("artifact has parent dir");
     std::fs::create_dir_all(tasks_dir).expect("create tasks dir");
     let json =
@@ -555,8 +564,6 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_fails_validation()
     );
 
     // 2. Write a valid .md with two tasks DISTINCT from the artifact (`vf-task-a`).
-    let md_dir = tempfile::tempdir().expect("create md tempdir");
-    let md_path = md_dir.path().join(format!("{slug}.md"));
     let md_content = r#"# Validate-Fail — Task List
 
 This .md should be used when the artifact fails validation.
