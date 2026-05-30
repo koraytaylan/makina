@@ -1057,11 +1057,27 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                         in_flight.insert(id.clone());
                         let driver_ctx = ctx.clone();
                         let driver_id = id.clone();
+                        // Tag this driver's whole future with a `task` span carrying
+                        // `task_slug`; the per-task log routing layer (`RunFileLayer`)
+                        // keys on that field to fan this task's records out to its
+                        // `{task_slug}.log`.  The span is created HERE — in
+                        // `scheduler`, where the enclosing `run_graph` span (which
+                        // carries `run_uid`) is the current span — so the new `task`
+                        // span is parented to it and the routing layer can resolve
+                        // BOTH `run_uid` (from the parent) and `task_slug` by walking
+                        // the scope.  (Evaluating the macro inside the spawned future
+                        // would lose that parent: the `run_graph` span is not current
+                        // on the `JoinSet` worker thread.)
+                        let task_span = tracing::info_span!("task", task_slug = %driver_id.0);
                         // The permit is MOVED into the future; it drops (releasing
                         // the slot) when the driver completes — on every path,
                         // INCLUDING a wall-clock timeout (the whole future, permit
                         // included, is dropped when `timeout` elapses).
                         join_set.spawn(async move {
+                            // `.instrument()` (not `.in_scope()`) because
+                            // `task_driver` `.await`s, so the span must persist
+                            // across await points.
+                            use tracing::Instrument as _;
                             let _permit = permit; // released on completion/cancel/panic.
                             // Bound the WHOLE per-task lifecycle by the wall-clock
                             // cap.  On elapse, `task_driver` is cancelled mid-await:
@@ -1069,7 +1085,7 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                             // `None` signals "timed out" to the scheduler.
                             match tokio::time::timeout(
                                 wall_clock,
-                                task_driver(&driver_ctx, &driver_id),
+                                task_driver(&driver_ctx, &driver_id).instrument(task_span),
                             )
                             .await
                             {
