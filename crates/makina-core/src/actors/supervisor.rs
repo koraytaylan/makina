@@ -1126,7 +1126,24 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
             Some(Ok((id, Some(Ok(state))))) => {
                 in_flight.remove(&id);
                 ctx.emit_task_state(&id, state);
-                outcomes.push((id, state));
+                outcomes.push((id.clone(), state));
+                // A cap-driven terminal `Failed` surfaces here (gate/review caps
+                // return `Ok(Failed)` from the driver).  Like the hard-error and
+                // wall-clock arms, transitively `Skipped` its dependents so they do
+                // not dangle non-terminal (a non-`Done` dep never unlocks them).
+                if state == TaskState::Failed {
+                    let skipped = {
+                        let mut graph = ctx.graph.lock().await;
+                        mark_dependents_skipped(&mut graph, &id)
+                    };
+                    if !skipped.is_empty() {
+                        ctx.persist().await;
+                        for skipped_id in skipped {
+                            ctx.emit_task_state(&skipped_id, TaskState::Skipped);
+                            outcomes.push((skipped_id, TaskState::Skipped));
+                        }
+                    }
+                }
                 // A Done task may have unlocked dependents → loop to fill again.
             }
             Some(Ok((id, Some(Err(e))))) => {
@@ -1136,11 +1153,22 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // it (the driver only emits the NON-terminal transitions; the
                 // scheduler owns the single terminal emission on every arm).
                 in_flight.remove(&id);
-                let terminal = {
-                    let graph = ctx.graph.lock().await;
-                    task_state_locked(&graph, &id).unwrap_or(TaskState::Failed)
+                let (terminal, skipped) = {
+                    let mut graph = ctx.graph.lock().await;
+                    let terminal = task_state_locked(&graph, &id).unwrap_or(TaskState::Failed);
+                    // Transitively `Skipped` the failed task's dependents under the
+                    // held lock (no .await), then drop the guard before emitting.
+                    let skipped = mark_dependents_skipped(&mut graph, &id);
+                    (terminal, skipped)
                 };
                 ctx.emit_task_state(&id, terminal);
+                // Persist the dependents' Skipped transitions (best-effort; lock
+                // already released above).
+                ctx.persist().await;
+                for skipped_id in skipped {
+                    ctx.emit_task_state(&skipped_id, TaskState::Skipped);
+                    outcomes.push((skipped_id, TaskState::Skipped));
+                }
                 fatal_error.get_or_insert(e);
                 stop_launching = true; // stop launching new work; drain the rest.
             }
@@ -1155,25 +1183,35 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // NOT stop the scheduler launching independent ready tasks (a
                 // timed-out task is not `Done`, so its dependents never unlock).
                 in_flight.remove(&id);
-                let final_state = {
+                let (final_state, skipped) = {
                     let mut graph = ctx.graph.lock().await;
-                    match apply_event_locked(&mut graph, &id, TaskEvent::WallClockCapReached) {
-                        Ok(()) => {
-                            mark_finished_locked(&mut graph, &id);
-                            TaskState::Failed
-                        }
-                        Err(_) => {
-                            // The task already reached a terminal state in the
-                            // instant before the timeout fired (a benign race):
-                            // record its actual terminal state instead.
-                            task_state_locked(&graph, &id).unwrap_or(TaskState::Failed)
-                        }
-                    }
+                    let final_state =
+                        match apply_event_locked(&mut graph, &id, TaskEvent::WallClockCapReached) {
+                            Ok(()) => {
+                                mark_finished_locked(&mut graph, &id);
+                                TaskState::Failed
+                            }
+                            Err(_) => {
+                                // The task already reached a terminal state in the
+                                // instant before the timeout fired (a benign race):
+                                // record its actual terminal state instead.
+                                task_state_locked(&graph, &id).unwrap_or(TaskState::Failed)
+                            }
+                        };
+                    // Transitively `Skipped` the failed task's dependents under the
+                    // held lock (no .await), then drop the guard before emitting.
+                    let skipped = mark_dependents_skipped(&mut graph, &id);
+                    (final_state, skipped)
                 }; // guard dropped before emit.
-                // Persist WallClockCapReached → Failed (best-effort).
+                // Persist WallClockCapReached → Failed + dependents' Skipped
+                // (best-effort).
                 ctx.persist().await;
                 ctx.emit_task_state(&id, final_state);
                 outcomes.push((id, final_state));
+                for skipped_id in skipped {
+                    ctx.emit_task_state(&skipped_id, TaskState::Skipped);
+                    outcomes.push((skipped_id, TaskState::Skipped));
+                }
             }
             Some(Err(join_err)) => {
                 // The driver task ended abnormally.  Two cases:
@@ -2001,4 +2039,68 @@ fn mark_finished_locked(graph: &mut TaskGraph, task_id: &TaskId) {
     if let Ok(task) = task_mut_locked(graph, task_id) {
         task.finished_at = Some(chrono::Utc::now());
     }
+}
+
+/// Move the transitive dependents of a just-`Failed` task to [`TaskState::Skipped`].
+///
+/// `depends_on` lists each task's *prerequisites*, so a failed task's dependents
+/// are the tasks whose `depends_on` transitively contains `failed_task_id`.  There
+/// is no reverse-adjacency helper, so we build the dependent set inline: starting
+/// from `failed_task_id`, repeatedly scan `graph.tasks` for any task whose
+/// `depends_on` contains an already-collected id (a reverse-edge BFS).
+///
+/// For each newly found dependent that is **not already terminal** we apply
+/// [`TaskEvent::DependencyFailed`] (active → `Skipped`) and stamp `finished_at`,
+/// then collect its id.  The `is_terminal` guard keeps the FSM clean —
+/// `apply_event_locked` already rejects the event from `Done/Failed/Skipped`.
+///
+/// Called under the held graph guard (no `.await`).  Returns the ids that were
+/// freshly moved to `Skipped`, so the caller can emit + record them after the
+/// guard is dropped.  This is required because `next_ready_task_id` needs every
+/// dep `== Done`, so a failed task's dependents would otherwise dangle
+/// non-terminal forever.
+fn mark_dependents_skipped(graph: &mut TaskGraph, failed_task_id: &TaskId) -> Vec<TaskId> {
+    // `collected` seeds the reverse-edge frontier with the failed id; `skipped`
+    // accumulates only the ids we actually moved to `Skipped` (excludes the
+    // failed root, which is already terminal).
+    let mut collected: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
+    collected.insert(failed_task_id.clone());
+    let mut skipped: Vec<TaskId> = Vec::new();
+
+    // Fixed-point scan: keep sweeping the whole graph until a full pass adds no
+    // new dependent (handles transitive chains regardless of authored order).
+    loop {
+        let mut found_new = false;
+        let candidates: Vec<TaskId> = graph
+            .tasks
+            .iter()
+            .filter(|t| !collected.contains(&t.id))
+            .filter(|t| t.depends_on.iter().any(|dep| collected.contains(dep)))
+            .map(|t| t.id.clone())
+            .collect();
+
+        for id in candidates {
+            collected.insert(id.clone());
+            found_new = true;
+            // Skip tasks that already reached a terminal state — the FSM (and
+            // `apply_event_locked`) would reject `DependencyFailed` for them.
+            let state = match task_state_locked(graph, &id) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if crate::state_machine::is_terminal(state) {
+                continue;
+            }
+            if apply_event_locked(graph, &id, TaskEvent::DependencyFailed).is_ok() {
+                mark_finished_locked(graph, &id);
+                skipped.push(id);
+            }
+        }
+
+        if !found_new {
+            break;
+        }
+    }
+
+    skipped
 }

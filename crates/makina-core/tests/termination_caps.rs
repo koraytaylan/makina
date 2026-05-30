@@ -142,13 +142,19 @@ fn gate(name: &str, command: &str) -> GateConfig {
 
 /// Build a `New` task with the given `id`.
 fn task(id: &str) -> Task {
+    task_with_deps(id, &[])
+}
+
+/// Build a `New` task with the given `id` and `depends_on` prerequisites
+/// (mirrors the `task(id, &[deps])` helper style from `concurrency.rs`).
+fn task_with_deps(id: &str, deps: &[&str]) -> Task {
     let now = Utc::now();
     Task {
         id: TaskId::new(id),
         title: format!("Task {id}"),
         description: format!("Implement {id}."),
         done_when: format!("{id} is done"),
-        depends_on: vec![],
+        depends_on: deps.iter().map(|d| TaskId::new(*d)).collect(),
         section: None,
         state: TaskState::New,
         gate_iterations: 0,
@@ -633,6 +639,114 @@ async fn wall_clock_cap_drives_task_to_failed() {
             panic!("branch task/doomed-slow leaked after the wall-clock cap fired");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    root.kill();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Transitive skip: a failed task's dependents → Skipped
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// **Dependents of a failed task are Skipped** — when task `A` reaches terminal
+/// `Failed` (here via the always-failing `false` gate at `gate_iterations = 2`),
+/// the scheduler transitively moves every task that (transitively) depends on `A`
+/// to `Skipped` so they do not dangle non-terminal forever (a non-`Done` dep
+/// never unlocks them).
+///
+/// Graph (concurrency 2): `A = []`, `B = [A]`, `C = [A]`, `D = [B]`.  Only `A`
+/// is ready; it fails at the gate cap.  `B`/`C` depend on `A` and `D` depends on
+/// `B`, so the reverse-edge BFS skips all three.
+///
+/// Asserts: `A` is `Failed`; `B`, `C`, `D` each reach `Skipped` (with
+/// `finished_at` stamped) in the final graph; and each appears as `Skipped` in
+/// `report.outcomes`.
+#[tokio::test]
+async fn dependents_of_failed_task_are_skipped() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // The developer always "succeeds" (produces output); the `false` gate always
+    // fails, so `A` is driven to `Failed` purely by the gate cap.
+    let backend = NoopBackend::with_responses(vec!["dev attempt".into()]);
+
+    let mut cfg = config(
+        vec![gate("false", "false")],
+        CapsConfig {
+            gate_iterations: 2,
+            reviewer_iterations: 5,
+            wall_clock_secs: 1800,
+        },
+    );
+    cfg.concurrency = 2;
+
+    let (root, supervisor_ref) = build_actor_tree(
+        repo_root.clone(),
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        cfg,
+    )
+    .await;
+
+    // a = [], b = [a], c = [a], d = [b].
+    supervisor_ref
+        .ask(SetTaskGraph(TaskGraph {
+            slug: "skip-dependents".into(),
+            tasks: vec![
+                task_with_deps("a", &[]),
+                task_with_deps("b", &["a"]),
+                task_with_deps("c", &["a"]),
+                task_with_deps("d", &["b"]),
+            ],
+        }))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = supervisor_ref
+        .ask(RunReadyTasks)
+        .send()
+        .await
+        .expect("RunReadyTasks must drive the loop without a hard error");
+
+    // `a` failed; `b`, `c`, `d` were transitively skipped.
+    assert!(
+        report
+            .outcomes
+            .contains(&(TaskId::new("a"), TaskState::Failed)),
+        "a must be Failed in outcomes; got {:?}",
+        report.outcomes
+    );
+    for id in ["b", "c", "d"] {
+        assert!(
+            report
+                .outcomes
+                .contains(&(TaskId::new(id), TaskState::Skipped)),
+            "dependent {id} must appear as Skipped in outcomes; got {:?}",
+            report.outcomes
+        );
+    }
+
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask must not fail")
+        .expect("graph should be Some");
+
+    let a = snapshot.get(&TaskId::new("a")).expect("a present");
+    assert_eq!(a.state, TaskState::Failed, "a must end Failed");
+
+    for id in ["b", "c", "d"] {
+        let t = snapshot.get(&TaskId::new(id)).expect("dependent present");
+        assert_eq!(
+            t.state,
+            TaskState::Skipped,
+            "dependent {id} must end Skipped"
+        );
+        assert!(
+            t.finished_at.is_some(),
+            "dependent {id} must have finished_at stamped when Skipped"
+        );
     }
 
     root.kill();
