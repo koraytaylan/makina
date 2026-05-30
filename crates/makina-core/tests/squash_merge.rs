@@ -481,14 +481,18 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
     );
 
     // ── The worktree + branch were torn down ──────────────────────────────────
-    let worktree_path = repo_root.join(".makina").join("worktrees").join("land-it");
+    // The ask path uses an empty plan_slug ⇒ `--land-it` / `task/--land-it`.
+    let worktree_path = repo_root
+        .join(".makina")
+        .join("worktrees")
+        .join("--land-it");
     assert!(
         !worktree_path.exists(),
         "worktree dir must be gone after the run"
     );
     assert!(
-        !branch_exists(&repo_root, "task/land-it"),
-        "task/land-it branch must be gone after the run"
+        !branch_exists(&repo_root, "task/--land-it"),
+        "task/--land-it branch must be gone after the run"
     );
 
     // develop's working tree is clean (excluding .makina/ which the supervisor

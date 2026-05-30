@@ -2,8 +2,9 @@
 //!
 //! The [`WorktreeManager`] creates and tears down git worktrees and their
 //! associated branches on behalf of the Supervisor.  Each task gets an
-//! isolated checkout at `.worktrees/{task_id}/` on branch `task/{task_id}`,
-//! branched off the configured base branch (typically `develop`).
+//! isolated checkout at `.worktrees/{plan_slug}--{task_id}/` on branch
+//! `task/{plan_slug}--{task_id}`, branched off the configured base branch
+//! (typically `develop`).
 //!
 //! # Design
 //!
@@ -103,7 +104,7 @@ pub struct WorktreeHandle {
     pub task_id: String,
 
     /// The git branch checked out in this worktree, of the form
-    /// `task/{task_id}`.
+    /// `task/{plan_slug}--{task_id}`.
     pub branch: String,
 
     /// Absolute path to the worktree directory on the filesystem.
@@ -121,9 +122,9 @@ pub struct WorktreeHandle {
 /// # use makina_core::worktree::WorktreeManager;
 /// # async fn example() -> Result<(), makina_core::worktree::WorktreeError> {
 /// let mgr = WorktreeManager::new(PathBuf::from("/path/to/repo"), "develop".into());
-/// let handle = mgr.create("my-task").await?;
+/// let handle = mgr.create("my-plan", "my-task").await?;
 /// // … dispatch work into handle.path …
-/// mgr.remove("my-task").await?;
+/// mgr.remove("my-plan", "my-task").await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -154,7 +155,11 @@ impl WorktreeManager {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// Create a worktree and branch for `task_id`.
+    /// Create a worktree and branch for `task_id` within `plan_slug`.
+    ///
+    /// The worktree directory and branch are plan-scoped as
+    /// `{plan_slug}--{task_id}` / `task/{plan_slug}--{task_id}` so that different
+    /// plans never collide even when they share a task id.
     ///
     /// # What this does
     ///
@@ -165,8 +170,8 @@ impl WorktreeManager {
     ///    if either does, returns [`WorktreeError::GitCommandFailed`] with a
     ///    clear message rather than silently clobbering existing work.
     /// 4. Runs `git -C {repo_root} worktree add {worktree_path} -b
-    ///    task/{task_id} {base_branch}` to create the branch off `base_branch`
-    ///    and check it out in the new worktree.
+    ///    task/{plan_slug}--{task_id} {base_branch}` to create the branch off
+    ///    `base_branch` and check it out in the new worktree.
     ///
     /// # Returns
     ///
@@ -178,11 +183,15 @@ impl WorktreeManager {
     /// - [`WorktreeError::GitCommandFailed`] — any git command failed, or the
     ///   worktree/branch already exists.
     /// - [`WorktreeError::Io`] — filesystem check error.
-    pub async fn create(&self, task_id: &str) -> Result<WorktreeHandle, WorktreeError> {
+    pub async fn create(
+        &self,
+        plan_slug: &str,
+        task_id: &str,
+    ) -> Result<WorktreeHandle, WorktreeError> {
         validate_task_id(task_id)?;
 
-        let worktree_path = self.worktree_path(task_id);
-        let branch = format!("task/{task_id}");
+        let worktree_path = self.worktree_path(plan_slug, task_id);
+        let branch = format!("task/{plan_slug}--{task_id}");
 
         // Prune stale registrations first so git doesn't complain about
         // already-registered-but-gone paths from previous crashed runs.
@@ -231,14 +240,14 @@ impl WorktreeManager {
         })
     }
 
-    /// Remove the worktree and branch for `task_id`.
+    /// Remove the worktree and branch for `task_id` within `plan_slug`.
     ///
     /// # What this does
     ///
     /// 1. Validates `task_id`.
     /// 2. Runs `git -C {repo_root} worktree remove --force {worktree_path}`.
     ///    "Not found" / "not a worktree" outcomes are treated as success.
-    /// 3. Runs `git -C {repo_root} branch -D task/{task_id}`.
+    /// 3. Runs `git -C {repo_root} branch -D task/{plan_slug}--{task_id}`.
     ///    "Branch not found" outcomes are treated as success.
     /// 4. Runs `git worktree prune` to keep the git index tidy.
     ///
@@ -254,11 +263,11 @@ impl WorktreeManager {
     /// - [`WorktreeError::InvalidTaskId`] — bad task ID.
     /// - [`WorktreeError::GitCommandFailed`] — a git command failed for a
     ///   reason other than "not found".
-    pub async fn remove(&self, task_id: &str) -> Result<(), WorktreeError> {
+    pub async fn remove(&self, plan_slug: &str, task_id: &str) -> Result<(), WorktreeError> {
         validate_task_id(task_id)?;
 
-        let worktree_path = self.worktree_path(task_id);
-        let branch = format!("task/{task_id}");
+        let worktree_path = self.worktree_path(plan_slug, task_id);
+        let branch = format!("task/{plan_slug}--{task_id}");
 
         // Remove the worktree (--force handles dirty checkouts; ignore
         // "not a worktree" / "not found" so the call is idempotent).
@@ -311,9 +320,9 @@ impl WorktreeManager {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Compute the worktree path for a given task ID.
-    fn worktree_path(&self, task_id: &str) -> PathBuf {
-        paths::worktree(&self.repo_root, task_id)
+    /// Compute the worktree path for a given plan slug + task ID.
+    fn worktree_path(&self, plan_slug: &str, task_id: &str) -> PathBuf {
+        paths::worktree(&self.repo_root, plan_slug, task_id)
     }
 
     /// Run `git worktree prune` in the repository.
@@ -492,7 +501,10 @@ mod tests {
     #[test]
     fn worktree_path_is_under_repo_root() {
         let mgr = WorktreeManager::new(PathBuf::from("/repo"), "develop".into());
-        let path = mgr.worktree_path("my-task");
-        assert_eq!(path, PathBuf::from("/repo/.makina/worktrees/my-task"));
+        let path = mgr.worktree_path("0003-runtime-and-tui-hardening", "sample-task");
+        assert_eq!(
+            path,
+            PathBuf::from("/repo/.makina/worktrees/0003-runtime-and-tui-hardening--sample-task")
+        );
     }
 }

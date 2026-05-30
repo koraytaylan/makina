@@ -10,7 +10,7 @@
 //! 2. Drive a single task through `run_graph` (the orchestrator's real path)
 //!    with `NoopBackend` and a temp repo.  Pass the spy + a known slug.
 //! 3. Assert the spy captured a `register` call for the dispatched task with
-//!    the correct `working_dir` (`repo_root/.makina/worktrees/{task_id}`), `run_id`
+//!    the correct `working_dir` (`repo_root/.makina/worktrees/{plan_slug}--{task_id}`), `run_id`
 //!    (`"run:42"` for `RunId(42)`), slug, and task id.
 //!
 //! # Note
@@ -164,7 +164,7 @@ fn task(id: &str) -> Task {
 /// 1. Passes a `SpyAuditRegistry` and the slug `"audit-spy-slug"` to `run_graph`.
 /// 2. Lets the task run to `Done` with `NoopBackend`.
 /// 3. Asserts the spy captured exactly one `register` call with:
-///    - `working_dir == repo_root/.makina/worktrees/audit-task`
+///    - `working_dir == repo_root/.makina/worktrees/audit-plan--audit-task`
 ///    - `run_uid == "audit-spy-run-uid"`
 ///    - `run_id == "run:42"` (from `RunId(42)`)
 ///    - `slug == "audit-spy-slug"`
@@ -176,6 +176,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
 
     let task_id_str = "audit-task";
     let slug = "audit-spy-slug";
+    let plan_slug = "audit-plan";
     let run_uid = "audit-spy-run-uid";
     let run_id = RunId(42);
 
@@ -217,7 +218,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
         Arc::new(spy),
         slug.to_string(),
         run_uid.to_string(),
-        String::new(),
+        plan_slug.to_string(),
     )
     .await
     .expect("run_graph must not error");
@@ -242,10 +243,10 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
     let expected_working_dir = repo_root
         .join(".makina")
         .join("worktrees")
-        .join(task_id_str);
+        .join(format!("{plan_slug}--{task_id_str}"));
     assert_eq!(
         call.working_dir, expected_working_dir,
-        "register: working_dir must be repo_root/.makina/worktrees/{task_id_str}"
+        "register: working_dir must be repo_root/.makina/worktrees/{plan_slug}--{task_id_str}"
     );
 
     assert_eq!(

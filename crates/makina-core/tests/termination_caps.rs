@@ -208,7 +208,12 @@ async fn build_actor_tree(
 /// teardown completes shortly *after* the run returns.  This polls a short
 /// deadline rather than using a fixed sleep (per the testing-strategy).
 async fn assert_worktree_gone(repo_root: &std::path::Path, task_id: &str) {
-    let worktree_path = repo_root.join(".makina").join("worktrees").join(task_id);
+    // The ask path uses an empty plan_slug, so the plan-scoped worktree dir name
+    // is `--{task_id}`.
+    let worktree_path = repo_root
+        .join(".makina")
+        .join("worktrees")
+        .join(format!("--{task_id}"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if !worktree_path.exists() {
@@ -308,17 +313,18 @@ async fn gate_cap_drives_task_to_failed() {
         "developer dispatched once per gate iteration, reviewer never reached; got {prompts:?}"
     );
 
-    // Worktree + branch torn down on the cap failure (no leak).
+    // Worktree + branch torn down on the cap failure (no leak). The ask path uses
+    // an empty plan_slug ⇒ `--doomed-gate` / `task/--doomed-gate`.
     assert!(
         !repo_root
             .join(".makina")
             .join("worktrees")
-            .join("doomed-gate")
+            .join("--doomed-gate")
             .exists(),
         "worktree must be torn down when the gate cap fails the task"
     );
     assert!(
-        !branch_exists(&repo_root, "task/doomed-gate"),
+        !branch_exists(&repo_root, "task/--doomed-gate"),
         "branch must be torn down when the gate cap fails the task"
     );
 
@@ -443,17 +449,18 @@ async fn reviewer_cap_drives_task_to_failed() {
         "Reviewer must run exactly {cap} times; got {review_prompts}"
     );
 
-    // Worktree + branch torn down on the cap failure (no leak).
+    // Worktree + branch torn down on the cap failure (no leak). The ask path uses
+    // an empty plan_slug ⇒ `--doomed-review` / `task/--doomed-review`.
     assert!(
         !repo_root
             .join(".makina")
             .join("worktrees")
-            .join("doomed-review")
+            .join("--doomed-review")
             .exists(),
         "worktree must be torn down when the reviewer cap fails the task"
     );
     assert!(
-        !branch_exists(&repo_root, "task/doomed-review"),
+        !branch_exists(&repo_root, "task/--doomed-review"),
         "branch must be torn down when the reviewer cap fails the task"
     );
 
@@ -630,13 +637,14 @@ async fn wall_clock_cap_drives_task_to_failed() {
     assert_worktree_gone(&repo_root, "doomed-slow").await;
     // Branch teardown rides along with the same `remove` call; once the worktree
     // dir is gone the branch is too (remove() removes both).
+    // Empty plan_slug on the ask path ⇒ `task/--doomed-slow`.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if !branch_exists(&repo_root, "task/doomed-slow") {
+        if !branch_exists(&repo_root, "task/--doomed-slow") {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("branch task/doomed-slow leaked after the wall-clock cap fired");
+            panic!("branch task/--doomed-slow leaked after the wall-clock cap fired");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

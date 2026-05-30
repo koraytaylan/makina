@@ -99,19 +99,29 @@ pub fn run_logs_dir(repo_root: &Path, run_id: &str) -> std::io::Result<PathBuf> 
     Ok(dir)
 }
 
-/// Returns the worktree directory for a task:
-/// `{repo_root}/.makina/worktrees/{task_id}`.
+/// Returns the worktree directory for a task within a plan:
+/// `{repo_root}/.makina/worktrees/{plan_slug}--{task_id}`.
+///
+/// Plan-scoping the directory name means different plans never collide even when
+/// they share a task id. `--` is the delimiter and never appears inside a
+/// kebab-case part, so the composite is unambiguous.
 ///
 /// # Example
 ///
 /// ```
 /// # use std::path::Path;
 /// # use makina_core::paths::worktree;
-/// let p = worktree(Path::new("/repo"), "task-a");
-/// assert_eq!(p, std::path::PathBuf::from("/repo/.makina/worktrees/task-a"));
+/// let p = worktree(Path::new("/repo"), "0003-runtime", "task-a");
+/// assert_eq!(
+///     p,
+///     std::path::PathBuf::from("/repo/.makina/worktrees/0003-runtime--task-a")
+/// );
 /// ```
-pub fn worktree(repo_root: &Path, task_id: &str) -> PathBuf {
-    repo_root.join(".makina").join("worktrees").join(task_id)
+pub fn worktree(repo_root: &Path, plan_slug: &str, task_id: &str) -> PathBuf {
+    repo_root
+        .join(".makina")
+        .join("worktrees")
+        .join(format!("{plan_slug}--{task_id}"))
 }
 
 #[cfg(test)]
@@ -161,8 +171,8 @@ mod tests {
     #[test]
     fn worktree_path() {
         assert_eq!(
-            worktree(Path::new("/repo"), "task-a"),
-            PathBuf::from("/repo/.makina/worktrees/task-a")
+            worktree(Path::new("/repo"), "my-plan", "task-a"),
+            PathBuf::from("/repo/.makina/worktrees/my-plan--task-a")
         );
     }
 

@@ -471,10 +471,9 @@ struct DriverContext {
     ///
     /// The `RunReadyTasks` ask path uses an empty string.
     ///
-    /// Threaded through here ahead of its consumer: the follow-up
-    /// `worktree-plan-scoped-naming` task reads it when building per-task worktree
-    /// directory + branch names. Until then it is set but not yet read.
-    #[allow(dead_code)]
+    /// Read when building per-task worktree directory + branch names: the
+    /// driver passes it to `WorktreeManager::create`/`remove` so the worktree
+    /// dir + branch are plan-scoped as `{plan_slug}--{task_id}`.
     plan_slug: String,
 }
 
@@ -1377,6 +1376,9 @@ fn advance_to_ready(graph: &mut TaskGraph, task_id: &TaskId) -> Result<(), Strin
 /// `remove` and set `worktree_removed = true`, so Drop only kills the spokes.
 struct DriverGuard {
     task_id: String,
+    /// Plan slug this task belongs to, used to plan-scope the worktree
+    /// directory + branch during safety-net teardown.
+    plan_slug: String,
     worktree_manager: WorktreeManager,
     developer: Option<ActorRef<Developer>>,
     reviewer: Option<ActorRef<Reviewer>>,
@@ -1403,12 +1405,13 @@ impl Drop for DriverGuard {
         if !self.worktree_removed {
             let mgr = self.worktree_manager.clone();
             let id = self.task_id.clone();
+            let plan_slug = self.plan_slug.clone();
             // `tokio::spawn` requires being inside a runtime; the driver always
             // runs inside one (JoinSet task).  Best-effort: remove() is
             // idempotent and treats "not found" as success.
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = mgr.remove(&id).await;
+                    let _ = mgr.remove(&plan_slug, &id).await;
                 });
             }
         }
@@ -1495,6 +1498,7 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
 
     let mut guard = DriverGuard {
         task_id: task_id.0.clone(),
+        plan_slug: ctx.plan_slug.clone(),
         worktree_manager: ctx.worktree_manager.clone(),
         developer: Some(developer.clone()),
         reviewer: Some(reviewer.clone()),
@@ -1519,7 +1523,11 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     // A worktree-create failure happens while the task is still `Ready` (before
     // the Developer is ever dispatched).  `Ready --HardError--> Failed` (task 25)
     // moves it to a terminal state cleanly rather than leaving it stuck `Ready`.
-    let worktree = match ctx.worktree_manager.create(&task_id.0).await {
+    let worktree = match ctx
+        .worktree_manager
+        .create(&ctx.plan_slug, &task_id.0)
+        .await
+    {
         Ok(wt) => wt,
         Err(e) => {
             {
@@ -1658,7 +1666,7 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 // We do NOT hold the graph lock while awaiting the merge lock (the
                 // review_task clone above already released the graph guard), so
                 // there is no lock-ordering cycle.
-                let branch = format!("task/{task_id}");
+                let branch = format!("task/{}--{task_id}", ctx.plan_slug);
                 let message = {
                     let graph = ctx.graph.lock().await;
                     squash_commit_message_locked(&graph, task_id)?
@@ -2010,7 +2018,10 @@ async fn develop_until_gates_pass(
 /// Best-effort worktree teardown (idempotent; ignores "already gone").
 async fn remove_worktree(ctx: &DriverContext, task_id: &TaskId) {
     // `remove` is idempotent and treats "not found" as success.
-    let _ = ctx.worktree_manager.remove(&task_id.0).await;
+    let _ = ctx
+        .worktree_manager
+        .remove(&ctx.plan_slug, &task_id.0)
+        .await;
 }
 
 // ── Locked graph helpers (NEVER hold the guard across an .await) ──────────────────

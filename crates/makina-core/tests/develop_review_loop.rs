@@ -206,14 +206,16 @@ async fn single_task_runs_end_to_end_to_done() {
         .await
         .expect("SetTaskGraph must be accepted");
 
-    // Sanity: the worktree/branch do NOT exist before the run.
+    // Sanity: the worktree/branch do NOT exist before the run. The ask path uses
+    // an empty plan_slug, so the plan-scoped name is `--build-thing` /
+    // `task/--build-thing`.
     let worktree_path = repo_root
         .join(".makina")
         .join("worktrees")
-        .join("build-thing");
+        .join("--build-thing");
     assert!(!worktree_path.exists(), "worktree must not exist pre-run");
     assert!(
-        !branch_exists(&repo_root, "task/build-thing"),
+        !branch_exists(&repo_root, "task/--build-thing"),
         "branch must not exist pre-run"
     );
 
@@ -261,7 +263,7 @@ async fn single_task_runs_end_to_end_to_done() {
         "worktree dir must be gone after the run"
     );
     assert!(
-        !branch_exists(&repo_root, "task/build-thing"),
+        !branch_exists(&repo_root, "task/--build-thing"),
         "branch must be gone after the run"
     );
 
@@ -380,8 +382,11 @@ async fn reject_then_approve_relays_feedback_and_finishes_done() {
         prompts[0]
     );
 
-    // Worktree torn down after completion.
-    let worktree_path = repo_root.join(".makina").join("worktrees").join("fix-bug");
+    // Worktree torn down after completion (empty plan_slug ⇒ `--fix-bug`).
+    let worktree_path = repo_root
+        .join(".makina")
+        .join("worktrees")
+        .join("--fix-bug");
     assert!(
         !worktree_path.exists(),
         "worktree must be gone after the run"
@@ -457,19 +462,19 @@ async fn dependency_chain_runs_a_then_b() {
         );
     }
 
-    // Both worktrees torn down.
+    // Both worktrees torn down (empty plan_slug ⇒ `--task-a` / `--task-b`).
     assert!(
         !repo_root
             .join(".makina")
             .join("worktrees")
-            .join("task-a")
+            .join("--task-a")
             .exists()
     );
     assert!(
         !repo_root
             .join(".makina")
             .join("worktrees")
-            .join("task-b")
+            .join("--task-b")
             .exists()
     );
 

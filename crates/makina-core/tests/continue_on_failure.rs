@@ -19,7 +19,8 @@
 //! one of three independents, so these tests use **test-only backends keyed by
 //! task id**.  A session's task id is recoverable from
 //! [`SessionConfig::working_dir`] — the worktree path is
-//! `.makina/worktrees/{task_id}`, so its final component is the task id.
+//! `.makina/worktrees/{plan_slug}--{task_id}`, so the task id is the part of the
+//! final component after the `--` delimiter.
 //!
 //! - [`FailOneBackend`] returns `Err` from `prompt()` for the designated task
 //!   (driving it to `Failed` via the Developer hard-error path) and the usual
@@ -57,15 +58,17 @@ use makina_core::worktree::WorktreeManager;
 
 /// Recover the task id a session belongs to from its `working_dir`.
 ///
-/// The worktree path is `.makina/worktrees/{task_id}`, so the final path
-/// component is the task id.  This lets a per-task-keyed backend decide how to
-/// respond without the backend trait carrying the task id explicitly.
+/// The worktree path is `.makina/worktrees/{plan_slug}--{task_id}`, so the final
+/// path component is `{plan_slug}--{task_id}`. `--` is the plan/task delimiter
+/// (and never appears inside a kebab part), so the task id is everything after
+/// the last `--`. This lets a per-task-keyed backend decide how to respond
+/// without the backend trait carrying the task id explicitly.
 fn task_id_of(config: &SessionConfig) -> String {
     config
         .working_dir
         .file_name()
         .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
+        .map(|s| s.rsplit("--").next().unwrap_or(s).to_string())
         .unwrap_or_default()
 }
 

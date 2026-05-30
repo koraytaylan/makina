@@ -1912,6 +1912,15 @@ Create beta.
         let file_path = dir.path().join("cancel-feature.md");
         std::fs::write(&file_path, source).unwrap();
 
+        // Worktree dirs + branches are plan-scoped as `{plan_slug}--{task_id}`;
+        // derive the same plan_slug the orchestrator does so this test stays
+        // location-agnostic (the tempdir parent name varies per run).
+        let plan_slug = plan_slug(&file_path);
+        let wt_name_a = format!("{plan_slug}--task-a");
+        let wt_name_b = format!("{plan_slug}--task-b");
+        let branch_a = format!("task/{plan_slug}--task-a");
+        let branch_b = format!("task/{plan_slug}--task-b");
+
         let run = match api
             .execute(Command::OpenRun {
                 task_list_path: file_path,
@@ -1930,7 +1939,7 @@ Create beta.
         //    has launched + created the worktree before the held developer turn).
         let worktrees_dir = repo_root.join(".makina").join("worktrees");
         let api_poll = Arc::clone(&api);
-        let wt_a = worktrees_dir.join("task-a");
+        let wt_a = worktrees_dir.join(&wt_name_a);
         poll_until(
             || {
                 let api = Arc::clone(&api_poll);
@@ -1994,11 +2003,15 @@ Create beta.
             || {
                 let repo_root = repo_root.clone();
                 let worktrees_dir = worktrees_dir.clone();
+                let wt_name_a = wt_name_a.clone();
+                let wt_name_b = wt_name_b.clone();
+                let branch_a = branch_a.clone();
+                let branch_b = branch_b.clone();
                 async move {
-                    let a_gone = !worktrees_dir.join("task-a").exists();
-                    let b_gone = !worktrees_dir.join("task-b").exists();
-                    let branch_a_gone = !branch_exists(&repo_root, "task/task-a");
-                    let branch_b_gone = !branch_exists(&repo_root, "task/task-b");
+                    let a_gone = !worktrees_dir.join(&wt_name_a).exists();
+                    let b_gone = !worktrees_dir.join(&wt_name_b).exists();
+                    let branch_a_gone = !branch_exists(&repo_root, &branch_a);
+                    let branch_b_gone = !branch_exists(&repo_root, &branch_b);
                     a_gone && b_gone && branch_a_gone && branch_b_gone
                 }
             },
