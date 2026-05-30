@@ -98,6 +98,16 @@ pub trait AuditRegistry: Send + Sync {
         slug: String,
         task_id: String,
     );
+
+    /// Evict every registry entry belonging to `run_id` (the `"run:{n}"` form).
+    ///
+    /// Called when a run reaches a terminal status so that per-task worktree
+    /// contexts do not accumulate for the process lifetime.  The default body is
+    /// a no-op so implementors that keep no state (e.g. [`NoopAuditRegistry`])
+    /// and test spies need not implement it.
+    fn evict_run(&self, run_id: &str) {
+        let _ = run_id;
+    }
 }
 
 // ── NoopAuditRegistry ──────────────────────────────────────────────────────────
@@ -147,10 +157,12 @@ impl AuditRegistry for NoopAuditRegistry {
 ///
 /// # Registry growth
 ///
-/// Registry entries are never evicted; they accumulate for the process
-/// lifetime.  This is acceptable for the MVP (entries are tiny and bounded by
-/// the total number of dispatched tasks), but should be revisited if `makina`
-/// becomes a long-running service.
+/// Registry entries are evicted on terminal: when a run reaches a terminal
+/// status the orchestrator calls [`AuditRegistry::evict_run`], which drops
+/// every entry whose [`AuditContext::run_id`] matches the run.  This keeps the
+/// registry bounded by the number of *in-flight* runs rather than every run the
+/// process has ever started, so `makina` can run as a long-lived service
+/// without the map growing without bound.
 pub struct JsonlAuditSink {
     /// Root of the project repository; the JSONL file lives at
     /// `repo_root/.tasks/{slug}/audit.jsonl`.
@@ -305,6 +317,26 @@ impl AuditRegistry for JsonlAuditSink {
                     "audit registry mutex poisoned; skipping registration for {}",
                     working_dir.display()
                 );
+            }
+        }
+    }
+
+    /// Drop every registry entry belonging to `run_id` (the `"run:{n}"` form).
+    ///
+    /// The map is keyed by `working_dir` (a [`PathBuf`]), **not** by run id, so
+    /// the match is on the [`AuditContext::run_id`] **value** rather than the
+    /// key; we `retain` only entries for *other* runs.  Called when a run
+    /// reaches a terminal status to bound registry growth.
+    ///
+    /// Non-panicking: on a poisoned mutex we log a warning and return (mirroring
+    /// [`register`](AuditRegistry::register)'s poison handling).
+    fn evict_run(&self, run_id: &str) {
+        match self.registry.lock() {
+            Ok(mut map) => {
+                map.retain(|_, ctx| ctx.run_id != run_id);
+            }
+            Err(_) => {
+                tracing::warn!("audit registry mutex poisoned; skipping eviction for {run_id}");
             }
         }
     }
@@ -558,6 +590,76 @@ mod tests {
             serde_json::from_str::<crate::governance::AuditEntry>(line)
                 .unwrap_or_else(|e| panic!("line {i} must be valid JSON: {e}"));
         }
+    }
+
+    /// Done-when test: `evict_run` removes exactly the entries belonging to the
+    /// named run (matched on the [`AuditContext::run_id`] **value**, since the
+    /// map is keyed by `working_dir`), leaving other runs untouched.
+    ///
+    /// Register two distinct working_dirs under run id `"run:1"` and one under
+    /// `"run:2"`, call `sink.evict_run("run:1")`, then inspect the
+    /// in-module-visible private `sink.registry` and assert only the `"run:2"`
+    /// entry survives.
+    #[test]
+    fn evict_run_removes_only_that_runs_entries() {
+        let repo_dir = tempfile::tempdir().expect("create temp dir");
+        let repo_root = repo_dir.path().to_path_buf();
+
+        let wd_run1_a = repo_root.join(".worktrees").join("task-a");
+        let wd_run1_b = repo_root.join(".worktrees").join("task-b");
+        let wd_run2 = repo_root.join(".worktrees").join("task-c");
+
+        let sink = JsonlAuditSink::new(repo_root.clone());
+
+        // Two entries under run:1 ...
+        sink.register(
+            wd_run1_a.clone(),
+            "run-uid-1".to_string(),
+            "run:1".to_string(),
+            "my-slug".to_string(),
+            "task-a".to_string(),
+        );
+        sink.register(
+            wd_run1_b.clone(),
+            "run-uid-1".to_string(),
+            "run:1".to_string(),
+            "my-slug".to_string(),
+            "task-b".to_string(),
+        );
+        // ... and one under run:2.
+        sink.register(
+            wd_run2.clone(),
+            "run-uid-2".to_string(),
+            "run:2".to_string(),
+            "my-slug".to_string(),
+            "task-c".to_string(),
+        );
+
+        // Evict run:1 only.
+        sink.evict_run("run:1");
+
+        // Inspect the private registry directly (in-module visibility).
+        let map = sink.registry.lock().expect("registry mutex not poisoned");
+        assert_eq!(
+            map.len(),
+            1,
+            "only the run:2 entry must remain after evicting run:1"
+        );
+        assert!(
+            !map.contains_key(&wd_run1_a),
+            "run:1 working_dir (task-a) must be evicted"
+        );
+        assert!(
+            !map.contains_key(&wd_run1_b),
+            "run:1 working_dir (task-b) must be evicted"
+        );
+        let surviving = map
+            .get(&wd_run2)
+            .expect("run:2 working_dir (task-c) must survive");
+        assert_eq!(
+            surviving.run_id, "run:2",
+            "the surviving entry must belong to run:2"
+        );
     }
 
     /// Unregistered working_dir: sink must warn and discard (not panic).

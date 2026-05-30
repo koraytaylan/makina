@@ -408,6 +408,11 @@ impl CoreState {
         if let Err(e) = write_run_metadata(&meta, &self.worktree_manager.repo_root).await {
             tracing::warn!(run_uid = %run_uid, error = %e, "run.json write failed");
         }
+
+        // The run is terminal; evict its per-task audit-registry entries so the
+        // registry stays bounded by in-flight runs.  The stored ids are the
+        // `"run:{n}"` form (`RunId` Display), so pass `&run.to_string()`.
+        self.audit_registry.evict_run(&run.to_string());
     }
 }
 
