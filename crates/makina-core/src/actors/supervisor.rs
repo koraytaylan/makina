@@ -1394,6 +1394,15 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     // Ready → InProgress (an intermediate transition; the scheduler owns the
     // terminal-state emission, the driver owns the intermediate ones — task 31).
     ctx.emit_task_state(task_id, TaskState::InProgress);
+    // Additive tracing emission (log-tracing-transition-events): a per-task
+    // subscriber captures the state transition.  Does NOT change EventSink
+    // behavior — runs alongside `emit_task_state`.
+    tracing::info!(
+        task = %task_id.0,
+        from = ?TaskState::Ready,
+        to = ?TaskState::InProgress,
+        "task state transition"
+    );
 
     // ── Step 3–6: the develop → gate → review loop (bounded retry) ─────────────
     let mut feedback: Option<String> = None;
@@ -1411,6 +1420,16 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 // The gate cap fired: the helper already moved the task to Failed
                 // and tore down the worktree.
                 guard.worktree_removed = true;
+                // Additive tracing emission (log-tracing-transition-events): the
+                // terminal Failed transition (InProgress → Failed via the gate
+                // cap).  The scheduler owns the terminal `emit_task_state`; this
+                // is the per-task subscriber's record of the transition.
+                tracing::info!(
+                    task = %task_id.0,
+                    from = ?TaskState::InProgress,
+                    to = ?TaskState::Failed,
+                    "task state transition"
+                );
                 terminal_state = TaskState::Failed;
                 break;
             }
@@ -1544,6 +1563,15 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         ctx.persist().await;
                         remove_worktree(ctx, task_id).await;
                         guard.worktree_removed = true;
+                        // Additive tracing emission (log-tracing-transition-events):
+                        // terminal Failed transition (InReview → Failed via a
+                        // merge conflict).
+                        tracing::info!(
+                            task = %task_id.0,
+                            from = ?TaskState::InReview,
+                            to = ?TaskState::Failed,
+                            "task state transition"
+                        );
                         terminal_state = TaskState::Failed;
                         break;
                     }
@@ -1590,6 +1618,15 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     ctx.emit_task_iterations(task_id, gate_iters, review_iters);
                     remove_worktree(ctx, task_id).await;
                     guard.worktree_removed = true;
+                    // Additive tracing emission (log-tracing-transition-events):
+                    // terminal Failed transition (InReview → Failed via the
+                    // reviewer cap).
+                    tracing::info!(
+                        task = %task_id.0,
+                        from = ?TaskState::InReview,
+                        to = ?TaskState::Failed,
+                        "task state transition"
+                    );
                     terminal_state = TaskState::Failed;
                     break;
                 }
@@ -1610,6 +1647,13 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 ctx.persist().await;
                 // InReview → InProgress (intermediate) + the bumped review count.
                 ctx.emit_task_state(task_id, TaskState::InProgress);
+                // Additive tracing emission (log-tracing-transition-events).
+                tracing::info!(
+                    task = %task_id.0,
+                    from = ?TaskState::InReview,
+                    to = ?TaskState::InProgress,
+                    "task state transition"
+                );
                 ctx.emit_task_iterations(task_id, gate_iters, review_iters);
 
                 // Relay the feedback to the Developer on the next iteration.
@@ -1689,6 +1733,13 @@ async fn develop_until_gates_pass(
 
         match outcome {
             Ok(GateOutcome::Passed) => {
+                // Additive tracing emission (log-tracing-transition-events): the
+                // gate-output record for the passing round (counterpart to the
+                // `gate failed` event on the Failed arm).
+                tracing::info!(
+                    task = %task_id.0,
+                    "gates passed"
+                );
                 // All gates passed → advance to review.
                 {
                     let mut graph = ctx.graph.lock().await;
@@ -1698,6 +1749,13 @@ async fn develop_until_gates_pass(
                 ctx.persist().await;
                 // InProgress → InReview (intermediate transition — task 31).
                 ctx.emit_task_state(task_id, TaskState::InReview);
+                // Additive tracing emission (log-tracing-transition-events).
+                tracing::info!(
+                    task = %task_id.0,
+                    from = ?TaskState::InProgress,
+                    to = ?TaskState::InReview,
+                    "task state transition"
+                );
                 return Ok(DevelopGateOutcome::ReadyForReview);
             }
             Ok(GateOutcome::Failed {
@@ -1705,6 +1763,15 @@ async fn develop_until_gates_pass(
                 output,
                 exit_code,
             }) => {
+                // Additive tracing emission (log-tracing-transition-events): the
+                // gate-output record for the failing gate.  Does NOT change
+                // EventSink behavior — runs alongside the existing emissions.
+                tracing::info!(
+                    task = %task_id.0,
+                    gate = %gate,
+                    exit_code,
+                    "gate failed"
+                );
                 // A gate failed → self-loop and count the iteration; enforce the
                 // per-task GATE cap.
                 let (iterations, review_iters) = {
@@ -1723,6 +1790,14 @@ async fn develop_until_gates_pass(
                 // gate count.  The TUI re-affirms InProgress and updates the
                 // counter (task 31).
                 ctx.emit_task_state(task_id, TaskState::InProgress);
+                // Additive tracing emission (log-tracing-transition-events): the
+                // InProgress self-loop transition.
+                tracing::info!(
+                    task = %task_id.0,
+                    from = ?TaskState::InProgress,
+                    to = ?TaskState::InProgress,
+                    "task state transition"
+                );
                 ctx.emit_task_iterations(task_id, iterations, review_iters);
 
                 if iterations >= ctx.config.caps.gate_iterations {
