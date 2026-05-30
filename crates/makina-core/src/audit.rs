@@ -47,10 +47,8 @@ struct AuditContext {
     /// The unique run identifier used to locate the run's directory
     /// (e.g. `.makina/runs/{run_uid}`).
     ///
-    /// Stored but not yet read: `record()` still routes to the old
-    /// `.tasks/{slug}/audit.jsonl` path. The relocation that consumes this
-    /// field is owned by `mk-audit-relocate-path`.
-    #[allow(dead_code)]
+    /// Read by `record()` to route the enriched entry to
+    /// `.makina/runs/{run_uid}/audit.jsonl` via [`crate::paths::audit_log`].
     run_uid: String,
     /// The stable run identifier (e.g. `"run:1"` from `RunId::to_string()`).
     run_id: String,
@@ -202,7 +200,7 @@ impl AuditSink for JsonlAuditSink {
     ///
     /// # File path
     ///
-    /// `{repo_root}/.tasks/{slug}/audit.jsonl`
+    /// `{repo_root}/.makina/runs/{run_uid}/audit.jsonl`
     ///
     /// The directory is created if it does not exist.
     fn record(&self, mut entry: AuditEntry) {
@@ -245,20 +243,22 @@ impl AuditSink for JsonlAuditSink {
             }
         };
 
-        // ── Append to .tasks/{slug}/audit.jsonl ───────────────────────────────
+        // ── Append to .makina/runs/{run_uid}/audit.jsonl ──────────────────────
         // NOTE: the dir-create + open + append below are synchronous (blocking)
         // `std::fs` calls run on the caller's thread — the ACP transport reader
         // loop, an async worker. This is acceptable for the MVP because
         // `record` fires at most once per permission prompt (a very low rate);
         // if the audit rate ever grows, offload these writes to a background
         // writer task (follow-up). See the `AuditSink` trait docs.
-        let dir = self.repo_root.join(".tasks").join(&ctx.slug);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        let path = crate::paths::audit_log(&self.repo_root, &ctx.run_uid);
+        if let Some(dir) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
             tracing::warn!(
-                slug = %ctx.slug,
+                run_uid = %ctx.run_uid,
                 dir = %dir.display(),
                 error = %e,
-                "audit sink: failed to create .tasks/<slug> directory; skipping"
+                "audit sink: failed to create run audit directory; skipping"
             );
             return;
         }
@@ -267,7 +267,6 @@ impl AuditSink for JsonlAuditSink {
         // A compact single-line audit entry is well under PIPE_BUF, so the
         // O_APPEND write is atomic on Linux/macOS; concurrent appends by two
         // tasks of the same run won't interleave lines.
-        let path = dir.join("audit.jsonl");
         use std::io::Write as _;
         match std::fs::OpenOptions::new()
             .create(true)
@@ -326,10 +325,11 @@ mod tests {
     /// Core acceptance test: register → record → assert file content.
     ///
     /// 1. Build a `JsonlAuditSink` over a temp dir.
-    /// 2. Register `working_dir` with (run-1, my-slug, task-a).
+    /// 2. Register `working_dir` with (run-uid-1, run-1, my-slug, task-a).
     /// 3. `record` an entry with the transport's placeholder ids.
-    /// 4. Assert `.tasks/my-slug/audit.jsonl` exists with one line containing
-    ///    `run_id == "run-1"`, `task_id == "task-a"`, and the decision populated.
+    /// 4. Assert `.makina/runs/run-uid-1/audit.jsonl` exists with one line
+    ///    containing `run_id == "run-1"`, `task_id == "task-a"`, and the
+    ///    decision populated.
     /// 5. `record` a second entry and assert TWO lines (append, not truncate).
     #[test]
     fn jsonl_audit_sink_enriches_and_appends() {
@@ -355,7 +355,11 @@ mod tests {
         sink.record(sample_entry(working_dir.clone()));
 
         // Assert the JSONL file exists and has exactly one line.
-        let audit_path = repo_root.join(".tasks").join("my-slug").join("audit.jsonl");
+        let audit_path = repo_root
+            .join(".makina")
+            .join("runs")
+            .join("run-uid-1")
+            .join("audit.jsonl");
         assert!(
             audit_path.exists(),
             "audit.jsonl must be created after first record"
@@ -416,13 +420,13 @@ mod tests {
         sink.record(sample_entry(working_dir));
 
         // No panic; no audit.jsonl created (nothing to route to).
-        let tasks_dir = repo_root.join(".tasks");
+        let runs_dir = repo_root.join(".makina").join("runs");
         assert!(
-            !tasks_dir.exists()
-                || std::fs::read_dir(&tasks_dir)
+            !runs_dir.exists()
+                || std::fs::read_dir(&runs_dir)
                     .map(|mut d| d.next().is_none())
                     .unwrap_or(true),
-            ".tasks/ must be empty or absent when no entry is routed"
+            ".makina/runs/ must be empty or absent when no entry is routed"
         );
     }
 
