@@ -45,7 +45,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, ExchangeEntry, Panel};
+use crate::app::{App, DependencyViewMode, ExchangeEntry, Panel};
 
 /// Render the full TUI layout into `frame`.
 ///
@@ -332,8 +332,22 @@ pub fn render(app: &App, frame: &mut Frame) {
                 frame.render_stateful_widget(task_table, table_area, &mut table_state);
             }
 
-            // ── Exchange pane (task 30) ────────────────────────────────────
-            render_exchange_pane(app, frame, exchange_area, main_focused);
+            // ── Dependency view + Exchange pane (task 30) ──────────────────
+            // When a dependency-view overlay is active, carve a top sub-pane out
+            // of the exchange region for it and render the exchange pane below.
+            // `DependencyViewMode::Off` leaves the exchange pane full-height.
+            let exchange_pane_area = if app.dependency_view == DependencyViewMode::Off {
+                exchange_area
+            } else {
+                let dep_height = (exchange_area.height / 2).max(3);
+                let dep_split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(dep_height), Constraint::Min(3)])
+                    .split(exchange_area);
+                render_dependency_view(app, frame, dep_split[0]);
+                dep_split[1]
+            };
+            render_exchange_pane(app, frame, exchange_pane_area, main_focused);
 
             // ── Error pane (collapsible) ───────────────────────────────────
             // A 0-height `error_area` (pane closed) makes this a no-op.
@@ -406,6 +420,75 @@ pub fn render(app: &App, frame: &mut Frame) {
 /// The App stores exchange logs for ALL in-flight tasks.  This function reads
 /// only the log for `app.selected_task_id()` — focus filtering happens here at
 /// render time, not in the event-handling layer.
+/// Render the dependency-view sub-pane for the selected task.
+///
+/// This is the single shared entry point for all [`DependencyViewMode`]
+/// renderings: sibling tasks (`tui-dep-tree`, `tui-dep-timeline`) only add their
+/// match arms here.  The pane is a top-bordered `Dependencies` block; its body
+/// depends on the active [`App::dependency_view`].
+///
+/// For [`DependencyViewMode::List`] it renders the selected task's `depends_on`
+/// as a compact `[state] task-id` list, one prerequisite per line, looking up
+/// each dependency's [`TaskView`] in the same run to colour its state badge.
+fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .title(" Dependencies ")
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    match app.dependency_view {
+        DependencyViewMode::List => {
+            // Resolve the selected task and its prerequisites within the run.
+            let selected_id = app.selected_task_id();
+            let run = app.selected_run();
+            let lines: Vec<Line> = match (selected_id, run) {
+                (Some(id), Some(run)) => {
+                    let selected = run.tasks.iter().find(|t| &t.id == id);
+                    match selected {
+                        Some(task) if !task.depends_on.is_empty() => task
+                            .depends_on
+                            .iter()
+                            .map(|dep_id| {
+                                // Look up the prerequisite's view in the same run
+                                // to colour its state badge; fall back to a plain
+                                // id line if the task is not present.
+                                match run.tasks.iter().find(|t| &t.id == dep_id) {
+                                    Some(dep) => {
+                                        let (badge, color) = task_state_badge(&dep.state);
+                                        Line::from(vec![Span::styled(
+                                            format!("{} {}", badge, dep.id.0),
+                                            Style::default().fg(color),
+                                        )])
+                                    }
+                                    None => Line::from(vec![Span::styled(
+                                        format!("  {}", dep_id.0),
+                                        Style::default().fg(Color::DarkGray),
+                                    )]),
+                                }
+                            })
+                            .collect(),
+                        _ => vec![Line::from(vec![Span::styled(
+                            "  No dependencies.",
+                            Style::default().fg(Color::DarkGray),
+                        )])],
+                    }
+                }
+                _ => vec![Line::from(vec![Span::styled(
+                    "  No task focused.",
+                    Style::default().fg(Color::DarkGray),
+                )])],
+            };
+            let para = Paragraph::new(lines);
+            frame.render_widget(para, inner);
+        }
+        // `Off` is handled by the caller (this fn is not invoked); `Tree` and
+        // `Timeline` arms are added by sibling tasks.
+        DependencyViewMode::Off | DependencyViewMode::Tree | DependencyViewMode::Timeline => {}
+    }
+}
+
 fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool) {
     // When the error pane is collapsed but errors are pending, surface a badge
     // in the Exchange title so the user knows there's something to expand.
@@ -1553,6 +1636,39 @@ mod tests {
         assert!(screen.contains('3'), "gate iteration count 3 must appear");
         // Alpha task has review_iterations=2.
         assert!(screen.contains('2'), "review iteration count 2 must appear");
+    }
+
+    /// With [`DependencyViewMode::List`] active and gamma (which depends on
+    /// beta) selected, the dependency sub-pane lists beta as a `[state] task-id`
+    /// line with beta's state badge, and the Exchange pane still renders below it
+    /// (no overlap).
+    #[test]
+    fn render_dependency_list_shows_prereqs_with_badges() {
+        use crate::app::DependencyViewMode;
+        let mut terminal = make_terminal(120, 30);
+        let mut app = task_status_app();
+        // gamma is index 2 and depends_on beta (InProgress → "[▶ working]").
+        app.selected_task = Some(2);
+        app.dependency_view = DependencyViewMode::List;
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The beta dependency id appears in the dependency list.
+        assert!(
+            screen.contains("beta"),
+            "dependency list should show the beta prerequisite id"
+        );
+        // Beta is InProgress; its state badge text must appear.
+        assert!(
+            screen.contains("working"),
+            "dependency list should show beta's state badge"
+        );
+        // The Exchange pane still renders below (no overlap).
+        assert!(
+            screen.contains("Exchange"),
+            "Exchange title/border must still render below the dependency pane"
+        );
     }
 
     /// The status bar shows the `G`/`R` legend when the selected run carries

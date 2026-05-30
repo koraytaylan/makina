@@ -149,6 +149,25 @@ pub enum Mode {
     FileBrowser,
 }
 
+/// Which dependency-view overlay (if any) the TUI renders above the exchange
+/// pane for the selected task.
+///
+/// [`DependencyViewMode::Off`] is the default (no dependency sub-pane).  The
+/// remaining variants pick a rendering: [`DependencyViewMode::List`] shows a
+/// compact `[state] task-id` list of the selected task's prerequisites; `Tree`
+/// and `Timeline` are added by sibling tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyViewMode {
+    /// No dependency sub-pane is shown.
+    Off,
+    /// Compact `[state] task-id` list of the selected task's `depends_on`.
+    List,
+    /// Indented dependency tree (task `tui-dep-tree`).
+    Tree,
+    /// Dependency timeline (task `tui-dep-timeline`).
+    Timeline,
+}
+
 // ── Panel focus ───────────────────────────────────────────────────────────────
 
 /// Which panel the keyboard focus is currently on.
@@ -307,6 +326,10 @@ pub struct App {
     /// file picker; [`Mode::Normal`] shows the runs sidebar + detail panel.
     pub mode: Mode,
 
+    /// Which dependency-view overlay (if any) is rendered above the exchange
+    /// pane for the selected task.  [`DependencyViewMode::Off`] hides it.
+    pub dependency_view: DependencyViewMode,
+
     /// File-browser view state.  `Some` only while [`App::mode`] is
     /// [`Mode::FileBrowser`]; the IO layer populates it via
     /// [`AppEvent::BrowserOpened`].
@@ -384,6 +407,7 @@ impl App {
             api,
             focused_panel: Panel::Sidebar,
             mode: Mode::Normal,
+            dependency_view: DependencyViewMode::Off,
             browser: None,
             runs: initial_runs,
             selected_run,
