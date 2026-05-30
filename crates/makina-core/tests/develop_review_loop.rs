@@ -207,7 +207,10 @@ async fn single_task_runs_end_to_end_to_done() {
         .expect("SetTaskGraph must be accepted");
 
     // Sanity: the worktree/branch do NOT exist before the run.
-    let worktree_path = repo_root.join(".worktrees").join("build-thing");
+    let worktree_path = repo_root
+        .join(".makina")
+        .join("worktrees")
+        .join("build-thing");
     assert!(!worktree_path.exists(), "worktree must not exist pre-run");
     assert!(
         !branch_exists(&repo_root, "task/build-thing"),
@@ -378,7 +381,7 @@ async fn reject_then_approve_relays_feedback_and_finishes_done() {
     );
 
     // Worktree torn down after completion.
-    let worktree_path = repo_root.join(".worktrees").join("fix-bug");
+    let worktree_path = repo_root.join(".makina").join("worktrees").join("fix-bug");
     assert!(
         !worktree_path.exists(),
         "worktree must be gone after the run"
@@ -455,8 +458,20 @@ async fn dependency_chain_runs_a_then_b() {
     }
 
     // Both worktrees torn down.
-    assert!(!repo_root.join(".worktrees").join("task-a").exists());
-    assert!(!repo_root.join(".worktrees").join("task-b").exists());
+    assert!(
+        !repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("task-a")
+            .exists()
+    );
+    assert!(
+        !repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("task-b")
+            .exists()
+    );
 
     root.kill();
 }

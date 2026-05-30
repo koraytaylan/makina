@@ -1704,7 +1704,7 @@ Create beta.
 
         // 2. Wait until task-a is InProgress AND its worktree exists (the driver
         //    has launched + created the worktree before the held developer turn).
-        let worktrees_dir = repo_root.join(".worktrees");
+        let worktrees_dir = repo_root.join(".makina").join("worktrees");
         let api_poll = Arc::clone(&api);
         let wt_a = worktrees_dir.join("task-a");
         poll_until(

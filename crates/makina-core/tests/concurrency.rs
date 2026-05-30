@@ -665,11 +665,12 @@ async fn merges_into_develop_are_serialized_and_clean() {
     );
 
     // develop is CLEAN (no half-staged squash / conflict markers left behind).
-    // The `.tasks/` directory is intentionally untracked (supervisor persistence
-    // artifacts); filter it out so the merge-cleanliness check stays meaningful.
+    // The `.makina/` directory is intentionally untracked (supervisor persistence
+    // artifacts and worktree checkouts); filter it out so the merge-cleanliness
+    // check stays meaningful.
     let dirty: String = status_porcelain(&repo_root)
         .lines()
-        .filter(|line| !line.contains(".tasks/"))
+        .filter(|line| !line.contains(".makina/"))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(

@@ -247,7 +247,11 @@ async fn passing_gates_advance_to_review_and_done() {
 
     // Worktree torn down after approval.
     assert!(
-        !repo_root.join(".worktrees").join("build-thing").exists(),
+        !repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("build-thing")
+            .exists(),
         "worktree must be gone after the run"
     );
 
@@ -366,7 +370,11 @@ async fn gate_failure_loops_then_passes_and_relays_feedback() {
     );
 
     assert!(
-        !repo_root.join(".worktrees").join("fix-thing").exists(),
+        !repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("fix-thing")
+            .exists(),
         "worktree must be gone after the run"
     );
 
@@ -457,7 +465,11 @@ async fn always_failing_gate_hits_cap_and_fails_task() {
 
     // The worktree was torn down on the cap failure (no leak).
     assert!(
-        !repo_root.join(".worktrees").join("doomed-thing").exists(),
+        !repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("doomed-thing")
+            .exists(),
         "worktree must be torn down when the gate cap fails the task"
     );
 

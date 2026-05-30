@@ -108,11 +108,11 @@ fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
 ///
 /// Sequence:
 /// 1. `WorktreeManager::new(temp_repo, "develop").create("sample-task")`
-///    - `.worktrees/sample-task/` must exist and contain a valid git checkout.
+///    - `.makina/worktrees/sample-task/` must exist and contain a valid git checkout.
 ///    - Branch `task/sample-task` must exist.
 ///    - Handle fields must match expectations.
 /// 2. `.remove("sample-task")`
-///    - `.worktrees/sample-task/` must be gone.
+///    - `.makina/worktrees/sample-task/` must be gone.
 ///    - Branch `task/sample-task` must be gone.
 #[tokio::test]
 async fn create_makes_worktree_and_branch_remove_tears_them_down() {
@@ -133,7 +133,10 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
     assert_eq!(handle.branch, "task/sample-task");
     assert_eq!(
         handle.path,
-        repo_root.join(".worktrees").join("sample-task")
+        repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("sample-task")
     );
 
     // Worktree directory must exist and be a git checkout.

@@ -202,7 +202,7 @@ async fn build_actor_tree(
 /// teardown completes shortly *after* the run returns.  This polls a short
 /// deadline rather than using a fixed sleep (per the testing-strategy).
 async fn assert_worktree_gone(repo_root: &std::path::Path, task_id: &str) {
-    let worktree_path = repo_root.join(".worktrees").join(task_id);
+    let worktree_path = repo_root.join(".makina").join("worktrees").join(task_id);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if !worktree_path.exists() {
@@ -304,7 +304,11 @@ async fn gate_cap_drives_task_to_failed() {
 
     // Worktree + branch torn down on the cap failure (no leak).
     assert!(
-        !repo_root.join(".worktrees").join("doomed-gate").exists(),
+        !repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("doomed-gate")
+            .exists(),
         "worktree must be torn down when the gate cap fails the task"
     );
     assert!(
@@ -435,7 +439,11 @@ async fn reviewer_cap_drives_task_to_failed() {
 
     // Worktree + branch torn down on the cap failure (no leak).
     assert!(
-        !repo_root.join(".worktrees").join("doomed-review").exists(),
+        !repo_root
+            .join(".makina")
+            .join("worktrees")
+            .join("doomed-review")
+            .exists(),
         "worktree must be torn down when the reviewer cap fails the task"
     );
     assert!(

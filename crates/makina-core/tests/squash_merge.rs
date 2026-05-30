@@ -481,7 +481,7 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
     );
 
     // ── The worktree + branch were torn down ──────────────────────────────────
-    let worktree_path = repo_root.join(".worktrees").join("land-it");
+    let worktree_path = repo_root.join(".makina").join("worktrees").join("land-it");
     assert!(
         !worktree_path.exists(),
         "worktree dir must be gone after the run"
@@ -491,11 +491,12 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
         "task/land-it branch must be gone after the run"
     );
 
-    // develop's working tree is clean (excluding .tasks/ which the supervisor
-    // persistence writes as an intentionally-untracked artifact).
+    // develop's working tree is clean (excluding .makina/ which the supervisor
+    // persistence and worktree machinery write as an intentionally-untracked
+    // artifact directory).
     let dirty: String = status_porcelain(&repo_root)
         .lines()
-        .filter(|line| !line.contains(".tasks/"))
+        .filter(|line| !line.contains(".makina/"))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(

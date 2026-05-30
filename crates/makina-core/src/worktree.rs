@@ -61,6 +61,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::paths;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors produced by [`WorktreeManager`].
@@ -311,7 +313,7 @@ impl WorktreeManager {
 
     /// Compute the worktree path for a given task ID.
     fn worktree_path(&self, task_id: &str) -> PathBuf {
-        self.repo_root.join(".worktrees").join(task_id)
+        paths::worktree(&self.repo_root, task_id)
     }
 
     /// Run `git worktree prune` in the repository.
@@ -491,6 +493,6 @@ mod tests {
     fn worktree_path_is_under_repo_root() {
         let mgr = WorktreeManager::new(PathBuf::from("/repo"), "develop".into());
         let path = mgr.worktree_path("my-task");
-        assert_eq!(path, PathBuf::from("/repo/.worktrees/my-task"));
+        assert_eq!(path, PathBuf::from("/repo/.makina/worktrees/my-task"));
     }
 }
