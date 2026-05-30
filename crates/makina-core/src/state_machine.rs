@@ -144,6 +144,16 @@ pub enum TaskEvent {
     /// (dispatch), so an un-started task cannot time out.  Enforced externally
     /// (the scheduler wraps each driver in a `tokio::time::timeout`).
     WallClockCapReached,
+
+    /// A prerequisite (transitive `depends_on`) of this task reached
+    /// [`TaskState::Failed`], so the task can never become [`TaskState::Ready`].
+    ///
+    /// Legal from any *active* state — [`TaskState::New`], [`TaskState::Ready`],
+    /// [`TaskState::InProgress`], or [`TaskState::InReview`] — all moving the task
+    /// to [`TaskState::Skipped`] (terminal).  **Not** legal from a terminal state
+    /// (`Done`, `Failed`, `Skipped`).  Enforced externally (the scheduler walks
+    /// the reverse dependency edges when a task fails).
+    DependencyFailed,
 }
 
 // ── IllegalTransition ─────────────────────────────────────────────────────────
@@ -219,6 +229,9 @@ pub fn transition(from: TaskState, event: TaskEvent) -> Result<TaskState, Illega
         (InReview, HardError) => Ok(Failed),     // review-time / hard-merge error (task 25)
         (InReview, WallClockCapReached) => Ok(Failed), // deadline (task 25)
 
+        // ── DependencyFailed (active → Skipped) ───────────────────────────────
+        (New | Ready | InProgress | InReview, DependencyFailed) => Ok(Skipped),
+
         // ── Everything else (illegal) ─────────────────────────────────────────
         _ => Err(IllegalTransition { from, event }),
     }
@@ -229,9 +242,12 @@ pub fn transition(from: TaskState, event: TaskEvent) -> Result<TaskState, Illega
 /// Returns `true` if `state` is a terminal state from which no further
 /// transitions are possible.
 ///
-/// Currently `Done` and `Failed` are the only terminal states.
+/// Currently `Done`, `Failed`, and `Skipped` are the terminal states.
 pub fn is_terminal(state: TaskState) -> bool {
-    matches!(state, TaskState::Done | TaskState::Failed)
+    matches!(
+        state,
+        TaskState::Done | TaskState::Failed | TaskState::Skipped
+    )
 }
 
 /// Returns the complete list of [`TaskEvent`]s that are legal in `state`.
@@ -243,14 +259,15 @@ pub fn legal_events(from: TaskState) -> Vec<TaskEvent> {
     use TaskState::*;
 
     match from {
-        New => vec![DependenciesSatisfied],
-        Ready => vec![Dispatched, HardError, WallClockCapReached],
+        New => vec![DependenciesSatisfied, DependencyFailed],
+        Ready => vec![Dispatched, HardError, WallClockCapReached, DependencyFailed],
         InProgress => vec![
             GateFailed,
             GatesPassed,
             GateCapReached,
             HardError,
             WallClockCapReached,
+            DependencyFailed,
         ],
         InReview => vec![
             ReviewerRejected,
@@ -259,8 +276,9 @@ pub fn legal_events(from: TaskState) -> Vec<TaskEvent> {
             MergeConflict,
             HardError,
             WallClockCapReached,
+            DependencyFailed,
         ],
-        Done | Failed => vec![],
+        Done | Failed | Skipped => vec![],
     }
 }
 
@@ -312,6 +330,10 @@ mod tests {
             (InReview, MergeConflict, Failed), // squash-merge conflict (dedicated)
             (InReview, HardError, Failed),     // review-time / hard-merge error (task 25)
             (InReview, WallClockCapReached, Failed), // deadline (task 25)
+            (New, DependencyFailed, Skipped),  // prerequisite failed (fsm-skipped-state)
+            (Ready, DependencyFailed, Skipped),
+            (InProgress, DependencyFailed, Skipped),
+            (InReview, DependencyFailed, Skipped),
         ]
     }
 
@@ -620,5 +642,49 @@ mod tests {
                 "MergeConflict must be rejected from {state:?}"
             );
         }
+    }
+
+    // ── Task fsm-skipped-state assertions ─────────────────────────────────────
+
+    /// `DependencyFailed` moves a task from each active state to `Skipped`.
+    #[test]
+    fn each_active_state_plus_dependency_failed_yields_skipped() {
+        for state in [
+            TaskState::New,
+            TaskState::Ready,
+            TaskState::InProgress,
+            TaskState::InReview,
+        ] {
+            assert_eq!(
+                transition(state, TaskEvent::DependencyFailed),
+                Ok(TaskState::Skipped),
+                "DependencyFailed should skip an active {state:?} task"
+            );
+        }
+    }
+
+    /// `DependencyFailed` is illegal from every terminal state (FSM totality).
+    #[test]
+    fn dependency_failed_is_illegal_from_terminal_states() {
+        use TaskState::*;
+        for &state in &[Done, Failed, Skipped] {
+            assert_eq!(
+                transition(state, TaskEvent::DependencyFailed),
+                Err(IllegalTransition {
+                    from: state,
+                    event: TaskEvent::DependencyFailed,
+                }),
+                "DependencyFailed must be rejected from terminal {state:?}"
+            );
+        }
+    }
+
+    /// `Skipped` is a terminal state.
+    #[test]
+    fn skipped_is_terminal() {
+        assert!(
+            is_terminal(TaskState::Skipped),
+            "Skipped must be a terminal state"
+        );
     }
 }

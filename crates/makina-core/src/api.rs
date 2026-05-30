@@ -130,6 +130,8 @@ pub enum TaskState {
     Done,
     /// Task permanently failed (gate/review limit exceeded or fatal error).
     Failed,
+    /// A prerequisite failed, so the task was never run.
+    Skipped,
 }
 
 /// Map the domain [`crate::task::TaskState`] onto the view-level [`TaskState`].
@@ -148,6 +150,7 @@ impl From<crate::task::TaskState> for TaskState {
             Domain::InReview => TaskState::InReview,
             Domain::Done => TaskState::Done,
             Domain::Failed => TaskState::Failed,
+            Domain::Skipped => TaskState::Skipped,
         }
     }
 }

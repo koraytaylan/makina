@@ -102,6 +102,11 @@ pub enum TaskState {
     /// The task permanently failed after exhausting retry / gate limits, or
     /// encountered an unrecoverable error.  Terminal.
     Failed,
+
+    /// A prerequisite of this task failed, so the task was never run.  Reached
+    /// via [`crate::state_machine::TaskEvent::DependencyFailed`] from any active
+    /// state.  Terminal.
+    Skipped,
 }
 
 // ── Task ──────────────────────────────────────────────────────────────────────

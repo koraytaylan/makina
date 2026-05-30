@@ -268,7 +268,11 @@ pub fn recover_for_resume(graph: &mut TaskGraph) {
             TaskState::InProgress | TaskState::InReview => {
                 task.state = TaskState::Ready;
             }
-            TaskState::New | TaskState::Ready | TaskState::Done | TaskState::Failed => {}
+            TaskState::New
+            | TaskState::Ready
+            | TaskState::Done
+            | TaskState::Failed
+            | TaskState::Skipped => {}
         }
     }
 }

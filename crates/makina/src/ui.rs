@@ -680,6 +680,7 @@ fn task_state_badge(s: &makina_core::api::TaskState) -> (&'static str, Color) {
         TaskState::InReview => ("[⧗ review]", Color::Yellow),
         TaskState::Done => ("[✓ done]", Color::Cyan),
         TaskState::Failed => ("[✗ failed]", Color::Red),
+        TaskState::Skipped => ("[⊘ skipped]", Color::DarkGray),
     }
 }
 
