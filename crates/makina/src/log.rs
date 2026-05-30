@@ -1,6 +1,15 @@
-//! Per-run **file** layer of the tracing subscriber.
+//! Tracing-subscriber layers for Makina.
 //!
-//! # Why a custom layer
+//! This module provides two [`tracing_subscriber::Layer`]s composed onto one
+//! registry in [`crate::main`]:
+//!
+//! - [`RunFileLayer`] — the per-run **file** layer (span-keyed routing), and
+//! - [`TuiLogLayer`] — the **TUI-channel** layer that `try_send`s a
+//!   [`makina_core::log_record::LogRecord`] per event onto a bounded mpsc
+//!   channel the TUI drains. Build it (plus its receiver) with
+//!   [`tui_log_channel`].
+//!
+//! # Why a custom file layer
 //!
 //! The subscriber is installed **once** at process startup ([`crate::main`]),
 //! but run ids are allocated **lazily** per `OpenRun` (the orchestrator's
@@ -35,11 +44,20 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use makina_core::log_record::LogRecord;
+use tokio::sync::mpsc;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
+
+/// Capacity of the bounded tracing→TUI channel.
+///
+/// Bounded so a stalled / slow TUI consumer cannot grow unbounded memory: when
+/// the channel is full the [`TuiLogLayer`] **drops** the record rather than
+/// block the emitting thread (logging must never stall a run).
+pub const TUI_LOG_CHANNEL_CAPACITY: usize = 256;
 
 /// The span-extension value: the `run_uid` a span (and its children) belong to.
 #[derive(Clone)]
@@ -168,4 +186,74 @@ where
         );
         self.append(&run_uid, &line);
     }
+}
+
+// ── TUI channel layer (task log-subscriber-tui-channel) ─────────────────────────
+
+/// A tracing [`Layer`] that forwards each event to the TUI over a **bounded**
+/// [`tokio::sync::mpsc`] channel.
+///
+/// # Why a channel layer
+///
+/// The TUI's error/log pane needs to surface `warn!`/`error!` (and friends) as
+/// they happen. Rather than have the TUI poll the per-run log files, this layer
+/// converts each `tracing::Event` into a self-contained
+/// [`makina_core::log_record::LogRecord`] and `try_send`s it onto a channel the
+/// TUI drains in its `tokio::select!` loop.
+///
+/// # Bounded, non-blocking, re-entrancy-safe
+///
+/// The channel is **bounded** ([`TUI_LOG_CHANNEL_CAPACITY`]). On a full channel
+/// the record is **dropped** ([`mpsc::error::TrySendError::Full`]) — the layer
+/// never blocks the emitting thread. Critically, the drop path does **not**
+/// itself emit a `tracing::warn!` (or any tracing event): doing so from inside
+/// the layer would re-enter the subscriber and could recurse. The dropped
+/// record is simply discarded.
+///
+/// Unlike [`RunFileLayer`], this layer does **not** require a `run_uid` span:
+/// every event (even those emitted outside any run span) is forwarded, so
+/// process-level diagnostics still reach the TUI.
+pub struct TuiLogLayer {
+    sender: mpsc::Sender<LogRecord>,
+}
+
+impl TuiLogLayer {
+    /// Create the layer from the sending half of a bounded channel.
+    ///
+    /// Pair with [`tui_log_channel`], which builds the channel at the spec's
+    /// capacity and hands the [`mpsc::Receiver`] to the TUI.
+    pub fn new(sender: mpsc::Sender<LogRecord>) -> Self {
+        Self { sender }
+    }
+}
+
+impl<S> Layer<S> for TuiLogLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+
+        let meta = event.metadata();
+        let record = LogRecord::now(
+            *meta.level(),
+            visitor.message.trim_end().to_owned(),
+            meta.target().to_owned(),
+        );
+
+        // Non-blocking: on a full channel, DROP the record. Do NOT emit a
+        // tracing event here (it would re-enter this layer and could recurse).
+        let _ = self.sender.try_send(record);
+    }
+}
+
+/// Build the bounded tracing→TUI channel at the spec capacity
+/// ([`TUI_LOG_CHANNEL_CAPACITY`]).
+///
+/// Returns the [`TuiLogLayer`] (compose it into the subscriber registry) and the
+/// [`mpsc::Receiver`] (hand it to the TUI event loop to drain).
+pub fn tui_log_channel() -> (TuiLogLayer, mpsc::Receiver<LogRecord>) {
+    let (tx, rx) = mpsc::channel(TUI_LOG_CHANNEL_CAPACITY);
+    (TuiLogLayer::new(tx), rx)
 }

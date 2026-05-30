@@ -9,7 +9,7 @@
 //! | `app` | All TUI state + pure `update(AppEvent)` function. |
 //! | `browser` | File-browser view state + pure navigation (no IO). |
 //! | `ui` | Pure rendering: `App` → `Frame` (uses `ratatui::TestBackend` in tests). |
-//! | `log` | Per-run **file** layer of the tracing subscriber (span-keyed routing). |
+//! | `log` | Tracing-subscriber layers: per-run **file** layer (span-keyed routing) + a **TUI-channel** layer (`try_send` to a bounded mpsc). |
 //! | `placeholder` | **test-only** `Api` double (`#[cfg(test)]`); the binary uses the real [`makina_core::orchestrator::CoreApi`]. |
 //!
 //! The crate exposes a thin library so integration tests (`tests/*.rs`) can

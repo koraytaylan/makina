@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
+use makina_core::log_record::LogRecord;
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -57,10 +58,22 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// should call `tui.restore()` (though the [`Drop`] impl on `Tui` is a safety
 /// net).
 ///
+/// `_log_rx` is the receiving half of the bounded tracing→TUI channel
+/// (task `log-subscriber-tui-channel`): the `TuiLogLayer` `try_send`s a
+/// [`LogRecord`] per event onto it. It is threaded in here so plan-0015's
+/// `tui-error-pane-channel-wire` can add a drain arm to the `tokio::select!`
+/// below; until then it is held (the leading underscore marks it as not-yet
+/// consumed) so the channel sender stays alive and records are not lost to a
+/// closed receiver.
+///
 /// # Errors
 ///
 /// Returns any `io::Error` from terminal I/O.
-pub async fn run(tui: &mut Tui, app: &mut App) -> std::io::Result<()> {
+pub async fn run(
+    tui: &mut Tui,
+    app: &mut App,
+    _log_rx: mpsc::Receiver<LogRecord>,
+) -> std::io::Result<()> {
     // Subscribe to api events once at startup.
     let mut api_stream = app.api.subscribe();
 

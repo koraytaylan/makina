@@ -15,6 +15,7 @@ pub mod gate;
 pub mod governance;
 pub mod interpreter;
 pub(crate) mod json;
+pub mod log_record;
 pub mod merge;
 pub mod orchestrator;
 pub mod paths;

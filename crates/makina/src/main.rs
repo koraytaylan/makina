@@ -63,21 +63,33 @@ async fn main() {
     // This guarantees the sink is the ONLY writer under `.tasks/{slug}/audit.jsonl`.
     let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.clone()));
 
-    // ── Tracing subscriber: per-run file log layer (task log-subscriber-file) ──
+    // ── Tracing subscriber: file + TUI-channel layers (tasks log-subscriber-*) ─
     // Installed ONCE here, after the audit-sink setup and before the event loop.
-    // Run ids are allocated lazily per OpenRun and many runs can be open at once,
-    // so the file destination cannot be a static path: the custom `RunFileLayer`
-    // resolves it per event from the current span's `run_uid` field, appending to
-    // `.makina/runs/{run_uid}/logs/run.log`. Events carry the key because
-    // `run_graph` opens a `tracing::info_span!(run_uid = …)`. There is no prior
-    // `tracing_subscriber` usage in the repo; this is the first install.
-    {
+    //
+    // Two layers are composed onto one registry:
+    //  - `RunFileLayer` (task log-subscriber-file): run ids are allocated lazily
+    //    per OpenRun and many runs can be open at once, so the file destination
+    //    cannot be a static path — it resolves per event from the current span's
+    //    `run_uid` field and appends to `.makina/runs/{run_uid}/logs/run.log`.
+    //    Events carry the key because `run_graph` opens an
+    //    `info_span!(run_uid = …)`.
+    //  - `TuiLogLayer` (task log-subscriber-tui-channel): converts each event to
+    //    a `LogRecord` and `try_send`s it onto a bounded mpsc channel; on a full
+    //    channel the record is dropped (never blocks). The `Receiver` is held
+    //    here and threaded into the event loop so plan-0015 can drain it.
+    //
+    // There is no prior `tracing_subscriber` usage in the repo; this is the
+    // first install.
+    let log_rx = {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
+        let (tui_layer, log_rx) = log::tui_log_channel();
         tracing_subscriber::registry()
             .with(log::RunFileLayer::new(repo_root.clone()))
+            .with(tui_layer)
             .init();
-    }
+        log_rx
+    };
 
     let backend: Arc<dyn AgentBackend> =
         Arc::new(
@@ -122,7 +134,9 @@ async fn main() {
     };
 
     // ── Event loop ────────────────────────────────────────────────────────────
-    if let Err(e) = event::run(&mut tui, &mut app).await {
+    // `log_rx` (the tracing→TUI channel receiver) is threaded in so plan-0015's
+    // `tui-error-pane-channel-wire` can drain it in the loop's `tokio::select!`.
+    if let Err(e) = event::run(&mut tui, &mut app, log_rx).await {
         // Restore the terminal before printing the error, so the message is
         // visible even if raw mode was active.
         tui.restore();
