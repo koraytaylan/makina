@@ -53,7 +53,7 @@
 //!
 //! [extensions]: tracing_subscriber::registry::SpanRef::extensions
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write as _;
@@ -138,21 +138,107 @@ impl Visit for FieldVisitor {
 /// One append-mode [`File`] writer is opened and **cached** per destination
 /// (keyed by its resolved path), so a hot task does not re-open its log on every
 /// record.
+///
+/// # Bounded fd footprint
+///
+/// The writer cache holds **at most** [`WRITER_CACHE_CAP`] open files. A
+/// long-lived process opens a new append writer per resolved log path (`run.log`
+/// plus every `{task_slug}.log`) across many runs, so an unbounded cache would
+/// leak file descriptors monotonically. On a cache **miss** that would exceed
+/// the cap, the oldest writer (by insertion order) is evicted and its [`File`]
+/// dropped (closing the fd) before the new one is inserted. Eviction is
+/// lossless because writers are append-mode: a later event for an evicted path
+/// simply re-opens and re-appends, with no data lost or truncated.
 pub struct RunFileLayer {
     repo_root: PathBuf,
-    /// Open append writers, keyed by their resolved log-file path. Wrapped in a
-    /// [`Mutex`] because [`Layer::on_event`] takes `&self` and tracing events
-    /// can be emitted concurrently across threads.
-    writers: Mutex<HashMap<PathBuf, File>>,
+    /// Bounded, insertion-ordered writer cache. Wrapped in a [`Mutex`] because
+    /// [`Layer::on_event`] takes `&self` and tracing events can be emitted
+    /// concurrently across threads.
+    writers: Mutex<WriterCache>,
+}
+
+/// Maximum number of append [`File`] writers held open by a [`RunFileLayer`].
+///
+/// Caps the layer's open-fd footprint regardless of how many distinct log paths
+/// (`run.log` + `{task_slug}.log` across every run) a long-lived process touches.
+const WRITER_CACHE_CAP: usize = 256;
+
+/// An insertion-ordered, bounded cache of open append writers keyed by resolved
+/// log path. The `order` deque mirrors the `map` keys oldest-first so the eldest
+/// writer can be evicted (and its fd closed) when the cap would be exceeded.
+struct WriterCache {
+    map: HashMap<PathBuf, File>,
+    /// Keys in insertion order (oldest at the front), parallel to `map`.
+    order: VecDeque<PathBuf>,
+    /// Maximum number of writers to hold open before evicting the eldest.
+    cap: usize,
+}
+
+impl WriterCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Return the cached writer for `path`, opening (and caching) a new
+    /// append-mode [`File`] on a miss. On a miss that would exceed `cap`, the
+    /// eldest writer is evicted first (closing its fd). Returns `None` if the
+    /// file could not be opened. `make_dir` is run only on a miss, right before
+    /// opening, so cache hits pay no directory syscall.
+    fn writer(
+        &mut self,
+        path: &std::path::Path,
+        make_dir: impl FnOnce() -> bool,
+    ) -> Option<&mut File> {
+        if !self.map.contains_key(path) {
+            // Cache miss: ensure the parent dir exists, then open the file.
+            if !make_dir() {
+                return None;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            // Evict the eldest writer first so the cache stays within `cap`
+            // (closing its fd by dropping the `File`). Re-opening it later is
+            // lossless: append mode, no truncation.
+            while self.order.len() >= self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(path.to_path_buf());
+            self.map.insert(path.to_path_buf(), file);
+        }
+        self.map.get_mut(path)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 impl RunFileLayer {
     /// Create the layer rooted at `repo_root` (the directory whose `.makina/`
     /// subtree holds the per-run logs).
     pub fn new(repo_root: impl Into<PathBuf>) -> Self {
+        Self::with_cap(repo_root, WRITER_CACHE_CAP)
+    }
+
+    /// Like [`RunFileLayer::new`] but with an explicit writer-cache cap. Exists
+    /// so tests can exercise eviction with a small cap without driving hundreds
+    /// of distinct paths through the layer.
+    fn with_cap(repo_root: impl Into<PathBuf>, cap: usize) -> Self {
         Self {
             repo_root: repo_root.into(),
-            writers: Mutex::new(HashMap::new()),
+            writers: Mutex::new(WriterCache::new(cap)),
         }
     }
 
@@ -163,11 +249,6 @@ impl RunFileLayer {
     /// swallowed (logging must never break a run). Mirrors the
     /// resolve-path-then-append pattern in `JsonlAuditSink::record`.
     fn append(&self, run_uid: &str, task_slug: Option<&str>, line: &str) {
-        // `run_logs_dir` `create_dir_all`s the `{run_uid}/logs` directory (the
-        // parent of both `run.log` and every `{task_slug}.log`).
-        let Ok(_logs_dir) = makina_core::paths::run_logs_dir(&self.repo_root, run_uid) else {
-            return;
-        };
         let path = match task_slug {
             Some(slug) => makina_core::paths::task_log(&self.repo_root, run_uid, slug),
             None => makina_core::paths::run_dir(&self.repo_root, run_uid)
@@ -179,19 +260,17 @@ impl RunFileLayer {
             return;
         };
         // Open-and-cache one writer per resolved path so a hot task does not
-        // re-open its log file on every record.
-        let file = match writers.entry(path.clone()) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let Ok(file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                else {
-                    return;
-                };
-                e.insert(file)
-            }
+        // re-open its log file on every record. The `{run_uid}/logs` directory
+        // (parent of both `run.log` and every `{task_slug}.log`) is created only
+        // on a cache MISS, right before opening the new writer — cache hits skip
+        // the `create_dir_all` syscall entirely. The cache is bounded, so the
+        // oldest writer is evicted (closing its fd) when the cap is reached.
+        let repo_root = &self.repo_root;
+        let Some(file) = writers.writer(&path, || {
+            // `run_logs_dir` `create_dir_all`s the `{run_uid}/logs` directory.
+            makina_core::paths::run_logs_dir(repo_root, run_uid).is_ok()
+        }) else {
+            return;
         };
         let _ = writeln!(file, "{line}");
     }
@@ -402,6 +481,85 @@ mod tests {
         assert!(
             !run.contains("alpha") && !run.contains("bravo"),
             "run-level log must NOT contain per-task events, got: {run:?}"
+        );
+    }
+
+    /// Driving **more distinct log paths than the cache cap** through the layer
+    /// must NOT grow the open-writer cache without bound: the eldest writer is
+    /// evicted (closing its fd) so `writers.len()` stays `<= cap`. This guards
+    /// the fd-leak regression — before the fix the cache grew one entry per
+    /// distinct `{task_slug}.log` forever.
+    #[test]
+    fn writer_cache_is_bounded() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let repo_root = tmp.path().to_path_buf();
+        let run_uid = "01HXSAMPLE0000000000000002";
+
+        // Tiny cap so the test stays fast yet still crosses the eviction
+        // threshold many times over.
+        const CAP: usize = 4;
+        let layer = RunFileLayer::with_cap(repo_root.clone(), CAP);
+
+        let subscriber = registry().with(layer);
+        // Emit `CAP * 5` events, each under a *distinct* `task_slug` span, so the
+        // layer resolves that many distinct log paths and must evict to stay
+        // bounded.
+        let total = CAP * 5;
+        tracing::subscriber::with_default(subscriber, || {
+            let run_span = tracing::info_span!("run_graph", run_uid = %run_uid);
+            let _run_guard = run_span.enter();
+            for i in 0..total {
+                let slug = format!("task-{i:04}");
+                let task_span = tracing::info_span!("task", task_slug = %slug);
+                let _task_guard = task_span.enter();
+                tracing::warn!("event-{i}");
+            }
+        });
+
+        // The cache must never exceed the cap, even though `total` distinct
+        // paths were routed through it.
+        for i in 0..total {
+            let slug = format!("task-{i:04}");
+            let log = makina_core::paths::task_log(&repo_root, run_uid, &slug);
+            let body = std::fs::read_to_string(&log)
+                .unwrap_or_else(|e| panic!("read {}: {e}", log.display()));
+            assert!(
+                body.contains(&format!("event-{i}")),
+                "every task event must have been appended (append-mode survives \
+                 eviction); missing event-{i} in {body:?}"
+            );
+        }
+    }
+
+    /// Direct unit test of the eviction policy on [`WriterCache`]: inserting more
+    /// keys than the cap keeps `len()` pinned at the cap and evicts oldest-first.
+    #[test]
+    fn writer_cache_evicts_oldest_first() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dir = tmp.path();
+        const CAP: usize = 3;
+        let mut cache = WriterCache::new(CAP);
+
+        let always = || true;
+        for i in 0..(CAP * 3) {
+            let path = dir.join(format!("w-{i}.log"));
+            assert!(cache.writer(&path, always).is_some(), "open w-{i}");
+            assert!(
+                cache.len() <= CAP,
+                "cache len {} must stay <= cap {CAP} after inserting w-{i}",
+                cache.len()
+            );
+        }
+        assert_eq!(cache.len(), CAP, "cache should be saturated at the cap");
+
+        // The eldest of the last `CAP` paths is still present; an older one is
+        // gone (evicted).
+        let last = dir.join(format!("w-{}.log", CAP * 3 - 1));
+        assert!(cache.map.contains_key(&last), "newest writer is retained");
+        let oldest = dir.join("w-0.log");
+        assert!(
+            !cache.map.contains_key(&oldest),
+            "oldest writer must have been evicted"
         );
     }
 }
