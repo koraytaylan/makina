@@ -166,9 +166,13 @@ impl WorktreeManager {
     /// 1. Validates `task_id` (kebab-case, non-empty, no `..` or `/`).
     /// 2. Runs `git worktree prune` to clear stale registrations from crashed
     ///    previous runs.
-    /// 3. Checks that neither the worktree path nor the branch already exist;
-    ///    if either does, returns [`WorktreeError::GitCommandFailed`] with a
-    ///    clear message rather than silently clobbering existing work.
+    /// 3. **Reclaim-on-conflict:** if the worktree path or the branch already
+    ///    exist — a stale slot left by a prior interrupted run — this does *not*
+    ///    error. The `{plan_slug}--{task_id}` namespace is unambiguously
+    ///    Makina-owned transient state, so the stale slot is reclaimed: it warns,
+    ///    calls [`remove`](Self::remove) (idempotent), and falls through to
+    ///    recreate the slot **fresh off `base_branch`** (Option A — reset, not
+    ///    resume: the prior attempt was never merged, so its work is throwaway).
     /// 4. Runs `git -C {repo_root} worktree add {worktree_path} -b
     ///    task/{plan_slug}--{task_id} {base_branch}` to create the branch off
     ///    `base_branch` and check it out in the new worktree.
@@ -180,8 +184,7 @@ impl WorktreeManager {
     /// # Errors
     ///
     /// - [`WorktreeError::InvalidTaskId`] — bad task ID.
-    /// - [`WorktreeError::GitCommandFailed`] — any git command failed, or the
-    ///   worktree/branch already exists.
+    /// - [`WorktreeError::GitCommandFailed`] — any git command failed.
     /// - [`WorktreeError::Io`] — filesystem check error.
     pub async fn create(
         &self,
@@ -197,21 +200,18 @@ impl WorktreeManager {
         // already-registered-but-gone paths from previous crashed runs.
         self.git_worktree_prune().await?;
 
-        // Guard: reject if worktree path already exists on disk.
-        if worktree_path.exists() {
-            return Err(WorktreeError::GitCommandFailed {
-                command: format!("guard: worktree path {worktree_path:?} already exists"),
-                stderr: "Worktree path already exists; call remove() first or investigate."
-                    .to_string(),
-            });
-        }
-
-        // Guard: reject if the branch already exists.
-        if self.branch_exists(&branch).await? {
-            return Err(WorktreeError::GitCommandFailed {
-                command: format!("guard: branch {branch:?} already exists"),
-                stderr: "Branch already exists; call remove() first or investigate.".to_string(),
-            });
+        // Reclaim-on-conflict: a leftover worktree path or branch is a stale slot
+        // from a prior interrupted run, not a collision with someone else's work.
+        // The `{plan_slug}--{task_id}` namespace is unambiguously Makina-owned
+        // transient state, so reset the slot fresh off `base_branch` (Option A —
+        // the prior attempt was never merged, so its work is throwaway).
+        if worktree_path.exists() || self.branch_exists(&branch).await? {
+            tracing::warn!(
+                plan_slug,
+                task_id,
+                "reclaiming stale worktree/branch from a prior interrupted run"
+            );
+            self.remove(plan_slug, task_id).await?;
         }
 
         // Create the worktree + branch in one atomic git command.

@@ -91,6 +91,24 @@ fn run_git(path: &std::path::Path, args: &[&str]) {
     );
 }
 
+/// Run a `git -C {path}` command and return its trimmed stdout, asserting exit 0.
+fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn git {:?}: {e}", args));
+    assert!(
+        output.status.success(),
+        "git {:?} in {:?} exited with {:?}",
+        args,
+        path,
+        output.status.code()
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 /// Return true if the branch exists in the repo at `path`.
 fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
     let output = Command::new("git")
@@ -189,6 +207,85 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
             "task/0003-runtime-and-tui-hardening--sample-task"
         ),
         "branch task/0003-runtime-and-tui-hardening--sample-task must be gone after remove"
+    );
+}
+
+// ── Robustness: reclaim-on-conflict ──────────────────────────────────────────
+
+/// A stale worktree/branch left by a prior interrupted run must be **reclaimed**,
+/// not rejected.
+///
+/// Sequence:
+/// 1. `create(plan_slug, task_id)` once to leave a real worktree + branch behind.
+/// 2. Write a sentinel file into the worktree (proves it's the *old* checkout).
+/// 3. `create(plan_slug, task_id)` again for the same pair.
+///
+/// The second `create` must return `Ok` with a fresh checkout at the same path,
+/// on a branch newly cut from `base_branch` (so the sentinel is gone) — **never**
+/// a [`WorktreeError::GitCommandFailed`].
+#[tokio::test]
+async fn create_reclaims_a_stale_slot() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    let plan_slug = "sample-plan";
+    let task_id = "stale-slot";
+    let mgr = WorktreeManager::new(repo_root.clone(), "develop".into());
+
+    // ── First create: leaves a real worktree + branch behind. ──────────────────
+    let first = mgr
+        .create(plan_slug, task_id)
+        .await
+        .expect("first create must succeed");
+
+    // Write a sentinel into the stale worktree — it must NOT survive the reclaim.
+    let sentinel = first.path.join("STALE_SENTINEL");
+    std::fs::write(&sentinel, b"leftover from a prior interrupted run")
+        .expect("writing sentinel into stale worktree must succeed");
+    assert!(sentinel.exists(), "sentinel must exist before reclaim");
+
+    // ── Second create for the SAME pair: must reclaim, not error. ──────────────
+    let second = mgr
+        .create(plan_slug, task_id)
+        .await
+        .expect("second create must reclaim the stale slot, not return GitCommandFailed");
+
+    // Same path — the slot is reused, recreated fresh.
+    assert_eq!(
+        second.path, first.path,
+        "reclaimed worktree must live at the same path"
+    );
+    assert_eq!(
+        second.branch,
+        format!("task/{plan_slug}--{task_id}"),
+        "reclaimed worktree must use the same branch name"
+    );
+
+    // Fresh checkout: the sentinel from the prior attempt is gone.
+    assert!(
+        second.path.exists(),
+        "reclaimed worktree dir {:?} must exist",
+        second.path
+    );
+    assert!(
+        !sentinel.exists(),
+        "sentinel {:?} must be gone — the slot was reset fresh off base_branch",
+        sentinel
+    );
+
+    // The branch must exist and point at base_branch (no commits of its own yet).
+    assert!(
+        branch_exists(&repo_root, &format!("task/{plan_slug}--{task_id}")),
+        "branch task/{plan_slug}--{task_id} must exist after reclaim"
+    );
+    let base_head = git_stdout(&repo_root, &["rev-parse", "develop"]);
+    let branch_head = git_stdout(
+        &repo_root,
+        &["rev-parse", &format!("task/{plan_slug}--{task_id}")],
+    );
+    assert_eq!(
+        branch_head, base_head,
+        "reclaimed branch must be cut fresh from base_branch (develop)"
     );
 }
 
