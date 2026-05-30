@@ -2,7 +2,7 @@
 //!
 //! The [`WorktreeManager`] creates and tears down git worktrees and their
 //! associated branches on behalf of the Supervisor.  Each task gets an
-//! isolated checkout at `.worktrees/{plan_slug}--{task_id}/` on branch
+//! isolated checkout at `.makina/worktrees/{plan_slug}--{task_id}/` on branch
 //! `task/{plan_slug}--{task_id}`, branched off the configured base branch
 //! (typically `develop`).
 //!
@@ -24,8 +24,9 @@
 //!
 //! # Transient storage
 //!
-//! `.worktrees/` is **not** committed — it is listed in the repo `.gitignore`.
-//! `.tasks/` (the task artifact directory) IS committed and is NOT ignored.
+//! `.makina/worktrees/` is **not** committed — it is listed in the repo
+//! `.gitignore`.  `.makina/tasks/` (the task artifact directory) IS committed
+//! and is NOT ignored.
 //!
 //! # Concurrency
 //!
@@ -505,6 +506,51 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from("/repo/.makina/worktrees/0003-runtime-and-tui-hardening--sample-task")
+        );
+    }
+
+    // ── module doc-comment layout invariant ───────────────────────────────────
+
+    /// Regression guard for the `docs-plan-scoped-layout` fix: the module-level
+    /// doc-comments must describe the shipped `.makina/` layout with plan-scoped
+    /// `{plan_slug}--{task_id}` naming, never the pre-relocation top-level
+    /// `.worktrees/` / `.tasks/` paths. Doc-comments aren't introspectable at
+    /// runtime, so we assert against the module-doc region of the source file.
+    #[test]
+    fn module_doc_describes_makina_plan_scoped_layout() {
+        let src = include_str!("worktree.rs");
+        // Only the leading `//!` module-doc block — stop at the first non-doc line.
+        let module_doc: String = src
+            .lines()
+            .take_while(|l| {
+                let t = l.trim_start();
+                t.starts_with("//!") || t.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Shipped layout must be present.
+        assert!(
+            module_doc.contains(".makina/worktrees/{plan_slug}--{task_id}/"),
+            "module doc must reference the plan-scoped `.makina/worktrees/` checkout path"
+        );
+        assert!(
+            module_doc.contains("`.makina/worktrees/`"),
+            "module doc must state `.makina/worktrees/` is gitignored"
+        );
+        assert!(
+            module_doc.contains("`.makina/tasks/`"),
+            "module doc must state `.makina/tasks/` is the committed artifact dir"
+        );
+
+        // Pre-relocation top-level paths must NOT reappear in the module doc.
+        assert!(
+            !module_doc.contains("`.worktrees/`"),
+            "module doc must not reference pre-relocation top-level `.worktrees/`"
+        );
+        assert!(
+            !module_doc.contains("`.tasks/`"),
+            "module doc must not reference pre-relocation top-level `.tasks/`"
         );
     }
 }

@@ -20,7 +20,8 @@ There are two equivalent ways to run it:
 
 ## 0. Safety — never run the loop on the live repo
 
-The loop creates `task/{id}` branches + `.makina/worktrees/{id}/` checkouts and
+The loop creates `task/{plan_slug}--{task_id}` branches +
+`.makina/worktrees/{plan_slug}--{task_id}/` checkouts and
 **squash-merges into `develop`**. That mutates the repository. Run it against a
 **throwaway clone**, never your working copy:
 
@@ -216,7 +217,7 @@ What the loop did (observed live via the event stream):
 | stage | result |
 |-------|--------|
 | **interpret** (planner) | ✅ 2 tasks planned: `format-duration` (no deps), `kebab-validate` (deps `format-duration`) — deterministic interpreter, no model call |
-| **worktree** | ✅ `task/format-duration` created off `develop` at `.makina/worktrees/format-duration/` |
+| **worktree** | ✅ `task/dogfood-tasks--format-duration` created off `develop` at `.makina/worktrees/dogfood-tasks--format-duration/` |
 | **developer** (gemini) | ✅ wrote `crates/makina-core/src/util.rs` with a correct, documented `format_duration` + unit tests, and added `pub mod util;` to `lib.rs` |
 | **gates** | ✅ `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all passed first try (gate_iterations=0) |
 | **reviewer** (gemini) | ✅ emitted ` ```json {"verdict":"approve"} ``` ` → parsed `Approve` (review_iterations=0) |

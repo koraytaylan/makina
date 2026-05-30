@@ -22,8 +22,9 @@ A central **Supervisor** drives each task through its lifecycle:
 
 1. **Plan** — the Planner interprets your Markdown task list into a task graph and
    infers cross-cutting dependencies so conflicting work serializes.
-2. **Develop** — the Supervisor creates a `task/{id}` branch + worktree off your
-   base branch and hands the task to a Developer agent, which implements it.
+2. **Develop** — the Supervisor creates a `task/{plan_slug}--{task_id}` branch +
+   worktree off your base branch and hands the task to a Developer agent, which
+   implements it.
 3. **Gate** — configured shell gates (e.g. `cargo test`/`clippy`/`fmt`) run in the
    worktree; failures are fed back to the agent until they pass or a cap is hit.
 4. **Review** — a Reviewer agent approves or rejects (with feedback that loops back
@@ -125,7 +126,8 @@ prompt/answer stream as the loop runs; approved tasks land on your base branch.
 
 ## Caution — running a list mutates the repository
 
-A Run creates `task/{id}` branches and `.makina/worktrees/{id}/` checkouts and
+A Run creates `task/{plan_slug}--{task_id}` branches and
+`.makina/worktrees/{plan_slug}--{task_id}/` checkouts and
 **squash-merges approved work into `base_branch` (default `develop`)**. Point it at
 a repository you're comfortable having it write to; for experimentation, use a
 throwaway clone:
