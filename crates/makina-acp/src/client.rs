@@ -198,6 +198,12 @@ pub struct AcpClient {
     /// The agent subprocess, when this client owns one. `None` for transports
     /// injected directly in tests.
     child: Option<Child>,
+    /// Process-group id of the spawned agent (its own pid, since it is the
+    /// group leader via `process_group(0)`). `None` when no subprocess is owned
+    /// (test transports) or the child's pid was already taken. Used to
+    /// **group-kill** the agent and every descendant it forked, not just the
+    /// direct child.
+    pgid: Option<u32>,
     /// JSON-RPC transport over the agent's stdio.
     transport: Transport<BoxedWriter>,
     /// The session created at connect time.
@@ -221,6 +227,7 @@ impl std::fmt::Debug for AcpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpClient")
             .field("has_subprocess", &self.child.is_some())
+            .field("pgid", &self.pgid)
             .field("session_id", &self.session_id)
             .field("protocol_version", &self.protocol_version)
             .field("agent_info", &self.agent_info)
@@ -242,9 +249,9 @@ impl AcpClient {
     /// The subprocess inherits the parent environment (Zed auth model); any
     /// `command.env` entries are layered on top.
     pub async fn connect(command: AcpCommand) -> Result<Self> {
-        let (child, transport) = spawn_transport(&command)?;
+        let (child, pgid, transport) = spawn_transport(&command)?;
         // Build atop the generic constructor so spawn + protocol stay separable.
-        let mut client = Self::from_parts(Some(child), transport);
+        let mut client = Self::from_parts(Some(child), pgid, transport);
         client.handshake(&command.working_dir).await?;
         Ok(client)
     }
@@ -284,15 +291,20 @@ impl AcpClient {
             cwd.clone(),
             sink,
         );
-        let mut client = Self::from_parts(None, transport);
+        let mut client = Self::from_parts(None, None, transport);
         client.handshake(&cwd).await?;
         Ok(client)
     }
 
     /// Assemble a not-yet-handshaked client from its parts.
-    fn from_parts(child: Option<Child>, transport: Transport<BoxedWriter>) -> Self {
+    fn from_parts(
+        child: Option<Child>,
+        pgid: Option<u32>,
+        transport: Transport<BoxedWriter>,
+    ) -> Self {
         Self {
             child,
+            pgid,
             transport,
             session_id: String::new(),
             protocol_version: 0,
@@ -446,9 +458,14 @@ impl AcpClient {
         self.closed = true;
 
         if let Some(child) = self.child.as_mut() {
-            // Send SIGKILL; a process that already exited yields a benign error
-            // we ignore (it's already gone).
-            let _ = child.start_kill();
+            // Group-kill the whole process group (the agent + every descendant
+            // it forked), not just the direct child. SIGTERM first for a clean
+            // exit, a short grace, then SIGKILL. Falls back to a direct-child
+            // kill when there is no pgid or we're not on Unix.
+            group_kill(self.pgid, child);
+            // Give the group a moment to react to SIGTERM before escalating.
+            tokio::time::sleep(KILL_GRACE).await;
+            group_kill_force(self.pgid, child);
             // Reap so no zombie lingers. Ignore the status — we are tearing down.
             let _ = child.wait().await;
         }
@@ -456,16 +473,57 @@ impl AcpClient {
     }
 }
 
+/// Grace period between SIGTERM and SIGKILL when group-killing an agent.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Send `SIGTERM` to the agent's process group (`pgid`), so the agent and every
+/// descendant it forked receive it. Falls back to a direct-child kill when
+/// `pgid` is `None` or on non-Unix. Best-effort: a group that already exited
+/// yields a benign error we ignore.
+fn group_kill(pgid: Option<u32>, child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pgid) = pgid {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            return;
+        }
+    }
+    let _ = pgid; // silence unused on non-Unix
+    let _ = child.start_kill();
+}
+
+/// Escalate to `SIGKILL` on the agent's process group after the grace period.
+/// Same fallback semantics as [`group_kill`].
+fn group_kill_force(pgid: Option<u32>, child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pgid) = pgid {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            return;
+        }
+    }
+    let _ = pgid; // silence unused on non-Unix
+    let _ = child.start_kill();
+}
+
 /// Best-effort synchronous teardown if the caller never called
 /// [`AcpClient::shutdown`]. Tokio's `Child` is configured (below) to kill the
 /// process when its handle drops, so this guarantees no leaked subprocess.
 impl Drop for AcpClient {
     fn drop(&mut self) {
-        // `Child` is created with `kill_on_drop(true)`, so dropping `self.child`
-        // here sends SIGKILL. The `Transport`'s own `Drop` aborts the reader
-        // task. Nothing further is required, but we make the intent explicit.
+        // Group-kill the agent's process group so descendants it forked die too,
+        // not just the direct child. `Drop` is synchronous, so we send `SIGKILL`
+        // straight away (no grace period). `kill_on_drop(true)` on the `Child`
+        // remains the last-resort direct-child backstop, and the `Transport`'s
+        // own `Drop` aborts the reader task.
         if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
+            group_kill_force(self.pgid, child);
         }
     }
 }
@@ -475,7 +533,7 @@ impl Drop for AcpClient {
 /// Spawn the agent subprocess with piped stdio and wrap its stdout/stdin in a
 /// [`Transport`]. Stderr is captured and forwarded line-by-line to this
 /// process's stderr (useful for surfacing agent diagnostics / auth prompts).
-fn spawn_transport(command: &AcpCommand) -> Result<(Child, Transport<BoxedWriter>)> {
+fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transport<BoxedWriter>)> {
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
         .current_dir(&command.working_dir)
@@ -485,6 +543,11 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Transport<BoxedWriter
         // Reap the process if the handle is dropped without an explicit kill —
         // this is the leak-prevention guarantee.
         .kill_on_drop(true);
+    // Put the agent in its own fresh process group (pgid == its pid) so that it
+    // becomes the group leader and every descendant it forks shares the group.
+    // That lets us reap the whole tree with `killpg`, not just the direct child.
+    #[cfg(unix)]
+    cmd.process_group(0);
     // Zed auth model: inherit the parent environment; only *add* extras.
     for (key, value) in &command.env {
         cmd.env(key, value);
@@ -496,6 +559,9 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Transport<BoxedWriter
             command.program.display()
         ))
     })?;
+
+    // The agent is its own process-group leader, so its pgid equals its pid.
+    let pgid = child.id();
 
     let stdin = child
         .stdin
@@ -519,7 +585,7 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Transport<BoxedWriter
     // always in sync (see `AcpCommand::transport_inputs`).
     let (policy, sink) = command.transport_inputs();
     let transport = Transport::new(reader, writer, policy, cwd, sink);
-    Ok((child, transport))
+    Ok((child, pgid, transport))
 }
 
 /// Drain the child's stderr line-by-line to this process's stderr.
