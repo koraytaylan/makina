@@ -695,6 +695,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: std::path::PathBuf::from(".tasks/control.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![],
         };
         let mut app = App::new(Arc::clone(&api) as Arc<dyn Api>, vec![run]);
@@ -766,6 +767,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: std::path::PathBuf::from(".tasks/ghost.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![],
         };
         let app = App::new(api, vec![run]);
@@ -935,6 +937,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: std::path::PathBuf::from(".tasks/pop.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![
                     TaskView {
                         id: TaskId::new("first"),

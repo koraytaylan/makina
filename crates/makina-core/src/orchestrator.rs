@@ -247,8 +247,14 @@ fn build_view(
     run_uid: String,
     task_list_path: PathBuf,
     status: RunStatus,
+    repo_root: &std::path::Path,
     graph: &TaskGraph,
 ) -> RunView {
+    let project = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     let tasks = graph
         .tasks
         .iter()
@@ -267,6 +273,7 @@ fn build_view(
         run_uid,
         task_list_path,
         status,
+        project,
         tasks,
     }
 }
@@ -838,7 +845,14 @@ impl CoreApi {
             )
         }; // registry guard dropped before await.
         let g = graph.lock().await;
-        Some(build_view(id, run_uid, path, status, &g))
+        Some(build_view(
+            id,
+            run_uid,
+            path,
+            status,
+            &self.state.worktree_manager.repo_root,
+            &g,
+        ))
     }
 }
 
@@ -898,7 +912,14 @@ impl Api for CoreApi {
         let mut views = Vec::with_capacity(entries.len());
         for (id, run_uid, path, status, graph) in entries {
             let g = graph.lock().await;
-            views.push(build_view(id, run_uid, path, status, &g));
+            views.push(build_view(
+                id,
+                run_uid,
+                path,
+                status,
+                &self.state.worktree_manager.repo_root,
+                &g,
+            ));
         }
         views
     }
@@ -2153,5 +2174,29 @@ Create beta.
                 .expect("stream ended unexpectedly");
             assert!(matches!(ev, Event::RunOpened { .. }));
         }
+    }
+
+    // ── build_view: project field ─────────────────────────────────────────────
+
+    /// `build_view` populates `RunView::project` with the final path component
+    /// (basename) of the `repo_root` it is handed.
+    #[test]
+    fn build_view_project_is_repo_root_basename() {
+        let repo_root = std::path::Path::new("/home/dev/projects/makina");
+        let graph = TaskGraph {
+            slug: "demo".to_string(),
+            tasks: vec![],
+        };
+
+        let view = build_view(
+            RunId(7),
+            "01J0000000000000000000000".to_string(),
+            std::path::PathBuf::from(".makina/tasks/demo.json"),
+            RunStatus::Pending,
+            repo_root,
+            &graph,
+        );
+
+        assert_eq!(view.project, "makina");
     }
 }

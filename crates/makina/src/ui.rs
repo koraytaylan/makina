@@ -822,6 +822,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/my-feature.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("t1"),
                 title: "First task".into(),
@@ -868,6 +869,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/alpha.json"),
                 status: RunStatus::Running,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -875,6 +877,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/beta.json"),
                 status: RunStatus::Failed,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -882,6 +885,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/gamma.json"),
                 status: RunStatus::Completed,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -927,6 +931,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/pending.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -934,6 +939,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/running.json"),
                 status: RunStatus::Running,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -941,6 +947,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/paused.json"),
                 status: RunStatus::Paused,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -948,6 +955,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/completed.json"),
                 status: RunStatus::Completed,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -955,6 +963,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/failed.json"),
                 status: RunStatus::Failed,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -990,6 +999,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/first.json"),
                 status: RunStatus::Running,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -997,6 +1007,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/second.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -1030,6 +1041,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/live.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![],
         }];
         let app = App::new(api, runs);
@@ -1054,6 +1066,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/broken.json"),
             status: RunStatus::Failed,
+            project: String::new(),
             tasks: vec![],
         }];
         let app = App::new(api, runs);
@@ -1253,6 +1266,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/status-test.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![
                 TaskView {
                     id: TaskId::new("alpha"),
@@ -1399,6 +1413,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/empty-run.json"),
             status: makina_core::api::RunStatus::Pending,
+            project: String::new(),
             tasks: vec![],
         };
         let app = App::new(api, vec![run]);
@@ -1431,6 +1446,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/live.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("live-task"),
                 title: "Live task".into(),
@@ -1521,6 +1537,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/exchange-test.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![
                 TaskView {
                     id: TaskId::new("task-a"),
@@ -1693,6 +1710,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/no-exchange.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("t1"),
                 title: "T1".into(),

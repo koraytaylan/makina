@@ -238,6 +238,11 @@ pub struct RunView {
     /// `.tasks/my-feature.json`).  Displayed in the TUI title bar.
     pub task_list_path: PathBuf,
 
+    /// The repo directory basename (the final path component of the worktree
+    /// manager's `repo_root`).  Used by the TUI to render `{project}/{plan}`
+    /// run labels.  Empty when the `repo_root` has no final component.
+    pub project: String,
+
     /// Aggregate status derived from the task states.
     pub status: RunStatus,
 
@@ -677,6 +682,7 @@ mod tests {
                         run_uid: String::new(),
                         task_list_path,
                         status: RunStatus::Pending,
+                        project: String::new(),
                         tasks: vec![TaskView {
                             id: TaskId::new("stub-task"),
                             title: "Stub task".to_string(),
@@ -971,6 +977,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![task],
         };
         let _run2 = run_view.clone();

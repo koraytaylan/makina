@@ -557,6 +557,7 @@ impl App {
                         run_uid: String::new(),
                         task_list_path: task_list_path.clone(),
                         status: RunStatus::Pending,
+                        project: String::new(),
                         tasks: vec![],
                     });
                     if self.selected_run.is_none() {
@@ -716,6 +717,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/demo.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![],
         };
         let mut app = App::new(api, vec![existing]);
@@ -742,6 +744,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("t1"),
                 title: "Task 1".into(),
@@ -776,6 +779,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("t1"),
                 title: "Task 1".into(),
@@ -807,6 +811,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/accessor.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![],
         };
         let app = App::new(api, vec![run]);
@@ -836,6 +841,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -843,6 +849,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Running,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -850,6 +857,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/c.json"),
                 status: RunStatus::Completed,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -873,6 +881,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -880,6 +889,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -902,6 +912,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -909,6 +920,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -928,6 +940,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/a.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![],
         }];
         let mut app = App::new(api, runs);
@@ -946,6 +959,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -953,6 +967,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -1018,6 +1033,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
             RunView {
@@ -1025,6 +1041,7 @@ mod tests {
                 run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
+                project: String::new(),
                 tasks: vec![],
             },
         ];
@@ -1059,6 +1076,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![],
         };
         let mut app = App::new(api, vec![run]);
@@ -1080,6 +1098,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![],
         };
         let mut app = App::new(api, vec![run]);
@@ -1101,6 +1120,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("t1"),
                 title: "Task 1".into(),
@@ -1136,6 +1156,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/test.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![],
         };
         let mut app = App::new(api, vec![placeholder]);
@@ -1150,6 +1171,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/test.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![
                 TaskView {
                     id: TaskId::new("t1"),
@@ -1197,6 +1219,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/new.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("only"),
                 title: "Only task".into(),
@@ -1224,6 +1247,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![
                 TaskView {
                     id: TaskId::new("t1"),
@@ -1274,6 +1298,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![
                 TaskView {
                     id: TaskId::new("t1"),
@@ -1468,6 +1493,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![
                 TaskView {
                     id: TaskId::new("task-a"),
@@ -1742,6 +1768,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/r1.json"),
             status: RunStatus::Running,
+            project: String::new(),
             tasks: vec![
                 TaskView {
                     id: TaskId::new("t1"),
@@ -1766,6 +1793,7 @@ mod tests {
             run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/r2.json"),
             status: RunStatus::Pending,
+            project: String::new(),
             tasks: vec![TaskView {
                 id: TaskId::new("ta"),
                 title: "TA".into(),

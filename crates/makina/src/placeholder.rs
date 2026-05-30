@@ -102,6 +102,7 @@ impl Api for PlaceholderApi {
                     run_uid: String::new(),
                     task_list_path: task_list_path.clone(),
                     status: RunStatus::Pending,
+                    project: String::new(),
                     tasks: vec![],
                 };
                 self.runs.lock().unwrap().push(run);
@@ -189,6 +190,7 @@ fn sample_run(id: RunId) -> RunView {
         run_uid: String::new(),
         task_list_path: PathBuf::from(".tasks/demo-feature.json"),
         status: RunStatus::Running,
+        project: "makina".into(),
         tasks: vec![
             TaskView {
                 id: TaskId::new("core-api"),
