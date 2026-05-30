@@ -64,7 +64,7 @@ args    = ["--acp", "--yolo"]   # see "Limitations" re: --yolo
 mechanism = "one-shot-agent"
 ```
 
-**Project** — `makina.toml` at the repo root (committed): the base branch and the
+**Project** — `.makina/config.toml` at the repo root (committed): the base branch and the
 quality gates. (This repo already ships one.)
 
 ```toml
@@ -125,7 +125,7 @@ prompt/answer stream as the loop runs; approved tasks land on your base branch.
 
 ## Caution — running a list mutates the repository
 
-A Run creates `task/{id}` branches and `.worktrees/{id}/` checkouts and
+A Run creates `task/{id}` branches and `.makina/worktrees/{id}/` checkouts and
 **squash-merges approved work into `base_branch` (default `develop`)**. Point it at
 a repository you're comfortable having it write to; for experimentation, use a
 throwaway clone:
@@ -147,7 +147,7 @@ git clone /path/to/repo /tmp/repo-trial && cd /tmp/repo-trial
 - Some agents require an auto-approve flag (gemini's `--yolo`); without it the
   agent's permission prompt stalls the turn — Makina's ACP client does not yet
   answer `session/request_permission`.
-- Task-graph state lives in memory; `.tasks/{slug}.json` persistence and crash
+- Task-graph state lives in memory; `.makina/tasks/{slug}.json` persistence and crash
   recovery are not implemented yet.
 
 These and prioritized next steps are tracked in

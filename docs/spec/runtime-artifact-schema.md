@@ -1,4 +1,4 @@
-# Runtime Artifact Schema — `.tasks/{slug}.json`
+# Runtime Artifact Schema — `.makina/tasks/{slug}.json`
 
 Version: 1.0
 Status: Normative
@@ -17,7 +17,7 @@ The input that produced the artifact is the structured-text task list (see [`str
 
 | Property | Value |
 |----------|-------|
-| Path | `.tasks/{slug}.json` inside the repository |
+| Path | `.makina/tasks/{slug}.json` inside the repository |
 | Naming | File stem equals the `slug` field (e.g. `my-feature.json` for `slug: "my-feature"`) |
 | Committed | Yes — the file is committed to version control so that every state change is a reviewable diff |
 | Writer | **Supervisor only** — no other actor or tool should write this file |

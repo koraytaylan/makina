@@ -20,7 +20,7 @@ There are two equivalent ways to run it:
 
 ## 0. Safety — never run the loop on the live repo
 
-The loop creates `task/{id}` branches + `.worktrees/{id}/` checkouts and
+The loop creates `task/{id}` branches + `.makina/worktrees/{id}/` checkouts and
 **squash-merges into `develop`**. That mutates the repository. Run it against a
 **throwaway clone**, never your working copy:
 
@@ -53,7 +53,7 @@ shared area, reinforcing the explicit `format-duration → kebab-validate` edge.
 
 ---
 
-## 2. Gate config — `makina.toml`
+## 2. Gate config — `.makina/config.toml`
 
 The committed project config at the repo root pins the base branch and the three
 quality gates (run via `sh -c` in each task's worktree; a task must pass all of
@@ -105,7 +105,7 @@ args    = ["--acp", "--yolo"]
 [planner]
 mechanism = "one-shot-agent"
 
-# Optional: defaults if you don't override them in makina.toml.
+# Optional: defaults if you don't override them in .makina/config.toml.
 # concurrency = 2
 # [caps]
 # gate_iterations     = 5
@@ -114,7 +114,7 @@ mechanism = "one-shot-agent"
 ```
 
 `Config::load_defaults()` merges `~/.makina/config.toml` (global) with
-`./makina.toml` (project, wins on conflict) and validates the result; a missing
+`./.makina/config.toml` (project, wins on conflict) and validates the result; a missing
 or invalid config is fatal at startup.
 
 The agent must already be signed in:
@@ -162,7 +162,7 @@ needed for CI).
 
 ## 5. Run it — interactive TUI (the human equivalent)
 
-With `~/.makina/config.toml` and `makina.toml` in place, **in a throwaway clone**:
+With `~/.makina/config.toml` and `.makina/config.toml` in place, **in a throwaway clone**:
 
 ```bash
 cd /tmp/makina-trial
@@ -216,7 +216,7 @@ What the loop did (observed live via the event stream):
 | stage | result |
 |-------|--------|
 | **interpret** (planner) | ✅ 2 tasks planned: `format-duration` (no deps), `kebab-validate` (deps `format-duration`) — deterministic interpreter, no model call |
-| **worktree** | ✅ `task/format-duration` created off `develop` at `.worktrees/format-duration/` |
+| **worktree** | ✅ `task/format-duration` created off `develop` at `.makina/worktrees/format-duration/` |
 | **developer** (gemini) | ✅ wrote `crates/makina-core/src/util.rs` with a correct, documented `format_duration` + unit tests, and added `pub mod util;` to `lib.rs` |
 | **gates** | ✅ `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all passed first try (gate_iterations=0) |
 | **reviewer** (gemini) | ✅ emitted ` ```json {"verdict":"approve"} ``` ` → parsed `Approve` (review_iterations=0) |
@@ -227,7 +227,7 @@ Evidence:
 - `git log develop -1 --pretty=%s` → `task(format-duration): Add a human-readable duration formatter`
 - `git show develop:crates/makina-core/src/util.rs` → the real `format_duration` (1019 bytes) with `#[cfg(test)] mod tests` covering 0/42/185/3723.
 - Event stream: 21 events; states reached `Ready, InProgress, InReview, Done`; 2 agent prompts, 9 response chunks, 2 turns; developer + reviewer both engaged.
-- The **live repo was untouched**: it stayed on `develop` @ its pre-run HEAD with no `.worktrees/` (the whole run happened in a `tempfile` clone).
+- The **live repo was untouched**: it stayed on `develop` @ its pre-run HEAD with no `.makina/worktrees/` (the whole run happened in a `tempfile` clone).
 
 ### Key finding — gemini's permission prompt hangs a default-mode turn
 
