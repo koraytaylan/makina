@@ -44,6 +44,14 @@ use crate::governance::{AuditEntry, AuditSink};
 /// Stored in [`JsonlAuditSink`]'s registry, keyed by `working_dir`.
 #[derive(Clone, Debug)]
 struct AuditContext {
+    /// The unique run identifier used to locate the run's directory
+    /// (e.g. `.makina/runs/{run_uid}`).
+    ///
+    /// Stored but not yet read: `record()` still routes to the old
+    /// `.tasks/{slug}/audit.jsonl` path. The relocation that consumes this
+    /// field is owned by `mk-audit-relocate-path`.
+    #[allow(dead_code)]
+    run_uid: String,
     /// The stable run identifier (e.g. `"run:1"` from `RunId::to_string()`).
     run_id: String,
     /// The task-graph slug (the file stem of the task-list file, e.g. `"my-feature"`).
@@ -62,12 +70,19 @@ struct AuditContext {
 ///
 /// The trait is intentionally minimal: one method, `Send + Sync`, `Arc`-safe.
 pub trait AuditRegistry: Send + Sync {
-    /// Associate `working_dir` with `(run_id, slug, task_id)`.
+    /// Associate `working_dir` with `(run_uid, run_id, slug, task_id)`.
     ///
     /// Calling this with the same `working_dir` a second time (e.g. for a
     /// re-dispatched task) replaces the previous entry, which is correct —
     /// the latest registration wins.
-    fn register(&self, working_dir: PathBuf, run_id: String, slug: String, task_id: String);
+    fn register(
+        &self,
+        working_dir: PathBuf,
+        run_uid: String,
+        run_id: String,
+        slug: String,
+        task_id: String,
+    );
 }
 
 // ── NoopAuditRegistry ──────────────────────────────────────────────────────────
@@ -80,7 +95,15 @@ pub trait AuditRegistry: Send + Sync {
 pub struct NoopAuditRegistry;
 
 impl AuditRegistry for NoopAuditRegistry {
-    fn register(&self, _working_dir: PathBuf, _run_id: String, _slug: String, _task_id: String) {}
+    fn register(
+        &self,
+        _working_dir: PathBuf,
+        _run_uid: String,
+        _run_id: String,
+        _slug: String,
+        _task_id: String,
+    ) {
+    }
 }
 
 // ── JsonlAuditSink ──────────────────────────────────────────────────────────────
@@ -139,12 +162,20 @@ impl AuditRegistry for JsonlAuditSink {
     /// form (both absolute, or both the same relative form).  If they differ
     /// (e.g. one is canonicalized and the other is not) the lookup in `record`
     /// will miss and the entry will be dropped with a `tracing::warn!`.
-    fn register(&self, working_dir: PathBuf, run_id: String, slug: String, task_id: String) {
+    fn register(
+        &self,
+        working_dir: PathBuf,
+        run_uid: String,
+        run_id: String,
+        slug: String,
+        task_id: String,
+    ) {
         match self.registry.lock() {
             Ok(mut map) => {
                 map.insert(
                     working_dir,
                     AuditContext {
+                        run_uid,
                         run_id,
                         slug,
                         task_id,
@@ -314,6 +345,7 @@ mod tests {
         // Register the worktree context.
         sink.register(
             working_dir.clone(),
+            "run-uid-1".to_string(),
             "run-1".to_string(),
             "my-slug".to_string(),
             "task-a".to_string(),
@@ -401,6 +433,7 @@ mod tests {
         // Must not panic.  The path is discarded by the noop, so any value works.
         reg.register(
             PathBuf::from("test-working-dir"),
+            "run-uid-0".into(),
             "run-0".into(),
             "test".into(),
             "task-0".into(),

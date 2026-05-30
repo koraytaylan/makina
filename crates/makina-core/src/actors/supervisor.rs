@@ -454,9 +454,9 @@ struct DriverContext {
     /// The `RunReadyTasks` ask path uses an empty string (no-op with
     /// `NoopAuditRegistry`).
     ///
-    /// Not yet read: `mk-run-id` only threads it into the context; the
-    /// `register()` call that consumes it is owned by `mk-audit-register-runuid`.
-    #[allow(dead_code)]
+    /// Consumed by the `AuditRegistry::register` call in `dispatch_task`, which
+    /// passes it as the 2nd arg so the audit ledger can key entries on the
+    /// stable cross-process run id.
     run_uid: String,
 }
 
@@ -1377,6 +1377,7 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     // is `NoopAuditRegistry` on the ask path, so this is a no-op there.
     ctx.audit_registry.register(
         worktree.path.clone(),
+        ctx.run_uid.clone(),
         ctx.control.run.to_string(),
         ctx.run_slug.clone(),
         task_id.0.clone(),

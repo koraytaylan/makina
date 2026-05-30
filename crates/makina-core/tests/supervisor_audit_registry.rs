@@ -1,12 +1,12 @@
 //! Integration test for **supervisor-audit-writer** — verifies that
-//! `task_driver` calls `ctx.audit_registry.register(working_dir, run_id,
-//! slug, task_id)` on the `run_graph` code path.
+//! `task_driver` calls `ctx.audit_registry.register(working_dir, run_uid,
+//! run_id, slug, task_id)` on the `run_graph` code path.
 //!
 //! # Strategy
 //!
 //! 1. Build a `SpyAuditRegistry` — a lightweight `AuditRegistry` impl that
-//!    records every `register(working_dir, run_id, slug, task_id)` call into
-//!    an `Arc<Mutex<Vec<RegisterCall>>>`.
+//!    records every `register(working_dir, run_uid, run_id, slug, task_id)`
+//!    call into an `Arc<Mutex<Vec<RegisterCall>>>`.
 //! 2. Drive a single task through `run_graph` (the orchestrator's real path)
 //!    with `NoopBackend` and a temp repo.  Pass the spy + a known slug.
 //! 3. Assert the spy captured a `register` call for the dispatched task with
@@ -40,6 +40,7 @@ use makina_core::worktree::WorktreeManager;
 #[derive(Debug, Clone)]
 struct RegisterCall {
     working_dir: PathBuf,
+    run_uid: String,
     run_id: String,
     slug: String,
     task_id: String,
@@ -68,12 +69,20 @@ impl SpyAuditRegistry {
 }
 
 impl AuditRegistry for SpyAuditRegistry {
-    fn register(&self, working_dir: PathBuf, run_id: String, slug: String, task_id: String) {
+    fn register(
+        &self,
+        working_dir: PathBuf,
+        run_uid: String,
+        run_id: String,
+        slug: String,
+        task_id: String,
+    ) {
         self.calls
             .lock()
             .expect("spy mutex must not be poisoned")
             .push(RegisterCall {
                 working_dir,
+                run_uid,
                 run_id,
                 slug,
                 task_id,
@@ -147,14 +156,16 @@ fn task(id: &str) -> Task {
 
 // ── Acceptance test ──────────────────────────────────────────────────────────────
 
-/// `task_driver` must call `audit_registry.register(working_dir, run_id, slug,
-/// task_id)` on the `run_graph` code path, before dispatching the Developer.
+/// `task_driver` must call `audit_registry.register(working_dir, run_uid,
+/// run_id, slug, task_id)` on the `run_graph` code path, before dispatching the
+/// Developer.
 ///
 /// This test:
 /// 1. Passes a `SpyAuditRegistry` and the slug `"audit-spy-slug"` to `run_graph`.
 /// 2. Lets the task run to `Done` with `NoopBackend`.
 /// 3. Asserts the spy captured exactly one `register` call with:
 ///    - `working_dir == repo_root/.makina/worktrees/audit-task`
+///    - `run_uid == "audit-spy-run-uid"`
 ///    - `run_id == "run:42"` (from `RunId(42)`)
 ///    - `slug == "audit-spy-slug"`
 ///    - `task_id == "audit-task"`
@@ -165,6 +176,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
 
     let task_id_str = "audit-task";
     let slug = "audit-spy-slug";
+    let run_uid = "audit-spy-run-uid";
     let run_id = RunId(42);
 
     // NoopBackend: developer responds with any text, reviewer approves.
@@ -204,7 +216,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
         control,
         Arc::new(spy),
         slug.to_string(),
-        String::new(),
+        run_uid.to_string(),
     )
     .await
     .expect("run_graph must not error");
@@ -233,6 +245,11 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
     assert_eq!(
         call.working_dir, expected_working_dir,
         "register: working_dir must be repo_root/.makina/worktrees/{task_id_str}"
+    );
+
+    assert_eq!(
+        call.run_uid, run_uid,
+        "register: run_uid must match the run_uid passed to run_graph"
     );
 
     assert_eq!(
