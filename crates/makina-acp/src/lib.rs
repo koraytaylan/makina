@@ -74,6 +74,7 @@ pub mod client;
 pub mod error;
 pub mod permission;
 pub mod protocol;
+pub mod reaper;
 pub mod transport;
 
 pub use backend::{AcpBackend, AcpSession};
@@ -83,4 +84,5 @@ pub use permission::{
     PermissionDecision, PermissionPolicy, PermissionRequestContext, WorktreePolicy,
 };
 pub use protocol::{AuthMethod, StopReason};
+pub use reaper::kill_all_agents;
 pub use transport::{Transport, TransportSender};

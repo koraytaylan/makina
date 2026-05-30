@@ -469,6 +469,11 @@ impl AcpClient {
             // Reap so no zombie lingers. Ignore the status — we are tearing down.
             let _ = child.wait().await;
         }
+        // We have reaped our own group; drop it from the process-wide reaper so
+        // a later `kill_all_agents()` does not re-kill a (possibly recycled) pgid.
+        if let Some(pgid) = self.pgid {
+            crate::reaper::deregister(pgid as i32);
+        }
         Ok(())
     }
 }
@@ -525,6 +530,11 @@ impl Drop for AcpClient {
         if let Some(child) = self.child.as_mut() {
             group_kill_force(self.pgid, child);
         }
+        // Deregister from the process-wide reaper after our own group-kill, so a
+        // later `kill_all_agents()` does not re-kill a (possibly recycled) pgid.
+        if let Some(pgid) = self.pgid {
+            crate::reaper::deregister(pgid as i32);
+        }
     }
 }
 
@@ -562,6 +572,13 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
 
     // The agent is its own process-group leader, so its pgid equals its pid.
     let pgid = child.id();
+
+    // Register the live process group in the process-wide reaper so a panic or
+    // out-of-band signal can still reap it (see `crate::reaper`). The owning
+    // client deregisters it after its own group-kill in `shutdown`/`Drop`.
+    if let Some(pgid) = pgid {
+        crate::reaper::register(pgid as i32);
+    }
 
     let stdin = child
         .stdin
