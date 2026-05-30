@@ -27,10 +27,13 @@
 //! [`ProjectConfig::from_toml_str`] with in-memory TOML strings, then
 //! [`Config::resolve`] and [`Config::validate`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
+
+use crate::paths;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -551,7 +554,10 @@ impl Config {
     /// [`Config::load`].
     ///
     /// - Global:  `~/.makina/config.toml`
-    /// - Project: `./makina.toml` (current working directory)
+    /// - Project: resolved against the current working directory with the
+    ///   following precedence:
+    ///   1. `.makina/config.toml` (preferred)
+    ///   2. legacy `./makina.toml` (deprecated; emits a `warn!` when chosen)
     ///
     /// Prefer this in production entry points.  In tests, use [`Config::load`]
     /// with explicit paths so tests don't depend on the operator's home
@@ -562,9 +568,35 @@ impl Config {
     /// Same as [`Config::load`].
     pub fn load_defaults() -> Result<Config, ConfigError> {
         let global_path = home_dir().map(|h| h.join(".makina").join("config.toml"));
-        let project_path = Some(std::path::PathBuf::from("makina.toml"));
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let (project_path, _legacy) = resolve_project_config_path(&repo_root);
 
         Config::load(global_path.as_deref(), project_path.as_deref())
+    }
+}
+
+/// Resolve the project config path under `repo_root`, applying the precedence
+/// `.makina/config.toml` (preferred) → legacy `./makina.toml` (deprecated).
+///
+/// Returns the chosen path (always `Some`, defaulting to the preferred path
+/// even when neither exists, so [`Config::load`] sees a non-existent preferred
+/// path and falls back to defaults) together with a `bool` indicating whether
+/// the legacy `./makina.toml` was chosen. Choosing the legacy path emits a
+/// `warn!`.
+fn resolve_project_config_path(repo_root: &Path) -> (Option<PathBuf>, bool) {
+    let primary = paths::config_file(repo_root);
+    let legacy = repo_root.join("makina.toml");
+
+    if primary.exists() {
+        (Some(primary), false)
+    } else if legacy.exists() {
+        warn!(
+            path = %legacy.display(),
+            "loading deprecated ./makina.toml; move it to .makina/config.toml"
+        );
+        (Some(legacy), true)
+    } else {
+        (Some(primary), false)
     }
 }
 
@@ -950,5 +982,45 @@ mod tests {
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }
+    }
+
+    // ── Project config path resolution ────────────────────────────────────────
+
+    /// `.makina/config.toml` is preferred over the legacy `./makina.toml`.
+    #[test]
+    fn resolve_project_config_path_prefers_makina_dir() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let repo_root = dir.path();
+
+        let primary = paths::config_file(repo_root);
+        std::fs::create_dir_all(primary.parent().unwrap()).expect("create .makina dir");
+        std::fs::write(&primary, "").expect("write .makina/config.toml");
+
+        let (path, legacy) = resolve_project_config_path(repo_root);
+
+        assert_eq!(path.as_deref(), Some(primary.as_path()));
+        assert!(
+            !legacy,
+            "legacy should be false when .makina/config.toml exists"
+        );
+    }
+
+    /// When only `./makina.toml` exists, it is chosen and flagged as legacy
+    /// (exercising the deprecation-warning branch).
+    #[test]
+    fn resolve_project_config_path_falls_back_to_legacy() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let repo_root = dir.path();
+
+        let legacy_path = repo_root.join("makina.toml");
+        std::fs::write(&legacy_path, "").expect("write ./makina.toml");
+
+        let (path, legacy) = resolve_project_config_path(repo_root);
+
+        assert_eq!(path.as_deref(), Some(legacy_path.as_path()));
+        assert!(
+            legacy,
+            "legacy should be true when only ./makina.toml exists"
+        );
     }
 }
