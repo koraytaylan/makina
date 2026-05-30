@@ -291,14 +291,18 @@ mod tests {
     //! # Coverage strategy
     //!
     //! The primary test (`exhaustive_transition_table`) iterates the full
-    //! Cartesian product of all 6 states × all 11 events (66 pairs total).
+    //! Cartesian product of all 7 states × all 12 events (84 pairs total).
     //! For each pair it asserts the exact expected outcome: `Ok(target)` for
-    //! the 15 legal transitions and `Err(IllegalTransition)` for the remaining
-    //! 51 pairs.  This single test is sufficient proof that the implementation
+    //! the 19 legal transitions and `Err(IllegalTransition)` for the remaining
+    //! 65 pairs.  This single test is sufficient proof that the implementation
     //! matches the architecture diagram exactly.
     //!
     //! The legal count grew from 9 → 14 in task 25 (`termination-caps`) ...
-    //! This task adds `MergeConflict` (legal only from InReview) as the 11th event.
+    //! Plan-0002 added `MergeConflict` (legal only from InReview) as the 11th event.
+    //! This task adds `DependencyFailed` as the 12th event (legal from each active
+    //! state → the new 7th state `Skipped`), so the table grows by one state and
+    //! one event: 6 → 7 states, 11 → 12 events, 66 → 84 pairs, 15 → 19 legal,
+    //! 51 → 65 illegal.
     //!
     //! Supporting tests cover `is_terminal` and `legal_events` independently.
 
@@ -308,8 +312,9 @@ mod tests {
     // ── Legal transition set ──────────────────────────────────────────────────
 
     /// The complete set of legal `(from, event, to)` triples from the
-    /// architecture state diagram (now 15 entries with MergeConflict).  Used both
-    /// by `exhaustive_transition_table` and as documentation of intent.
+    /// architecture state diagram (now 19 entries: 15 + the 4 DependencyFailed
+    /// edges into Skipped).  Used both by `exhaustive_transition_table` and as
+    /// documentation of intent.
     fn legal_table() -> Vec<(TaskState, TaskEvent, TaskState)> {
         use TaskEvent::*;
         use TaskState::*;
@@ -340,7 +345,7 @@ mod tests {
     /// All [`TaskState`] variants — used to build the Cartesian product.
     fn all_states() -> Vec<TaskState> {
         use TaskState::*;
-        vec![New, Ready, InProgress, InReview, Done, Failed]
+        vec![New, Ready, InProgress, InReview, Done, Failed, Skipped]
     }
 
     /// All [`TaskEvent`] variants — used to build the Cartesian product.
@@ -358,19 +363,21 @@ mod tests {
             ReviewCapReached,
             MergeConflict,
             WallClockCapReached,
+            DependencyFailed,
         ]
     }
 
     // ── Exhaustive Cartesian-product test ─────────────────────────────────────
 
-    /// For every `(state, event)` pair in the 6×11 Cartesian product:
+    /// For every `(state, event)` pair in the 7×12 Cartesian product:
     /// - If the pair is in the legal table → assert `Ok(expected_target)`.
     /// - Otherwise → assert `Err(IllegalTransition { from, event })`.
     ///
     /// This is the definitive proof that the FSM implementation matches the
-    /// architecture diagram: 15 legal transitions and 51 illegal ones, totalling
-    /// 66 assertions. (Task 25 grew the table; this task adds MergeConflict as
-    /// the 11th event with 1 new legal edge + 5 new illegal pairs.)
+    /// architecture diagram: 19 legal transitions and 65 illegal ones, totalling
+    /// 84 assertions. (Task 25 grew the table; plan-0002 added MergeConflict;
+    /// this task adds DependencyFailed as the 12th event and Skipped as the 7th
+    /// state, with 4 new legal edges into Skipped.)
     #[test]
     fn exhaustive_transition_table() {
         use std::collections::HashMap;
@@ -385,7 +392,7 @@ mod tests {
         let events = all_events();
 
         let total = states.len() * events.len();
-        assert_eq!(total, 66, "expected 6 states × 11 events = 66 pairs");
+        assert_eq!(total, 84, "expected 7 states × 12 events = 84 pairs");
 
         let mut legal_count = 0usize;
         let mut illegal_count = 0usize;
@@ -412,8 +419,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_count, 15, "expected exactly 15 legal transitions");
-        assert_eq!(illegal_count, 51, "expected exactly 51 illegal transitions");
+        assert_eq!(legal_count, 19, "expected exactly 19 legal transitions");
+        assert_eq!(illegal_count, 65, "expected exactly 65 illegal transitions");
     }
 
     // ── is_terminal ───────────────────────────────────────────────────────────
