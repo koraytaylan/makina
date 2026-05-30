@@ -17,6 +17,7 @@ pub mod interpreter;
 pub(crate) mod json;
 pub mod merge;
 pub mod orchestrator;
+pub mod paths;
 pub mod persist;
 pub mod roles;
 pub mod state_machine;
