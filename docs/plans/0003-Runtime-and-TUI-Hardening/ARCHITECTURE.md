@@ -142,8 +142,17 @@ non-terminal forever. A normal `Failed` (gate/review cap) and wall-clock-cap do
 
 - **Error/log pane** (new, bottom, collapsible): default collapsed with an
   error-count badge; a key toggles it; shows recent system errors + agent
-  stderr fed by the tracing TUI layer (B). Replaces the `eprintln!` frame-bypass
-  (`main.rs:57/116/126`). Nothing writes outside the ratatui frame anymore.
+  stderr fed by the tracing TUI layer (B). Replaces the **in-frame** `eprintln!`
+  frame-bypass: any `tracing::error!`/`tracing::warn!` raised while a ratatui
+  frame is live now flows into the pane instead of stdout/stderr, so nothing
+  writes outside the ratatui frame *during the live-frame region*. The three
+  fatal `main.rs` `eprintln!` sites are **intentionally exempt** and stay as
+  `eprintln!`: the config-load failure (`main.rs:43`, before `Tui::init()`), the
+  terminal-init failure itself (`main.rs:131`), and the post-`tui.restore()`
+  error print (`main.rs:143`) — none of these runs while a live ratatui frame
+  exists to render into, so each must write directly to stderr. (Line numbers
+  are hints; these sites are pre-`Tui::init()`, the init failure, and
+  post-`tui.restore()` respectively.)
 - **Exchange pane** (`ui.rs:exchange_entry_lines` ~`:453`, no ANSI handling
   today): parse ANSI SGR → ratatui styles (render the agent's colors), special-
   case unified-diff lines (+/− gutter, green/red, preserved alignment), and
