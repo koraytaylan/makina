@@ -512,9 +512,44 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
             let para = Paragraph::new(lines);
             frame.render_widget(para, inner);
         }
-        // `Off` is handled by the caller (this fn is not invoked); the
-        // `Timeline` arm is added by a sibling task.
-        DependencyViewMode::Off | DependencyViewMode::Timeline => {}
+        DependencyViewMode::Timeline => {
+            // Lane view over scheduling order: one ROW per longest-path level,
+            // with same-level (parallelisable) tasks side-by-side and every
+            // dependent in a strictly later row than its prerequisites.
+            let run = app.selected_run();
+            let lines: Vec<Line> = match run {
+                Some(run) if !run.tasks.is_empty() => {
+                    let levels = dependency_levels(&run.tasks);
+                    levels
+                        .iter()
+                        .map(|lane| {
+                            // Reuse the `[state] id` badge format, side-by-side.
+                            let mut spans: Vec<Span> = Vec::new();
+                            for (i, task) in lane.iter().enumerate() {
+                                if i > 0 {
+                                    spans.push(Span::raw("  "));
+                                }
+                                let (badge, color) = task_state_badge(&task.state);
+                                spans.push(Span::styled(
+                                    format!("{} {}", badge, task.id.0),
+                                    Style::default().fg(color),
+                                ));
+                            }
+                            Line::from(spans)
+                        })
+                        .collect()
+                }
+                _ => vec![Line::from(vec![Span::styled(
+                    "  No tasks.",
+                    Style::default().fg(Color::DarkGray),
+                )])],
+            };
+            // Respect the pane height: only as many lanes as fit are drawn.
+            let para = Paragraph::new(lines);
+            frame.render_widget(para, inner);
+        }
+        // `Off` is handled by the caller (this fn is not invoked).
+        DependencyViewMode::Off => {}
     }
 }
 
@@ -572,6 +607,76 @@ fn render_dependency_tree_children(
             }
         }
     }
+}
+
+/// Assign each task a static *longest-path* dependency level and group the
+/// tasks into lanes by that level for the `Timeline` view.
+///
+/// `level(t) = 0` when `t.depends_on` is empty, otherwise
+/// `1 + max(level(d) for d in t.depends_on)` over the run's `tasks`.  A
+/// `depends_on` id that is not present in `tasks` is treated as level `0`
+/// (an unknown-id / cycle guard so the computation always terminates).
+///
+/// The returned `Vec` has one inner `Vec` per level: index `i` holds every
+/// task whose level is `i`, in the input order.  Trailing empty levels do not
+/// occur because a level is only created when at least one task occupies it.
+/// Because a dependent's level is strictly greater than each of its
+/// prerequisites' levels, a task always lands in a lane *after* all of its
+/// prerequisites — i.e. tasks in the same inner `Vec` can run in parallel and
+/// dependents appear in strictly later lanes.
+fn dependency_levels(
+    tasks: &[makina_core::api::TaskView],
+) -> Vec<Vec<&makina_core::api::TaskView>> {
+    use std::collections::HashMap;
+
+    // Index tasks by id for O(1) prerequisite lookup.
+    let by_id: HashMap<&makina_core::api::TaskId, &makina_core::api::TaskView> =
+        tasks.iter().map(|t| (&t.id, t)).collect();
+
+    // Memoised longest-path level per task id.  `in_progress` tracks ids on the
+    // current DFS stack so a dependency cycle is broken (treated as level 0)
+    // rather than recursing forever.
+    fn level_of<'a>(
+        id: &'a makina_core::api::TaskId,
+        by_id: &HashMap<&'a makina_core::api::TaskId, &'a makina_core::api::TaskView>,
+        memo: &mut HashMap<&'a makina_core::api::TaskId, usize>,
+        in_progress: &mut std::collections::HashSet<&'a makina_core::api::TaskId>,
+    ) -> usize {
+        if let Some(&lvl) = memo.get(id) {
+            return lvl;
+        }
+        // Unknown id (not in this run) or a cycle back-edge → level 0 guard.
+        let Some(task) = by_id.get(id) else {
+            return 0;
+        };
+        if !in_progress.insert(id) {
+            return 0;
+        }
+        let lvl = if task.depends_on.is_empty() {
+            0
+        } else {
+            task.depends_on
+                .iter()
+                .map(|dep| 1 + level_of(dep, by_id, memo, in_progress))
+                .max()
+                .unwrap_or(0)
+        };
+        in_progress.remove(id);
+        memo.insert(id, lvl);
+        lvl
+    }
+
+    let mut memo: HashMap<&makina_core::api::TaskId, usize> = HashMap::new();
+    let mut levels: Vec<Vec<&makina_core::api::TaskView>> = Vec::new();
+    for task in tasks {
+        let mut in_progress = std::collections::HashSet::new();
+        let lvl = level_of(&task.id, &by_id, &mut memo, &mut in_progress);
+        if lvl >= levels.len() {
+            levels.resize_with(lvl + 1, Vec::new);
+        }
+        levels[lvl].push(task);
+    }
+    levels
 }
 
 fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool) {
@@ -1877,6 +1982,143 @@ mod tests {
         assert!(
             c_col > a_col,
             "grandchild 'c' must be indented deeper than parent 'a' (a_col={a_col}, c_col={c_col})"
+        );
+    }
+
+    /// `dependency_levels` assigns parallelisable siblings (no deps) the same
+    /// level 0 and a dependent the next level up.  Fixture: A (no deps),
+    /// B (no deps), C (`depends_on A`) ⇒ level(A) == level(B) == 0, level(C) == 1.
+    #[test]
+    fn dependency_levels_assigns_parallel_siblings_same_level() {
+        use makina_core::api::{TaskId, TaskState, TaskView};
+
+        let tasks = vec![
+            TaskView {
+                id: TaskId::new("A"),
+                title: "A".into(),
+                state: TaskState::Ready,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            },
+            TaskView {
+                id: TaskId::new("B"),
+                title: "B".into(),
+                state: TaskState::Ready,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            },
+            TaskView {
+                id: TaskId::new("C"),
+                title: "C".into(),
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![TaskId::new("A")],
+            },
+        ];
+
+        let levels = dependency_levels(&tasks);
+        // Helper: the level index a given task id landed in.
+        let level_of_id = |id: &str| -> usize {
+            levels
+                .iter()
+                .position(|lane| lane.iter().any(|t| t.id.0 == id))
+                .expect("task should appear in some level")
+        };
+
+        assert_eq!(level_of_id("A"), 0, "A has no deps → level 0");
+        assert_eq!(level_of_id("B"), 0, "B has no deps → level 0");
+        assert_eq!(
+            level_of_id("A"),
+            level_of_id("B"),
+            "A and B are parallel siblings"
+        );
+        assert_eq!(level_of_id("C"), 1, "C depends on A → level 1");
+    }
+
+    /// With [`DependencyViewMode::Timeline`] active, the dependency sub-pane
+    /// renders a lane view: independent tasks A and B (level 0) share the same
+    /// terminal row while dependent C (`depends_on A`, level 1) renders on a
+    /// strictly later row.
+    #[test]
+    fn timeline_groups_independent_tasks_and_orders_dependents() {
+        use crate::app::DependencyViewMode;
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/timeline-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("alpha"),
+                    title: "Alpha task".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("beta"),
+                    title: "Beta task".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("gamma"),
+                    title: "Gamma task".into(),
+                    state: TaskState::New,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![TaskId::new("alpha")],
+                },
+            ],
+        };
+        let mut app = App::new(api, vec![run]);
+        app.dependency_view = DependencyViewMode::Timeline;
+
+        let mut terminal = make_terminal(120, 40);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // `screen` is a flat `width * height` char string laid out row-major;
+        // split it into 120-char rows on char boundaries.
+        let chars: Vec<char> = screen.chars().collect();
+        let rows: Vec<Vec<char>> = chars.chunks(120).map(|c| c.to_vec()).collect();
+        // Locate each id's row by scanning the rendered lines.
+        let row_of = |id: &str| -> usize {
+            rows.iter()
+                .position(|row| {
+                    let s: String = row.iter().collect();
+                    s.contains(id)
+                })
+                .unwrap_or(usize::MAX)
+        };
+        let alpha_row = row_of("alpha");
+        let beta_row = row_of("beta");
+        let gamma_row = row_of("gamma");
+
+        assert_ne!(alpha_row, usize::MAX, "alpha must render somewhere");
+        assert_ne!(beta_row, usize::MAX, "beta must render somewhere");
+        assert_ne!(gamma_row, usize::MAX, "gamma must render somewhere");
+
+        // alpha and beta (level 0) share the same terminal row.
+        assert_eq!(
+            alpha_row, beta_row,
+            "independent tasks alpha and beta must appear on the SAME row"
+        );
+        // gamma (level 1, depends_on alpha) is on a strictly later row.
+        assert!(
+            gamma_row > alpha_row,
+            "dependent gamma must appear on a strictly LATER row than alpha \
+             (alpha_row={alpha_row}, gamma_row={gamma_row})"
         );
     }
 
