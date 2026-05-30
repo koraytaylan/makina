@@ -771,3 +771,98 @@ async fn driver_intervals_observable() {
 
     root.kill();
 }
+
+// ── Test 7: ≥2 drivers overlap at concurrency=2 (deterministic) ───────────────────
+
+/// **Done-when** (`sched-parallelism-verify-test`) — prove real parallelism the
+/// way the suite already does: via the deterministic barrier, NOT flaky
+/// timestamp-only timing (the module doc above explicitly rejects timing-based
+/// assertions and arbitrary sleeps).
+///
+/// Two INDEPENDENT ready tasks at `concurrency = 2` with a 2-party
+/// `CountingBackend` barrier force simultaneity: progress is only possible once
+/// both drivers' prompts are simultaneously active, so the peak observed
+/// concurrency settles to exactly `2`.  We additionally read each driver's
+/// `[started_at, finished_at]` interval (exposed by `sched-parallelism-instrument`
+/// via the `TaskGraphSnapshot` ask) and assert the two intervals intersect —
+/// cross-checked against `max_observed() == 2` so the assertion stays
+/// deterministic (the barrier, not timing, is what proves overlap).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drivers_overlap_under_concurrency_2() {
+    const N: usize = 2;
+
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // 2-party barrier: both drivers' prompts must be simultaneously active before
+    // either can proceed, forcing deterministic overlap (no sleeps, no timing).
+    let backend = CountingBackend::new(Some(N), r#"{"verdict":"approve"}"#);
+    let probe = backend.clone();
+
+    let (root, supervisor_ref) = build_actor_tree(
+        repo_root.clone(),
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config_with_concurrency(N),
+    )
+    .await;
+
+    // Two independent ready tasks (no deps) so both can run at once.
+    let graph = TaskGraph {
+        slug: "overlap-test".into(),
+        tasks: vec![task("task-a", &[]), task("task-b", &[])],
+    };
+    supervisor_ref
+        .ask(SetTaskGraph(graph))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = run_with_timeout(&supervisor_ref).await;
+
+    // Both tasks reached Done.
+    assert_eq!(report.outcomes.len(), N, "both tasks must be reported");
+    for (_, state) in &report.outcomes {
+        assert_eq!(*state, TaskState::Done, "every task must reach Done");
+    }
+
+    // The CORE assertion: the 2-party barrier could only have released if both
+    // drivers were simultaneously active, so the peak observed concurrency is
+    // exactly N — proving ≥2 drivers overlapped at concurrency=2.
+    assert_eq!(
+        probe.max_observed(),
+        N,
+        "max observed concurrency must be exactly N (= {N}); got {}",
+        probe.max_observed()
+    );
+
+    // Cross-check via the `sched-parallelism-instrument` start/end intervals: read
+    // each driver's [started_at, finished_at] and assert they intersect.  This is
+    // anchored on `max_observed() == 2` above, so the overlap claim stays
+    // deterministic (the barrier — not timing — is what forces it).
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask")
+        .expect("graph Some");
+
+    let a = snapshot
+        .get(&TaskId::new("task-a"))
+        .expect("task-a in graph");
+    let b = snapshot
+        .get(&TaskId::new("task-b"))
+        .expect("task-b in graph");
+
+    let a_started = a.started_at.expect("task-a started_at stamped");
+    let a_finished = a.finished_at.expect("task-a finished_at stamped");
+    let b_started = b.started_at.expect("task-b started_at stamped");
+    let b_finished = b.finished_at.expect("task-b finished_at stamped");
+
+    // The intervals [a_started, a_finished] and [b_started, b_finished] INTERSECT.
+    assert!(
+        a_started < b_finished && b_started < a_finished,
+        "driver intervals must intersect: a=[{a_started}, {a_finished}], b=[{b_started}, {b_finished}]"
+    );
+
+    root.kill();
+}
