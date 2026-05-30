@@ -36,9 +36,13 @@
 //! task and eliminates merge-lock contention on a shared branch (e.g.
 //! `develop`) when multiple tasks run in parallel.
 //!
-//! `.tasks/` is intentionally **not** listed in `.gitignore`, so the artifact
-//! is committable whenever the user/CI wants a checkpoint.  `/.worktrees/` is
-//! gitignored because those checkouts are transient runtime state.
+//! The repo lays out its Makina state under a single `.makina/` directory with
+//! a commit/ignore split: `.makina/config.toml` and the task artifacts under
+//! `.makina/tasks/` are **committed** (never listed in any `.gitignore`), while
+//! the transient runtime state — `.makina/runs/` and `.makina/worktrees/` — is
+//! gitignored via `.makina/.gitignore` (which lists `/runs/` and `/worktrees/`).
+//! So the artifact is committable whenever the user/CI wants a checkpoint, and
+//! the run/worktree checkouts stay out of history because they are transient.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -520,14 +524,16 @@ mod tests {
 
     // ── Test 6: .gitignore commit-policy invariants ───────────────────────────
 
-    /// Assert that the repo's `.gitignore` ignores `/.worktrees/` but does
-    /// **not** ignore `.tasks/` (i.e. `.tasks/` is committable).
+    /// Assert the `.makina/` commit/ignore split: `.makina/.gitignore` ignores
+    /// `runs/` and `worktrees/` (transient runtime state), while the root
+    /// `.gitignore` no longer ignores `.worktrees/` and does **not** ignore
+    /// `.makina/` itself (config + tasks under `.makina/` are committable).
     ///
-    /// This test reads the `.gitignore` at the repo root (two levels above
-    /// `CARGO_MANIFEST_DIR`) and checks the rules by simple string matching.
-    /// It is intentionally kept to string-level checks rather than spawning
-    /// `git check-ignore` so that it works in any environment (including CI
-    /// sandboxes without a full git context).
+    /// This test reads the `.gitignore` files (the root one two levels above
+    /// `CARGO_MANIFEST_DIR`, plus `.makina/.gitignore`) and checks the rules by
+    /// simple string matching. It is intentionally kept to string-level checks
+    /// rather than spawning `git check-ignore` so that it works in any
+    /// environment (including CI sandboxes without a full git context).
     #[test]
     fn gitignore_worktrees_ignored_tasks_not_ignored() {
         // CARGO_MANIFEST_DIR = .../crates/makina-core
@@ -539,27 +545,42 @@ mod tests {
             .parent()
             .expect("repo root");
 
+        // ── .makina/.gitignore: runs/ and worktrees/ are ignored ──────────────
+        let makina_gitignore_path = repo_root.join(".makina").join(".gitignore");
+        let makina_contents = std::fs::read_to_string(&makina_gitignore_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", makina_gitignore_path.display()));
+
+        assert!(
+            makina_contents.lines().any(|l| l.trim() == "/runs/"),
+            "/runs/ must be listed in .makina/.gitignore — found:\n{makina_contents}"
+        );
+        assert!(
+            makina_contents.lines().any(|l| l.trim() == "/worktrees/"),
+            "/worktrees/ must be listed in .makina/.gitignore — found:\n{makina_contents}"
+        );
+
+        // ── root .gitignore: no longer ignores .worktrees/ or .makina/ ────────
         let gitignore_path = repo_root.join(".gitignore");
         let contents = std::fs::read_to_string(&gitignore_path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", gitignore_path.display()));
 
-        // /.worktrees/ must appear as a gitignore rule.
+        // /.worktrees/ must no longer appear as a gitignore rule.
         assert!(
-            contents.lines().any(|l| l.trim() == "/.worktrees/"),
-            "/.worktrees/ must be listed in .gitignore — found:\n{contents}"
+            !contents.lines().any(|l| l.trim() == "/.worktrees/"),
+            "/.worktrees/ must NOT be listed in the root .gitignore — found:\n{contents}"
         );
 
-        // No rule that would ignore .tasks/ or .tasks should be present.
-        let tasks_ignored = contents.lines().any(|l| {
+        // No rule that would ignore .makina/ or .makina should be present.
+        let makina_ignored = contents.lines().any(|l| {
             let l = l.trim();
-            // Reject any non-comment line that would swallow .tasks paths:
-            // e.g. ".tasks", ".tasks/", "/.tasks", "/.tasks/"
+            // Reject any non-comment line that would swallow .makina paths:
+            // e.g. ".makina", ".makina/", "/.makina", "/.makina/"
             !l.starts_with('#')
-                && (l == ".tasks" || l == ".tasks/" || l == "/.tasks" || l == "/.tasks/")
+                && (l == ".makina" || l == ".makina/" || l == "/.makina" || l == "/.makina/")
         });
         assert!(
-            !tasks_ignored,
-            ".tasks must NOT be in .gitignore — found an ignoring rule in:\n{contents}"
+            !makina_ignored,
+            ".makina must NOT be in the root .gitignore — found an ignoring rule in:\n{contents}"
         );
     }
 
