@@ -127,11 +127,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             .runs
             .iter()
             .map(|run| {
-                let name = run
-                    .task_list_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown");
+                let name = run_label(run);
                 let (badge, badge_color) = status_badge(&run.status);
                 let line = Line::from(vec![
                     Span::styled(badge, Style::default().fg(badge_color)),
@@ -639,6 +635,33 @@ fn panel_block(title: &str, focused: bool) -> Block<'static> {
         .padding(Padding::horizontal(1))
 }
 
+/// Derive the sidebar run label as `{project}/{plan}` for plan-style task-list
+/// paths, falling back to the bare file stem otherwise.
+///
+/// A path is plan-style when its `file_name` is `TASKS.md` (case-insensitive)
+/// AND its parent directory name is non-empty; in that case `{plan}` is the
+/// parent-directory name and `{project}` is [`RunView::project`]. For any other
+/// shape (e.g. `.tasks/feature.json`) the label is just the `file_stem`.
+fn run_label(run: &makina_core::api::RunView) -> String {
+    let path = &run.task_list_path;
+    let is_tasks_md = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("TASKS.md"));
+    let plan = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str());
+    if is_tasks_md && let Some(plan) = plan.filter(|p| !p.is_empty()) {
+        let project = &run.project;
+        return format!("{project}/{plan}");
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Return the short status badge text and its display colour for a [`RunStatus`].
 ///
 /// The badge is a fixed-width 3-character label shown in the sidebar List.
@@ -917,6 +940,65 @@ mod tests {
         assert!(
             screen.contains("[✓]"),
             "Completed badge must appear for gamma"
+        );
+    }
+
+    #[test]
+    fn render_sidebar_shows_plan_label() {
+        // Plan-style path renders "{project}/{plan}"; a non-plan path falls back
+        // to the bare file stem.  The terminal is wide enough that the full
+        // "makina/0002-Governance-and-Persistence" label fits in the 30%-wide
+        // sidebar without being clipped at the panel boundary.
+        let mut terminal = make_terminal(200, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        // The non-plan run is listed first so that it is the auto-selected run
+        // (`App::new` selects index 0). This keeps the `.tasks/feature.json`
+        // stem — which has no "TASKS" substring — in the Detail header, so the
+        // only path-derived text on screen that could contain "TASKS" is the
+        // plan-style sidebar label, which renders as "{project}/{plan}".
+        let runs = vec![
+            RunView {
+                id: RunId(2),
+                run_uid: String::new(),
+                task_list_path: PathBuf::from(".tasks/feature.json"),
+                status: RunStatus::Completed,
+                project: "makina".into(),
+                tasks: vec![],
+            },
+            RunView {
+                id: RunId(1),
+                run_uid: String::new(),
+                task_list_path: PathBuf::from("docs/plans/0002-Governance-and-Persistence/TASKS.md"),
+                status: RunStatus::Running,
+                project: "makina".into(),
+                tasks: vec![],
+            },
+        ];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        // Plan-style run shows the plan dir name, not "TASKS".
+        assert!(
+            screen.contains("0002-Governance-and-Persistence"),
+            "sidebar must show the plan dir name"
+        );
+        assert!(
+            !screen.contains("TASKS"),
+            "sidebar must not show 'TASKS' for plan-style paths"
+        );
+
+        // Non-plan path still renders its bare file stem.
+        assert!(
+            screen.contains("feature"),
+            "sidebar must show 'feature' stem for non-plan paths"
         );
     }
 
