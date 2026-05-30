@@ -235,3 +235,78 @@ config back-compat fallback to `./makina.toml`; continue-independents +
   startup sweep. After a hard `kill -9` that bypasses every exit hook, a stray
   worktree is reclaimed lazily by `create` on the next run of that task — so no
   poisoning persists, but a sweep is intentionally not built.
+
+### Parallelism root-cause
+
+**Verdict: NO real, reproducible cargo build-contention defect exists in the
+current code. The prime suspect — concurrent `cargo` gate builds across
+worktrees serializing on a *shared* target dir — does not occur, because each
+worktree already resolves to its own private `target/` directory by default.
+`sched-isolated-target-dirs` is therefore NOT triggered: there is nothing to
+isolate, and this is recorded as an explicitly-accepted (non-)limitation, not a
+fix to implement.**
+
+**What was probed (real gate config, not the in-process test harness).** The
+deterministic concurrency harness uses `CountingBackend` with an *empty* gate
+list (`config_with_concurrency`, `crates/makina-core/tests/concurrency.rs`;
+`develop_until_gates_pass` runs `run_gates` over no gates), so it can never
+reproduce cargo contention. The probe instead reconstructed Makina's real layout
+out-of-band: a `[workspace] members = ["crates/*"]` repo (identical to
+`/Users/koraytaylan/Workspace/makina/Cargo.toml`), two git worktrees created at
+`.makina/worktrees/{task_id}` (matching `paths::worktree`), each member crate
+carrying a `build.rs` that sleeps ~4s so a real recompile is wall-clock
+observable. Each gate was launched **exactly** as `GateRunner::run_gates`
+launches it (`crates/makina-core/src/gate.rs`): `sh -c "cargo build"` with
+`current_dir(worktree_path)` and the parent environment inherited verbatim. Two
+gates were run concurrently and their start/end wall-clock stamps compared for
+overlap.
+
+**Measured results (cargo 1.94.0, `CARGO_TARGET_DIR` unset, no
+`.cargo/config.toml` anywhere in the repo):**
+
+1. **Where the target dir resolves.** `cargo metadata` inside each worktree
+   reports `workspace_root` = the worktree itself and `target_directory` =
+   `.makina/worktrees/{task_id}/target`. The two worktrees resolve to **two
+   distinct** target dirs. A nested worktree is a full checkout of the whole
+   tree (its own root `Cargo.toml` + `crates/`), so it is its own workspace and
+   is **not** swallowed into the parent repo's workspace and does **not** share
+   the parent's `target/`.
+2. **Default (per-worktree target) — concurrent builds fully overlap.** Two
+   concurrent `cargo build` gates: `A dur≈4.8s, B dur≈5.0s, wall≈5.0s, overlap
+   window≈4.8s` — i.e. total wall-clock ≈ a single build. **No serialization.**
+3. **Contrast — forcing a *shared* target dir DOES serialize.** Re-running the
+   identical two gates with `CARGO_TARGET_DIR` pointed at one shared directory:
+   `B dur≈4.6s, A dur≈9.0s, wall≈9.0s` (≈ B + B again). The second build blocked
+   on cargo's build-directory lock until the first finished. This confirms the
+   *mechanism* the suspect describes is real — but it only fires under sharing,
+   which Makina does not do.
+
+**Root cause of the "sequential appearance."** It is **not** cargo target-dir
+contention (no sharing exists to contend on). The apparent sequencing in dogfood
+runs is attributable to the scheduler/dispatch path and the cost of git worktree
+setup + agent turns per task, not to a build-lock defect. The deterministic
+overlap tests added by `sched-parallelism-instrument` /
+`sched-parallelism-verify-test`
+(`crates/makina-core/tests/concurrency.rs::drivers_overlap_under_concurrency_2`,
+`driver_intervals_observable`) already prove the scheduler itself launches ≥2
+drivers simultaneously at `concurrency = 2` (`max_observed() == 2` with a 2-party
+barrier), so the scheduler is not the serializer either.
+
+**Fix recommendation: none required.** No file needs changing for build
+contention. Were target-dir sharing ever introduced (e.g. a repo-level
+`.cargo/config.toml` with a `build.target-dir`, or a `CARGO_TARGET_DIR` exported
+into the agent/gate environment), the contention in result (3) would appear; the
+single point to fix it then would be `GateRunner::run_gates`
+(`crates/makina-core/src/gate.rs`), by adding
+`.env("CARGO_TARGET_DIR", <per-worktree path>)` to the
+`tokio::process::Command` (or equivalently a per-worktree `target/` set at
+worktree creation in `crates/makina-core/src/worktree.rs`). That is the design
+that `sched-isolated-target-dirs` would implement — but it is **conditional on
+this finding, and this finding does not confirm the defect**, so it remains
+unbuilt by choice.
+
+- **Cargo target-dir contention (accepted non-limitation):** worktrees at
+  `.makina/worktrees/{task_id}` each get their own `target/` automatically, so
+  concurrent `cargo` gates run in parallel with no build-lock serialization.
+  Verified empirically (per-worktree targets → full overlap; only an artificially
+  *shared* target dir serializes). No isolation code is added.
