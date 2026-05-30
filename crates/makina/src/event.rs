@@ -679,6 +679,7 @@ mod tests {
         });
         let run = RunView {
             id: RunId(7),
+            run_uid: String::new(),
             task_list_path: std::path::PathBuf::from(".tasks/control.json"),
             status: RunStatus::Pending,
             tasks: vec![],
@@ -749,6 +750,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let run = RunView {
             id: RunId(999),
+            run_uid: String::new(),
             task_list_path: std::path::PathBuf::from(".tasks/ghost.json"),
             status: RunStatus::Pending,
             tasks: vec![],
@@ -917,6 +919,7 @@ mod tests {
         {
             let run = RunView {
                 id: RunId(5),
+                run_uid: String::new(),
                 task_list_path: std::path::PathBuf::from(".tasks/pop.json"),
                 status: RunStatus::Pending,
                 tasks: vec![

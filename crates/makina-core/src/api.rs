@@ -225,6 +225,12 @@ pub struct RunView {
     /// Stable handle for this Run within the current session.
     pub id: RunId,
 
+    /// Persistent, sortable run identity (26-char ULID string) minted when the
+    /// Run is opened.  Unlike [`RunView::id`] (a session-scoped `u64` handle),
+    /// the ULID's lexicographic order matches chronological order, so it is a
+    /// stable key that survives across processes.
+    pub run_uid: String,
+
     /// Path to the task-list file that backs this Run (e.g.
     /// `.tasks/my-feature.json`).  Displayed in the TUI title bar.
     pub task_list_path: PathBuf,
@@ -665,6 +671,7 @@ mod tests {
                     let id = self.alloc_id();
                     let view = RunView {
                         id,
+                        run_uid: String::new(),
                         task_list_path,
                         status: RunStatus::Pending,
                         tasks: vec![TaskView {
@@ -958,6 +965,7 @@ mod tests {
 
         let run_view = RunView {
             id: RunId(42),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
             tasks: vec![task],

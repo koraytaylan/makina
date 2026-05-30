@@ -446,6 +446,18 @@ struct DriverContext {
     /// started; the `RunReadyTasks` ask path uses an empty string (no-op with
     /// `NoopAuditRegistry`).
     run_slug: String,
+
+    /// The persistent, sortable run identity (26-char ULID string) minted by the
+    /// orchestrator when the run is opened, threaded through so the audit ledger
+    /// can key entries on a stable cross-process run id.
+    ///
+    /// The `RunReadyTasks` ask path uses an empty string (no-op with
+    /// `NoopAuditRegistry`).
+    ///
+    /// Not yet read: `mk-run-id` only threads it into the context; the
+    /// `register()` call that consumes it is owned by `mk-audit-register-runuid`.
+    #[allow(dead_code)]
+    run_uid: String,
 }
 
 impl DriverContext {
@@ -644,6 +656,7 @@ impl Supervisor {
             RunControl::silent(),
             Arc::new(NoopAuditRegistry),
             String::new(),
+            String::new(),
         ) {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -667,14 +680,16 @@ impl Supervisor {
     /// were not injected via [`SetSpokes`], or if the worktree manager is absent.
     /// `control` carries the per-run event sink + pause/cancel signals (task 31);
     /// pass [`RunControl::silent`] for the uncontrolled ask path.
-    /// `audit_registry` and `run_slug` are for the audit ledger; pass
-    /// `Arc::new(NoopAuditRegistry)` / `String::new()` for the ask path.
+    /// `audit_registry`, `run_slug`, and `run_uid` are for the audit ledger; pass
+    /// `Arc::new(NoopAuditRegistry)` / `String::new()` / `String::new()` for the
+    /// ask path.
     fn driver_context(
         &self,
         graph: Arc<Mutex<TaskGraph>>,
         control: RunControl,
         audit_registry: Arc<dyn AuditRegistry>,
         run_slug: String,
+        run_uid: String,
     ) -> Result<DriverContext, String> {
         let worktree_manager = self
             .worktree_manager
@@ -706,6 +721,7 @@ impl Supervisor {
             control,
             audit_registry,
             run_slug,
+            run_uid,
         })
     }
 
@@ -747,6 +763,10 @@ impl Supervisor {
 /// The graph-lock-never-across-await invariant and the per-task [`DriverGuard`]
 /// teardown are unchanged; this only wraps the scheduler with wiring + the two
 /// aggregate `RunStatusChanged` emissions.
+// The orchestrator threads the full run context (graph + wiring + audit slug +
+// run_uid) into this single entrypoint; grouping these into a struct would just
+// move the argument list elsewhere without simplifying the call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_graph(
     graph: Arc<Mutex<TaskGraph>>,
     worktree_manager: WorktreeManager,
@@ -755,6 +775,7 @@ pub async fn run_graph(
     control: RunControl,
     audit_registry: Arc<dyn AuditRegistry>,
     run_slug: String,
+    run_uid: String,
 ) -> Result<RunReport, String> {
     // Announce the run is now executing.
     control.emit(api::Event::RunStatusChanged {
@@ -803,6 +824,7 @@ pub async fn run_graph(
         control: control.clone(),
         audit_registry,
         run_slug,
+        run_uid,
     };
 
     let result = scheduler(ctx, config.concurrency).await;

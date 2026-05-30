@@ -99,6 +99,7 @@ impl Api for PlaceholderApi {
                 let id = self.alloc_id();
                 let run = RunView {
                     id,
+                    run_uid: String::new(),
                     task_list_path: task_list_path.clone(),
                     status: RunStatus::Pending,
                     tasks: vec![],
@@ -185,6 +186,7 @@ impl Api for PlaceholderApi {
 fn sample_run(id: RunId) -> RunView {
     RunView {
         id,
+        run_uid: String::new(),
         task_list_path: PathBuf::from(".tasks/demo-feature.json"),
         status: RunStatus::Running,
         tasks: vec![

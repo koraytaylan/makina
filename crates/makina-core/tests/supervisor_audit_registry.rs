@@ -204,6 +204,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
         control,
         Arc::new(spy),
         slug.to_string(),
+        String::new(),
     )
     .await
     .expect("run_graph must not error");

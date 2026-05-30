@@ -554,6 +554,7 @@ impl App {
                 if !self.runs.iter().any(|r| r.id == *run) {
                     self.runs.push(RunView {
                         id: *run,
+                        run_uid: String::new(),
                         task_list_path: task_list_path.clone(),
                         status: RunStatus::Pending,
                         tasks: vec![],
@@ -712,6 +713,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let existing = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/demo.json"),
             status: RunStatus::Pending,
             tasks: vec![],
@@ -737,6 +739,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Pending,
             tasks: vec![TaskView {
@@ -770,6 +773,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
             tasks: vec![TaskView {
@@ -800,6 +804,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(7),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/accessor.json"),
             status: RunStatus::Running,
             tasks: vec![],
@@ -828,18 +833,21 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Running,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(3),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/c.json"),
                 status: RunStatus::Completed,
                 tasks: vec![],
@@ -862,12 +870,14 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
@@ -889,12 +899,14 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
@@ -913,6 +925,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let runs = vec![RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/a.json"),
             status: RunStatus::Pending,
             tasks: vec![],
@@ -930,12 +943,14 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
@@ -1000,12 +1015,14 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/a.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/b.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
@@ -1039,6 +1056,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Pending,
             tasks: vec![],
@@ -1059,6 +1077,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
             tasks: vec![],
@@ -1079,6 +1098,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
             tasks: vec![TaskView {
@@ -1113,6 +1133,7 @@ mod tests {
         // Start with a placeholder (empty tasks) inserted by RunOpened.
         let placeholder = RunView {
             id: RunId(42),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/test.json"),
             status: RunStatus::Pending,
             tasks: vec![],
@@ -1126,6 +1147,7 @@ mod tests {
         // Now feed a RunLoaded event with the full RunView (with tasks).
         let full_run = RunView {
             id: RunId(42),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/test.json"),
             status: RunStatus::Pending,
             tasks: vec![
@@ -1172,6 +1194,7 @@ mod tests {
 
         let full_run = RunView {
             id: RunId(7),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/new.json"),
             status: RunStatus::Pending,
             tasks: vec![TaskView {
@@ -1198,6 +1221,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
             tasks: vec![
@@ -1247,6 +1271,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
             tasks: vec![
@@ -1440,6 +1465,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/x.json"),
             status: RunStatus::Running,
             tasks: vec![
@@ -1713,6 +1739,7 @@ mod tests {
         // Two runs, each with tasks.
         let run1 = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/r1.json"),
             status: RunStatus::Running,
             tasks: vec![
@@ -1736,6 +1763,7 @@ mod tests {
         };
         let run2 = RunView {
             id: RunId(2),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/r2.json"),
             status: RunStatus::Pending,
             tasks: vec![TaskView {

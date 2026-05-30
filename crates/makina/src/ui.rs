@@ -818,6 +818,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/my-feature.json"),
             status: RunStatus::Running,
             tasks: vec![TaskView {
@@ -863,18 +864,21 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/alpha.json"),
                 status: RunStatus::Running,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/beta.json"),
                 status: RunStatus::Failed,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(3),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/gamma.json"),
                 status: RunStatus::Completed,
                 tasks: vec![],
@@ -919,30 +923,35 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/pending.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/running.json"),
                 status: RunStatus::Running,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(3),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/paused.json"),
                 status: RunStatus::Paused,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(4),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/completed.json"),
                 status: RunStatus::Completed,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(5),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/failed.json"),
                 status: RunStatus::Failed,
                 tasks: vec![],
@@ -977,12 +986,14 @@ mod tests {
         let runs = vec![
             RunView {
                 id: RunId(1),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/first.json"),
                 status: RunStatus::Running,
                 tasks: vec![],
             },
             RunView {
                 id: RunId(2),
+                run_uid: String::new(),
                 task_list_path: PathBuf::from(".tasks/second.json"),
                 status: RunStatus::Pending,
                 tasks: vec![],
@@ -1015,6 +1026,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/live.json"),
             status: RunStatus::Running,
             tasks: vec![],
@@ -1038,6 +1050,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/broken.json"),
             status: RunStatus::Failed,
             tasks: vec![],
@@ -1236,6 +1249,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/status-test.json"),
             status: RunStatus::Running,
             tasks: vec![
@@ -1381,6 +1395,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let run = makina_core::api::RunView {
             id: makina_core::api::RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/empty-run.json"),
             status: makina_core::api::RunStatus::Pending,
             tasks: vec![],
@@ -1412,6 +1427,7 @@ mod tests {
         // Start with one task in New state, zero iterations.
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/live.json"),
             status: RunStatus::Pending,
             tasks: vec![TaskView {
@@ -1501,6 +1517,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/exchange-test.json"),
             status: RunStatus::Running,
             tasks: vec![
@@ -1672,6 +1689,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let run = RunView {
             id: RunId(1),
+            run_uid: String::new(),
             task_list_path: PathBuf::from(".tasks/no-exchange.json"),
             status: RunStatus::Running,
             tasks: vec![TaskView {

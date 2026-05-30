@@ -207,6 +207,12 @@ struct RunHandle {
 struct RunEntry {
     /// Path to the task-list file this Run was opened from.
     task_list_path: PathBuf,
+    /// Persistent, sortable run identity (26-char ULID string) minted when this
+    /// Run is opened.  Unlike the in-memory [`RunId`] session handle, the ULID's
+    /// lexicographic order matches chronological order, giving a stable key that
+    /// survives across processes.  Surfaced read-only on [`RunView::run_uid`] and
+    /// threaded into the audit ledger.
+    run_uid: String,
     /// The interpreted task graph, shared with the background scheduler.  Reads
     /// (`run`/`runs`) lock it briefly to snapshot; the scheduler mutates it as
     /// tasks progress.
@@ -225,7 +231,13 @@ struct RunEntry {
 /// inline (it is behind an async mutex); callers snapshot the graph first, then
 /// build the view from the clone — keeping the registry lock and the graph lock
 /// strictly separate.
-fn build_view(id: RunId, task_list_path: PathBuf, status: RunStatus, graph: &TaskGraph) -> RunView {
+fn build_view(
+    id: RunId,
+    run_uid: String,
+    task_list_path: PathBuf,
+    status: RunStatus,
+    graph: &TaskGraph,
+) -> RunView {
     let tasks = graph
         .tasks
         .iter()
@@ -241,6 +253,7 @@ fn build_view(id: RunId, task_list_path: PathBuf, status: RunStatus, graph: &Tas
 
     RunView {
         id,
+        run_uid,
         task_list_path,
         status,
         tasks,
@@ -517,9 +530,11 @@ impl CoreApi {
             }
         };
 
-        // 3. Allocate an id and register the Run.  Lock → insert → DROP guard
-        //    before any further await/broadcast.
+        // 3. Allocate an id, mint the persistent ULID run identity, and register
+        //    the Run.  Lock → insert → DROP guard before any further
+        //    await/broadcast.
         let id = self.state.alloc_id();
+        let run_uid = ulid::Ulid::new().to_string();
         {
             let mut runs = self
                 .state
@@ -530,6 +545,7 @@ impl CoreApi {
                 id.0,
                 RunEntry {
                     task_list_path: task_list_path.clone(),
+                    run_uid,
                     graph: Arc::new(AsyncMutex::new(graph)),
                     status: RunStatus::Pending,
                     handle: None,
@@ -612,7 +628,7 @@ impl CoreApi {
     fn start_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
         // Take everything we need out of the registry under ONE lock, then drop
         // the guard before spawning (no lock across the spawn / await boundary).
-        let (graph, cancel, pause, run_slug) = {
+        let (graph, cancel, pause, run_slug, run_uid) = {
             let mut runs = self
                 .state
                 .runs
@@ -640,8 +656,12 @@ impl CoreApi {
             // logs all agree on one slug.
             let slug = run_slug(&entry.task_list_path);
 
+            // The persistent ULID identity, threaded into the scheduler so the
+            // audit ledger can key entries on it.
+            let run_uid = entry.run_uid.clone();
+
             // Return the pieces the background task needs.
-            (Arc::clone(&entry.graph), cancel, pause, slug)
+            (Arc::clone(&entry.graph), cancel, pause, slug, run_uid)
         }; // registry guard dropped here.
 
         // Build the per-run control (sink → broadcast, pause flag, cancel token).
@@ -675,6 +695,7 @@ impl CoreApi {
                 control,
                 audit_registry,
                 run_slug,
+                run_uid,
             )
             .await;
             state.finalize_run_status(run).await;
@@ -751,7 +772,7 @@ impl CoreApi {
     async fn view_of(&self, id: RunId) -> Option<RunView> {
         // Pull the Arc graph handle + metadata out under the registry lock, then
         // drop the guard before awaiting the (separate) graph mutex.
-        let (path, status, graph) = {
+        let (run_uid, path, status, graph) = {
             let runs = self
                 .state
                 .runs
@@ -759,13 +780,14 @@ impl CoreApi {
                 .expect("runs registry mutex poisoned");
             let entry = runs.get(&id.0)?;
             (
+                entry.run_uid.clone(),
                 entry.task_list_path.clone(),
                 entry.status.clone(),
                 Arc::clone(&entry.graph),
             )
         }; // registry guard dropped before await.
         let g = graph.lock().await;
-        Some(build_view(id, path, status, &g))
+        Some(build_view(id, run_uid, path, status, &g))
     }
 }
 
@@ -797,7 +819,13 @@ impl Api for CoreApi {
         // Snapshot the (id, path, status, graph-handle) tuples under the registry
         // lock, drop the guard, THEN lock each graph to build its view — so the
         // registry lock is never held across the graph `.await`.
-        let entries: Vec<(RunId, PathBuf, RunStatus, Arc<AsyncMutex<TaskGraph>>)> = {
+        let entries: Vec<(
+            RunId,
+            String,
+            PathBuf,
+            RunStatus,
+            Arc<AsyncMutex<TaskGraph>>,
+        )> = {
             let runs = self
                 .state
                 .runs
@@ -807,6 +835,7 @@ impl Api for CoreApi {
                 .map(|(id, entry)| {
                     (
                         RunId(*id),
+                        entry.run_uid.clone(),
                         entry.task_list_path.clone(),
                         entry.status.clone(),
                         Arc::clone(&entry.graph),
@@ -816,9 +845,9 @@ impl Api for CoreApi {
         }; // registry guard dropped before any graph await.
 
         let mut views = Vec::with_capacity(entries.len());
-        for (id, path, status, graph) in entries {
+        for (id, run_uid, path, status, graph) in entries {
             let g = graph.lock().await;
-            views.push(build_view(id, path, status, &g));
+            views.push(build_view(id, run_uid, path, status, &g));
         }
         views
     }
@@ -1170,6 +1199,70 @@ Do the thing in `lib.rs`.
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, RunId(1));
         assert_eq!(all[1].id, RunId(2));
+    }
+
+    /// `mk-run-id`: every opened Run is stamped with a persistent, sortable ULID
+    /// `run_uid`.  Modeled on `multiple_open_runs_get_distinct_ids`: open two runs
+    /// and snapshot `api.runs()`, then assert each `RunView.run_uid` is a 26-char
+    /// ULID string, the two differ, and the second sorts after the first.
+    ///
+    /// Chronological ordering is made deterministic by sleeping a few milliseconds
+    /// between the two `OpenRun` calls so the ULID's millisecond timestamp prefix
+    /// (not just the random tail) guarantees the lexicographic order.
+    #[tokio::test]
+    async fn open_runs_carry_distinct_sortable_run_uids() {
+        let (api, _repo) = execution_core_api();
+        let (_d1, p1) = write_task_list(SAMPLE_TASK_LIST);
+        let (_d2, p2) = write_task_list(SAMPLE_TASK_LIST);
+
+        let id1 = match api
+            .execute(Command::OpenRun { task_list_path: p1 })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        // Advance the wall clock past one ULID timestamp tick so the second run's
+        // timestamp prefix is strictly greater — the sort order is then guaranteed
+        // by the prefix, not just the random tail.
+        std::thread::sleep(Duration::from_millis(5));
+
+        let id2 = match api
+            .execute(Command::OpenRun { task_list_path: p2 })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        // The numeric session handles still work as the in-memory key.
+        assert_ne!(id1, id2, "each run must get a distinct id");
+        assert_eq!(id1, RunId(1));
+        assert_eq!(id2, RunId(2));
+
+        let all = api.runs().await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, RunId(1));
+        assert_eq!(all[1].id, RunId(2));
+
+        let uid1 = &all[0].run_uid;
+        let uid2 = &all[1].run_uid;
+
+        // Each run_uid is a 26-char ULID string.
+        assert_eq!(uid1.len(), 26, "run_uid must be a 26-char ULID string");
+        assert_eq!(uid2.len(), 26, "run_uid must be a 26-char ULID string");
+
+        // The two run_uids differ…
+        assert_ne!(uid1, uid2, "each run must get a distinct run_uid");
+
+        // …and the second sorts after the first (chronological == lexicographic).
+        assert!(
+            uid2.as_str() > uid1.as_str(),
+            "the second run_uid must sort after the first ({uid1} !< {uid2})"
+        );
     }
 
     // ── Plan-scoped run slug (mk-run-slug) ────────────────────────────────────
