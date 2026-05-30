@@ -373,6 +373,21 @@ pub struct App {
     /// disengages auto-follow; scrolling back down to the bottom re-engages it.
     pub exchange_auto_follow: bool,
 
+    /// The most recent `scroll_max` (`total_lines - pane_height`) the render
+    /// pass computed for the exchange pane.
+    ///
+    /// `App` has no pane geometry, so the render path records the real bottom
+    /// offset here via interior mutability ([`std::cell::Cell`]) — letting the
+    /// `&App` render signature stay unchanged.  Two consumers read it:
+    ///
+    /// * [`App::scroll_up`] anchors the manual offset to the rendered bottom
+    ///   when auto-follow first disengages (so the first wheel-up moves up by
+    ///   exactly one line instead of jumping to the top), and
+    /// * the `AppEvent::ScrollDown` arm in [`App::update`] uses it as the
+    ///   clamp bound so reaching the real rendered bottom re-engages
+    ///   auto-follow.
+    pub last_scroll_max: std::cell::Cell<u16>,
+
     /// Last api event received — stored for test assertions and status-bar
     /// display.  Will be used by tasks 27–31 for richer updates.
     pub last_event: Option<Event>,
@@ -418,6 +433,7 @@ impl App {
             exchange_logs: HashMap::new(),
             exchange_scroll: 0,
             exchange_auto_follow: true,
+            last_scroll_max: std::cell::Cell::new(0),
             last_event: None,
             status_message: None,
             error_pane_open: false,
@@ -470,7 +486,17 @@ impl App {
     /// Disengages auto-follow (the user is reviewing history) and decrements the
     /// manual offset, clamped at `0`.  `App` does not know the rendered line
     /// count, so no upper bound is needed here.
+    ///
+    /// When auto-follow is currently engaged the manual `exchange_scroll` is
+    /// stale (`0`) while the render path pins the pane to `scroll_max`.  Anchor
+    /// the manual offset to the last rendered bottom ([`App::last_scroll_max`])
+    /// *before* decrementing, so the first wheel-up moves up by exactly one
+    /// line (`scroll_max - 1`) instead of snapping to the top.
     pub fn scroll_up(&mut self) {
+        if self.exchange_auto_follow {
+            // Anchor to the rendered bottom so the first wheel-up is `max - 1`.
+            self.exchange_scroll = self.last_scroll_max.get();
+        }
         self.exchange_auto_follow = false;
         self.exchange_scroll = self.exchange_scroll.saturating_sub(1);
     }
@@ -482,7 +508,7 @@ impl App {
     /// Reaching the bottom re-engages auto-follow so new exchanges keep the pane
     /// pinned to the latest line.
     pub fn scroll_down(&mut self, scroll_max: u16) {
-        self.exchange_scroll = (self.exchange_scroll + 1).min(scroll_max);
+        self.exchange_scroll = self.exchange_scroll.saturating_add(1).min(scroll_max);
         if self.exchange_scroll == scroll_max {
             self.exchange_auto_follow = true;
         }
@@ -591,16 +617,20 @@ impl App {
             // ── Exchange-pane scroll (task `tui-mouse-scroll`) ────────────────
             // Mirror BrowserUp/BrowserDown: a wheel event nudges the manual
             // scroll offset via the `tui-scroll-state` helpers.  `update` has no
-            // pane geometry, so it uses `u16::MAX` as `scroll_max`; the render
-            // pass re-clamps the offset to the real `total_lines - pane_height`
-            // via `effective_offset`.
+            // live pane geometry, so it uses `last_scroll_max` — the bottom
+            // offset the render pass most recently recorded — as `scroll_max`;
+            // the render pass re-clamps the offset to the current
+            // `total_lines - pane_height` via `effective_offset`.
             AppEvent::ScrollUp => {
                 self.scroll_up();
                 true
             }
             AppEvent::ScrollDown => {
-                let scroll_max = u16::MAX;
-                self.scroll_down(scroll_max);
+                // Use the last rendered bottom as the clamp bound (not
+                // `u16::MAX`) so reaching the real bottom re-engages auto-follow
+                // in `scroll_down`; otherwise `exchange_scroll == scroll_max`
+                // could never hold and auto-follow would never re-engage.
+                self.scroll_down(self.last_scroll_max.get());
                 true
             }
             AppEvent::ApiEvent(ev) => {
@@ -2045,6 +2075,11 @@ mod tests {
     fn scroll_event_changes_offset_not_selection() {
         let mut app = make_app_with_tasks();
 
+        // The render pass records the rendered bottom; the geometry-free update
+        // path uses it as the scroll clamp bound.  Without a non-zero bound there
+        // is nowhere to scroll, so simulate a multi-line pane.
+        app.last_scroll_max.set(5);
+
         // Record the task selection before scrolling.
         let selected_before = app.selected_task;
         assert_eq!(selected_before, Some(0));
@@ -2076,6 +2111,95 @@ mod tests {
             app.selected_task, selected_before,
             "ScrollUp must NOT change task selection"
         );
+    }
+
+    /// Regression (fix `tui-scroll-and-restore` #1): the FIRST wheel-up from
+    /// auto-follow must move up by exactly one line (`scroll_max - 1`), NOT snap
+    /// to the top (offset 0).
+    ///
+    /// Before the fix, `scroll_up` left the stale `exchange_scroll == 0` and
+    /// merely `saturating_sub(1)`-ed it, so `effective_offset` returned 0 (top)
+    /// on the first wheel-up while auto-following.
+    #[test]
+    fn first_scroll_up_from_auto_follow_anchors_to_bottom_minus_one() {
+        let mut app = make_app();
+        let max: u16 = 12;
+
+        // Simulate what the render pass records: the bottom-most offset.
+        app.last_scroll_max.set(max);
+        assert!(app.exchange_auto_follow, "default is auto-follow");
+        assert_eq!(
+            app.exchange_scroll, 0,
+            "manual offset is stale (0) while following"
+        );
+
+        // First wheel-up disengages auto-follow and anchors to the bottom.
+        app.scroll_up();
+
+        assert!(
+            !app.exchange_auto_follow,
+            "scroll_up must disengage auto-follow"
+        );
+        assert_eq!(
+            app.effective_offset(max),
+            max - 1,
+            "first wheel-up must be max-1 (one line up), NOT 0 (top)"
+        );
+        assert_eq!(
+            app.exchange_scroll,
+            max - 1,
+            "exchange_scroll must be anchored to the rendered bottom minus one"
+        );
+    }
+
+    /// Regression (fix `tui-scroll-and-restore` #2): mouse auto-follow must
+    /// re-engage when scrolling back down to the real rendered bottom.
+    ///
+    /// Before the fix, the `ScrollDown` arm clamped at `u16::MAX`, so
+    /// `exchange_scroll == scroll_max` was unreachable and auto-follow could
+    /// never re-engage via the mouse path.  Now it clamps at `last_scroll_max`.
+    #[test]
+    fn mouse_scroll_down_to_bottom_reengages_auto_follow() {
+        let mut app = make_app_with_tasks();
+        let max: u16 = 4;
+
+        // The render pass records the real bottom offset.
+        app.last_scroll_max.set(max);
+
+        // Scroll up several times (disengages auto-follow, walks the offset up).
+        for _ in 0..3 {
+            app.update(AppEvent::ScrollUp);
+        }
+        assert!(
+            !app.exchange_auto_follow,
+            "scrolling up must disengage auto-follow"
+        );
+
+        // Now scroll down enough to reach the real rendered bottom.
+        for _ in 0..(max + 5) {
+            app.update(AppEvent::ScrollDown);
+        }
+
+        assert_eq!(
+            app.exchange_scroll, max,
+            "ScrollDown must clamp at the real rendered bottom (last_scroll_max)"
+        );
+        assert!(
+            app.exchange_auto_follow,
+            "reaching the rendered bottom via the mouse path must re-engage auto-follow"
+        );
+    }
+
+    /// Regression (fix `tui-scroll-and-restore` #3): `scroll_down` must not
+    /// overflow `exchange_scroll` when it is already at `u16::MAX` (debug panic).
+    #[test]
+    fn scroll_down_does_not_overflow_at_u16_max() {
+        let mut app = make_app();
+        app.exchange_auto_follow = false;
+        app.exchange_scroll = u16::MAX;
+        // saturating_add inside scroll_down must not panic in debug builds.
+        app.scroll_down(u16::MAX);
+        assert_eq!(app.exchange_scroll, u16::MAX);
     }
 
     /// Task selection: run navigation (Sidebar focus) must NOT change

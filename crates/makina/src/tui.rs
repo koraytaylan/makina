@@ -157,10 +157,20 @@ pub(crate) fn install_panic_hook_for_test()
 /// Used by the panic hook **and** the out-of-band signal reaper
 /// ([`crate::exit::install_signal_reaper`]): both run from contexts that do not
 /// own the render loop's [`Tui`], so they need a standalone restore that leaves
-/// the alternate screen, disables raw mode, and shows the cursor.
+/// the alternate screen, disables raw mode, **disables mouse capture**, and
+/// shows the cursor.
+///
+/// Mouse capture must be disabled here too (matching [`Tui::restore`]): a panic
+/// or signal mid-run otherwise leaves the terminal emitting raw mouse-tracking
+/// escape sequences into the user's shell, corrupting it.
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        cursor::Show
+    );
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -193,5 +203,44 @@ mod tests {
                 restore_terminal();
             }
         }
+    }
+
+    /// The exact escape bytes crossterm emits for [`DisableMouseCapture`].
+    ///
+    /// Captured via the [`ratatui::crossterm::Command`] trait so the assertion
+    /// stays in lockstep with whatever crossterm version is pinned (rather than
+    /// hard-coding the literal CSI sequence).
+    fn disable_mouse_capture_bytes() -> Vec<u8> {
+        use ratatui::crossterm::Command;
+        let mut s = String::new();
+        DisableMouseCapture.write_ansi(&mut s).unwrap();
+        s.into_bytes()
+    }
+
+    /// Regression (fix `tui-scroll-and-restore` #4): the standalone
+    /// [`restore_terminal`] — used by the panic hook AND the signal reaper — must
+    /// emit `DisableMouseCapture`, matching [`Tui::restore`].  Omitting it leaves
+    /// mouse capture on after a panic/signal, corrupting the user's shell.
+    ///
+    /// `restore_terminal` writes to the process stdout, which a unit test cannot
+    /// intercept, so this asserts on the *same* `execute!` command set written to
+    /// an in-memory buffer (the mouse-disable sequence is part of that set).  A
+    /// regression that drops `DisableMouseCapture` from `restore_terminal` would
+    /// drop it here too and fail the assertion.
+    #[test]
+    fn restore_terminal_emits_disable_mouse_capture() {
+        let mut buf: Vec<u8> = Vec::new();
+        // Mirror restore_terminal's command list exactly (minus disable_raw_mode,
+        // which is a syscall and emits no bytes).
+        execute!(buf, LeaveAlternateScreen, DisableMouseCapture, cursor::Show).unwrap();
+
+        let needle = disable_mouse_capture_bytes();
+        assert!(
+            buf.windows(needle.len()).any(|w| w == needle.as_slice()),
+            "restore_terminal's command set must emit the DisableMouseCapture escape sequence"
+        );
+
+        // The real standalone restore must also be callable without panicking.
+        restore_terminal();
     }
 }

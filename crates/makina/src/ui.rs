@@ -740,6 +740,10 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
             let pane_height = inner.height as usize;
             let total_lines = lines.len();
             let scroll_max = total_lines.saturating_sub(pane_height) as u16;
+            // Record the rendered bottom so the (geometry-free) `App::update`
+            // scroll path can anchor `scroll_up` and bound `scroll_down` to the
+            // real bottom (interior mutability keeps the `&App` render signature).
+            app.last_scroll_max.set(scroll_max);
             let scroll_offset = app.effective_offset(scroll_max);
 
             let para = Paragraph::new(lines)
@@ -882,8 +886,17 @@ fn exchange_entry_lines(entry: &ExchangeEntry) -> Vec<Line<'static>> {
             spans.push(Span::raw("  "));
             for AnsiSpan { text, style } in ansi_spans {
                 let style = match (diff_style, style.fg) {
+                    // ANSI SGR set no foreground → overlay ONLY the diff base
+                    // colour, preserving any add_modifier (e.g. BOLD) the span's
+                    // ANSI run set.  Replacing the whole style here would drop
+                    // those modifiers (spec `tui-exchange-render` step 3: overlay
+                    // the foreground only).  `base.fg` is always `Some` for a
+                    // diff line, but fall back to the span's own fg defensively.
+                    (Some(base), None) => match base.fg {
+                        Some(base_color) => style.fg(base_color),
+                        None => style,
+                    },
                     // ANSI SGR set a foreground → it wins over the diff base.
-                    (Some(base), None) => base,
                     _ => style,
                 };
                 spans.push(Span::styled(text, style));
@@ -2716,6 +2729,55 @@ mod tests {
         assert!(
             !screen.contains("this text must stay hidden"),
             "collapsed error pane must NOT render message text"
+        );
+    }
+
+    // ── Diff overlay preserves ANSI modifiers (fix `tui-scroll-and-restore` #5) ──
+
+    /// Regression: when a diff `+`/`-`/`@@` line carries an ANSI run that set a
+    /// modifier (e.g. `\x1b[1m` → BOLD) but NO foreground, overlaying the diff
+    /// base colour must set ONLY the foreground and PRESERVE the modifier.
+    ///
+    /// Before the fix, `(Some(base), None) => base` replaced the whole `Style`,
+    /// dropping `add_modifier` (the BOLD) on such a span.
+    #[test]
+    fn diff_base_overlay_preserves_ansi_bold_modifier() {
+        use crate::app::ExchangeEntry;
+        use makina_core::api::AgentRole;
+
+        // A complete Developer response whose single text line is a diff-add
+        // line (`+`) that opens BOLD via ANSI but sets no foreground colour.
+        let entry = ExchangeEntry {
+            role: AgentRole::Developer,
+            is_prompt: false,
+            text: "+\x1b[1madded bold line".to_string(),
+            complete: true,
+        };
+
+        let lines = exchange_entry_lines(&entry);
+
+        // Find the span carrying the diff text and assert BOTH the diff base
+        // foreground (green) AND the BOLD modifier survive.
+        let mut found = false;
+        for line in &lines {
+            for span in line.spans.iter() {
+                if span.content.contains("added bold line") {
+                    found = true;
+                    assert_eq!(
+                        span.style.fg,
+                        Some(Color::Green),
+                        "diff '+' line must overlay the green diff base colour"
+                    );
+                    assert!(
+                        span.style.add_modifier.contains(Modifier::BOLD),
+                        "ANSI BOLD modifier must be preserved when overlaying the diff base"
+                    );
+                }
+            }
+        }
+        assert!(
+            found,
+            "the diff text span must be present in the rendered lines"
         );
     }
 }
