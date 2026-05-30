@@ -229,18 +229,24 @@ pub fn render(app: &App, frame: &mut Frame) {
                 (task_count + 1).min(10) // cap at 10 visible rows + header
             };
 
+            // Error pane height: a few rows when open, 0 (a no-op area) when
+            // closed.  Placed AFTER the exchange pane in the vertical split.
+            let error_pane_height: u16 = if app.error_pane_open { 5 } else { 0 };
+
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(header_height),
                     Constraint::Length(table_rows),
                     Constraint::Min(3), // exchange pane — always at least 3 rows
+                    Constraint::Length(error_pane_height), // error pane (0 = hidden)
                 ])
                 .split(inner);
 
             let header_area = split[0];
             let table_area = split[1];
             let exchange_area = split[2];
+            let error_area = split[3];
 
             let header_para = Paragraph::new(header_lines).style(Style::default().fg(Color::White));
             frame.render_widget(header_para, header_area);
@@ -328,6 +334,10 @@ pub fn render(app: &App, frame: &mut Frame) {
 
             // ── Exchange pane (task 30) ────────────────────────────────────
             render_exchange_pane(app, frame, exchange_area, main_focused);
+
+            // ── Error pane (collapsible) ───────────────────────────────────
+            // A 0-height `error_area` (pane closed) makes this a no-op.
+            render_error_pane(app, frame, error_area);
         }
     }
 
@@ -379,8 +389,16 @@ pub fn render(app: &App, frame: &mut Frame) {
 /// only the log for `app.selected_task_id()` — focus filtering happens here at
 /// render time, not in the event-handling layer.
 fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool) {
+    // When the error pane is collapsed but errors are pending, surface a badge
+    // in the Exchange title so the user knows there's something to expand.
+    let title = if !app.error_pane_open && !app.error_messages.is_empty() {
+        let n = app.error_messages.len();
+        format!(" Exchange ({n} errors) ")
+    } else {
+        " Exchange ".to_string()
+    };
     let block = Block::default()
-        .title(" Exchange ")
+        .title(title)
         .borders(Borders::TOP)
         .border_style(if focused {
             Style::default().fg(Color::Blue)
@@ -439,6 +457,73 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
             frame.render_widget(para, inner);
         }
     }
+}
+
+// ── Error pane (collapsible) ──────────────────────────────────────────────────
+
+/// Render the collapsible error pane below the exchange pane.
+///
+/// Mirrors [`render_exchange_pane`]: a top-bordered block titled `Errors` with
+/// one line per recent [`crate::app::ErrorMessage`], coloured by its
+/// [`crate::app::ErrorLevel`].  The pane is shown only when
+/// `app.error_pane_open` is set; the caller passes a 0-height `area` when the
+/// pane is collapsed, which makes this a no-op (nothing is drawn into an empty
+/// rectangle).
+fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
+    // A 0-height area (pane collapsed) is a no-op: skip all rendering.
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    use crate::app::ErrorLevel;
+
+    let block = Block::default()
+        .title(" Errors ")
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::Red));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.error_messages.is_empty() {
+        let para = Paragraph::new(Line::from(vec![Span::styled(
+            "  No errors.",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        frame.render_widget(para, inner);
+        return;
+    }
+
+    // Show the most recent messages, newest last, each coloured by level.
+    let lines: Vec<Line> = app
+        .error_messages
+        .iter()
+        .map(|msg| {
+            let color = match msg.level {
+                ErrorLevel::Error => Color::Red,
+                ErrorLevel::Warn => Color::Yellow,
+                ErrorLevel::Info => Color::DarkGray,
+            };
+            Line::from(vec![Span::styled(
+                format!("  {}", msg.text),
+                Style::default().fg(color),
+            )])
+        })
+        .collect();
+
+    // Auto-scroll so the latest messages stay visible.
+    let pane_height = inner.height as usize;
+    let total_lines = lines.len();
+    let scroll_offset = if total_lines > pane_height {
+        (total_lines - pane_height) as u16
+    } else {
+        0
+    };
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0));
+    frame.render_widget(para, inner);
 }
 
 /// Convert a single [`ExchangeEntry`] into display [`Line`]s.
@@ -1808,6 +1893,75 @@ mod tests {
         assert!(
             screen.contains("No exchange yet") || screen.contains("exchange"),
             "exchange pane must show 'No exchange yet' placeholder when log is empty"
+        );
+    }
+
+    // ── Error pane (collapsible) ──────────────────────────────────────────────
+
+    /// **Open pane (done-when):** with `error_pane_open = true` and messages
+    /// present the pane shows the message text AND colours each line by level.
+    #[test]
+    fn render_error_pane_shows_messages_when_open() {
+        use crate::app::{ErrorLevel, ErrorMessage};
+
+        let mut terminal = make_terminal(120, 40);
+        let mut app = exchange_app();
+        app.error_pane_open = true;
+        app.error_messages.push(ErrorMessage {
+            timestamp: std::time::SystemTime::now(),
+            level: ErrorLevel::Error,
+            text: "agent crashed unexpectedly".into(),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        let buf = terminal.backend().buffer().clone();
+
+        // The message text must be visible.
+        assert!(
+            screen.contains("agent crashed unexpectedly"),
+            "open error pane must show the message text"
+        );
+
+        // At least one cell must use the Error level colour (Red).
+        let has_red = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Red);
+        assert!(
+            has_red,
+            "Error-level message must be rendered with Red foreground"
+        );
+    }
+
+    /// **Collapsed badge (done-when):** with `error_pane_open = false` and
+    /// messages present, the Exchange title carries a `(N errors)` badge and the
+    /// message text itself is NOT shown.
+    #[test]
+    fn render_error_badge_when_collapsed_with_errors() {
+        use crate::app::{ErrorLevel, ErrorMessage};
+
+        let mut terminal = make_terminal(120, 40);
+        let mut app = exchange_app();
+        app.error_pane_open = false;
+        app.error_messages.push(ErrorMessage {
+            timestamp: std::time::SystemTime::now(),
+            level: ErrorLevel::Warn,
+            text: "this text must stay hidden".into(),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The count badge must appear in the Exchange title.
+        assert!(
+            screen.contains("(1 errors)"),
+            "collapsed error pane must surface a count badge in the Exchange title"
+        );
+        // The message text itself must NOT be rendered when collapsed.
+        assert!(
+            !screen.contains("this text must stay hidden"),
+            "collapsed error pane must NOT render message text"
         );
     }
 }
