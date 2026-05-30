@@ -681,3 +681,93 @@ async fn merges_into_develop_are_serialized_and_clean() {
 
     root.kill();
 }
+
+// ── Test 6: per-driver start/end intervals are observable & overlap ───────────────
+
+/// **Done-when** (`sched-parallelism-instrument`) — each driver's start/end
+/// interval is observable via the already-existing `Task.started_at` /
+/// `Task.finished_at` timestamps (stamped by `mark_started_locked` /
+/// `mark_finished_locked`), read back through the `TaskGraphSnapshot` ask.
+///
+/// With `concurrency = 2`, a 2-party barrier forces both drivers' prompts to be
+/// simultaneously active, so the two tasks' `[started_at, finished_at]` intervals
+/// MUST overlap.  We assert that overlap with strict inequalities (no weakening to
+/// "non-None"):
+///
+/// ```text
+/// a.started_at < b.finished_at && b.started_at < a.finished_at
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn driver_intervals_observable() {
+    const N: usize = 2;
+
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // 2-party barrier: both drivers' prompts must be simultaneously active to make
+    // progress, guaranteeing their start/end intervals overlap deterministically.
+    let backend = CountingBackend::new(Some(N), r#"{"verdict":"approve"}"#);
+    let probe = backend.clone();
+
+    let (root, supervisor_ref) = build_actor_tree(
+        repo_root.clone(),
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config_with_concurrency(N),
+    )
+    .await;
+
+    // Two independent ready tasks (no deps) so both can run at once.
+    let graph = TaskGraph {
+        slug: "intervals-test".into(),
+        tasks: vec![task("task-a", &[]), task("task-b", &[])],
+    };
+    supervisor_ref
+        .ask(SetTaskGraph(graph))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = run_with_timeout(&supervisor_ref).await;
+
+    // Both tasks reached Done.
+    assert_eq!(report.outcomes.len(), 2, "both tasks must be reported");
+    for (_, state) in &report.outcomes {
+        assert_eq!(*state, TaskState::Done, "every task must reach Done");
+    }
+
+    // Cross-check: the 2-party barrier could only release if both drivers were
+    // simultaneously active, so the peak observed concurrency is exactly N.
+    assert_eq!(
+        probe.max_observed(),
+        N,
+        "max observed concurrency must be exactly N (= {N}); got {}",
+        probe.max_observed()
+    );
+
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask")
+        .expect("graph Some");
+
+    let a = snapshot
+        .get(&TaskId::new("task-a"))
+        .expect("task-a in graph");
+    let b = snapshot
+        .get(&TaskId::new("task-b"))
+        .expect("task-b in graph");
+
+    let a_started = a.started_at.expect("task-a started_at stamped");
+    let a_finished = a.finished_at.expect("task-a finished_at stamped");
+    let b_started = b.started_at.expect("task-b started_at stamped");
+    let b_finished = b.finished_at.expect("task-b finished_at stamped");
+
+    // The intervals [a_started, a_finished] and [b_started, b_finished] OVERLAP.
+    assert!(
+        a_started < b_finished && b_started < a_finished,
+        "driver intervals must overlap: a=[{a_started}, {a_finished}], b=[{b_started}, {b_finished}]"
+    );
+
+    root.kill();
+}
