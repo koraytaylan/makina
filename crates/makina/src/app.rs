@@ -330,6 +330,19 @@ pub struct App {
     /// the currently focused task when rendering the exchange pane.
     pub exchange_logs: HashMap<TaskId, ExchangeLog>,
 
+    /// Manual scroll offset for the exchange pane, in lines from the top.
+    ///
+    /// `App` does not know the rendered line count or pane height, so the
+    /// clamp upper bound (`scroll_max`) is passed in by the render/event layer
+    /// (see [`App::scroll_down`] / [`App::effective_offset`]).
+    pub exchange_scroll: u16,
+
+    /// Whether the exchange pane auto-follows the bottom of the log.
+    ///
+    /// Defaults to `true` (newest exchange always visible).  Scrolling up
+    /// disengages auto-follow; scrolling back down to the bottom re-engages it.
+    pub exchange_auto_follow: bool,
+
     /// Last api event received — stored for test assertions and status-bar
     /// display.  Will be used by tasks 27–31 for richer updates.
     pub last_event: Option<Event>,
@@ -372,6 +385,8 @@ impl App {
             selected_run,
             selected_task,
             exchange_logs: HashMap::new(),
+            exchange_scroll: 0,
+            exchange_auto_follow: true,
             last_event: None,
             status_message: None,
             error_pane_open: false,
@@ -417,6 +432,42 @@ impl App {
         self.selected_run()
             .and_then(|run| self.selected_task.and_then(|i| run.tasks.get(i)))
             .map(|tv| &tv.id)
+    }
+
+    /// Scroll the exchange pane up by one line.
+    ///
+    /// Disengages auto-follow (the user is reviewing history) and decrements the
+    /// manual offset, clamped at `0`.  `App` does not know the rendered line
+    /// count, so no upper bound is needed here.
+    pub fn scroll_up(&mut self) {
+        self.exchange_auto_follow = false;
+        self.exchange_scroll = self.exchange_scroll.saturating_sub(1);
+    }
+
+    /// Scroll the exchange pane down by one line, clamped at `scroll_max`.
+    ///
+    /// `scroll_max` is computed by the caller exactly like
+    /// [`render_exchange_pane`](crate::ui) — `total_lines.saturating_sub(pane_height)`.
+    /// Reaching the bottom re-engages auto-follow so new exchanges keep the pane
+    /// pinned to the latest line.
+    pub fn scroll_down(&mut self, scroll_max: u16) {
+        self.exchange_scroll = (self.exchange_scroll + 1).min(scroll_max);
+        if self.exchange_scroll == scroll_max {
+            self.exchange_auto_follow = true;
+        }
+    }
+
+    /// The effective scroll offset to render with, given the current
+    /// `scroll_max` (computed by the caller as in `render_exchange_pane`).
+    ///
+    /// When auto-following, returns `scroll_max` (pinned to the bottom);
+    /// otherwise returns the manual offset, clamped to `scroll_max`.
+    pub fn effective_offset(&self, scroll_max: u16) -> u16 {
+        if self.exchange_auto_follow {
+            scroll_max
+        } else {
+            self.exchange_scroll.min(scroll_max)
+        }
     }
 
     /// Apply one [`AppEvent`] to the App state.
@@ -1875,6 +1926,47 @@ mod tests {
         // Up again: clamps at 0.
         app.update(AppEvent::SelectUp);
         assert_eq!(app.selected_task, Some(0), "must clamp at first task");
+    }
+
+    /// Exchange-pane scroll: manual offset clamps to `[0, scroll_max]`,
+    /// scrolling up disengages auto-follow, and scrolling back down to the
+    /// bottom re-engages it.
+    #[test]
+    fn exchange_scroll_clamps_and_auto_follow_reengages() {
+        let mut app = make_app();
+        let max: u16 = 3;
+
+        // Default: auto-follow engaged, offset at the top.
+        assert!(app.exchange_auto_follow);
+        assert_eq!(app.exchange_scroll, 0);
+
+        // (2) scroll_up clears auto-follow.
+        app.scroll_up();
+        assert!(
+            !app.exchange_auto_follow,
+            "scroll_up must clear exchange_auto_follow"
+        );
+
+        // (1) scroll_up never goes below 0.
+        app.scroll_up();
+        app.scroll_up();
+        assert_eq!(app.exchange_scroll, 0, "scroll_up must not go below 0");
+
+        // (1) scroll_down never exceeds max.
+        for _ in 0..(max + 5) {
+            app.scroll_down(max);
+            assert!(
+                app.exchange_scroll <= max,
+                "scroll_down must never exceed scroll_max"
+            );
+        }
+        assert_eq!(app.exchange_scroll, max);
+
+        // (3) scroll_down reaching max re-sets auto-follow.
+        assert!(
+            app.exchange_auto_follow,
+            "scroll_down reaching scroll_max must re-set exchange_auto_follow"
+        );
     }
 
     /// Task selection: run navigation (Sidebar focus) must NOT change
