@@ -185,6 +185,10 @@ pub enum AppEvent {
     SelectUp,
     /// Move the sidebar selection one row down (`↓` / `j`).
     SelectDown,
+    /// Scroll the focused exchange pane one line up (mouse wheel up).
+    ScrollUp,
+    /// Scroll the focused exchange pane one line down (mouse wheel down).
+    ScrollDown,
     /// An event arrived from `api.subscribe()`.
     ApiEvent(Event),
     /// Periodic tick — triggers a redraw without other state changes.
@@ -546,6 +550,21 @@ impl App {
                         }
                     }
                 }
+                true
+            }
+            // ── Exchange-pane scroll (task `tui-mouse-scroll`) ────────────────
+            // Mirror BrowserUp/BrowserDown: a wheel event nudges the manual
+            // scroll offset via the `tui-scroll-state` helpers.  `update` has no
+            // pane geometry, so it uses `u16::MAX` as `scroll_max`; the render
+            // pass re-clamps the offset to the real `total_lines - pane_height`
+            // via `effective_offset`.
+            AppEvent::ScrollUp => {
+                self.scroll_up();
+                true
+            }
+            AppEvent::ScrollDown => {
+                let scroll_max = u16::MAX;
+                self.scroll_down(scroll_max);
                 true
             }
             AppEvent::ApiEvent(ev) => {
@@ -1966,6 +1985,46 @@ mod tests {
         assert!(
             app.exchange_auto_follow,
             "scroll_down reaching scroll_max must re-set exchange_auto_follow"
+        );
+    }
+
+    /// Mouse-wheel scroll events (`ScrollUp`/`ScrollDown`) change the exchange
+    /// scroll offset WITHOUT touching task selection (task `tui-mouse-scroll`).
+    /// Scrolling is orthogonal to task switching, which stays on keys/sidebar.
+    #[test]
+    fn scroll_event_changes_offset_not_selection() {
+        let mut app = make_app_with_tasks();
+
+        // Record the task selection before scrolling.
+        let selected_before = app.selected_task;
+        assert_eq!(selected_before, Some(0));
+
+        // ScrollDown nudges the manual offset down by one line.
+        let offset_before = app.exchange_scroll;
+        app.update(AppEvent::ScrollDown);
+        assert_ne!(
+            app.exchange_scroll, offset_before,
+            "ScrollDown must change the exchange scroll offset"
+        );
+        assert_eq!(
+            app.selected_task, selected_before,
+            "ScrollDown must NOT change task selection"
+        );
+
+        // ScrollUp moves the offset back up and disengages auto-follow.
+        let offset_after_down = app.exchange_scroll;
+        app.update(AppEvent::ScrollUp);
+        assert_ne!(
+            app.exchange_scroll, offset_after_down,
+            "ScrollUp must change the exchange scroll offset"
+        );
+        assert!(
+            !app.exchange_auto_follow,
+            "ScrollUp must disengage auto-follow"
+        );
+        assert_eq!(
+            app.selected_task, selected_before,
+            "ScrollUp must NOT change task selection"
         );
     }
 

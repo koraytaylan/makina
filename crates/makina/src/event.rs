@@ -33,7 +33,9 @@
 
 use std::time::Duration;
 
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyCode, KeyModifiers};
+use crossterm::event::{
+    Event as CrosstermEvent, EventStream, KeyCode, KeyModifiers, MouseEventKind,
+};
 use futures::StreamExt;
 use makina_core::log_record::LogRecord;
 use tokio::sync::mpsc;
@@ -358,7 +360,15 @@ fn translate_terminal_event(ev: CrosstermEvent, browsing: bool) -> AppEvent {
     match ev {
         CrosstermEvent::Key(key) => translate_key(key, browsing),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
-        // Mouse, paste, focus, etc. — ignored for now (task 31 may handle some).
+        // Mouse wheel scrolls the focused exchange pane regardless of the
+        // `browsing` flag (the exchange pane is not the browser).  Other mouse
+        // kinds (clicks, drags, moves) are ignored → harmless Tick redraw.
+        CrosstermEvent::Mouse(m) => match m.kind {
+            MouseEventKind::ScrollUp => AppEvent::ScrollUp,
+            MouseEventKind::ScrollDown => AppEvent::ScrollDown,
+            _ => AppEvent::Tick,
+        },
+        // Paste, focus, etc. — ignored for now.
         _ => AppEvent::Tick,
     }
 }
@@ -417,7 +427,9 @@ fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+    };
 
     fn key_press(code: KeyCode, modifiers: KeyModifiers) -> CrosstermEvent {
         CrosstermEvent::Key(KeyEvent {
@@ -426,6 +438,31 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         })
+    }
+
+    /// Build a crossterm mouse-wheel event of the given `kind`
+    /// (task `tui-mouse-scroll`).
+    fn wheel(kind: MouseEventKind) -> CrosstermEvent {
+        CrosstermEvent::Mouse(MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn wheel_translates_to_scroll() {
+        // Wheel events route to the exchange-pane scroll helpers regardless of
+        // the `browsing` flag (the exchange pane is not the browser).
+        assert!(matches!(
+            translate_terminal_event(wheel(MouseEventKind::ScrollUp), false),
+            AppEvent::ScrollUp
+        ));
+        assert!(matches!(
+            translate_terminal_event(wheel(MouseEventKind::ScrollDown), false),
+            AppEvent::ScrollDown
+        ));
     }
 
     #[test]

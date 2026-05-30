@@ -442,14 +442,14 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 lines.extend(exchange_entry_lines(entry));
             }
 
-            // Auto-scroll: compute scroll offset so the last lines are visible.
+            // Scroll: `scroll_max` pins the bottom-most visible offset (as the
+            // old auto-scroll did); `effective_offset` honours the user's manual
+            // wheel offset (task `tui-mouse-scroll`) or stays pinned to the
+            // bottom while auto-following.
             let pane_height = inner.height as usize;
             let total_lines = lines.len();
-            let scroll_offset = if total_lines > pane_height {
-                (total_lines - pane_height) as u16
-            } else {
-                0
-            };
+            let scroll_max = total_lines.saturating_sub(pane_height) as u16;
+            let scroll_offset = app.effective_offset(scroll_max);
 
             let para = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })

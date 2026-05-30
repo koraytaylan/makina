@@ -25,7 +25,9 @@ use std::panic;
 
 use ratatui::Terminal;
 use ratatui::crossterm::{
-    cursor, execute,
+    cursor,
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::CrosstermBackend;
@@ -54,7 +56,12 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            cursor::Hide
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -74,6 +81,7 @@ impl Tui {
         let _ = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
+            DisableMouseCapture,
             cursor::Show
         );
     }
@@ -121,4 +129,37 @@ fn install_panic_hook() {
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test for the init → restore round-trip (task `tui-mouse-scroll`).
+    ///
+    /// In a TTY, `Tui::init` enables raw mode, the alternate screen, **mouse
+    /// capture** (`EnableMouseCapture`), and hides the cursor; `Tui::restore`
+    /// disables raw mode, leaves the alternate screen, **disables mouse capture**
+    /// (`DisableMouseCapture`), and shows the cursor.  Under `cargo test` there is
+    /// usually no real TTY, so `enable_raw_mode()` may return an error and `init`
+    /// returns `Err`; that is fine — the point is that the round-trip neither
+    /// panics nor leaves the terminal in a bad state.  When a TTY *is* present we
+    /// drive a full init+restore and assert it round-trips cleanly.
+    #[test]
+    fn init_then_restore_round_trips() {
+        match Tui::init() {
+            Ok(mut tui) => {
+                // A real TTY was available: restore must not panic and must be
+                // safe to call (it disables mouse capture among other things).
+                tui.restore();
+            }
+            Err(_) => {
+                // No TTY under the test harness — raw mode could not be enabled.
+                // The static restore path must still be callable without panic.
+                restore_terminal();
+            }
+        }
+    }
 }
