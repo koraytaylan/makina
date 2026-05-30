@@ -148,6 +148,33 @@ pub fn run_slug(task_list_path: &Path) -> String {
     }
 }
 
+/// Derive a plan slug from a task-list path: the lowercased-kebab of the task
+/// list's **parent directory name only** (no file stem).
+///
+/// e.g. `…/0003-Runtime-and-TUI-Hardening/TASKS.md` →
+/// `0003-runtime-and-tui-hardening`. Unlike [`run_slug`] (which scopes on
+/// `parent-stem` to disambiguate per task-list file), this names the *plan*
+/// itself so per-task worktree directories and branches can be plan-scoped.
+///
+/// Reuses [`run_slug`]'s kebab sanitizer. Falls back to [`SLUG_FALLBACK`] when
+/// there is no usable parent directory (or its sanitized form is shorter than
+/// the §4.1 minimum of two characters).
+pub fn plan_slug(task_list_path: &Path) -> String {
+    let parent = task_list_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str());
+
+    if let Some(parent) = parent {
+        let slug = sanitize_kebab(parent);
+        if slug.len() >= 2 {
+            return slug;
+        }
+    }
+
+    SLUG_FALLBACK.to_string()
+}
+
 /// Sanitize `input` into a valid kebab id per `runtime-artifact-schema.md`
 /// §4.1: lowercase; map every maximal run of non-`[a-z0-9]` chars to a single
 /// `-`; trim leading/trailing `-`. The caller enforces the §4.1 length minimum.
@@ -220,6 +247,10 @@ struct RunEntry {
     /// Cached here so run finalization can stamp it into `run.json` without
     /// re-deriving it from the path.
     run_slug: String,
+    /// The plan slug (lowercased-kebab of the task-list's parent directory name)
+    /// derived at open. Threaded into the scheduler so per-task worktree calls
+    /// can plan-scope their directory + branch names.
+    plan_slug: String,
     /// When this Run transitioned to [`RunStatus::Running`] (set in
     /// [`CoreApi::start_run`]).  `None` until the run is started; carried into the
     /// finalization-time [`RunMetadata`].
@@ -589,6 +620,7 @@ impl CoreApi {
                     task_list_path: task_list_path.clone(),
                     run_uid,
                     run_slug: slug.clone(),
+                    plan_slug: plan_slug(&task_list_path),
                     started_at: None,
                     graph: Arc::new(AsyncMutex::new(graph)),
                     status: RunStatus::Pending,
@@ -672,7 +704,7 @@ impl CoreApi {
     fn start_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
         // Take everything we need out of the registry under ONE lock, then drop
         // the guard before spawning (no lock across the spawn / await boundary).
-        let (graph, cancel, pause, run_slug, run_uid) = {
+        let (graph, cancel, pause, run_slug, run_uid, plan_slug) = {
             let mut runs = self
                 .state
                 .runs
@@ -706,8 +738,19 @@ impl CoreApi {
             // audit ledger can key entries on it.
             let run_uid = entry.run_uid.clone();
 
+            // The plan slug, threaded into the scheduler so per-task worktree
+            // calls can plan-scope their directory + branch names.
+            let plan_slug = entry.plan_slug.clone();
+
             // Return the pieces the background task needs.
-            (Arc::clone(&entry.graph), cancel, pause, slug, run_uid)
+            (
+                Arc::clone(&entry.graph),
+                cancel,
+                pause,
+                slug,
+                run_uid,
+                plan_slug,
+            )
         }; // registry guard dropped here.
 
         // Build the per-run control (sink → broadcast, pause flag, cancel token).
@@ -754,6 +797,7 @@ impl CoreApi {
                 audit_registry,
                 run_slug,
                 run_uid,
+                plan_slug,
             )
             .await;
             state.finalize_run_status(run).await;
@@ -1388,6 +1432,21 @@ Do the thing in `lib.rs`.
                 "slug {s:?} must satisfy the §4.1 kebab predicate"
             );
         }
+    }
+
+    #[test]
+    fn plan_slug_is_kebab_parent_dir() {
+        // The plan slug is the lowercased-kebab of the parent directory name
+        // ONLY — the file stem (`tasks`) is dropped.
+        assert_eq!(
+            plan_slug(Path::new(
+                "/repo/docs/plans/0003-Runtime-and-TUI-Hardening/TASKS.md"
+            )),
+            "0003-runtime-and-tui-hardening",
+        );
+
+        // No usable parent directory → SLUG_FALLBACK.
+        assert_eq!(plan_slug(Path::new("TASKS.md")), SLUG_FALLBACK);
     }
 
     /// Modeled on `open_run_seeds_artifact_before_start_run` and

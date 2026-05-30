@@ -268,6 +268,7 @@ async fn run_graph_emits_tracing_transition_and_gate_events() {
         Arc::new(NoopAuditRegistry),
         slug.to_string(),
         run_uid.to_string(),
+        String::new(),
     )
     .await
     .expect("run_graph must not error");

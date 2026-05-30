@@ -464,6 +464,18 @@ struct DriverContext {
     /// passes it as the 2nd arg so the audit ledger can key entries on the
     /// stable cross-process run id.
     run_uid: String,
+
+    /// The plan slug (lowercased-kebab of the task-list's parent directory name),
+    /// threaded from the orchestrator so per-task worktree calls can plan-scope
+    /// their directory + branch names.
+    ///
+    /// The `RunReadyTasks` ask path uses an empty string.
+    ///
+    /// Threaded through here ahead of its consumer: the follow-up
+    /// `worktree-plan-scoped-naming` task reads it when building per-task worktree
+    /// directory + branch names. Until then it is set but not yet read.
+    #[allow(dead_code)]
+    plan_slug: String,
 }
 
 impl DriverContext {
@@ -666,6 +678,7 @@ impl Supervisor {
             Arc::new(NoopAuditRegistry),
             String::new(),
             String::new(),
+            String::new(),
         ) {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -689,9 +702,9 @@ impl Supervisor {
     /// were not injected via [`SetSpokes`], or if the worktree manager is absent.
     /// `control` carries the per-run event sink + pause/cancel signals (task 31);
     /// pass [`RunControl::silent`] for the uncontrolled ask path.
-    /// `audit_registry`, `run_slug`, and `run_uid` are for the audit ledger; pass
-    /// `Arc::new(NoopAuditRegistry)` / `String::new()` / `String::new()` for the
-    /// ask path.
+    /// `audit_registry`, `run_slug`, and `run_uid` are for the audit ledger;
+    /// `plan_slug` plan-scopes per-task worktree calls. Pass
+    /// `Arc::new(NoopAuditRegistry)` / `String::new()` ×3 for the ask path.
     fn driver_context(
         &self,
         graph: Arc<Mutex<TaskGraph>>,
@@ -699,6 +712,7 @@ impl Supervisor {
         audit_registry: Arc<dyn AuditRegistry>,
         run_slug: String,
         run_uid: String,
+        plan_slug: String,
     ) -> Result<DriverContext, String> {
         let worktree_manager = self
             .worktree_manager
@@ -731,6 +745,7 @@ impl Supervisor {
             audit_registry,
             run_slug,
             run_uid,
+            plan_slug,
         })
     }
 
@@ -785,6 +800,7 @@ pub async fn run_graph(
     audit_registry: Arc<dyn AuditRegistry>,
     run_slug: String,
     run_uid: String,
+    plan_slug: String,
 ) -> Result<RunReport, String> {
     // Open the run-scoped tracing span so every event emitted while driving this
     // graph carries the `run_uid` key. The `makina` binary's per-run file layer
@@ -804,6 +820,7 @@ pub async fn run_graph(
         audit_registry,
         run_slug,
         run_uid,
+        plan_slug,
     )
     .instrument(run_span)
     .await
@@ -819,6 +836,7 @@ async fn run_graph_inner(
     audit_registry: Arc<dyn AuditRegistry>,
     run_slug: String,
     run_uid: String,
+    plan_slug: String,
 ) -> Result<RunReport, String> {
     // Announce the run is now executing.
     control.emit(api::Event::RunStatusChanged {
@@ -868,6 +886,7 @@ async fn run_graph_inner(
         audit_registry,
         run_slug,
         run_uid,
+        plan_slug,
     };
 
     let result = scheduler(ctx, config.concurrency).await;

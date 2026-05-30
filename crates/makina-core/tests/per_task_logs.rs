@@ -308,6 +308,7 @@ async fn per_task_logs() {
         Arc::new(NoopAuditRegistry),
         slug.to_string(),
         run_uid.to_string(),
+        String::new(),
     )
     .await
     .expect("run_graph must not error");
