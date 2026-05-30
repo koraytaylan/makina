@@ -532,6 +532,7 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
 /// indented and shown in a lighter colour.  An in-progress streaming response
 /// (not yet complete) gets a trailing `▌` cursor indicator.
 fn exchange_entry_lines(entry: &ExchangeEntry) -> Vec<Line<'static>> {
+    use crate::ansi::{AnsiSpan, diff_line_style, parse_ansi};
     use makina_core::api::AgentRole;
 
     let mut lines = Vec::new();
@@ -579,10 +580,24 @@ fn exchange_entry_lines(entry: &ExchangeEntry) -> Vec<Line<'static>> {
             format!("{}▌", entry.text)
         };
         for text_line in text_to_show.lines() {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  {text_line}"),
-                Style::default().fg(Color::White),
-            )]));
+            // Parse embedded ANSI SGR runs into styled spans (no literal escape
+            // byte survives), then overlay a diff base colour where the line is a
+            // diff add/remove/hunk line — ANSI SGR wins where present.
+            let diff_style = diff_line_style(text_line);
+            let ansi_spans = parse_ansi(text_line);
+
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            // Two-space indent, default-styled, owning its text.
+            spans.push(Span::raw("  "));
+            for AnsiSpan { text, style } in ansi_spans {
+                let style = match (diff_style, style.fg) {
+                    // ANSI SGR set a foreground → it wins over the diff base.
+                    (Some(base), None) => base,
+                    _ => style,
+                };
+                spans.push(Span::styled(text, style));
+            }
+            lines.push(Line::from(spans));
         }
         if entry.text.is_empty() && !entry.complete {
             lines.push(Line::from(vec![Span::styled(
@@ -1862,6 +1877,97 @@ mod tests {
         assert!(
             has_cyan,
             "focused task row must use Cyan highlight background"
+        );
+    }
+
+    /// **ANSI + diff styling (done-when):** a response whose text carries an
+    /// embedded SGR escape and a `@@` hunk header must render with no literal
+    /// escape byte and no raw `[..m` SGR text, with the `+added` line green and
+    /// the `@@` line cyan.
+    #[test]
+    fn exchange_render_styles_ansi_and_diff_no_literal_escape() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        let mut terminal = make_terminal(120, 40);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/ansi-diff.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("task-a"),
+                title: "Task A".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            }],
+        };
+        let mut app = App::new(api, vec![run]);
+        assert_eq!(app.selected_task, Some(0));
+
+        // Response text: an ANSI-green `+added` diff line and a `@@` hunk header.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-a"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::ResponseChunk {
+                text: "\x1b[32m+added\x1b[0m\n@@ -1,2 +1,2 @@\n context".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("task-a"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // (a) No literal escape char survives, and the flattened buffer carries
+        // no raw `[32m` SGR text.  Scan the full multi-char cell symbols, not
+        // just each cell's first char.
+        let flattened: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            !buf.content()
+                .iter()
+                .any(|c| c.symbol().chars().any(|ch| ch == '\u{1b}')),
+            "no cell symbol may contain the literal ESC char"
+        );
+        assert!(
+            !flattened.contains("[32m"),
+            "raw SGR `[32m` text must not render literally"
+        );
+
+        // (b) The `+added` line must have at least one Green cell and the `@@`
+        // line must have at least one Cyan cell.
+        let row_text = |row: u16| -> String {
+            (0..buf.area.width)
+                .map(|col| buf[(col, row)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        let added_fg_green = (0..buf.area.height).any(|row| {
+            row_text(row).contains("+added")
+                && (0..buf.area.width).any(|col| buf[(col, row)].fg == ratatui::style::Color::Green)
+        });
+        let hunk_fg_cyan = (0..buf.area.height).any(|row| {
+            row_text(row).contains("@@ -1,2 +1,2 @@")
+                && (0..buf.area.width).any(|col| buf[(col, row)].fg == ratatui::style::Color::Cyan)
+        });
+        assert!(
+            added_fg_green,
+            "the `+added` line must have at least one Green-foreground cell"
+        );
+        assert!(
+            hunk_fg_cyan,
+            "the `@@` hunk header line must have at least one Cyan-foreground cell"
         );
     }
 
