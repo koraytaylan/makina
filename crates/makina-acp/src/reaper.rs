@@ -109,14 +109,49 @@ pub fn kill_all_agents() {
 
 // ── Test seam ──────────────────────────────────────────────────────────────────
 
-/// Install a recording kill stub for the duration of a unit test, returning the
-/// previously-installed seam (so a test can restore it). Test-only.
-#[cfg(test)]
-fn set_kill_fn_for_test(f: KillFn) -> Option<KillFn> {
+/// Install a recording kill stub for the duration of a test, returning the
+/// previously-installed seam (so a test can restore it).
+///
+/// Exposed (behind the `test-util` feature) so downstream crates — notably the
+/// `makina` TUI binary — can drive the exit-cleanup path in their own tests and
+/// assert which pgids the reaper targeted, without signalling any real process.
+/// Not compiled into production builds.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn set_kill_fn_for_test(f: KillFn) -> Option<KillFn> {
     kill_fn_slot()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace(f)
+}
+
+/// Register `pgid` as a live agent process group (test seam).
+///
+/// The production `register` is `pub(crate)`; this `test-util`-gated wrapper lets
+/// downstream-crate tests seed the registry with a *fake* pgid so they can drive
+/// the exit-cleanup path and assert the registry is drained. Not compiled into
+/// production builds.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn register_for_test(pgid: i32) {
+    register(pgid);
+}
+
+/// Snapshot the set of currently-registered pgids (test seam).
+///
+/// Lets a test assert the registry was drained by [`kill_all_agents`]. Not
+/// compiled into production builds.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn registered_pgids_for_test() -> Vec<i32> {
+    let mut v: Vec<i32> = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 #[cfg(test)]

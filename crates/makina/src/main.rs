@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use makina::{app, event, log, tui};
+use makina::{app, event, exit, log, tui};
 use makina_acp::AcpBackend;
 use makina_core::audit::JsonlAuditSink;
 use makina_core::backend::AgentBackend;
@@ -133,16 +133,33 @@ async fn main() {
         }
     };
 
+    // ── No-orphan: out-of-band signal reaper (task tui-exit-reaps-agents) ──────
+    // The in-TUI Ctrl-C is already a clean quit (it reaches the teardown below),
+    // so this background task only covers SIGINT/SIGTERM arriving from OUTSIDE
+    // the TUI — e.g. `kill <makina-pid>`. On receipt it reaps every live agent
+    // process group, restores the terminal, and exits, so an external signal can
+    // never orphan a `grok`/agent subprocess. No-op on non-unix.
+    exit::install_signal_reaper(tui::restore_terminal);
+
     // ── Event loop ────────────────────────────────────────────────────────────
     // `log_rx` (the tracing→TUI channel receiver) is threaded in so plan-0015's
     // `tui-error-pane-channel-wire` can drain it in the loop's `tokio::select!`.
     if let Err(e) = event::run(&mut tui, &mut app, log_rx).await {
+        // No-orphan teardown (error arm): cancel any still-open runs, then reap
+        // any agent process group still live, BEFORE restoring the terminal and
+        // exiting — so an event-loop failure leaves nothing behind.
+        exit::reap_open_runs(api.as_ref()).await;
         // Restore the terminal before printing the error, so the message is
         // visible even if raw mode was active.
         tui.restore();
         eprintln!("TUI error: {e}");
         std::process::exit(1);
     }
+
+    // No-orphan teardown (clean arm): cancel any still-open runs, then reap any
+    // agent process group still live, BEFORE the final terminal restore — so the
+    // normal `q`/`Esc`/`Ctrl-C` quit never orphans an agent.
+    exit::reap_open_runs(api.as_ref()).await;
 
     // tui.restore() is called by the Drop impl, but calling it explicitly here
     // ensures we exit the alternate screen before any post-main cleanup runs.

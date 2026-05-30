@@ -29,3 +29,7 @@ tracing-appender = { workspace = true }
 [dev-dependencies]
 # Temporary files/dirs for the file-browser IO + TUI↔CoreApi flow tests.
 tempfile = "3"
+# Enable the reaper's process-registry test seam so the exit-cleanup tests
+# (`exit.rs`, `tests/`) can register a fake agent pgid, install a recording kill
+# stub, and assert the registry is drained — without signalling real processes.
+makina-acp = { workspace = true, features = ["test-util"] }

@@ -120,13 +120,45 @@ impl Drop for Tui {
 fn install_panic_hook() {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        // Reap any live agent process groups FIRST: a panic mid-run must not
+        // leave orphaned `grok`/agent subprocesses behind. `kill_all_agents` is
+        // sync and takes no locks across an `.await`, so it is safe to call from
+        // the panic hook.
+        makina_acp::kill_all_agents();
         restore_terminal();
         default_hook(info);
     }));
 }
 
-/// Restore the terminal outside of a [`Tui`] instance (used by the panic hook).
-fn restore_terminal() {
+/// Test seam: install the production panic hook so a test can assert it reaps
+/// agents before restoring the terminal.
+///
+/// Installs the *same* reaping hook the production [`install_panic_hook`] does
+/// (it calls [`makina_acp::kill_all_agents`] first), and **returns the previously
+/// installed hook** so the test can restore it afterwards (the panic hook is
+/// process-global and must not leak into sibling tests in this binary). Exposed
+/// only under `cfg(test)` for the `exit::panic_hook_invokes_reaper` test;
+/// production code installs the hook via [`Tui::init`].
+#[cfg(test)]
+pub(crate) fn install_panic_hook_for_test()
+-> Box<dyn Fn(&panic::PanicHookInfo<'_>) + Send + Sync + 'static> {
+    // Snapshot the harness's current hook so the caller can restore it.
+    let original = panic::take_hook();
+    // Install a no-op as the *default* the production hook will wrap, so the
+    // simulated panic doesn't spew the standard panic message to the test's
+    // stderr. The production installer then layers the reaping hook on top.
+    panic::set_hook(Box::new(|_| {}));
+    install_panic_hook();
+    original
+}
+
+/// Restore the terminal outside of a [`Tui`] instance.
+///
+/// Used by the panic hook **and** the out-of-band signal reaper
+/// ([`crate::exit::install_signal_reaper`]): both run from contexts that do not
+/// own the render loop's [`Tui`], so they need a standalone restore that leaves
+/// the alternate screen, disables raw mode, and shows the cursor.
+pub fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
 }

@@ -6,6 +6,14 @@ authors.workspace = true
 license.workspace = true
 description = "ACP (agent client protocol) backend implementation for Makina — subprocesses an ACP-compatible CLI over stdio"
 
+[features]
+# Exposes the reaper's process-registry test seam (`register_for_test`,
+# `set_kill_fn_for_test`, `registered_pgids_for_test`) as public `#[doc(hidden)]`
+# helpers so downstream crates (notably the `makina` TUI binary) can drive the
+# exit-cleanup path in their own tests without signalling real processes. Off by
+# default; production builds never compile the seam.
+test-util = []
+
 [dependencies]
 makina-core = { workspace = true }
 tokio = { workspace = true }

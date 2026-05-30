@@ -85,4 +85,7 @@ pub use permission::{
 };
 pub use protocol::{AuthMethod, StopReason};
 pub use reaper::kill_all_agents;
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub use reaper::{register_for_test, registered_pgids_for_test, set_kill_fn_for_test};
 pub use transport::{Transport, TransportSender};
