@@ -370,6 +370,8 @@ fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
             KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::Quit,
             KeyCode::Esc => AppEvent::Quit,
             KeyCode::Tab => AppEvent::FocusNext,
+            // Toggle the error pane open/closed.
+            KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
             // Open the file browser to pick a task list.
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
             // ── Run control (task 31): act on the selected Run ────────────────
@@ -435,6 +437,14 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(ev, false),
             AppEvent::FocusNext
+        ));
+    }
+
+    #[test]
+    fn e_key_translates_to_toggle_error_pane() {
+        assert!(matches!(
+            translate_terminal_event(key_press(KeyCode::Char('e'), KeyModifiers::NONE), false),
+            AppEvent::ToggleErrorPane
         ));
     }
 

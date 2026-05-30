@@ -189,6 +189,8 @@ pub enum AppEvent {
     ApiEvent(Event),
     /// Periodic tick — triggers a redraw without other state changes.
     Tick,
+    /// Toggle the error pane open/closed (`e` / `E`).
+    ToggleErrorPane,
 
     // ── Task-status view (task 29) ────────────────────────────────────────────
     /// A full [`RunView`] (with its task list) was fetched from the api and
@@ -430,6 +432,10 @@ impl App {
                     Panel::Sidebar => Panel::Main,
                     Panel::Main => Panel::Sidebar,
                 };
+                true
+            }
+            AppEvent::ToggleErrorPane => {
+                self.error_pane_open = !self.error_pane_open;
                 true
             }
             AppEvent::SelectUp => {
@@ -767,6 +773,16 @@ mod tests {
         assert_eq!(app.focused_panel, Panel::Main);
         app.update(AppEvent::FocusNext);
         assert_eq!(app.focused_panel, Panel::Sidebar);
+    }
+
+    #[test]
+    fn error_pane_toggle_flips_flag() {
+        let mut app = make_app();
+        assert!(!app.error_pane_open);
+        assert!(app.update(AppEvent::ToggleErrorPane));
+        assert!(app.error_pane_open);
+        assert!(app.update(AppEvent::ToggleErrorPane));
+        assert!(!app.error_pane_open);
     }
 
     // ── Tick does not quit ────────────────────────────────────────────────────
