@@ -361,8 +361,26 @@ pub fn render(app: &App, frame: &mut Frame) {
             format!("  {focus_label}{event_hint}")
         }
     };
+    // Legend for the `G`/`R` task columns — only worth the screen real estate
+    // when the selected run actually has non-zero iteration counts.  Appended to
+    // the status bar (the top-level layout has no spare body row) using the same
+    // ASCII `│` separator as the trailer (the non-ASCII `·` would collapse under
+    // `screen_of`, which flattens each cell to its first char).
+    let show_legend = app.selected_run().is_some_and(|r| {
+        r.tasks
+            .iter()
+            .any(|t| t.gate_iterations > 0 || t.review_iterations > 0)
+    });
+    let legend = if show_legend {
+        "  │  G = gate iterations  R = review iterations"
+    } else {
+        ""
+    };
+    // The legend precedes the trailer so its full text (notably "review
+    // iterations") stays inside the visible width; the lower-priority trailer
+    // (focus/last-event hint) is the part that gets clipped on narrow terminals.
     let status_text =
-        format!(" [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [q/^C] quit{trailer}");
+        format!(" [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [q/^C] quit{legend}{trailer}");
     let status_bar =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     frame.render_widget(status_bar, status_area);
@@ -1535,6 +1553,69 @@ mod tests {
         assert!(screen.contains('3'), "gate iteration count 3 must appear");
         // Alpha task has review_iterations=2.
         assert!(screen.contains('2'), "review iteration count 2 must appear");
+    }
+
+    /// The status bar shows the `G`/`R` legend when the selected run carries
+    /// non-zero gate/review iteration counts.
+    #[test]
+    fn render_status_bar_shows_gr_legend_when_counts_nonzero() {
+        let mut terminal = make_terminal(120, 30);
+        let app = task_status_app();
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("gate iterations"),
+            "legend should explain the G column"
+        );
+        assert!(
+            screen.contains("review iterations"),
+            "legend should explain the R column"
+        );
+    }
+
+    /// The status bar hides the `G`/`R` legend when every task has zero
+    /// gate/review iteration counts.
+    #[test]
+    fn render_status_bar_hides_gr_legend_when_counts_zero() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/status-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("alpha"),
+                    title: "Alpha task".into(),
+                    state: TaskState::New,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("beta"),
+                    title: "Beta task".into(),
+                    state: TaskState::New,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        let app = App::new(api, vec![run]);
+
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            !screen.contains("gate iterations"),
+            "legend must be hidden when all counts are zero"
+        );
     }
 
     /// Done-state badge must use Cyan foreground; Failed must use Red.
