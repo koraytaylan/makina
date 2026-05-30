@@ -483,9 +483,94 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
             let para = Paragraph::new(lines);
             frame.render_widget(para, inner);
         }
-        // `Off` is handled by the caller (this fn is not invoked); `Tree` and
-        // `Timeline` arms are added by sibling tasks.
-        DependencyViewMode::Off | DependencyViewMode::Tree | DependencyViewMode::Timeline => {}
+        DependencyViewMode::Tree => {
+            // Resolve the selected task (the tree root) within the run, then
+            // recurse over its forward `depends_on` prerequisites, drawing an
+            // indented ASCII tree capped at depth 2.
+            let selected_id = app.selected_task_id();
+            let run = app.selected_run();
+            let lines: Vec<Line> = match (selected_id, run) {
+                (Some(id), Some(run)) => {
+                    let selected = run.tasks.iter().find(|t| &t.id == id);
+                    match selected {
+                        Some(root) if !root.depends_on.is_empty() => {
+                            let mut acc: Vec<Line> = Vec::new();
+                            render_dependency_tree_children(run, &root.depends_on, "", 0, &mut acc);
+                            acc
+                        }
+                        _ => vec![Line::from(vec![Span::styled(
+                            "  No dependencies.",
+                            Style::default().fg(Color::DarkGray),
+                        )])],
+                    }
+                }
+                _ => vec![Line::from(vec![Span::styled(
+                    "  No task focused.",
+                    Style::default().fg(Color::DarkGray),
+                )])],
+            };
+            let para = Paragraph::new(lines);
+            frame.render_widget(para, inner);
+        }
+        // `Off` is handled by the caller (this fn is not invoked); the
+        // `Timeline` arm is added by a sibling task.
+        DependencyViewMode::Off | DependencyViewMode::Timeline => {}
+    }
+}
+
+/// Maximum recursion depth (in addition to the direct prerequisites at depth 0)
+/// for the dependency `Tree` view; `0` = direct prerequisites only, so the cap
+/// of `2` admits prerequisites, their prerequisites, and grandchildren.
+const DEPENDENCY_TREE_MAX_DEPTH: usize = 2;
+
+/// Recursively emit indented ASCII-tree lines for a slice of prerequisite task
+/// ids, looking each up in `run.tasks` for its state badge.
+///
+/// `prefix` is the indentation carried from ancestor levels (built from `│   `
+/// for ancestors that still have following siblings and `    ` for ancestors
+/// that were the last child).  Each emitted line is
+/// `<prefix><connector>[state] <id>` where `<connector>` is `├── ` for a child
+/// with following siblings and `└── ` for the last child.  An unknown id (not
+/// present in `run.tasks`) renders with a `[?]` badge.  Recursion stops once
+/// `depth` exceeds [`DEPENDENCY_TREE_MAX_DEPTH`].
+fn render_dependency_tree_children(
+    run: &makina_core::api::RunView,
+    deps: &[makina_core::api::TaskId],
+    prefix: &str,
+    depth: usize,
+    acc: &mut Vec<Line<'static>>,
+) {
+    for (i, dep_id) in deps.iter().enumerate() {
+        let is_last = i + 1 == deps.len();
+        let connector = if is_last { "└── " } else { "├── " };
+        match run.tasks.iter().find(|t| &t.id == dep_id) {
+            Some(dep) => {
+                let (badge, color) = task_state_badge(&dep.state);
+                acc.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{connector}{badge} {}", dep.id.0),
+                    Style::default().fg(color),
+                )]));
+                if depth < DEPENDENCY_TREE_MAX_DEPTH && !dep.depends_on.is_empty() {
+                    // Carry `│   ` past children that still have siblings, or a
+                    // blank gap past the last child.
+                    let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
+                    render_dependency_tree_children(
+                        run,
+                        &dep.depends_on,
+                        &child_prefix,
+                        depth + 1,
+                        acc,
+                    );
+                }
+            }
+            None => {
+                // Missing/unknown id: render the bare id with a `[?]` badge.
+                acc.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{connector}[?] {}", dep_id.0),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
     }
 }
 
@@ -1668,6 +1753,130 @@ mod tests {
         assert!(
             screen.contains("Exchange"),
             "Exchange title/border must still render below the dependency pane"
+        );
+    }
+
+    /// With [`DependencyViewMode::Tree`] active, the dependency sub-pane draws
+    /// an indented ASCII tree of the selected task's prerequisites: direct
+    /// children carry `├──`/`└──` connectors with their state badges, and a
+    /// grandchild prerequisite is indented deeper than its parent.
+    #[test]
+    fn render_dependency_tree_shows_connectors_and_badges() {
+        use crate::app::DependencyViewMode;
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+
+        let api = Arc::new(PlaceholderApi::empty());
+        // root depends_on [a (Done), b (Failed)]; a depends_on [c (New)].
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/dep-tree-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("root"),
+                    title: "Root task".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![TaskId::new("a"), TaskId::new("b")],
+                },
+                TaskView {
+                    id: TaskId::new("a"),
+                    title: "A task".into(),
+                    state: TaskState::Done,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![TaskId::new("c")],
+                },
+                TaskView {
+                    id: TaskId::new("b"),
+                    title: "B task".into(),
+                    state: TaskState::Failed,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("c"),
+                    title: "C task".into(),
+                    state: TaskState::New,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                },
+            ],
+        };
+        let mut app = App::new(api, vec![run]);
+        // Select root (index 0) and switch to the tree view.
+        app.selected_task = Some(0);
+        app.dependency_view = DependencyViewMode::Tree;
+
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Connectors for non-last (a) and last (b) direct children.
+        assert!(
+            screen.contains("├── "),
+            "tree should draw a branch connector for non-last children"
+        );
+        assert!(
+            screen.contains("└── "),
+            "tree should draw a corner connector for the last child"
+        );
+        // State badges: a is Done, b is Failed.
+        assert!(
+            screen.contains("[✓ done]"),
+            "tree should show the Done badge for prerequisite a"
+        );
+        assert!(
+            screen.contains("[✗ failed]"),
+            "tree should show the Failed badge for prerequisite b"
+        );
+        // Child id strings appear.
+        assert!(
+            screen.contains(" a"),
+            "tree should show prerequisite id 'a'"
+        );
+        assert!(
+            screen.contains(" b"),
+            "tree should show prerequisite id 'b'"
+        );
+        assert!(
+            screen.contains(" c"),
+            "tree should show grandchild prerequisite id 'c'"
+        );
+
+        // The grandchild `c` must be indented deeper than its parent `a`.  The
+        // flat `screen` string is `width * height` chars laid out row-major, so
+        // split it into 120-char rows on char boundaries (multi-byte connectors
+        // and badges make byte-chunking unsafe).  Because both the `a` row (the
+        // only `[✓ done]` line) and the `c` row (the only `[new]` line) share
+        // the same dependency-pane left offset, the column of their tree
+        // connector char (`├`/`└`) directly reflects the relative indent.
+        let chars: Vec<char> = screen.chars().collect();
+        let rows: Vec<Vec<char>> = chars.chunks(120).map(|c| c.to_vec()).collect();
+        let connector_col = |badge: &str| -> usize {
+            for row in &rows {
+                let row_str: String = row.iter().collect();
+                if row_str.contains(badge) {
+                    // Find the first tree connector char on this row.
+                    if let Some(col) = row.iter().position(|&ch| ch == '├' || ch == '└') {
+                        return col;
+                    }
+                }
+            }
+            usize::MAX
+        };
+        let a_col = connector_col("[✓ done]");
+        let c_col = connector_col("[new]");
+        assert_ne!(a_col, usize::MAX, "expected a rendered tree row for 'a'");
+        assert_ne!(c_col, usize::MAX, "expected a rendered tree row for 'c'");
+        assert!(
+            c_col > a_col,
+            "grandchild 'c' must be indented deeper than parent 'a' (a_col={a_col}, c_col={c_col})"
         );
     }
 
