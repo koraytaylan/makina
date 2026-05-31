@@ -765,6 +765,7 @@ impl App {
                         status: RunStatus::Pending,
                         project: String::new(),
                         tasks: vec![],
+                        report: makina_core::api::IngestionReport::default(),
                     });
                     if self.selected_run.is_none() {
                         self.selected_run = Some(0);
@@ -990,6 +991,7 @@ mod tests {
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![existing]);
 
@@ -1024,6 +1026,7 @@ mod tests {
                 review_iterations: 0,
                 depends_on: vec![],
             }],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run]);
 
@@ -1059,6 +1062,7 @@ mod tests {
                 review_iterations: 0,
                 depends_on: vec![],
             }],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run]);
 
@@ -1084,6 +1088,7 @@ mod tests {
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         };
         let app = App::new(api, vec![run]);
         let selected = app.selected_run();
@@ -1114,6 +1119,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
             RunView {
                 id: RunId(2),
@@ -1122,6 +1128,7 @@ mod tests {
                 status: RunStatus::Running,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
             RunView {
                 id: RunId(3),
@@ -1130,6 +1137,7 @@ mod tests {
                 status: RunStatus::Completed,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
         ];
         let mut app = App::new(api, runs);
@@ -1154,6 +1162,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
             RunView {
                 id: RunId(2),
@@ -1162,6 +1171,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
         ];
         let mut app = App::new(api, runs);
@@ -1185,6 +1195,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
             RunView {
                 id: RunId(2),
@@ -1193,6 +1204,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
         ];
         let mut app = App::new(api, runs);
@@ -1213,6 +1225,7 @@ mod tests {
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         }];
         let mut app = App::new(api, runs);
         assert_eq!(app.selected_run, Some(0));
@@ -1232,6 +1245,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
             RunView {
                 id: RunId(2),
@@ -1240,6 +1254,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
         ];
         let mut app = App::new(api, runs);
@@ -1306,6 +1321,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
             RunView {
                 id: RunId(2),
@@ -1314,6 +1330,7 @@ mod tests {
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
             },
         ];
         let mut app = App::new(api, runs);
@@ -1349,6 +1366,7 @@ mod tests {
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run]);
 
@@ -1371,6 +1389,7 @@ mod tests {
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run]);
 
@@ -1400,6 +1419,7 @@ mod tests {
                 review_iterations: 0,
                 depends_on: vec![],
             }],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run]);
 
@@ -1429,6 +1449,7 @@ mod tests {
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![placeholder]);
         assert!(
@@ -1461,6 +1482,7 @@ mod tests {
                     depends_on: vec![TaskId::new("t1")],
                 },
             ],
+            report: makina_core::api::IngestionReport::default(),
         };
         app.update(AppEvent::RunLoaded(full_run));
 
@@ -1499,6 +1521,7 @@ mod tests {
                 review_iterations: 0,
                 depends_on: vec![],
             }],
+            report: makina_core::api::IngestionReport::default(),
         };
         app.update(AppEvent::RunLoaded(full_run));
 
@@ -1537,6 +1560,7 @@ mod tests {
                     depends_on: vec![],
                 },
             ],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run]);
 
@@ -1588,6 +1612,7 @@ mod tests {
                     depends_on: vec![],
                 },
             ],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run]);
 
@@ -1783,6 +1808,7 @@ mod tests {
                     depends_on: vec![],
                 },
             ],
+            report: makina_core::api::IngestionReport::default(),
         };
         App::new(api, vec![run])
     }
@@ -2233,6 +2259,7 @@ mod tests {
                     depends_on: vec![],
                 },
             ],
+            report: makina_core::api::IngestionReport::default(),
         };
         let run2 = RunView {
             id: RunId(2),
@@ -2248,6 +2275,7 @@ mod tests {
                 review_iterations: 0,
                 depends_on: vec![],
             }],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run1, run2]);
 

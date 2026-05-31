@@ -104,6 +104,7 @@ impl Api for PlaceholderApi {
                     status: RunStatus::Pending,
                     project: String::new(),
                     tasks: vec![],
+                    report: makina_core::api::IngestionReport::default(),
                 };
                 self.runs.lock().unwrap().push(run);
                 // Broadcast a RunOpened event so any subscriber sees it.
@@ -217,6 +218,7 @@ fn sample_run(id: RunId) -> RunView {
                 depends_on: vec![TaskId::new("tui-scaffold")],
             },
         ],
+        report: makina_core::api::IngestionReport::default(),
     }
 }
 

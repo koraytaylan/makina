@@ -73,6 +73,7 @@ fn exchange_app() -> App {
             review_iterations: 0,
             depends_on: vec![],
         }],
+        report: makina_core::api::IngestionReport::default(),
     };
     let mut app = App::new(api, vec![run]);
 

@@ -265,6 +265,9 @@ struct RunEntry {
     status: RunStatus,
     /// The background execution's control handle.  `None` until `StartRun`.
     handle: Option<RunHandle>,
+    /// Ingestion report computed at open (validate + qualify). Threaded to
+    /// every RunView snapshot.
+    report: crate::ingestion::IngestionReport,
 }
 
 /// Project a snapshot graph + metadata into the view-level [`RunView`].
@@ -280,6 +283,7 @@ fn build_view(
     status: RunStatus,
     repo_root: &std::path::Path,
     graph: &TaskGraph,
+    report: crate::ingestion::IngestionReport,
 ) -> RunView {
     let project = repo_root
         .file_name()
@@ -306,6 +310,7 @@ fn build_view(
         status,
         project,
         tasks,
+        report,
     }
 }
 
@@ -603,6 +608,14 @@ impl CoreApi {
             }
         };
 
+        // Compute ingestion report (validate + qualify) right after graph is
+        // resolved (artifact or fresh), before registry insert.
+        let report = {
+            let mut issues = crate::ingestion::validate(&graph);
+            issues.extend(crate::ingestion::qualify(&graph));
+            crate::ingestion::IngestionReport { issues }
+        };
+
         // 3. Allocate an id, mint the persistent ULID run identity, and register
         //    the Run.  Lock → insert → DROP guard before any further
         //    await/broadcast.
@@ -625,6 +638,7 @@ impl CoreApi {
                     graph: Arc::new(AsyncMutex::new(graph)),
                     status: RunStatus::Pending,
                     handle: None,
+                    report,
                 },
             );
         } // guard dropped here
@@ -874,7 +888,7 @@ impl CoreApi {
     async fn view_of(&self, id: RunId) -> Option<RunView> {
         // Pull the Arc graph handle + metadata out under the registry lock, then
         // drop the guard before awaiting the (separate) graph mutex.
-        let (run_uid, path, status, graph) = {
+        let (run_uid, path, status, report, graph) = {
             let runs = self
                 .state
                 .runs
@@ -885,6 +899,7 @@ impl CoreApi {
                 entry.run_uid.clone(),
                 entry.task_list_path.clone(),
                 entry.status.clone(),
+                entry.report.clone(),
                 Arc::clone(&entry.graph),
             )
         }; // registry guard dropped before await.
@@ -896,6 +911,7 @@ impl CoreApi {
             status,
             &self.state.worktree_manager.repo_root,
             &g,
+            report,
         ))
     }
 }
@@ -933,6 +949,7 @@ impl Api for CoreApi {
             String,
             PathBuf,
             RunStatus,
+            crate::ingestion::IngestionReport,
             Arc<AsyncMutex<TaskGraph>>,
         )> = {
             let runs = self
@@ -947,6 +964,7 @@ impl Api for CoreApi {
                         entry.run_uid.clone(),
                         entry.task_list_path.clone(),
                         entry.status.clone(),
+                        entry.report.clone(),
                         Arc::clone(&entry.graph),
                     )
                 })
@@ -954,7 +972,7 @@ impl Api for CoreApi {
         }; // registry guard dropped before any graph await.
 
         let mut views = Vec::with_capacity(entries.len());
-        for (id, run_uid, path, status, graph) in entries {
+        for (id, run_uid, path, status, report, graph) in entries {
             let g = graph.lock().await;
             views.push(build_view(
                 id,
@@ -963,6 +981,7 @@ impl Api for CoreApi {
                 status,
                 &self.state.worktree_manager.repo_root,
                 &g,
+                report,
             ));
         }
         views
@@ -2267,8 +2286,80 @@ Create beta.
             RunStatus::Pending,
             repo_root,
             &graph,
+            crate::ingestion::IngestionReport::default(),
         );
 
         assert_eq!(view.project, "makina");
+    }
+
+    // ── open_run attaches IngestionReport (task requirement) ──────────────────
+
+    /// Acceptance: `open_run` computes `IngestionReport` (validate + qualify)
+    /// at graph resolution time and threads it onto the `RunEntry` (and thus
+    /// every `RunView` returned by `runs()` / `run()`). Modelled on
+    /// `open_run_interprets_file_and_creates_run`.
+    #[tokio::test]
+    async fn open_run_attaches_ingestion_report() {
+        let (api, _repo) = execution_core_api();
+
+        // Clean graph via normal interpret path (SAMPLE has substantive done_whens ≥12 chars, no placeholders).
+        let (_d_clean, clean_path) = write_task_list(SAMPLE_TASK_LIST);
+        let _ = api
+            .execute(Command::OpenRun {
+                task_list_path: clean_path,
+            })
+            .await
+            .expect("clean OpenRun succeeds");
+
+        let clean_views = api.runs().await;
+        assert_eq!(clean_views.len(), 1);
+        let clean_view = &clean_views[0];
+        assert!(
+            !clean_view.report.is_blocked(),
+            "clean canned graph must yield report.is_blocked() == false; issues: {:?}",
+            clean_view.report.issues
+        );
+
+        // Blocked case: short done_when triggers qualify "vague-done-when" (Blocking).
+        // (Using short-but-nonempty avoids interpreter ParseError for missing/empty field.)
+        let vague_list = r#"# Vague — Task List
+
+A list with a task whose done_when is too short to pass qualify.
+
+---
+
+## 0001 — Vague
+
+### vague-t — Vague task
+
+Description text that is long enough for parser.
+
+- **Depends on:** —
+- **Done when:** soon
+"#;
+        let (_d_vague, vague_path) = write_task_list(vague_list);
+        let _ = api
+            .execute(Command::OpenRun {
+                task_list_path: vague_path.clone(),
+            })
+            .await
+            .expect("vague OpenRun succeeds (report carries the issue)");
+
+        let all_views = api.runs().await;
+        let vague_view = all_views
+            .iter()
+            .find(|v| v.task_list_path == vague_path)
+            .expect("vague run view present");
+        assert!(
+            vague_view.report.is_blocked(),
+            "vague graph must be blocked"
+        );
+        assert!(
+            vague_view.report.issues.iter().any(|i| {
+                i.code == "vague-done-when" && i.severity == crate::api::IssueSeverity::Blocking
+            }),
+            "expected Blocking 'vague-done-when' issue in report; got {:?}",
+            vague_view.report.issues
+        );
     }
 }

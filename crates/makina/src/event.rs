@@ -778,6 +778,7 @@ mod tests {
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(Arc::clone(&api) as Arc<dyn Api>, vec![run]);
         assert_eq!(app.selected_run().unwrap().id, RunId(7));
@@ -850,6 +851,7 @@ mod tests {
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
         };
         let app = App::new(api, vec![run]);
 
@@ -1037,6 +1039,7 @@ mod tests {
                         depends_on: vec![TaskId::new("first")],
                     },
                 ],
+                report: makina_core::api::IngestionReport::default(),
             };
             // Use execute(OpenRun) is not ideal here since it creates an empty run;
             // instead we directly call the public `execute` and rely on the test

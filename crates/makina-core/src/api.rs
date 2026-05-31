@@ -37,6 +37,10 @@ use async_trait::async_trait;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
+// Re-export ingestion report types so TUI (and other consumers) can import them
+// from `makina_core::api` alongside the other view types (RunView, TaskView, …).
+pub use crate::ingestion::{IngestionIssue, IngestionReport, IssueSeverity, IssueSource};
+
 // ── Identifier newtypes ───────────────────────────────────────────────────────
 
 /// Opaque numeric identifier for an open Run.
@@ -249,6 +253,11 @@ pub struct RunView {
     /// Ordered list of all tasks in this Run.  Order matches the task-list
     /// file; the TUI renders them in this order.
     pub tasks: Vec<TaskView>,
+
+    /// Ingestion report (from validate + qualify) computed at `OpenRun` time
+    /// and carried on the run.  Enables the TUI to render issues without
+    /// re-scanning the source.
+    pub report: IngestionReport,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -691,6 +700,7 @@ mod tests {
                             review_iterations: 0,
                             depends_on: vec![],
                         }],
+                        report: IngestionReport::default(),
                     };
                     self.runs.lock().unwrap().push(view);
                     Ok(CommandOutcome::RunOpened { run: id })
@@ -979,6 +989,7 @@ mod tests {
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![task],
+            report: IngestionReport::default(),
         };
         let _run2 = run_view.clone();
         assert!(format!("{run_view:?}").contains("Running"));
