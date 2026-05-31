@@ -744,6 +744,22 @@ impl CoreApi {
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
 
+            if entry.report.is_blocked() {
+                let blockers: Vec<_> = entry.report.blocking().collect();
+                let n = blockers.len();
+                let codes = blockers
+                    .iter()
+                    .map(|i| i.code.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(ApiError::InvalidCommand {
+                    reason: format!(
+                        "cannot start: {} blocking ingestion issue(s) — {}",
+                        n, codes
+                    ),
+                });
+            }
+
             // If a previous handle exists (e.g. resuming a paused run), cancel its
             // (already-finished or paused) scheduler defensively and replace it.
             if let Some(old) = entry.handle.take() {
@@ -1071,10 +1087,10 @@ A one-task list used to exercise CoreApi::StartRun execution.
 
 ## 0001 — Foundation
 
-### solo-task — The only task
+### solo-task — Implement the solo task
 Do the thing in `lib.rs`.
 - **Depends on:** —
-- **Done when:** it works.
+- **Done when:** The solo task is implemented, the code works, and tests pass.
 "#;
 
     /// Build a `Config` with NO gates (the gate loop is a no-op) so the develop
@@ -1919,6 +1935,81 @@ Create beta.
         assert!(matches!(err, Err(ApiError::UnknownRun { run: RunId(999) })));
     }
 
+    // ── StartRun refuses when report blocked (ingest guard) ───────────────────
+
+    /// Refuses `StartRun` (with InvalidCommand) while the run's ingestion report
+    /// has blocking issues (e.g. non-actionable title from qualify); status
+    /// remains `Pending` (no mutation of handle/status occurs).
+    #[tokio::test]
+    async fn start_run_refused_while_report_blocked() {
+        let (api, _repo) = execution_core_api();
+
+        // Task list whose title triggers "non-actionable-title" (Blocking) via qualify.
+        // (Description and done_when are long enough to avoid other blocks.)
+        let blocked_list = r#"# Blocked — Task List
+
+A list containing a non-actionable task.
+
+---
+
+## 0001 — Section
+
+### the-task — The big refactor effort
+
+This description is long enough to pass the thin-description threshold.
+
+- **Depends on:** —
+- **Done when:** The refactored code compiles cleanly and all new tests pass.
+"#;
+        let (_dir, path) = write_task_list(blocked_list);
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .expect("OpenRun must succeed for blocked list (report carries issue)")
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected OpenRun outcome: {other:?}"),
+        };
+
+        // Precondition: still Pending.
+        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Pending);
+
+        let err = api.execute(Command::StartRun { run }).await;
+        assert!(
+            matches!(err, Err(ApiError::InvalidCommand { .. })),
+            "expected InvalidCommand when report blocked; got {err:?}"
+        );
+
+        // Critical: status untouched (still Pending); guard returned before any mutation.
+        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Pending);
+    }
+
+    /// Clean report proceeds: `StartRun` returns `Ok`, status becomes `Running`.
+    #[tokio::test]
+    async fn start_run_proceeds_when_report_clean() {
+        let (api, _repo) = execution_core_api();
+        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .expect("OpenRun succeeds for clean list")
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let outcome = api.execute(Command::StartRun { run }).await;
+        assert!(
+            matches!(outcome, Ok(CommandOutcome::Acknowledged)),
+            "clean StartRun must succeed; got {outcome:?}"
+        );
+        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Running);
+    }
+
     // ── CancelRun affects the Run ─────────────────────────────────────────────
 
     /// **Cancel affects the Run — deterministically (the done-when for Cancel).**
@@ -1952,10 +2043,10 @@ Create beta.
         // A 2-task chain: task-b depends on task-a (so task-b cannot run until
         // task-a is Done — which never happens because we hold + cancel it).
         let source = "# Cancel — Task List\n\nPreamble.\n\n---\n\n## 0001 — S\n\n\
-### task-a — Task A\nDoes A in `lib.rs`.\n- **Depends on:** —\n\
-- **Done when:** a works.\n\n\
-### task-b — Task B\nDoes B in `lib.rs`.\n- **Depends on:** task-a\n\
-- **Done when:** b works.\n";
+### task-a — Implement task A\nDoes A in `lib.rs`.\n- **Depends on:** —\n\
+- **Done when:** Task A completes its implementation and all checks pass.\n\n\
+### task-b — Implement task B\nDoes B in `lib.rs`.\n- **Depends on:** task-a\n\
+- **Done when:** Task B completes after its dependency and all checks pass.\n";
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("cancel-feature.md");
         std::fs::write(&file_path, source).unwrap();
@@ -2189,10 +2280,10 @@ Create beta.
 
         // Two INDEPENDENT tasks (both ready immediately); concurrency=1 serializes.
         let source = "# PauseTwo — Task List\n\nPreamble.\n\n---\n\n## 0001 — S\n\n\
-### first — First task\nDoes first in `a.rs`.\n- **Depends on:** —\n\
-- **Done when:** first works.\n\n\
-### second — Second task\nDoes second in `b.rs`.\n- **Depends on:** —\n\
-- **Done when:** second works.\n";
+### first — Implement the first task\nDoes first in `a.rs`.\n- **Depends on:** —\n\
+- **Done when:** The first task completes its work and outputs are verified.\n\n\
+### second — Implement the second task\nDoes second in `b.rs`.\n- **Depends on:** —\n\
+- **Done when:** The second task completes after the first and outputs are verified.\n";
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("pausetwo.md");
         std::fs::write(&file_path, source).unwrap();

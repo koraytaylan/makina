@@ -95,10 +95,10 @@ A one-task list used to exercise run finalization.
 
 ## 0001 — Foundation
 
-### solo-task — The only task
+### solo-task — Implement the solo task
 Do the thing in `lib.rs`.
 - **Depends on:** —
-- **Done when:** it works.
+- **Done when:** The solo task completes its work and all verification checks pass.
 "#;
 
 // ── Test: run.json is written at finalization ────────────────────────────────
