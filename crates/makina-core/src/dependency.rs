@@ -224,7 +224,8 @@ pub fn infer_edges(graph: &mut TaskGraph) {
 /// `depends_on` edges in the current state of `graph` (DFS).
 ///
 /// Used by [`infer_edges`] as a reachability guard to prevent cycles.
-fn transitive_depends_on(graph: &TaskGraph, start: &TaskId, target: &TaskId) -> bool {
+/// Also used by the structural validator for cycle detection via self-reachability.
+pub(crate) fn transitive_depends_on(graph: &TaskGraph, start: &TaskId, target: &TaskId) -> bool {
     // Build a quick id→task index map for efficient lookup.
     let index_of: HashMap<&TaskId, usize> = graph
         .tasks
