@@ -280,6 +280,9 @@ pub enum AppEvent {
     PauseRun,
     /// User pressed `c` — cancel the selected Run.
     CancelRun,
+    /// User pressed `r` / `R` — re-interpret the selected Run (bypass artifact,
+    /// re-ingest source to recompute report and graph).
+    Reinterpret,
 
     /// A transient status-bar message to display (command outcome or error).
     ///
@@ -715,7 +718,10 @@ impl App {
             // async `api.execute(...)` for the selected run and feeds back a
             // StatusMessage.  `update` itself does not mutate state here (no
             // async), so these are no-ops that simply request a redraw.
-            AppEvent::StartRun | AppEvent::PauseRun | AppEvent::CancelRun => true,
+            AppEvent::StartRun
+            | AppEvent::PauseRun
+            | AppEvent::CancelRun
+            | AppEvent::Reinterpret => true,
 
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);

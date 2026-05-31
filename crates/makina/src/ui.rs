@@ -233,11 +233,25 @@ pub fn render(app: &App, frame: &mut Frame) {
             // closed.  Placed AFTER the exchange pane in the vertical split.
             let error_pane_height: u16 = if app.error_pane_open { 5 } else { 0 };
 
+            // Ingestion pane height (near task table): non-zero only when the
+            // selected run has a non-empty report. Mirrors error pane allocation.
+            let ingestion_pane_height: u16 = if let Some(r) = app.selected_run() {
+                if r.report.is_empty() {
+                    0
+                } else {
+                    let n = r.report.issues.len() as u16;
+                    (n + 2).min(8) // title + borders + issues (capped)
+                }
+            } else {
+                0
+            };
+
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(header_height),
                     Constraint::Length(table_rows),
+                    Constraint::Length(ingestion_pane_height), // ingestion issues (0 = hidden)
                     Constraint::Min(3), // exchange pane — always at least 3 rows
                     Constraint::Length(error_pane_height), // error pane (0 = hidden)
                 ])
@@ -245,8 +259,9 @@ pub fn render(app: &App, frame: &mut Frame) {
 
             let header_area = split[0];
             let table_area = split[1];
-            let exchange_area = split[2];
-            let error_area = split[3];
+            let ingestion_area = split[2];
+            let exchange_area = split[3];
+            let error_area = split[4];
 
             let header_para = Paragraph::new(header_lines).style(Style::default().fg(Color::White));
             frame.render_widget(header_para, header_area);
@@ -332,6 +347,10 @@ pub fn render(app: &App, frame: &mut Frame) {
                 frame.render_stateful_widget(task_table, table_area, &mut table_state);
             }
 
+            // Render ingestion report panel (0-height area is a no-op inside).
+            // Placed directly after the task table (near the task detail).
+            render_ingestion_panel(app, frame, ingestion_area);
+
             // ── Dependency view + Exchange pane (task 30) ──────────────────
             // When a dependency-view overlay is active, carve a top sub-pane out
             // of the exchange region for it and render the exchange pane below.
@@ -390,11 +409,29 @@ pub fn render(app: &App, frame: &mut Frame) {
     } else {
         ""
     };
+    // Blocked-start notice (mirrors gr-legend append): only when the selected
+    // run's report has blocking issues. Tells user why Start is gated and how
+    // to re-interpret.
+    let blocked_notice = app
+        .selected_run()
+        .and_then(|r| {
+            if r.report.is_blocked() {
+                let n = r.report.blocking().count();
+                Some(format!(
+                    "  │  ⚠ {} blocking issue(s) — press r to re-interpret",
+                    n
+                ))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
     // The legend precedes the trailer so its full text (notably "review
     // iterations") stays inside the visible width; the lower-priority trailer
     // (focus/last-event hint) is the part that gets clipped on narrow terminals.
-    let status_text =
-        format!(" [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [q/^C] quit{legend}{trailer}");
+    let status_text = format!(
+        " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [q/^C] quit{legend}{blocked_notice}{trailer}"
+    );
     let status_bar =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     frame.render_widget(status_bar, status_area);
@@ -821,6 +858,79 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para, inner);
 }
 
+/// Render the ingestion report panel for the selected run (when it has issues).
+///
+/// Each issue is shown as `[{source}] {code} — {message}` with severity
+/// colour (Blocking=Red, Warning=Yellow). Mirrors `render_error_pane`
+/// structure and `task_state_badge` colouring. A 0-height area is a no-op.
+fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    use makina_core::api::{IssueSeverity, IssueSource};
+
+    let run = match app.selected_run() {
+        Some(r) if !r.report.is_empty() => r,
+        _ => return,
+    };
+
+    let has_blocking = run.report.is_blocked();
+    let border_color = if has_blocking {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let title = if has_blocking {
+        " Blocking Issues "
+    } else {
+        " Ingestion Issues "
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = run
+        .report
+        .issues
+        .iter()
+        .map(|issue| {
+            let color = match issue.severity {
+                IssueSeverity::Blocking => Color::Red,
+                IssueSeverity::Warning => Color::Yellow,
+            };
+            let source = match issue.source {
+                IssueSource::Interpreter => "interpreter",
+                IssueSource::Validator => "validator",
+                IssueSource::Qualifier => "qualifier",
+            };
+            Line::from(vec![Span::styled(
+                format!("  [{}] {} — {}", source, issue.code, issue.message),
+                Style::default().fg(color),
+            )])
+        })
+        .collect();
+
+    // Auto-scroll if more issues than fit (rare, capped by layout height).
+    let pane_height = inner.height as usize;
+    let total_lines = lines.len();
+    let scroll_offset = if total_lines > pane_height {
+        (total_lines - pane_height) as u16
+    } else {
+        0
+    };
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0));
+    frame.render_widget(para, inner);
+}
+
 /// Convert a single [`ExchangeEntry`] into display [`Line`]s.
 ///
 /// Prompt entries get a role-coloured label header; response entries are
@@ -1141,7 +1251,10 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::placeholder::PlaceholderApi;
-    use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+    use makina_core::api::{
+        IngestionIssue, IngestionReport, IssueSeverity, IssueSource, RunId, RunStatus, RunView,
+        TaskId, TaskState, TaskView,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
@@ -1580,6 +1693,79 @@ mod tests {
             .iter()
             .any(|cell| cell.fg == ratatui::style::Color::Red);
         assert!(has_red, "Failed status badge must use Red foreground");
+    }
+
+    // ── Render: ingestion report panel (ingest-tui-report-panel) ──────────────
+
+    #[test]
+    fn render_ingestion_panel_shows_blocking_issue() {
+        let mut terminal = make_terminal(100, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/bad.json"),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![],
+            report: IngestionReport {
+                issues: vec![IngestionIssue {
+                    task_id: None,
+                    severity: IssueSeverity::Blocking,
+                    source: IssueSource::Qualifier,
+                    code: "vague-done-when".into(),
+                    message: "done_when is too vague".into(),
+                    suggestion: None,
+                }],
+            },
+        }];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("vague-done-when"),
+            "ingestion panel should contain the issue code"
+        );
+
+        let buf = terminal.backend().buffer().clone();
+        let has_red = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Red);
+        assert!(has_red, "Blocking issue line must use Red foreground");
+    }
+
+    #[test]
+    fn render_status_bar_shows_blocked_notice_when_report_blocked() {
+        let mut terminal = make_terminal(120, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/blocked.json"),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![],
+            report: IngestionReport {
+                issues: vec![IngestionIssue {
+                    task_id: None,
+                    severity: IssueSeverity::Blocking,
+                    source: IssueSource::Interpreter,
+                    code: "bad-json".into(),
+                    message: "parse failed".into(),
+                    suggestion: None,
+                }],
+            },
+        }];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("blocking issue(s) — press r to re-interpret"),
+            "status bar must show the blocking-count notice when report.is_blocked()"
+        );
     }
 
     // ── Render: focus indicator ───────────────────────────────────────────────

@@ -261,6 +261,10 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
         AppEvent::StartRun => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
         AppEvent::PauseRun => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
         AppEvent::CancelRun => (AppEvent::Tick, run_control(app, ControlKind::Cancel).await),
+        AppEvent::Reinterpret => (
+            AppEvent::Tick,
+            run_control(app, ControlKind::Reinterpret).await,
+        ),
         // Everything else passes straight through.
         other => (other, None),
     }
@@ -272,6 +276,7 @@ enum ControlKind {
     Start,
     Pause,
     Cancel,
+    Reinterpret,
 }
 
 /// Issue a run-control command for the currently selected Run and return a
@@ -291,6 +296,7 @@ async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
         ControlKind::Start => (Command::StartRun { run }, "Start"),
         ControlKind::Pause => (Command::PauseRun { run }, "Pause"),
         ControlKind::Cancel => (Command::CancelRun { run }, "Cancel"),
+        ControlKind::Reinterpret => (Command::ReinterpretRun { run }, "Reinterpret"),
     };
     match app.api.execute(command).await {
         Ok(_) => Some(format!("{verb} {run}")),
@@ -416,6 +422,8 @@ fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
             KeyCode::Char('s') | KeyCode::Char('S') => AppEvent::StartRun,
             KeyCode::Char('p') | KeyCode::Char('P') => AppEvent::PauseRun,
             KeyCode::Char('c') | KeyCode::Char('C') => AppEvent::CancelRun,
+            // Re-interpret the selected run (e.g. after fixing blocking issues).
+            KeyCode::Char('r') | KeyCode::Char('R') => AppEvent::Reinterpret,
             // Sidebar navigation: arrow keys and vim-style j/k.
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
@@ -516,6 +524,14 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(key_press(KeyCode::Char('e'), KeyModifiers::NONE), false),
             AppEvent::ToggleErrorPane
+        ));
+    }
+
+    #[test]
+    fn r_key_translates_to_reinterpret() {
+        assert!(matches!(
+            translate_terminal_event(key_press(KeyCode::Char('r'), KeyModifiers::NONE), false),
+            AppEvent::Reinterpret
         ));
     }
 
