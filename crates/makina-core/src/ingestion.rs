@@ -10,6 +10,32 @@ use serde::{Deserialize, Serialize};
 use crate::dependency::transitive_depends_on;
 use crate::task::{TaskGraph, TaskId};
 
+// ── Qualifier thresholds (tunable, test-pinned) ──────────────────────────────
+
+/// Minimum trimmed length for a concrete `done_when` acceptance criterion.
+const MIN_DONE_WHEN_LEN: usize = 12;
+
+/// Minimum trimmed length for a substantive task description.
+const MIN_DESCRIPTION_LEN: usize = 12;
+
+/// Markers that indicate placeholder / incomplete content (case-insensitive
+/// substring match against title, description, or done_when).
+const PLACEHOLDER_MARKERS: &[&str] = &[
+    "tbd",
+    "todo",
+    "???",
+    "fixme",
+    "xxx",
+    "fill in",
+    "to be defined",
+];
+
+/// First words that make a multi-word title non-actionable (articles, vague
+/// collectives, etc.).  Titles whose first word (lowercased) matches one of
+/// these AND that contain at least two words are flagged.  The list is small
+/// and permissive by design so that real imperative titles pass.
+const NON_ACTIONABLE_OPENERS: &[&str] = &["the", "a", "an", "some", "stuff", "things", "misc"];
+
 // ── Supporting enums ──────────────────────────────────────────────────────────
 
 /// Severity of an ingestion issue.
@@ -350,6 +376,96 @@ pub fn lint_source(source_text: &str) -> Vec<IngestionIssue> {
     // EOF: commit any final in-progress task.
     if let Some((prev_line, prev_id, has_dep, has_don)) = current_task.take() {
         push_missing(&mut issues, prev_line, prev_id.as_ref(), has_dep, has_don);
+    }
+
+    issues
+}
+
+/// Deterministic actionability / quality checks over a task graph (no model
+/// calls).  Produces `Qualifier` + `Blocking` issues for tasks whose titles,
+/// descriptions, or `done_when` fields are too short, contain placeholders, or
+/// are non-actionable.
+///
+/// Emits at most one issue per (task, code) pair.  Does not re-emit any
+/// validator codes such as "dangling-dependency".  The function is pure.
+pub fn qualify(graph: &TaskGraph) -> Vec<IngestionIssue> {
+    let mut issues: Vec<IngestionIssue> = Vec::new();
+
+    for task in &graph.tasks {
+        // (1) vague-done-when: trimmed done_when shorter than threshold.
+        if task.done_when.trim().len() < MIN_DONE_WHEN_LEN {
+            issues.push(IngestionIssue {
+                task_id: Some(task.id.clone()),
+                severity: IssueSeverity::Blocking,
+                source: IssueSource::Qualifier,
+                code: "vague-done-when".to_string(),
+                message: format!("task `{}` has a vague `done_when` (too short)", task.id),
+                suggestion: Some(
+                    "write a concrete, verifiable acceptance criterion (≥12 chars after trim)"
+                        .to_string(),
+                ),
+            });
+        }
+
+        // (2) placeholder-text: lowered title/desc/done_when contains any marker
+        // (substring match, including multi-word markers like "fill in").
+        let has_placeholder = {
+            let t = task.title.to_lowercase();
+            let d = task.description.to_lowercase();
+            let w = task.done_when.to_lowercase();
+            PLACEHOLDER_MARKERS
+                .iter()
+                .any(|m| t.contains(m) || d.contains(m) || w.contains(m))
+        };
+        if has_placeholder {
+            issues.push(IngestionIssue {
+                task_id: Some(task.id.clone()),
+                severity: IssueSeverity::Blocking,
+                source: IssueSource::Qualifier,
+                code: "placeholder-text".to_string(),
+                message: format!("task `{}` contains placeholder text", task.id),
+                suggestion: Some(
+                    "replace placeholder markers (TBD, TODO, ???, etc.) with concrete text"
+                        .to_string(),
+                ),
+            });
+        }
+
+        // (3) non-actionable-title: first word (trim+lower) is in the bad-opener
+        // list *and* title has ≥2 words.  Permissive heuristic (only known-bad
+        // openers trigger) so substantive imperative titles from real plans pass.
+        let title_trim = task.title.trim();
+        let words: Vec<&str> = title_trim.split_whitespace().collect();
+        if words.len() >= 2 {
+            let first_lower = words[0].to_lowercase();
+            if NON_ACTIONABLE_OPENERS.contains(&first_lower.as_str()) {
+                issues.push(IngestionIssue {
+                    task_id: Some(task.id.clone()),
+                    severity: IssueSeverity::Blocking,
+                    source: IssueSource::Qualifier,
+                    code: "non-actionable-title".to_string(),
+                    message: format!("task `{}` has a non-actionable title", task.id),
+                    suggestion: Some(
+                        "rewrite the title to start with an imperative verb (e.g. \"Add …\", \"Implement …\")"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+
+        // (4) thin-description: trimmed description shorter than threshold.
+        if task.description.trim().len() < MIN_DESCRIPTION_LEN {
+            issues.push(IngestionIssue {
+                task_id: Some(task.id.clone()),
+                severity: IssueSeverity::Blocking,
+                source: IssueSource::Qualifier,
+                code: "thin-description".to_string(),
+                message: format!("task `{}` has a thin description", task.id),
+                suggestion: Some(
+                    "expand the description to at least 12 characters after trimming".to_string(),
+                ),
+            });
+        }
     }
 
     issues
@@ -794,6 +910,188 @@ Desc.
         assert!(
             issues[0].code == "heading-missing-em-dash",
             "first issue should be the dashless heading"
+        );
+    }
+
+    // ── qualify tests (per task spec) ─────────────────────────────────────────
+
+    #[test]
+    fn qualify_flags_vague_done_when() {
+        let now = Utc::now();
+        let t = Task {
+            id: TaskId::new("vague-dw"),
+            title: "Implement the feature".to_string(),
+            description: "This is a full description that easily exceeds the minimum length."
+                .to_string(),
+            done_when: "Soon.".to_string(), // trimmed len = 5 < MIN_DONE_WHEN_LEN
+            depends_on: vec![],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        let g = make_graph(vec![t]);
+        let issues = qualify(&g);
+        assert!(
+            issues.iter().any(|i| i.code == "vague-done-when"
+                && i.task_id == Some(TaskId::new("vague-dw"))
+                && i.severity == IssueSeverity::Blocking
+                && i.source == IssueSource::Qualifier
+                && i.suggestion.is_some()),
+            "must flag vague-done-when for short done_when; got: {:?}",
+            issues
+        );
+        // Only the one expected code for this fixture.
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn qualify_flags_placeholder_text() {
+        let now = Utc::now();
+        let t = Task {
+            id: TaskId::new("has-todo"),
+            title: "Fix the widget".to_string(),
+            description: "We will update the code and tests. TODO: choose the right API."
+                .to_string(),
+            done_when: "All tests pass and the behaviour is as specified.".to_string(),
+            depends_on: vec![],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        let g = make_graph(vec![t]);
+        let issues = qualify(&g);
+        assert!(
+            issues.iter().any(|i| i.code == "placeholder-text"
+                && i.task_id == Some(TaskId::new("has-todo"))
+                && i.severity == IssueSeverity::Blocking
+                && i.source == IssueSource::Qualifier
+                && i.suggestion.is_some()),
+            "must flag placeholder-text when a marker appears in any field; got: {:?}",
+            issues
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn qualify_flags_non_actionable_title() {
+        let now = Utc::now();
+        let t = Task {
+            id: TaskId::new("the-stuff"),
+            title: "The big refactor effort".to_string(), // first word "The" in bad list, >=2 words
+            description: "A complete description that is long enough to pass the thin check."
+                .to_string(),
+            done_when: "The refactored code compiles cleanly and all new tests pass.".to_string(),
+            depends_on: vec![],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        let g = make_graph(vec![t]);
+        let issues = qualify(&g);
+        assert!(
+            issues.iter().any(|i| i.code == "non-actionable-title"
+                && i.task_id == Some(TaskId::new("the-stuff"))
+                && i.severity == IssueSeverity::Blocking
+                && i.source == IssueSource::Qualifier
+                && i.suggestion.is_some()),
+            "must flag non-actionable-title when first word is a known bad opener; got: {:?}",
+            issues
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn qualify_flags_thin_description() {
+        let now = Utc::now();
+        let t = Task {
+            id: TaskId::new("thin-desc"),
+            title: "Add the new helper".to_string(),
+            description: "Short one.".to_string(), // trimmed len = 10 < MIN_DESCRIPTION_LEN
+            done_when: "The helper is present, documented, and covered by unit tests.".to_string(),
+            depends_on: vec![],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        let g = make_graph(vec![t]);
+        let issues = qualify(&g);
+        assert!(
+            issues.iter().any(|i| i.code == "thin-description"
+                && i.task_id == Some(TaskId::new("thin-desc"))
+                && i.severity == IssueSeverity::Blocking
+                && i.source == IssueSource::Qualifier
+                && i.suggestion.is_some()),
+            "must flag thin-description for short description; got: {:?}",
+            issues
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn qualify_accepts_a_known_good_plan() {
+        // 2-task graph whose tasks mirror the style and substance of real
+        // plan-0003 work items: imperative titles, multi-sentence descriptions,
+        // and concrete (long, specific) done_when criteria.
+        let now = Utc::now();
+
+        let t1 = Task {
+            id: TaskId::new("mk-paths-module"),
+            title: "Add the `.makina/` paths module".to_string(),
+            description: "Create `crates/makina-core/src/paths.rs` with pure path-building helpers (no I/O, no logic). Pin exact signatures and include rustdoc examples that are exercised by `cargo test --doc`.".to_string(),
+            done_when: "A `#[cfg(test)] mod tests` with one `assert_eq!` per helper (using `Path::new(\"/repo\")`) exists; both `cargo test -p makina-core paths` and the doctests pass.".to_string(),
+            depends_on: vec![],
+            section: Some("0012".to_string()),
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+
+        let t2 = Task {
+            id: TaskId::new("mk-run-id"),
+            title: "Allocate a persistent ULID run identity".to_string(),
+            description: "Introduce the `ulid` crate and thread a stable 26-char ULID through RunEntry, RunView, DriverContext, and the start/open paths so that every run carries a sortable, unique identifier alongside the existing RunId handle.".to_string(),
+            done_when: "A test `open_runs_carry_distinct_sortable_run_uids` opens two runs and asserts both `run_uid` values are 26 chars, distinct, and the second sorts after the first; cargo test -p makina-core, clippy, and fmt all pass.".to_string(),
+            depends_on: vec![TaskId::new("mk-paths-module")],
+            section: Some("0012".to_string()),
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+
+        let g = make_graph(vec![t1, t2]);
+        let issues = qualify(&g);
+        assert!(
+            issues.is_empty(),
+            "a 2-task graph modelled on real plan-0003 tasks must produce zero qualify issues (thresholds must not be too strict); got: {:?}",
+            issues
         );
     }
 }
