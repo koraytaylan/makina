@@ -193,6 +193,168 @@ pub fn validate(graph: &TaskGraph) -> Vec<IngestionIssue> {
     issues
 }
 
+/// Scans a raw structured-text task list document and reports **all** convention
+/// violations (as blocking `Interpreter` issues) instead of failing fast like
+/// `parse_structured_text`. This is a pure line scanner (no graph construction,
+/// no I/O) used on the deterministic offline ingest path.
+pub fn lint_source(source_text: &str) -> Vec<IngestionIssue> {
+    const SEP: &str = " \u{2014} ";
+    let mut issues: Vec<IngestionIssue> = Vec::new();
+    let mut seen_section = false;
+    // (heading_line, task_id, has_depends, has_done) for in-progress task block
+    let mut current_task: Option<(usize, Option<String>, bool, bool)> = None;
+
+    /// Emit the two possible missing-field issues for a just-ended task block.
+    fn push_missing(
+        issues: &mut Vec<IngestionIssue>,
+        heading_line: usize,
+        task_id: Option<&String>,
+        has_dep: bool,
+        has_don: bool,
+    ) {
+        if !has_dep {
+            let msg = task_id.map_or_else(
+                || {
+                    format!(
+                        "parse error at line {heading_line}: task is missing the `- **Depends on:**` field"
+                    )
+                },
+                |id| {
+                    format!(
+                        "parse error at line {heading_line}: task `{id}` is missing the `- **Depends on:**` field"
+                    )
+                },
+            );
+            issues.push(IngestionIssue {
+                task_id: None,
+                severity: IssueSeverity::Blocking,
+                source: IssueSource::Interpreter,
+                code: "task-missing-depends-on".to_string(),
+                message: msg,
+                suggestion: None,
+            });
+        }
+        if !has_don {
+            let msg = task_id.map_or_else(
+                || {
+                    format!(
+                        "parse error at line {heading_line}: task is missing the `- **Done when:**` field"
+                    )
+                },
+                |id| {
+                    format!(
+                        "parse error at line {heading_line}: task `{id}` is missing the `- **Done when:**` field"
+                    )
+                },
+            );
+            issues.push(IngestionIssue {
+                task_id: None,
+                severity: IssueSeverity::Blocking,
+                source: IssueSource::Interpreter,
+                code: "task-missing-done-when".to_string(),
+                message: msg,
+                suggestion: None,
+            });
+        }
+    }
+
+    for (idx, raw_line) in source_text.lines().enumerate() {
+        let line_no = idx + 1; // 1-based
+
+        // ── Section heading: `## NNNN — Title` (or malformed) ─────────────────
+        if let Some(rest) = raw_line.strip_prefix("## ") {
+            if let Some((prev_line, prev_id, has_dep, has_don)) = current_task.take() {
+                push_missing(&mut issues, prev_line, prev_id.as_ref(), has_dep, has_don);
+            }
+            if !rest.contains(SEP) {
+                issues.push(IngestionIssue {
+                    task_id: None,
+                    severity: IssueSeverity::Blocking,
+                    source: IssueSource::Interpreter,
+                    code: "heading-missing-em-dash".to_string(),
+                    message: format!(
+                        "parse error at line {line_no}: section heading is missing the ` — ` separator (space + U+2014 + space)"
+                    ),
+                    suggestion: None,
+                });
+            }
+            seen_section = true;
+            continue;
+        }
+
+        // ── Task heading: `### {id} — {title}` (or malformed) ────────────────
+        if let Some(rest) = raw_line.strip_prefix("### ") {
+            let has_sep = rest.contains(SEP);
+            if !seen_section {
+                issues.push(IngestionIssue {
+                    task_id: None,
+                    severity: IssueSeverity::Blocking,
+                    source: IssueSource::Interpreter,
+                    code: "task-before-section".to_string(),
+                    message: format!(
+                        "parse error at line {line_no}: task heading found before any section heading"
+                    ),
+                    suggestion: None,
+                });
+            }
+            if !has_sep {
+                issues.push(IngestionIssue {
+                    task_id: None,
+                    severity: IssueSeverity::Blocking,
+                    source: IssueSource::Interpreter,
+                    code: "heading-missing-em-dash".to_string(),
+                    message: format!(
+                        "parse error at line {line_no}: task heading is missing the ` — ` separator (space + U+2014 + space)"
+                    ),
+                    suggestion: None,
+                });
+            }
+            // Commit previous task block before (possibly) starting a new one.
+            if let Some((prev_line, prev_id, has_dep, has_don)) = current_task.take() {
+                push_missing(&mut issues, prev_line, prev_id.as_ref(), has_dep, has_don);
+            }
+            if has_sep {
+                let task_id = rest.split_once(SEP).map(|(id, _)| id.trim().to_string());
+                current_task = Some((line_no, task_id, false, false));
+            } else {
+                current_task = None;
+            }
+            continue;
+        }
+
+        // ── Field lines (only track presence; do not validate content) ───────
+        if raw_line.strip_prefix("- **Depends on:** ").is_some() {
+            if let Some((_, _, has_dep, _)) = &mut current_task {
+                *has_dep = true;
+            }
+            continue;
+        }
+        if raw_line.strip_prefix("- **Done when:** ").is_some() {
+            if let Some((_, _, _, has_don)) = &mut current_task {
+                *has_don = true;
+            }
+            continue;
+        }
+
+        // ── Separator commits current task (mirrors parser) ──────────────────
+        if raw_line == "---" {
+            if let Some((prev_line, prev_id, has_dep, has_don)) = current_task.take() {
+                push_missing(&mut issues, prev_line, prev_id.as_ref(), has_dep, has_don);
+            }
+            continue;
+        }
+
+        // All other lines (preamble, descriptions, blank, continuations) ignored by lint.
+    }
+
+    // EOF: commit any final in-progress task.
+    if let Some((prev_line, prev_id, has_dep, has_don)) = current_task.take() {
+        push_missing(&mut issues, prev_line, prev_id.as_ref(), has_dep, has_don);
+    }
+
+    issues
+}
+
 // ── Tests (per task spec) ─────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -370,6 +532,268 @@ mod tests {
                 .any(|i| i.code == "dependency-cycle" && i.task_id.is_none()),
             "must flag dependency-cycle at graph level (task_id=None); got: {:?}",
             issues
+        );
+    }
+
+    // ── lint_source tests (per task spec) ─────────────────────────────────────
+
+    fn assert_lint_basics(issue: &IngestionIssue, expected_code: &str) {
+        assert_eq!(
+            issue.severity,
+            IssueSeverity::Blocking,
+            "lint issues are always Blocking"
+        );
+        assert_eq!(
+            issue.source,
+            IssueSource::Interpreter,
+            "lint_source produces Interpreter issues"
+        );
+        assert_eq!(issue.task_id, None, "lint_source sets task_id=None");
+        assert_eq!(issue.code, expected_code);
+        assert!(
+            issue.suggestion.is_none(),
+            "lint_source leaves suggestion=None"
+        );
+        assert!(
+            issue.message.contains("parse error at line"),
+            "message must embed 1-based line: {}",
+            issue.message
+        );
+    }
+
+    #[test]
+    fn lint_source_clean_document_has_no_issues() {
+        // Exact worked example from docs/spec/structured-text-convention.md §7
+        let source = r#"# Example Project — Build Task List
+
+Structured-text task list for Example Project.
+
+**Conventions**
+- Each task has a stable kebab-case **id** (also used for its branch
+  `task/{id}` and worktree `.worktrees/{id}/`).
+- **Depends on** lists *direct* structural prerequisites only.
+- The Planner adds further dependency edges automatically.
+- **Done when** is the acceptance check.
+
+---
+
+## 0001 — Foundation
+
+### init-repo — Initialise the repository
+Create the Git repository, add `.gitignore`, and push an initial commit.
+- **Depends on:** —
+- **Done when:** `git log` shows the initial commit and `.gitignore` is
+  present.
+
+### add-ci — Add CI pipeline
+Add a GitHub Actions workflow that runs `cargo test` on every push.
+- **Depends on:** init-repo
+- **Done when:** a push to `main` triggers the CI workflow and it passes.
+
+---
+
+## 0002 — Core Library
+
+### core-lib — Create core library crate
+Scaffold the `core` crate with a public API module and passing unit
+tests.
+- **Depends on:** init-repo, add-ci
+- **Done when:** `cargo test -p core` passes and the public API module
+  is documented.
+"#;
+        let issues = lint_source(source);
+        assert!(
+            issues.is_empty(),
+            "worked example from spec §7 must yield empty vec; got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn lint_source_detects_task_before_section() {
+        // Task heading appears before any ## section heading.
+        let source = r#"# T
+
+Preamble text.
+
+---
+
+### too-early — Task before section
+Description here.
+- **Depends on:** —
+- **Done when:** it is done.
+
+## 0001 — First Section
+
+### ok — Valid task
+Ok description.
+- **Depends on:** —
+- **Done when:** ok.
+"#;
+        let issues = lint_source(source);
+        let before: Vec<_> = issues
+            .iter()
+            .filter(|i| i.code == "task-before-section")
+            .collect();
+        assert_eq!(before.len(), 1, "exactly one task-before-section");
+        assert_lint_basics(before[0], "task-before-section");
+        // The offending ### is on line 7 in this fixture
+        assert!(
+            before[0].message.contains("7"),
+            "message must mention line 7: {}",
+            before[0].message
+        );
+    }
+
+    #[test]
+    fn lint_source_detects_heading_missing_em_dash() {
+        let source = r#"# T
+
+Preamble.
+
+---
+
+## 0001 Missing dash here
+Some text after bad section.
+
+### good — Good task
+Desc.
+- **Depends on:** —
+- **Done when:** done.
+
+### bad-task  Also missing dash
+More desc.
+- **Depends on:** —
+- **Done when:** also done.
+"#;
+        let issues = lint_source(source);
+        let dashless: Vec<_> = issues
+            .iter()
+            .filter(|i| i.code == "heading-missing-em-dash")
+            .collect();
+        assert_eq!(dashless.len(), 2, "two headings lack the em-dash separator");
+        assert_lint_basics(dashless[0], "heading-missing-em-dash");
+        assert_lint_basics(dashless[1], "heading-missing-em-dash");
+        // Lines: ## on 5, first ### good has dash, second ### on ~13 lacks
+        assert!(
+            dashless.iter().any(|i| i.message.contains("5")),
+            "one must be the ## on line 5"
+        );
+        assert!(
+            dashless.iter().any(|i| i.message.contains("task heading")),
+            "one must be a task heading"
+        );
+    }
+
+    #[test]
+    fn lint_source_detects_task_missing_depends_on() {
+        let source = r#"# T
+
+Preamble.
+
+---
+
+## 0001 — Section
+
+### no-dep — Task without depends line
+This task only has a Done when.
+- **Done when:** the work completes successfully.
+"#;
+        let issues = lint_source(source);
+        let missing: Vec<_> = issues
+            .iter()
+            .filter(|i| i.code == "task-missing-depends-on")
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert_lint_basics(missing[0], "task-missing-depends-on");
+        // Heading for the bad task is line 7
+        assert!(
+            missing[0].message.contains("9"),
+            "message should reference the task heading line 9: {}",
+            missing[0].message
+        );
+        assert!(
+            missing[0].message.contains("no-dep"),
+            "message should mention the task id when known"
+        );
+    }
+
+    #[test]
+    fn lint_source_detects_task_missing_done_when() {
+        let source = r#"# T
+
+Preamble.
+
+---
+
+## 0001 — Section
+
+### no-done — Task without done line
+Has depends but no done when before EOF.
+- **Depends on:** —
+"#;
+        let issues = lint_source(source);
+        let missing: Vec<_> = issues
+            .iter()
+            .filter(|i| i.code == "task-missing-done-when")
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert_lint_basics(missing[0], "task-missing-done-when");
+        assert!(
+            missing[0].message.contains("9"),
+            "message should reference heading line: {}",
+            missing[0].message
+        );
+        assert!(
+            missing[0].message.contains("no-done"),
+            "message should mention task id"
+        );
+    }
+
+    #[test]
+    fn lint_source_reports_all_problems_at_once() {
+        // Fixture with one dash-less heading + one task missing Done when.
+        // Must report BOTH (does not stop at first error).
+        let source = r#"# T
+
+Preamble.
+
+---
+
+## 0001  Dashless section heading
+
+### good — Has both fields
+Description.
+- **Depends on:** —
+- **Done when:** completes.
+
+### incomplete — Missing done when
+Desc.
+- **Depends on:** —
+"#; // EOF ends the last task without Done when
+        let issues = lint_source(source);
+        assert_eq!(
+            issues.len(),
+            2,
+            "must collect both problems, not stop at first; got: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.code == "heading-missing-em-dash"),
+            "must include heading-missing-em-dash"
+        );
+        assert!(
+            issues.iter().any(|i| i.code == "task-missing-done-when"),
+            "must include task-missing-done-when"
+        );
+        for i in &issues {
+            assert_lint_basics(i, &i.code);
+        }
+        // Discovery order: dashless ## is seen first (line 5), missing done is
+        // reported on EOF for the task whose heading was line 11.
+        assert!(
+            issues[0].code == "heading-missing-em-dash",
+            "first issue should be the dashless heading"
         );
     }
 }
