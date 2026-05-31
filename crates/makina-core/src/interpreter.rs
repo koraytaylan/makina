@@ -840,6 +840,37 @@ pub fn build_planner_interpreter(
     }
 }
 
+/// Build an ingestion-ready [`TaskListInterpreter`] by wrapping the result of
+/// [`build_planner_interpreter`] in [`crate::dependency::EdgeInferrer`].
+///
+/// This single composition helper routes the TUI/API interpreter choice
+/// through the mechanism factory so it is unit-testable instead of hand-wired
+/// in `main.rs`.
+///
+/// # Variants
+///
+/// | `mechanism` | `backend` | Result |
+/// |-------------|-----------|--------|
+/// | `OneShotAgent` | `Some(b)` | `EdgeInferrer::new( ModelInterpreter::new(b) )` |
+/// | `OneShotAgent` | `None` | `EdgeInferrer::new( StructuredTextInterpreter::new() )` (deterministic / offline path) |
+/// | `DirectApi` | any | `Err(InterpretError::MechanismNotSupported)` |
+///
+/// The three cases mirror the table on [`build_planner_interpreter`] exactly,
+/// with the `EdgeInferrer` decorator applied on success paths.
+/// `OneShotAgent + Some(backend)` yields the model-backed ingestion path,
+/// `OneShotAgent + None` the deterministic structured-text path, and
+/// `DirectApi` propagates [`InterpretError::MechanismNotSupported`].
+///
+/// [`PlannerMechanism`]: crate::config::PlannerMechanism
+pub fn build_ingestion_interpreter(
+    mechanism: &crate::config::PlannerMechanism,
+    backend: Option<Arc<dyn AgentBackend>>,
+) -> Result<Arc<dyn TaskListInterpreter>, InterpretError> {
+    Ok(std::sync::Arc::new(crate::dependency::EdgeInferrer::new(
+        build_planner_interpreter(mechanism, backend)?,
+    )))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1364,6 +1395,104 @@ Description of third.
             }
             Err(other) => panic!("expected MechanismNotSupported, got: {other:?}"),
             Ok(_) => panic!("DirectApi must not succeed"),
+        }
+    }
+
+    // ── build_ingestion_interpreter tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_ingestion_interpreter_model_path_interprets_canned_json() {
+        use crate::config::PlannerMechanism;
+
+        // One-task JSON that ModelInterpreter (inside EdgeInferrer) will parse.
+        let json = r#"{
+  "slug": "s",
+  "tasks": [
+    {
+      "id": "the-task",
+      "title": "The task",
+      "description": "Implements the feature.",
+      "done_when": "the task passes.",
+      "depends_on": [],
+      "section": "0001",
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }
+  ]
+}"#
+        .to_string();
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![json]));
+        let interpreter =
+            build_ingestion_interpreter(&PlannerMechanism::OneShotAgent, Some(backend))
+                .expect("build_ingestion_interpreter(OneShot + Some) must succeed");
+
+        let graph = interpreter
+            .interpret("s", "ignored")
+            .await
+            .expect("interpret via model path + EdgeInferrer must succeed");
+
+        assert_eq!(graph.slug, "s");
+        assert_eq!(
+            graph.tasks.len(),
+            1,
+            "graph must contain the one task from canned JSON"
+        );
+        assert!(
+            graph.tasks.iter().any(|t| t.id.0 == "the-task"),
+            "returned graph must contain the task from the canned JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_ingestion_interpreter_offline_path_parses_structured_text() {
+        use crate::config::PlannerMechanism;
+
+        // Minimal 1-task structured-text snippet (per the convention).
+        let source = r#"# s — Ingestion test
+
+## 0001 — One
+
+### only-task — Only task
+
+Does the one thing.
+
+- **Depends on:** —
+- **Done when:** the work is complete.
+
+"#;
+        let interpreter = build_ingestion_interpreter(&PlannerMechanism::OneShotAgent, None)
+            .expect("build_ingestion_interpreter(OneShot + None) must succeed");
+
+        let graph = interpreter
+            .interpret("s", source)
+            .await
+            .expect("interpret via offline structured-text path + EdgeInferrer must succeed");
+
+        assert_eq!(graph.slug, "s");
+        assert_eq!(graph.tasks.len(), 1);
+        assert_eq!(graph.tasks[0].id.0, "only-task");
+        graph
+            .validate()
+            .expect("graph from ingestion helper must validate");
+    }
+
+    #[tokio::test]
+    async fn build_ingestion_interpreter_direct_api_errors() {
+        use crate::config::PlannerMechanism;
+
+        let result = build_ingestion_interpreter(&PlannerMechanism::DirectApi, None);
+        match result {
+            Err(InterpretError::MechanismNotSupported { mechanism }) => {
+                assert!(
+                    mechanism.contains("direct-api"),
+                    "mechanism string should mention 'direct-api': {mechanism}"
+                );
+            }
+            Err(other) => panic!("expected MechanismNotSupported, got: {other:?}"),
+            Ok(_) => panic!("DirectApi must not succeed for build_ingestion_interpreter either"),
         }
     }
 }
