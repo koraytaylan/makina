@@ -569,7 +569,7 @@ impl CoreApi {
         let repo_root = &self.state.worktree_manager.repo_root;
 
         // 2. Try the persisted artifact first.
-        let graph = match crate::persist::load_graph(repo_root, &slug).await {
+        let (graph, interpret_issue) = match crate::persist::load_graph(repo_root, &slug).await {
             Ok(Some(mut loaded)) => {
                 // Apply the resume recovery rule: in-progress/in-review → ready.
                 crate::persist::recover_for_resume(&mut loaded);
@@ -577,7 +577,7 @@ impl CoreApi {
                 match loaded.validate() {
                     Ok(()) => {
                         // Artifact is usable — use it and skip the .md entirely.
-                        loaded
+                        (loaded, None)
                     }
                     Err(e) => {
                         // Corrupt artifact: warn and fall back to a fresh interpret.
@@ -609,10 +609,15 @@ impl CoreApi {
         };
 
         // Compute ingestion report (validate + qualify) right after graph is
-        // resolved (artifact or fresh), before registry insert.
+        // resolved (artifact or fresh), before registry insert.  Fold any
+        // carried interpret failure (from fresh path) into the report so the
+        // run is reviewable as Pending with a blocking issue.
         let report = {
             let mut issues = crate::ingestion::validate(&graph);
             issues.extend(crate::ingestion::qualify(&graph));
+            if let Some(issue) = interpret_issue {
+                issues.push(issue);
+            }
             crate::ingestion::IngestionReport { issues }
         };
 
@@ -652,24 +657,28 @@ impl CoreApi {
         Ok(CommandOutcome::RunOpened { run: id })
     }
 
-    /// Read + interpret the task-list file at `task_list_path` and seed-persist
-    /// the resulting graph.
+    /// Read + interpret the task-list file at `task_list_path` and (on success)
+    /// seed-persist the resulting graph.
     ///
     /// This is the "fresh path" factored out of [`open_run`] so the artifact-first
-    /// branch can call it as a fallback without duplicating code.  Returns the
-    /// interpreted [`TaskGraph`] ready to register.
+    /// branch can call it as a fallback without duplicating code.
+    ///
+    /// On success: returns `(graph, None)` after best-effort seed-persist.
+    /// On interpret failure: returns an empty graph + `Some(IngestionIssue)` (with
+    /// code `"interpreter-failed"`) **without** seed-persist; caller folds it into
+    /// the run report so `OpenRun` yields a reviewable Pending run.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::InvalidCommand`] if the file cannot be read or the
-    /// content cannot be interpreted.  Seed-persist failure is best-effort (logs a
-    /// warning but does not fail `open_run`).
+    /// Returns [`ApiError::InvalidCommand`] only on read failure (bad path is not
+    /// reviewable). Interpret failures surface as a carried issue instead of error.
+    /// Seed-persist failure is best-effort (logs a warning but does not fail `open_run`).
     async fn interpret_and_seed(
         &self,
         slug: &str,
         task_list_path: &std::path::Path,
         repo_root: &std::path::Path,
-    ) -> Result<TaskGraph, ApiError> {
+    ) -> Result<(TaskGraph, Option<crate::ingestion::IngestionIssue>), ApiError> {
         // Read the .md file.
         let text = tokio::fs::read_to_string(task_list_path)
             .await
@@ -681,27 +690,36 @@ impl CoreApi {
             })?;
 
         // Interpret into a fresh TaskGraph.
-        let graph = self
-            .state
-            .interpreter
-            .interpret(slug, &text)
-            .await
-            .map_err(|e| ApiError::InvalidCommand {
-                reason: format!("could not interpret task list `{slug}`: {e}"),
-            })?;
-
-        // Seed-persist the freshly-interpreted graph so the artifact exists
-        // immediately (before StartRun).  Best-effort: a failure only warns;
-        // opening a run must not break because the disk is unwritable.
-        if let Err(e) = crate::persist::persist_graph(&graph, repo_root).await {
-            tracing::warn!(
-                slug = %slug,
-                error = %e,
-                "seed-persist failed for freshly-opened run; continuing without artifact",
-            );
+        match self.state.interpreter.interpret(slug, &text).await {
+            Ok(graph) => {
+                // Seed-persist the freshly-interpreted graph so the artifact exists
+                // immediately (before StartRun).  Best-effort: a failure only warns;
+                // opening a run must not break because the disk is unwritable.
+                if let Err(e) = crate::persist::persist_graph(&graph, repo_root).await {
+                    tracing::warn!(
+                        slug = %slug,
+                        error = %e,
+                        "seed-persist failed for freshly-opened run; continuing without artifact",
+                    );
+                }
+                Ok((graph, None))
+            }
+            Err(e) => {
+                let graph = TaskGraph {
+                    slug: slug.into(),
+                    tasks: vec![],
+                };
+                let issue = crate::ingestion::IngestionIssue {
+                    task_id: None,
+                    severity: crate::ingestion::IssueSeverity::Blocking,
+                    source: crate::ingestion::IssueSource::Interpreter,
+                    code: "interpreter-failed".into(),
+                    message: format!("could not interpret task list `{slug}`: {e}"),
+                    suggestion: Some("fix the task list and re-interpret".into()),
+                };
+                Ok((graph, Some(issue)))
+            }
         }
-
-        Ok(graph)
     }
 
     /// Implement `StartRun`: spawn the Supervisor scheduler in the background.
@@ -1562,7 +1580,7 @@ Do the thing in `lib.rs`.
     }
 
     #[tokio::test]
-    async fn open_run_with_invalid_content_returns_error() {
+    async fn open_run_with_invalid_content_is_reviewable() {
         let (api, _repo) = execution_core_api();
         let bad = r#"# Bad — Task List
 
@@ -1579,21 +1597,32 @@ Does a thing.
 "#;
         let (_dir, path) = write_task_list(bad);
 
-        let result = api
+        let outcome = api
             .execute(Command::OpenRun {
                 task_list_path: path,
             })
-            .await;
-        match result {
-            Err(ApiError::InvalidCommand { reason }) => {
+            .await
+            .expect(
+                "OpenRun must succeed for interpret failure, producing a reviewable Pending run",
+            );
+        match outcome {
+            CommandOutcome::RunOpened { run } => {
+                let view = api
+                    .run(run)
+                    .await
+                    .expect("opened run must be queryable via run()");
                 assert!(
-                    reason.contains("could not interpret task list"),
-                    "error should explain the interpretation failure; got: {reason}"
+                    view.report.issues.iter().any(|i| {
+                        i.code == "interpreter-failed"
+                            && i.severity == crate::api::IssueSeverity::Blocking
+                    }),
+                    "RunView.report must carry a Blocking 'interpreter-failed' issue; got {:?}",
+                    view.report.issues
                 );
             }
-            other => panic!("expected InvalidCommand for invalid content, got {other:?}"),
+            other => panic!("expected RunOpened, got {other:?}"),
         }
-        assert!(api.runs().await.is_empty());
+        assert!(!api.runs().await.is_empty());
     }
 
     #[tokio::test]
