@@ -152,6 +152,14 @@ impl Api for PlaceholderApi {
                     Err(ApiError::UnknownRun { run })
                 }
             }
+            Command::ReinterpretRun { run } => {
+                let runs = self.runs.lock().unwrap();
+                if runs.iter().any(|r| r.id == run) {
+                    Ok(CommandOutcome::Acknowledged)
+                } else {
+                    Err(ApiError::UnknownRun { run })
+                }
+            }
         }
     }
 

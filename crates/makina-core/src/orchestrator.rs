@@ -917,6 +917,65 @@ impl CoreApi {
         Ok(CommandOutcome::Acknowledged)
     }
 
+    /// Implement `ReinterpretRun`: bypass artifact, re-interpret source .md,
+    /// recompute report, atomically replace graph+report under lock, emit
+    /// RunOpened (so TUI reloads the view), return Acknowledged.
+    async fn reinterpret_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let repo_root = self.state.worktree_manager.repo_root.clone();
+
+        // Lookup path + slug + enforce Pending (no lock held across the await).
+        let (task_list_path, slug) = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            if entry.status != RunStatus::Pending {
+                return Err(ApiError::InvalidCommand {
+                    reason: "reinterpret only valid for Pending runs".into(),
+                });
+            }
+            (entry.task_list_path.clone(), entry.run_slug.clone())
+        };
+
+        // Fresh interpret (the ingest-interpret-failure-recoverable path).
+        let (new_graph, interpret_issue) = self
+            .interpret_and_seed(&slug, &task_list_path, &repo_root)
+            .await?;
+
+        // Recompute report exactly as open_run does.
+        let report = {
+            let mut issues = crate::ingestion::validate(&new_graph);
+            issues.extend(crate::ingestion::qualify(&new_graph));
+            if let Some(issue) = interpret_issue {
+                issues.push(issue);
+            }
+            crate::ingestion::IngestionReport { issues }
+        };
+
+        // Replace under lock (second lookup is defensive for races with Cancel).
+        {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            entry.graph = Arc::new(AsyncMutex::new(new_graph));
+            entry.report = report;
+        }
+
+        // Emit RunOpened (reusing the event is the smaller change; its
+        // resolve_api_event + RunLoaded path will refresh the TUI's RunView).
+        let _ = self.state.event_tx.send(Event::RunOpened {
+            run,
+            task_list_path,
+        });
+
+        Ok(CommandOutcome::Acknowledged)
+    }
+
     /// Snapshot a single Run's view, locking the registry then the graph (never
     /// both at once, never the registry lock across the `.await`).
     async fn view_of(&self, id: RunId) -> Option<RunView> {
@@ -961,15 +1020,18 @@ impl Api for CoreApi {
     ///   (the Run actually executes) and returns [`CommandOutcome::Acknowledged`].
     /// * [`Command::PauseRun`] stops the scheduler launching NEW tasks.
     /// * [`Command::CancelRun`] aborts the scheduler and cleans up.
+    /// * [`Command::ReinterpretRun`] re-reads the source (async, like OpenRun).
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
             Command::OpenRun { task_list_path } => self.open_run(task_list_path).await,
             // Start/Pause/Cancel are synchronous registry+signal operations that
             // spawn/signal the background scheduler; none of them awaits, so they
             // are infallible-to-call and return promptly.
+            // ReinterpretRun is async (performs interpret I/O) like OpenRun.
             Command::StartRun { run } => self.start_run(run),
             Command::PauseRun { run } => self.pause_run(run),
             Command::CancelRun { run } => self.cancel_run(run),
+            Command::ReinterpretRun { run } => self.reinterpret_run(run).await,
         }
     }
 
@@ -2361,6 +2423,147 @@ This description is long enough to pass the thin-description threshold.
         let (api, _repo) = execution_core_api();
         let err = api.execute(Command::PauseRun { run: RunId(7) }).await;
         assert!(matches!(err, Err(ApiError::UnknownRun { .. })));
+    }
+
+    // ── ReinterpretRun ─────────────────────────────────────────────────────────
+
+    /// **Reinterpret clears a blocking report and allows StartRun.**
+    ///
+    /// Opens with a model-path interpreter + cycling NoopBackend whose first
+    /// response is a JSON graph with a non-actionable title (blocking report);
+    /// StartRun refused. ReinterpretRun forces re-interpret (second/clear graph);
+    /// report no longer blocked and StartRun now succeeds.
+    #[tokio::test]
+    async fn reinterpret_clears_block_and_allows_start() {
+        let blocked_json = r#"{
+  "slug": "reinterp",
+  "tasks": [
+    {
+      "id": "only",
+      "title": "The blocked task",
+      "description": "A sufficiently long description for qualify.",
+      "done_when": "The work completes successfully with tests passing.",
+      "depends_on": [],
+      "section": "0001",
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }
+  ]
+}"#
+        .to_string();
+
+        let clean_json = r#"{
+  "slug": "reinterp",
+  "tasks": [
+    {
+      "id": "only",
+      "title": "Implement the feature",
+      "description": "A sufficiently long description for qualify.",
+      "done_when": "The work completes successfully with tests passing.",
+      "depends_on": [],
+      "section": "0001",
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }
+  ]
+}"#
+        .to_string();
+
+        let backend: Arc<dyn crate::backend::AgentBackend> =
+            Arc::new(NoopBackend::with_responses(vec![blocked_json, clean_json]));
+
+        let interpreter = crate::interpreter::build_ingestion_interpreter(
+            &crate::config::PlannerMechanism::OneShotAgent,
+            Some(Arc::clone(&backend)),
+        )
+        .expect("model ingestion interpreter must build");
+
+        let repo_dir = setup_temp_repo();
+        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
+        let api = CoreApi::new(interpreter, backend, wm, no_gate_config());
+
+        let (_dir, path) = write_task_list(
+            "# Reinterp test\n\nPreamble.\n\n---\n\n## 0001\n\n### only — placeholder\nDesc long.\n- **Done when:** done when long enough.\n",
+        );
+
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .expect("OpenRun must succeed (blocked report is carried)")
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        // Initial report from first (blocked) response must block Start.
+        let view0 = api.run(run).await.expect("run exists");
+        assert!(
+            view0.report.is_blocked(),
+            "first graph must produce blocking report; issues: {:?}",
+            view0.report.issues
+        );
+        let err = api.execute(Command::StartRun { run }).await;
+        assert!(
+            matches!(err, Err(ApiError::InvalidCommand { .. })),
+            "StartRun must be refused while blocked; got {err:?}"
+        );
+
+        // Reinterpret pulls the second (clean) response.
+        let outcome = api
+            .execute(Command::ReinterpretRun { run })
+            .await
+            .expect("ReinterpretRun must succeed");
+        assert!(matches!(outcome, CommandOutcome::Acknowledged));
+
+        // Now report clean.
+        let view1 = api.run(run).await.expect("run still exists");
+        assert!(
+            !view1.report.is_blocked(),
+            "after reinterpret, report must not be blocked; issues: {:?}",
+            view1.report.issues
+        );
+
+        // StartRun now allowed.
+        let start_ok = api.execute(Command::StartRun { run }).await;
+        assert!(
+            matches!(start_ok, Ok(CommandOutcome::Acknowledged)),
+            "StartRun must succeed after reinterpret cleared the block; got {start_ok:?}"
+        );
+    }
+
+    /// Reinterpret on a non-Pending run is rejected with InvalidCommand.
+    #[tokio::test]
+    async fn reinterpret_rejected_when_not_pending() {
+        let (api, _repo) = execution_core_api();
+        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        // Advance to Running.
+        api.execute(Command::StartRun { run }).await.unwrap();
+        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Running);
+
+        let err = api.execute(Command::ReinterpretRun { run }).await;
+        assert!(
+            matches!(err, Err(ApiError::InvalidCommand { .. })),
+            "reinterpret on Running run must yield InvalidCommand; got {err:?}"
+        );
     }
 
     // ── subscribe semantics ───────────────────────────────────────────────────

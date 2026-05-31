@@ -333,6 +333,18 @@ pub enum Command {
         /// The Run to cancel.
         run: RunId,
     },
+
+    /// Re-interpret a [`RunStatus::Pending`] Run from its source file,
+    /// bypassing any persisted artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::UnknownRun`] if `run` does not identify an open Run.
+    /// Returns [`ApiError::InvalidCommand`] if the Run is not currently pending.
+    ReinterpretRun {
+        /// The Run to re-interpret.
+        run: RunId,
+    },
 }
 
 /// The successful outcome of a [`Command`] executed via [`Api::execute`].
@@ -347,7 +359,7 @@ pub enum CommandOutcome {
     },
 
     /// Returned by commands that have no specific output to report
-    /// ([`Command::StartRun`], [`Command::PauseRun`], [`Command::CancelRun`]).
+    /// ([`Command::StartRun`], [`Command::PauseRun`], [`Command::CancelRun`], [`Command::ReinterpretRun`]).
     ///
     /// The TUI should react to state changes via the [`EventStream`] rather
     /// than polling after receiving `Acknowledged`.
@@ -732,6 +744,14 @@ mod tests {
                     let before = runs.len();
                     runs.retain(|r| r.id != run);
                     if runs.len() < before {
+                        Ok(CommandOutcome::Acknowledged)
+                    } else {
+                        Err(ApiError::UnknownRun { run })
+                    }
+                }
+                Command::ReinterpretRun { run } => {
+                    let runs = self.runs.lock().unwrap();
+                    if runs.iter().any(|r| r.id == run) {
                         Ok(CommandOutcome::Acknowledged)
                     } else {
                         Err(ApiError::UnknownRun { run })
