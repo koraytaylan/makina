@@ -388,7 +388,7 @@ async fn read_loop<R, W>(
                 match serde_json::from_str::<IncomingMessage>(trimmed) {
                     Ok(message) => route_message(message, &shared, &notif_tx, &sender).await,
                     Err(_) => {
-                        eprintln!("[acp] ignoring non-JSON-RPC line: {trimmed}");
+                        tracing::debug!(target: "acp", "ignoring non-JSON-RPC line: {trimmed}");
                     }
                 }
             }
@@ -515,7 +515,7 @@ async fn route_message<W>(
                             sender.inner.audit_sink.record(entry);
                         }
                         Err(e) => {
-                            eprintln!("[acp] malformed permission request params: {e}");
+                            tracing::warn!(target: "acp", "malformed permission request params: {e}");
                             let _ = sender
                                 .send_error_response(
                                     req_id,
@@ -543,8 +543,9 @@ async fn route_message<W>(
             } else {
                 // Other inbound requests (tools, etc.): log and reply with
                 // method-not-found so the peer's request never hangs.
-                eprintln!(
-                    "[acp] inbound request for unsupported method {method}; replying with error so caller does not hang"
+                tracing::warn!(
+                    target: "acp",
+                    "inbound request for unsupported method {method}; replying with error so caller does not hang"
                 );
                 let _ = sender
                     .send_error_response(

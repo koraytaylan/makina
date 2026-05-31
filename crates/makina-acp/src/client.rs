@@ -395,9 +395,9 @@ impl AcpClient {
     /// If the agent surfaces an error during `initialize` or `session/prompt` that
     /// suggests it is not authenticated, check that the CLI is signed in independently
     /// (`gemini auth login`, `claude` login, etc.) and re-run. The error will surface
-    /// as [`AcpError::Rpc`] or [`AcpError::AgentExited`]; the agent's stderr (forwarded
-    /// to this process's stderr as `[acp-agent] …` lines) typically contains the
-    /// human-readable reason.
+    /// as [`AcpError::Rpc`] or [`AcpError::AgentExited`]; the agent's stderr
+    /// (forwarded to `tracing` under the `acp_agent` target → the run/task log
+    /// file and the TUI error pane) typically contains the human-readable reason.
     pub fn auth_methods(&self) -> &[crate::protocol::AuthMethod] {
         &self.auth_methods
     }
@@ -589,8 +589,10 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
         .take()
         .ok_or_else(|| AcpError::Spawn("child stdout was not captured".into()))?;
 
-    // Forward the agent's stderr to ours so operators can see auth/errors. This
-    // task ends when stderr closes (process exit); it holds no client state.
+    // Forward the agent's stderr into `tracing` (never raw stderr) so operators
+    // can see auth/errors in the run/task log + TUI error pane without dumping
+    // over the live frame. This task ends when stderr closes (process exit); it
+    // holds no client state.
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(forward_stderr(stderr));
     }
@@ -605,12 +607,18 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
     Ok((child, pgid, transport))
 }
 
-/// Drain the child's stderr line-by-line to this process's stderr.
+/// Drain the child's stderr line-by-line into `tracing`.
+///
+/// Each line is emitted as a `tracing::info!` event under the `acp_agent`
+/// target so plan-0003's subscriber routes it to the per-run/per-task log file
+/// and the TUI error pane. It must **not** be written to this process's stderr:
+/// the ACP backend runs while the TUI's ratatui frame is live, so a raw
+/// `eprintln!` would dump over the alternate screen and corrupt the UI.
 async fn forward_stderr(stderr: tokio::process::ChildStderr) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        eprintln!("[acp-agent] {line}");
+        tracing::info!(target: "acp_agent", "{line}");
     }
 }
 
