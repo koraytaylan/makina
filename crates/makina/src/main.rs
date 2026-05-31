@@ -102,16 +102,25 @@ async fn main() {
 
     // ── Api ───────────────────────────────────────────────────────────────────
     // The real, core-backed orchestrator Api.  It opens Runs by reading a
-    // task-list file and interpreting it with the DETERMINISTIC interpreter
-    // (`StructuredTextInterpreter`) wrapped in the cross-cutting `EdgeInferrer`
-    // decorator — so the TUI can open runs with no model/auth — then drives them
-    // with the injected backend + worktree manager + config (task 31).
-    //
-    // Seam for the e2e (task 33): swap `StructuredTextInterpreter` for a
-    // `ModelInterpreter` over the ACP backend to get model-backed planning.
-    let interpreter = Arc::new(EdgeInferrer::new(
-        Arc::new(StructuredTextInterpreter::new()),
-    ));
+    // task-list file and interpreting it via `build_ingestion_interpreter`
+    // (the **model** interpreter is now the default per `config.planner.mechanism`
+    // + ACP backend; deterministic `StructuredTextInterpreter` + `EdgeInferrer`
+    // is the offline/`None`-backend fallback) — then drives them with the
+    // injected backend + worktree manager + config (task 31).
+    let interpreter = match makina_core::interpreter::build_ingestion_interpreter(
+        &config.planner.mechanism,
+        Some(Arc::clone(&backend)),
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "planner mechanism unavailable; falling back to deterministic interpreter: {e}"
+            );
+            Arc::new(EdgeInferrer::new(
+                Arc::new(StructuredTextInterpreter::new()),
+            )) as Arc<dyn makina_core::interpreter::TaskListInterpreter>
+        }
+    };
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
         interpreter,
         backend,

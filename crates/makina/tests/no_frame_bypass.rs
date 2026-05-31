@@ -8,12 +8,13 @@
 //! (`tui-error-pane-channel-wire`), so nothing writes outside the frame and
 //! corrupts the alternate screen.
 //!
-//! `main.rs` is handled separately: it is allowed to contain EXACTLY the three
+//! `main.rs` is handled separately: it is allowed to contain EXACTLY the four
 //! fatal `eprintln!` sites that are intentionally exempt because none runs while
 //! a live ratatui frame exists — the config-load failure (pre-`Tui::init()`),
-//! the terminal-init failure itself, and the post-`tui.restore()` error print.
-//! The test pins the count to three so a NEW in-frame `eprintln!` added to
-//! `main.rs` (e.g. between `Tui::init()` and `tui.restore()`) trips the guard.
+//! the planner-mechanism fallback notice (pre-`Tui::init()`), the terminal-init
+//! failure itself, and the post-`tui.restore()` error print.  The test pins the
+//! count to four so a NEW in-frame `eprintln!` added to `main.rs` (e.g. between
+//! `Tui::init()` and `tui.restore()`) trips the guard.
 
 use std::path::PathBuf;
 
@@ -22,9 +23,9 @@ use std::path::PathBuf;
 /// the alternate screen, so none may contain `eprintln!`/`println!`.
 const LIVE_FRAME_REGION: &[&str] = &["event.rs", "app.rs", "ui.rs", "tui.rs", "browser.rs"];
 
-/// `main.rs` is exempt but pinned: exactly these three FATAL sites may print,
+/// `main.rs` is exempt but pinned: exactly these four FATAL sites may print,
 /// and only because each runs with NO live ratatui frame.
-const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 3;
+const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 4;
 
 fn src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -80,8 +81,9 @@ fn main_rs_has_exactly_the_three_exempt_print_sites() {
         count, MAIN_RS_EXEMPT_PRINT_COUNT,
         "main.rs must contain EXACTLY the {MAIN_RS_EXEMPT_PRINT_COUNT} fatal, \
          frame-exempt eprintln! sites (config-load failure before Tui::init(), \
-         terminal-init failure, and the post-tui.restore() error print); found \
-         {count}. A new print here likely means an in-frame error is bypassing \
-         the error pane — route it through tracing::error! instead.",
+         planner-mechanism fallback before Tui::init(), terminal-init failure, \
+         and the post-tui.restore() error print); found {count}. A new print \
+         here likely means an in-frame error is bypassing the error pane — \
+         route it through tracing::error! instead.",
     );
 }
