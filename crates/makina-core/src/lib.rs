@@ -13,6 +13,7 @@ pub mod config;
 pub mod dependency;
 pub mod gate;
 pub mod governance;
+pub mod ingestion;
 pub mod interpreter;
 pub(crate) mod json;
 pub mod log_record;
