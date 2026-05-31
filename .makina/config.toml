@@ -25,11 +25,11 @@
 # except via the squash-merge of an approved, gate-passing task branch.
 base_branch = "develop"
 
-# How many tasks may run concurrently (each in its own worktree). Kept
-# conservative for this repo: agent turns drive real model calls and each gate
-# pass compiles the whole workspace, so a low ceiling keeps machine load and
-# the merge-lock contention sane. Raise it on a beefier machine.
-concurrency = 2
+# How many tasks may run concurrently (each in its own worktree). Set to 10 to
+# parallelise aggressively. Note each gate pass compiles the whole workspace and
+# agent turns drive real model calls, so a high ceiling raises machine load and
+# merge-lock contention; lower it if the machine struggles.
+concurrency = 10
 
 # Termination caps (project overrides of the global defaults). Generous on
 # iterations because a real agent may need a couple of rounds to make the gates
