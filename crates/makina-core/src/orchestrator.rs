@@ -569,7 +569,7 @@ impl CoreApi {
         let repo_root = &self.state.worktree_manager.repo_root;
 
         // 2. Try the persisted artifact first.
-        let (graph, interpret_issue) = match crate::persist::load_graph(repo_root, &slug).await {
+        let (graph, interpret_issues) = match crate::persist::load_graph(repo_root, &slug).await {
             Ok(Some(mut loaded)) => {
                 // Apply the resume recovery rule: in-progress/in-review → ready.
                 crate::persist::recover_for_resume(&mut loaded);
@@ -577,7 +577,7 @@ impl CoreApi {
                 match loaded.validate() {
                     Ok(()) => {
                         // Artifact is usable — use it and skip the .md entirely.
-                        (loaded, None)
+                        (loaded, vec![])
                     }
                     Err(e) => {
                         // Corrupt artifact: warn and fall back to a fresh interpret.
@@ -615,9 +615,7 @@ impl CoreApi {
         let report = {
             let mut issues = crate::ingestion::validate(&graph);
             issues.extend(crate::ingestion::qualify(&graph));
-            if let Some(issue) = interpret_issue {
-                issues.push(issue);
-            }
+            issues.extend(interpret_issues);
             crate::ingestion::IngestionReport { issues }
         };
 
@@ -663,22 +661,27 @@ impl CoreApi {
     /// This is the "fresh path" factored out of [`open_run`] so the artifact-first
     /// branch can call it as a fallback without duplicating code.
     ///
-    /// On success: returns `(graph, None)` after best-effort seed-persist.
-    /// On interpret failure: returns an empty graph + `Some(IngestionIssue)` (with
-    /// code `"interpreter-failed"`) **without** seed-persist; caller folds it into
-    /// the run report so `OpenRun` yields a reviewable Pending run.
+    /// On success: returns `(graph, vec![])` after best-effort seed-persist.
+    /// On interpret failure: returns an empty graph + `Vec<IngestionIssue>`
+    /// **without** seed-persist; caller folds them into the run report so `OpenRun`
+    /// yields a reviewable Pending run.
+    ///
+    /// When the underlying error is a `ParseError` from the deterministic
+    /// structured-text path, the detailed issues produced by `lint_source` (the
+    /// four convention codes) are returned instead of a generic item so that the
+    /// report contains the multi-error diagnostics promised by plan 0004.
     ///
     /// # Errors
     ///
     /// Returns [`ApiError::InvalidCommand`] only on read failure (bad path is not
-    /// reviewable). Interpret failures surface as a carried issue instead of error.
+    /// reviewable). Interpret failures surface as carried issues instead of error.
     /// Seed-persist failure is best-effort (logs a warning but does not fail `open_run`).
     async fn interpret_and_seed(
         &self,
         slug: &str,
         task_list_path: &std::path::Path,
         repo_root: &std::path::Path,
-    ) -> Result<(TaskGraph, Option<crate::ingestion::IngestionIssue>), ApiError> {
+    ) -> Result<(TaskGraph, Vec<crate::ingestion::IngestionIssue>), ApiError> {
         // Read the .md file.
         let text = tokio::fs::read_to_string(task_list_path)
             .await
@@ -688,6 +691,9 @@ impl CoreApi {
                     task_list_path.display()
                 ),
             })?;
+
+        let lint_issues: Vec<crate::ingestion::IngestionIssue> =
+            crate::ingestion::lint_source(&text);
 
         // Interpret into a fresh TaskGraph.
         match self.state.interpreter.interpret(slug, &text).await {
@@ -702,22 +708,32 @@ impl CoreApi {
                         "seed-persist failed for freshly-opened run; continuing without artifact",
                     );
                 }
-                Ok((graph, None))
+                Ok((graph, vec![]))
             }
             Err(e) => {
                 let graph = TaskGraph {
                     slug: slug.into(),
                     tasks: vec![],
                 };
-                let issue = crate::ingestion::IngestionIssue {
-                    task_id: None,
-                    severity: crate::ingestion::IssueSeverity::Blocking,
-                    source: crate::ingestion::IssueSource::Interpreter,
-                    code: "interpreter-failed".into(),
-                    message: format!("could not interpret task list `{slug}`: {e}"),
-                    suggestion: Some("fix the task list and re-interpret".into()),
+                let issues = match &e {
+                    crate::interpreter::InterpretError::ParseError { .. }
+                        if !lint_issues.is_empty() =>
+                    {
+                        lint_issues
+                    }
+                    crate::interpreter::InterpretError::ValidationFailed(ge) => {
+                        crate::ingestion::validator_issues_from_graph_error(ge)
+                    }
+                    _ => vec![crate::ingestion::IngestionIssue {
+                        task_id: None,
+                        severity: crate::ingestion::IssueSeverity::Blocking,
+                        source: crate::ingestion::IssueSource::Interpreter,
+                        code: "interpreter-failed".into(),
+                        message: format!("could not interpret task list `{slug}`: {e}"),
+                        suggestion: Some("fix the task list and re-interpret".into()),
+                    }],
                 };
-                Ok((graph, Some(issue)))
+                Ok((graph, issues))
             }
         }
     }
@@ -922,6 +938,11 @@ impl CoreApi {
     /// Implement `ReinterpretRun`: bypass artifact, re-interpret source .md,
     /// recompute report, atomically replace graph+report under lock, emit
     /// RunOpened (so TUI reloads the view), return Acknowledged.
+    ///
+    // Concurrent ReinterpretRun calls on the same run are not serialized beyond the
+    // registry lock. Last writer wins (the second swap overwrites the first's graph+report).
+    // This is the same tolerance already present for concurrent OpenRun of the same slug
+    // from two TUI instances.  A per-run in-flight flag can be added later if needed.
     async fn reinterpret_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
         let repo_root = self.state.worktree_manager.repo_root.clone();
 
@@ -942,7 +963,7 @@ impl CoreApi {
         };
 
         // Fresh interpret (the ingest-interpret-failure-recoverable path).
-        let (new_graph, interpret_issue) = self
+        let (new_graph, interpret_issues) = self
             .interpret_and_seed(&slug, &task_list_path, &repo_root)
             .await?;
 
@@ -950,13 +971,13 @@ impl CoreApi {
         let report = {
             let mut issues = crate::ingestion::validate(&new_graph);
             issues.extend(crate::ingestion::qualify(&new_graph));
-            if let Some(issue) = interpret_issue {
-                issues.push(issue);
-            }
+            issues.extend(interpret_issues);
             crate::ingestion::IngestionReport { issues }
         };
 
-        // Replace under lock (second lookup is defensive for races with Cancel).
+        // Second lookup + re-check (defensive for races with Cancel or with a StartRun
+        // that became legal because this re-interpret cleared the last blocker).
+        // We deliberately do not hold the registry lock across the await above.
         {
             let mut runs = self
                 .state
@@ -964,6 +985,11 @@ impl CoreApi {
                 .lock()
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            if entry.status != RunStatus::Pending {
+                return Err(ApiError::InvalidCommand {
+                    reason: "reinterpret only valid for Pending runs".into(),
+                });
+            }
             entry.graph = Arc::new(AsyncMutex::new(new_graph));
             entry.report = report;
         }
@@ -1693,16 +1719,125 @@ Does a thing.
                     .expect("opened run must be queryable via run()");
                 assert!(
                     view.report.issues.iter().any(|i| {
-                        i.code == "interpreter-failed"
+                        i.code == "dangling-dependency"
+                            && i.source == crate::api::IssueSource::Validator
                             && i.severity == crate::api::IssueSeverity::Blocking
+                            && i.suggestion.is_some()
                     }),
-                    "RunView.report must carry a Blocking 'interpreter-failed' issue; got {:?}",
+                    "expected rich Validator dangling issue; got {:?}",
                     view.report.issues
                 );
             }
             other => panic!("expected RunOpened, got {other:?}"),
         }
         assert!(!api.runs().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_run_with_duplicate_task_id_reports_validator_issue() {
+        let (api, _repo) = execution_core_api();
+        let dup = r#"# Dup — Task List
+
+Preamble.
+
+---
+
+## 0001 — X
+
+### same-id — First task
+Does the first thing with enough description text here.
+- **Depends on:** —
+- **Done when:** first thing done successfully.
+
+### same-id — Second task
+Does the second thing with enough description text here.
+- **Depends on:** —
+- **Done when:** second thing done successfully.
+"#;
+        let (_dir, path) = write_task_list(dup);
+
+        let outcome = api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .expect("OpenRun must succeed for validation failure");
+        let run = match outcome {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("expected RunOpened, got {other:?}"),
+        };
+
+        let view = api.run(run).await.expect("run must be queryable");
+        assert!(
+            view.report.issues.iter().any(|i| {
+                i.code == "duplicate-task-id"
+                    && i.source == crate::api::IssueSource::Validator
+                    && i.severity == crate::api::IssueSeverity::Blocking
+            }),
+            "expected Validator duplicate-task-id issue; got {:?}",
+            view.report.issues
+        );
+    }
+
+    #[tokio::test]
+    async fn open_run_with_bad_convention_source_produces_lint_issues_in_report() {
+        let bad_source = r#"# Bad Convention
+
+Preamble.
+
+---
+
+## 0001 Dashless Section   // missing em-dash
+
+### first — First task
+Desc that is long enough.
+- **Depends on:** —
+// missing Done when entirely
+"#;
+
+        let (_dir, path) = write_task_list(bad_source);
+
+        let (api, _repo) = execution_core_api();
+        let outcome = api
+            .execute(Command::OpenRun {
+                task_list_path: path.clone(),
+            })
+            .await
+            .expect("OpenRun must succeed even for lint-only problems");
+        let run = match outcome {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("expected RunOpened, got {other:?}"),
+        };
+
+        let view = api.run(run).await.expect("run must be queryable");
+        let codes: Vec<_> = view.report.issues.iter().map(|i| i.code.as_str()).collect();
+
+        assert!(
+            codes.contains(&"heading-missing-em-dash"),
+            "must contain heading-missing-em-dash from lint; got: {:?}",
+            codes
+        );
+        assert!(
+            codes.contains(&"task-missing-done-when"),
+            "must contain task-missing-done-when from lint; got: {:?}",
+            codes
+        );
+        assert!(
+            view.report.is_blocked(),
+            "lint issues must be Blocking so the gate refuses StartRun"
+        );
+
+        // Overwrite with a clean list and re-interpret to clear the report.
+        std::fs::write(&path, SAMPLE_TASK_LIST).expect("overwrite with clean source");
+        api.execute(Command::ReinterpretRun { run })
+            .await
+            .expect("ReinterpretRun must succeed");
+        let view_after = api.run(run).await.expect("run still exists");
+        assert!(
+            !view_after.report.is_blocked(),
+            "clean re-interpret must clear blocking lint issues; got {:?}",
+            view_after.report.issues
+        );
     }
 
     #[tokio::test]

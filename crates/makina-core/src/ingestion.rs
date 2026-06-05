@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dependency::transitive_depends_on;
-use crate::task::{TaskGraph, TaskId};
+use crate::task::{TaskGraph, TaskGraphError, TaskId};
 
 // ── Qualifier thresholds (tunable, test-pinned) ──────────────────────────────
 
@@ -217,6 +217,34 @@ pub fn validate(graph: &TaskGraph) -> Vec<IngestionIssue> {
     }
 
     issues
+}
+
+/// Maps a [`TaskGraphError`] from interpret-time validation into the same
+/// [`IngestionIssue`] shapes that [`validate`] would emit for that defect.
+///
+/// Used by `interpret_and_seed` to give users the same codes they would have
+/// seen from validate had a graph been built.
+pub(crate) fn validator_issues_from_graph_error(e: &TaskGraphError) -> Vec<IngestionIssue> {
+    match e {
+        TaskGraphError::DuplicateId { id } => vec![IngestionIssue {
+            task_id: Some(id.clone()),
+            severity: IssueSeverity::Blocking,
+            source: IssueSource::Validator,
+            code: "duplicate-task-id".to_string(),
+            message: format!("duplicate task id: {id}"),
+            suggestion: Some("ensure every task has a unique id".to_string()),
+        }],
+        TaskGraphError::UnresolvedDependency { task, missing } => vec![IngestionIssue {
+            task_id: Some(task.clone()),
+            severity: IssueSeverity::Blocking,
+            source: IssueSource::Validator,
+            code: "dangling-dependency".to_string(),
+            message: format!("task `{task}` depends on unknown task `{missing}`"),
+            suggestion: Some(
+                "remove the reference or add the missing task to the graph".to_string(),
+            ),
+        }],
+    }
 }
 
 /// Scans a raw structured-text task list document and reports **all** convention
@@ -649,6 +677,54 @@ mod tests {
             "must flag dependency-cycle at graph level (task_id=None); got: {:?}",
             issues
         );
+    }
+
+    // ── validator_issues_from_graph_error tests ───────────────────────────────
+
+    #[test]
+    fn validator_issues_from_graph_error_maps_duplicate_id() {
+        let id = TaskId::new("dupe");
+        let issues = validator_issues_from_graph_error(&TaskGraphError::DuplicateId {
+            id: id.clone(),
+        });
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.code, "duplicate-task-id");
+        assert_eq!(issue.source, IssueSource::Validator);
+        assert_eq!(issue.severity, IssueSeverity::Blocking);
+        assert_eq!(issue.task_id, Some(id));
+        assert!(issue.suggestion.is_some());
+        assert_eq!(
+            validate(&make_graph(vec![
+                make_task("dupe", "done criterion", vec![]),
+                make_task("dupe", "done criterion", vec![]),
+            ]))
+            .into_iter()
+            .find(|i| i.code == "duplicate-task-id")
+            .map(|v| (v.code.clone(), v.message.clone(), v.suggestion.clone())),
+            Some((
+                issue.code.clone(),
+                issue.message.clone(),
+                issue.suggestion.clone()
+            ))
+        );
+    }
+
+    #[test]
+    fn validator_issues_from_graph_error_maps_unresolved_dependency() {
+        let task = TaskId::new("only");
+        let missing = TaskId::new("ghost");
+        let issues = validator_issues_from_graph_error(&TaskGraphError::UnresolvedDependency {
+            task: task.clone(),
+            missing: missing.clone(),
+        });
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.code, "dangling-dependency");
+        assert_eq!(issue.source, IssueSource::Validator);
+        assert_eq!(issue.severity, IssueSeverity::Blocking);
+        assert_eq!(issue.task_id, Some(task));
+        assert!(issue.suggestion.is_some());
     }
 
     // ── lint_source tests (per task spec) ─────────────────────────────────────
