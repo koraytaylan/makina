@@ -324,8 +324,18 @@ fn build_view(
 /// `&self` methods cannot be borrowed by a `'static` spawned future, but a
 /// cloned `Arc<CoreState>` can.
 struct CoreState {
-    /// The interpreter used to turn task-list source text into a [`TaskGraph`].
+    /// The interpreter used to turn task-list source text into a [`TaskGraph`]
+    /// for `OpenRun` / `ReinterpretRun` (the ingestion path).  Always the
+    /// deterministic `StructuredTextInterpreter + EdgeInferrer` in the TUI
+    /// binary for responsiveness.
     interpreter: Arc<dyn TaskListInterpreter>,
+
+    /// The interpreter passed to the per-run `Planner` actor (via `run_graph`).
+    /// This one *does* respect `config.planner.mechanism` (may be model-backed
+    /// via `build_planner_interpreter`).  Separate from the ingestion interpreter
+    /// so that TUI file opens stay fast/local while planner authoring flows can
+    /// use the model.
+    planner_interpreter: Arc<dyn TaskListInterpreter>,
 
     /// The agent backend cloned into each background scheduler (and from there
     /// into every per-task Developer/Reviewer).  Injected so the deterministic
@@ -485,10 +495,12 @@ pub struct CoreApi {
 impl CoreApi {
     /// Create a new `CoreApi` with all execution dependencies injected.
     ///
-    /// The TUI passes the deterministic interpreter, a `NoopBackend` (or the ACP
-    /// backend), a `WorktreeManager` pointed at the repo, and a resolved
-    /// `Config`.  Tests pass `NoopBackend` + a temp-repo `WorktreeManager` + a
-    /// trivial `Config`.
+    /// The TUI passes the deterministic *ingestion* interpreter (for OpenRun),
+    /// a separate *planner* interpreter (respecting mechanism, for the Planner
+    /// actor), a `NoopBackend` (or the ACP backend), a `WorktreeManager` pointed
+    /// at the repo, and a resolved `Config`.  Tests pass `NoopBackend` + a
+    /// temp-repo `WorktreeManager` + a trivial `Config` (planner defaults to
+    /// same as ingestion).
     ///
     /// `audit_registry` is the seam the Supervisor uses to register each task's
     /// worktree context before dispatching a driver.  Pass
@@ -502,8 +514,14 @@ impl CoreApi {
         worktree_manager: WorktreeManager,
         config: Config,
     ) -> Self {
+        let planner_interpreter = Arc::clone(&interpreter);
         Self::with_audit_registry(
             interpreter,
+            // For the simple `new` path (mostly tests), default planner to same
+            // as ingestion interpreter.  The TUI binary and tests that care
+            // about planner mechanism will use `with_audit_registry` (or the
+            // updated helpers) to pass a separately-built one.
+            planner_interpreter,
             backend,
             worktree_manager,
             config,
@@ -516,8 +534,12 @@ impl CoreApi {
     /// Use this in production to inject the `JsonlAuditSink` so the Supervisor
     /// can register each task's worktree context and audit entries are routed to
     /// `.tasks/{slug}/audit.jsonl`.
+    ///
+    /// Note the two interpreters: `interpreter` (ingestion, for OpenRun) and
+    /// `planner_interpreter` (for the Planner actor / mechanism).
     pub fn with_audit_registry(
         interpreter: Arc<dyn TaskListInterpreter>,
+        planner_interpreter: Arc<dyn TaskListInterpreter>,
         backend: Arc<dyn AgentBackend>,
         worktree_manager: WorktreeManager,
         config: Config,
@@ -527,6 +549,7 @@ impl CoreApi {
         Self {
             state: Arc::new(CoreState {
                 interpreter,
+                planner_interpreter,
                 backend,
                 worktree_manager,
                 config,
@@ -586,14 +609,14 @@ impl CoreApi {
                             error = %e,
                             "persisted artifact failed validation; falling back to fresh interpret",
                         );
-                        self.interpret_and_seed(&slug, &task_list_path, repo_root)
+                        self.interpret_and_seed(&slug, &task_list_path, repo_root, true)
                             .await?
                     }
                 }
             }
             Ok(None) => {
                 // No artifact yet — fresh interpret + seed.
-                self.interpret_and_seed(&slug, &task_list_path, repo_root)
+                self.interpret_and_seed(&slug, &task_list_path, repo_root, true)
                     .await?
             }
             Err(e) => {
@@ -603,7 +626,7 @@ impl CoreApi {
                     error = %e,
                     "failed to load persisted artifact; falling back to fresh interpret",
                 );
-                self.interpret_and_seed(&slug, &task_list_path, repo_root)
+                self.interpret_and_seed(&slug, &task_list_path, repo_root, true)
                     .await?
             }
         };
@@ -676,11 +699,16 @@ impl CoreApi {
     /// Returns [`ApiError::InvalidCommand`] only on read failure (bad path is not
     /// reviewable). Interpret failures surface as carried issues instead of error.
     /// Seed-persist failure is best-effort (logs a warning but does not fail `open_run`).
+    ///
+    /// When `seed_persist` is `false` (used by [`reinterpret_run`]), a successful
+    /// interpret does not write the artifact until the caller has re-validated run
+    /// status — avoids seeding disk when a post-await race rejects the swap.
     async fn interpret_and_seed(
         &self,
         slug: &str,
         task_list_path: &std::path::Path,
         repo_root: &std::path::Path,
+        seed_persist: bool,
     ) -> Result<(TaskGraph, Vec<crate::ingestion::IngestionIssue>), ApiError> {
         // Read the .md file.
         let text = tokio::fs::read_to_string(task_list_path)
@@ -701,7 +729,9 @@ impl CoreApi {
                 // Seed-persist the freshly-interpreted graph so the artifact exists
                 // immediately (before StartRun).  Best-effort: a failure only warns;
                 // opening a run must not break because the disk is unwritable.
-                if let Err(e) = crate::persist::persist_graph(&graph, repo_root).await {
+                if seed_persist
+                    && let Err(e) = crate::persist::persist_graph(&graph, repo_root).await
+                {
                     tracing::warn!(
                         slug = %slug,
                         error = %e,
@@ -843,7 +873,7 @@ impl CoreApi {
         let config = self.state.config.clone();
         let backend = Arc::clone(&self.state.backend);
         let audit_registry = Arc::clone(&self.state.audit_registry);
-        let planner_interpreter = Arc::clone(&self.state.interpreter);
+        let planner_interpreter = Arc::clone(&self.state.planner_interpreter);
         let state = Arc::clone(&self.state);
 
         // Spawn the scheduler.  It emits RunStatusChanged{Running} at the start
@@ -939,10 +969,10 @@ impl CoreApi {
     /// recompute report, atomically replace graph+report under lock, emit
     /// RunOpened (so TUI reloads the view), return Acknowledged.
     ///
-    // Concurrent ReinterpretRun calls on the same run are not serialized beyond the
-    // registry lock. Last writer wins (the second swap overwrites the first's graph+report).
-    // This is the same tolerance already present for concurrent OpenRun of the same slug
-    // from two TUI instances.  A per-run in-flight flag can be added later if needed.
+    /// Concurrent `ReinterpretRun` calls on the same run are not serialized beyond the
+    /// registry lock. Last writer wins (the second swap overwrites the first's graph+report).
+    /// This is the same tolerance already present for concurrent `OpenRun` of the same slug
+    /// from two TUI instances. A per-run in-flight flag can be added later if needed.
     async fn reinterpret_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
         let repo_root = self.state.worktree_manager.repo_root.clone();
 
@@ -962,9 +992,9 @@ impl CoreApi {
             (entry.task_list_path.clone(), entry.run_slug.clone())
         };
 
-        // Fresh interpret (the ingest-interpret-failure-recoverable path).
+        // Fresh interpret without seed-persist until status is re-checked below.
         let (new_graph, interpret_issues) = self
-            .interpret_and_seed(&slug, &task_list_path, &repo_root)
+            .interpret_and_seed(&slug, &task_list_path, &repo_root, false)
             .await?;
 
         // Recompute report exactly as open_run does.
@@ -978,6 +1008,8 @@ impl CoreApi {
         // Second lookup + re-check (defensive for races with Cancel or with a StartRun
         // that became legal because this re-interpret cleared the last blocker).
         // We deliberately do not hold the registry lock across the await above.
+        let seed_snapshot = (!new_graph.tasks.is_empty()).then(|| new_graph.clone());
+
         {
             let mut runs = self
                 .state
@@ -992,6 +1024,17 @@ impl CoreApi {
             }
             entry.graph = Arc::new(AsyncMutex::new(new_graph));
             entry.report = report;
+        }
+
+        // Seed only after the swap succeeds; never while holding the registry lock.
+        if let Some(graph) = seed_snapshot
+            && let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await
+        {
+            tracing::warn!(
+                slug = %slug,
+                error = %e,
+                "seed-persist failed after re-interpret; continuing",
+            );
         }
 
         // Emit RunOpened (reusing the event is the smaller change; its
@@ -1321,9 +1364,17 @@ Do the thing in `lib.rs`.
     /// `WorktreeManager` + a no-gate `Config`.  Returns the api and the temp dir
     /// (keep it alive for the test).
     fn execution_core_api() -> (CoreApi, tempfile::TempDir) {
-        let interpreter = Arc::new(EdgeInferrer::new(
+        let ingestion = Arc::new(EdgeInferrer::new(
             Arc::new(StructuredTextInterpreter::new()),
         ));
+        // Use build_planner for the planner interpreter (even though None backend
+        // yields det here); satisfies plan 0005 wiring test requirement and
+        // makes mechanism path explicit in helper.
+        let planner = crate::interpreter::build_planner_interpreter(
+            &crate::config::PlannerMechanism::OneShotAgent,
+            None,
+        )
+        .expect("planner build must succeed with None backend");
         // Cycle: developer output, then approve verdict (covers any task count).
         let backend = Arc::new(NoopBackend::with_responses(vec![
             "Implemented the feature.".into(),
@@ -1331,7 +1382,14 @@ Do the thing in `lib.rs`.
         ]));
         let repo_dir = setup_temp_repo();
         let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
-        let api = CoreApi::new(interpreter, backend, wm, no_gate_config());
+        let api = CoreApi::with_audit_registry(
+            ingestion,
+            planner,
+            backend,
+            wm,
+            no_gate_config(),
+            Arc::new(NoopAuditRegistry),
+        );
         (api, repo_dir)
     }
 
@@ -1773,6 +1831,7 @@ Does the second thing with enough description text here.
                 i.code == "duplicate-task-id"
                     && i.source == crate::api::IssueSource::Validator
                     && i.severity == crate::api::IssueSeverity::Blocking
+                    && i.suggestion.is_some()
             }),
             "expected Validator duplicate-task-id issue; got {:?}",
             view.report.issues

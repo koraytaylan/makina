@@ -1737,6 +1737,10 @@ mod tests {
             "ingestion panel should contain the issue code"
         );
         assert!(
+            screen.contains("suggestion"),
+            "ingestion panel should label suggestions"
+        );
+        assert!(
             screen.contains("write a concrete acceptance criterion"),
             "ingestion panel should contain the suggestion text"
         );
