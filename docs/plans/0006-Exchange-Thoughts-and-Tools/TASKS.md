@@ -179,7 +179,7 @@ Pay special attention to:
 
 - **Done when:** `grep -n 'AcpResponseChunk\|ResponseEvent::\|ExchangeEvent::' --include='*.rs' crates/ | xargs grep -L 'Thought\|ToolCall' | ...` (or simply a full `cargo check -p makina -p makina-core -p makina-acp --tests` succeeds with no "non-exhaustive" or "unreachable" warnings related to the new variants).
 
-### plan-0005-acceptance — End-to-end observability test using the real mock path
+### plan-0006-acceptance — End-to-end observability test using the real mock path
 
 Add (or expand) one test that goes through the full stack:
 
