@@ -669,6 +669,16 @@ impl App {
                 if is_selected || self.selected_run == Some(self.runs.len().saturating_sub(1)) {
                     self.clamp_selected_task();
                 }
+                // Tiny state rule: on RunLoaded (or RunOpened producing a loaded view)
+                // the status is cleared unless it was an error. This ensures a
+                // successful load overwrites transient "Interpreting …" with the
+                // normal ready-state hints in the status bar.
+                if let Some(msg) = &self.status_message {
+                    let l = msg.to_lowercase();
+                    if !l.contains("fail") && !l.contains("error") {
+                        self.status_message = None;
+                    }
+                }
                 true
             }
 
@@ -1534,6 +1544,62 @@ mod tests {
         assert_eq!(app.runs.len(), 1);
         assert_eq!(app.runs[0].tasks.len(), 1);
         assert_eq!(app.selected_run, Some(0), "auto-selects first run");
+    }
+
+    /// On successful `RunLoaded` any prior transient non-error status (such as
+    /// the "Interpreting …" message left by `BrowserActivate` for a file) is
+    /// cleared, leaving the status bar in the empty/default (normal ready/hints)
+    /// state.
+    #[test]
+    fn runloaded_clears_interpreting_status() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![]);
+        // Simulate the transient set by resolve_io on file activate.
+        app.status_message = Some("Interpreting example.md...".to_string());
+        assert!(app.status_message.is_some());
+
+        let full_run = RunView {
+            id: RunId(99),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from("example.md"),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("t1"),
+                title: "Task".into(),
+                state: TaskState::Ready,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        app.update(AppEvent::RunLoaded(full_run));
+
+        assert!(
+            app.status_message.is_none(),
+            "RunLoaded must clear transient non-error status (e.g. interpreting) to ready state"
+        );
+        assert_eq!(app.runs.len(), 1);
+
+        // An error status must survive (the "unless it was an error" rule).
+        app.status_message = Some("Open failed: boom".into());
+        let err_run = RunView {
+            id: RunId(100),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from("bad.md"),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        app.update(AppEvent::RunLoaded(err_run));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Open failed: boom"),
+            "error status must not be cleared by RunLoaded"
+        );
     }
 
     /// `TaskStateChanged` updates the task state and recomputes the aggregate
