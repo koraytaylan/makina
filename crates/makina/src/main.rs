@@ -25,8 +25,6 @@ use makina_acp::AcpBackend;
 use makina_core::audit::JsonlAuditSink;
 use makina_core::backend::AgentBackend;
 use makina_core::config::Config;
-use makina_core::dependency::EdgeInferrer;
-use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::orchestrator::CoreApi;
 use makina_core::worktree::WorktreeManager;
 
@@ -102,27 +100,22 @@ async fn main() {
 
     // ── Api ───────────────────────────────────────────────────────────────────
     // The real, core-backed orchestrator Api.  It opens Runs by reading a
-    // task-list file and interpreting it via `build_ingestion_interpreter`
-    // (the **model** interpreter is now the default per `config.planner.mechanism`
-    // + ACP backend; deterministic `StructuredTextInterpreter` + `EdgeInferrer`
-    // is the offline/`None`-backend fallback) — then drives them with the
-    // injected backend + worktree manager + config (task 31).
-    let interpreter = match makina_core::interpreter::build_ingestion_interpreter(
-        &config.planner.mechanism,
-        Some(Arc::clone(&backend)),
-    ) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!(
-                "planner mechanism unavailable; falling back to deterministic interpreter: {e}"
-            );
-            Arc::new(EdgeInferrer::new(
-                Arc::new(StructuredTextInterpreter::new()),
-            )) as Arc<dyn makina_core::interpreter::TaskListInterpreter>
-        }
-    };
+    // task-list file and interpreting it via the deterministic
+    // `StructuredTextInterpreter` + `EdgeInferrer` path (always, for TUI
+    // OpenRun/ReinterpretRun responsiveness). The model path selected by
+    // `config.planner.mechanism` + ACP backend is reserved exclusively for the
+    // Planner actor/spoke; ingestion in the TUI binary is never the model path.
+    // The run is then driven with the injected backend + worktree manager +
+    // config (task 31).
+    tracing::info!(
+        "Using deterministic structured-text + edge inference for TUI OpenRun/ReinterpretRun (planner mechanism only affects the Planner actor)"
+    );
+    let ingestion_interpreter: Arc<dyn makina_core::interpreter::TaskListInterpreter> =
+        Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
+            makina_core::interpreter::StructuredTextInterpreter::new(),
+        )));
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
-        interpreter,
+        ingestion_interpreter,
         backend,
         worktree_manager,
         config,
