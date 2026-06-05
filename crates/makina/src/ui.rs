@@ -860,8 +860,9 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
 
 /// Render the ingestion report panel for the selected run (when it has issues).
 ///
-/// Each issue is shown as `[{source}] {code} — {message}` with severity
-/// colour (Blocking=Red, Warning=Yellow). Mirrors `render_error_pane`
+/// Each issue is shown as `[{source}] {code} — {message}` with an optional
+/// ` — suggestion: …` suffix when present, and severity colour (Blocking=Red,
+/// Warning=Yellow). Mirrors `render_error_pane`
 /// structure and `task_state_badge` colouring. A 0-height area is a no-op.
 fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
     if area.height == 0 || area.width == 0 {
@@ -909,8 +910,16 @@ fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
                 IssueSource::Validator => "validator",
                 IssueSource::Qualifier => "qualifier",
             };
+            let suffix = issue
+                .suggestion
+                .as_ref()
+                .map(|s| format!(" — suggestion: {}", s))
+                .unwrap_or_default();
             Line::from(vec![Span::styled(
-                format!("  [{}] {} — {}", source, issue.code, issue.message),
+                format!(
+                    "  [{}] {} — {}{}",
+                    source, issue.code, issue.message, suffix
+                ),
                 Style::default().fg(color),
             )])
         })
@@ -1715,7 +1724,7 @@ mod tests {
                     source: IssueSource::Qualifier,
                     code: "vague-done-when".into(),
                     message: "done_when is too vague".into(),
-                    suggestion: None,
+                    suggestion: Some("write a concrete acceptance criterion".into()),
                 }],
             },
         }];
@@ -1727,6 +1736,10 @@ mod tests {
             screen.contains("vague-done-when"),
             "ingestion panel should contain the issue code"
         );
+        assert!(
+            screen.contains("write a concrete acceptance criterion"),
+            "ingestion panel should contain the suggestion text"
+        );
 
         let buf = terminal.backend().buffer().clone();
         let has_red = buf
@@ -1734,6 +1747,45 @@ mod tests {
             .iter()
             .any(|cell| cell.fg == ratatui::style::Color::Red);
         assert!(has_red, "Blocking issue line must use Red foreground");
+    }
+
+    #[test]
+    fn render_ingestion_panel_shows_warning_issue() {
+        let mut terminal = make_terminal(100, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let runs = vec![RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/warn.json"),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![],
+            report: IngestionReport {
+                issues: vec![IngestionIssue {
+                    task_id: None,
+                    severity: IssueSeverity::Warning,
+                    source: IssueSource::Qualifier,
+                    code: "short-done-when".into(),
+                    message: "done_when is very short".into(),
+                    suggestion: None,
+                }],
+            },
+        }];
+        let app = App::new(api, runs);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("short-done-when"),
+            "ingestion panel should contain the warning issue code"
+        );
+
+        let buf = terminal.backend().buffer().clone();
+        let has_yellow = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Yellow);
+        assert!(has_yellow, "Warning issue line must use Yellow foreground");
     }
 
     #[test]
