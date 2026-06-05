@@ -152,6 +152,7 @@ use crate::audit::{AuditRegistry, NoopAuditRegistry};
 use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::gate::{GateOutcome, GateRunner};
+use crate::interpreter::TaskListInterpreter;
 use crate::merge::{MergeOutcome, SquashMerger};
 use crate::persist::persist_graph;
 use crate::state_machine::{TaskEvent, transition};
@@ -160,6 +161,7 @@ use crate::task::{Task, TaskGraph, TaskId, TaskState};
 use crate::worktree::WorktreeManager;
 
 use super::developer::{Develop, Developer, DeveloperArgs};
+use super::planner::{Planner, PlannerArgs};
 use super::reviewer::{Review, ReviewVerdict, Reviewer, ReviewerArgs};
 
 // ── Live event emission (task 31: run-control) ──────────────────────────────────
@@ -800,6 +802,7 @@ pub async fn run_graph(
     run_slug: String,
     run_uid: String,
     plan_slug: String,
+    planner_interpreter: Arc<dyn TaskListInterpreter>,
 ) -> Result<RunReport, String> {
     // Open the run-scoped tracing span so every event emitted while driving this
     // graph carries the `run_uid` key. The `makina` binary's per-run file layer
@@ -820,6 +823,7 @@ pub async fn run_graph(
         run_slug,
         run_uid,
         plan_slug,
+        planner_interpreter,
     )
     .instrument(run_span)
     .await
@@ -836,6 +840,7 @@ async fn run_graph_inner(
     run_slug: String,
     run_uid: String,
     plan_slug: String,
+    planner_interpreter: Arc<dyn TaskListInterpreter>,
 ) -> Result<RunReport, String> {
     // Announce the run is now executing.
     control.emit(api::Event::RunStatusChanged {
@@ -864,6 +869,20 @@ async fn run_graph_inner(
         .send()
         .await
         .map_err(|e| format!("failed to wire supervisor spokes: {e}"))?;
+
+    // Spawn the Planner under the root (prod launch path). The interpreter is
+    // threaded from the orchestrator so the mechanism choice (structured-text
+    // vs model) is carried into the run's actor tree. The ref is not stored;
+    // spawning under the root is sufficient for lifecycle/observability.
+    let _planner_ref = RootSupervisor::spawn_child::<Planner>(
+        &root,
+        PlannerArgs {
+            supervisor: supervisor_ref.clone(),
+            interpreter: planner_interpreter,
+        },
+        RestartConfig::default(),
+    )
+    .await;
 
     // Build the driver context directly (we drive the `scheduler` ourselves so
     // we keep ownership of the shared graph for the final status derivation).

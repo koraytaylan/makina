@@ -36,6 +36,7 @@ use makina_core::audit::NoopAuditRegistry;
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
+use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::worktree::WorktreeManager;
 
@@ -269,6 +270,7 @@ async fn run_graph_emits_tracing_transition_and_gate_events() {
         slug.to_string(),
         run_uid.to_string(),
         String::new(),
+        Arc::new(StructuredTextInterpreter::new()),
     )
     .await
     .expect("run_graph must not error");

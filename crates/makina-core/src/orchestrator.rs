@@ -827,6 +827,7 @@ impl CoreApi {
         let config = self.state.config.clone();
         let backend = Arc::clone(&self.state.backend);
         let audit_registry = Arc::clone(&self.state.audit_registry);
+        let planner_interpreter = Arc::clone(&self.state.interpreter);
         let state = Arc::clone(&self.state);
 
         // Spawn the scheduler.  It emits RunStatusChanged{Running} at the start
@@ -846,6 +847,7 @@ impl CoreApi {
                 run_slug,
                 run_uid,
                 plan_slug,
+                planner_interpreter,
             )
             .await;
             state.finalize_run_status(run).await;
