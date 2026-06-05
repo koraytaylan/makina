@@ -210,8 +210,9 @@ async fn resolve_api_event(
 /// This is the single place where the TUI touches the filesystem and the api;
 /// [`App::update`] never does.  Handles:
 /// - **File browser** (task 28): `OpenBrowser` → read CWD; `BrowserActivate` on
-///   a dir → read it, on a file → `execute(OpenRun)` (outcome → status message)
-///   → `CloseBrowser`; `BrowserParent` → read parent dir.
+///   a dir → read it, on a file → compute transient "Interpreting …" status,
+///   `execute(OpenRun)` (now fast) → `CloseBrowser` (a transient "Interpreting …"
+///   status is surfaced for files); `BrowserParent` → read parent dir.
 /// - **Run control** (task 31): `StartRun`/`PauseRun`/`CancelRun` →
 ///   `execute(...)` for `app.selected_run()` (outcome/error → status message);
 ///   the run-state changes themselves flow back via `api.subscribe()`.
@@ -233,23 +234,27 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
             match app.browser.as_ref().and_then(|b| b.selected_entry()) {
                 Some(entry) if entry.is_dir => (read_dir_event(&entry.path).await, None),
                 Some(entry) => {
-                    // It's a file: open a Run for it, then close the browser.
-                    // Capture the outcome/error and surface it (resolves the
-                    // task-28 outcome-surfacing note): the resulting `RunOpened`
-                    // event also flows back through `api.subscribe()` and updates
-                    // the sidebar.
+                    // It's a file: compute a transient "Interpreting …" status
+                    // (for immediate user feedback), perform the (now fast)
+                    // execute(OpenRun) to register the run + broadcast, then
+                    // close the browser.  The "Opened {run}" (or error only on
+                    // failure) can follow from the RunLoaded path.
+                    let stem = entry
+                        .path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("task list");
+                    let status = format!("Interpreting {}...", stem);
                     let result = app
                         .api
                         .execute(makina_core::api::Command::OpenRun {
                             task_list_path: entry.path.clone(),
                         })
                         .await;
-                    let msg = match result {
-                        Ok(makina_core::api::CommandOutcome::RunOpened { run }) => {
-                            format!("Opened {run}")
-                        }
-                        Ok(_) => "Run opened".to_string(),
-                        Err(e) => format!("Open failed: {e}"),
+                    let msg = if let Err(e) = result {
+                        format!("Open failed: {e}")
+                    } else {
+                        status
                     };
                     (AppEvent::CloseBrowser, Some(msg))
                 }
@@ -906,11 +911,51 @@ mod tests {
         }
     }
 
+    /// `resolve_io(BrowserActivate)` for a file entry using a `PlaceholderApi`
+    /// (the style used by the other browser tests in this module) must return
+    /// `CloseBrowser` plus a status whose text contains "Interpreting" (or
+    /// "Opening") and the file stem.
+    #[tokio::test]
+    async fn browser_activate_file_produces_interpreting_status() {
+        use crate::app::{App, AppEvent, Mode};
+        use crate::browser::{DirEntry, FileBrowser};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![]);
+        app.mode = Mode::FileBrowser;
+        let file_path = std::path::PathBuf::from("/tmp/example-task-list.md");
+        app.browser = Some(FileBrowser::new(
+            std::path::PathBuf::from("/tmp"),
+            vec![DirEntry {
+                name: "example-task-list.md".to_string(),
+                path: file_path,
+                is_dir: false,
+            }],
+        ));
+
+        let (resolved, status) = resolve_io(&app, AppEvent::BrowserActivate).await;
+        assert!(
+            matches!(resolved, AppEvent::CloseBrowser),
+            "file activate must resolve to CloseBrowser"
+        );
+        let msg = status.expect("activating a file must produce a status message");
+        assert!(
+            msg.contains("Interpreting") || msg.contains("Opening"),
+            "status must contain 'Interpreting' (or 'Opening'); got {msg:?}"
+        );
+        assert!(
+            msg.contains("example-task-list"),
+            "status must contain the file stem; got {msg:?}"
+        );
+    }
+
     /// **TUI ↔ CoreApi flow (the done-when through the event layer).**
     ///
     /// Drive the exact event-loop step that opens a file against the REAL
     /// `CoreApi`: set up a browser whose selection is a sample task-list file,
-    /// call `resolve_browser_io(BrowserActivate)` (which performs
+    /// call `resolve_io(BrowserActivate)` (which performs
     /// `api.execute(OpenRun)`), then drain `api.subscribe()` and feed the
     /// resulting `RunOpened` into `App::update` — asserting the Run appears in
     /// `app.runs`.
@@ -968,15 +1013,18 @@ mod tests {
         assert!(app.runs.is_empty());
 
         // The event-loop step: activating a file selection performs the async
-        // OpenRun against CoreApi and returns CloseBrowser + a status message.
+        // OpenRun against CoreApi and returns CloseBrowser + a status message
+        // (now the transient "Interpreting …" one).
         let (resolved, status) = resolve_io(&app, AppEvent::BrowserActivate).await;
         assert!(
             matches!(resolved, AppEvent::CloseBrowser),
             "selecting a file must resolve to CloseBrowser"
         );
         assert!(
-            status.as_deref().is_some_and(|m| m.contains("Opened")),
-            "opening a file must surface an 'Opened …' status message; got {status:?}"
+            status
+                .as_deref()
+                .is_some_and(|m| m.contains("Interpreting") || m.contains("Opening")),
+            "opening a file must surface an 'Interpreting …' (or 'Opening …') status message; got {status:?}"
         );
         app.update(resolved);
         if let Some(msg) = status {
