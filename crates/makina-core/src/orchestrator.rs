@@ -66,6 +66,7 @@
 //! | model-backed interpreter + real ACP backend | injected, not wired | e2e (task 33) |
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -381,9 +382,43 @@ impl CoreState {
     /// TUI may not be subscribed yet; events are best-effort.  The events the
     /// engine produces are already tagged with the correct `RunId` (the
     /// scheduler/drivers stamp it from the `RunControl`), so this is a thin pass.
-    fn make_sink(&self) -> EventSink {
-        let tx = self.event_tx.clone();
+    fn make_sink(state: Arc<CoreState>) -> EventSink {
+        let tx = state.event_tx.clone();
+        let repo_root = state.worktree_manager.repo_root.clone();
         Arc::new(move |event: Event| {
+            if let Event::AgentExchange {
+                run,
+                task,
+                event: exchange,
+                ..
+            } = &event
+            {
+                let run_uid = {
+                    let runs = state.runs.lock().expect("runs registry mutex poisoned");
+                    runs.get(&run.0).map(|entry| entry.run_uid.clone())
+                };
+                if let Some(run_uid) = run_uid
+                    && let Err(e) = (|| -> std::io::Result<()> {
+                        let logs_dir = paths::run_logs_dir(&repo_root, &run_uid)?;
+                        let path = logs_dir.join(format!("{}_transcript.jsonl", task.0));
+                        let line = serde_json::to_string(exchange)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)?;
+                        writeln!(file, "{line}")?;
+                        Ok(())
+                    })()
+                {
+                    tracing::warn!(
+                        run_uid = %run_uid,
+                        task_id = %task.0,
+                        error = %e,
+                        "failed to persist agent exchange transcript; continuing"
+                    );
+                }
+            }
             let _ = tx.send(event);
         })
     }
@@ -850,7 +885,7 @@ impl CoreApi {
         // Build the per-run control (sink → broadcast, pause flag, cancel token).
         let control = RunControl {
             run,
-            sink: self.state.make_sink(),
+            sink: CoreState::make_sink(Arc::clone(&self.state)),
             pause,
             cancel,
         };
@@ -2030,7 +2065,7 @@ Create beta.
     // starvation between the poll loop and the background execution).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn start_run_executes_run_and_emits_live_events() {
-        let (api, _repo) = execution_core_api();
+        let (api, repo) = execution_core_api();
         let api = Arc::new(api);
         let (_dir, path) = write_task_list(ONE_TASK_LIST);
 
@@ -2188,6 +2223,26 @@ Create beta.
         let view = api.run(run).await.unwrap();
         assert_eq!(view.status, RunStatus::Completed);
         assert!(view.tasks.iter().all(|t| t.state == TaskState::Done));
+
+        // Agent exchanges are persisted to per-task JSONL transcripts.
+        let transcript_path = paths::run_logs_dir(repo.path(), &view.run_uid)
+            .expect("per-run logs dir")
+            .join("solo-task_transcript.jsonl");
+        assert!(
+            transcript_path.is_file(),
+            "transcript file must exist at {}",
+            transcript_path.display()
+        );
+        let transcript = std::fs::read_to_string(&transcript_path).expect("read transcript");
+        let lines: Vec<&str> = transcript.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            !lines.is_empty(),
+            "transcript must contain at least one exchange line"
+        );
+        for line in lines {
+            let _: ExchangeEvent =
+                serde_json::from_str(line).expect("each transcript line must be valid JSON");
+        }
     }
 
     /// Unknown run id is rejected by StartRun.
