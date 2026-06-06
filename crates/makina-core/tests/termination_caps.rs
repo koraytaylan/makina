@@ -137,6 +137,7 @@ fn gate(name: &str, command: &str) -> GateConfig {
     GateConfig {
         name: name.to_string(),
         command: command.to_string(),
+        image: None,
     }
 }
 

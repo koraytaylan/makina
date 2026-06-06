@@ -285,6 +285,12 @@ pub struct GateConfig {
     ///
     /// Must be non-empty; [`Config::validate`] enforces this.
     pub command: String,
+
+    /// Optional Docker image to run the gate command inside.
+    ///
+    /// When absent, the gate runs directly on the host.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 /// Optional per-field overrides of [`CapsConfig`] that a project can set.

@@ -138,6 +138,7 @@ pub enum GateOutcome {
 /// let gates = vec![GateConfig {
 ///     name: "tests".into(),
 ///     command: "cargo test --workspace".into(),
+///     image: None,
 /// }];
 /// match runner.run_gates(&gates, Path::new("/path/to/worktree")).await? {
 ///     GateOutcome::Passed => { /* advance to review */ }
@@ -274,6 +275,7 @@ mod tests {
         GateConfig {
             name: name.to_string(),
             command: command.to_string(),
+            image: None,
         }
     }
 
