@@ -1869,6 +1869,11 @@ Desc that is long enough.
         };
 
         let view = api.run(run).await.expect("run must be queryable");
+        // Print the report for inspection when running with --nocapture (per task Done when).
+        eprintln!(
+            "open_run_with_bad_convention_source_produces_lint_issues_in_report report: {:?}",
+            view.report
+        );
         let codes: Vec<_> = view.report.issues.iter().map(|i| i.code.as_str()).collect();
 
         assert!(

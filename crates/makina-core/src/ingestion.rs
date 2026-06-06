@@ -684,9 +684,8 @@ mod tests {
     #[test]
     fn validator_issues_from_graph_error_maps_duplicate_id() {
         let id = TaskId::new("dupe");
-        let issues = validator_issues_from_graph_error(&TaskGraphError::DuplicateId {
-            id: id.clone(),
-        });
+        let issues =
+            validator_issues_from_graph_error(&TaskGraphError::DuplicateId { id: id.clone() });
         assert_eq!(issues.len(), 1);
         let issue = &issues[0];
         assert_eq!(issue.code, "duplicate-task-id");
