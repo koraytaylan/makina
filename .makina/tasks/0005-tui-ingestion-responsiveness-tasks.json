@@ -1,0 +1,174 @@
+{
+  "slug": "0005-tui-ingestion-responsiveness-tasks",
+  "tasks": [
+    {
+      "id": "tui-always-deterministic-ingestion",
+      "title": "Force the CoreApi in the real binary to use Structured + EdgeInferrer for ingestion",
+      "description": "In `crates/makina/src/main.rs`:\n\n- Replace the existing block that does `match build_ingestion_interpreter(&config.planner.mechanism, Some(Arc::clone(&backend))) { ... }` (the one that produces the `interpreter` variable passed to `CoreApi::with_audit_registry`).\n- Instead, unconditionally construct the fast path:\n\n  ```rust\n  let ingestion_interpreter: Arc<dyn makina_core::interpreter::TaskListInterpreter> =\n      Arc::new(makina_core::dependency::EdgeInferrer::new(\n          Arc::new(makina_core::interpreter::StructuredTextInterpreter::new()),\n      ));\n  ```\n\n- Keep the previous fallback `eprintln!` / log only for the planner construction (see the next task). Remove or repurpose the \"planner mechanism unavailable; falling back to deterministic interpreter\" message that was tied to ingestion.\n- Add a single `tracing::info!` (or `eprintln!` before the subscriber if needed) that says approximately: \"Using deterministic structured-text + edge inference for TUI OpenRun/ReinterpretRun (planner mechanism only affects the Planner actor)\".\n- Update the big comment block immediately above the construction (the one that starts \"The real, core-backed orchestrator Api. It opens Runs by reading a task-list file...\") to state clearly that the TUI always uses the deterministic ingestion path for responsiveness; the model path is reserved for the Planner spoke.\n\nThe variable passed to `CoreApi::with_audit_registry( ingestion_interpreter, backend, ... )` must be the one built above.",
+      "done_when": "- `grep -n 'EdgeInferrer::new' crates/makina/src/main.rs` shows the deterministic construction for the value given to CoreApi.\n- `grep -n 'Using deterministic structured-text' crates/makina/src/main.rs` (or the exact log string you chose) exists and is reached on normal startup.\n- `cargo test -p makina --test e2e` (and any test that drives `OpenRun` through a real `CoreApi` constructed the way the binary does) still passes; the opened graphs are identical to before for all the golden task lists.\n- `cargo test -p makina -p makina-core`, `cargo clippy -p makina -p makina-core --all-targets -- -D warnings`, and `cargo fmt --check` are green.\n- A new test `tui_main_constructs_deterministic_ingestion_interpreter` (see 0032) will later assert the behaviour.",
+      "depends_on": [],
+      "section": "0029",
+      "state": "done",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:41:41.770616Z",
+      "started_at": "2026-06-05T19:31:08.796322Z",
+      "finished_at": "2026-06-05T19:41:41.770616Z"
+    },
+    {
+      "id": "tui-no-model-in-openrun-path",
+      "title": "(grep + compile guard) prove that the TUI binary path never constructs a ModelInterpreter for ingestion",
+      "description": "Add a compile-time or test-time assertion (a `#[cfg(test)]` helper or a simple unit test in `main.rs` or `lib.rs` under `#[cfg(test)]`) that would fail to compile or would panic at test time if `ModelInterpreter` were accidentally used for the ingestion interpreter in the `main` path.\n\nAt minimum, add a literal comment block and a `grep` check:\n\n- In the same area of `main.rs`, right after the ingestion construction, add:\n\n  ```rust\n  // INVARIANT: the ingestion interpreter used for OpenRun/ReinterpretRun in the\n  // shipping TUI is *never* a ModelInterpreter.  All model use for task-list\n  // interpretation goes through the Planner actor (build_planner_interpreter).\n  // If you change this, update plan 0005 and the test that asserts the invariant.\n  ```",
+      "done_when": "- `grep -n 'ModelInterpreter' crates/makina/src/main.rs` returns no matches (or only appears inside a test that explicitly builds a model ingestion path for a negative test).\n- The exact `grep -n 'INVARIANT: the ingestion interpreter' crates/makina/src/main.rs` line appears in \"Done when\" of this task and matches after the edit.\n- `cargo test -p makina` (the binary crate tests) passes.",
+      "depends_on": [],
+      "section": "0029",
+      "state": "failed",
+      "gate_iterations": 1,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:47:08.769160Z",
+      "started_at": "2026-06-05T19:31:08.793367Z",
+      "finished_at": "2026-06-05T19:47:08.769161Z"
+    },
+    {
+      "id": "browser-activate-interpreting-status",
+      "title": "Return an \"Interpreting …\" status for file activations",
+      "description": "In `crates/makina/src/event.rs`, inside `resolve_io`, in the `BrowserActivate` match arm for `Some(entry) if !entry.is_dir`:\n\n- Before (or instead of) performing the `execute(OpenRun)` await, compute a user-visible stem:\n\n  ```rust\n  let stem = entry.path\n      .file_stem()\n      .and_then(|s| s.to_str())\n      .unwrap_or(\"task list\");\n  let status = format!(\"Interpreting {}...\", stem);\n  ```\n\n- Perform the execute (it is now fast).\n- Return `(AppEvent::CloseBrowser, Some(status))` (the later \"Opened {run}\" or error can be a follow-up status from the `RunLoaded` path, or you may choose to surface the final outcome only on error; the important thing is the user sees activity immediately).\n- Update the doc comment for `resolve_io` (the paragraph about BrowserActivate) to mention that a transient \"Interpreting …\" status is surfaced for files.",
+      "done_when": "- `grep -n 'Interpreting .*...' crates/makina/src/event.rs` (or the exact format string) shows the status construction for the file case.\n- In the existing browser tests (the `mod tests` that exercise `resolve_io` with a `PlaceholderApi`), a test now asserts that activating a file entry produces a status message whose text contains \"Interpreting\" (or \"Opening\") and the stem.\n- The literal test name `browser_activate_file_produces_interpreting_status` appears in the \"Done when\" and the test body matches the description.\n- `cargo test -p makina --test event` (or the browser-related tests) is green.",
+      "depends_on": [
+        "tui-always-deterministic-ingestion"
+      ],
+      "section": "0030",
+      "state": "done",
+      "gate_iterations": 1,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:48:28.352912Z",
+      "started_at": "2026-06-05T19:41:43.411084Z",
+      "finished_at": "2026-06-05T19:48:28.352912Z"
+    },
+    {
+      "id": "runloaded-clears-interpreting-status",
+      "title": "(optional polish) ensure a successful RunLoaded overwrites any transient interpreting message with the normal ready state",
+      "description": "If after the change the status bar is left showing the \"Interpreting\" line even after the run appears, add a tiny state rule: on `RunLoaded` (or on any `RunOpened` that produces a loaded view) the status is cleared unless it was an error.",
+      "done_when": "a render or app test (can be an addition to an existing `RunLoaded` test in `app.rs` tests) asserts that after `RunLoaded` the transient status is the empty/default one (or the normal \"Ready\" hint). The test name contains `runloaded_clears_interpreting_status` or is listed in this task's \"Done when\".",
+      "depends_on": [
+        "browser-activate-interpreting-status"
+      ],
+      "section": "0030",
+      "state": "done",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:53:47.506667Z",
+      "started_at": "2026-06-05T19:48:29.535691Z",
+      "finished_at": "2026-06-05T19:53:47.506667Z"
+    },
+    {
+      "id": "run-graph-accepts-planner-interpreter",
+      "title": "Extend the prod run launch path to carry a planner interpreter",
+      "description": "In `crates/makina-core/src/actors/supervisor.rs` and the `run_graph` / `run_graph_inner` functions:\n\n- Add a parameter (or extend `DriverContext` / a new small struct) so that a `planner_interpreter: Arc<dyn TaskListInterpreter>` reaches the place where spokes are created.\n- After the `SetSpokes` ask (or in the same region), spawn the Planner exactly as the actor smoke test does:\n\n  ```rust\n  let planner_ref = RootSupervisor::spawn_child::<Planner>(\n      &root,\n      PlannerArgs {\n          supervisor: supervisor_ref.clone(),\n          interpreter: planner_interpreter,\n      },\n      RestartConfig::default(),\n  ).await;\n  ```\n\n  (Store the ref only if you need it; for this plan the mere act of spawning under the root is sufficient for lifecycle and to make the mechanism choice observable.)\n\n- Update the signature of `pub async fn run_graph(...)` and the internal `_inner` helper.\n- Update the call site in `orchestrator.rs:839` (the `tokio::spawn(async move { run_graph(...) })`).",
+      "done_when": "- `grep -n 'spawn_child::<Planner>' crates/makina-core/src/actors/supervisor.rs` finds the spawn (or the equivalent location after edits).\n- `grep -n 'planner_interpreter' crates/makina-core/src/actors/supervisor.rs` (and the orchestrator call site) shows the threading.\n- `cargo test -p makina-core --test planner_actor` and the broader `cargo test -p makina-core` stay green (the test helpers will be updated in the companion task).",
+      "depends_on": [],
+      "section": "0031",
+      "state": "done",
+      "gate_iterations": 2,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:45:11.492027Z",
+      "started_at": "2026-06-05T19:31:08.794369Z",
+      "finished_at": "2026-06-05T19:45:11.492027Z"
+    },
+    {
+      "id": "main-builds-and-passes-planner-interpreter",
+      "title": "In the TUI binary, build the planner interpreter with the real mechanism and pass it through",
+      "description": "In `crates/makina/src/main.rs`:\n\n- After (or alongside) the ingestion construction, add:\n\n  ```rust\n  let planner_interpreter = match makina_core::interpreter::build_planner_interpreter(\n      &config.planner.mechanism,\n      Some(Arc::clone(&backend)),\n  ) {\n      Ok(p) => p,\n      Err(e) => {\n          eprintln!(\"planner mechanism unavailable; falling back to deterministic planner: {e}\");\n          Arc::new(makina_core::dependency::EdgeInferrer::new(\n              Arc::new(makina_core::interpreter::StructuredTextInterpreter::new()),\n          )) as Arc<dyn makina_core::interpreter::TaskListInterpreter>\n      }\n  };\n  ```\n\n- Thread `planner_interpreter` into the place that eventually calls `run_graph` (you may need to extend `CoreApi` construction or the exit/reap paths, or simply build it in the scope where `api` lives and pass it when the run is started; the orchestrator already has access to `config` via the api state). The minimal change that makes the mechanism live is to build it here and ensure the value reaches the `run_graph` spawn site (via a new field on the api state or by changing the internal start-run helper).\n\n- The fallback message is now specifically about the *planner*.",
+      "done_when": "- `grep -n 'build_planner_interpreter' crates/makina/src/main.rs` shows the call using `&config.planner.mechanism`.\n- The fallback message now mentions \"planner\" (not the generic ingestion fallback).\n- Starting the binary with a config that requests `OneShotAgent` + a working backend no longer causes model calls on `[o]` open of a `.md`; a later `StartRun` (once the planner is sent `InterpretTaskList`) will exercise the model path if that flow is triggered.\n- All normal `cargo test -p makina` invocations (which usually have no real backend) fall back cleanly.",
+      "depends_on": [
+        "tui-always-deterministic-ingestion",
+        "tui-no-model-in-openrun-path",
+        "run-graph-accepts-planner-interpreter"
+      ],
+      "section": "0031",
+      "state": "skipped",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:47:10.810975Z",
+      "finished_at": "2026-06-05T19:47:10.810976Z"
+    },
+    {
+      "id": "update-orchestrator-test-helpers-for-planner",
+      "title": "Make the CoreApi test constructors that start real runs accept / build a planner interpreter",
+      "description": "In `crates/makina-core/src/orchestrator.rs` (the `mod tests` helpers: `execution_core_api`, `no_gate_config`, the ones used by `open_run_*`, `reinterpret_*`, and `planner_actor` tests):\n\n- Change (or add an overload for) the helpers that previously did `let interpreter = Arc::new(EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new())));` for the planner case so that they go through `build_planner_interpreter(&PlannerMechanism::OneShotAgent, None_or_Some(mock_backend))`.\n- The `CoreApi` construction for tests that only care about ingestion can keep forcing det; the ones that exercise `InterpretTaskList` via a supervisor must now be able to inject a model planner when they want the model behaviour.",
+      "done_when": "- `grep -n 'build_planner_interpreter' crates/makina-core/src/orchestrator.rs` shows at least one use inside the test helpers.\n- `cargo test -p makina-core --test planner_actor` (the tests that send `InterpretTaskList`) pass with both the det and a mock-backend model planner.\n- `cargo test -p makina-core` (the big orchestrator suite) is green.",
+      "depends_on": [
+        "tui-always-deterministic-ingestion",
+        "browser-activate-interpreting-status",
+        "run-graph-accepts-planner-interpreter",
+        "main-builds-and-passes-planner-interpreter"
+      ],
+      "section": "0031",
+      "state": "skipped",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:47:10.810977Z",
+      "finished_at": "2026-06-05T19:47:10.810977Z"
+    },
+    {
+      "id": "tui-uses-deterministic-ingestion-interpreter",
+      "title": "New test that the shipping construction path is det",
+      "description": "Add a test (can live in `crates/makina/src/app.rs` under `mod tests`, or a new `main_ingestion_test.rs`, or as a `#[test]` in a `#[cfg(test)]` module in `main.rs` that is compiled only for tests):\n\n```rust\n#[test]\nfn tui_main_constructs_deterministic_ingestion_interpreter() {\n    // Simulate the exact construction that main.rs performs for the api\n    // (using the same EdgeInferrer + StructuredTextInterpreter literals).\n    // Then create a CoreApi (or the minimal state) and assert that an\n    // OpenRun of a known-good sample produces the expected graph with\n    // zero backend involvement (pass None or a backend that would panic\n    // if called).\n    // The test must be named exactly as shown and must fail before the\n    // 0029 change.\n}\n```\n\nThe test must not require a real ACP backend.",
+      "done_when": "- The test with the literal name `tui_main_constructs_deterministic_ingestion_interpreter` exists, is listed in this task's \"Done when\", and passes.\n- It would have failed (or not compiled) before the main.rs edit in 0029.",
+      "depends_on": [
+        "tui-always-deterministic-ingestion",
+        "tui-no-model-in-openrun-path",
+        "browser-activate-interpreting-status",
+        "update-orchestrator-test-helpers-for-planner"
+      ],
+      "section": "0032",
+      "state": "skipped",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:47:10.810976Z",
+      "finished_at": "2026-06-05T19:47:10.810976Z"
+    },
+    {
+      "id": "update-comments-after-decoupling",
+      "title": "Sweep for stale claims about model being default for OpenRun",
+      "description": "Use `grep` (and fix) for every comment, docstring, or log that said the model/default ingestion path was used for task-list files opened by the TUI / `OpenRun` in the app.\n\nAt minimum the sites changed in 0029/0030/0031 plus the big comment in `orchestrator.rs` that describes the api interpreter.",
+      "done_when": "- `grep -n 'model.*default.*task.list|ingestion.*model.*default' --include='*.rs' crates/ | cat` returns no matches that claim the TUI uses model for OpenRun (a few test sites that explicitly opt into model ingestion are allowed).\n- A literal `grep -n 'always use the deterministic' crates/makina/src/main.rs` (or the exact clarifying sentence you added) appears in the \"Done when\".",
+      "depends_on": [
+        "tui-always-deterministic-ingestion",
+        "tui-no-model-in-openrun-path"
+      ],
+      "section": "0032",
+      "state": "skipped",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:47:10.810977Z",
+      "finished_at": "2026-06-05T19:47:10.810977Z"
+    },
+    {
+      "id": "shift-plan-5-and-6-titles-and-refs",
+      "title": "Perform the directory + title renumber",
+      "description": "- Rename `docs/plans/0005-Exchange-Thoughts-and-Tools/` → `docs/plans/0006-Exchange-Thoughts-and-Tools/`\n- Rename `docs/plans/0006-Ingestion-Gate-Hardening/` → `docs/plans/0007-Ingestion-Gate-Hardening/`\n- In all three files of the former 0005 (now 0006): change every \"Makina Plan 0005\", \"Plan 0005\", \"plan 0005\", \"End of plan 0005 TASKS\" to the 0006 equivalents. Leave the internal workstream numbers 0025–0028 and all \"changes in 0025–0028\" text untouched (they are stable).\n- In all three files of the former 0006 (now 0007): change every \"Makina Plan 0006\", \"Plan 0006\", \"plan 0006\", \"End of plan 0006 TASKS\" to the 0007 equivalents. Leave 0021–0024 untouched.\n- Update any \"see plan 0005\" / \"post-0005\" style sentences inside the shifted docs (and inside this new plan's docs if they mention the old numbers) to the new plan numbers.\n- The new plan 0005's own TASKS/SCOPE/ARCH use 0029–0032 and refer to the shifted plans by their *new* numbers (0006 for Exchange, 0007 for the gate hardening).",
+      "done_when": "- `ls docs/plans/ | grep -E '000[5-7]'` shows exactly `0005-TUI-Ingestion-Responsiveness`, `0006-Exchange-Thoughts-and-Tools`, `0007-Ingestion-Gate-Hardening`.\n- `grep -n 'Makina Plan 0006 — Exchange' docs/plans/0006-Exchange-Thoughts-and-Tools/TASKS.md` matches.\n- `grep -n 'Makina Plan 0007 — Ingestion Gate Hardening' docs/plans/0007-Ingestion-Gate-Hardening/TASKS.md` matches.\n- `grep -n 'End of plan 0006 TASKS' docs/plans/0006-Exchange-Thoughts-and-Tools/TASKS.md` matches (and the 0007 equivalent).\n- No stale \"plan 0005\" or \"plan 0006\" (as a plan identifier) remains in the three plan trees except inside this new plan's docs when it talks about the *old* numbering before the shift.\n- `cargo test -p makina -p makina-core` (the tests that mention plan numbers in comments or error messages are unaffected).",
+      "depends_on": [
+        "tui-always-deterministic-ingestion"
+      ],
+      "section": "0032",
+      "state": "done",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-06-05T19:29:44Z",
+      "updated_at": "2026-06-05T19:47:27.968747Z",
+      "started_at": "2026-06-05T19:41:43.407300Z",
+      "finished_at": "2026-06-05T19:47:27.968747Z"
+    }
+  ]
+}

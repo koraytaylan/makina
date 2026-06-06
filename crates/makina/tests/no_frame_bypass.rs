@@ -26,7 +26,7 @@ const LIVE_FRAME_REGION: &[&str] = &["event.rs", "app.rs", "ui.rs", "tui.rs", "b
 
 /// `main.rs` is exempt but pinned: exactly these three FATAL sites may print,
 /// and only because each runs with NO live ratatui frame.
-const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 3;
+const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 4;
 
 fn src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -73,7 +73,7 @@ fn no_print_macros_in_live_frame_region() {
 }
 
 #[test]
-fn main_rs_has_exactly_the_three_exempt_print_sites() {
+fn main_rs_has_exactly_the_exempt_print_sites() {
     let path = src_dir().join("main.rs");
     let source =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -82,7 +82,8 @@ fn main_rs_has_exactly_the_three_exempt_print_sites() {
         count, MAIN_RS_EXEMPT_PRINT_COUNT,
         "main.rs must contain EXACTLY the {MAIN_RS_EXEMPT_PRINT_COUNT} fatal, \
          frame-exempt eprintln! sites (config-load failure before Tui::init(), \
-         terminal-init failure, and the post-tui.restore() error print); \
+         terminal-init failure, the post-tui.restore() error print, and the \
+         planner mechanism fallback at startup); \
          found {count}. A new print here likely means an in-frame error is \
          bypassing the error pane — route it through tracing::error! instead.",
     );

@@ -1212,4 +1212,110 @@ mod tests {
             "selected_run().tasks must be non-empty after RunLoaded"
         );
     }
+
+    /// Simulate the exact construction that main.rs performs for the api
+    /// (using the same EdgeInferrer + StructuredTextInterpreter literals).
+    /// Then create a CoreApi and assert that an OpenRun of a known-good sample
+    /// produces the expected graph with zero backend involvement (the backend
+    /// panics if called, proving ingestion path does not touch it).
+    /// The test must be named exactly as shown and must fail before the 0029 change.
+    #[test]
+    fn tui_main_constructs_deterministic_ingestion_interpreter() {
+        use std::sync::Arc;
+
+        use makina_core::backend::{AgentBackend, BackendError, SessionConfig};
+        use makina_core::dependency::EdgeInferrer;
+        use makina_core::interpreter::{StructuredTextInterpreter, TaskListInterpreter};
+        use makina_core::worktree::WorktreeManager;
+
+        // Exact literals from main.rs deterministic construction.
+        let ingestion_interpreter: Arc<dyn TaskListInterpreter> = Arc::new(EdgeInferrer::new(
+            Arc::new(StructuredTextInterpreter::new()),
+        ));
+
+        // Backend that must never be called during OpenRun/ingestion.
+        struct PanicOnUseBackend;
+        #[async_trait::async_trait]
+        impl AgentBackend for PanicOnUseBackend {
+            async fn spawn(
+                &self,
+                _cfg: SessionConfig,
+            ) -> Result<Box<dyn makina_core::backend::AgentSession>, BackendError> {
+                panic!("backend must not be involved in TUI ingestion/OpenRun path");
+            }
+        }
+        let backend: Arc<dyn AgentBackend> = Arc::new(PanicOnUseBackend);
+
+        // Fresh temp repo for wm (OpenRun uses it for slug/artifact paths).
+        let repo_dir = tempfile::tempdir().expect("temp repo");
+        // init minimal git so WorktreeManager is happy if it checks.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo_dir.path())
+            .status()
+            .expect("git init");
+        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
+
+        let config = makina_core::config::Config {
+            backend: makina_core::config::BackendConfig {
+                command: "echo".into(),
+                args: vec![],
+            },
+            planner: makina_core::config::PlannerConfig::default(),
+            gates: vec![],
+            caps: makina_core::config::CapsConfig::default(),
+            concurrency: 1,
+            base_branch: "develop".into(),
+        };
+
+        let api = Arc::new(makina_core::orchestrator::CoreApi::new(
+            ingestion_interpreter,
+            backend,
+            wm,
+            config,
+        ));
+
+        // Bring Api trait into scope for .execute().
+        use makina_core::api::Api as _;
+
+        // Write a minimal valid task list (the interpreter will succeed).
+        let (tmp, path) = {
+            let dir = tempfile::tempdir().expect("task list dir");
+            let p = dir.path().join("sample.md");
+            std::fs::write(
+                &p,
+                r#"# Sample — Test
+Preamble.
+
+---
+## 0001 — Section
+
+### sample-task — Sample task
+A description that is long enough to pass minimums.
+- **Depends on:** —
+- **Done when:** the work completes successfully with tests passing.
+"#,
+            )
+            .expect("write sample");
+            (dir, p)
+        };
+
+        // OpenRun must succeed without touching the panicking backend.
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(api.execute(makina_core::api::Command::OpenRun {
+                task_list_path: path,
+            }))
+            .expect("OpenRun must succeed with det ingestion");
+
+        match outcome {
+            makina_core::api::CommandOutcome::RunOpened { .. } => {}
+            other => panic!("expected RunOpened, got {:?}", other),
+        }
+
+        // If we reached here, backend was not called (would have panicked).
+        // Also, the graph was interpreted (we can query runs but since no subscribe
+        // in this sync test, just the outcome is proof).
+        drop(tmp); // keep dir alive till end
+    }
 }

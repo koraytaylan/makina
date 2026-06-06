@@ -102,9 +102,11 @@ async fn main() {
     // The real, core-backed orchestrator Api.  It opens Runs by reading a
     // task-list file and interpreting it via the deterministic
     // `StructuredTextInterpreter` + `EdgeInferrer` path (always, for TUI
-    // OpenRun/ReinterpretRun responsiveness). The model path selected by
+    // OpenRun/ReinterpretRun responsiveness; we always use the deterministic
+    // ingestion interpreter in the shipping binary). The model path selected by
     // `config.planner.mechanism` + ACP backend is reserved exclusively for the
     // Planner actor/spoke; ingestion in the TUI binary is never the model path.
+    // (always use the deterministic path for TUI ingestion)
     // The run is then driven with the injected backend + worktree manager +
     // config (task 31).
     tracing::info!(
@@ -114,8 +116,31 @@ async fn main() {
         Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
             makina_core::interpreter::StructuredTextInterpreter::new(),
         )));
+    // INVARIANT: the ingestion interpreter used for OpenRun/ReinterpretRun in the
+    // shipping TUI is *never* the model-backed interpreter.  All model use for task-list
+    // interpretation goes through the Planner actor (build_planner_interpreter).
+    // If you change this, update plan 0005 and the test that asserts the invariant.
+
+    // Build a *separate* planner interpreter that *does* respect the configured
+    // mechanism (may be model-backed).  This is passed through CoreApi state
+    // into run_graph so the Planner actor (when spawned) uses the user's choice.
+    // Ingestion stays det for TUI responsiveness.
+    let planner_interpreter = match makina_core::interpreter::build_planner_interpreter(
+        &config.planner.mechanism,
+        Some(Arc::clone(&backend)),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("planner mechanism unavailable; falling back to deterministic planner: {e}");
+            Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
+                makina_core::interpreter::StructuredTextInterpreter::new(),
+            ))) as Arc<dyn makina_core::interpreter::TaskListInterpreter>
+        }
+    };
+
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
         ingestion_interpreter,
+        planner_interpreter,
         backend,
         worktree_manager,
         config,
