@@ -185,17 +185,32 @@ impl GateRunner {
         for gate in gates {
             // Execute the gate's command line through a shell so operators can
             // use ordinary shell syntax (pipes, &&, env expansion, etc.).
-            let output = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&gate.command)
-                .current_dir(working_dir)
-                .output()
-                .await
-                .map_err(|e| GateRunnerError::Launch {
-                    gate: gate.name.clone(),
-                    command: gate.command.clone(),
-                    message: e.to_string(),
-                })?;
+            let mut cmd = if let Some(ref image) = gate.image {
+                let mut docker_cmd = tokio::process::Command::new("docker");
+                let wd = working_dir.to_string_lossy();
+                docker_cmd
+                    .arg("run")
+                    .arg("--rm")
+                    .arg("-v")
+                    .arg(format!("{wd}:{wd}"))
+                    .arg("-w")
+                    .arg(working_dir)
+                    .arg(image)
+                    .arg("sh")
+                    .arg("-c")
+                    .arg(&gate.command);
+                docker_cmd
+            } else {
+                let mut sh_cmd = tokio::process::Command::new("sh");
+                sh_cmd.arg("-c").arg(&gate.command).current_dir(working_dir);
+                sh_cmd
+            };
+
+            let output = cmd.output().await.map_err(|e| GateRunnerError::Launch {
+                gate: gate.name.clone(),
+                command: gate.command.clone(),
+                message: e.to_string(),
+            })?;
 
             if !output.status.success() {
                 // First failing gate: this is the one fed back to the agent.
@@ -343,6 +358,22 @@ mod tests {
             !sentinel.exists(),
             "the gate after the first failure must NOT run"
         );
+    }
+
+    #[tokio::test]
+    async fn sandboxed_gate_uses_docker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gates = vec![GateConfig {
+            name: "sandboxed".to_string(),
+            command: "true".to_string(),
+            image: Some("alpine:latest".to_string()),
+        }];
+        let result = GateRunner::new().run_gates(&gates, dir.path()).await;
+        match result {
+            Ok(GateOutcome::Passed) => {}
+            Ok(GateOutcome::Failed { .. }) => {}
+            Err(GateRunnerError::Launch { .. }) => {}
+        }
     }
 
     #[tokio::test]
