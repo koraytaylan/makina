@@ -293,6 +293,11 @@ while read -r _line; do :; done
     while let Some(item) = stream.next().await {
         match item.expect("no transport error") {
             makina_acp::AcpResponseChunk::Text(t) => answer.push_str(&t),
+            // Rich side-channel chunks (thoughts/tool calls) are not relevant to
+            // this auth-verification turn; ignore them.
+            makina_acp::AcpResponseChunk::Thought(_)
+            | makina_acp::AcpResponseChunk::ToolCall { .. }
+            | makina_acp::AcpResponseChunk::ToolCallUpdate { .. } => {}
             makina_acp::AcpResponseChunk::TurnComplete(_) => break,
         }
     }

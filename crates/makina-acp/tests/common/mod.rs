@@ -43,8 +43,16 @@ pub struct MockBehavior {
     /// The `stopReason` string returned in the prompt result (e.g. `"end_turn"`).
     pub stop_reason: String,
     /// If set, the mock injects this many non-text updates (a tool-call update)
-    /// before the text chunks, to prove the client ignores them.
+    /// before the text chunks. Since `tool_call` is now a modelled update kind,
+    /// the client delivers each of these as an [`makina_acp::AcpResponseChunk::ToolCall`]
+    /// side-channel chunk rather than ignoring it.
     pub leading_noise_updates: usize,
+    /// If `true`, the mock injects — before the text chunks, in this exact order —
+    /// one `agent_thought_chunk` (with text), one `tool_call` (toolCallId + title +
+    /// status `"pending"`), and one `tool_call_update` (same toolCallId, status
+    /// `"completed"`). Lets tests assert the rich Thought / ToolCall / ToolCallUpdate
+    /// chunks are delivered interleaved with text.
+    pub inject_thoughts_and_tools: bool,
     /// Authentication methods advertised in the `initialize` response.
     ///
     /// Each entry is a `{ "type": "…", … }` JSON object, mirroring the ACP wire
@@ -65,6 +73,7 @@ impl Default for MockBehavior {
             chunks: vec!["Hello".into(), ", ".into(), "world!".into()],
             stop_reason: "end_turn".to_string(),
             leading_noise_updates: 0,
+            inject_thoughts_and_tools: false,
             // Default: advertise one auth method so tests can assert observability.
             auth_methods: vec![json!({ "type": "oauth" })],
             inject_permission_request: None,
@@ -195,6 +204,61 @@ async fn run_mock<R, W>(
                                     "sessionUpdate": "tool_call",
                                     "toolCallId": format!("tc-{n}"),
                                     "title": "noise"
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                }
+
+                // Optional rich side-channel updates: one thought, one tool_call,
+                // and one matching tool_call_update, in that exact order, before
+                // the text chunks. Lets the rich-drain tests assert arrival order.
+                if behavior.inject_thoughts_and_tools {
+                    send(
+                        &mut writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "agent_thought_chunk",
+                                    "content": { "type": "text", "text": "thinking…" }
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                    send(
+                        &mut writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "tool_call",
+                                    "toolCallId": "rich-tc-1",
+                                    "title": "running tests",
+                                    "kind": "execute",
+                                    "status": "pending"
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                    send(
+                        &mut writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": {
+                                    "sessionUpdate": "tool_call_update",
+                                    "toolCallId": "rich-tc-1",
+                                    "status": "completed"
                                 }
                             }
                         }),

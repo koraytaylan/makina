@@ -50,21 +50,95 @@ pub struct ErrorMessage {
     pub text: String,
 }
 
-/// A single turn in a live agent exchange: either a prompt from the
-/// orchestrator or a (possibly still-streaming) response from the agent.
+/// The payload of an [`ExchangeEntry`].
+///
+/// An entry is one of four kinds.  Prompts/responses build the visible
+/// conversation; thoughts and tool calls are observability-only side channels
+/// that the TUI renders for transparency but that never contribute to the
+/// agent's answer text.
+#[derive(Debug, Clone)]
+pub enum ExchangeContent {
+    /// A prompt sent TO the agent by the orchestrator.
+    ///
+    /// `text` is the full text of [`ExchangeEvent::PromptSent`].
+    Prompt {
+        /// Full prompt text.
+        text: String,
+    },
+    /// A (possibly still-streaming) response FROM the agent.
+    ///
+    /// Each [`ExchangeEvent::ResponseChunk`] is appended to `text` as it
+    /// arrives; `complete` flips to `true` on [`ExchangeEvent::TurnComplete`].
+    Response {
+        /// Accumulated response text.
+        text: String,
+        /// Whether [`ExchangeEvent::TurnComplete`] has been received.
+        complete: bool,
+    },
+    /// A burst of the agent's internal reasoning ([`ExchangeEvent::ThoughtChunk`]).
+    ///
+    /// Consecutive thought chunks for the same role coalesce into a single
+    /// entry; observability-only, never part of the answer text.
+    Thought {
+        /// Accumulated thought text.
+        text: String,
+    },
+    /// A tool invocation announced by the agent, keyed by `id`
+    /// ([`ExchangeEvent::ToolCall`] / [`ExchangeEvent::ToolCallUpdate`]).
+    Tool {
+        /// Stable id correlating the call with later updates.
+        id: String,
+        /// Human-readable title (may be empty).
+        title: String,
+        /// Optional semantic kind (e.g. `"execute"`, `"edit"`).
+        kind: Option<String>,
+        /// Latest lifecycle status (e.g. `"pending"`, `"completed"`).
+        status: String,
+        /// Accumulated or last tool content.  The live event path carries no
+        /// content text yet, so this stays empty there; the field EXISTS so
+        /// rich tool rendering can construct an entry WITH content.
+        content: String,
+    },
+}
+
+/// A single turn in a live agent exchange.
+///
+/// Every entry carries the [`AgentRole`] that produced it plus its
+/// [`ExchangeContent`] — a prompt, a (possibly streaming) response, a thought
+/// burst, or a tool call.
 #[derive(Debug, Clone)]
 pub struct ExchangeEntry {
     /// The agent role that produced this turn.
     pub role: AgentRole,
-    /// `true` → this is a prompt sent TO the agent; `false` → response.
-    pub is_prompt: bool,
-    /// Accumulated text.  For prompts this is the full text of
-    /// [`ExchangeEvent::PromptSent`].  For responses each
-    /// [`ExchangeEvent::ResponseChunk`] is appended here as it arrives.
-    pub text: String,
-    /// Whether [`ExchangeEvent::TurnComplete`] has been received for the
-    /// current response turn.  Always `true` for prompt entries.
-    pub complete: bool,
+    /// The kind and payload of this turn.
+    pub content: ExchangeContent,
+}
+
+impl ExchangeEntry {
+    /// `true` when this entry is a prompt sent TO the agent.
+    pub fn is_prompt(&self) -> bool {
+        matches!(self.content, ExchangeContent::Prompt { .. })
+    }
+
+    /// The entry's primary text (prompt/response/thought text, or a tool's
+    /// title).  Used by render and migrated tests.
+    pub fn text(&self) -> &str {
+        match &self.content {
+            ExchangeContent::Prompt { text }
+            | ExchangeContent::Response { text, .. }
+            | ExchangeContent::Thought { text } => text,
+            ExchangeContent::Tool { title, .. } => title,
+        }
+    }
+
+    /// Whether this entry is finalised.  Responses track
+    /// [`ExchangeEvent::TurnComplete`]; all other kinds are always complete.
+    pub fn complete(&self) -> bool {
+        match &self.content {
+            ExchangeContent::Response { complete, .. } => *complete,
+            _ => true,
+        }
+    }
 }
 
 /// Per-task bounded ring of exchange entries.
@@ -91,9 +165,7 @@ impl ExchangeLog {
     pub fn add_prompt(&mut self, role: AgentRole, text: String) {
         self.push(ExchangeEntry {
             role,
-            is_prompt: true,
-            text,
-            complete: true,
+            content: ExchangeContent::Prompt { text },
         });
     }
 
@@ -104,33 +176,137 @@ impl ExchangeLog {
     /// `PromptSent` in this log still needs to go somewhere — we create an
     /// implicit incomplete response entry rather than silently dropping data.
     pub fn append_chunk(&mut self, role: AgentRole, chunk: String) {
-        // Look for the last incomplete response entry with the same role so we
-        // can accumulate streaming chunks.
-        if let Some(last) = self.entries.last_mut()
-            && !last.is_prompt
-            && !last.complete
-            && last.role == role
-        {
-            last.text.push_str(&chunk);
-            return;
+        // A streaming response can have Thought/Tool entries interleaved between
+        // its chunks (e.g. PromptSent → ResponseChunk → ThoughtChunk →
+        // ResponseChunk → TurnComplete for any thinking-capable LLM).  Scan back
+        // past those transparent entries to find the still-open Response of the
+        // same role so streaming chunks accumulate into a single entry.
+        for entry in self.entries.iter_mut().rev() {
+            match &mut entry.content {
+                ExchangeContent::Response { text, complete }
+                    if entry.role == role && !*complete =>
+                {
+                    text.push_str(&chunk);
+                    return;
+                }
+                ExchangeContent::Thought { .. } | ExchangeContent::Tool { .. } => continue,
+                _ => break,
+            }
         }
         // No open response entry for this role — start a new one.
         self.push(ExchangeEntry {
             role,
-            is_prompt: false,
-            text: chunk,
-            complete: false,
+            content: ExchangeContent::Response {
+                text: chunk,
+                complete: false,
+            },
         });
     }
 
     /// Mark the last incomplete response entry as complete.
+    ///
+    /// Scans back past any trailing Thought/Tool entries (which may be
+    /// interleaved before the terminating `TurnComplete`) so the real Response
+    /// entry is finalised even when it isn't the literal last entry.
     pub fn complete_turn(&mut self) {
-        if let Some(last) = self.entries.last_mut()
-            && !last.is_prompt
-            && !last.complete
-        {
-            last.complete = true;
+        for entry in self.entries.iter_mut().rev() {
+            match &mut entry.content {
+                ExchangeContent::Response { complete, .. } if !*complete => {
+                    *complete = true;
+                    return;
+                }
+                ExchangeContent::Thought { .. } | ExchangeContent::Tool { .. } => continue,
+                _ => break,
+            }
         }
+    }
+
+    /// Append a thought "burst" for the given role.
+    ///
+    /// Coalesces with the immediately-preceding entry when that entry is a
+    /// [`ExchangeContent::Thought`] of the same role; otherwise starts a new
+    /// thought entry.  Thoughts are observability-only and never affect the
+    /// answer text.
+    pub fn append_thought(&mut self, role: AgentRole, chunk: String) {
+        if let Some(last) = self.entries.last_mut()
+            && last.role == role
+            && let ExchangeContent::Thought { text } = &mut last.content
+        {
+            text.push_str(&chunk);
+            return;
+        }
+        self.push(ExchangeEntry {
+            role,
+            content: ExchangeContent::Thought { text: chunk },
+        });
+    }
+
+    /// Upsert a tool call by `id`.
+    ///
+    /// Updates an existing [`ExchangeContent::Tool`] entry with the same `id`
+    /// (overwriting title/kind/status, leaving accumulated `content`), or
+    /// pushes a new tool entry with empty content.
+    pub fn start_tool(
+        &mut self,
+        role: AgentRole,
+        id: String,
+        title: String,
+        kind: Option<String>,
+        status: String,
+    ) {
+        if let Some(entry) = self.find_tool_mut(&id) {
+            if let ExchangeContent::Tool {
+                title: t,
+                kind: k,
+                status: s,
+                ..
+            } = &mut entry.content
+            {
+                *t = title;
+                *k = kind;
+                *s = status;
+            }
+            return;
+        }
+        self.push(ExchangeEntry {
+            role,
+            content: ExchangeContent::Tool {
+                id,
+                title,
+                kind,
+                status,
+                content: String::new(),
+            },
+        });
+    }
+
+    /// Apply a status/title update to an existing tool entry by `id`.
+    ///
+    /// Finds the [`ExchangeContent::Tool`] entry with the matching `id` and
+    /// updates `status`/`title` when present; leaves `content` untouched.  No-op
+    /// when no entry matches (live updates always follow a `start_tool`).
+    pub fn update_tool(&mut self, id: &str, status: Option<String>, title: Option<String>) {
+        if let Some(entry) = self.find_tool_mut(id)
+            && let ExchangeContent::Tool {
+                title: t,
+                status: s,
+                ..
+            } = &mut entry.content
+        {
+            if let Some(new_status) = status {
+                *s = new_status;
+            }
+            if let Some(new_title) = title {
+                *t = new_title;
+            }
+        }
+    }
+
+    /// Find the tool entry with the given `id`, if any.
+    fn find_tool_mut(&mut self, id: &str) -> Option<&mut ExchangeEntry> {
+        self.entries
+            .iter_mut()
+            .find(|e| matches!(&e.content, ExchangeContent::Tool { id: eid, .. } if eid == id))
     }
 }
 
@@ -846,6 +1022,26 @@ impl App {
                     }
                     ExchangeEvent::ResponseChunk { text } => {
                         log.append_chunk(role.clone(), text.clone());
+                    }
+                    ExchangeEvent::ThoughtChunk { text } => {
+                        log.append_thought(role.clone(), text.clone());
+                    }
+                    ExchangeEvent::ToolCall {
+                        id,
+                        title,
+                        kind,
+                        status,
+                    } => {
+                        log.start_tool(
+                            role.clone(),
+                            id.clone(),
+                            title.clone(),
+                            kind.clone(),
+                            status.clone(),
+                        );
+                    }
+                    ExchangeEvent::ToolCallUpdate { id, status, title } => {
+                        log.update_tool(id, status.clone(), title.clone());
                     }
                     ExchangeEvent::TurnComplete => {
                         log.complete_turn();
@@ -1933,18 +2129,22 @@ mod tests {
         assert_eq!(log.entries.len(), 2, "expect prompt + response entries");
 
         // Entry 0: prompt.
-        assert!(log.entries[0].is_prompt, "first entry must be a prompt");
-        assert_eq!(log.entries[0].text, "implement X");
+        assert!(log.entries[0].is_prompt(), "first entry must be a prompt");
+        assert_eq!(log.entries[0].text(), "implement X");
         assert_eq!(log.entries[0].role, AgentRole::Developer);
 
         // Entry 1: concatenated response.
-        assert!(!log.entries[1].is_prompt, "second entry must be a response");
+        assert!(
+            !log.entries[1].is_prompt(),
+            "second entry must be a response"
+        );
         assert_eq!(
-            log.entries[1].text, "working on it",
+            log.entries[1].text(),
+            "working on it",
             "chunks must concatenate in order"
         );
         assert!(
-            log.entries[1].complete,
+            log.entries[1].complete(),
             "TurnComplete must mark entry complete"
         );
     }
@@ -2007,18 +2207,18 @@ mod tests {
         let log = app.exchange_logs.get(&tid).expect("log must exist");
         assert_eq!(log.entries.len(), 4, "2 prompts + 2 responses");
         // Ordering.
-        assert!(log.entries[0].is_prompt);
+        assert!(log.entries[0].is_prompt());
         assert_eq!(log.entries[0].role, AgentRole::Developer);
-        assert_eq!(log.entries[0].text, "dev prompt");
-        assert!(!log.entries[1].is_prompt);
+        assert_eq!(log.entries[0].text(), "dev prompt");
+        assert!(!log.entries[1].is_prompt());
         assert_eq!(log.entries[1].role, AgentRole::Developer);
-        assert_eq!(log.entries[1].text, "dev reply");
-        assert!(log.entries[2].is_prompt);
+        assert_eq!(log.entries[1].text(), "dev reply");
+        assert!(log.entries[2].is_prompt());
         assert_eq!(log.entries[2].role, AgentRole::Reviewer);
-        assert_eq!(log.entries[2].text, "review prompt");
-        assert!(!log.entries[3].is_prompt);
+        assert_eq!(log.entries[2].text(), "review prompt");
+        assert!(!log.entries[3].is_prompt());
         assert_eq!(log.entries[3].role, AgentRole::Reviewer);
-        assert_eq!(log.entries[3].text, "lgtm");
+        assert_eq!(log.entries[3].text(), "lgtm");
     }
 
     /// **Focus filtering:** feed AgentExchange for task-a and task-b; focused
@@ -2075,7 +2275,7 @@ mod tests {
             .exchange_logs
             .get(app.selected_task_id().unwrap())
             .unwrap();
-        assert_eq!(focused_log.entries[0].text, "task-a prompt");
+        assert_eq!(focused_log.entries[0].text(), "task-a prompt");
 
         // Navigate to task-b.
         app.update(AppEvent::SelectDown);
@@ -2086,7 +2286,7 @@ mod tests {
             .exchange_logs
             .get(app.selected_task_id().unwrap())
             .unwrap();
-        assert_eq!(focused_log_b.entries[0].text, "task-b prompt");
+        assert_eq!(focused_log_b.entries[0].text(), "task-b prompt");
     }
 
     /// **Task selection:** Up/Down moves the focused task when Main is focused
@@ -2421,15 +2621,15 @@ mod tests {
         let mut log = ExchangeLog::default();
         log.add_prompt(AgentRole::Developer, "hello".into());
         assert_eq!(log.entries.len(), 1);
-        assert!(log.entries[0].is_prompt);
-        assert_eq!(log.entries[0].text, "hello");
-        assert!(log.entries[0].complete);
+        assert!(log.entries[0].is_prompt());
+        assert_eq!(log.entries[0].text(), "hello");
+        assert!(log.entries[0].complete());
 
         log.append_chunk(AgentRole::Developer, "chunk1".into());
         assert_eq!(log.entries.len(), 2);
-        assert!(!log.entries[1].is_prompt);
-        assert_eq!(log.entries[1].text, "chunk1");
-        assert!(!log.entries[1].complete);
+        assert!(!log.entries[1].is_prompt());
+        assert_eq!(log.entries[1].text(), "chunk1");
+        assert!(!log.entries[1].complete());
 
         log.append_chunk(AgentRole::Developer, " chunk2".into());
         assert_eq!(
@@ -2437,12 +2637,280 @@ mod tests {
             2,
             "chunks must accumulate, not add new entries"
         );
-        assert_eq!(log.entries[1].text, "chunk1 chunk2");
+        assert_eq!(log.entries[1].text(), "chunk1 chunk2");
 
         log.complete_turn();
         assert!(
-            log.entries[1].complete,
+            log.entries[1].complete(),
             "TurnComplete must mark response complete"
         );
+    }
+
+    /// Regression: a thinking-capable LLM interleaves a ThoughtChunk between two
+    /// ResponseChunks (PromptSent → ResponseChunk → ThoughtChunk →
+    /// ResponseChunk → TurnComplete).  The streaming chunks MUST coalesce into a
+    /// single Response entry (not split into two), the thought must survive, and
+    /// TurnComplete must finalise the response even though the literal last
+    /// entry at that point is the Response again — but the bug also surfaced when
+    /// the last entry was the Thought.  Drives the exact failing sequence and
+    /// asserts coalescing + completion + thought preservation.
+    #[test]
+    fn exchange_log_response_chunks_coalesce_across_interleaved_thought() {
+        use crate::app::ExchangeLog;
+        use makina_core::api::AgentRole;
+
+        let mut log = ExchangeLog::default();
+        log.add_prompt(AgentRole::Developer, "do it".into());
+        log.append_chunk(AgentRole::Developer, "A".into());
+        log.append_thought(AgentRole::Developer, "hmm".into());
+        log.append_chunk(AgentRole::Developer, "B".into());
+        log.complete_turn();
+
+        // Exactly ONE Response entry — the chunks coalesced across the thought.
+        let responses: Vec<_> = log
+            .entries
+            .iter()
+            .filter(|e| matches!(e.content, ExchangeContent::Response { .. }))
+            .collect();
+        assert_eq!(
+            responses.len(),
+            1,
+            "ResponseChunks must coalesce into ONE entry across the interleaved thought"
+        );
+        match &responses[0].content {
+            ExchangeContent::Response { text, complete } => {
+                assert_eq!(
+                    text, "AB",
+                    "chunks must coalesce across the interleaved thought"
+                );
+                assert!(
+                    complete,
+                    "TurnComplete must finalise the coalesced response"
+                );
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+
+        // The interleaved thought must still be present (not lost).
+        assert!(
+            log.entries
+                .iter()
+                .any(|e| matches!(&e.content, ExchangeContent::Thought { text } if text == "hmm")),
+            "the interleaved thought must be preserved"
+        );
+    }
+
+    /// Regression: TurnComplete must finalise the response even when the literal
+    /// last entry is a Tool (PromptSent → ResponseChunk → ToolCall →
+    /// TurnComplete).  Before the fix this was a silent no-op and the UI showed
+    /// the streaming cursor forever.
+    #[test]
+    fn complete_turn_marks_response_complete_when_last_entry_is_tool() {
+        use crate::app::ExchangeLog;
+        use makina_core::api::AgentRole;
+
+        let mut log = ExchangeLog::default();
+        log.add_prompt(AgentRole::Developer, "do it".into());
+        log.append_chunk(AgentRole::Developer, "X".into());
+        log.start_tool(
+            AgentRole::Developer,
+            "tc-1".into(),
+            "run tests".into(),
+            Some("execute".into()),
+            "pending".into(),
+        );
+        log.complete_turn();
+
+        let response = log
+            .entries
+            .iter()
+            .find(|e| matches!(e.content, ExchangeContent::Response { .. }))
+            .expect("response entry must exist");
+        match &response.content {
+            ExchangeContent::Response { text, complete } => {
+                assert_eq!(text, "X");
+                assert!(
+                    complete,
+                    "TurnComplete must finalise the response past a trailing Tool entry"
+                );
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+    }
+
+    /// ExchangeLog must capture thought bursts and tool calls/updates as
+    /// distinct entry kinds, with tool updates upserting in place by id.
+    ///
+    /// Feeds a Prompt, several Thoughts, a ToolCall, two ToolCallUpdates for
+    /// the same id, then a Response, all through `App::update`, and asserts the
+    /// resulting log has the right number/kinds of entries and that the single
+    /// tool entry carries the FINAL status.
+    #[test]
+    fn exchange_log_captures_thoughts_and_tool_updates() {
+        use makina_core::api::{AgentRole, Event, ExchangeEvent, RunId, TaskId};
+        let mut app = make_app_with_tasks();
+        let tid = TaskId::new("task-a");
+
+        let feed = |app: &mut App, event: ExchangeEvent| {
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: TaskId::new("task-a"),
+                role: AgentRole::Developer,
+                event,
+            }));
+        };
+
+        // Prompt.
+        feed(
+            &mut app,
+            ExchangeEvent::PromptSent {
+                text: "do the thing".into(),
+            },
+        );
+        // Several thought chunks — these must coalesce into ONE thought entry.
+        feed(
+            &mut app,
+            ExchangeEvent::ThoughtChunk {
+                text: "let me ".into(),
+            },
+        );
+        feed(
+            &mut app,
+            ExchangeEvent::ThoughtChunk {
+                text: "think...".into(),
+            },
+        );
+        // Tool call announced, then two updates for the same id.
+        feed(
+            &mut app,
+            ExchangeEvent::ToolCall {
+                id: "tc-1".into(),
+                title: "run tests".into(),
+                kind: Some("execute".into()),
+                status: "pending".into(),
+            },
+        );
+        feed(
+            &mut app,
+            ExchangeEvent::ToolCallUpdate {
+                id: "tc-1".into(),
+                status: Some("in_progress".into()),
+                title: None,
+            },
+        );
+        feed(
+            &mut app,
+            ExchangeEvent::ToolCallUpdate {
+                id: "tc-1".into(),
+                status: Some("completed".into()),
+                title: None,
+            },
+        );
+        // Response + turn complete.
+        feed(
+            &mut app,
+            ExchangeEvent::ResponseChunk {
+                text: "done".into(),
+            },
+        );
+        feed(&mut app, ExchangeEvent::TurnComplete);
+
+        let log = app.exchange_logs.get(&tid).expect("log must exist");
+
+        // Kinds + counts: prompt, ONE coalesced thought, ONE tool, response.
+        assert_eq!(
+            log.entries.len(),
+            4,
+            "prompt + 1 thought + 1 tool + 1 response (thoughts coalesce, tool upserts)"
+        );
+
+        assert!(matches!(
+            log.entries[0].content,
+            ExchangeContent::Prompt { .. }
+        ));
+        match &log.entries[1].content {
+            ExchangeContent::Thought { text } => {
+                assert_eq!(text, "let me think...", "thought bursts must coalesce");
+            }
+            other => panic!("entry 1 must be a Thought, got {other:?}"),
+        }
+        match &log.entries[2].content {
+            ExchangeContent::Tool {
+                id, title, status, ..
+            } => {
+                assert_eq!(id, "tc-1");
+                assert_eq!(title, "run tests");
+                assert_eq!(status, "completed", "tool entry must reflect FINAL status");
+            }
+            other => panic!("entry 2 must be a Tool, got {other:?}"),
+        }
+        match &log.entries[3].content {
+            ExchangeContent::Response { text, complete } => {
+                assert_eq!(text, "done");
+                assert!(complete, "TurnComplete must finalise the response");
+            }
+            other => panic!("entry 3 must be a Response, got {other:?}"),
+        }
+    }
+
+    /// Two ToolCallUpdates for id "tc-1" must mutate the SAME tool entry in
+    /// place (no duplicate entries), and the entry's status must reflect the
+    /// LAST update.
+    #[test]
+    fn exchange_log_tool_update_mutates_in_place() {
+        use crate::app::ExchangeLog;
+        use makina_core::api::AgentRole;
+
+        let mut log = ExchangeLog::default();
+
+        // Announce a tool call.
+        log.start_tool(
+            AgentRole::Developer,
+            "tc-1".into(),
+            "edit file".into(),
+            Some("edit".into()),
+            "pending".into(),
+        );
+        assert_eq!(log.entries.len(), 1, "one tool entry after start_tool");
+
+        // First update.
+        log.update_tool("tc-1", Some("in_progress".into()), None);
+        // Second update — title change too.
+        log.update_tool(
+            "tc-1",
+            Some("completed".into()),
+            Some("edit file (done)".into()),
+        );
+
+        // Still exactly ONE tool entry — updates mutated in place.
+        assert_eq!(
+            log.entries.len(),
+            1,
+            "two updates for the same id must NOT create new entries"
+        );
+
+        match &log.entries[0].content {
+            ExchangeContent::Tool {
+                id,
+                title,
+                kind,
+                status,
+                content,
+            } => {
+                assert_eq!(id, "tc-1");
+                assert_eq!(status, "completed", "status must reflect the LAST update");
+                assert_eq!(
+                    title, "edit file (done)",
+                    "title must reflect the LAST update"
+                );
+                assert_eq!(
+                    kind.as_deref(),
+                    Some("edit"),
+                    "kind set by start_tool stays"
+                );
+                assert!(content.is_empty(), "no content carried on the update path");
+            }
+            other => panic!("entry must be a Tool, got {other:?}"),
+        }
     }
 }

@@ -541,6 +541,10 @@ mod tests {
         while let Some(item) = stream.next().await {
             match item.expect("no error in noop stream") {
                 ResponseEvent::TextChunk { text } => dev_output.push_str(&text),
+                // Side-channel events do not contribute to the developer output.
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. } => {}
                 ResponseEvent::TurnComplete => break,
             }
         }

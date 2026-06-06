@@ -12,7 +12,7 @@
 //!  AcpClient::connect(AcpCommand)        // spawn subprocess + initialize + session/new
 //!        │
 //!        ▼
-//!  client.prompt("…") ──► PromptStream ──► [Text, Text, …, TurnComplete]
+//!  client.prompt("…") ──► PromptStream ──► [Text|Thought|ToolCall|…, …, TurnComplete]
 //!        │
 //!        ▼ client.shutdown()  (or drop)   // kill subprocess, abort reader task
 //! ```
@@ -43,8 +43,9 @@ use makina_core::governance::NoopAuditSink;
 use crate::error::{AcpError, Result};
 use crate::permission::WorktreePolicy;
 use crate::protocol::{
-    self, AuthMethod, ContentBlock, Implementation, InitializeParams, InitializeResult,
-    NewSessionParams, NewSessionResult, PromptParams, PromptResult, SessionUpdate, StopReason,
+    self, AuthMethod, ContentBlock, ContentChunk, Implementation, InitializeParams,
+    InitializeResult, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
+    SessionUpdate, StopReason,
 };
 use crate::transport::Transport;
 
@@ -174,14 +175,52 @@ impl AcpCommand {
 
 /// One item produced by a [`PromptStream`].
 ///
-/// A turn yields zero or more [`AcpResponseChunk::Text`] items (assembled from
-/// `agent_message_chunk` `session/update` notifications) followed by exactly one
-/// [`AcpResponseChunk::TurnComplete`]. This mirrors the shape of
+/// A turn yields, in arrival order, zero or more of the following — interleaved
+/// as the agent emits them:
+/// * [`AcpResponseChunk::Text`] — a fragment of the assistant message
+///   (`agent_message_chunk`);
+/// * [`AcpResponseChunk::Thought`] — a fragment of the agent's reasoning stream
+///   (`agent_thought_chunk`);
+/// * [`AcpResponseChunk::ToolCall`] — the agent announced a tool call;
+/// * [`AcpResponseChunk::ToolCallUpdate`] — a status/result update for a
+///   previously-announced tool call;
+///
+/// followed by exactly one terminal [`AcpResponseChunk::TurnComplete`]. The
+/// non-text variants are a side channel: they do not contribute to the assembled
+/// assistant text, but they are delivered (not dropped) so downstream consumers
+/// can render thoughts and tool activity. This mirrors the shape of
 /// `makina_core::backend::ResponseEvent` so task 15's adapter is a thin mapping.
+///
+/// Every field is a `String`/`Option<String>` so the enum stays `Clone + Eq`;
+/// richer per-tool payloads (raw input, content, …) are intentionally not
+/// carried here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpResponseChunk {
     /// A fragment of the agent's assistant message text (never empty).
     Text(String),
+    /// A fragment of the agent's "thinking"/reasoning stream (never empty).
+    Thought(String),
+    /// The agent announced a tool call. `status` defaults to `"pending"` when the
+    /// agent omits it; `kind` is the optional semantic category (e.g. `"execute"`).
+    ToolCall {
+        /// Stable id correlating this call with later [`AcpResponseChunk::ToolCallUpdate`]s.
+        id: String,
+        /// Human-readable title (empty when the agent omits it).
+        title: String,
+        /// Optional semantic kind (e.g. `"execute"`, `"edit"`).
+        kind: Option<String>,
+        /// Lifecycle status (`"pending"` when the agent omits it).
+        status: String,
+    },
+    /// A status/result update for a previously-announced tool call.
+    ToolCallUpdate {
+        /// The id of the [`AcpResponseChunk::ToolCall`] this updates.
+        id: String,
+        /// Updated lifecycle status, if the update carried one.
+        status: Option<String>,
+        /// Updated title, if the update carried one.
+        title: Option<String>,
+    },
     /// The turn finished; carries the agent's stop reason.
     TurnComplete(StopReason),
 }
@@ -407,8 +446,11 @@ impl AcpClient {
     ///
     /// The returned [`PromptStream`] borrows the client for the duration of the
     /// turn; drain it (to [`AcpResponseChunk::TurnComplete`] or an error) before
-    /// issuing another prompt. Yields:
+    /// issuing another prompt. Yields, in arrival order:
     /// * [`AcpResponseChunk::Text`] for each assistant `agent_message_chunk`;
+    /// * [`AcpResponseChunk::Thought`] for each `agent_thought_chunk`;
+    /// * [`AcpResponseChunk::ToolCall`] / [`AcpResponseChunk::ToolCallUpdate`]
+    ///   for `tool_call` / `tool_call_update` lifecycle updates;
     /// * [`AcpResponseChunk::TurnComplete`] once the `session/prompt` response
     ///   arrives;
     /// * an [`AcpError`] if the transport breaks or the agent exits mid-turn,
@@ -646,23 +688,55 @@ pub struct PromptStream<'a> {
     transport: &'a mut Transport<BoxedWriter>,
     /// Turn progress.
     state: StreamState,
-    /// Text chunks observed after the response resolved, queued to emit before
-    /// `TurnComplete` (insurance against any chunk/response reordering).
-    buffered: VecDeque<String>,
+    /// Response chunks observed after the prompt response resolved, queued to
+    /// emit before `TurnComplete` (insurance against any chunk/response
+    /// reordering). Holds the full rich variant set, not just text, so thoughts
+    /// and tool-call updates that land late are not lost.
+    buffered: VecDeque<AcpResponseChunk>,
 }
 
 impl PromptStream<'_> {
-    /// Pull the next text chunk out of an already-delivered notification, if it
-    /// is an assistant `agent_message_chunk` with non-empty text. Other update
-    /// kinds (thoughts, tool calls, …) return `None` and are skipped.
-    fn chunk_text(update: SessionUpdate) -> Option<String> {
+    /// Pull the assistant message text out of an `agent_message_chunk` update, if
+    /// it carries non-empty text. Returns `None` for every other update kind.
+    ///
+    /// Kept as the single place that knows how to read an assistant text chunk;
+    /// [`Self::classify_update`] reuses it for the [`AcpResponseChunk::Text`] case.
+    fn extract_text(chunk: &ContentChunk) -> Option<String> {
+        chunk
+            .content
+            .as_text()
+            .map(str::to_string)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Classify an already-delivered notification into the rich response chunk it
+    /// should produce, if any.
+    ///
+    /// Assistant/thought text chunks become [`AcpResponseChunk::Text`] /
+    /// [`AcpResponseChunk::Thought`] (empty text is dropped); tool-call lifecycle
+    /// updates become [`AcpResponseChunk::ToolCall`] /
+    /// [`AcpResponseChunk::ToolCallUpdate`]. User-message echoes and unmodelled
+    /// kinds (`SessionUpdate::Other`) return `None` and are skipped.
+    fn classify_update(update: SessionUpdate) -> Option<AcpResponseChunk> {
         match update {
-            SessionUpdate::AgentMessageChunk(chunk) => chunk
-                .content
-                .as_text()
-                .map(str::to_string)
-                .filter(|t| !t.is_empty()),
-            _ => None,
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                Self::extract_text(&chunk).map(AcpResponseChunk::Text)
+            }
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                Self::extract_text(&chunk).map(AcpResponseChunk::Thought)
+            }
+            SessionUpdate::ToolCall(tc) => Some(AcpResponseChunk::ToolCall {
+                id: tc.tool_call_id,
+                title: tc.title.unwrap_or_default(),
+                kind: tc.kind,
+                status: tc.status.unwrap_or_else(|| "pending".to_string()),
+            }),
+            SessionUpdate::ToolCallUpdate(u) => Some(AcpResponseChunk::ToolCallUpdate {
+                id: u.tool_call_id,
+                status: u.status,
+                title: u.title,
+            }),
+            SessionUpdate::UserMessageChunk(_) | SessionUpdate::Other => None,
         }
     }
 }
@@ -675,25 +749,28 @@ impl Stream for PromptStream<'_> {
 
         loop {
             // Emit any buffered post-response chunks before TurnComplete.
-            if let Some(text) = this.buffered.pop_front() {
-                return Poll::Ready(Some(Ok(AcpResponseChunk::Text(text))));
+            if let Some(chunk) = this.buffered.pop_front() {
+                return Poll::Ready(Some(Ok(chunk)));
             }
 
             match &mut this.state {
                 StreamState::Streaming(response) => {
                     // 1. Prefer delivering a ready notification chunk first, so
-                    //    text streams out incrementally as it arrives.
+                    //    text/thoughts/tools stream out incrementally as they arrive.
                     match this.transport.notifications_mut().poll_recv(cx) {
                         Poll::Ready(Some(notif)) => {
-                            if let Some(text) = Self::chunk_text(notif.update) {
-                                return Poll::Ready(Some(Ok(AcpResponseChunk::Text(text))));
+                            if let Some(chunk) = Self::classify_update(notif.update) {
+                                return Poll::Ready(Some(Ok(chunk)));
                             }
-                            // Non-text update: loop to check for more.
+                            // Update kind with no chunk (user echo / unmodelled):
+                            // loop to check for more.
                             continue;
                         }
                         Poll::Ready(None) => {
-                            // The agent disconnected. Resolve via the response
-                            // future, which will carry the terminal error.
+                            // Notification channel closed (agent disconnected).
+                            // Fall through to poll the response future, which will
+                            // now resolve with a terminal error because the reader
+                            // task called `shared.shutdown()` on EOF/error, waking it.
                         }
                         Poll::Pending => {}
                     }
@@ -703,10 +780,11 @@ impl Stream for PromptStream<'_> {
                     match response.as_mut().poll(cx) {
                         Poll::Ready(Ok(result)) => {
                             // Drain any chunks that landed before the response so
-                            // none are dropped, then move to Completing.
+                            // none are dropped (text AND rich side-channel kinds),
+                            // then move to Completing.
                             while let Ok(notif) = this.transport.notifications_mut().try_recv() {
-                                if let Some(text) = Self::chunk_text(notif.update) {
-                                    this.buffered.push_back(text);
+                                if let Some(chunk) = Self::classify_update(notif.update) {
+                                    this.buffered.push_back(chunk);
                                 }
                             }
                             this.state = StreamState::Completing(result.stop_reason);

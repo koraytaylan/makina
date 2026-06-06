@@ -96,6 +96,10 @@ pub async fn drain_response(stream: makina_core::backend::ResponseStream) -> Str
     while let Some(item) = events.next().await {
         match item.expect("unexpected Err item in noop stream") {
             ResponseEvent::TextChunk { text: chunk } => text.push_str(&chunk),
+            // Side-channel events do not contribute to the assembled answer.
+            ResponseEvent::ThoughtChunk { .. }
+            | ResponseEvent::ToolCall { .. }
+            | ResponseEvent::ToolCallUpdate { .. } => {}
             ResponseEvent::TurnComplete => break,
         }
     }

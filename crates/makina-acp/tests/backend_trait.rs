@@ -55,6 +55,14 @@ async fn drain_ok(stream: ResponseStream) -> (String, /* turn_complete_count */ 
                 assert!(!saw_complete_last, "no chunk may follow TurnComplete");
                 text.push_str(&chunk);
             }
+            // Side-channel events do not contribute to the assembled answer; the
+            // dedicated `non_message_updates_are_mapped_to_response_events` test
+            // asserts their delivery.
+            ResponseEvent::ThoughtChunk { .. }
+            | ResponseEvent::ToolCall { .. }
+            | ResponseEvent::ToolCallUpdate { .. } => {
+                assert!(!saw_complete_last, "no event may follow TurnComplete");
+            }
             ResponseEvent::TurnComplete => {
                 completes += 1;
                 saw_complete_last = true;
@@ -100,22 +108,78 @@ async fn prompt_round_trips_through_the_trait() {
 }
 
 #[tokio::test]
-async fn non_text_updates_are_skipped_behind_the_trait() {
-    // Leading tool-call noise updates must not leak into the mapped stream.
+async fn non_message_updates_are_mapped_to_response_events() {
+    // Non-text updates (thoughts + tool calls) are now MAPPED through the trait
+    // adapter as side-channel ResponseEvents rather than being dropped. The mock
+    // injects — before the text chunks — one thought, one tool_call, and one
+    // tool_call_update; the drained stream must contain all of them while the
+    // TextChunks still assemble to the clean answer and the LAST item is exactly
+    // one TurnComplete.
     let behavior = MockBehavior {
-        session_id: "sess-noise".into(),
+        session_id: "sess-rich".into(),
         chunks: vec!["clean ".into(), "text".into()],
         stop_reason: "end_turn".into(),
-        leading_noise_updates: 3,
+        inject_thoughts_and_tools: true,
         ..MockBehavior::default()
     };
     let mut session = session_over_mock(behavior, "").await;
 
-    let stream = session.prompt(Prompt::new("go")).await.unwrap();
-    let (text, completes) = drain_ok(stream).await;
+    let mut stream = session.prompt(Prompt::new("go")).await.unwrap();
 
+    let mut text = String::new();
+    let mut thoughts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<(String, String, Option<String>, String)> = Vec::new();
+    let mut tool_call_updates: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut completes = 0usize;
+    let mut saw_complete_last = false;
+    while let Some(item) = stream.next().await {
+        match item.expect("no error item on a clean turn") {
+            ResponseEvent::TextChunk { text: chunk } => {
+                assert!(!saw_complete_last, "no event may follow TurnComplete");
+                text.push_str(&chunk);
+            }
+            ResponseEvent::ThoughtChunk { text: t } => {
+                assert!(!saw_complete_last, "no event may follow TurnComplete");
+                thoughts.push(t);
+            }
+            ResponseEvent::ToolCall {
+                id,
+                title,
+                kind,
+                status,
+            } => {
+                assert!(!saw_complete_last, "no event may follow TurnComplete");
+                tool_calls.push((id, title, kind, status));
+            }
+            ResponseEvent::ToolCallUpdate { id, status, title } => {
+                assert!(!saw_complete_last, "no event may follow TurnComplete");
+                tool_call_updates.push((id, status, title));
+            }
+            ResponseEvent::TurnComplete => {
+                completes += 1;
+                saw_complete_last = true;
+            }
+        }
+    }
+
+    // The answer text is unaffected by the side-channel events.
     assert_eq!(text, "clean text");
-    assert_eq!(completes, 1);
+    assert_eq!(completes, 1, "exactly one TurnComplete");
+    assert!(saw_complete_last, "stream must end with TurnComplete");
+
+    // The rich events were delivered (not dropped).
+    assert_eq!(thoughts, vec!["thinking…".to_string()], "thought delivered");
+    assert_eq!(tool_calls.len(), 1, "one tool call delivered");
+    let (id, title, kind, status) = &tool_calls[0];
+    assert_eq!(id, "rich-tc-1");
+    assert_eq!(title, "running tests");
+    assert_eq!(kind.as_deref(), Some("execute"));
+    assert_eq!(status, "pending");
+    assert_eq!(tool_call_updates.len(), 1, "one tool-call update delivered");
+    let (uid, ustatus, _utitle) = &tool_call_updates[0];
+    assert_eq!(uid, "rich-tc-1");
+    assert_eq!(ustatus.as_deref(), Some("completed"));
+
     session.terminate().await.unwrap();
 }
 
@@ -230,6 +294,13 @@ async fn mid_turn_disconnect_surfaces_transport_error_no_false_turn_complete() {
             Ok(ResponseEvent::TextChunk { text }) => {
                 assert_eq!(text, "partial");
                 saw_text = true;
+            }
+            Ok(
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. },
+            ) => {
+                panic!("this turn injects no side-channel events");
             }
             Ok(ResponseEvent::TurnComplete) => {
                 panic!("must NOT emit TurnComplete after a mid-turn disconnect");

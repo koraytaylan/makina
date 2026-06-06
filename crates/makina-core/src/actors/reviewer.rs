@@ -200,6 +200,44 @@ impl kameo::message::Message<Review> for Reviewer {
                     });
                     output.push_str(&text);
                 }
+                // Thought and tool events are side-channel only: they are
+                // forwarded to the live `AgentExchange` stream for observability
+                // but MUST NOT contribute to `output` (the verdict text is built
+                // solely from `TextChunk`/`ResponseChunk`).
+                Ok(ResponseEvent::ThoughtChunk { text }) => {
+                    (msg.sink)(api::Event::AgentExchange {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Reviewer,
+                        event: api::ExchangeEvent::ThoughtChunk { text },
+                    });
+                }
+                Ok(ResponseEvent::ToolCall {
+                    id,
+                    title,
+                    kind,
+                    status,
+                }) => {
+                    (msg.sink)(api::Event::AgentExchange {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Reviewer,
+                        event: api::ExchangeEvent::ToolCall {
+                            id,
+                            title,
+                            kind,
+                            status,
+                        },
+                    });
+                }
+                Ok(ResponseEvent::ToolCallUpdate { id, status, title }) => {
+                    (msg.sink)(api::Event::AgentExchange {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Reviewer,
+                        event: api::ExchangeEvent::ToolCallUpdate { id, status, title },
+                    });
+                }
                 Ok(ResponseEvent::TurnComplete) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,

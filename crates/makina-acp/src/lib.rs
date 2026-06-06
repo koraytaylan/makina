@@ -50,6 +50,10 @@
 //! while let Some(item) = stream.next().await {
 //!     match item? {
 //!         AcpResponseChunk::Text(t) => answer.push_str(&t),
+//!         // Thoughts and tool-call activity arrive as a side channel.
+//!         AcpResponseChunk::Thought(_)
+//!         | AcpResponseChunk::ToolCall { .. }
+//!         | AcpResponseChunk::ToolCallUpdate { .. } => {}
 //!         AcpResponseChunk::TurnComplete(_reason) => break,
 //!     }
 //! }

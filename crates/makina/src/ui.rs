@@ -945,88 +945,152 @@ fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
 /// Prompt entries get a role-coloured label header; response entries are
 /// indented and shown in a lighter colour.  An in-progress streaming response
 /// (not yet complete) gets a trailing `▌` cursor indicator.
-fn exchange_entry_lines(entry: &ExchangeEntry) -> Vec<Line<'static>> {
+/// Render one content line: parse embedded ANSI SGR runs into styled spans
+/// (no literal escape byte survives), overlaying a diff base colour where the
+/// line is a diff add/remove/hunk line. ANSI SGR foreground wins where present;
+/// modifiers (e.g. BOLD) are always preserved. Two-space indented.
+fn diff_overlaid_content_line(text_line: &str) -> Line<'static> {
     use crate::ansi::{AnsiSpan, diff_line_style, parse_ansi};
+
+    let diff_style = diff_line_style(text_line);
+    let ansi_spans = parse_ansi(text_line);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Two-space indent, default-styled, owning its text.
+    spans.push(Span::raw("  "));
+    for AnsiSpan { text, style } in ansi_spans {
+        let style = match (diff_style, style.fg) {
+            // ANSI SGR set no foreground → overlay ONLY the diff base
+            // colour, preserving any add_modifier (e.g. BOLD) the
+            // span's ANSI run set.  Replacing the whole style here
+            // would drop those modifiers (spec `tui-exchange-render`
+            // step 3: overlay the foreground only).  `base.fg` is
+            // always `Some` for a diff line, but fall back to the
+            // span's own fg defensively.
+            (Some(base), None) => match base.fg {
+                Some(base_color) => style.fg(base_color),
+                None => style,
+            },
+            // ANSI SGR set a foreground → it wins over the diff base.
+            _ => style,
+        };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+fn exchange_entry_lines(entry: &ExchangeEntry) -> Vec<Line<'static>> {
+    use crate::app::ExchangeContent;
     use makina_core::api::AgentRole;
 
     let mut lines = Vec::new();
 
-    if entry.is_prompt {
-        // Role label + prompt text on separate lines.
-        let (label, label_color) = match entry.role {
-            AgentRole::Developer => ("▶ Developer prompt", Color::Green),
-            AgentRole::Reviewer => ("▶ Reviewer prompt", Color::Yellow),
-        };
-        lines.push(Line::from(vec![Span::styled(
-            label,
-            Style::default()
-                .fg(label_color)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        // Render prompt text lines (split on newlines).
-        for text_line in entry.text.lines() {
+    match &entry.content {
+        ExchangeContent::Prompt { text } => {
+            // Role label + prompt text on separate lines.
+            let (label, label_color) = match entry.role {
+                AgentRole::Developer => ("▶ Developer prompt", Color::Green),
+                AgentRole::Reviewer => ("▶ Reviewer prompt", Color::Yellow),
+            };
             lines.push(Line::from(vec![Span::styled(
-                format!("  {text_line}"),
-                Style::default().fg(Color::White),
+                label,
+                Style::default()
+                    .fg(label_color)
+                    .add_modifier(Modifier::BOLD),
             )]));
-        }
-        if entry.text.is_empty() {
-            lines.push(Line::from(vec![Span::styled(
-                "  (empty)",
-                Style::default().fg(Color::DarkGray),
-            )]));
-        }
-    } else {
-        // Response entry.
-        let (resp_label, resp_color) = match entry.role {
-            AgentRole::Developer => ("◀ Developer response", Color::Cyan),
-            AgentRole::Reviewer => ("◀ Reviewer response", Color::Magenta),
-        };
-        lines.push(Line::from(vec![Span::styled(
-            resp_label,
-            Style::default().fg(resp_color).add_modifier(Modifier::BOLD),
-        )]));
-        // Response text.
-        let text_to_show = if entry.complete {
-            entry.text.clone()
-        } else {
-            // Still streaming — append cursor.
-            format!("{}▌", entry.text)
-        };
-        for text_line in text_to_show.lines() {
-            // Parse embedded ANSI SGR runs into styled spans (no literal escape
-            // byte survives), then overlay a diff base colour where the line is a
-            // diff add/remove/hunk line — ANSI SGR wins where present.
-            let diff_style = diff_line_style(text_line);
-            let ansi_spans = parse_ansi(text_line);
-
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            // Two-space indent, default-styled, owning its text.
-            spans.push(Span::raw("  "));
-            for AnsiSpan { text, style } in ansi_spans {
-                let style = match (diff_style, style.fg) {
-                    // ANSI SGR set no foreground → overlay ONLY the diff base
-                    // colour, preserving any add_modifier (e.g. BOLD) the span's
-                    // ANSI run set.  Replacing the whole style here would drop
-                    // those modifiers (spec `tui-exchange-render` step 3: overlay
-                    // the foreground only).  `base.fg` is always `Some` for a
-                    // diff line, but fall back to the span's own fg defensively.
-                    (Some(base), None) => match base.fg {
-                        Some(base_color) => style.fg(base_color),
-                        None => style,
-                    },
-                    // ANSI SGR set a foreground → it wins over the diff base.
-                    _ => style,
-                };
-                spans.push(Span::styled(text, style));
+            // Render prompt text lines (split on newlines).
+            for text_line in text.lines() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {text_line}"),
+                    Style::default().fg(Color::White),
+                )]));
             }
-            lines.push(Line::from(spans));
+            if text.is_empty() {
+                lines.push(Line::from(vec![Span::styled(
+                    "  (empty)",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
         }
-        if entry.text.is_empty() && !entry.complete {
+        ExchangeContent::Response { text, complete } => {
+            // Response entry.
+            let (resp_label, resp_color) = match entry.role {
+                AgentRole::Developer => ("◀ Developer response", Color::Cyan),
+                AgentRole::Reviewer => ("◀ Reviewer response", Color::Magenta),
+            };
             lines.push(Line::from(vec![Span::styled(
-                "  ▌",
-                Style::default().fg(Color::DarkGray),
+                resp_label,
+                Style::default().fg(resp_color).add_modifier(Modifier::BOLD),
             )]));
+            // Response text.
+            let text_to_show = if *complete {
+                text.clone()
+            } else {
+                // Still streaming — append cursor.
+                format!("{text}▌")
+            };
+            for text_line in text_to_show.lines() {
+                lines.push(diff_overlaid_content_line(text_line));
+            }
+            if text.is_empty() && !*complete {
+                lines.push(Line::from(vec![Span::styled(
+                    "  ▌",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
+        // ── Thought (agent internal reasoning) ────────────────────────────
+        // Observability-only side channel.  Bold, role-coloured header
+        // ("💭 Developer thought" green / "💭 Reviewer thought" yellow) then
+        // the reasoning text dimmed (DarkGray) at a 2-space indent so it reads
+        // as a quiet aside rather than part of the answer.
+        ExchangeContent::Thought { text } => {
+            let (label, label_color) = match entry.role {
+                AgentRole::Developer => ("💭 Developer thought", Color::Green),
+                AgentRole::Reviewer => ("💭 Reviewer thought", Color::Yellow),
+            };
+            lines.push(Line::from(vec![Span::styled(
+                label,
+                Style::default()
+                    .fg(label_color)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            for text_line in text.lines() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {text_line}"),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
+        // ── Tool (agent tool invocation) ──────────────────────────────────
+        // Header "⚙ <title> [<status>]" coloured by lifecycle status, then the
+        // tool's content lines rendered with the SAME parse_ansi + diff base
+        // overlay loop the Response arm uses, so an edit diff in tool output is
+        // syntax-coloured.  Empty content renders nothing extra.
+        ExchangeContent::Tool {
+            title,
+            status,
+            content,
+            ..
+        } => {
+            let status_color = match status.as_str() {
+                "pending" => Color::DarkGray,
+                "in_progress" => Color::Cyan,
+                "completed" => Color::Green,
+                "failed" => Color::Red,
+                _ => Color::White,
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!("⚙ {title} [{status}]"),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            for text_line in content.lines() {
+                // Re-use the Response arm's ANSI + diff overlay so an edit diff
+                // in tool output is syntax-coloured the same way.
+                lines.push(diff_overlaid_content_line(text_line));
+            }
         }
     }
     // Blank separator line between entries.
@@ -3008,16 +3072,17 @@ mod tests {
     /// dropping `add_modifier` (the BOLD) on such a span.
     #[test]
     fn diff_base_overlay_preserves_ansi_bold_modifier() {
-        use crate::app::ExchangeEntry;
+        use crate::app::{ExchangeContent, ExchangeEntry};
         use makina_core::api::AgentRole;
 
         // A complete Developer response whose single text line is a diff-add
         // line (`+`) that opens BOLD via ANSI but sets no foreground colour.
         let entry = ExchangeEntry {
             role: AgentRole::Developer,
-            is_prompt: false,
-            text: "+\x1b[1madded bold line".to_string(),
-            complete: true,
+            content: ExchangeContent::Response {
+                text: "+\x1b[1madded bold line".to_string(),
+                complete: true,
+            },
         };
 
         let lines = exchange_entry_lines(&entry);
@@ -3044,6 +3109,98 @@ mod tests {
         assert!(
             found,
             "the diff text span must be present in the rendered lines"
+        );
+    }
+
+    /// **Rich thought + tool rendering:** a Developer thought and a completed
+    /// Developer tool (with a diff line in its content) must render with their
+    /// distinctive headers and styled content.
+    ///
+    /// Inspects the rendered Buffer (not just the `Line` spans) for the ASCII
+    /// header text ("Developer thought", the tool title, "[completed]"), a body
+    /// word, a diff-style fact (a Green-foreground cell on the "+added line"),
+    /// and confirms no literal ESC byte survives.  Asserts on ASCII substrings
+    /// rather than the wide emoji glyphs ("💭"/"⚙"), which the per-cell
+    /// `.chars().next()` flattening can mangle.
+    #[test]
+    fn exchange_render_shows_thought_and_tool_entries() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+
+        // A Developer thought followed by a completed Developer tool whose
+        // content carries a `@@` hunk header and a `+added line` diff line.
+        let thought = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Thought {
+                text: "considering the trait".to_string(),
+            },
+        };
+        let tool = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "tool-1".to_string(),
+                title: "Editing src/lib.rs".to_string(),
+                kind: Some("edit".to_string()),
+                status: "completed".to_string(),
+                content: "@@ -1 +1 @@\n+added line".to_string(),
+            },
+        };
+
+        // Render both entries' lines into a small Buffer via a Paragraph.
+        let mut lines: Vec<Line> = Vec::new();
+        lines.extend(exchange_entry_lines(&thought));
+        lines.extend(exchange_entry_lines(&tool));
+
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+
+        // (a) No literal escape char survives any cell.
+        assert!(
+            !buf.content()
+                .iter()
+                .any(|c| c.symbol().chars().any(|ch| ch == '\u{1b}')),
+            "no cell symbol may contain the literal ESC char"
+        );
+
+        // (b) ASCII header + body substrings appear (assert on normal-width
+        // text, NOT the wide emoji glyphs).
+        let row_text = |row: u16| -> String {
+            (0..buf.area.width)
+                .map(|col| buf[(col, row)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        let flattened: String = (0..buf.area.height).map(row_text).collect();
+        assert!(
+            flattened.contains("Developer thought"),
+            "thought header text must render; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("considering"),
+            "thought body text must render; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("Editing src/lib.rs"),
+            "tool title must render in the header; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("[completed]"),
+            "tool status badge must render in the header; got:\n{flattened}"
+        );
+
+        // (c) Diff styling reaches the tool content: the `+added line` row must
+        // carry at least one Green-foreground cell.
+        let added_fg_green = (0..buf.area.height).any(|row| {
+            row_text(row).contains("+added line")
+                && (0..buf.area.width).any(|col| buf[(col, row)].fg == Color::Green)
+        });
+        assert!(
+            added_fg_green,
+            "the `+added line` in tool content must have a Green-foreground cell (diff styling)"
         );
     }
 }

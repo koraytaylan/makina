@@ -72,7 +72,10 @@ mod tests {
     //! — the test cannot observe a reply before the handler runs, so the ordering is
     //! deterministic.
 
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use chrono::Utc;
 
@@ -82,7 +85,8 @@ mod tests {
             PlannerArgs, Review, ReviewVerdict, Reviewer, ReviewerArgs, SetTaskGraph, Supervisor,
             SupervisorArgs, TaskGraphSnapshot,
         },
-        backend::{AgentBackend, noop::NoopBackend},
+        api,
+        backend::{AgentBackend, ResponseEvent, noop::NoopBackend},
         config::{Config, GlobalConfig, ProjectConfig},
         interpreter::StructuredTextInterpreter,
         supervision::{RestartConfig, RootSupervisor},
@@ -323,6 +327,156 @@ mod tests {
         );
 
         // ── Clean shutdown ────────────────────────────────────────────────────
+        root.kill();
+    }
+
+    // ── Rich exchange-event forwarding (plan-0006 task 5) ──────────────────────
+
+    /// Drive a Developer turn whose backend emits a mix of `TextChunk`,
+    /// `ThoughtChunk`, `ToolCall`, and `ToolCallUpdate` events, and assert:
+    ///
+    /// 1. The thought and both tool events are forwarded to the sink as
+    ///    `api::Event::AgentExchange` events with the matching `ExchangeEvent`
+    ///    kinds (observability side channel).
+    /// 2. NONE of the thought/tool text leaks into the Developer's collected
+    ///    `output` — the final answer is built solely from the `TextChunk`s, so it
+    ///    is exactly `"answer done"` (the two `TextChunk`s concatenated).
+    ///
+    /// This reuses the same `RootSupervisor` + `Develop`-`ask` harness as the
+    /// smoke test above; the only additions are the `scripted` backend and a
+    /// capturing sink. The end-to-end orchestrator-driven assertion lives in the
+    /// task-9 acceptance test; this one isolates the actor's forwarding contract.
+    #[tokio::test]
+    async fn developer_forwards_thoughts_and_tools_without_polluting_output() {
+        let root = RootSupervisor::start();
+
+        // A backend whose single turn emits text + thought + tool events
+        // (TurnComplete is appended automatically by `scripted`).
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::scripted(vec![
+            ResponseEvent::TextChunk {
+                text: "answer ".into(),
+            },
+            ResponseEvent::ThoughtChunk {
+                text: "thinking".into(),
+            },
+            ResponseEvent::ToolCall {
+                id: "t1".into(),
+                title: "run".into(),
+                kind: Some("execute".into()),
+                status: "pending".into(),
+            },
+            ResponseEvent::ToolCallUpdate {
+                id: "t1".into(),
+                status: Some("completed".into()),
+                title: None,
+            },
+            ResponseEvent::TextChunk {
+                text: "done".into(),
+            },
+        ]));
+
+        let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
+            &root,
+            SupervisorArgs {
+                worktree_manager: WorktreeManager::new(
+                    PathBuf::from("/tmp/makina-actor-rich"),
+                    "develop".into(),
+                ),
+                config: test_config_no_gates(),
+            },
+            RestartConfig::default(),
+        )
+        .await;
+
+        let developer_ref = RootSupervisor::spawn_child::<Developer>(
+            &root,
+            DeveloperArgs {
+                supervisor: supervisor_ref.clone(),
+                backend: Arc::clone(&backend),
+            },
+            RestartConfig::default(),
+        )
+        .await;
+
+        // Capturing sink: collect every AgentExchange event the handler emits.
+        let captured: Arc<Mutex<Vec<api::Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = Arc::clone(&captured);
+            std::sync::Arc::new(move |event: api::Event| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+
+        // The Developer commits the worktree, so it needs a real git repo.
+        let dev_worktree = tempfile::tempdir().expect("temp worktree dir");
+        init_git_repo(dev_worktree.path());
+
+        let task = minimal_graph().tasks[0].clone();
+        let outcome = developer_ref
+            .ask(Develop {
+                task,
+                worktree: dev_worktree.path().to_path_buf(),
+                feedback: None,
+                run: api::RunId(7),
+                sink,
+            })
+            .send()
+            .await
+            .expect("Develop must return Ok(DevelopOutcome)");
+
+        // ── Output purity: ONLY the TextChunks contributed. ───────────────────
+        assert_eq!(
+            outcome,
+            DevelopOutcome {
+                output: "answer done".to_string()
+            },
+            "output must be the TextChunks concatenated — no thought/tool text",
+        );
+
+        // ── Forwarding: the sink saw the thought + both tool exchange events. ──
+        let events = captured.lock().unwrap();
+
+        let saw_thought = events.iter().any(|e| {
+            matches!(
+                e,
+                api::Event::AgentExchange {
+                    role: api::AgentRole::Developer,
+                    event: api::ExchangeEvent::ThoughtChunk { text },
+                    ..
+                } if text == "thinking"
+            )
+        });
+        let saw_tool_call = events.iter().any(|e| {
+            matches!(
+                e,
+                api::Event::AgentExchange {
+                    role: api::AgentRole::Developer,
+                    event: api::ExchangeEvent::ToolCall { id, kind, status, .. },
+                    ..
+                } if id == "t1" && kind.as_deref() == Some("execute") && status == "pending"
+            )
+        });
+        let saw_tool_update = events.iter().any(|e| {
+            matches!(
+                e,
+                api::Event::AgentExchange {
+                    role: api::AgentRole::Developer,
+                    event: api::ExchangeEvent::ToolCallUpdate { id, status, .. },
+                    ..
+                } if id == "t1" && status.as_deref() == Some("completed")
+            )
+        });
+
+        assert!(
+            saw_thought,
+            "sink must observe a ThoughtChunk exchange event"
+        );
+        assert!(saw_tool_call, "sink must observe a ToolCall exchange event");
+        assert!(
+            saw_tool_update,
+            "sink must observe a ToolCallUpdate exchange event",
+        );
+
         root.kill();
     }
 }

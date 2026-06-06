@@ -83,6 +83,10 @@ async fn collect_response(
                     eprint!("{text}");
                     collected.push_str(&text);
                 }
+                // Side-channel events do not contribute to the collected answer.
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. } => {}
                 ResponseEvent::TurnComplete => {
                     eprintln!("\n[turn complete]");
                     break;

@@ -421,6 +421,13 @@ pub enum AgentRole {
 /// This is a **view-level enum** that mirrors `crate::backend::ResponseEvent`
 /// plus the outgoing prompt.  It is defined independently here — `api` MUST NOT
 /// import `backend` types in public signatures.
+///
+/// Besides the prompt/answer/turn-complete events, this enum carries the
+/// agent's thought and tool-call side channels ([`ExchangeEvent::ThoughtChunk`],
+/// [`ExchangeEvent::ToolCall`], [`ExchangeEvent::ToolCallUpdate`]).  Those are
+/// **observability-only**: the TUI renders them for transparency but they do
+/// **not** contribute to the final answer text, which is built solely from
+/// [`ExchangeEvent::ResponseChunk`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExchangeEvent {
@@ -440,6 +447,45 @@ pub enum ExchangeEvent {
     ResponseChunk {
         /// A fragment of the agent's response.  Never empty.
         text: String,
+    },
+
+    /// The agent emitted a chunk of its internal reasoning.
+    ///
+    /// The TUI renders this as a distinct "thought", NOT as part of the answer
+    /// text.  Observability-only: thought chunks never contribute to the final
+    /// answer built from [`ExchangeEvent::ResponseChunk`].
+    ThoughtChunk {
+        /// A fragment of the agent's reasoning text.  Never empty.
+        text: String,
+    },
+
+    /// The agent announced a tool invocation.
+    ///
+    /// The TUI renders this as a distinct tool entry, keyed by `id`.
+    /// Observability-only: tool calls never contribute to the answer text.
+    ToolCall {
+        /// Stable id correlating this call with later
+        /// [`ExchangeEvent::ToolCallUpdate`] events.
+        id: String,
+        /// Human-readable title (empty when the agent omits it).
+        title: String,
+        /// Optional semantic kind (e.g. `"execute"`, `"edit"`).
+        kind: Option<String>,
+        /// Lifecycle status (`"pending"` when the agent omits it).
+        status: String,
+    },
+
+    /// An incremental status/content update for a previously-announced tool call.
+    ///
+    /// The TUI upserts this into the matching tool entry by `id`.
+    /// Observability-only: tool-call updates never contribute to the answer text.
+    ToolCallUpdate {
+        /// The id of the [`ExchangeEvent::ToolCall`] this updates.
+        id: String,
+        /// Updated lifecycle status, if the update carried one.
+        status: Option<String>,
+        /// Updated title, if the update carried one.
+        title: Option<String>,
     },
 
     /// The agent has finished its current response turn.
@@ -535,7 +581,10 @@ pub enum Event {
         task: TaskId,
         /// Which agent role is involved (Developer or Reviewer).
         role: AgentRole,
-        /// The specific exchange event (prompt sent / chunk / turn complete).
+        /// The specific exchange event (prompt sent / chunk / turn complete,
+        /// plus the thought and tool-call side channels).  The thought/tool
+        /// kinds are observability-only and do not contribute to the final
+        /// answer text.
         event: ExchangeEvent,
     },
 }
@@ -1021,6 +1070,59 @@ mod tests {
 
         let outcome = CommandOutcome::RunOpened { run: RunId(1) };
         let _outcome2 = outcome.clone();
+    }
+
+    #[tokio::test]
+    async fn exchange_event_side_channel_variants_round_trip() {
+        // Construct + serde round-trip the thought/tool side-channel variants,
+        // matching on their concrete fields (not just `..`) to lock the shapes
+        // that mirror `backend::ResponseEvent`.
+        let thought = ExchangeEvent::ThoughtChunk {
+            text: "thinking…".to_string(),
+        };
+        let call = ExchangeEvent::ToolCall {
+            id: "call-1".to_string(),
+            title: "run tests".to_string(),
+            kind: Some("execute".to_string()),
+            status: "pending".to_string(),
+        };
+        let update = ExchangeEvent::ToolCallUpdate {
+            id: "call-1".to_string(),
+            status: Some("completed".to_string()),
+            title: None,
+        };
+
+        for ev in [thought.clone(), call.clone(), update.clone()] {
+            let json = serde_json::to_string(&ev).expect("serialize");
+            let back: ExchangeEvent = serde_json::from_str(&json).expect("deserialize");
+            match back {
+                ExchangeEvent::ThoughtChunk { text } => assert_eq!(text, "thinking…"),
+                ExchangeEvent::ToolCall {
+                    id,
+                    title,
+                    kind,
+                    status,
+                } => {
+                    assert_eq!(id, "call-1");
+                    assert_eq!(title, "run tests");
+                    assert_eq!(kind.as_deref(), Some("execute"));
+                    assert_eq!(status, "pending");
+                }
+                ExchangeEvent::ToolCallUpdate { id, status, title } => {
+                    assert_eq!(id, "call-1");
+                    assert_eq!(status.as_deref(), Some("completed"));
+                    assert!(title.is_none());
+                }
+                other => panic!("unexpected variant after round-trip: {other:?}"),
+            }
+        }
+
+        // The tagged representation uses the snake_case variant name.
+        let json = serde_json::to_string(&thought).expect("serialize");
+        assert!(
+            json.contains("\"thought_chunk\""),
+            "tag should be snake_case: {json}"
+        );
     }
 
     #[tokio::test]

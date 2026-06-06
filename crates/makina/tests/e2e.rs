@@ -510,6 +510,21 @@ fn log_event(ev: &Event) {
                     eprintln!("  · {role:?}[{}] → {preview}", task.0);
                 }
             }
+            ExchangeEvent::ThoughtChunk { text } => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    let preview: String = trimmed.chars().take(80).collect();
+                    eprintln!("  · {role:?}[{}] ⟂ thought: {preview}", task.0);
+                }
+            }
+            ExchangeEvent::ToolCall {
+                id, title, status, ..
+            } => eprintln!("  · {role:?}[{}] ⚙ tool {id} '{title}' [{status}]", task.0),
+            ExchangeEvent::ToolCallUpdate { id, status, .. } => eprintln!(
+                "  · {role:?}[{}] ⚙ tool {id} update [{}]",
+                task.0,
+                status.as_deref().unwrap_or("-")
+            ),
             ExchangeEvent::TurnComplete => {
                 eprintln!("  · {role:?}[{}] → [turn complete]", task.0)
             }
@@ -535,6 +550,9 @@ fn report_event_highlights(events: &[Event]) {
     let mut prompts = 0usize;
     let mut chunks = 0usize;
     let mut turns = 0usize;
+    let mut thoughts = 0usize;
+    let mut tool_calls = 0usize;
+    let mut tool_updates = 0usize;
     let mut saw_dev = false;
     let mut saw_reviewer = false;
     let mut reached: Vec<String> = Vec::new();
@@ -556,6 +574,9 @@ fn report_event_highlights(events: &[Event]) {
                 match event {
                     ExchangeEvent::PromptSent { .. } => prompts += 1,
                     ExchangeEvent::ResponseChunk { .. } => chunks += 1,
+                    ExchangeEvent::ThoughtChunk { .. } => thoughts += 1,
+                    ExchangeEvent::ToolCall { .. } => tool_calls += 1,
+                    ExchangeEvent::ToolCallUpdate { .. } => tool_updates += 1,
                     ExchangeEvent::TurnComplete => turns += 1,
                 }
             }
@@ -567,5 +588,8 @@ fn report_event_highlights(events: &[Event]) {
     eprintln!("[e2e]   total events: {}", events.len());
     eprintln!("[e2e]   task state-changes: {state_changes} (reached: {reached:?})");
     eprintln!("[e2e]   agent prompts: {prompts}, response chunks: {chunks}, turns: {turns}");
+    eprintln!(
+        "[e2e]   thoughts: {thoughts}, tool calls: {tool_calls}, tool updates: {tool_updates}"
+    );
     eprintln!("[e2e]   developer engaged: {saw_dev}, reviewer engaged: {saw_reviewer}");
 }

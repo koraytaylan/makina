@@ -91,6 +91,14 @@ pub struct NoopBackend {
 
     /// Shared atomic counter for cycling through `responses`.
     response_index: Arc<Mutex<usize>>,
+
+    /// Scripted events for the rich-path test support (see [`NoopBackend::scripted`]).
+    ///
+    /// When `Some`, every prompt emits exactly this sequence (with a
+    /// `TurnComplete` appended if the script does not already end with one),
+    /// bypassing the `responses`/`next_response` text path entirely.  `None`
+    /// preserves the default canned-text behaviour.
+    scripted_events: Option<Vec<ResponseEvent>>,
 }
 
 impl NoopBackend {
@@ -100,6 +108,7 @@ impl NoopBackend {
             responses: Vec::new(),
             recorder: Arc::new(Mutex::new(Vec::new())),
             response_index: Arc::new(Mutex::new(0)),
+            scripted_events: None,
         }
     }
 
@@ -115,6 +124,25 @@ impl NoopBackend {
             responses,
             recorder: Arc::new(Mutex::new(Vec::new())),
             response_index: Arc::new(Mutex::new(0)),
+            scripted_events: None,
+        }
+    }
+
+    /// Build a backend whose every turn emits exactly the given scripted events
+    /// (followed by `TurnComplete` if the script does not already end with one).
+    ///
+    /// This is test-support for the *rich* response path: it lets a test make a
+    /// Noop session emit `ThoughtChunk`/`ToolCall`/`ToolCallUpdate` side-channel
+    /// events interleaved with `TextChunk`s, which the default canned-text path
+    /// cannot produce.  Prompts are still recorded into [`recorded_prompts`].
+    ///
+    /// [`recorded_prompts`]: NoopBackend::recorded_prompts
+    pub fn scripted(events: Vec<ResponseEvent>) -> Self {
+        Self {
+            responses: Vec::new(),
+            recorder: Arc::new(Mutex::new(Vec::new())),
+            response_index: Arc::new(Mutex::new(0)),
+            scripted_events: Some(events),
         }
     }
 
@@ -192,8 +220,10 @@ impl AgentSession for NoopSession {
     /// # Contract
     ///
     /// Returns `BackendError::Terminated` immediately if the session has been
-    /// terminated.  Otherwise produces zero or more `TextChunk` events followed
-    /// by exactly one `TurnComplete`.
+    /// terminated.  Otherwise: if the backend was built with
+    /// [`NoopBackend::scripted`], emits exactly the scripted events (appending a
+    /// `TurnComplete` if absent); otherwise produces zero or more `TextChunk`
+    /// events followed by exactly one `TurnComplete`.
     async fn prompt(&mut self, prompt: Prompt) -> Result<ResponseStream, BackendError> {
         if self.terminated {
             return Err(BackendError::Terminated);
@@ -204,6 +234,18 @@ impl AgentSession for NoopSession {
             .lock()
             .expect("noop recorder mutex poisoned")
             .push(prompt.text.clone());
+
+        // Rich-path test support: if the backend was built with `scripted`,
+        // emit exactly those events (ensuring a trailing TurnComplete) and skip
+        // the canned-text path entirely.
+        if let Some(script) = &self.backend.scripted_events {
+            let mut events: Vec<Result<ResponseEvent, BackendError>> =
+                script.iter().cloned().map(Ok).collect();
+            if !matches!(events.last(), Some(Ok(ResponseEvent::TurnComplete))) {
+                events.push(Ok(ResponseEvent::TurnComplete));
+            }
+            return Ok(Box::pin(stream::iter(events)));
+        }
 
         // Retrieve the next canned response.
         let response_text = self.backend.next_response();
@@ -321,6 +363,47 @@ mod tests {
         assert!(matches!(&events[1], ResponseEvent::TextChunk { text } if text == "line two"));
         assert!(matches!(&events[2], ResponseEvent::TextChunk { text } if text == "line three"));
         assert!(matches!(&events[3], ResponseEvent::TurnComplete));
+    }
+
+    // ── rich path: scripted() emits side-channel events ───────────────────────
+
+    #[tokio::test]
+    async fn scripted_emits_thought_and_tool_events_then_appends_turn_complete() {
+        // Script omits the trailing TurnComplete on purpose to prove it is
+        // appended automatically.
+        let backend = NoopBackend::scripted(vec![
+            ResponseEvent::ThoughtChunk {
+                text: "planning".into(),
+            },
+            ResponseEvent::ToolCall {
+                id: "tc-1".into(),
+                title: "run tests".into(),
+                kind: Some("execute".into()),
+                status: "pending".into(),
+            },
+            ResponseEvent::TextChunk {
+                text: "the answer".into(),
+            },
+            ResponseEvent::ToolCallUpdate {
+                id: "tc-1".into(),
+                status: Some("completed".into()),
+                title: None,
+            },
+        ]);
+        let mut session = backend.spawn(test_config()).await.unwrap();
+
+        let stream = session.prompt(Prompt::new("go")).await.unwrap();
+        let events = drain_ok(stream).await;
+
+        assert_eq!(events.len(), 5, "4 scripted events + appended TurnComplete");
+        assert!(matches!(&events[0], ResponseEvent::ThoughtChunk { text } if text == "planning"));
+        assert!(matches!(&events[1], ResponseEvent::ToolCall { id, .. } if id == "tc-1"));
+        assert!(matches!(&events[2], ResponseEvent::TextChunk { text } if text == "the answer"));
+        assert!(matches!(&events[3], ResponseEvent::ToolCallUpdate { id, .. } if id == "tc-1"));
+        assert!(matches!(&events[4], ResponseEvent::TurnComplete));
+
+        // The prompt was still recorded.
+        assert_eq!(backend.recorded_prompts(), vec!["go"]);
     }
 
     // ── contract 2: terminate is idempotent ───────────────────────────────────
@@ -484,6 +567,11 @@ mod tests {
                         }
                         collected.push_str(&text);
                     }
+                    // Side-channel events do not contribute to the collected
+                    // answer text.
+                    ResponseEvent::ThoughtChunk { .. }
+                    | ResponseEvent::ToolCall { .. }
+                    | ResponseEvent::ToolCallUpdate { .. } => {}
                     ResponseEvent::TurnComplete => break,
                 }
             }

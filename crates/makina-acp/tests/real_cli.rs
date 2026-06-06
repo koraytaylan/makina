@@ -75,6 +75,11 @@ async fn real_cli_prompt_response() {
                     eprint!("{t}");
                     answer.push_str(&t);
                 }
+                // Rich side-channel chunks (thoughts/tool calls): this test only
+                // cares about the assistant text, so ignore them.
+                AcpResponseChunk::Thought(_)
+                | AcpResponseChunk::ToolCall { .. }
+                | AcpResponseChunk::ToolCallUpdate { .. } => {}
                 AcpResponseChunk::TurnComplete(reason) => {
                     eprintln!("\n[turn complete: {reason:?}]");
                     completed = true;
@@ -133,6 +138,10 @@ async fn real_cli_prompt_response_through_the_backend_trait() {
                     eprint!("{text}");
                     answer.push_str(&text);
                 }
+                // Side-channel events do not contribute to the collected answer.
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. } => {}
                 ResponseEvent::TurnComplete => {
                     eprintln!("\n[turn complete]");
                     completed = true;

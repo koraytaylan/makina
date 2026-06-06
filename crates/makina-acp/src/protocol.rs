@@ -24,9 +24,11 @@
 //! * **`session/new`** — `{ "cwd": <absolute path>, "mcpServers": [] }`.
 //! * **`session/prompt`** — `{ "sessionId": <string>, "prompt": [ContentBlock] }`.
 //! * **`session/update`** — agent→client notification carrying a tagged
-//!   `update` whose `sessionUpdate` discriminator selects the chunk kind
-//!   (`agent_message_chunk`, `agent_thought_chunk`, …); the chunk's `content`
-//!   is a `{ "type": "text", "text": … }` block.
+//!   `update` whose `sessionUpdate` discriminator selects the update kind. Text
+//!   chunks (`agent_message_chunk`, `agent_thought_chunk`, `user_message_chunk`)
+//!   carry a `{ "type": "text", "text": … }` block; tool-call lifecycle updates
+//!   (`tool_call`, `tool_call_update`) are now modelled too. Unmodelled kinds
+//!   (plans, mode changes, …) collapse into `SessionUpdate::Other`.
 //!
 //! Method-name constants (`initialize`, `session/new`, `session/prompt`,
 //! `session/update`, `session/cancel`) are mirrored from the schema's
@@ -431,8 +433,9 @@ pub struct SessionNotificationParams {
 ///
 /// Mirrors `agent_client_protocol_schema::SessionUpdate`
 /// (`#[serde(tag = "sessionUpdate", rename_all = "snake_case")]`). Each text
-/// chunk variant wraps a flattened [`ContentChunk`]. Variants Makina does not
-/// consume (tool calls, plans, …) collapse into [`SessionUpdate::Other`].
+/// chunk variant wraps a flattened [`ContentChunk`]; tool-call lifecycle updates
+/// wrap [`ToolCall`] / [`ToolCallUpdate`]. Remaining update kinds Makina does not
+/// consume (plans, mode changes, …) collapse into [`SessionUpdate::Other`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub enum SessionUpdate {
@@ -442,7 +445,12 @@ pub enum SessionUpdate {
     AgentThoughtChunk(ContentChunk),
     /// A chunk echoing the user message (ignored).
     UserMessageChunk(ContentChunk),
-    /// Any other update kind (tool call, plan, mode change, …) — ignored.
+    /// The agent initiated a tool call (`toolCallId`, `title`, `kind`, `status`,
+    /// `content`, …). Shares the wire shape of the permission [`ToolCall`].
+    ToolCall(ToolCall),
+    /// Incremental status/result update for a previously-announced tool call.
+    ToolCallUpdate(ToolCallUpdate),
+    /// Any other update kind (plan, mode change, …) — ignored.
     #[serde(other)]
     Other,
 }
@@ -525,6 +533,14 @@ pub struct ToolCall {
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
+
+/// Partial view of a `tool_call_update` session update.
+///
+/// The wire shape is identical to the [`ToolCall`] announcement — both carry
+/// `toolCallId`, optional lifecycle fields (`status`/`title`/`kind`), and an
+/// open `extra` map for everything else. Kept as an alias so the two stay in
+/// lock-step; promote to its own struct if the schemas ever diverge.
+pub type ToolCallUpdate = ToolCall;
 
 /// Response returned to the agent for a `session/request_permission` request.
 ///
@@ -635,16 +651,112 @@ mod tests {
 
     #[test]
     fn session_update_ignores_unknown_update_kinds() {
+        // `tool_call` and `tool_call_update` are now modelled explicitly, so this
+        // must exercise a genuinely-unknown discriminator to still prove the
+        // `#[serde(other)]` fallback for future/unmodelled update kinds.
+        let v = serde_json::json!({
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "some_future_kind",
+                "entries": [ { "content": "step one", "priority": "high" } ]
+            }
+        });
+        let n: SessionNotificationParams = serde_json::from_value(v).unwrap();
+        assert!(matches!(n.update, SessionUpdate::Other));
+    }
+
+    #[test]
+    fn session_update_parses_tool_call_update_and_preserves_extra() {
+        // Realistic `session/update` notification carrying a `tool_call_update`.
+        // Includes several fields beyond our minimal model (content, rawInput,
+        // and a made-up futureField) that must survive in the flatten map.
+        let v = serde_json::json!({
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-42",
+                "status": "completed",
+                "content": [
+                    { "type": "content", "content": { "type": "text", "text": "exit 0" } }
+                ],
+                "rawInput": { "command": "cargo test" },
+                "futureField": "must survive round-trip"
+            }
+        });
+        let n: SessionNotificationParams = serde_json::from_value(v).unwrap();
+        assert_eq!(n.session_id, "sess-1");
+        match n.update {
+            SessionUpdate::ToolCallUpdate(upd) => {
+                assert_eq!(upd.tool_call_id, "tc-42");
+                assert_eq!(upd.status.as_deref(), Some("completed"));
+                // Unknown/extra fields must survive (the key requirement).
+                assert!(
+                    upd.extra.contains_key("content"),
+                    "content array must be preserved"
+                );
+                assert!(
+                    upd.extra.contains_key("rawInput"),
+                    "rawInput must be preserved"
+                );
+                assert!(
+                    upd.extra.get("futureField").and_then(|v| v.as_str())
+                        == Some("must survive round-trip"),
+                    "future unknown field must be retained in the flatten map"
+                );
+                // Known fields must NOT leak into extra.
+                assert!(!upd.extra.contains_key("toolCallId"));
+                assert!(!upd.extra.contains_key("status"));
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_update_tool_call_update_allows_absent_optional_fields() {
+        // Only the required identity field is present; every `#[serde(default)]`
+        // optional must default cleanly and the flatten map must stay empty.
+        let v = serde_json::json!({
+            "sessionId": "sess-1",
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "tc-9" }
+        });
+        let n: SessionNotificationParams = serde_json::from_value(v).unwrap();
+        match n.update {
+            SessionUpdate::ToolCallUpdate(upd) => {
+                assert_eq!(upd.tool_call_id, "tc-9");
+                assert!(upd.status.is_none());
+                assert!(upd.title.is_none());
+                assert!(upd.kind.is_none());
+                assert!(upd.extra.is_empty());
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_update_parses_tool_call() {
+        // A `tool_call` session-update mirrors the permission `ToolCall` shape.
         let v = serde_json::json!({
             "sessionId": "sess-1",
             "update": {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "tc-1",
-                "title": "running tests"
+                "title": "running tests",
+                "kind": "execute",
+                "status": "pending",
+                "rawInput": { "command": "cargo test" }
             }
         });
         let n: SessionNotificationParams = serde_json::from_value(v).unwrap();
-        assert!(matches!(n.update, SessionUpdate::Other));
+        match n.update {
+            SessionUpdate::ToolCall(tc) => {
+                assert_eq!(tc.tool_call_id, "tc-1");
+                assert_eq!(tc.title.as_deref(), Some("running tests"));
+                assert_eq!(tc.kind.as_deref(), Some("execute"));
+                assert_eq!(tc.status.as_deref(), Some("pending"));
+                assert!(tc.extra.contains_key("rawInput"));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]

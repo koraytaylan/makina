@@ -414,10 +414,19 @@ impl AgentSession for AcpSession {
 ///
 /// Guarantees the trait stream contract:
 /// * `AcpResponseChunk::Text(s)` → `ResponseEvent::TextChunk { text: s }`;
+/// * `AcpResponseChunk::Thought(s)` → `ResponseEvent::ThoughtChunk { text: s }`;
+/// * `AcpResponseChunk::ToolCall { .. }` → `ResponseEvent::ToolCall { .. }`
+///   (1:1 field mapping);
+/// * `AcpResponseChunk::ToolCallUpdate { .. }` → `ResponseEvent::ToolCallUpdate
+///   { .. }` (1:1 field mapping);
 /// * `AcpResponseChunk::TurnComplete(_)` → `ResponseEvent::TurnComplete`, sent as
 ///   the final item on a clean turn;
 /// * any [`AcpError`] (including a failure to even start the turn) → a single
 ///   [`BackendError`] item (never followed by a `TurnComplete`).
+///
+/// The `Thought`/`ToolCall`/`ToolCallUpdate` chunks are forwarded as
+/// side-channel `ResponseEvent`s; consumers that only want the final answer text
+/// accumulate `TextChunk` and ignore the rest.
 ///
 /// Stops early — without error — if a `send` fails, which means the consumer
 /// dropped the [`ResponseStream`]. In every case the borrowed `PromptStream` is
@@ -443,9 +452,27 @@ async fn run_turn(
     while let Some(item) = stream.next().await {
         let event = match item {
             Ok(AcpResponseChunk::Text(text)) => Ok(ResponseEvent::TextChunk { text }),
+            // Rich side-channel chunks map 1:1 to their ResponseEvent twins.
+            Ok(AcpResponseChunk::Thought(text)) => Ok(ResponseEvent::ThoughtChunk { text }),
+            Ok(AcpResponseChunk::ToolCall {
+                id,
+                title,
+                kind,
+                status,
+            }) => Ok(ResponseEvent::ToolCall {
+                id,
+                title,
+                kind,
+                status,
+            }),
+            Ok(AcpResponseChunk::ToolCallUpdate { id, status, title }) => {
+                Ok(ResponseEvent::ToolCallUpdate { id, status, title })
+            }
             Ok(AcpResponseChunk::TurnComplete(_reason)) => {
                 // Final item on a clean turn. Forward it; whether or not the
-                // consumer is still listening, the turn is over.
+                // consumer is still listening, the turn is over. The ACP
+                // `stop_reason` is intentionally dropped — `ResponseEvent::TurnComplete`
+                // carries no reason in the MVP.
                 let _ = event_tx.send(Ok(ResponseEvent::TurnComplete)).await;
                 return;
             }
@@ -463,6 +490,11 @@ async fn run_turn(
             return;
         }
     }
+    // NOTE: if the ACP stream ends without a TurnComplete (truncated/misbehaving
+    // peer), the consumer's ResponseStream simply ends without one. Pre-existing
+    // behavior; a future change could send BackendError here to distinguish a
+    // clean end-of-turn from a truncated stream.
+    //
     // `stream` is dropped here (function return), releasing the &mut borrow of
     // `client` so the caller can move it back over the oneshot.
 }
@@ -744,6 +776,10 @@ mod tests {
                 makina_core::backend::ResponseEvent::TextChunk { text: chunk } => {
                     text.push_str(&chunk)
                 }
+                // Side-channel events do not contribute to the assembled answer.
+                makina_core::backend::ResponseEvent::ThoughtChunk { .. }
+                | makina_core::backend::ResponseEvent::ToolCall { .. }
+                | makina_core::backend::ResponseEvent::ToolCallUpdate { .. } => {}
                 makina_core::backend::ResponseEvent::TurnComplete => completes += 1,
             }
         }

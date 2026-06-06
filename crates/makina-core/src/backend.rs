@@ -13,7 +13,9 @@
 //!  AgentBackend::spawn(config)
 //!        │
 //!        ▼
-//!  AgentSession ──► prompt(p) ──► ResponseStream ──► [TextChunk…, TurnComplete]
+//!  AgentSession ──► prompt(p) ──► ResponseStream ──► [TextChunk/ThoughtChunk/
+//!        │                                            ToolCall/ToolCallUpdate…,
+//!        │                                            TurnComplete]
 //!        │
 //!        ▼ terminate()
 //!     (released)
@@ -113,16 +115,28 @@ impl Prompt {
 
 /// A single event emitted from a [`ResponseStream`].
 ///
-/// Implementers stream zero or more [`ResponseEvent::TextChunk`] events
-/// followed by exactly one [`ResponseEvent::TurnComplete`] to signal that the
-/// agent has finished its turn.  The stream MUST then end (i.e. yield `None`
-/// as the next `Poll`).
+/// Implementers stream zero or more
+/// [`TextChunk`](ResponseEvent::TextChunk) /
+/// [`ThoughtChunk`](ResponseEvent::ThoughtChunk) /
+/// [`ToolCall`](ResponseEvent::ToolCall) /
+/// [`ToolCallUpdate`](ResponseEvent::ToolCallUpdate) events followed by exactly
+/// one [`TurnComplete`](ResponseEvent::TurnComplete) to signal that the agent
+/// has finished its turn.  The stream MUST then end (i.e. yield `None` as the
+/// next `Poll`).
+///
+/// Only [`TextChunk`](ResponseEvent::TextChunk) contributes to the final answer
+/// text — consumers wanting just the answer accumulate `TextChunk` and ignore
+/// the rest (thoughts and tool activity are a side channel surfaced for live UI).
 ///
 /// # Contracts for implementers
 ///
 /// * `TextChunk` events MAY arrive in any granularity (one per token, one per
 ///   line, or even the entire response in one chunk).  The TUI accumulates
 ///   them in order.
+/// * `ThoughtChunk`, `ToolCall`, and `ToolCallUpdate` MAY be emitted at any
+///   point before the final `TurnComplete`.  They are informational only;
+///   consumers that only want the final answer text MUST ignore them (or
+///   accumulate `TextChunk` exclusively).
 /// * `TurnComplete` MUST be the final event before the stream closes.  Sending
 ///   further events after `TurnComplete` is a protocol violation.
 /// * If the agent errors mid-stream, implementers SHOULD yield an `Err` value
@@ -134,9 +148,44 @@ pub enum ResponseEvent {
     /// A streamed chunk of the agent's text response.
     ///
     /// The TUI concatenates chunks in arrival order to build the full message.
+    /// This is the ONLY variant that contributes to the final answer text.
     TextChunk {
         /// A fragment of the agent's response text.  Never empty.
         text: String,
+    },
+
+    /// A streamed chunk of the agent's "thinking"/reasoning stream.
+    ///
+    /// Side-channel only: consumers building the final answer ignore this.
+    ThoughtChunk {
+        /// A fragment of the agent's reasoning text.  Never empty.
+        text: String,
+    },
+
+    /// The agent announced a tool call.
+    ///
+    /// Side-channel only: consumers building the final answer ignore this.
+    ToolCall {
+        /// Stable id correlating this call with later [`ResponseEvent::ToolCallUpdate`]s.
+        id: String,
+        /// Human-readable title (empty when the agent omits it).
+        title: String,
+        /// Optional semantic kind (e.g. `"execute"`, `"edit"`).
+        kind: Option<String>,
+        /// Lifecycle status (`"pending"` when the agent omits it).
+        status: String,
+    },
+
+    /// A status/result update for a previously-announced tool call.
+    ///
+    /// Side-channel only: consumers building the final answer ignore this.
+    ToolCallUpdate {
+        /// The id of the [`ResponseEvent::ToolCall`] this updates.
+        id: String,
+        /// Updated lifecycle status, if the update carried one.
+        status: Option<String>,
+        /// Updated title, if the update carried one.
+        title: Option<String>,
     },
 
     /// The agent has finished generating its response for this turn.
@@ -150,9 +199,13 @@ pub enum ResponseEvent {
 /// A boxed, owned stream of response events for one prompt turn.
 ///
 /// Consumers drive the stream with standard `futures::StreamExt` combinators
-/// or via a manual poll loop.  The stream ends (returns `Poll::Ready(None)`)
-/// after [`ResponseEvent::TurnComplete`] is yielded or after a
-/// [`BackendError`] is yielded.
+/// or via a manual poll loop.  The stream yields zero or more
+/// `TextChunk`/`ThoughtChunk`/`ToolCall`/`ToolCallUpdate` events followed by
+/// exactly one [`ResponseEvent::TurnComplete`]; only `TextChunk` contributes to
+/// the final answer text — consumers wanting just the answer accumulate
+/// `TextChunk` and ignore the rest.  The stream ends (returns
+/// `Poll::Ready(None)`) after [`ResponseEvent::TurnComplete`] is yielded or
+/// after a [`BackendError`] is yielded.
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<ResponseEvent, BackendError>> + Send>>;
 
 // ── Traits ────────────────────────────────────────────────────────────────────
@@ -208,9 +261,14 @@ pub trait AgentSession: Send {
     ///
     /// # Contracts
     ///
-    /// * The returned stream MUST yield zero or more [`ResponseEvent::TextChunk`]
-    ///   events followed by exactly one [`ResponseEvent::TurnComplete`] if the
-    ///   turn succeeds.
+    /// * The returned stream MUST yield zero or more
+    ///   `TextChunk`/`ThoughtChunk`/`ToolCall`/`ToolCallUpdate`
+    ///   [`ResponseEvent`]s followed by exactly one
+    ///   [`ResponseEvent::TurnComplete`] if the turn succeeds.  Implementers MAY
+    ///   emit the `ThoughtChunk`/`ToolCall`/`ToolCallUpdate` side-channel
+    ///   variants at any point before the final `TurnComplete`; consumers that
+    ///   only want the final answer text should ignore them (or only accumulate
+    ///   `TextChunk`).
     /// * The stream MUST terminate (return `Poll::Ready(None)`) immediately
     ///   after either `TurnComplete` or an `Err` item.
     /// * Calling `prompt` on a terminated session MUST return
@@ -386,6 +444,58 @@ mod tests {
             toml::from_str(&serialised).expect("deserialise config from TOML");
         assert_eq!(config.system_prompt, deserialised.system_prompt);
         assert_eq!(config.working_dir, deserialised.working_dir);
+    }
+
+    #[tokio::test]
+    async fn text_accumulation_ignores_thought_and_tool_events() {
+        // A stream that interleaves the side-channel variants (ThoughtChunk,
+        // ToolCall, ToolCallUpdate) with the real answer text. A consumer that
+        // wants only the final answer accumulates TextChunk and ignores the
+        // rest — proving the new variants are a pure side channel.
+        let events: Vec<Result<ResponseEvent, BackendError>> = vec![
+            Ok(ResponseEvent::ThoughtChunk {
+                text: "let me think".to_string(),
+            }),
+            Ok(ResponseEvent::TextChunk {
+                text: "Hello".to_string(),
+            }),
+            Ok(ResponseEvent::ToolCall {
+                id: "tc-1".to_string(),
+                title: "run tests".to_string(),
+                kind: Some("execute".to_string()),
+                status: "pending".to_string(),
+            }),
+            Ok(ResponseEvent::TextChunk {
+                text: ", world!".to_string(),
+            }),
+            Ok(ResponseEvent::ToolCallUpdate {
+                id: "tc-1".to_string(),
+                status: Some("completed".to_string()),
+                title: None,
+            }),
+            Ok(ResponseEvent::TurnComplete),
+        ];
+        let stream: ResponseStream = Box::pin(stream::iter(events));
+
+        // Drain, accumulating ONLY TextChunk into the answer string.
+        let mut answer = String::new();
+        let mut events = stream;
+        while let Some(item) = events.next().await {
+            match item.expect("no error item in this scripted stream") {
+                ResponseEvent::TextChunk { text } => answer.push_str(&text),
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. } => {
+                    // Side-channel events do not contribute to the answer.
+                }
+                ResponseEvent::TurnComplete => break,
+            }
+        }
+
+        assert_eq!(
+            answer, "Hello, world!",
+            "only TextChunk text should contribute to the accumulated answer"
+        );
     }
 
     #[tokio::test]

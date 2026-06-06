@@ -741,6 +741,11 @@ impl TaskListInterpreter for ModelInterpreter {
         while let Some(item) = stream.next().await {
             match item? {
                 ResponseEvent::TextChunk { text } => raw_response.push_str(&text),
+                // Side-channel events do not contribute to the model's textual
+                // response; the interpreter only cares about the answer text.
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. } => {}
                 ResponseEvent::TurnComplete => break,
             }
         }
