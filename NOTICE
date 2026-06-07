@@ -1,0 +1,15 @@
+Makina
+Copyright (c) 2026 Koray Taylan Davgana
+
+This product is source-available software licensed under the Elastic License 2.0
+(ELv2). See the LICENSE file for the full terms. It is not OSI-approved "open
+source": self-hosting and modification are permitted, but offering it to third
+parties as a hosted or managed service is not. A separate commercial license is
+available from the licensor for uses the ELv2 does not permit.
+
+Contributions are accepted under the Contributor License Agreement (see CLA.md
+and CONTRIBUTING.md), which lets the licensor offer the combined work under both
+the ELv2 and commercial license terms.
+
+Third-party components are distributed under their own licenses; see Cargo.toml /
+Cargo.lock and the respective upstream projects for details.
