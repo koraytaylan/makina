@@ -274,13 +274,10 @@ pub fn render(app: &App, frame: &mut Frame) {
                 )]));
                 frame.render_widget(waiting, table_area);
             } else {
-                // Build a Table with columns: Task | State | G: | R:
-                // Column widths: task title fills remainder; state fixed 12;
-                // gate and review counters fixed 6 each.
-                let col_title = Constraint::Min(10);
+                // Build a Table with columns: Task | State
+                // Column widths: task title fills remainder; state fixed 12.
+                let col_title = Constraint::Min(20);
                 let col_state = Constraint::Length(12);
-                let col_gates = Constraint::Length(6);
-                let col_reviews = Constraint::Length(6);
 
                 let table_header = Row::new(vec![
                     Cell::from("Task").style(
@@ -289,16 +286,6 @@ pub fn render(app: &App, frame: &mut Frame) {
                             .add_modifier(Modifier::UNDERLINED),
                     ),
                     Cell::from("State").style(
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::UNDERLINED),
-                    ),
-                    Cell::from("G").style(
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::UNDERLINED),
-                    ),
-                    Cell::from("R").style(
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::UNDERLINED),
@@ -313,25 +300,11 @@ pub fn render(app: &App, frame: &mut Frame) {
                         Row::new(vec![
                             Cell::from(task.title.clone()).style(Style::default().fg(Color::White)),
                             Cell::from(badge).style(Style::default().fg(badge_color)),
-                            Cell::from(task.gate_iterations.to_string()).style(
-                                Style::default().fg(if task.gate_iterations > 0 {
-                                    Color::Yellow
-                                } else {
-                                    Color::DarkGray
-                                }),
-                            ),
-                            Cell::from(task.review_iterations.to_string()).style(
-                                Style::default().fg(if task.review_iterations > 0 {
-                                    Color::Yellow
-                                } else {
-                                    Color::DarkGray
-                                }),
-                            ),
                         ])
                     })
                     .collect();
 
-                let task_table = Table::new(rows, [col_title, col_state, col_gates, col_reviews])
+                let task_table = Table::new(rows, [col_title, col_state])
                     .header(table_header)
                     .row_highlight_style(
                         Style::default()
@@ -394,21 +367,6 @@ pub fn render(app: &App, frame: &mut Frame) {
             format!("  {focus_label}{event_hint}")
         }
     };
-    // Legend for the `G`/`R` task columns — only worth the screen real estate
-    // when the selected run actually has non-zero iteration counts.  Appended to
-    // the status bar (the top-level layout has no spare body row) using the same
-    // ASCII `│` separator as the trailer (the non-ASCII `·` would collapse under
-    // `screen_of`, which flattens each cell to its first char).
-    let show_legend = app.selected_run().is_some_and(|r| {
-        r.tasks
-            .iter()
-            .any(|t| t.gate_iterations > 0 || t.review_iterations > 0)
-    });
-    let legend = if show_legend {
-        "  │  G = gate iterations  R = review iterations"
-    } else {
-        ""
-    };
     // Blocked-start notice (mirrors gr-legend append): only when the selected
     // run's report has blocking issues. Tells user why Start is gated and how
     // to re-interpret.
@@ -426,11 +384,18 @@ pub fn render(app: &App, frame: &mut Frame) {
             }
         })
         .unwrap_or_default();
-    // The legend precedes the trailer so its full text (notably "review
-    // iterations") stays inside the visible width; the lower-priority trailer
-    // (focus/last-event hint) is the part that gets clipped on narrow terminals.
+    // Compute the current-view label from app.dependency_view
+    let view = match app.dependency_view {
+        DependencyViewMode::Off => "off",
+        DependencyViewMode::List => "list",
+        DependencyViewMode::Tree => "tree",
+        DependencyViewMode::Timeline => "timeline",
+    };
+    // The blocked notice precedes the trailer so its full text stays inside the
+    // visible width; the lower-priority trailer (focus/last-event hint) is the
+    // part that gets clipped on narrow terminals.
     let status_text = format!(
-        " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [q/^C] quit{legend}{blocked_notice}{trailer}"
+        " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [v] view  [q/^C] quit  │  view: {view}{blocked_notice}{trailer}"
     );
     let status_bar =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
@@ -468,8 +433,14 @@ pub fn render(app: &App, frame: &mut Frame) {
 /// as a compact `[state] task-id` list, one prerequisite per line, looking up
 /// each dependency's [`TaskView`] in the same run to colour its state badge.
 fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
+    let view_label = match app.dependency_view {
+        DependencyViewMode::Off => "off",
+        DependencyViewMode::List => "list",
+        DependencyViewMode::Tree => "tree",
+        DependencyViewMode::Timeline => "timeline",
+    };
     let block = Block::default()
-        .title(" Dependencies ")
+        .title(format!(" Dependencies — {} ", view_label))
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
@@ -745,27 +716,90 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
     match log_opt {
         None => {
             // No task focused or no exchange yet.
+            let mut detail_lines: Vec<Line> = Vec::new();
+
+            // Add task detail with iteration counts if a task is selected.
+            if let Some(task) = app
+                .selected_run()
+                .and_then(|run| app.selected_task.and_then(|i| run.tasks.get(i)))
+            {
+                let counts = format!(
+                    "gate ×{}  ·  review ×{}",
+                    task.gate_iterations, task.review_iterations
+                );
+                let style = if task.gate_iterations + task.review_iterations == 0 {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                detail_lines.push(Line::from(Span::styled(counts, style)));
+                detail_lines.push(Line::from(""));
+            }
+
             let hint = if task_id.is_none() {
                 "  No task focused."
             } else {
                 "  No exchange yet."
             };
-            let para = Paragraph::new(Line::from(vec![Span::styled(
+            detail_lines.push(Line::from(vec![Span::styled(
                 hint,
                 Style::default().fg(Color::DarkGray),
             )]));
+
+            let para = Paragraph::new(detail_lines);
             frame.render_widget(para, inner);
         }
         Some(log) if log.entries.is_empty() => {
-            let para = Paragraph::new(Line::from(vec![Span::styled(
+            let mut detail_lines: Vec<Line> = Vec::new();
+
+            // Add task detail with iteration counts if a task is selected.
+            if let Some(task) = app
+                .selected_run()
+                .and_then(|run| app.selected_task.and_then(|i| run.tasks.get(i)))
+            {
+                let counts = format!(
+                    "gate ×{}  ·  review ×{}",
+                    task.gate_iterations, task.review_iterations
+                );
+                let style = if task.gate_iterations + task.review_iterations == 0 {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                detail_lines.push(Line::from(Span::styled(counts, style)));
+                detail_lines.push(Line::from(""));
+            }
+
+            detail_lines.push(Line::from(vec![Span::styled(
                 "  No exchange yet.",
                 Style::default().fg(Color::DarkGray),
             )]));
+
+            let para = Paragraph::new(detail_lines);
             frame.render_widget(para, inner);
         }
         Some(log) => {
             // Build the exchange lines.
             let mut lines: Vec<Line> = Vec::new();
+
+            // Add task detail with iteration counts if a task is selected.
+            if let Some(task) = app
+                .selected_run()
+                .and_then(|run| app.selected_task.and_then(|i| run.tasks.get(i)))
+            {
+                let counts = format!(
+                    "gate ×{}  ·  review ×{}",
+                    task.gate_iterations, task.review_iterations
+                );
+                let style = if task.gate_iterations + task.review_iterations == 0 {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                lines.push(Line::from(Span::styled(counts, style)));
+                lines.push(Line::from(""));
+            }
+
             for entry in &log.entries {
                 lines.extend(exchange_entry_lines(entry));
             }
@@ -1410,7 +1444,7 @@ mod tests {
     /// When `app.status_message` is set, it is rendered in the status bar.
     #[test]
     fn render_status_bar_shows_status_message() {
-        let mut terminal = make_terminal(100, 24);
+        let mut terminal = make_terminal(150, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![]);
         app.update(crate::app::AppEvent::StatusMessage("Start run:1".into()));
@@ -1421,6 +1455,68 @@ mod tests {
         assert!(
             screen.contains("Start run:1"),
             "status bar must render the transient status_message"
+        );
+    }
+
+    /// The status bar must advertise the `[v]` key for cycling dependency views.
+    #[test]
+    fn status_bar_advertises_view_key() {
+        let mut terminal = make_terminal(120, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![]);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("[v]"),
+            "status bar must advertise the [v] view key"
+        );
+    }
+
+    /// The status bar must show the current dependency view label.
+    #[test]
+    fn status_bar_shows_current_view_label() {
+        let mut terminal = make_terminal(120, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![]);
+
+        // Test with DependencyViewMode::Off (default)
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("view: off"),
+            "status bar must show 'view: off' when dependency_view is Off"
+        );
+
+        // Cycle to List
+        app.update(crate::app::AppEvent::CycleDependencyView);
+        let mut terminal = make_terminal(120, 24);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("view: list"),
+            "status bar must show 'view: list' when dependency_view is List"
+        );
+
+        // Cycle to Tree
+        app.update(crate::app::AppEvent::CycleDependencyView);
+        let mut terminal = make_terminal(120, 24);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("view: tree"),
+            "status bar must show 'view: tree' when dependency_view is Tree"
+        );
+
+        // Cycle to Timeline
+        app.update(crate::app::AppEvent::CycleDependencyView);
+        let mut terminal = make_terminal(120, 24);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("view: timeline"),
+            "status bar must show 'view: timeline' when dependency_view is Timeline"
         );
     }
 
@@ -1858,7 +1954,7 @@ mod tests {
 
     #[test]
     fn render_status_bar_shows_blocked_notice_when_report_blocked() {
-        let mut terminal = make_terminal(120, 30);
+        let mut terminal = make_terminal(150, 30);
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
@@ -1892,7 +1988,7 @@ mod tests {
 
     #[test]
     fn render_focus_label_changes_with_panel() {
-        let mut terminal = make_terminal(80, 24);
+        let mut terminal = make_terminal(150, 24);
         let api = Arc::new(PlaceholderApi::new());
         let mut app = App::new(api, vec![]);
 
@@ -2151,16 +2247,20 @@ mod tests {
     #[test]
     fn render_task_status_shows_iteration_counts() {
         let mut terminal = make_terminal(120, 30);
-        let app = task_status_app();
+        let mut app = task_status_app();
+
+        // Select a task to show its iteration counts in the exchange pane detail.
+        // Alpha task has review_iterations=2; Beta has gate_iterations=1.
+        app.selected_task = Some(1); // Select Beta task (gate_iterations=1)
 
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
 
-        // Beta task has gate_iterations=1; Delta has gate_iterations=3.
-        assert!(screen.contains('1'), "gate iteration count 1 must appear");
-        assert!(screen.contains('3'), "gate iteration count 3 must appear");
-        // Alpha task has review_iterations=2.
-        assert!(screen.contains('2'), "review iteration count 2 must appear");
+        // Beta task has gate_iterations=1; it should appear in the task detail.
+        assert!(
+            screen.contains("gate ×1"),
+            "gate iteration count 1 must appear in task detail"
+        );
     }
 
     /// With [`DependencyViewMode::List`] active and gamma (which depends on
@@ -2459,8 +2559,8 @@ mod tests {
         );
     }
 
-    /// The status bar shows the `G`/`R` legend when the selected run carries
-    /// non-zero gate/review iteration counts.
+    /// The status bar does NOT show the `G`/`R` legend (it was removed).
+    /// The iteration counts are now shown in the task detail pane instead.
     #[test]
     fn render_status_bar_shows_gr_legend_when_counts_nonzero() {
         let mut terminal = make_terminal(120, 30);
@@ -2469,13 +2569,14 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
 
+        // The legend no longer appears in the status bar.
         assert!(
-            screen.contains("gate iterations"),
-            "legend should explain the G column"
+            !screen.contains("gate iterations"),
+            "legend should NOT appear in status bar (G/R columns removed)"
         );
         assert!(
-            screen.contains("review iterations"),
-            "legend should explain the R column"
+            !screen.contains("review iterations"),
+            "legend should NOT appear in status bar (G/R columns removed)"
         );
     }
 
@@ -2628,6 +2729,9 @@ mod tests {
         };
         let mut app = App::new(api, vec![run]);
 
+        // Select the task (it's at index 0) so its detail shows in the exchange pane.
+        app.selected_task = Some(0);
+
         // Feed TaskStateChanged: New → InProgress.
         app.update(AppEvent::ApiEvent(Event::TaskStateChanged {
             run: RunId(1),
@@ -2655,10 +2759,10 @@ mod tests {
             screen.contains("working"),
             "InProgress badge must appear after TaskStateChanged"
         );
-        // '1' is the gate iteration count.
+        // Gate iteration count should appear in task detail as "gate ×1".
         assert!(
-            screen.contains('1'),
-            "gate iteration count must appear after TaskIterationsUpdated"
+            screen.contains("gate ×1"),
+            "gate iteration count must appear in task detail after TaskIterationsUpdated"
         );
 
         // Now transition to Done and update review iterations.
@@ -2682,8 +2786,8 @@ mod tests {
             "Done badge must appear after state transition to Done"
         );
         assert!(
-            screen2.contains('2'),
-            "review iteration count 2 must appear after update"
+            screen2.contains("review ×2"),
+            "review iteration count 2 must appear in task detail after update"
         );
         // Run aggregate status must also have updated to Completed.
         assert_eq!(
@@ -3201,6 +3305,113 @@ mod tests {
         assert!(
             added_fg_green,
             "the `+added line` in tool content must have a Green-foreground cell (diff styling)"
+        );
+    }
+
+    /// **Task table has no G/R columns:** The task table header must contain
+    /// exactly "Task" and "State" cells, with no "G" or "R" columns.
+    #[test]
+    fn task_table_has_no_gate_review_columns() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("alpha"),
+                    title: "Alpha task".into(),
+                    state: TaskState::Done,
+                    gate_iterations: 2,
+                    review_iterations: 1,
+                    depends_on: vec![],
+                },
+                TaskView {
+                    id: TaskId::new("beta"),
+                    title: "Beta task".into(),
+                    state: TaskState::InProgress,
+                    gate_iterations: 1,
+                    review_iterations: 3,
+                    depends_on: vec![],
+                },
+            ],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let app = App::new(api, vec![run]);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Assert that "Task" and "State" appear in the header.
+        assert!(
+            screen.contains("Task"),
+            "table header must contain 'Task' cell"
+        );
+        assert!(
+            screen.contains("State"),
+            "table header must contain 'State' cell"
+        );
+
+        // Assert that "G" and "R" headers are NOT present (they were removed).
+        // We check for the specific pattern to avoid false positives from words
+        // that contain these letters.
+        assert!(
+            !screen.contains(" G ") && !screen.contains(" G\n") && !screen.contains("\nG "),
+            "table header must not contain 'G' column (gate_iterations was removed)"
+        );
+        assert!(
+            !screen.contains(" R ") && !screen.contains(" R\n") && !screen.contains("\nR "),
+            "table header must not contain 'R' column (review_iterations was removed)"
+        );
+    }
+
+    /// **Task detail shows iteration counts:** When a task with non-zero
+    /// gate_iterations and review_iterations is selected, the exchange pane
+    /// displays the counts in the format "gate ×N · review ×M".
+    #[test]
+    fn task_detail_shows_iteration_counts() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("gamma"),
+                title: "Gamma task".into(),
+                state: TaskState::Done,
+                gate_iterations: 2,
+                review_iterations: 1,
+                depends_on: vec![],
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run]);
+
+        // Select the run (index 0 by default) and task (index 0).
+        app.selected_run = Some(0);
+        app.selected_task = Some(0);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Assert that the iteration counts appear in the rendered output.
+        assert!(
+            screen.contains("gate ×2"),
+            "task detail must show 'gate ×2' for gate_iterations=2"
+        );
+        assert!(
+            screen.contains("review ×1"),
+            "task detail must show 'review ×1' for review_iterations=1"
         );
     }
 }
