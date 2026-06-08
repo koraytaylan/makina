@@ -75,7 +75,7 @@ fn exchange_app() -> App {
         }],
         report: makina_core::api::IngestionReport::default(),
     };
-    let mut app = App::new(api, vec![run]);
+    let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
 
     app.update(AppEvent::ApiEvent(Event::AgentExchange {
         run: RunId(1),

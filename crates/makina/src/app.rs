@@ -161,6 +161,16 @@ impl ExchangeLog {
         }
     }
 
+    /// Mark the last entry complete if it is a still-open response.
+    /// Called before pushing any new entry so only the tail segment streams.
+    fn finalize_trailing_response(&mut self) {
+        if let Some(last) = self.entries.last_mut()
+            && let ExchangeContent::Response { complete, .. } = &mut last.content
+        {
+            *complete = true;
+        }
+    }
+
     /// Start a new prompt entry for the given role.
     pub fn add_prompt(&mut self, role: AgentRole, text: String) {
         self.push(ExchangeEntry {
@@ -176,24 +186,17 @@ impl ExchangeLog {
     /// `PromptSent` in this log still needs to go somewhere — we create an
     /// implicit incomplete response entry rather than silently dropping data.
     pub fn append_chunk(&mut self, role: AgentRole, chunk: String) {
-        // A streaming response can have Thought/Tool entries interleaved between
-        // its chunks (e.g. PromptSent → ResponseChunk → ThoughtChunk →
-        // ResponseChunk → TurnComplete for any thinking-capable LLM).  Scan back
-        // past those transparent entries to find the still-open Response of the
-        // same role so streaming chunks accumulate into a single entry.
-        for entry in self.entries.iter_mut().rev() {
-            match &mut entry.content {
-                ExchangeContent::Response { text, complete }
-                    if entry.role == role && !*complete =>
-                {
-                    text.push_str(&chunk);
-                    return;
-                }
-                ExchangeContent::Thought { .. } | ExchangeContent::Tool { .. } => continue,
-                _ => break,
-            }
+        if let Some(last) = self.entries.last_mut()
+            && last.role == role
+            && let ExchangeContent::Response { text, complete } = &mut last.content
+            && !*complete
+        {
+            text.push_str(&chunk);
+            return;
         }
-        // No open response entry for this role — start a new one.
+        // A thought/tool (or a different role) intervened: close the old segment
+        // and start a new one so order is preserved.
+        self.finalize_trailing_response();
         self.push(ExchangeEntry {
             role,
             content: ExchangeContent::Response {
@@ -228,6 +231,7 @@ impl ExchangeLog {
     /// thought entry.  Thoughts are observability-only and never affect the
     /// answer text.
     pub fn append_thought(&mut self, role: AgentRole, chunk: String) {
+        self.finalize_trailing_response();
         if let Some(last) = self.entries.last_mut()
             && last.role == role
             && let ExchangeContent::Thought { text } = &mut last.content
@@ -268,6 +272,7 @@ impl ExchangeLog {
             }
             return;
         }
+        self.finalize_trailing_response();
         self.push(ExchangeEntry {
             role,
             content: ExchangeContent::Tool {
@@ -583,13 +588,20 @@ pub struct App {
     /// Bounded ring of error-pane messages.  Capped at [`ERROR_MESSAGES_CAP`]
     /// by evicting the oldest; see [`App::push_error`].
     pub error_messages: Vec<ErrorMessage>,
+
+    /// The root directory of the repository, used for compacting tool paths.
+    pub repo_root: PathBuf,
+
+    /// Tick counter, incremented on each [`AppEvent::Tick`].
+    /// Used to drive animations like the working spinner.
+    pub tick: u64,
 }
 
 impl App {
-    /// Build a new [`App`] with the given api and initial run list.
+    /// Build a new [`App`] with the given api, initial run list, and repo root.
     ///
     /// Call `api.runs().await` before constructing to obtain `initial_runs`.
-    pub fn new(api: Arc<dyn Api>, initial_runs: Vec<RunView>) -> Self {
+    pub fn new(api: Arc<dyn Api>, initial_runs: Vec<RunView>, repo_root: PathBuf) -> Self {
         let selected_run = if initial_runs.is_empty() {
             None
         } else {
@@ -617,6 +629,8 @@ impl App {
             status_message: None,
             error_pane_open: false,
             error_messages: Vec::new(),
+            repo_root,
+            tick: 0,
         }
     }
 
@@ -817,7 +831,7 @@ impl App {
                 true
             }
             AppEvent::Tick => {
-                // Tick drives the redraw loop; no state changes needed here.
+                self.tick = self.tick.wrapping_add(1);
                 true
             }
 
@@ -1064,7 +1078,7 @@ mod tests {
 
     fn make_app() -> App {
         let api = Arc::new(PlaceholderApi::new());
-        App::new(api, vec![])
+        App::new(api, vec![], PathBuf::from("."))
     }
 
     // ── Error pane ────────────────────────────────────────────────────────────
@@ -1205,7 +1219,7 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![existing]);
+        let mut app = App::new(api, vec![existing], PathBuf::from("."));
 
         // Sending a RunOpened for the same id should not add a second entry.
         let ev = Event::RunOpened {
@@ -1240,7 +1254,7 @@ mod tests {
             }],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run]);
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
 
         let ev = Event::TaskStateChanged {
             run: RunId(1),
@@ -1276,7 +1290,7 @@ mod tests {
             }],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run]);
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
 
         let ev = Event::TaskStateChanged {
             run: RunId(1),
@@ -1302,7 +1316,7 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let app = App::new(api, vec![run]);
+        let app = App::new(api, vec![run], PathBuf::from("."));
         let selected = app.selected_run();
         assert!(
             selected.is_some(),
@@ -1352,7 +1366,7 @@ mod tests {
                 report: makina_core::api::IngestionReport::default(),
             },
         ];
-        let mut app = App::new(api, runs);
+        let mut app = App::new(api, runs, PathBuf::from("."));
         assert_eq!(app.selected_run, Some(0));
 
         app.update(AppEvent::SelectDown);
@@ -1386,7 +1400,7 @@ mod tests {
                 report: makina_core::api::IngestionReport::default(),
             },
         ];
-        let mut app = App::new(api, runs);
+        let mut app = App::new(api, runs, PathBuf::from("."));
         // Move to last entry.
         app.update(AppEvent::SelectDown);
         assert_eq!(app.selected_run, Some(1));
@@ -1419,7 +1433,7 @@ mod tests {
                 report: makina_core::api::IngestionReport::default(),
             },
         ];
-        let mut app = App::new(api, runs);
+        let mut app = App::new(api, runs, PathBuf::from("."));
         app.update(AppEvent::SelectDown);
         assert_eq!(app.selected_run, Some(1));
         app.update(AppEvent::SelectUp);
@@ -1439,7 +1453,7 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         }];
-        let mut app = App::new(api, runs);
+        let mut app = App::new(api, runs, PathBuf::from("."));
         assert_eq!(app.selected_run, Some(0));
         app.update(AppEvent::SelectUp);
         assert_eq!(app.selected_run, Some(0), "should clamp at zero");
@@ -1469,7 +1483,7 @@ mod tests {
                 report: makina_core::api::IngestionReport::default(),
             },
         ];
-        let mut app = App::new(api, runs);
+        let mut app = App::new(api, runs, PathBuf::from("."));
         // Switch focus to main panel.
         app.update(AppEvent::FocusNext);
         assert_eq!(app.focused_panel, Panel::Main);
@@ -1545,7 +1559,7 @@ mod tests {
                 report: makina_core::api::IngestionReport::default(),
             },
         ];
-        let mut app = App::new(api, runs);
+        let mut app = App::new(api, runs, PathBuf::from("."));
         // Select second run.
         app.update(AppEvent::SelectDown);
         assert_eq!(app.selected_run, Some(1));
@@ -1580,7 +1594,7 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run]);
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
 
         let ev = Event::RunStatusChanged {
             run: RunId(1),
@@ -1603,7 +1617,7 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run]);
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
 
         let ev = Event::RunStatusChanged {
             run: RunId(1),
@@ -1633,7 +1647,7 @@ mod tests {
             }],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run]);
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
 
         let ev = Event::TaskIterationsUpdated {
             run: RunId(1),
@@ -1663,7 +1677,7 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![placeholder]);
+        let mut app = App::new(api, vec![placeholder], PathBuf::from("."));
         assert!(
             app.runs[0].tasks.is_empty(),
             "placeholder should have no tasks"
@@ -1716,7 +1730,7 @@ mod tests {
     fn run_loaded_inserts_new_run_when_id_unknown() {
         use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
         let api = Arc::new(PlaceholderApi::new());
-        let mut app = App::new(api, vec![]);
+        let mut app = App::new(api, vec![], PathBuf::from("."));
         assert!(app.runs.is_empty());
 
         let full_run = RunView {
@@ -1750,7 +1764,7 @@ mod tests {
     fn runloaded_clears_interpreting_status() {
         use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
         let api = Arc::new(PlaceholderApi::new());
-        let mut app = App::new(api, vec![]);
+        let mut app = App::new(api, vec![], PathBuf::from("."));
         // Simulate the transient set by resolve_io on file activate.
         app.status_message = Some("Interpreting example.md...".to_string());
         assert!(app.status_message.is_some());
@@ -1830,7 +1844,7 @@ mod tests {
             ],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run]);
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
 
         // Transition t2 to Done → all tasks Done → Completed.
         app.update(AppEvent::ApiEvent(Event::TaskStateChanged {
@@ -1882,7 +1896,7 @@ mod tests {
             ],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run]);
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
 
         app.update(AppEvent::ApiEvent(Event::TaskIterationsUpdated {
             run: RunId(1),
@@ -2078,7 +2092,7 @@ mod tests {
             ],
             report: makina_core::api::IngestionReport::default(),
         };
-        App::new(api, vec![run])
+        App::new(api, vec![run], PathBuf::from("."))
     }
 
     /// **Live streaming (the done-when):** Feed PromptSent, several
@@ -2549,7 +2563,7 @@ mod tests {
             }],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(api, vec![run1, run2]);
+        let mut app = App::new(api, vec![run1, run2], PathBuf::from("."));
 
         // Initially: sidebar focused, run index 0, task index 0.
         assert_eq!(app.focused_panel, Panel::Sidebar);
@@ -2648,12 +2662,9 @@ mod tests {
 
     /// Regression: a thinking-capable LLM interleaves a ThoughtChunk between two
     /// ResponseChunks (PromptSent → ResponseChunk → ThoughtChunk →
-    /// ResponseChunk → TurnComplete).  The streaming chunks MUST coalesce into a
-    /// single Response entry (not split into two), the thought must survive, and
-    /// TurnComplete must finalise the response even though the literal last
-    /// entry at that point is the Response again — but the bug also surfaced when
-    /// the last entry was the Thought.  Drives the exact failing sequence and
-    /// asserts coalescing + completion + thought preservation.
+    /// ResponseChunk → TurnComplete).  With segmentation, these chunks should
+    /// create two separate Response entries (preserving chronological order), the
+    /// thought must survive, and TurnComplete must finalise all responses.
     #[test]
     fn exchange_log_response_chunks_coalesce_across_interleaved_thought() {
         use crate::app::ExchangeLog;
@@ -2666,7 +2677,7 @@ mod tests {
         log.append_chunk(AgentRole::Developer, "B".into());
         log.complete_turn();
 
-        // Exactly ONE Response entry — the chunks coalesced across the thought.
+        // TWO Response entries (segmented by the intervening thought)
         let responses: Vec<_> = log
             .entries
             .iter()
@@ -2674,19 +2685,25 @@ mod tests {
             .collect();
         assert_eq!(
             responses.len(),
-            1,
-            "ResponseChunks must coalesce into ONE entry across the interleaved thought"
+            2,
+            "ResponseChunks must segment into TWO entries around the interleaved thought"
         );
+        // First segment contains "A"
         match &responses[0].content {
             ExchangeContent::Response { text, complete } => {
-                assert_eq!(
-                    text, "AB",
-                    "chunks must coalesce across the interleaved thought"
-                );
+                assert_eq!(text, "A", "first segment must contain the initial chunk");
                 assert!(
                     complete,
-                    "TurnComplete must finalise the coalesced response"
+                    "first segment must be closed after thought intervenes"
                 );
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+        // Second segment contains "B"
+        match &responses[1].content {
+            ExchangeContent::Response { text, complete } => {
+                assert_eq!(text, "B", "second segment must contain the later chunk");
+                assert!(complete, "TurnComplete must finalise the second segment");
             }
             other => panic!("expected a Response, got {other:?}"),
         }
@@ -2698,6 +2715,42 @@ mod tests {
                 .any(|e| matches!(&e.content, ExchangeContent::Thought { text } if text == "hmm")),
             "the interleaved thought must be preserved"
         );
+    }
+
+    /// Response chunks should be segmented when a thought or tool intervenes,
+    /// so the order is preserved: chunk → thought → tool → chunk becomes
+    /// Response, Thought, Tool, Response (not all chunks coalesced into one).
+    #[test]
+    fn exchange_log_segments_response_around_thought_and_tool() {
+        let mut log = ExchangeLog::default();
+        log.append_chunk(AgentRole::Developer, "Let me ".into());
+        log.append_thought(AgentRole::Developer, "checking…".into());
+        log.start_tool(
+            AgentRole::Developer,
+            "t1".into(),
+            "read".into(),
+            None,
+            "completed".into(),
+        );
+        log.append_chunk(AgentRole::Developer, "do X.".into());
+        let kinds: Vec<_> = log
+            .entries
+            .iter()
+            .map(|e| match &e.content {
+                ExchangeContent::Response { .. } => "resp",
+                ExchangeContent::Thought { .. } => "thought",
+                ExchangeContent::Tool { .. } => "tool",
+                ExchangeContent::Prompt { .. } => "prompt",
+            })
+            .collect();
+        assert_eq!(kinds, ["resp", "thought", "tool", "resp"]);
+        // First segment is closed; only the tail is open until complete_turn.
+        assert!(matches!(
+            log.entries[0].content,
+            ExchangeContent::Response { complete: true, .. }
+        ));
+        log.complete_turn();
+        assert!(log.entries.iter().all(|e| e.complete()));
     }
 
     /// Regression: TurnComplete must finalise the response even when the literal

@@ -96,7 +96,7 @@ async fn main() {
                     Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>
                 ),
         );
-    let worktree_manager = WorktreeManager::new(repo_root, config.base_branch.clone());
+    let worktree_manager = WorktreeManager::new(repo_root.clone(), config.base_branch.clone());
 
     // ── Api ───────────────────────────────────────────────────────────────────
     // The real, core-backed orchestrator Api.  It opens Runs by reading a
@@ -149,7 +149,7 @@ async fn main() {
 
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;
-    let mut app = app::App::new(Arc::clone(&api), initial_runs);
+    let mut app = app::App::new(Arc::clone(&api), initial_runs, repo_root);
 
     // ── Terminal lifecycle ────────────────────────────────────────────────────
     let mut tui = match tui::Tui::init() {

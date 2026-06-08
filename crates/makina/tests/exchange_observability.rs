@@ -194,7 +194,11 @@ async fn full_turn_with_thoughts_and_tools_surfaces_in_exchange_log() {
     // No initial runs are seeded: AgentExchange handling keys the log by task id
     // (`exchange_logs.entry(task).or_default()`), so the log is built purely from
     // the live events flowing through the real stack.
-    let mut app = App::new(Arc::clone(&api), Vec::<RunView>::new());
+    let mut app = App::new(
+        Arc::clone(&api),
+        Vec::<RunView>::new(),
+        std::path::PathBuf::from("."),
+    );
 
     // Subscribe BEFORE starting so no events are missed.
     let mut stream = api.subscribe();
@@ -325,19 +329,28 @@ async fn full_turn_with_thoughts_and_tools_surfaces_in_exchange_log() {
         "the tool status must be the FINAL 'completed' after the two in-place updates"
     );
 
-    // (d) The Response entry text is EXACTLY the concatenation of the TextChunks —
-    //     no thought/tool text leaked into the answer.
-    let response_text = log
+    // (d) After response segmentation, the scripted turn's two TextChunks appear
+    //     as TWO separate Response entries (one before the thought/tool, one after).
+    //     Collect all of them and assert their texts are exactly the scripted chunks —
+    //     no thought/tool text must leak into any response entry.
+    let response_texts: Vec<&str> = log
         .entries
         .iter()
-        .find_map(|e| match &e.content {
+        .filter_map(|e| match &e.content {
             ExchangeContent::Response { text, .. } => Some(text.as_str()),
             _ => None,
         })
-        .expect("a Response entry must be present");
+        .collect();
+    assert!(
+        !response_texts.is_empty(),
+        "at least one Response entry must be present; entries = {:?}",
+        log.entries
+    );
+    let all_response_text = response_texts.join("");
     assert_eq!(
-        response_text, "Working on it. Done.",
-        "the answer must be exactly the TextChunks concatenated (no thought/tool leakage)"
+        all_response_text, "Working on it. Done.",
+        "all Response segments concatenated must equal the TextChunks (no thought/tool leakage); \
+         segments = {response_texts:?}"
     );
 
     // Keep the temp repo alive until here (worktrees were created off it).

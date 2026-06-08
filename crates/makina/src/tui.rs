@@ -25,9 +25,7 @@ use std::panic;
 
 use ratatui::Terminal;
 use ratatui::crossterm::{
-    cursor,
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
+    cursor, execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::CrosstermBackend;
@@ -56,12 +54,7 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            cursor::Hide
-        )?;
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -81,7 +74,6 @@ impl Tui {
         let _ = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
-            DisableMouseCapture,
             cursor::Show
         );
     }
@@ -157,20 +149,10 @@ pub(crate) fn install_panic_hook_for_test()
 /// Used by the panic hook **and** the out-of-band signal reaper
 /// ([`crate::exit::install_signal_reaper`]): both run from contexts that do not
 /// own the render loop's [`Tui`], so they need a standalone restore that leaves
-/// the alternate screen, disables raw mode, **disables mouse capture**, and
-/// shows the cursor.
-///
-/// Mouse capture must be disabled here too (matching [`Tui::restore`]): a panic
-/// or signal mid-run otherwise leaves the terminal emitting raw mouse-tracking
-/// escape sequences into the user's shell, corrupting it.
+/// the alternate screen, disables raw mode, and shows the cursor.
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        cursor::Show
-    );
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -181,20 +163,19 @@ mod tests {
 
     /// Smoke test for the init → restore round-trip (task `tui-mouse-scroll`).
     ///
-    /// In a TTY, `Tui::init` enables raw mode, the alternate screen, **mouse
-    /// capture** (`EnableMouseCapture`), and hides the cursor; `Tui::restore`
-    /// disables raw mode, leaves the alternate screen, **disables mouse capture**
-    /// (`DisableMouseCapture`), and shows the cursor.  Under `cargo test` there is
-    /// usually no real TTY, so `enable_raw_mode()` may return an error and `init`
-    /// returns `Err`; that is fine — the point is that the round-trip neither
-    /// panics nor leaves the terminal in a bad state.  When a TTY *is* present we
-    /// drive a full init+restore and assert it round-trips cleanly.
+    /// In a TTY, `Tui::init` enables raw mode, the alternate screen, and hides
+    /// the cursor; `Tui::restore` disables raw mode, leaves the alternate screen,
+    /// and shows the cursor. Under `cargo test` there is usually no real TTY, so
+    /// `enable_raw_mode()` may return an error and `init` returns `Err`; that is
+    /// fine — the point is that the round-trip neither panics nor leaves the
+    /// terminal in a bad state.  When a TTY *is* present we drive a full init+restore
+    /// and assert it round-trips cleanly.
     #[test]
     fn init_then_restore_round_trips() {
         match Tui::init() {
             Ok(mut tui) => {
                 // A real TTY was available: restore must not panic and must be
-                // safe to call (it disables mouse capture among other things).
+                // safe to call.
                 tui.restore();
             }
             Err(_) => {
@@ -203,44 +184,5 @@ mod tests {
                 restore_terminal();
             }
         }
-    }
-
-    /// The exact escape bytes crossterm emits for [`DisableMouseCapture`].
-    ///
-    /// Captured via the [`ratatui::crossterm::Command`] trait so the assertion
-    /// stays in lockstep with whatever crossterm version is pinned (rather than
-    /// hard-coding the literal CSI sequence).
-    fn disable_mouse_capture_bytes() -> Vec<u8> {
-        use ratatui::crossterm::Command;
-        let mut s = String::new();
-        DisableMouseCapture.write_ansi(&mut s).unwrap();
-        s.into_bytes()
-    }
-
-    /// Regression (fix `tui-scroll-and-restore` #4): the standalone
-    /// [`restore_terminal`] — used by the panic hook AND the signal reaper — must
-    /// emit `DisableMouseCapture`, matching [`Tui::restore`].  Omitting it leaves
-    /// mouse capture on after a panic/signal, corrupting the user's shell.
-    ///
-    /// `restore_terminal` writes to the process stdout, which a unit test cannot
-    /// intercept, so this asserts on the *same* `execute!` command set written to
-    /// an in-memory buffer (the mouse-disable sequence is part of that set).  A
-    /// regression that drops `DisableMouseCapture` from `restore_terminal` would
-    /// drop it here too and fail the assertion.
-    #[test]
-    fn restore_terminal_emits_disable_mouse_capture() {
-        let mut buf: Vec<u8> = Vec::new();
-        // Mirror restore_terminal's command list exactly (minus disable_raw_mode,
-        // which is a syscall and emits no bytes).
-        execute!(buf, LeaveAlternateScreen, DisableMouseCapture, cursor::Show).unwrap();
-
-        let needle = disable_mouse_capture_bytes();
-        assert!(
-            buf.windows(needle.len()).any(|w| w == needle.as_slice()),
-            "restore_terminal's command set must emit the DisableMouseCapture escape sequence"
-        );
-
-        // The real standalone restore must also be callable without panicking.
-        restore_terminal();
     }
 }

@@ -719,7 +719,7 @@ mod tests {
         use std::sync::Arc;
 
         let api = Arc::new(PlaceholderApi::empty());
-        let mut app = App::new(api, vec![]);
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         let ev = translate_terminal_event(key_press(KeyCode::Char('q'), KeyModifiers::NONE), false);
         app.update(ev);
@@ -735,7 +735,7 @@ mod tests {
         use std::sync::Arc;
 
         let api = Arc::new(PlaceholderApi::empty());
-        let mut app = App::new(api, vec![]);
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         let core_ev = CoreEvent::RunOpened {
             run: RunId(42),
@@ -801,7 +801,11 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = App::new(Arc::clone(&api) as Arc<dyn Api>, vec![run]);
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![run],
+            std::path::PathBuf::from("."),
+        );
         assert_eq!(app.selected_run().unwrap().id, RunId(7));
 
         // Start.
@@ -846,7 +850,7 @@ mod tests {
         use std::sync::Arc;
 
         let api = Arc::new(PlaceholderApi::empty());
-        let app = App::new(api, vec![]);
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
         assert!(app.selected_run().is_none());
 
         let (ev, status) = resolve_io(&app, AppEvent::StartRun).await;
@@ -874,7 +878,7 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let app = App::new(api, vec![run]);
+        let app = App::new(api, vec![run], std::path::PathBuf::from("."));
 
         let (_ev, status) = resolve_io(&app, AppEvent::StartRun).await;
         let msg = status.expect("an error must still produce a status message");
@@ -896,7 +900,7 @@ mod tests {
         use std::sync::Arc;
 
         let api = Arc::new(PlaceholderApi::empty());
-        let app = App::new(api, vec![]);
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         let (resolved, status) = resolve_io(&app, AppEvent::OpenBrowser).await;
         assert!(status.is_none(), "OpenBrowser has no status message");
@@ -923,7 +927,7 @@ mod tests {
         use std::sync::Arc;
 
         let api = Arc::new(PlaceholderApi::empty());
-        let mut app = App::new(api, vec![]);
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
         app.mode = Mode::FileBrowser;
         let file_path = std::path::PathBuf::from("/tmp/example-task-list.md");
         app.browser = Some(FileBrowser::new(
@@ -1000,7 +1004,7 @@ mod tests {
         let mut sub = api.subscribe();
 
         // Build an App whose browser has the sample file selected.
-        let mut app = App::new(Arc::clone(&api), vec![]);
+        let mut app = App::new(Arc::clone(&api), vec![], std::path::PathBuf::from("."));
         app.mode = Mode::FileBrowser;
         app.browser = Some(FileBrowser::new(
             dir.path().to_path_buf(),
@@ -1197,7 +1201,7 @@ mod tests {
         }
 
         // Apply to App — verifies the full pipeline end-to-end.
-        let mut app = App::new(Arc::clone(&api), vec![]);
+        let mut app = App::new(Arc::clone(&api), vec![], std::path::PathBuf::from("."));
         app.update(resolved);
 
         assert_eq!(

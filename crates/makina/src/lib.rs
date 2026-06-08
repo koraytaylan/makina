@@ -29,6 +29,7 @@ pub mod browser;
 pub mod event;
 pub mod exit;
 pub mod log;
+pub mod markup;
 #[cfg(test)]
 pub mod placeholder;
 pub mod tui;
