@@ -496,6 +496,12 @@ fn log_event(ev: &Event) {
             "  · TaskIterations {} gate={gate_iterations} review={review_iterations}",
             task.0
         ),
+        Event::SessionCapabilities { task, role, .. } => {
+            eprintln!("  · SessionCapabilities {role:?}[{}]", task.0)
+        }
+        Event::CurrentModeUpdate { task, role, .. } => {
+            eprintln!("  · CurrentModeUpdate {role:?}[{}]", task.0)
+        }
         Event::AgentExchange {
             task, role, event, ..
         } => match event {

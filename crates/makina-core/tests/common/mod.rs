@@ -80,6 +80,9 @@ pub fn test_session_config() -> SessionConfig {
     SessionConfig {
         working_dir: PathBuf::from("/tmp/makina-test"),
         system_prompt: "You are a test agent.".to_string(),
+        mode: None,
+        model: None,
+        effort: None,
         extra: None,
     }
 }

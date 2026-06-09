@@ -116,6 +116,9 @@ async fn real_cli_prompt_response_through_the_backend_trait() {
     let config = SessionConfig {
         working_dir: cwd,
         system_prompt: "You are a terse assistant.".to_string(),
+        mode: None,
+        model: None,
+        effort: None,
         extra: None,
     };
 

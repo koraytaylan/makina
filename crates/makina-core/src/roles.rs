@@ -39,16 +39,18 @@
 //! [`parse_review_verdict`] extracts the outermost `{ … }` JSON object,
 //! strips fences and prose, and maps the result to [`ReviewVerdict`].
 //!
-//! # Usage by task 21
+//! # Usage by orchestrator
 //!
 //! ```rust,ignore
 //! // Developer session
-//! let config = session_config_for(Role::Developer, worktree_path);
-//! let mut session = backend.spawn(config).await?;
+//! let assignment = config.roles.developer.clone();
+//! let session_cfg = session_config_for(Role::Developer, worktree_path, assignment);
+//! let mut session = backend.spawn(session_cfg).await?;
 //!
 //! // Reviewer session
-//! let config = session_config_for(Role::Reviewer, worktree_path);
-//! let mut session = backend.spawn(config).await?;
+//! let assignment = config.roles.reviewer.clone();
+//! let session_cfg = session_config_for(Role::Reviewer, worktree_path, assignment);
+//! let mut session = backend.spawn(session_cfg).await?;
 //! // … collect response …
 //! let verdict = parse_review_verdict(&response_text)?;
 //! ```
@@ -58,6 +60,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::backend::SessionConfig;
+use crate::config::RoleAssignment;
 
 // ── Role ──────────────────────────────────────────────────────────────────────
 
@@ -167,24 +170,42 @@ pub fn system_prompt_for(role: Role) -> &'static str {
     }
 }
 
-/// Build a [`SessionConfig`] for the given [`Role`] and working directory.
+/// Build a [`SessionConfig`] for the given [`Role`], working directory, and role assignment.
 ///
-/// Sets `system_prompt` to the role-appropriate constant and `extra` to
-/// `None` (use backend defaults).  Task 21 (`develop-review-loop`) calls this
-/// instead of constructing `SessionConfig` by hand.
+/// Sets `system_prompt` to the role-appropriate constant and carries the
+/// `mode`, `model`, and `effort` defaults from the role's assignment.
+/// The orchestrator calls this when spawning a session for a role.
 ///
 /// # Example
 /// ```
 /// use std::path::PathBuf;
 /// use makina_core::roles::{Role, session_config_for, REVIEWER_SYSTEM_PROMPT};
-/// let cfg = session_config_for(Role::Reviewer, PathBuf::from("/tmp/worktree"));
+/// use makina_core::config::RoleAssignment;
+/// let assignment = RoleAssignment {
+///     provider: "default".to_string(),
+///     mode: None,
+///     model: None,
+///     effort: None,
+/// };
+/// let cfg = session_config_for(Role::Reviewer, PathBuf::from("/tmp/worktree"), Some(assignment));
 /// assert_eq!(cfg.system_prompt, REVIEWER_SYSTEM_PROMPT);
 /// assert_eq!(cfg.working_dir, PathBuf::from("/tmp/worktree"));
 /// ```
-pub fn session_config_for(role: Role, working_dir: PathBuf) -> SessionConfig {
+pub fn session_config_for(
+    role: Role,
+    working_dir: PathBuf,
+    assignment: Option<RoleAssignment>,
+) -> SessionConfig {
+    let (mode, model, effort) = assignment
+        .map(|a| (a.mode, a.model, a.effort))
+        .unwrap_or((None, None, None));
+
     SessionConfig {
         working_dir,
         system_prompt: system_prompt_for(role).to_string(),
+        mode,
+        model,
+        effort,
         extra: None,
     }
 }
@@ -358,19 +379,25 @@ mod tests {
     #[test]
     fn session_config_for_developer_sets_correct_prompt_and_dir() {
         let dir = PathBuf::from("/repo/worktree/task-42");
-        let cfg = session_config_for(Role::Developer, dir.clone());
+        let cfg = session_config_for(Role::Developer, dir.clone(), None);
         assert_eq!(cfg.system_prompt, DEVELOPER_SYSTEM_PROMPT);
         assert_eq!(cfg.working_dir, dir);
         assert!(cfg.extra.is_none());
+        assert!(cfg.mode.is_none());
+        assert!(cfg.model.is_none());
+        assert!(cfg.effort.is_none());
     }
 
     #[test]
     fn session_config_for_reviewer_sets_correct_prompt_and_dir() {
         let dir = PathBuf::from("/repo/worktree/task-42-review");
-        let cfg = session_config_for(Role::Reviewer, dir.clone());
+        let cfg = session_config_for(Role::Reviewer, dir.clone(), None);
         assert_eq!(cfg.system_prompt, REVIEWER_SYSTEM_PROMPT);
         assert_eq!(cfg.working_dir, dir);
         assert!(cfg.extra.is_none());
+        assert!(cfg.mode.is_none());
+        assert!(cfg.model.is_none());
+        assert!(cfg.effort.is_none());
     }
 
     // ── parse_review_verdict: happy paths ─────────────────────────────────────
@@ -526,7 +553,8 @@ mod tests {
             "fn main() { println!(\"hello\"); }".to_string(),
         ]));
 
-        let config = session_config_for(Role::Developer, PathBuf::from("/tmp/worktree/task-1"));
+        let config =
+            session_config_for(Role::Developer, PathBuf::from("/tmp/worktree/task-1"), None);
         let mut session = backend
             .spawn(config)
             .await
@@ -573,5 +601,41 @@ mod tests {
         let r2 = r.clone();
         assert_eq!(r, r2);
         assert!(format!("{r:?}").contains("Reject"));
+    }
+
+    // ── SessionConfig with role assignments ───────────────────────────────────
+
+    #[test]
+    fn session_config_for_carries_role_assignments() {
+        // Proves that session_config_for correctly threads role assignment
+        // (mode, model, effort) into the SessionConfig.
+        let assignment = RoleAssignment {
+            provider: "grok".to_string(),
+            mode: Some("code".to_string()),
+            model: Some("claude-opus".to_string()),
+            effort: Some("high".to_string()),
+        };
+
+        let cfg = session_config_for(
+            Role::Developer,
+            PathBuf::from("/tmp/worktree"),
+            Some(assignment),
+        );
+
+        assert_eq!(cfg.mode, Some("code".to_string()));
+        assert_eq!(cfg.model, Some("claude-opus".to_string()));
+        assert_eq!(cfg.effort, Some("high".to_string()));
+        assert_eq!(cfg.system_prompt, DEVELOPER_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn session_config_for_none_assignment_has_no_selections() {
+        // Proves that when no assignment is provided, selections are None.
+        let cfg = session_config_for(Role::Reviewer, PathBuf::from("/tmp/worktree"), None);
+
+        assert_eq!(cfg.mode, None);
+        assert_eq!(cfg.model, None);
+        assert_eq!(cfg.effort, None);
+        assert_eq!(cfg.system_prompt, REVIEWER_SYSTEM_PROMPT);
     }
 }

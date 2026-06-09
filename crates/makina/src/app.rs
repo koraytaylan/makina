@@ -10,7 +10,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use makina_core::api::{AgentRole, Api, Event, RunId, RunView, TaskId};
+use makina_core::api::{
+    AgentRole, Api, ConfigOptionView, Event, RunId, RunView, SessionModes, TaskId,
+};
+#[cfg(test)]
+use makina_core::config::RoleAssignment;
+use makina_core::config::{ProviderConfig, RolesConfig};
 
 use crate::browser::{DirEntry, FileBrowser};
 
@@ -371,6 +376,27 @@ pub enum Mode {
     Normal,
     /// The modal file browser for picking a task-list file to open.
     FileBrowser,
+    /// The modal provider/role configuration editor.
+    ProviderConfig,
+}
+
+// ── Provider configuration editor ──────────────────────────────────────────────
+
+/// State for the provider/role configuration editor modal.
+#[derive(Debug, Clone)]
+pub struct ProviderEditor {
+    /// The editable list of providers.
+    pub providers: Vec<ProviderConfig>,
+    /// Role assignments to providers.
+    pub roles: RolesConfig,
+    /// Available session modes, if discovered from a live session.
+    pub available_modes: Option<SessionModes>,
+    /// Available configuration options, if discovered from a live session.
+    pub available_config_options: Vec<ConfigOptionView>,
+    /// Index of the currently selected provider in `providers`.
+    pub selected_provider: Option<usize>,
+    /// Which role/selection is currently focused: provider list, or a role's mode/model/effort.
+    pub selection_index: usize,
 }
 
 /// Which dependency-view overlay (if any) the TUI renders above the exchange
@@ -491,6 +517,18 @@ pub enum AppEvent {
     /// file was opened).
     CloseBrowser,
 
+    // ── Provider configuration editor (task 0041) ──────────────────────────────
+    /// User requested to open the provider configuration editor (e.g. pressed `g`).
+    OpenProviderEditor,
+    /// Move the editor selection one row up.
+    ProviderEditorUp,
+    /// Move the editor selection one row down.
+    ProviderEditorDown,
+    /// Close the provider editor and return to the normal view (Esc).
+    CloseProviderEditor,
+    /// Commit the edited configuration back to the config file.
+    ProviderEditorCommit,
+
     // ── Run control (task 31) ─────────────────────────────────────────────────
     //
     // Start/Pause/Cancel are INTENT signals (like the browser intents): the IO
@@ -564,6 +602,16 @@ pub struct App {
     /// [`Mode::FileBrowser`]; the IO layer populates it via
     /// [`AppEvent::BrowserOpened`].
     pub browser: Option<FileBrowser>,
+
+    /// Provider/role configuration editor state.  `Some` only while
+    /// [`App::mode`] is [`Mode::ProviderConfig`].
+    pub provider_editor: Option<ProviderEditor>,
+
+    /// The named providers loaded from config (used to seed the editor).
+    pub providers: Vec<ProviderConfig>,
+
+    /// The role-to-provider assignments loaded from config (used to seed the editor).
+    pub roles: RolesConfig,
 
     /// The list of open Runs, seeded from `api.runs()` at startup and
     /// incrementally updated from api events.
@@ -675,6 +723,9 @@ impl App {
             mode: Mode::Normal,
             dependency_view: DependencyViewMode::Off,
             browser: None,
+            provider_editor: None,
+            providers: Vec::new(),
+            roles: RolesConfig::default(),
             runs: initial_runs,
             selected_run,
             selected_task,
@@ -689,6 +740,23 @@ impl App {
             repo_root,
             tick: 0,
         }
+    }
+
+    /// Build a new [`App`] with explicit providers and roles from a resolved config.
+    ///
+    /// Use this variant when a config is available (main.rs) so the provider
+    /// editor is seeded with the current configuration.
+    pub fn with_config(
+        api: Arc<dyn Api>,
+        initial_runs: Vec<RunView>,
+        repo_root: PathBuf,
+        providers: Vec<ProviderConfig>,
+        roles: RolesConfig,
+    ) -> Self {
+        let mut app = Self::new(api, initial_runs, repo_root);
+        app.providers = providers;
+        app.roles = roles;
+        app
     }
 
     /// Push a new error-pane message, evicting the oldest when over cap.
@@ -706,6 +774,11 @@ impl App {
     /// Whether the modal file browser is currently active.
     pub fn is_browsing(&self) -> bool {
         self.mode == Mode::FileBrowser
+    }
+
+    /// Whether the provider configuration editor is currently active.
+    pub fn is_editing_providers(&self) -> bool {
+        self.mode == Mode::ProviderConfig
     }
 
     /// Return the currently selected [`RunView`], if any.
@@ -987,6 +1060,58 @@ impl App {
                 true
             }
 
+            // ── Provider configuration editor (task 0041) ──────────────────────
+            AppEvent::OpenProviderEditor => {
+                // Open the provider editor modal, seeded from the app's current
+                // providers/roles (loaded from config at startup).
+                self.provider_editor = Some(ProviderEditor {
+                    providers: self.providers.clone(),
+                    roles: self.roles.clone(),
+                    available_modes: None,
+                    available_config_options: vec![],
+                    selected_provider: if self.providers.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    },
+                    selection_index: 0,
+                });
+                self.mode = Mode::ProviderConfig;
+                true
+            }
+            AppEvent::ProviderEditorUp => {
+                if let Some(editor) = self.provider_editor.as_mut() {
+                    editor.selection_index = editor.selection_index.saturating_sub(1);
+                }
+                true
+            }
+            AppEvent::ProviderEditorDown => {
+                if let Some(editor) = self.provider_editor.as_mut() {
+                    // Calculate total number of selectable items:
+                    // providers list + 3 roles (each with mode/model/effort selections)
+                    let total_items = editor.providers.len() + 3;
+                    editor.selection_index =
+                        (editor.selection_index + 1).min(total_items.saturating_sub(1));
+                }
+                true
+            }
+            AppEvent::CloseProviderEditor => {
+                self.mode = Mode::Normal;
+                self.provider_editor = None;
+                true
+            }
+            AppEvent::ProviderEditorCommit => {
+                // The IO layer (resolve_io in event.rs) writes the config to disk.
+                // Here we apply the editor's final state back to app.providers/roles
+                // and close the editor so the TUI returns to normal mode.
+                if let Some(editor) = self.provider_editor.take() {
+                    self.providers = editor.providers;
+                    self.roles = editor.roles;
+                }
+                self.mode = Mode::Normal;
+                true
+            }
+
             // ── Run control (task 31) ─────────────────────────────────────────
             // Start/Pause/Cancel are IO-layer intents: the event loop issues the
             // async `api.execute(...)` for the selected run and feeds back a
@@ -1148,6 +1273,25 @@ impl App {
                     tv.gate_iterations = *gate_iterations;
                     tv.review_iterations = *review_iterations;
                 }
+            }
+            // SessionCapabilities and CurrentModeUpdate are observability events
+            // for the provider editor (task 0041). For now, we ignore them at the
+            // app level; the TUI will subscribe to these to populate UI fields.
+            Event::SessionCapabilities {
+                run: _,
+                task: _,
+                role: _,
+                capabilities: _,
+            } => {
+                // TODO(0041): surface capabilities to the provider editor
+            }
+            Event::CurrentModeUpdate {
+                run: _,
+                task: _,
+                role: _,
+                current_mode_id: _,
+            } => {
+                // TODO(0041): update the provider editor's current mode display
             }
             // AgentExchange events accumulate into the per-task exchange log
             // (task 30: prompt-answer-stream).  The TUI stores ALL tasks' logs
@@ -2159,6 +2303,81 @@ mod tests {
         app.update(AppEvent::OpenBrowser);
         assert_eq!(app.mode, Mode::Normal, "OpenBrowser alone changes nothing");
         assert!(app.browser.is_none());
+    }
+
+    // ── Provider configuration editor (task 0041) ──────────────────────────────
+
+    /// Pressing `g` dispatches `OpenProviderEditor`, which must set
+    /// `mode = Mode::ProviderConfig` and populate `provider_editor` from the
+    /// app's current providers/roles.
+    #[test]
+    fn provider_editor_opens_and_lists_providers() {
+        use crate::placeholder::PlaceholderApi;
+
+        // Build an app pre-seeded with two providers (simulates what main.rs does
+        // after loading config).
+        let api = Arc::new(PlaceholderApi::new());
+        let providers = vec![
+            ProviderConfig {
+                name: "default".into(),
+                command: "acp-cli".into(),
+                args: vec![],
+                env: Default::default(),
+            },
+            ProviderConfig {
+                name: "grok".into(),
+                command: "grok".into(),
+                args: vec!["agent".into()],
+                env: Default::default(),
+            },
+        ];
+        let roles = RolesConfig {
+            developer: Some(RoleAssignment {
+                provider: "default".into(),
+                mode: None,
+                model: None,
+                effort: None,
+            }),
+            ..Default::default()
+        };
+        let mut app = App::with_config(
+            api,
+            vec![],
+            PathBuf::from("."),
+            providers.clone(),
+            roles.clone(),
+        );
+
+        // Sanity: starts in Normal mode with no editor open.
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.provider_editor.is_none());
+
+        // Dispatch the OpenProviderEditor event (the same path `g` triggers via
+        // translate_key in event.rs).
+        let redraw = app.update(AppEvent::OpenProviderEditor);
+
+        // The mode must switch and the editor must be populated.
+        assert!(redraw, "OpenProviderEditor must trigger a redraw");
+        assert_eq!(app.mode, Mode::ProviderConfig);
+        assert!(app.is_editing_providers());
+        assert!(
+            app.provider_editor.is_some(),
+            "provider_editor must be Some"
+        );
+
+        let editor = app.provider_editor.as_ref().unwrap();
+        assert_eq!(
+            editor.providers.len(),
+            2,
+            "editor must list both configured providers"
+        );
+        assert_eq!(editor.providers[0].name, "default");
+        assert_eq!(editor.providers[1].name, "grok");
+        assert_eq!(
+            editor.selected_provider,
+            Some(0),
+            "first provider must be pre-selected"
+        );
     }
 
     // ── prompt-answer-stream (task 30) ────────────────────────────────────────

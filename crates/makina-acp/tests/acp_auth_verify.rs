@@ -331,6 +331,9 @@ async fn acp_backend_spawn_of_missing_binary_is_spawn_not_auth_error() {
     let config = SessionConfig {
         working_dir: std::env::temp_dir(),
         system_prompt: String::new(),
+        mode: None,
+        model: None,
+        effort: None,
         extra: None,
     };
     match backend.spawn(config).await {

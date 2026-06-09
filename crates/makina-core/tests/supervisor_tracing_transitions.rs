@@ -264,6 +264,7 @@ async fn run_graph_emits_tracing_transition_and_gate_events() {
         Arc::clone(&graph),
         worktree_manager,
         config,
+        Arc::clone(&backend),
         backend,
         control,
         Arc::new(NoopAuditRegistry),

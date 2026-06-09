@@ -304,6 +304,7 @@ async fn per_task_logs() {
         Arc::clone(&graph),
         worktree_manager,
         config,
+        Arc::clone(&backend),
         backend,
         control,
         Arc::new(NoopAuditRegistry),

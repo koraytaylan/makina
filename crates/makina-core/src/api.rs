@@ -495,6 +495,71 @@ pub enum ExchangeEvent {
     TurnComplete,
 }
 
+/// Discovered capabilities of a session (modes, config options, current mode).
+///
+/// Surfaced to the TUI so it can render what the live agent offers for
+/// mode/model/effort selection. Mirrors the structures from the ACP protocol
+/// but is defined here so the TUI depends only on the API layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCapabilities {
+    /// All available session modes and the currently active mode.
+    pub modes: Option<SessionModes>,
+    /// All available configuration options (model, effort, etc.).
+    pub config_options: Vec<ConfigOptionView>,
+}
+
+/// The current mode and available modes for a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionModes {
+    /// The id of the mode currently active.
+    pub current_mode_id: String,
+    /// All modes the agent supports.
+    pub available_modes: Vec<SessionModeView>,
+}
+
+/// A single session mode option.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionModeView {
+    /// The mode's stable identifier.
+    pub id: String,
+    /// Human-readable name of the mode.
+    pub name: String,
+    /// Optional description of what this mode does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A configuration option the agent supports (e.g., model, reasoning effort).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigOptionView {
+    /// The stable identifier of this option.
+    pub id: String,
+    /// Human-readable name of the option.
+    pub name: String,
+    /// The category of this option (e.g., "model", "thought_level", "model_config").
+    pub category: String,
+    /// The type of this option (e.g., "select", "boolean").
+    pub kind: String,
+    /// The current value of this option (if set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_value: Option<serde_json::Value>,
+    /// Available choices for this option (if it's a select type).
+    #[serde(default)]
+    pub options: Vec<ConfigOptionChoiceView>,
+}
+
+/// A choice for a config option (e.g., a model variant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigOptionChoiceView {
+    /// The stable value identifier for this choice.
+    pub value: String,
+    /// Human-readable name of the choice.
+    pub name: String,
+    /// Optional description of what this choice does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// An event emitted by the orchestrator and consumed by the TUI.
 ///
 /// The TUI subscribes once via [`Api::subscribe`] and drives a render loop
@@ -559,6 +624,39 @@ pub enum Event {
         gate_iterations: u32,
         /// Updated review-iteration counter.
         review_iterations: u32,
+    },
+
+    /// Discovered capabilities of a new session (modes, config options).
+    ///
+    /// Emitted when a session is opened and the agent advertises what modes
+    /// and config options it supports. The TUI uses this to populate model/effort
+    /// selectors in the provider editor. Omitted if the agent does not advertise
+    /// capabilities (e.g. older ACP agents).
+    SessionCapabilities {
+        /// The Run whose task's session opened.
+        run: RunId,
+        /// The task whose agent session was opened.
+        task: TaskId,
+        /// Which agent role is involved (Developer or Reviewer).
+        role: AgentRole,
+        /// The discovered modes and config options.
+        capabilities: SessionCapabilities,
+    },
+
+    /// The agent autonomously changed its operating mode.
+    ///
+    /// Emitted when a `current_mode_update` notification arrives from the agent,
+    /// indicating the agent switched modes (e.g., user action in the remote UI).
+    /// The TUI should update the displayed current mode.
+    CurrentModeUpdate {
+        /// The Run whose task's agent switched modes.
+        run: RunId,
+        /// The task whose agent changed mode.
+        task: TaskId,
+        /// Which agent role is involved (Developer or Reviewer).
+        role: AgentRole,
+        /// The new current mode ID.
+        current_mode_id: String,
     },
 
     /// A live agent exchange event from any in-flight task/agent.

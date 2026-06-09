@@ -214,6 +214,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
         Arc::clone(&graph),
         worktree_manager,
         config,
+        Arc::clone(&backend),
         backend,
         control,
         Arc::new(spy),

@@ -27,9 +27,10 @@
 //! [`ProjectConfig::from_toml_str`] with in-memory TOML strings, then
 //! [`Config::resolve`] and [`Config::validate`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
@@ -87,7 +88,7 @@ pub enum ConfigError {
 ///
 /// `command` defaults to an empty string; [`Config::validate`] will reject a
 /// config whose `backend.command` is empty.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BackendConfig {
     /// The binary or command to spawn for agent sessions (e.g. `"acp-cli"`).
@@ -99,6 +100,75 @@ pub struct BackendConfig {
     pub args: Vec<String>,
 }
 
+// ── Provider and Role config ──────────────────────────────────────────────────
+
+/// Configuration for a named ACP provider.
+///
+/// A provider is an external agent backend (ACP CLI) that can be referenced
+/// by name and assigned to roles. Each provider has a command, optional
+/// arguments, and optional environment variables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    /// The unique name of this provider (e.g. `"default"`, `"grok"`, `"claude"`).
+    pub name: String,
+
+    /// The binary or command to spawn for agent sessions.
+    ///
+    /// Must be non-empty after validation.
+    pub command: String,
+
+    /// Arguments to pass to `command` when spawning agent sessions.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Environment variables to set when spawning the backend.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Assignment of a role to a provider, with optional mode/model/effort defaults.
+///
+/// Specifies which provider (ACP backend) a role uses and what default
+/// mode/model/effort selections it should apply when opening a session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoleAssignment {
+    /// The name of the provider this role is assigned to.
+    ///
+    /// Must reference a declared provider in `GlobalConfig::providers`.
+    pub provider: String,
+
+    /// Optional default mode ID to apply when opening a session.
+    #[serde(default)]
+    pub mode: Option<String>,
+
+    /// Optional default model option value to apply when opening a session.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Optional default effort (thought_level) option value to apply when opening a session.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// Role-to-provider assignments and defaults.
+///
+/// Specifies which provider each role (Planner, Developer, Reviewer) uses
+/// and what default mode/model/effort selections apply to each.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RolesConfig {
+    /// Optional assignment for the Planner role.
+    #[serde(default)]
+    pub planner: Option<RoleAssignment>,
+
+    /// Optional assignment for the Developer role.
+    #[serde(default)]
+    pub developer: Option<RoleAssignment>,
+
+    /// Optional assignment for the Reviewer role.
+    #[serde(default)]
+    pub reviewer: Option<RoleAssignment>,
+}
+
 // ── Planner config ────────────────────────────────────────────────────────────
 
 /// Planner model and call mechanism configuration.
@@ -108,7 +178,7 @@ pub struct BackendConfig {
 /// `OneShotAgent` is the implemented MVP path; `DirectApi` is deferred.
 ///
 /// See `docs/spec/planner-model-mechanism.md` for the full decision and rationale.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlannerConfig {
     /// The model identifier used by the Planner (e.g. `"gemini-2.0-flash"`).
@@ -132,7 +202,7 @@ pub struct PlannerConfig {
 /// fallback).
 ///
 /// Serde strings are stable: `"one-shot-agent"` and `"direct-api"`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlannerMechanism {
     /// **Implemented (MVP path).** The Planner spawns a one-shot agent session
@@ -161,7 +231,7 @@ pub enum PlannerMechanism {
 ///
 /// These caps protect against runaway tasks.  All values must be ≥ 1;
 /// [`Config::validate`] enforces this.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapsConfig {
     /// Maximum number of gate iterations before a task is failed.
@@ -206,11 +276,25 @@ fn default_concurrency() -> usize {
 /// [`Default`] implementations.  This means a completely empty global config
 /// file is valid at parse time (though it may fail [`Config::validate`] if, for
 /// example, `backend.command` remains empty and no project override supplies it).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlobalConfig {
     /// The ACP agent CLI to spawn for Developer and Reviewer sessions.
+    ///
+    /// **Legacy field (back-compat).** When `providers` is empty but `backend` is set,
+    /// the backend is synthesized into a provider named `"default"` during resolve.
     pub backend: BackendConfig,
+
+    /// Named ACP providers available for role assignment.
+    ///
+    /// If empty at resolve time and a legacy `[backend]` section exists,
+    /// one default provider is synthesized from the backend config.
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+
+    /// Role-to-provider assignments and per-role mode/model/effort defaults.
+    #[serde(default)]
+    pub roles: RolesConfig,
 
     /// Planner model and mechanism.  See [`PlannerConfig`].
     ///
@@ -231,6 +315,8 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             backend: BackendConfig::default(),
+            providers: Vec::new(),
+            roles: RolesConfig::default(),
             planner: PlannerConfig::default(),
             caps: CapsConfig::default(),
             concurrency: 3,
@@ -364,8 +450,14 @@ impl ProjectConfig {
 /// [`Config::resolve`] + [`Config::validate`] (testable without I/O).
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The agent backend CLI command and arguments.
+    /// The agent backend CLI command and arguments (legacy field; use `providers` instead).
     pub backend: BackendConfig,
+
+    /// Named ACP providers available for role assignment.
+    pub providers: Vec<ProviderConfig>,
+
+    /// Role-to-provider assignments and per-role mode/model/effort defaults.
+    pub roles: RolesConfig,
 
     /// Planner configuration (model + mechanism).  See [`PlannerConfig`].
     pub planner: PlannerConfig,
@@ -390,6 +482,10 @@ impl Config {
     /// override replaces the corresponding global value; `concurrency` is
     /// similarly overridden if present.  `gates` and `base_branch` always come
     /// from the project layer.
+    ///
+    /// **Back-compat:** if `providers` is empty but a legacy `[backend]` exists,
+    /// a single provider named `"default"` is synthesized from the backend config,
+    /// and any role not explicitly assigned is assigned to `"default"`.
     ///
     /// This function does **not** validate the result; call [`Config::validate`]
     /// after `resolve` to surface semantic errors.
@@ -417,8 +513,52 @@ impl Config {
             project.base_branch
         };
 
+        // ── Provider and role resolution with back-compat ──────────────────────
+
+        // If providers is empty but backend.command is set, synthesize a default provider.
+        let mut providers = global.providers.clone();
+        let mut roles = global.roles.clone();
+
+        if providers.is_empty() && !global.backend.command.is_empty() {
+            // Synthesize a "default" provider from the legacy backend config.
+            providers.push(ProviderConfig {
+                name: "default".to_string(),
+                command: global.backend.command.clone(),
+                args: global.backend.args.clone(),
+                env: BTreeMap::new(),
+            });
+
+            // Assign any role not explicitly set to "default".
+            if roles.planner.is_none() {
+                roles.planner = Some(RoleAssignment {
+                    provider: "default".to_string(),
+                    mode: None,
+                    model: None,
+                    effort: None,
+                });
+            }
+            if roles.developer.is_none() {
+                roles.developer = Some(RoleAssignment {
+                    provider: "default".to_string(),
+                    mode: None,
+                    model: None,
+                    effort: None,
+                });
+            }
+            if roles.reviewer.is_none() {
+                roles.reviewer = Some(RoleAssignment {
+                    provider: "default".to_string(),
+                    mode: None,
+                    model: None,
+                    effort: None,
+                });
+            }
+        }
+
         Self {
             backend: global.backend,
+            providers,
+            roles,
             planner: global.planner,
             caps,
             concurrency,
@@ -431,7 +571,10 @@ impl Config {
     ///
     /// Checks performed:
     ///
-    /// - `backend.command` is non-empty.
+    /// - `backend.command` is non-empty (legacy field).
+    /// - All provider commands are non-empty.
+    /// - All provider names are unique.
+    /// - All `RoleAssignment.provider` names reference declared providers.
     /// - `caps.gate_iterations` ≥ 1.
     /// - `caps.reviewer_iterations` ≥ 1.
     /// - `caps.wall_clock_secs` ≥ 1.
@@ -445,7 +588,48 @@ impl Config {
     /// Returns [`ConfigError::Validation`] with a precise `reason` string on
     /// the first violation found.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.backend.command.is_empty() {
+        // Validate providers.
+        let mut seen_names = std::collections::HashSet::new();
+
+        for provider in &self.providers {
+            // Check for non-empty command.
+            if provider.command.is_empty() {
+                return Err(ConfigError::Validation {
+                    reason: format!("provider {:?}: command must not be empty", provider.name),
+                });
+            }
+
+            // Check for unique names.
+            if !seen_names.insert(provider.name.clone()) {
+                return Err(ConfigError::Validation {
+                    reason: format!("duplicate provider name: {:?}", provider.name),
+                });
+            }
+        }
+
+        // Validate role assignments reference declared providers.
+        let provider_names: std::collections::HashSet<_> =
+            self.providers.iter().map(|p| p.name.clone()).collect();
+
+        for (role_name, assignment) in [
+            ("planner", &self.roles.planner),
+            ("developer", &self.roles.developer),
+            ("reviewer", &self.roles.reviewer),
+        ] {
+            if let Some(assignment) = assignment
+                && !provider_names.contains(&assignment.provider)
+            {
+                return Err(ConfigError::Validation {
+                    reason: format!(
+                        "role '{}' references unknown provider {:?}",
+                        role_name, assignment.provider
+                    ),
+                });
+            }
+        }
+
+        // Legacy backend.command check (kept for back-compat).
+        if self.backend.command.is_empty() && self.providers.is_empty() {
             return Err(ConfigError::Validation {
                 reason: "backend.command must not be empty".to_string(),
             });
@@ -1027,6 +1211,146 @@ mod tests {
         assert!(
             legacy,
             "legacy should be true when only ./makina.toml exists"
+        );
+    }
+
+    // ── Provider and role config tests ────────────────────────────────────────
+
+    /// **Acceptance criterion — legacy backend becomes default provider**
+    ///
+    /// Given a global config with only `[backend]` (no `providers` section),
+    /// after resolve, a `ProviderConfig` named `"default"` should be synthesized
+    /// from the backend command/args, and all roles should be assigned to it.
+    #[test]
+    fn legacy_backend_becomes_default_provider() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+            args = ["--verbose"]
+            "#,
+            "test-global",
+        )
+        .expect("valid");
+
+        let project = ProjectConfig::default();
+        let config = Config::resolve(global, project);
+
+        // Should have exactly one provider: "default".
+        assert_eq!(
+            config.providers.len(),
+            1,
+            "should have one synthesized provider"
+        );
+        assert_eq!(config.providers[0].name, "default");
+        assert_eq!(config.providers[0].command, "acp-cli");
+        assert_eq!(config.providers[0].args, vec!["--verbose"]);
+
+        // All three roles should be assigned to "default".
+        assert!(config.roles.planner.is_some(), "planner should be assigned");
+        assert_eq!(config.roles.planner.as_ref().unwrap().provider, "default");
+
+        assert!(
+            config.roles.developer.is_some(),
+            "developer should be assigned"
+        );
+        assert_eq!(config.roles.developer.as_ref().unwrap().provider, "default");
+
+        assert!(
+            config.roles.reviewer.is_some(),
+            "reviewer should be assigned"
+        );
+        assert_eq!(config.roles.reviewer.as_ref().unwrap().provider, "default");
+
+        // Validation should pass.
+        config
+            .validate()
+            .expect("synthesized default provider should pass validation");
+    }
+
+    /// **Acceptance criterion — role assignment resolves provider**
+    ///
+    /// Given a global config with two providers ("a" and "b") and developer
+    /// assigned to provider "b", the resolved config should have both providers
+    /// and the developer role should reference "b".
+    #[test]
+    fn role_assignment_resolves_provider() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [[providers]]
+            name = "a"
+            command = "provider-a"
+
+            [[providers]]
+            name = "b"
+            command = "provider-b"
+
+            [roles.developer]
+            provider = "b"
+            mode = "code"
+            model = "grok-2"
+            effort = "high"
+            "#,
+            "test-global",
+        )
+        .expect("valid");
+
+        let project = ProjectConfig::default();
+        let config = Config::resolve(global, project);
+
+        // Should have both providers.
+        assert_eq!(config.providers.len(), 2);
+        assert_eq!(config.providers[0].name, "a");
+        assert_eq!(config.providers[1].name, "b");
+
+        // Developer should be assigned to "b".
+        assert!(config.roles.developer.is_some());
+        let dev_assignment = config.roles.developer.as_ref().unwrap();
+        assert_eq!(dev_assignment.provider, "b");
+        assert_eq!(dev_assignment.mode, Some("code".to_string()));
+        assert_eq!(dev_assignment.model, Some("grok-2".to_string()));
+        assert_eq!(dev_assignment.effort, Some("high".to_string()));
+
+        // Validation should pass.
+        config
+            .validate()
+            .expect("config with valid provider references should pass validation");
+    }
+
+    /// **Acceptance criterion — unknown provider rejected**
+    ///
+    /// Given a config where roles.reviewer.provider references a provider named
+    /// "nope" that does not exist, validate() should return a Validation error
+    /// mentioning "unknown provider".
+    #[test]
+    fn unknown_provider_rejected() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [[providers]]
+            name = "a"
+            command = "provider-a"
+
+            [roles.reviewer]
+            provider = "nope"
+            "#,
+            "test-global",
+        )
+        .expect("valid TOML");
+
+        let project = ProjectConfig::default();
+        let config = Config::resolve(global, project);
+
+        let err = config
+            .validate()
+            .expect_err("reviewer referencing unknown provider 'nope' should fail validation");
+
+        assert!(
+            matches!(err, ConfigError::Validation { .. }),
+            "should be a validation error"
+        );
+        assert!(
+            err.to_string().contains("unknown provider"),
+            "error should mention 'unknown provider', got: {err}"
         );
     }
 }

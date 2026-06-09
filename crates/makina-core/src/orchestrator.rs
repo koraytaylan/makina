@@ -338,10 +338,19 @@ struct CoreState {
     /// use the model.
     planner_interpreter: Arc<dyn TaskListInterpreter>,
 
-    /// The agent backend cloned into each background scheduler (and from there
-    /// into every per-task Developer/Reviewer).  Injected so the deterministic
-    /// `NoopBackend` (tests/TUI) and the ACP backend (e2e) are interchangeable.
-    backend: Arc<dyn AgentBackend>,
+    /// The agent backend for the Developer role.
+    ///
+    /// Resolved from `config.roles.developer.provider` in the TUI binary; cloned
+    /// into every background `run_graph` call as `developer_backend`. In tests and
+    /// the simple `new` path, this is the same `Arc` as `reviewer_backend`.
+    developer_backend: Arc<dyn AgentBackend>,
+
+    /// The agent backend for the Reviewer role.
+    ///
+    /// Resolved from `config.roles.reviewer.provider` in the TUI binary; cloned
+    /// into every background `run_graph` call as `reviewer_backend`. In tests and
+    /// the simple `new` path, this is the same `Arc` as `developer_backend`.
+    reviewer_backend: Arc<dyn AgentBackend>,
 
     /// Worktree/branch lifecycle manager (repo root + base branch) handed to the
     /// background scheduler.
@@ -572,6 +581,8 @@ impl CoreApi {
         config: Config,
     ) -> Self {
         let planner_interpreter = Arc::clone(&interpreter);
+        // In the simple test path, both roles share the same backend Arc.
+        let backend_clone = Arc::clone(&backend);
         Self::with_audit_registry(
             interpreter,
             // For the simple `new` path (mostly tests), default planner to same
@@ -580,6 +591,7 @@ impl CoreApi {
             // updated helpers) to pass a separately-built one.
             planner_interpreter,
             backend,
+            backend_clone,
             worktree_manager,
             config,
             Arc::new(NoopAuditRegistry),
@@ -597,7 +609,8 @@ impl CoreApi {
     pub fn with_audit_registry(
         interpreter: Arc<dyn TaskListInterpreter>,
         planner_interpreter: Arc<dyn TaskListInterpreter>,
-        backend: Arc<dyn AgentBackend>,
+        developer_backend: Arc<dyn AgentBackend>,
+        reviewer_backend: Arc<dyn AgentBackend>,
         worktree_manager: WorktreeManager,
         config: Config,
         audit_registry: Arc<dyn AuditRegistry>,
@@ -607,7 +620,8 @@ impl CoreApi {
             state: Arc::new(CoreState {
                 interpreter,
                 planner_interpreter,
-                backend,
+                developer_backend,
+                reviewer_backend,
                 worktree_manager,
                 config,
                 runs: Mutex::new(BTreeMap::new()),
@@ -928,7 +942,8 @@ impl CoreApi {
         // task (so it can finalize the registry status when the scheduler ends).
         let worktree_manager = self.state.worktree_manager.clone();
         let config = self.state.config.clone();
-        let backend = Arc::clone(&self.state.backend);
+        let developer_backend = Arc::clone(&self.state.developer_backend);
+        let reviewer_backend = Arc::clone(&self.state.reviewer_backend);
         let audit_registry = Arc::clone(&self.state.audit_registry);
         let planner_interpreter = Arc::clone(&self.state.planner_interpreter);
         let state = Arc::clone(&self.state);
@@ -944,7 +959,8 @@ impl CoreApi {
                 graph,
                 worktree_manager,
                 config,
-                backend,
+                developer_backend,
+                reviewer_backend,
                 control,
                 audit_registry,
                 run_slug,
@@ -1461,7 +1477,7 @@ Do the thing in `lib.rs`.
         )
         .expect("planner build must succeed with None backend");
         // Cycle: developer output, then approve verdict (covers any task count).
-        let backend = Arc::new(NoopBackend::with_responses(vec![
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![
             "Implemented the feature.".into(),
             r#"{"verdict":"approve"}"#.into(),
         ]));
@@ -1470,6 +1486,7 @@ Do the thing in `lib.rs`.
         let api = CoreApi::with_audit_registry(
             ingestion,
             planner,
+            Arc::clone(&backend),
             backend,
             wm,
             no_gate_config(),

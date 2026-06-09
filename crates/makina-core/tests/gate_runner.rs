@@ -95,11 +95,20 @@ fn run_git(path: &std::path::Path, args: &[&str]) {
 /// so it is never actually spawned) and `base_branch` is `develop` to match the
 /// temp repo.
 fn config_with_gates(gates: Vec<GateConfig>, gate_iterations: u32) -> Config {
+    use makina_core::config::{ProviderConfig, RolesConfig};
+
     Config {
         backend: BackendConfig {
             command: "noop".into(),
             args: vec![],
         },
+        providers: vec![ProviderConfig {
+            name: "default".into(),
+            command: "noop".into(),
+            args: vec![],
+            env: Default::default(),
+        }],
+        roles: RolesConfig::default(),
         planner: PlannerConfig::default(),
         caps: CapsConfig {
             gate_iterations,
@@ -176,7 +185,8 @@ async fn build_actor_tree(
         .ask(SetSpokes {
             root: root.clone(),
             supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
+            developer_backend: Arc::clone(&backend),
+            reviewer_backend: Arc::clone(&backend),
         })
         .send()
         .await

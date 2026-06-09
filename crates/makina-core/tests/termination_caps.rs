@@ -119,11 +119,20 @@ fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
 /// backends, so it is never spawned) and `base_branch` is `develop` to match the
 /// temp repo.
 fn config(gates: Vec<GateConfig>, caps: CapsConfig) -> Config {
+    use makina_core::config::{ProviderConfig, RolesConfig};
+
     Config {
         backend: BackendConfig {
             command: "noop".into(),
             args: vec![],
         },
+        providers: vec![ProviderConfig {
+            name: "default".into(),
+            command: "noop".into(),
+            args: vec![],
+            env: Default::default(),
+        }],
+        roles: RolesConfig::default(),
         planner: PlannerConfig::default(),
         caps,
         concurrency: 1,
@@ -193,7 +202,8 @@ async fn build_actor_tree(
         .ask(SetSpokes {
             root: root.clone(),
             supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
+            developer_backend: Arc::clone(&backend),
+            reviewer_backend: Arc::clone(&backend),
         })
         .send()
         .await

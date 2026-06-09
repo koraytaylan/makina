@@ -256,6 +256,10 @@ pub struct AcpClient {
     /// Retained for observability (Zed model: Makina never calls `authenticate`).
     /// An empty list means the agent requires no auth or is already authenticated.
     auth_methods: Vec<AuthMethod>,
+    /// Session modes advertised by the agent (if supported).
+    modes: Option<protocol::SessionModeState>,
+    /// Config options advertised by the agent (e.g., model, effort).
+    config_options: Vec<protocol::ConfigOption>,
     /// Set once [`shutdown`](Self::shutdown) has run, to make it idempotent.
     closed: bool,
 }
@@ -271,6 +275,8 @@ impl std::fmt::Debug for AcpClient {
             .field("protocol_version", &self.protocol_version)
             .field("agent_info", &self.agent_info)
             .field("auth_methods_count", &self.auth_methods.len())
+            .field("modes_available", &self.modes.is_some())
+            .field("config_options_count", &self.config_options.len())
             .field("closed", &self.closed)
             .finish()
     }
@@ -349,6 +355,8 @@ impl AcpClient {
             protocol_version: 0,
             agent_info: None,
             auth_methods: Vec::new(),
+            modes: None,
+            config_options: Vec::new(),
             closed: false,
         }
     }
@@ -397,6 +405,8 @@ impl AcpClient {
         let session: NewSessionResult = serde_json::from_value(session_value)
             .map_err(|e| AcpError::protocol(format!("invalid session/new result: {e}")))?;
         self.session_id = session.session_id;
+        self.modes = session.modes;
+        self.config_options = session.config_options;
 
         Ok(())
     }
@@ -439,6 +449,73 @@ impl AcpClient {
     /// file and the TUI error pane) typically contains the human-readable reason.
     pub fn auth_methods(&self) -> &[crate::protocol::AuthMethod] {
         &self.auth_methods
+    }
+
+    /// Get the session modes advertised by the agent (if any).
+    pub fn modes(&self) -> Option<&protocol::SessionModeState> {
+        self.modes.as_ref()
+    }
+
+    /// Get the configuration options advertised by the agent (if any).
+    pub fn config_options(&self) -> &[protocol::ConfigOption] {
+        &self.config_options
+    }
+
+    /// Request the agent to switch to a different mode.
+    ///
+    /// Sends a `session/set_mode` request to the agent. Returns `Ok(())` if the
+    /// request was sent successfully; the agent's response is handled asynchronously.
+    pub async fn set_mode(&mut self, mode_id: &str) -> Result<()> {
+        if self.closed {
+            return Err(AcpError::Closed);
+        }
+        if let Some(err) = self.transport.sender().ended_error() {
+            return Err(err);
+        }
+
+        let params = protocol::SetModeParams {
+            session_id: self.session_id.clone(),
+            mode_id: mode_id.to_string(),
+        };
+
+        let sender = self.transport.sender().clone();
+        let _response: serde_json::Value = sender
+            .send_request(protocol::METHOD_SESSION_SET_MODE, &params)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Set a configuration option on the agent.
+    ///
+    /// Sends a `session/set_config_option` request to the agent. Returns `Ok(())`
+    /// if the request was sent successfully; the agent's response is handled
+    /// asynchronously. The `value` parameter is a JSON value that matches the
+    /// option's expected type.
+    pub async fn set_config_option(
+        &mut self,
+        option_id: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        if self.closed {
+            return Err(AcpError::Closed);
+        }
+        if let Some(err) = self.transport.sender().ended_error() {
+            return Err(err);
+        }
+
+        let params = protocol::SetConfigOptionParams {
+            session_id: self.session_id.clone(),
+            option_id: option_id.to_string(),
+            value,
+        };
+
+        let sender = self.transport.sender().clone();
+        let _response: serde_json::Value = sender
+            .send_request(protocol::METHOD_SESSION_SET_CONFIG_OPTION, &params)
+            .await?;
+
+        Ok(())
     }
 
     /// Send `text` as a single user turn and return an incremental stream of
@@ -715,8 +792,8 @@ impl PromptStream<'_> {
     /// Assistant/thought text chunks become [`AcpResponseChunk::Text`] /
     /// [`AcpResponseChunk::Thought`] (empty text is dropped); tool-call lifecycle
     /// updates become [`AcpResponseChunk::ToolCall`] /
-    /// [`AcpResponseChunk::ToolCallUpdate`]. User-message echoes and unmodelled
-    /// kinds (`SessionUpdate::Other`) return `None` and are skipped.
+    /// [`AcpResponseChunk::ToolCallUpdate`]. User-message echoes, mode updates,
+    /// and unmodelled kinds (`SessionUpdate::Other`) return `None` and are skipped.
     fn classify_update(update: SessionUpdate) -> Option<AcpResponseChunk> {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => {
@@ -736,7 +813,9 @@ impl PromptStream<'_> {
                 status: u.status,
                 title: u.title,
             }),
-            SessionUpdate::UserMessageChunk(_) | SessionUpdate::Other => None,
+            SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::CurrentModeUpdate { .. }
+            | SessionUpdate::Other => None,
         }
     }
 }

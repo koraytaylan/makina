@@ -114,7 +114,7 @@ async fn developer_role_produces_dev_output() {
 
     let cwd = std::env::current_dir().unwrap();
     let backend = AcpBackend::new(program, args);
-    let config = session_config_for(Role::Developer, cwd);
+    let config = session_config_for(Role::Developer, cwd, None);
 
     eprintln!(
         "Spawning Developer session with system_prompt prefix: {:?}…",
@@ -159,7 +159,7 @@ async fn reviewer_role_produces_parseable_verdict() {
 
     let cwd = std::env::current_dir().unwrap();
     let backend = AcpBackend::new(program, args);
-    let config = session_config_for(Role::Reviewer, cwd);
+    let config = session_config_for(Role::Reviewer, cwd, None);
 
     eprintln!(
         "Spawning Reviewer session with system_prompt prefix: {:?}…",

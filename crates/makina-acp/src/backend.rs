@@ -57,6 +57,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use makina_core::api;
 use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
 };
@@ -250,18 +251,115 @@ impl AgentBackend for AcpBackend {
     /// Builds an [`AcpCommand`] (program/args from this backend, `working_dir`
     /// from `config`), runs [`AcpClient::connect`] (spawn + `initialize` +
     /// `session/new`), and wraps the connected client in an [`AcpSession`].
-    /// `config.system_prompt` is stored and prepended to the first prompt;
-    /// `config.extra` is not used by this backend.
+    /// `config.system_prompt` is stored and prepended to the first prompt.
+    ///
+    /// After the session is created, if the role assignment specifies a `mode`,
+    /// `model`, or `effort` and the agent advertises those capabilities, they are
+    /// applied via `set_mode` / `set_config_option` (silently skipped if not
+    /// advertised).
     ///
     /// Connect failures are mapped to [`BackendError`] (`Spawn` for spawn
     /// failures, `Transport` for handshake/protocol failures).
     async fn spawn(&self, config: SessionConfig) -> Result<Box<dyn AgentSession>, BackendError> {
         let command = self.command_for(config.working_dir);
-        let client = AcpClient::connect(command).await.map_err(map_error)?;
+        let mut client = AcpClient::connect(command).await.map_err(map_error)?;
+
+        // Apply role assignments (mode, model, effort) if advertised.
+        if let Some(mode) = &config.mode
+            && let Some(modes) = client.modes()
+            && modes.available_modes.iter().any(|m| &m.id == mode)
+        {
+            client.set_mode(mode).await.map_err(map_error)?;
+        }
+
+        if let Some(model) = &config.model {
+            // Find the first option whose category is "model" — its *id* is the
+            // option identifier; `model` is the desired *value* to set on it.
+            let model_option_id = client
+                .config_options()
+                .iter()
+                .find(|o| o.category == "model")
+                .map(|o| o.id.clone());
+            if let Some(option_id) = model_option_id {
+                client
+                    .set_config_option(&option_id, serde_json::Value::String(model.clone()))
+                    .await
+                    .map_err(map_error)?;
+            }
+        }
+
+        if let Some(effort) = &config.effort {
+            // Find the first option whose category is "thought_level" — its *id* is
+            // the option identifier; `effort` is the desired *value* to set on it.
+            let effort_option_id = client
+                .config_options()
+                .iter()
+                .find(|o| o.category == "thought_level")
+                .map(|o| o.id.clone());
+            if let Some(option_id) = effort_option_id {
+                client
+                    .set_config_option(&option_id, serde_json::Value::String(effort.clone()))
+                    .await
+                    .map_err(map_error)?;
+            }
+        }
+
         Ok(Box::new(AcpSession::from_client(
             client,
             config.system_prompt,
         )))
+    }
+}
+
+// ── Capability snapshot helper ────────────────────────────────────────────────
+
+/// Build an [`api::SessionCapabilities`] snapshot from a connected
+/// [`AcpClient`], mapping the ACP protocol types to the API view types.
+///
+/// Returns `None` if the client advertises neither modes nor config options
+/// (i.e. the agent did not include them in `session/new`).
+fn build_capabilities(client: &AcpClient) -> Option<api::SessionCapabilities> {
+    let modes = client.modes().map(|m| api::SessionModes {
+        current_mode_id: m.current_mode_id.clone(),
+        available_modes: m
+            .available_modes
+            .iter()
+            .map(|mode| api::SessionModeView {
+                id: mode.id.clone(),
+                name: mode.name.clone(),
+                description: mode.description.clone(),
+            })
+            .collect(),
+    });
+
+    let config_options: Vec<api::ConfigOptionView> = client
+        .config_options()
+        .iter()
+        .map(|opt| api::ConfigOptionView {
+            id: opt.id.clone(),
+            name: opt.name.clone(),
+            category: opt.category.clone(),
+            kind: opt.kind.clone(),
+            current_value: opt.current_value.clone(),
+            options: opt
+                .options
+                .iter()
+                .map(|choice| api::ConfigOptionChoiceView {
+                    value: choice.value.clone(),
+                    name: choice.name.clone(),
+                    description: choice.description.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    if modes.is_none() && config_options.is_empty() {
+        None
+    } else {
+        Some(api::SessionCapabilities {
+            modes,
+            config_options,
+        })
     }
 }
 
@@ -284,6 +382,9 @@ pub struct AcpSession {
     /// The session/role prompt, prepended to the first prompt's text. `take`n on
     /// first use so later turns are sent verbatim.
     system_prompt: Option<String>,
+    /// Capabilities snapshot taken from the client at construction time (after
+    /// `session/new` handshake). `None` if the agent did not advertise any.
+    capabilities: Option<api::SessionCapabilities>,
 }
 
 impl AcpSession {
@@ -294,14 +395,20 @@ impl AcpSession {
     /// [`AcpClient::with_transport`] against an in-memory mock agent (no
     /// subprocess), wrap it here, and exercise the [`AgentSession`] trait
     /// methods. It is also how [`AcpBackend::spawn`] constructs the session.
+    ///
+    /// Snapshots the client's advertised capabilities at construction time so
+    /// that callers can query them via [`AgentSession::capabilities`] without
+    /// needing access to the client directly.
     pub fn from_client(client: AcpClient, system_prompt: impl Into<String>) -> Self {
         let system_prompt = system_prompt.into();
+        let capabilities = build_capabilities(&client);
         Self {
             client: Some(client),
             pending_return: None,
             // An empty system prompt is treated as "no prelude" so we never send
             // a stray leading blank line.
             system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
+            capabilities,
         }
     }
 
@@ -404,6 +511,13 @@ impl AgentSession for AcpSession {
             // Already terminated — idempotent success.
             None => Ok(()),
         }
+    }
+
+    /// Return the capabilities snapshot taken from the ACP client at session
+    /// construction time (after `session/new`).  `None` if the agent did not
+    /// advertise any modes or config options.
+    fn capabilities(&self) -> Option<api::SessionCapabilities> {
+        self.capabilities.clone()
     }
 }
 
@@ -565,6 +679,9 @@ mod tests {
         let config = SessionConfig {
             working_dir: std::env::temp_dir(),
             system_prompt: "test".into(),
+            mode: None,
+            model: None,
+            effort: None,
             extra: None,
         };
         // The Ok variant (`Box<dyn AgentSession>`) is not Debug, so match rather
@@ -604,6 +721,7 @@ mod tests {
             client: None,
             pending_return: None,
             system_prompt: Some("SYS".to_string()),
+            capabilities: None,
         };
         assert_eq!(session.compose_first_turn("turn1".into()), "SYS\n\nturn1");
         // The prompt is consumed; later turns are verbatim.
@@ -616,6 +734,7 @@ mod tests {
             client: None,
             pending_return: None,
             system_prompt: None,
+            capabilities: None,
         };
         assert_eq!(session.compose_first_turn("hello".into()), "hello");
     }

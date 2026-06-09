@@ -50,6 +50,7 @@ use kameo::actor::ActorRef;
 
 use crate::api;
 use crate::backend::{AgentBackend, Prompt, ResponseEvent};
+use crate::config::RoleAssignment;
 use crate::roles::{Role, parse_review_verdict, session_config_for};
 use crate::task::Task;
 
@@ -84,6 +85,10 @@ pub struct Reviewer {
     ///
     /// Shared (`Arc`) with the Developer and the Supervisor's wiring.
     backend: Arc<dyn AgentBackend>,
+
+    /// The role assignment (provider, mode, model, effort) for the Reviewer.
+    /// Carried to `session_config_for` so the ACP backend applies the selections.
+    assignment: Option<RoleAssignment>,
 }
 
 /// Construction arguments for [`Reviewer`].
@@ -98,6 +103,13 @@ pub struct ReviewerArgs {
 
     /// The agent backend the Reviewer drives to produce a verdict.
     pub backend: Arc<dyn AgentBackend>,
+
+    /// The role assignment (provider, mode, model, effort) for the Reviewer.
+    ///
+    /// When `Some`, the defaults from the assignment (mode/model/effort) are
+    /// threaded into [`SessionConfig`] so the ACP backend can apply them after
+    /// `session/new`. When `None`, no selections are applied.
+    pub assignment: Option<RoleAssignment>,
 }
 
 impl kameo::actor::Actor for Reviewer {
@@ -108,6 +120,7 @@ impl kameo::actor::Actor for Reviewer {
         Ok(Reviewer {
             supervisor: args.supervisor,
             backend: args.backend,
+            assignment: args.assignment,
         })
     }
 }
@@ -153,8 +166,13 @@ impl kameo::message::Message<Review> for Reviewer {
         msg: Review,
         _ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 1. Build a reviewer session config rooted at the task's worktree.
-        let config = session_config_for(Role::Reviewer, msg.worktree.clone());
+        // 1. Build a reviewer session config rooted at the task's worktree,
+        //    carrying the role assignment (mode/model/effort) from `self.assignment`.
+        let config = session_config_for(
+            Role::Reviewer,
+            msg.worktree.clone(),
+            self.assignment.clone(),
+        );
 
         // 2. Spawn a session on the injected backend.
         let mut session = self
@@ -163,11 +181,22 @@ impl kameo::message::Message<Review> for Reviewer {
             .await
             .map_err(|e| format!("reviewer backend spawn failed: {e}"))?;
 
+        let task_id = api::TaskId(msg.task.id.0.clone());
+
+        // Surface discovered capabilities to the TUI (step 5 of task 0040).
+        if let Some(capabilities) = session.capabilities() {
+            (msg.sink)(api::Event::SessionCapabilities {
+                run: msg.run,
+                task: task_id.clone(),
+                role: api::AgentRole::Reviewer,
+                capabilities,
+            });
+        }
+
         // 3. Prompt for a structured review verdict.
         let prompt_text = build_review_prompt(&msg.task);
 
         // Publish the outgoing prompt as the Reviewer "user turn" (task 31).
-        let task_id = api::TaskId(msg.task.id.0.clone());
         (msg.sink)(api::Event::AgentExchange {
             run: msg.run,
             task: task_id.clone(),

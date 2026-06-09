@@ -29,6 +29,9 @@ pulldown-cmark = { version = "0.12", default-features = false }
 ansi-to-tui = "8"
 # JSON serialization for replay module (reading transcripts)
 serde_json = { workspace = true }
+# TOML serialization for writing provider/role config back to disk (task 0041)
+toml = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 # Temporary files/dirs for the file-browser IO + TUI↔CoreApi flow tests.

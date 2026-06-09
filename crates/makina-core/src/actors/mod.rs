@@ -213,6 +213,7 @@ mod tests {
             DeveloperArgs {
                 supervisor: supervisor_ref.clone(),
                 backend: Arc::clone(&backend),
+                assignment: None,
             },
             RestartConfig::default(),
         )
@@ -224,6 +225,7 @@ mod tests {
             ReviewerArgs {
                 supervisor: supervisor_ref.clone(),
                 backend: Arc::clone(&backend),
+                assignment: None,
             },
             RestartConfig::default(),
         )
@@ -393,6 +395,7 @@ mod tests {
             DeveloperArgs {
                 supervisor: supervisor_ref.clone(),
                 backend: Arc::clone(&backend),
+                assignment: None,
             },
             RestartConfig::default(),
         )

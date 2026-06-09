@@ -50,6 +50,9 @@
 //! let config = SessionConfig {
 //!     working_dir: PathBuf::from("/tmp"),
 //!     system_prompt: "test".into(),
+//!     mode: None,
+//!     model: None,
+//!     effort: None,
 //!     extra: None,
 //! };
 //!
@@ -304,6 +307,9 @@ mod tests {
         SessionConfig {
             working_dir: PathBuf::from("/tmp/noop-test"),
             system_prompt: "You are a noop agent.".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
             extra: None,
         }
     }
@@ -542,6 +548,9 @@ mod tests {
             let config = SessionConfig {
                 working_dir: PathBuf::from("/tmp/actor-test"),
                 system_prompt: "noop".to_string(),
+                mode: None,
+                model: None,
+                effort: None,
                 extra: None,
             };
             let mut session = self

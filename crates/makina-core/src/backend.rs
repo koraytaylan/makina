@@ -32,6 +32,8 @@ use async_trait::async_trait;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::api;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors that can originate from any backend operation.
@@ -84,6 +86,28 @@ pub struct SessionConfig {
     /// at spawn time (or equivalent) rather than repeated with every prompt.
     /// Implementers MUST pass it to the agent before the first user turn.
     pub system_prompt: String,
+
+    /// Optional default mode ID to apply to the session (via `session/set_mode` if supported).
+    ///
+    /// The backend should apply this mode after `session/new` if the agent advertises it
+    /// in its modes. Ignored if the agent does not support modes or does not advertise
+    /// the requested mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    /// Optional default model option value to apply to the session.
+    ///
+    /// The backend should apply this option after `session/new` if the agent advertises it
+    /// in its config options with category "model". Ignored if not advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Optional default effort (thought_level) option value to apply to the session.
+    ///
+    /// The backend should apply this option after `session/new` if the agent advertises it
+    /// in its config options with category "thought_level". Ignored if not advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 
     /// Optional backend-specific settings serialised as a TOML value.
     ///
@@ -292,6 +316,21 @@ pub trait AgentSession: Send {
     /// * Callers SHOULD call `terminate` even if a previous `prompt` returned
     ///   an error, to ensure resource cleanup.
     async fn terminate(&mut self) -> Result<(), BackendError>;
+
+    /// Return the capabilities (modes, config options) discovered during the
+    /// session handshake, if any.
+    ///
+    /// The default implementation returns `None`, which is correct for test
+    /// backends and any backend whose agent does not advertise capabilities.
+    /// ACP-backed sessions override this to surface the modes and config
+    /// options received in the `session/new` response.
+    ///
+    /// Callers (Developer/Reviewer handlers) invoke this immediately after
+    /// [`AgentBackend::spawn`] to emit an [`api::Event::SessionCapabilities`]
+    /// event to the TUI.
+    fn capabilities(&self) -> Option<api::SessionCapabilities> {
+        None
+    }
 }
 
 // ── Submodules ────────────────────────────────────────────────────────────────
@@ -368,6 +407,9 @@ mod tests {
         let config = SessionConfig {
             working_dir: PathBuf::from("/tmp/stub"),
             system_prompt: "You are a stub agent.".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
             extra: None,
         };
         let mut session: Box<dyn AgentSession> = backend.spawn(config).await.unwrap();
@@ -419,6 +461,9 @@ mod tests {
         let config = SessionConfig {
             working_dir: PathBuf::from("/tmp/stub"),
             system_prompt: "stub".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
             extra: None,
         };
         let mut session = backend.spawn(config).await.unwrap();
@@ -437,6 +482,9 @@ mod tests {
         let config = SessionConfig {
             working_dir: PathBuf::from("/repo/task-42"),
             system_prompt: "You are a developer.".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
             extra: None,
         };
         let serialised = toml::to_string(&config).expect("serialise config to TOML");

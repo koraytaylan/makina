@@ -44,6 +44,10 @@ pub const METHOD_INITIALIZE: &str = "initialize";
 pub const METHOD_SESSION_NEW: &str = "session/new";
 /// `session/prompt` — send one user turn (client → agent).
 pub const METHOD_SESSION_PROMPT: &str = "session/prompt";
+/// `session/set_mode` — change the agent's operating mode (client → agent).
+pub const METHOD_SESSION_SET_MODE: &str = "session/set_mode";
+/// `session/set_config_option` — set a configuration option (client → agent).
+pub const METHOD_SESSION_SET_CONFIG_OPTION: &str = "session/set_config_option";
 /// `session/update` — streamed turn update (agent → client notification).
 pub const METHOD_SESSION_UPDATE: &str = "session/update";
 /// `session/cancel` — cancel the in-flight turn (client → agent notification).
@@ -327,12 +331,76 @@ pub struct NewSessionParams {
     pub mcp_servers: Vec<serde_json::Value>,
 }
 
+/// A mode the agent can operate in (e.g., "code", "analyze", "explain").
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionMode {
+    /// The mode's stable identifier.
+    pub id: String,
+    /// Human-readable name of the mode.
+    pub name: String,
+    /// Optional description of what this mode does.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// The current mode and available modes for a session.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    /// The id of the mode currently active.
+    pub current_mode_id: String,
+    /// All modes the agent supports.
+    pub available_modes: Vec<SessionMode>,
+}
+
+/// A choice for a config option (e.g., a model variant).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigOptionChoice {
+    /// The stable value identifier for this choice.
+    pub value: String,
+    /// Human-readable name of the choice.
+    pub name: String,
+    /// Optional description of what this choice does.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A configuration option the agent supports (e.g., model, reasoning effort).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOption {
+    /// The stable identifier of this option.
+    pub id: String,
+    /// Human-readable name of the option.
+    pub name: String,
+    /// The category of this option (e.g., "model", "thought_level", "model_config").
+    pub category: String,
+    /// The type of this option (e.g., "select", "boolean").
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The current value of this option (if set).
+    #[serde(default)]
+    pub current_value: Option<serde_json::Value>,
+    /// Available choices for this option (if it's a select type).
+    #[serde(default)]
+    pub options: Vec<ConfigOptionChoice>,
+    /// Extra/unknown fields to preserve forward compatibility.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
 /// `session/new` result (agent → client).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionResult {
     /// The opaque session identifier the agent assigned.
     pub session_id: String,
+    /// Optional mode state (if the agent advertises modes).
+    #[serde(default)]
+    pub modes: Option<SessionModeState>,
+    /// Optional config options the agent advertises (model, effort, etc).
+    #[serde(default)]
+    pub config_options: Vec<ConfigOption>,
 }
 
 /// `session/prompt` params (client → agent).
@@ -360,6 +428,28 @@ pub struct PromptResult {
 pub struct CancelParams {
     /// Session whose in-flight turn should be cancelled.
     pub session_id: String,
+}
+
+/// `session/set_mode` params (client → agent request).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModeParams {
+    /// The session to change the mode for.
+    pub session_id: String,
+    /// The mode id to switch to.
+    pub mode_id: String,
+}
+
+/// `session/set_config_option` params (client → agent request).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConfigOptionParams {
+    /// The session this option applies to.
+    pub session_id: String,
+    /// The option id to set.
+    pub option_id: String,
+    /// The new value for this option.
+    pub value: serde_json::Value,
 }
 
 /// Reason an agent stopped a prompt turn.
@@ -435,7 +525,7 @@ pub struct SessionNotificationParams {
 /// (`#[serde(tag = "sessionUpdate", rename_all = "snake_case")]`). Each text
 /// chunk variant wraps a flattened [`ContentChunk`]; tool-call lifecycle updates
 /// wrap [`ToolCall`] / [`ToolCallUpdate`]. Remaining update kinds Makina does not
-/// consume (plans, mode changes, …) collapse into [`SessionUpdate::Other`].
+/// consume (plans, …) collapse into [`SessionUpdate::Other`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub enum SessionUpdate {
@@ -450,7 +540,14 @@ pub enum SessionUpdate {
     ToolCall(ToolCall),
     /// Incremental status/result update for a previously-announced tool call.
     ToolCallUpdate(ToolCallUpdate),
-    /// Any other update kind (plan, mode change, …) — ignored.
+    /// The agent changed to a different mode.
+    #[serde(rename = "current_mode_update")]
+    CurrentModeUpdate {
+        /// The new current mode id.
+        #[serde(rename = "currentModeId")]
+        current_mode_id: String,
+    },
+    /// Any other update kind (plan, …) — ignored.
     #[serde(other)]
     Other,
 }
@@ -957,5 +1054,198 @@ mod tests {
         assert_eq!(v["id"], 42);
         assert_eq!(v["result"]["outcome"]["outcome"], "selected");
         assert_eq!(v["result"]["outcome"]["optionId"], "allow");
+    }
+
+    #[test]
+    fn session_new_parses_modes() {
+        // A session/new result with modes → NewSessionResult.modes is Some with
+        // 2 available_modes.
+        let v = serde_json::json!({
+            "sessionId": "sess-with-modes",
+            "modes": {
+                "currentModeId": "code",
+                "availableModes": [
+                    {
+                        "id": "code",
+                        "name": "Code Mode",
+                        "description": "Write and debug code"
+                    },
+                    {
+                        "id": "analyze",
+                        "name": "Analyze Mode",
+                        "description": "Analyze existing code"
+                    }
+                ]
+            }
+        });
+        let result: NewSessionResult = serde_json::from_value(v).unwrap();
+        assert_eq!(result.session_id, "sess-with-modes");
+        assert!(result.modes.is_some());
+        let modes = result.modes.unwrap();
+        assert_eq!(modes.current_mode_id, "code");
+        assert_eq!(modes.available_modes.len(), 2);
+        assert_eq!(modes.available_modes[0].id, "code");
+        assert_eq!(modes.available_modes[0].name, "Code Mode");
+        assert_eq!(
+            modes.available_modes[0].description.as_deref(),
+            Some("Write and debug code")
+        );
+        assert_eq!(modes.available_modes[1].id, "analyze");
+    }
+
+    #[test]
+    fn set_mode_serializes() {
+        // SetModeParams → {"sessionId":…,"modeId":…}
+        let params = SetModeParams {
+            session_id: "sess-123".into(),
+            mode_id: "analyze".into(),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v["sessionId"], "sess-123");
+        assert_eq!(v["modeId"], "analyze");
+    }
+
+    #[test]
+    fn current_mode_update_is_not_other() {
+        // A current_mode_update notification parses to CurrentModeUpdate, not
+        // Other.
+        let v = serde_json::json!({
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": "analyze"
+            }
+        });
+        let n: SessionNotificationParams = serde_json::from_value(v).unwrap();
+        assert_eq!(n.session_id, "sess-1");
+        match n.update {
+            SessionUpdate::CurrentModeUpdate { current_mode_id } => {
+                assert_eq!(current_mode_id, "analyze");
+            }
+            other => panic!(
+                "expected CurrentModeUpdate, got {other:?}; the serde rename may be incorrect"
+            ),
+        }
+    }
+
+    #[test]
+    fn session_new_parses_config_options_and_preserves_unknown() {
+        // A session/new result with config options including unknown categories
+        // should parse successfully and preserve unknown fields.
+        let v = serde_json::json!({
+            "sessionId": "sess-with-options",
+            "configOptions": [
+                {
+                    "id": "model_opt_1",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "grok-1",
+                    "options": [
+                        {
+                            "value": "grok-1",
+                            "name": "Grok 1",
+                            "description": "Older model"
+                        },
+                        {
+                            "value": "grok-2",
+                            "name": "Grok 2",
+                            "description": "Newer model"
+                        }
+                    ]
+                },
+                {
+                    "id": "effort_opt_1",
+                    "name": "Reasoning Effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "medium",
+                    "options": [
+                        {
+                            "value": "low",
+                            "name": "Low"
+                        },
+                        {
+                            "value": "medium",
+                            "name": "Medium"
+                        },
+                        {
+                            "value": "high",
+                            "name": "High"
+                        }
+                    ]
+                },
+                {
+                    "id": "unknown_opt",
+                    "name": "Future Option",
+                    "category": "unknown_category",
+                    "type": "select",
+                    "currentValue": "value1",
+                    "futureField": "preserved"
+                }
+            ]
+        });
+        let result: NewSessionResult = serde_json::from_value(v).unwrap();
+        assert_eq!(result.session_id, "sess-with-options");
+        assert_eq!(result.config_options.len(), 3);
+
+        // Check first option (model)
+        assert_eq!(result.config_options[0].id, "model_opt_1");
+        assert_eq!(result.config_options[0].name, "Model");
+        assert_eq!(result.config_options[0].category, "model");
+        assert_eq!(result.config_options[0].kind, "select");
+        assert_eq!(
+            result.config_options[0]
+                .current_value
+                .as_ref()
+                .and_then(|v| v.as_str()),
+            Some("grok-1")
+        );
+        assert_eq!(result.config_options[0].options.len(), 2);
+        assert_eq!(result.config_options[0].options[0].value, "grok-1");
+        assert_eq!(result.config_options[0].options[0].name, "Grok 1");
+
+        // Check second option (effort)
+        assert_eq!(result.config_options[1].category, "thought_level");
+        assert_eq!(result.config_options[1].options.len(), 3);
+
+        // Check that unknown category is preserved
+        assert_eq!(result.config_options[2].category, "unknown_category");
+        assert!(
+            result.config_options[2].extra.contains_key("futureField"),
+            "unknown fields must be preserved in extra"
+        );
+        assert_eq!(
+            result.config_options[2]
+                .extra
+                .get("futureField")
+                .and_then(|v| v.as_str()),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn set_config_option_serializes() {
+        // SetConfigOptionParams should serialize to the correct JSON-RPC shape.
+        let params = SetConfigOptionParams {
+            session_id: "sess-456".into(),
+            option_id: "model_opt_1".into(),
+            value: serde_json::json!("grok-2"),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v["sessionId"], "sess-456");
+        assert_eq!(v["optionId"], "model_opt_1");
+        assert_eq!(v["value"], "grok-2");
+
+        // Test with a non-string value
+        let params2 = SetConfigOptionParams {
+            session_id: "sess-789".into(),
+            option_id: "effort_opt_1".into(),
+            value: serde_json::json!(42),
+        };
+        let v2 = serde_json::to_value(&params2).unwrap();
+        assert_eq!(v2["sessionId"], "sess-789");
+        assert_eq!(v2["optionId"], "effort_opt_1");
+        assert_eq!(v2["value"], 42);
     }
 }

@@ -725,6 +725,9 @@ impl TaskListInterpreter for ModelInterpreter {
         let config = SessionConfig {
             working_dir: self.working_dir.clone(),
             system_prompt: self.system_prompt.clone(),
+            mode: None,
+            model: None,
+            effort: None,
             extra: None,
         };
         let mut session = self.backend.spawn(config).await?;

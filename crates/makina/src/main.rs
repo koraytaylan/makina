@@ -18,6 +18,7 @@
 //! CI cannot drive an interactive terminal; the test suite uses `ratatui::TestBackend`
 //! for rendering tests and unit-tests for update logic.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use makina::{app, event, exit, log, tui};
@@ -89,13 +90,75 @@ async fn main() {
         log_rx
     };
 
-    let backend: Arc<dyn AgentBackend> =
+    // ── Build one backend per declared provider ───────────────────────────────
+    // Build a name → Arc<dyn AgentBackend> map from config.providers.
+    // The shared audit sink is the same Arc injected into every backend so all
+    // permission decisions are routed through the same JSONL ledger.
+    let mut provider_backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
+    for provider in &config.providers {
+        let mut backend =
+            AcpBackend::new(provider.command.clone(), provider.args.clone()).with_audit_sink(
+                Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>,
+            );
+        for (key, value) in &provider.env {
+            backend = backend.env(key.clone(), value.clone());
+        }
+        provider_backends.insert(provider.name.clone(), Arc::new(backend));
+    }
+
+    /// Resolve the backend for a role from the provider map.
+    ///
+    /// Looks up the role's assignment provider name, falling back to "default"
+    /// or the first configured provider, and finally to the legacy `[backend]`
+    /// field for configs that predate named providers.
+    fn resolve_role_backend(
+        provider_name_opt: Option<&str>,
+        provider_backends: &HashMap<String, Arc<dyn AgentBackend>>,
+        first_provider_name: Option<&str>,
+        legacy_backend: Arc<dyn AgentBackend>,
+    ) -> Arc<dyn AgentBackend> {
+        let name = provider_name_opt
+            .or(first_provider_name)
+            .unwrap_or("default");
+        provider_backends
+            .get(name)
+            .cloned()
+            .unwrap_or(legacy_backend)
+    }
+
+    // Build the legacy fallback backend (used only when no providers are configured).
+    let legacy_backend: Arc<dyn AgentBackend> =
         Arc::new(
             AcpBackend::new(config.backend.command.clone(), config.backend.args.clone())
                 .with_audit_sink(
                     Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>
                 ),
         );
+
+    let first_provider_name = config.providers.first().map(|p| p.name.as_str());
+
+    let developer_backend: Arc<dyn AgentBackend> = resolve_role_backend(
+        config.roles.developer.as_ref().map(|a| a.provider.as_str()),
+        &provider_backends,
+        first_provider_name,
+        Arc::clone(&legacy_backend),
+    );
+
+    let reviewer_backend: Arc<dyn AgentBackend> = resolve_role_backend(
+        config.roles.reviewer.as_ref().map(|a| a.provider.as_str()),
+        &provider_backends,
+        first_provider_name,
+        Arc::clone(&legacy_backend),
+    );
+
+    // The developer backend is also used for the planner (one-shot-agent path)
+    // when no planner assignment is configured.
+    let backend: Arc<dyn AgentBackend> = resolve_role_backend(
+        config.roles.planner.as_ref().map(|a| a.provider.as_str()),
+        &provider_backends,
+        first_provider_name,
+        Arc::clone(&legacy_backend),
+    );
     let worktree_manager = WorktreeManager::new(repo_root.clone(), config.base_branch.clone());
 
     // ── Api ───────────────────────────────────────────────────────────────────
@@ -141,7 +204,8 @@ async fn main() {
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
         ingestion_interpreter,
         planner_interpreter,
-        backend,
+        developer_backend,
+        reviewer_backend,
         worktree_manager,
         config,
         audit_sink as Arc<dyn makina_core::audit::AuditRegistry>,

@@ -132,7 +132,8 @@ async fn build_actor_tree(
         .ask(SetSpokes {
             root: root.clone(),
             supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
+            developer_backend: Arc::clone(&backend),
+            reviewer_backend: Arc::clone(&backend),
         })
         .send()
         .await

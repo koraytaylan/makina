@@ -119,12 +119,13 @@ pub async fn run(
 
     loop {
         let browsing = app.is_browsing();
+        let editing_providers = app.is_editing_providers();
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
             biased;
 
             maybe_term = term_rx.recv() => {
-                maybe_term.map(|ev| translate_terminal_event(ev, browsing))
+                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers))
             }
 
             maybe_api = api_stream.next() => {
@@ -270,8 +271,72 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
             AppEvent::Tick,
             run_control(app, ControlKind::Reinterpret).await,
         ),
+        // ── Provider configuration editor commit (task 0041) ──────────────────
+        // Write the editor's current providers + roles back to the project config
+        // file (`{repo_root}/.makina/config.toml`).  Best-effort: on IO/serialise
+        // error push an error-pane message rather than crashing.  The actual state
+        // update (closing the editor, updating app.providers/roles) is handled by
+        // App::update after this returns.
+        AppEvent::ProviderEditorCommit => {
+            let status = commit_provider_config(app).await;
+            (AppEvent::ProviderEditorCommit, status)
+        }
         // Everything else passes straight through.
         other => (other, None),
+    }
+}
+
+/// Write the provider/role configuration from the editor back to
+/// `{repo_root}/.makina/config.toml`, best-effort.
+///
+/// Returns `Some(msg)` with a success/error description (surfaced in the status
+/// bar), or `None` if there is no active editor to commit.
+async fn commit_provider_config(app: &App) -> Option<String> {
+    use makina_core::config::GlobalConfig;
+    use makina_core::paths::config_file;
+
+    let editor = app.provider_editor.as_ref()?;
+
+    // Read the current on-disk config (if any) so we don't lose fields we
+    // don't manage (e.g. gates, caps, base_branch).  On read failure start
+    // from a default so we can still write back the providers/roles.
+    let config_path = config_file(&app.repo_root);
+    let existing_global: GlobalConfig = if config_path.exists() {
+        match tokio::fs::read_to_string(&config_path).await {
+            Ok(s) => toml::from_str::<GlobalConfig>(&s).unwrap_or_default(),
+            Err(_) => GlobalConfig::default(),
+        }
+    } else {
+        GlobalConfig::default()
+    };
+
+    // Build the updated global config: preserve all existing fields but
+    // replace providers and roles with the editor's current state.
+    let updated = GlobalConfig {
+        providers: editor.providers.clone(),
+        roles: editor.roles.clone(),
+        ..existing_global
+    };
+
+    // Serialise to TOML.
+    let toml_str = match toml::to_string_pretty(&updated) {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(format!("Config serialise error: {e}"));
+        }
+    };
+
+    // Ensure the parent directory exists.
+    if let Some(parent) = config_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return Some(format!("Config write error: {e}"));
+    }
+
+    // Write the file.
+    match tokio::fs::write(&config_path, toml_str).await {
+        Ok(()) => Some("Config saved".to_string()),
+        Err(e) => Some(format!("Config write error: {e}")),
     }
 }
 
@@ -364,12 +429,17 @@ async fn read_dir_event(dir: &std::path::Path) -> AppEvent {
 ///
 /// `browsing` selects the keymap: the modal file browser (task 28) captures
 /// navigation keys (Enter / Backspace / Esc) differently from the normal view.
+/// Similarly, `editing_providers` activates the provider editor keymap.
 ///
 /// Returns [`AppEvent::Tick`] for events the TUI doesn't handle (e.g. mouse
 /// events); those simply trigger a harmless redraw.
-fn translate_terminal_event(ev: CrosstermEvent, browsing: bool) -> AppEvent {
+fn translate_terminal_event(
+    ev: CrosstermEvent,
+    browsing: bool,
+    editing_providers: bool,
+) -> AppEvent {
     match ev {
-        CrosstermEvent::Key(key) => translate_key(key, browsing),
+        CrosstermEvent::Key(key) => translate_key(key, browsing, editing_providers),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
         // `browsing` flag (the exchange pane is not the browser).  Other mouse
@@ -385,7 +455,11 @@ fn translate_terminal_event(ev: CrosstermEvent, browsing: bool) -> AppEvent {
 }
 
 /// Translate a key press into an [`AppEvent`], honouring the current view mode.
-fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
+fn translate_key(
+    key: crossterm::event::KeyEvent,
+    browsing: bool,
+    editing_providers: bool,
+) -> AppEvent {
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
     if key.kind != KeyEventKind::Press {
@@ -409,6 +483,16 @@ fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
             KeyCode::Down | KeyCode::Char('j') => AppEvent::BrowserDown,
             _ => AppEvent::Tick,
         }
+    } else if editing_providers {
+        // ── Provider editor keymap ────────────────────────────────────────────
+        // Esc closes the editor; Enter commits; j/k/arrows navigate.
+        match key.code {
+            KeyCode::Esc => AppEvent::CloseProviderEditor,
+            KeyCode::Enter => AppEvent::ProviderEditorCommit,
+            KeyCode::Up | KeyCode::Char('k') => AppEvent::ProviderEditorUp,
+            KeyCode::Down | KeyCode::Char('j') => AppEvent::ProviderEditorDown,
+            _ => AppEvent::Tick,
+        }
     } else {
         // ── Normal keymap ────────────────────────────────────────────────────
         match key.code {
@@ -421,6 +505,8 @@ fn translate_key(key: crossterm::event::KeyEvent, browsing: bool) -> AppEvent {
             KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
             // Open the file browser to pick a task list.
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
+            // Open the provider/role configuration editor.
+            KeyCode::Char('g') | KeyCode::Char('G') => AppEvent::OpenProviderEditor,
             // ── Run control (task 31): act on the selected Run ────────────────
             // s = Start/resume, p = Pause, c = Cancel.  These are intents; the IO
             // layer resolves them into the async `api.execute(...)` call.
@@ -471,11 +557,11 @@ mod tests {
         // Wheel events route to the exchange-pane scroll helpers regardless of
         // the `browsing` flag (the exchange pane is not the browser).
         assert!(matches!(
-            translate_terminal_event(wheel(MouseEventKind::ScrollUp), false),
+            translate_terminal_event(wheel(MouseEventKind::ScrollUp), false, false),
             AppEvent::ScrollUp
         ));
         assert!(matches!(
-            translate_terminal_event(wheel(MouseEventKind::ScrollDown), false),
+            translate_terminal_event(wheel(MouseEventKind::ScrollDown), false, false),
             AppEvent::ScrollDown
         ));
     }
@@ -484,7 +570,7 @@ mod tests {
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::Quit
         ));
     }
@@ -493,7 +579,7 @@ mod tests {
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::Quit
         ));
     }
@@ -502,7 +588,7 @@ mod tests {
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::Quit
         ));
     }
@@ -511,7 +597,7 @@ mod tests {
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::FocusNext
         ));
     }
@@ -519,7 +605,11 @@ mod tests {
     #[test]
     fn v_translates_to_cycle_dependency_view() {
         assert!(matches!(
-            translate_terminal_event(key_press(KeyCode::Char('v'), KeyModifiers::NONE), false),
+            translate_terminal_event(
+                key_press(KeyCode::Char('v'), KeyModifiers::NONE),
+                false,
+                false
+            ),
             AppEvent::CycleDependencyView
         ));
     }
@@ -527,7 +617,11 @@ mod tests {
     #[test]
     fn e_key_translates_to_toggle_error_pane() {
         assert!(matches!(
-            translate_terminal_event(key_press(KeyCode::Char('e'), KeyModifiers::NONE), false),
+            translate_terminal_event(
+                key_press(KeyCode::Char('e'), KeyModifiers::NONE),
+                false,
+                false
+            ),
             AppEvent::ToggleErrorPane
         ));
     }
@@ -535,7 +629,11 @@ mod tests {
     #[test]
     fn r_key_translates_to_reinterpret() {
         assert!(matches!(
-            translate_terminal_event(key_press(KeyCode::Char('r'), KeyModifiers::NONE), false),
+            translate_terminal_event(
+                key_press(KeyCode::Char('r'), KeyModifiers::NONE),
+                false,
+                false
+            ),
             AppEvent::Reinterpret
         ));
     }
@@ -551,7 +649,7 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::Tick
         ));
     }
@@ -560,7 +658,7 @@ mod tests {
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -569,7 +667,7 @@ mod tests {
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::SelectUp
         ));
     }
@@ -578,7 +676,7 @@ mod tests {
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::SelectDown
         ));
     }
@@ -587,7 +685,7 @@ mod tests {
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::SelectUp
         ));
     }
@@ -596,7 +694,7 @@ mod tests {
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::SelectDown
         ));
     }
@@ -607,7 +705,7 @@ mod tests {
     fn o_key_opens_browser_in_normal_mode() {
         let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::OpenBrowser
         ));
     }
@@ -618,7 +716,7 @@ mod tests {
     fn s_key_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::StartRun
         ));
     }
@@ -627,7 +725,7 @@ mod tests {
     fn p_key_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::PauseRun
         ));
     }
@@ -637,7 +735,7 @@ mod tests {
         // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false),
+            translate_terminal_event(ev, false, false),
             AppEvent::CancelRun
         ));
     }
@@ -649,7 +747,7 @@ mod tests {
         for ch in ['s', 'p', 'c'] {
             let ev = key_press(KeyCode::Char(ch), KeyModifiers::NONE);
             assert!(
-                matches!(translate_terminal_event(ev, true), AppEvent::Tick),
+                matches!(translate_terminal_event(ev, true, false), AppEvent::Tick),
                 "'{ch}' must be inert in browser mode"
             );
         }
@@ -659,7 +757,7 @@ mod tests {
     fn enter_in_browser_activates_selection() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true),
+            translate_terminal_event(ev, true, false),
             AppEvent::BrowserActivate
         ));
     }
@@ -669,7 +767,7 @@ mod tests {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         // In browser mode, Esc must close the browser, NOT quit the app.
         assert!(matches!(
-            translate_terminal_event(ev, true),
+            translate_terminal_event(ev, true, false),
             AppEvent::CloseBrowser
         ));
     }
@@ -678,7 +776,7 @@ mod tests {
     fn backspace_in_browser_goes_to_parent() {
         let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true),
+            translate_terminal_event(ev, true, false),
             AppEvent::BrowserParent
         ));
     }
@@ -687,12 +785,12 @@ mod tests {
     fn jk_in_browser_navigate_browser_not_sidebar() {
         let down = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(down, true),
+            translate_terminal_event(down, true, false),
             AppEvent::BrowserDown
         ));
         let up = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(up, true),
+            translate_terminal_event(up, true, false),
             AppEvent::BrowserUp
         ));
     }
@@ -700,7 +798,10 @@ mod tests {
     #[test]
     fn ctrl_c_quits_even_in_browser_mode() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(matches!(translate_terminal_event(ev, true), AppEvent::Quit));
+        assert!(matches!(
+            translate_terminal_event(ev, true, false),
+            AppEvent::Quit
+        ));
     }
 
     #[test]
@@ -708,7 +809,10 @@ mod tests {
         // `q` is a normal-mode quit key; inside the browser it must not quit
         // (it falls through to Tick so the user can keep browsing).
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
-        assert!(matches!(translate_terminal_event(ev, true), AppEvent::Tick));
+        assert!(matches!(
+            translate_terminal_event(ev, true, false),
+            AppEvent::Tick
+        ));
     }
 
     /// Verify the full quit path: translate key → update App → should_quit.
@@ -721,7 +825,11 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
-        let ev = translate_terminal_event(key_press(KeyCode::Char('q'), KeyModifiers::NONE), false);
+        let ev = translate_terminal_event(
+            key_press(KeyCode::Char('q'), KeyModifiers::NONE),
+            false,
+            false,
+        );
         app.update(ev);
         assert!(app.should_quit);
     }
@@ -1217,6 +1325,103 @@ mod tests {
         );
     }
 
+    // ── Provider configuration editor commit (task 0041) ─────────────────────
+
+    /// Edit a provider assignment then commit → the temp `config.toml` round-trips
+    /// the change.  The test exercises the full IO path:
+    /// 1. Build an App with a provider-editor already open (providers + roles set).
+    /// 2. Call `resolve_io(ProviderEditorCommit)` → writes `{repo_root}/.makina/config.toml`.
+    /// 3. Read back the TOML and assert the providers/roles were persisted.
+    #[tokio::test]
+    async fn provider_editor_commit_writes_config() {
+        use crate::app::{App, AppEvent, Mode, ProviderEditor};
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::config::{ProviderConfig, RoleAssignment, RolesConfig};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo_root = tmp.path().to_path_buf();
+
+        let providers = vec![ProviderConfig {
+            name: "fast".into(),
+            command: "grok".into(),
+            args: vec!["agent".into()],
+            env: Default::default(),
+        }];
+        let roles = RolesConfig {
+            developer: Some(RoleAssignment {
+                provider: "fast".into(),
+                mode: Some("code".into()),
+                model: Some("grok-3".into()),
+                effort: Some("high".into()),
+            }),
+            ..Default::default()
+        };
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn makina_core::api::Api>,
+            vec![],
+            repo_root.clone(),
+        );
+        // Seed the editor (as if the user opened it and made edits).
+        app.provider_editor = Some(ProviderEditor {
+            providers: providers.clone(),
+            roles: roles.clone(),
+            available_modes: None,
+            available_config_options: vec![],
+            selected_provider: Some(0),
+            selection_index: 0,
+        });
+        app.mode = Mode::ProviderConfig;
+
+        // Run the IO layer commit.
+        let (resolved_event, status) = resolve_io(&app, AppEvent::ProviderEditorCommit).await;
+        assert!(
+            matches!(resolved_event, AppEvent::ProviderEditorCommit),
+            "commit must return ProviderEditorCommit for App::update to close the editor"
+        );
+        let msg = status.expect("commit must produce a status message");
+        assert!(
+            msg.contains("saved") || msg.contains("Config"),
+            "status must mention config write; got {msg:?}"
+        );
+
+        // The config file must have been written.
+        let config_path = repo_root.join(".makina").join("config.toml");
+        assert!(
+            config_path.exists(),
+            "config.toml must exist after commit; path: {}",
+            config_path.display()
+        );
+
+        // Round-trip: read back and parse.
+        let written = std::fs::read_to_string(&config_path).expect("read config");
+        let parsed: makina_core::config::GlobalConfig =
+            toml::from_str(&written).expect("config.toml must be valid TOML");
+
+        // Assert the providers were persisted.
+        assert_eq!(
+            parsed.providers.len(),
+            1,
+            "one provider must be written; got {}",
+            parsed.providers.len()
+        );
+        assert_eq!(parsed.providers[0].name, "fast");
+        assert_eq!(parsed.providers[0].command, "grok");
+
+        // Assert the role assignment was persisted.
+        let dev = parsed
+            .roles
+            .developer
+            .as_ref()
+            .expect("developer role must be written");
+        assert_eq!(dev.provider, "fast");
+        assert_eq!(dev.mode.as_deref(), Some("code"));
+        assert_eq!(dev.model.as_deref(), Some("grok-3"));
+        assert_eq!(dev.effort.as_deref(), Some("high"));
+    }
+
     /// Simulate the exact construction that main.rs performs for the api
     /// (using the same EdgeInferrer + StructuredTextInterpreter literals).
     /// Then create a CoreApi and assert that an OpenRun of a known-good sample
@@ -1265,6 +1470,13 @@ mod tests {
                 command: "echo".into(),
                 args: vec![],
             },
+            providers: vec![makina_core::config::ProviderConfig {
+                name: "default".into(),
+                command: "echo".into(),
+                args: vec![],
+                env: Default::default(),
+            }],
+            roles: makina_core::config::RolesConfig::default(),
             planner: makina_core::config::PlannerConfig::default(),
             gates: vec![],
             caps: makina_core::config::CapsConfig::default(),

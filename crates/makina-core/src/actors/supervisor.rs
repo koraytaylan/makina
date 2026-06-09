@@ -269,11 +269,18 @@ pub struct Supervisor {
     /// `ActorRef<Supervisor>` (the star-topology anchor).  `None` until wired.
     self_ref: Option<ActorRef<Supervisor>>,
 
-    /// The shared agent backend, injected post-spawn via [`SetSpokes`].
+    /// The agent backend for the Developer role, injected post-spawn via [`SetSpokes`].
     ///
-    /// Cloned (`Arc`) into every per-task Developer/Reviewer.  `None` until
-    /// wired.
-    backend: Option<Arc<dyn AgentBackend>>,
+    /// Resolved from `config.roles.developer.provider`; cloned (`Arc`) into every
+    /// per-task Developer actor.  `None` until wired.
+    developer_backend: Option<Arc<dyn AgentBackend>>,
+
+    /// The agent backend for the Reviewer role, injected post-spawn via [`SetSpokes`].
+    ///
+    /// Resolved from `config.roles.reviewer.provider`; cloned (`Arc`) into every
+    /// per-task Reviewer actor.  May point to the same Arc as `developer_backend`
+    /// when both roles share a provider.  `None` until wired.
+    reviewer_backend: Option<Arc<dyn AgentBackend>>,
 
     /// The resolved runtime configuration.
     ///
@@ -338,7 +345,8 @@ impl kameo::actor::Actor for Supervisor {
             worktree_manager: Some(args.worktree_manager),
             root: None,
             self_ref: None,
-            backend: None,
+            developer_backend: None,
+            reviewer_backend: None,
             config: args.config,
             gate_runner: GateRunner::new(),
             squash_merger,
@@ -429,8 +437,19 @@ struct DriverContext {
     /// Developer/Reviewer `Args`.
     supervisor: ActorRef<Supervisor>,
 
-    /// The shared agent backend, cloned into each per-task Developer/Reviewer.
-    backend: Arc<dyn AgentBackend>,
+    /// The agent backend for the Developer role.
+    ///
+    /// Resolved from `config.roles.developer.provider` at DriverContext construction
+    /// time and cloned into each per-task Developer actor.  May be the same Arc as
+    /// `reviewer_backend` when both roles use the same provider.
+    developer_backend: Arc<dyn AgentBackend>,
+
+    /// The agent backend for the Reviewer role.
+    ///
+    /// Resolved from `config.roles.reviewer.provider` at DriverContext construction
+    /// time and cloned into each per-task Reviewer actor.  Distinct from
+    /// `developer_backend` when the config assigns different providers to the roles.
+    reviewer_backend: Arc<dyn AgentBackend>,
 
     /// Per-run control + live-event sink (task 31).  Threaded into the scheduler
     /// (pause/cancel checks) and every [`task_driver`] (event emission +
@@ -581,8 +600,17 @@ pub struct SetSpokes {
     /// The hub's own ref, used as the star-topology anchor in each per-task
     /// Developer/Reviewer's `Args`.
     pub supervisor: ActorRef<Supervisor>,
-    /// The shared agent backend cloned into each per-task Developer/Reviewer.
-    pub backend: Arc<dyn AgentBackend>,
+    /// The agent backend for the Developer role.
+    ///
+    /// Resolved from `config.roles.developer.provider`; passed as
+    /// `DeveloperArgs.backend` for each per-task Developer actor.
+    pub developer_backend: Arc<dyn AgentBackend>,
+    /// The agent backend for the Reviewer role.
+    ///
+    /// Resolved from `config.roles.reviewer.provider`; passed as
+    /// `ReviewerArgs.backend` for each per-task Reviewer actor.  May be the same
+    /// Arc as `developer_backend` when both roles share a provider.
+    pub reviewer_backend: Arc<dyn AgentBackend>,
 }
 
 impl kameo::message::Message<SetSpokes> for Supervisor {
@@ -595,7 +623,8 @@ impl kameo::message::Message<SetSpokes> for Supervisor {
     ) -> Self::Reply {
         self.root = Some(msg.root);
         self.self_ref = Some(msg.supervisor);
-        self.backend = Some(msg.backend);
+        self.developer_backend = Some(msg.developer_backend);
+        self.reviewer_backend = Some(msg.reviewer_backend);
     }
 }
 
@@ -727,10 +756,14 @@ impl Supervisor {
             .self_ref
             .clone()
             .ok_or("supervisor has no self ref (call SetSpokes first)")?;
-        let backend = self
-            .backend
+        let developer_backend = self
+            .developer_backend
             .clone()
-            .ok_or("supervisor has no backend (call SetSpokes first)")?;
+            .ok_or("supervisor has no developer backend (call SetSpokes first)")?;
+        let reviewer_backend = self
+            .reviewer_backend
+            .clone()
+            .ok_or("supervisor has no reviewer backend (call SetSpokes first)")?;
 
         Ok(DriverContext {
             graph,
@@ -741,7 +774,8 @@ impl Supervisor {
             config: self.config.clone(),
             root,
             supervisor,
-            backend,
+            developer_backend,
+            reviewer_backend,
             control,
             audit_registry,
             run_slug,
@@ -796,7 +830,8 @@ pub async fn run_graph(
     graph: Arc<Mutex<TaskGraph>>,
     worktree_manager: WorktreeManager,
     config: Config,
-    backend: Arc<dyn AgentBackend>,
+    developer_backend: Arc<dyn AgentBackend>,
+    reviewer_backend: Arc<dyn AgentBackend>,
     control: RunControl,
     audit_registry: Arc<dyn AuditRegistry>,
     run_slug: String,
@@ -817,7 +852,8 @@ pub async fn run_graph(
         graph,
         worktree_manager,
         config,
-        backend,
+        developer_backend,
+        reviewer_backend,
         control,
         audit_registry,
         run_slug,
@@ -834,7 +870,8 @@ async fn run_graph_inner(
     graph: Arc<Mutex<TaskGraph>>,
     worktree_manager: WorktreeManager,
     config: Config,
-    backend: Arc<dyn AgentBackend>,
+    developer_backend: Arc<dyn AgentBackend>,
+    reviewer_backend: Arc<dyn AgentBackend>,
     control: RunControl,
     audit_registry: Arc<dyn AuditRegistry>,
     run_slug: String,
@@ -864,7 +901,8 @@ async fn run_graph_inner(
         .ask(SetSpokes {
             root: root.clone(),
             supervisor: supervisor_ref.clone(),
-            backend: Arc::clone(&backend),
+            developer_backend: Arc::clone(&developer_backend),
+            reviewer_backend: Arc::clone(&reviewer_backend),
         })
         .send()
         .await
@@ -899,7 +937,8 @@ async fn run_graph_inner(
         config: config.clone(),
         root: root.clone(),
         supervisor: supervisor_ref.clone(),
-        backend,
+        developer_backend,
+        reviewer_backend,
         control: control.clone(),
         audit_registry,
         run_slug,
@@ -1500,13 +1539,17 @@ impl Drop for DriverGuard {
 async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState, String> {
     // ── Spawn this task's OWN Developer + Reviewer (single Developer per task) ─
     //
-    // Supervised children of the RootSupervisor, sharing the hub ref (star
-    // anchor) and the shared backend Arc.  Torn down by the DriverGuard.
+    // Supervised children of the RootSupervisor, using the hub ref (star anchor)
+    // and the role-specific backend Arc.  Developer gets ctx.developer_backend;
+    // Reviewer gets ctx.reviewer_backend — they may be the same Arc when both
+    // roles share a provider, or distinct Arcs when configured separately.
+    // Torn down by the DriverGuard.
     let developer = RootSupervisor::spawn_child::<Developer>(
         &ctx.root,
         DeveloperArgs {
             supervisor: ctx.supervisor.clone(),
-            backend: Arc::clone(&ctx.backend),
+            backend: Arc::clone(&ctx.developer_backend),
+            assignment: ctx.config.roles.developer.clone(),
         },
         RestartConfig::default(),
     )
@@ -1515,7 +1558,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
         &ctx.root,
         ReviewerArgs {
             supervisor: ctx.supervisor.clone(),
-            backend: Arc::clone(&ctx.backend),
+            backend: Arc::clone(&ctx.reviewer_backend),
+            assignment: ctx.config.roles.reviewer.clone(),
         },
         RestartConfig::default(),
     )

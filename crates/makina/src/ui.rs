@@ -415,6 +415,15 @@ pub fn render(app: &App, frame: &mut Frame) {
     {
         render_file_browser(browser, frame, area);
     }
+
+    // ── Provider configuration editor overlay ──────────────────────────────────
+    // Drawn after the file browser so it sits on top when both might be open
+    // (task 0041).
+    if app.is_editing_providers()
+        && let Some(editor) = app.provider_editor.as_ref()
+    {
+        render_provider_editor(editor, frame, area);
+    }
 }
 
 // ── Exchange pane (task 30: prompt-answer-stream) ─────────────────────────────
@@ -1247,6 +1256,110 @@ fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame,
     frame.render_widget(footer, footer_area);
 }
 
+/// Render the provider configuration editor modal.
+fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame, area: Rect) {
+    // Centre a box ~85% wide / 85% tall.
+    let popup = centered_rect(85, 85, area);
+
+    // Clear the region first so the popup is opaque.
+    frame.render_widget(Clear, popup);
+
+    let title = " Configure Providers & Roles ";
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split the popup into list area + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let list_area = chunks[0];
+    let footer_area = chunks[1];
+
+    // Build the list of items: providers + roles
+    let mut items: Vec<ListItem> = vec![];
+
+    // Add providers section
+    for (idx, provider) in editor.providers.iter().enumerate() {
+        let style = if editor.selected_provider == Some(idx) {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let line = Line::from(vec![Span::styled(
+            format!("  Provider: {}", provider.name),
+            style,
+        )]);
+        items.push(ListItem::new(line));
+    }
+
+    // Add role assignments section
+    let roles_header = Line::from(vec![Span::styled(
+        "  Roles:",
+        Style::default().fg(Color::Magenta),
+    )]);
+    items.push(ListItem::new(roles_header));
+
+    // Helper: format a role assignment as "    {label}: {provider} ({model} · {effort})".
+    // The `name · effort` format is as requested by the spec (model shown with effort level).
+    let fmt_role = |label: &str, assignment: &makina_core::config::RoleAssignment| -> String {
+        let model_effort = match (&assignment.model, &assignment.effort) {
+            (Some(model), Some(effort)) => format!("{} · {}", model, effort),
+            (Some(model), None) => model.clone(),
+            (None, Some(effort)) => effort.clone(),
+            (None, None) => String::new(),
+        };
+        if model_effort.is_empty() {
+            format!("    {}: {}", label, assignment.provider)
+        } else {
+            format!("    {}: {} ({})", label, assignment.provider, model_effort)
+        }
+    };
+
+    for (label, assignment_opt) in [
+        ("Developer", &editor.roles.developer),
+        ("Reviewer", &editor.roles.reviewer),
+        ("Planner", &editor.roles.planner),
+    ] {
+        if let Some(assignment) = assignment_opt {
+            let detail = fmt_role(label, assignment);
+            items.push(ListItem::new(Line::from(vec![Span::styled(
+                detail,
+                Style::default().fg(Color::White),
+            )])));
+        }
+    }
+
+    let highlight_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let list = List::new(items)
+        .highlight_style(highlight_style)
+        .highlight_symbol("▶ ");
+
+    let mut state = ListState::default();
+    state.select(Some(editor.selection_index.min(editor.providers.len() + 3)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    // Footer with hints
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "[Enter] commit  [↑↓/jk] navigate  [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(footer, footer_area);
+}
+
 /// Compute a [`Rect`] centred within `area`, sized to `percent_x` × `percent_y`
 /// of it.  Used to position the modal file-browser popup.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1389,6 +1502,8 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::RunStatusChanged { .. } => "RunStatusChanged",
         Event::TaskStateChanged { .. } => "TaskStateChanged",
         Event::TaskIterationsUpdated { .. } => "TaskIterationsUpdated",
+        Event::SessionCapabilities { .. } => "SessionCapabilities",
+        Event::CurrentModeUpdate { .. } => "CurrentModeUpdate",
         Event::AgentExchange { .. } => "AgentExchange",
     }
 }
