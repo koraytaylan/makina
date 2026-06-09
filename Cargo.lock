@@ -860,6 +860,7 @@ dependencies = [
  "makina-core",
  "pulldown-cmark",
  "ratatui",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",

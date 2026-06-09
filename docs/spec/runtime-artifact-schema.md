@@ -225,3 +225,161 @@ The following are explicitly deferred and must not appear in the current artifac
 
 A canonical sample artifact is provided at
 [`docs/spec/examples/sample-run.tasks.json`](examples/sample-run.tasks.json).
+
+---
+
+# Exchange Transcript Schema — `.makina/runs/{run_uid}/{task_id}_transcript.jsonl`
+
+Version: 1.0
+Status: Normative
+
+## §T.1 Purpose
+
+The exchange transcript is the **authoritative record of all communications** between the orchestrator and agents (Developer, Reviewer) during a task's execution. It captures every prompt sent, response chunk received, thought emitted, tool call made, and turn completion event in the exact order they occurred.
+
+The transcript enables:
+- **Replaying** a finished run with 100% visual fidelity — opening a closed run in the TUI shows the same Exchange pane as it did live.
+- **Auditing** — inspecting the full decision chain that led to a task outcome.
+- **Analysis and debugging** — understanding why a task took a particular path.
+
+---
+
+## §T.2 File Location and Ownership
+
+| Property | Value |
+|----------|-------|
+| Path | `.makina/runs/{run_uid}/{task_id}_transcript.jsonl` inside the repository |
+| Naming | File stem equals the task id (e.g. `my-task_transcript.jsonl` for task id `"my-task"`). Extension is `.jsonl` (JSON Lines, one object per line). |
+| Committed | No — transcripts are ephemeral run artifacts, not version controlled. |
+| Writer | **Orchestrator only** — the `make_sink` function appends each `AgentExchange` event as it is emitted. |
+| Reader | TUI (replay module), audit tools, developers (direct file inspection). |
+
+The Orchestrator is the **sole writer**. Each `Event::AgentExchange` is appended as a single JSON line immediately upon emission, in order.
+
+---
+
+## §T.3 File Format: JSON Lines (JSONL)
+
+The transcript is stored as **JSON Lines**, one `ExchangeEvent` object per line:
+
+```jsonl
+{"type":"prompt_sent","text":"Implement the solo task"}
+{"type":"response_chunk","text":"I'll start by "}
+{"type":"response_chunk","text":"analyzing the requirements"}
+{"type":"turn_complete"}
+```
+
+**Serialization:**
+- Each line is a complete, standalone JSON object serialized with `serde_json::to_string`.
+- Objects use the `#[serde(tag = "type", rename_all = "snake_case")]` tagging scheme, so the `type` field is self-describing.
+- Every line is terminated with a newline (`\n`); empty lines are ignored by readers.
+
+**Deserialization:**
+- Each line parses independently via `serde_json::from_str::<ExchangeEvent>(line)`.
+- Malformed lines are skipped with a warning (best-effort); a single bad line does not corrupt the whole transcript.
+- No external context (schema version, role, task id) is needed — the `type` field fully qualifies the object.
+
+---
+
+## §T.4 ExchangeEvent Object Structure
+
+The `ExchangeEvent` enum (in `crates/makina-core/src/api.rs`) defines the event types. Each line is serialized as a tagged union with the `type` field indicating which variant it is.
+
+### §T.4.1 PromptSent
+
+```json
+{"type":"prompt_sent","text":"Implement the task"}
+```
+
+Emitted when the orchestrator sends a prompt to an agent (Developer or Reviewer).
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `type` | `"prompt_sent"` | Event type tag |
+| `text` | string | Full text of the prompt dispatched to the agent |
+
+### §T.4.2 ResponseChunk
+
+```json
+{"type":"response_chunk","text":"I'll "}
+{"type":"response_chunk","text":"start by "}
+```
+
+Emitted as the agent's response is streamed in segments. Chunks accumulate to form the full response.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `type` | `"response_chunk"` | Event type tag |
+| `text` | string | A fragment of the agent's response; never empty |
+
+### §T.4.3 ThoughtChunk
+
+```json
+{"type":"thought_chunk","text":"Let me understand "}
+```
+
+Emitted as the agent's internal reasoning is streamed in segments. Thoughts are observational only and do not contribute to the final response text.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `type` | `"thought_chunk"` | Event type tag |
+| `text` | string | A fragment of the agent's reasoning; never empty |
+
+### §T.4.4 ToolCall
+
+```json
+{"type":"tool_call","id":"bash_123","title":"run tests","kind":"execute","status":"pending"}
+```
+
+Emitted when an agent announces a tool invocation.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `type` | `"tool_call"` | Event type tag |
+| `id` | string | Stable identifier correlating this call with later updates |
+| `title` | string | Human-readable title (may be empty) |
+| `kind` | string \| null | Optional semantic kind (e.g. `"execute"`, `"edit"`) |
+| `status` | string | Lifecycle status (e.g. `"pending"`, `"running"`, `"completed"`) |
+
+### §T.4.5 ToolCallUpdate
+
+```json
+{"type":"tool_call_update","id":"bash_123","status":"running","title":null}
+```
+
+Emitted as an incremental status or title update for a previously-announced tool call.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `type` | `"tool_call_update"` | Event type tag |
+| `id` | string | The id of the `ToolCall` this updates |
+| `status` | string \| null | Updated lifecycle status (if the update carried one) |
+| `title` | string \| null | Updated title (if the update carried one) |
+
+### §T.4.6 TurnComplete
+
+```json
+{"type":"turn_complete"}
+```
+
+Emitted when the agent has finished its current response turn. Signals the end of a back-and-forth cycle; the next `PromptSent` begins a new turn.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `type` | `"turn_complete"` | Event type tag |
+
+---
+
+## §T.5 Ordering Guarantee
+
+Events are appended to the transcript **in the exact order they are emitted**, preserving causal order and response segmentation. Because plan 0009 segments responses into `ResponseChunk` and `ThoughtChunk` events, a reader can faithfully reconstruct the streaming experience by replaying events in order.
+
+**Invariant:** If event A's causal origin is event B, then A appears after B in the transcript.
+
+---
+
+## §T.6 Back-Compat and Versioning
+
+Currently, no schema version is stored in the transcript. If the `ExchangeEvent` enum changes, older transcripts must be read by a decoder that understands the old schema.
+
+Future enhancements may prepend a header line or embed a version in the first event. For now, the `ExchangeEvent` type definitions in `crates/makina-core/src/api.rs` are the single source of truth.

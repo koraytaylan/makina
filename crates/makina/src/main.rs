@@ -150,6 +150,7 @@ async fn main() {
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;
     let mut app = app::App::new(Arc::clone(&api), initial_runs, repo_root);
+    app.load_initial_exchanges();
 
     // ── Terminal lifecycle ────────────────────────────────────────────────────
     let mut tui = match tui::Tui::init() {

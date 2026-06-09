@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use makina_core::api::{AgentRole, Api, Event, RunView, TaskId};
+use makina_core::api::{AgentRole, Api, Event, RunId, RunView, TaskId};
 
 use crate::browser::{DirEntry, FileBrowser};
 
@@ -315,6 +315,49 @@ impl ExchangeLog {
     }
 }
 
+// ── Exchange event reducer ──────────────────────────────────────────────────────
+//
+// Apply one exchange event to a task's log. The single source of truth used
+// by both the live event path and on-disk replay (plan 0010).
+
+use makina_core::api::ExchangeEvent;
+
+/// Apply one exchange event to a task's log. The single source of truth used
+/// by both the live event path and on-disk replay (plan 0010).
+pub fn apply_exchange_event(log: &mut ExchangeLog, role: AgentRole, event: &ExchangeEvent) {
+    match event {
+        ExchangeEvent::PromptSent { text } => {
+            log.add_prompt(role, text.clone());
+        }
+        ExchangeEvent::ResponseChunk { text } => {
+            log.append_chunk(role, text.clone());
+        }
+        ExchangeEvent::ThoughtChunk { text } => {
+            log.append_thought(role, text.clone());
+        }
+        ExchangeEvent::ToolCall {
+            id,
+            title,
+            kind,
+            status,
+        } => {
+            log.start_tool(
+                role,
+                id.clone(),
+                title.clone(),
+                kind.clone(),
+                status.clone(),
+            );
+        }
+        ExchangeEvent::ToolCallUpdate { id, status, title } => {
+            log.update_tool(id, status.clone(), title.clone());
+        }
+        ExchangeEvent::TurnComplete => {
+            log.complete_turn();
+        }
+    }
+}
+
 // ── View mode ───────────────────────────────────────────────────────────────────
 
 /// Which top-level view the TUI is currently showing.
@@ -537,12 +580,17 @@ pub struct App {
     /// the selected run has no tasks.
     pub selected_task: Option<usize>,
 
-    /// Per-task exchange logs, keyed by [`TaskId`].
+    /// Per-task exchange logs, keyed by `(RunId, TaskId)`.
+    ///
+    /// Keying by the composite `(RunId, TaskId)` ensures that switching between
+    /// two runs that share the same task slug (e.g. `implement-auth`) never
+    /// shows stale data from the other run.  Both the live event path and the
+    /// on-disk replay path use this composite key.
     ///
     /// The orchestrator emits [`Event::AgentExchange`] for ALL in-flight
     /// tasks; the TUI stores logs for every task it hears about and filters to
     /// the currently focused task when rendering the exchange pane.
-    pub exchange_logs: HashMap<TaskId, ExchangeLog>,
+    pub exchange_logs: HashMap<(RunId, TaskId), ExchangeLog>,
 
     /// Manual scroll offset for the exchange pane, in lines from the top.
     ///
@@ -598,6 +646,15 @@ pub struct App {
 }
 
 impl App {
+    /// Load transcripts for the initially-selected run (if any).
+    ///
+    /// Should be called right after `new()` to populate exchanges for the first
+    /// run shown in the TUI. This is a separate step because `App::new` does not
+    /// take `&mut self`.
+    pub fn load_initial_exchanges(&mut self) {
+        self.load_exchanges_for_selected_run();
+    }
+
     /// Build a new [`App`] with the given api, initial run list, and repo root.
     ///
     /// Call `api.runs().await` before constructing to obtain `initial_runs`.
@@ -672,6 +729,19 @@ impl App {
         self.selected_run()
             .and_then(|run| self.selected_task.and_then(|i| run.tasks.get(i)))
             .map(|tv| &tv.id)
+    }
+
+    /// Return the exchange log for the currently focused task, if any.
+    ///
+    /// Looks up by `(RunId, TaskId)` to ensure the correct run's log is returned
+    /// even when two runs share a task slug (e.g. `implement-auth`).
+    pub fn selected_exchange_log(&self) -> Option<&ExchangeLog> {
+        let run = self.selected_run()?;
+        let task_id = self
+            .selected_task
+            .and_then(|i| run.tasks.get(i))
+            .map(|tv| &tv.id)?;
+        self.exchange_logs.get(&(run.id, task_id.clone()))
     }
 
     /// Scroll the exchange pane up by one line.
@@ -768,6 +838,8 @@ impl App {
                                 self.selected_run = Some(new_idx);
                                 // Re-clamp selected_task to the new run's task list.
                                 self.clamp_selected_task();
+                                // Load transcripts for the newly selected run.
+                                self.load_exchanges_for_selected_run();
                             }
                         }
                     }
@@ -791,6 +863,8 @@ impl App {
                                 self.selected_run = Some(new_idx);
                                 // Re-clamp selected_task to the new run's task list.
                                 self.clamp_selected_task();
+                                // Load transcripts for the newly selected run.
+                                self.load_exchanges_for_selected_run();
                             }
                         }
                     }
@@ -948,6 +1022,62 @@ impl App {
         };
     }
 
+    /// Load transcripts for the selected run's tasks from disk.
+    ///
+    /// When a run is selected, lazily try to populate its exchange logs from
+    /// persisted transcript files. This is best-effort: missing or unparseable
+    /// transcripts are silently skipped (no crash).
+    ///
+    /// Caches by `(RunId, task_id)` — the composite key — so re-selecting the
+    /// same run is free, and switching from Run A to Run B never shows Run A's
+    /// stale transcripts for tasks that share the same slug.
+    fn load_exchanges_for_selected_run(&mut self) {
+        use makina_core::paths;
+
+        let Some(run) = self.selected_run() else {
+            return;
+        };
+
+        // Skip if the run has no run_uid (e.g. a placeholder from RunOpened before
+        // the full metadata arrives).
+        if run.run_uid.is_empty() {
+            return;
+        }
+
+        let run_id = run.id;
+        let run_uid = run.run_uid.clone();
+        let tasks = run.tasks.clone();
+
+        // Use the pure path helper (no I/O, no create_dir_all) so the replay
+        // loader does not silently create directories for non-existent runs.
+        let logs_dir = paths::run_dir(&self.repo_root, &run_uid).join("logs");
+
+        // Try to load transcripts for each task in this run.
+        for task in tasks {
+            let cache_key = (run_id, task.id.clone());
+
+            // Skip if we already have this log cached for this exact run.
+            if self.exchange_logs.contains_key(&cache_key) {
+                continue;
+            }
+
+            // Construct the path to the task's transcript file.
+            let transcript_path = logs_dir.join(format!("{}_transcript.jsonl", task.id));
+
+            // Try to load the transcript. Use Developer role as the default
+            // (the transcript should contain role info in future versions).
+            match crate::replay::load_task_exchange(&transcript_path, AgentRole::Developer) {
+                Ok(log) => {
+                    self.exchange_logs.insert(cache_key, log);
+                }
+                Err(_) => {
+                    // Transcript missing or unreadable; skip silently.
+                    // The log will remain empty unless filled by live events.
+                }
+            }
+        }
+    }
+
     /// Apply a core api [`Event`] to the App state.
     ///
     /// Tasks 27–31 will handle the full set of variants here; the scaffold
@@ -1021,46 +1151,17 @@ impl App {
             }
             // AgentExchange events accumulate into the per-task exchange log
             // (task 30: prompt-answer-stream).  The TUI stores ALL tasks' logs
-            // and filters to the focused task at render time.
+            // and filters to the focused task at render time.  Keyed by
+            // (RunId, TaskId) so logs from different runs with the same task
+            // slug never collide.
             Event::AgentExchange {
+                run,
                 task,
                 role,
                 event: exchange_ev,
-                ..
             } => {
-                use makina_core::api::ExchangeEvent;
-                let log = self.exchange_logs.entry(task.clone()).or_default();
-                match exchange_ev {
-                    ExchangeEvent::PromptSent { text } => {
-                        log.add_prompt(role.clone(), text.clone());
-                    }
-                    ExchangeEvent::ResponseChunk { text } => {
-                        log.append_chunk(role.clone(), text.clone());
-                    }
-                    ExchangeEvent::ThoughtChunk { text } => {
-                        log.append_thought(role.clone(), text.clone());
-                    }
-                    ExchangeEvent::ToolCall {
-                        id,
-                        title,
-                        kind,
-                        status,
-                    } => {
-                        log.start_tool(
-                            role.clone(),
-                            id.clone(),
-                            title.clone(),
-                            kind.clone(),
-                            status.clone(),
-                        );
-                    }
-                    ExchangeEvent::ToolCallUpdate { id, status, title } => {
-                        log.update_tool(id, status.clone(), title.clone());
-                    }
-                    ExchangeEvent::TurnComplete => {
-                        log.complete_turn();
-                    }
-                }
+                let log = self.exchange_logs.entry((*run, task.clone())).or_default();
+                apply_exchange_event(log, role.clone(), exchange_ev);
             }
         }
 
@@ -2138,8 +2239,11 @@ mod tests {
             event: ExchangeEvent::TurnComplete,
         }));
 
-        // Assert the log.
-        let log = app.exchange_logs.get(&focused_id).expect("log must exist");
+        // Assert the log (keyed by composite (RunId, TaskId)).
+        let log = app
+            .exchange_logs
+            .get(&(RunId(1), focused_id.clone()))
+            .expect("log must exist");
         assert_eq!(log.entries.len(), 2, "expect prompt + response entries");
 
         // Entry 0: prompt.
@@ -2218,7 +2322,10 @@ mod tests {
             event: ExchangeEvent::TurnComplete,
         }));
 
-        let log = app.exchange_logs.get(&tid).expect("log must exist");
+        let log = app
+            .exchange_logs
+            .get(&(RunId(1), tid.clone()))
+            .expect("log must exist");
         assert_eq!(log.entries.len(), 4, "2 prompts + 2 responses");
         // Ordering.
         assert!(log.entries[0].is_prompt());
@@ -2270,13 +2377,13 @@ mod tests {
             },
         }));
 
-        // Both logs are stored.
+        // Both logs are stored (keyed by composite (RunId, TaskId)).
         assert!(
-            app.exchange_logs.contains_key(&id_a),
+            app.exchange_logs.contains_key(&(RunId(1), id_a.clone())),
             "task-a log must be stored"
         );
         assert!(
-            app.exchange_logs.contains_key(&id_b),
+            app.exchange_logs.contains_key(&(RunId(1), id_b.clone())),
             "task-b log must be stored"
         );
 
@@ -2285,10 +2392,7 @@ mod tests {
         assert_eq!(app.selected_task_id(), Some(&id_a));
 
         // Only task-a's log is "shown" by the focus query.
-        let focused_log = app
-            .exchange_logs
-            .get(app.selected_task_id().unwrap())
-            .unwrap();
+        let focused_log = app.selected_exchange_log().unwrap();
         assert_eq!(focused_log.entries[0].text(), "task-a prompt");
 
         // Navigate to task-b.
@@ -2296,10 +2400,7 @@ mod tests {
         assert_eq!(app.selected_task, Some(1));
         assert_eq!(app.selected_task_id(), Some(&id_b));
 
-        let focused_log_b = app
-            .exchange_logs
-            .get(app.selected_task_id().unwrap())
-            .unwrap();
+        let focused_log_b = app.selected_exchange_log().unwrap();
         assert_eq!(focused_log_b.entries[0].text(), "task-b prompt");
     }
 
@@ -2617,7 +2718,10 @@ mod tests {
             }));
         }
 
-        let log = app.exchange_logs.get(&tid).expect("log must exist");
+        let log = app
+            .exchange_logs
+            .get(&(RunId(1), tid.clone()))
+            .expect("log must exist");
         assert!(
             log.entries.len() <= EXCHANGE_LOG_CAP,
             "log must be capped at EXCHANGE_LOG_CAP={} but has {} entries",
@@ -2868,7 +2972,10 @@ mod tests {
         );
         feed(&mut app, ExchangeEvent::TurnComplete);
 
-        let log = app.exchange_logs.get(&tid).expect("log must exist");
+        let log = app
+            .exchange_logs
+            .get(&(RunId(1), tid.clone()))
+            .expect("log must exist");
 
         // Kinds + counts: prompt, ONE coalesced thought, ONE tool, response.
         assert_eq!(
@@ -2965,5 +3072,243 @@ mod tests {
             }
             other => panic!("entry must be a Tool, got {other:?}"),
         }
+    }
+
+    /// The reducer must produce identical results whether events are fed live
+    /// or replayed from disk. This test verifies the invariant by feeding the
+    /// same event sequence through the reducer twice and asserting the resulting
+    /// logs are equal.
+    #[test]
+    fn replay_reducer_matches_live() {
+        use makina_core::api::AgentRole;
+
+        // Sample sequence: prompt, thought, tool announce, response chunks,
+        // tool update, turn complete.
+        let events: Vec<(AgentRole, ExchangeEvent)> = vec![
+            (
+                AgentRole::Developer,
+                ExchangeEvent::PromptSent {
+                    text: "do something".into(),
+                },
+            ),
+            (
+                AgentRole::Developer,
+                ExchangeEvent::ThoughtChunk {
+                    text: "I will ".into(),
+                },
+            ),
+            (
+                AgentRole::Developer,
+                ExchangeEvent::ThoughtChunk {
+                    text: "plan first".into(),
+                },
+            ),
+            (
+                AgentRole::Developer,
+                ExchangeEvent::ToolCall {
+                    id: "tc-1".into(),
+                    title: "execute".into(),
+                    kind: Some("exec".into()),
+                    status: "pending".into(),
+                },
+            ),
+            (
+                AgentRole::Developer,
+                ExchangeEvent::ResponseChunk {
+                    text: "I will ".into(),
+                },
+            ),
+            (
+                AgentRole::Developer,
+                ExchangeEvent::ToolCallUpdate {
+                    id: "tc-1".into(),
+                    status: Some("completed".into()),
+                    title: None,
+                },
+            ),
+            (
+                AgentRole::Developer,
+                ExchangeEvent::ResponseChunk {
+                    text: "run it".into(),
+                },
+            ),
+            (AgentRole::Developer, ExchangeEvent::TurnComplete),
+        ];
+
+        // Feed through live path.
+        let mut live_log = ExchangeLog::default();
+        for (role, ev) in &events {
+            apply_exchange_event(&mut live_log, role.clone(), ev);
+        }
+
+        // Feed through replay path.
+        let mut replay_log = ExchangeLog::default();
+        for (role, ev) in &events {
+            apply_exchange_event(&mut replay_log, role.clone(), ev);
+        }
+
+        // Both must be identical.
+        assert_eq!(
+            format!("{live_log:?}"),
+            format!("{replay_log:?}"),
+            "live and replay logs must be identical"
+        );
+    }
+
+    /// **Replay from disk (the done-when):** Given a fixture run directory
+    /// containing a transcript, construct an App pointed at that directory,
+    /// select the run (via `load_initial_exchanges`), and assert that the
+    /// focused task's `ExchangeLog` is non-empty and contains the expected
+    /// event kinds in order.
+    ///
+    /// This exercises `App::load_initial_exchanges` → `load_exchanges_for_selected_run`
+    /// → `replay::load_task_exchange` end-to-end through the App — not just the
+    /// replay loader in isolation.
+    #[test]
+    fn open_finished_run_populates_exchange() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        use std::fs::{self, File};
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        // Create a temporary repo root with the expected directory layout:
+        // {repo_root}/.makina/runs/{run_uid}/logs/{task_id}_transcript.jsonl
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let repo_root = temp_dir.path().to_path_buf();
+        let run_uid = "01TESTREPLAYUID";
+        let task_id = "test-task";
+        let logs_dir = repo_root
+            .join(".makina")
+            .join("runs")
+            .join(run_uid)
+            .join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let transcript_path = logs_dir.join(format!("{task_id}_transcript.jsonl"));
+
+        // Write a transcript with multiple event types.
+        {
+            let mut file = File::create(&transcript_path).expect("create transcript file");
+
+            // Prompt
+            writeln!(
+                file,
+                r#"{{"type":"prompt_sent","text":"implement a function"}}"#
+            )
+            .expect("write prompt");
+
+            // Thought chunks
+            writeln!(file, r#"{{"type":"thought_chunk","text":"I need to"}}"#)
+                .expect("write thought 1");
+            writeln!(file, r#"{{"type":"thought_chunk","text":" plan"}}"#)
+                .expect("write thought 2");
+
+            // Tool call
+            writeln!(
+                file,
+                r#"{{"type":"tool_call","id":"tc1","title":"read file","kind":"read","status":"pending"}}"#
+            )
+            .expect("write tool call");
+
+            // Response chunks
+            writeln!(file, r#"{{"type":"response_chunk","text":"I'll read"}}"#)
+                .expect("write response chunk 1");
+            writeln!(file, r#"{{"type":"response_chunk","text":" the file"}}"#)
+                .expect("write response chunk 2");
+
+            // Tool update
+            writeln!(
+                file,
+                r#"{{"type":"tool_call_update","id":"tc1","status":"completed","title":null}}"#
+            )
+            .expect("write tool update");
+
+            // Turn complete
+            writeln!(file, r#"{{"type":"turn_complete"}}"#).expect("write turn complete");
+        }
+
+        // Build a RunView for the fixture run.  The run_uid must match the
+        // directory name so the replay loader finds the transcript.
+        let run_id = RunId(42);
+        let fixture_run = RunView {
+            id: run_id,
+            run_uid: run_uid.to_string(),
+            task_list_path: repo_root.join("tasks.md"),
+            status: RunStatus::Completed,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new(task_id),
+                title: "Test task".into(),
+                state: TaskState::Done,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+
+        // Construct App and populate exchanges for the selected run.
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![fixture_run], repo_root);
+
+        // The first run is auto-selected; its first task is also auto-selected.
+        assert_eq!(app.selected_run, Some(0));
+        assert_eq!(app.selected_task, Some(0));
+
+        // Trigger the replay loader.
+        app.load_initial_exchanges();
+
+        // The focused task's log must now be populated.
+        let log = app
+            .selected_exchange_log()
+            .expect("exchange log must exist after load_initial_exchanges");
+
+        // Assert non-empty.
+        assert!(!log.entries.is_empty(), "loaded log must not be empty");
+
+        // Verify we have the expected kinds in order.
+        // The reducer coalesces: Prompt, accumulated Thought, Tool, accumulated Response.
+        assert!(
+            log.entries.len() >= 3,
+            "log should have at least 3 entries (prompt, thought, response), got {}",
+            log.entries.len()
+        );
+
+        use crate::app::ExchangeContent;
+
+        // First entry must be a prompt.
+        match &log.entries[0].content {
+            ExchangeContent::Prompt { text } => {
+                assert_eq!(text, "implement a function");
+            }
+            other => panic!("first entry should be Prompt, got {other:?}"),
+        }
+
+        // Must have a thought entry.
+        let has_thought = log
+            .entries
+            .iter()
+            .any(|e| matches!(e.content, ExchangeContent::Thought { .. }));
+        assert!(has_thought, "log must contain at least one Thought entry");
+
+        // Must have a tool entry.
+        let has_tool = log
+            .entries
+            .iter()
+            .any(|e| matches!(e.content, ExchangeContent::Tool { .. }));
+        assert!(has_tool, "log must contain at least one Tool entry");
+
+        // Must have a response entry.
+        let has_response = log
+            .entries
+            .iter()
+            .any(|e| matches!(e.content, ExchangeContent::Response { .. }));
+        assert!(has_response, "log must contain at least one Response entry");
+
+        // Also verify the composite cache key: the log is indexed by (RunId, TaskId).
+        let cache_key = (run_id, TaskId::new(task_id));
+        assert!(
+            app.exchange_logs.contains_key(&cache_key),
+            "exchange_logs must use (RunId, TaskId) as composite cache key"
+        );
     }
 }

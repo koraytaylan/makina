@@ -89,7 +89,7 @@ use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::interpreter::TaskListInterpreter;
 use crate::paths;
-use crate::run_metadata::{RunMetadata, write_run_metadata};
+use crate::run_metadata::{RunMetadata, TaskSnapshot, load_disk_run_views, write_run_metadata};
 use crate::task::TaskGraph;
 use crate::worktree::WorktreeManager;
 
@@ -460,18 +460,33 @@ impl CoreState {
         if cancelled {
             return; // Cancel set the status explicitly; do not overwrite it.
         }
-        // Derive the terminal status from the live task states.
-        let status = {
+        // Derive the terminal status from the live task states and collect
+        // per-task snapshots for the persistent run record.
+        let (status, task_snapshots) = {
             let g = graph.lock().await;
             let all_done = g
                 .tasks
                 .iter()
                 .all(|t| t.state == crate::task::TaskState::Done);
-            if all_done {
+            let terminal_status = if all_done {
                 RunStatus::Completed
             } else {
                 RunStatus::Failed
-            }
+            };
+            // Capture per-task state at finalization time for the run snapshot.
+            let snapshots: Vec<TaskSnapshot> = g
+                .tasks
+                .iter()
+                .map(|t| TaskSnapshot {
+                    id: t.id.0.clone(),
+                    title: t.title.clone(),
+                    state: crate::api::TaskState::from(t.state),
+                    gate_iterations: t.gate_iterations,
+                    review_iterations: t.review_iterations,
+                    depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                })
+                .collect();
+            (terminal_status, snapshots)
         }; // graph guard dropped before re-taking the registry lock.
 
         {
@@ -488,11 +503,18 @@ impl CoreState {
             }
         } // registry guard dropped before the best-effort async write.
 
-        // Persist the run's identity + lifecycle window to `run.json`,
-        // best-effort.  A failure here must never propagate or abort the run —
-        // mirror the seed-persist warn-only pattern in `interpret_and_seed`.
+        // Persist the run's identity + lifecycle window + per-task snapshots
+        // to `run.json`, best-effort.  A failure here must never propagate or
+        // abort the run — mirror the seed-persist warn-only pattern.
         let started_at = started_at.unwrap_or_else(Utc::now);
-        let meta = RunMetadata::new(run_uid.clone(), run_slug, status, started_at, Utc::now());
+        let meta = RunMetadata::with_tasks(
+            run_uid.clone(),
+            run_slug,
+            status,
+            started_at,
+            Utc::now(),
+            task_snapshots,
+        );
         if let Err(e) = write_run_metadata(&meta, &self.worktree_manager.repo_root).await {
             tracing::warn!(run_uid = %run_uid, error = %e, "run.json write failed");
         }
@@ -1141,25 +1163,43 @@ impl Api for CoreApi {
         }
     }
 
-    /// Snapshot all open Runs in ascending `RunId` (insertion) order.
+    /// Snapshot all open Runs plus any finished runs loaded from disk that are
+    /// not present in the live registry.
+    ///
+    /// Live runs are returned in ascending [`RunId`] (insertion) order, followed
+    /// by disk-snapshot runs in ULID (chronological) order.  Disk runs are only
+    /// included when their `run_uid` is absent from the live registry — i.e. they
+    /// are finished, evicted runs that survive across process restarts.
     async fn runs(&self) -> Vec<RunView> {
         // Snapshot the (id, path, status, graph-handle) tuples under the registry
         // lock, drop the guard, THEN lock each graph to build its view — so the
         // registry lock is never held across the graph `.await`.
-        let entries: Vec<(
-            RunId,
-            String,
-            PathBuf,
-            RunStatus,
-            crate::ingestion::IngestionReport,
-            Arc<AsyncMutex<TaskGraph>>,
-        )> = {
+        let (entries, live_run_uids, mut disk_next_id): (
+            Vec<(
+                RunId,
+                String,
+                PathBuf,
+                RunStatus,
+                crate::ingestion::IngestionReport,
+                Arc<AsyncMutex<TaskGraph>>,
+            )>,
+            std::collections::HashSet<String>,
+            u64,
+        ) = {
             let runs = self
                 .state
                 .runs
                 .lock()
                 .expect("runs registry mutex poisoned");
-            runs.iter()
+            let live_uids: std::collections::HashSet<String> =
+                runs.values().map(|e| e.run_uid.clone()).collect();
+            // The next available id for disk-loaded views must not collide with any
+            // live id.  We peek at the current next_id counter (load Relaxed here —
+            // we only need an approximate upper bound; the disk views are session-only
+            // handles that never outlive this `runs()` call's snapshot).
+            let next = self.state.next_id.load(Ordering::Relaxed);
+            let entries = runs
+                .iter()
                 .map(|(id, entry)| {
                     (
                         RunId(*id),
@@ -1170,7 +1210,8 @@ impl Api for CoreApi {
                         Arc::clone(&entry.graph),
                     )
                 })
-                .collect()
+                .collect();
+            (entries, live_uids, next)
         }; // registry guard dropped before any graph await.
 
         let mut views = Vec::with_capacity(entries.len());
@@ -1186,6 +1227,15 @@ impl Api for CoreApi {
                 report,
             ));
         }
+
+        // Append finished runs loaded from disk (not in the live registry).
+        let disk_views = load_disk_run_views(
+            &self.state.worktree_manager.repo_root,
+            &live_run_uids,
+            &mut disk_next_id,
+        );
+        views.extend(disk_views);
+
         views
     }
 

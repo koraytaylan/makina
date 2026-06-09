@@ -10,7 +10,7 @@
 //!     → real Developer actor (forwards each ResponseEvent as an ExchangeEvent)
 //!       → real CoreApi event stream (Event::AgentExchange)
 //!         → real App::update(AppEvent::ApiEvent(..))  (the binary's path for AgentExchange)
-//!           → App::exchange_logs[task]  (ExchangeLog)
+//!           → App::exchange_logs[(RunId, task)]  (ExchangeLog)
 //! ```
 //!
 //! It deliberately drives the **production** `CoreApi` orchestrator (the same
@@ -191,9 +191,9 @@ async fn full_turn_with_thoughts_and_tools_surfaces_in_exchange_log() {
     let api: Arc<dyn Api> = Arc::new(CoreApi::new(interpreter, backend, wm, no_gate_config()));
 
     // ── 2. A real App consuming events the exact way the binary does ───────────
-    // No initial runs are seeded: AgentExchange handling keys the log by task id
-    // (`exchange_logs.entry(task).or_default()`), so the log is built purely from
-    // the live events flowing through the real stack.
+    // No initial runs are seeded: AgentExchange handling keys the log by the
+    // composite (RunId, TaskId) to prevent cross-run stale data; the log is
+    // built purely from the live events flowing through the real stack.
     let mut app = App::new(
         Arc::clone(&api),
         Vec::<RunView>::new(),
@@ -261,10 +261,12 @@ async fn full_turn_with_thoughts_and_tools_surfaces_in_exchange_log() {
     );
 
     // ── 5. Assert on the accumulated per-task exchange log ─────────────────────
+    // The log is keyed by (RunId, TaskId) — the composite key that prevents
+    // cross-run stale data when two runs share the same task slug.
     let log = app
         .exchange_logs
-        .get(&task_id)
-        .expect("the solo-task exchange log must exist");
+        .get(&(run, task_id.clone()))
+        .expect("the solo-task exchange log must exist (keyed by (RunId, TaskId))");
 
     // (a) The prompt entry is present (Developer role).
     let prompt = log

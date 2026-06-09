@@ -11,14 +11,45 @@
 //! it serializes with [`serde_json::to_string_pretty`], `create_dir_all`s the
 //! destination directory, and writes the file — all on Tokio's async filesystem
 //! API.
+//!
+//! ## Disk RunSnapshot
+//!
+//! [`load_disk_run_views`] scans `.makina/runs/` and returns a [`RunView`] for
+//! every finished run whose `run_uid` is **not** already present in the live
+//! registry.  This is the seam used by [`crate::orchestrator::CoreApi::runs`] to
+//! surface historical runs that have been evicted from memory.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::api::RunStatus;
+use crate::api::{IngestionReport, RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
 use crate::paths;
+
+/// A snapshot of a single task's state at run finalization.
+///
+/// Captured alongside [`RunMetadata`] to enable reconstruction of task
+/// list and states for a finished run without the live registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSnapshot {
+    /// Unique kebab-case identifier within the Run.
+    pub id: String,
+    /// Human-readable task title (taken verbatim from the task-list file).
+    pub title: String,
+    /// Final lifecycle state of the task at run completion.
+    pub state: TaskState,
+    /// Number of times this task cycled through the Developer → gate → failed-gate loop.
+    #[serde(default)]
+    pub gate_iterations: u32,
+    /// Number of times this task cycled through the Developer → Reviewer → changes-requested loop.
+    #[serde(default)]
+    pub review_iterations: u32,
+    /// IDs of tasks that must reach [`TaskState::Done`] before this task becomes ready.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
 
 /// A durable snapshot of a Run's identity and lifecycle window.
 ///
@@ -39,6 +70,10 @@ pub struct RunMetadata {
     started_at: DateTime<Utc>,
     /// When the run reached its terminal status.
     ended_at: DateTime<Utc>,
+    /// Per-task snapshots capturing final state and iteration counts.
+    /// Additive field: old `run.json` files without it still load with `#[serde(default)]`.
+    #[serde(default)]
+    tasks: Vec<TaskSnapshot>,
 }
 
 impl RunMetadata {
@@ -56,6 +91,26 @@ impl RunMetadata {
             status,
             started_at,
             ended_at,
+            tasks: Vec::new(),
+        }
+    }
+
+    /// Construct a [`RunMetadata`] record with per-task snapshots.
+    pub fn with_tasks(
+        run_uid: String,
+        run_slug: String,
+        status: RunStatus,
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
+        tasks: Vec<TaskSnapshot>,
+    ) -> Self {
+        Self {
+            run_uid,
+            run_slug,
+            status,
+            started_at,
+            ended_at,
+            tasks,
         }
     }
 
@@ -82,6 +137,11 @@ impl RunMetadata {
     /// When the run reached its terminal status.
     pub fn ended_at(&self) -> DateTime<Utc> {
         self.ended_at
+    }
+
+    /// Per-task snapshots captured at run finalization.
+    pub fn tasks(&self) -> &[TaskSnapshot] {
+        &self.tasks
     }
 }
 
@@ -111,6 +171,124 @@ pub async fn write_run_metadata(meta: &RunMetadata, repo_root: &Path) -> std::io
     tokio::fs::write(&dest, json.as_bytes()).await?;
 
     Ok(())
+}
+
+/// Attempt to read [`RunMetadata`] from `.makina/runs/{run_uid}/run.json`.
+///
+/// Returns `Ok(None)` if the file does not exist; propagates parse errors.
+pub fn read_run_metadata(repo_root: &Path, run_uid: &str) -> std::io::Result<Option<RunMetadata>> {
+    let path = paths::run_dir(repo_root, run_uid).join("run.json");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let meta = serde_json::from_str(&contents)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(Some(meta))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Build a [`RunView`] from a [`RunMetadata`] snapshot, assigning `id` as the
+/// session-scoped [`RunId`] and using `repo_root` to derive the `project` label.
+///
+/// Tasks are reconstructed from the embedded [`TaskSnapshot`] slice.  When the
+/// slice is empty (an old `run.json` pre-dating this change) the returned view
+/// has no tasks — callers may optionally fall back to the task-list artifact.
+/// The ingestion report is left empty (no issues) for disk-loaded snapshots
+/// because the original `IngestionReport` is not persisted.
+fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> RunView {
+    let project = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    let tasks: Vec<TaskView> = meta
+        .tasks()
+        .iter()
+        .map(|t| TaskView {
+            id: TaskId::new(t.id.clone()),
+            title: t.title.clone(),
+            state: t.state.clone(),
+            gate_iterations: t.gate_iterations,
+            review_iterations: t.review_iterations,
+            depends_on: t
+                .depends_on
+                .iter()
+                .map(|d| TaskId::new(d.clone()))
+                .collect(),
+        })
+        .collect();
+
+    // Reconstruct the task-list path from the run_slug stored in the metadata.
+    // For disk snapshots the original absolute path is not persisted; we use a
+    // `.tasks/{slug}.json` relative path as a best-effort label.
+    let task_list_path = std::path::PathBuf::from(format!(".tasks/{}.json", meta.run_slug()));
+
+    RunView {
+        id,
+        run_uid: meta.run_uid().to_string(),
+        task_list_path,
+        status: meta.status().clone(),
+        project,
+        tasks,
+        report: IngestionReport::default(),
+    }
+}
+
+/// Scan `.makina/runs/` and return one [`RunView`] per finished run whose
+/// `run_uid` is **not** in `live_run_uids`.
+///
+/// This is the disk-snapshot reader used by [`crate::orchestrator::CoreApi::runs`]
+/// to surface historical runs that have been evicted from the live registry
+/// (e.g. after process restart).
+///
+/// IDs for the returned views are assigned by incrementing `next_id` from its
+/// current value (same counter the live registry uses, passed in by the caller
+/// so all session-scoped IDs remain unique).
+///
+/// Non-existent runs directory and individual unreadable/unparseable `run.json`
+/// files are silently skipped (best-effort; the caller logs at `warn` level if
+/// desired).
+pub fn load_disk_run_views(
+    repo_root: &Path,
+    live_run_uids: &HashSet<String>,
+    next_id: &mut u64,
+) -> Vec<RunView> {
+    let runs_dir = repo_root.join(".makina").join("runs");
+    let dir_iter = match std::fs::read_dir(&runs_dir) {
+        Ok(iter) => iter,
+        Err(_) => return Vec::new(), // directory absent or unreadable — nothing to load
+    };
+
+    let mut views = Vec::new();
+    for entry in dir_iter.flatten() {
+        let run_uid = entry.file_name().to_string_lossy().to_string();
+        // Skip runs that are already tracked in the live registry.
+        if live_run_uids.contains(&run_uid) {
+            continue;
+        }
+        // Attempt to read run.json; skip on any error (best-effort).
+        match read_run_metadata(repo_root, &run_uid) {
+            Ok(Some(meta)) => {
+                let id = RunId(*next_id);
+                *next_id += 1;
+                views.push(run_view_from_metadata(id, &meta, repo_root));
+            }
+            Ok(None) => {
+                // run.json absent — directory may be a partial/corrupt run.
+                tracing::warn!(run_uid = %run_uid, "run directory has no run.json; skipping");
+            }
+            Err(e) => {
+                tracing::warn!(run_uid = %run_uid, error = %e, "failed to read run.json; skipping");
+            }
+        }
+    }
+
+    // Sort by run_uid (ULID lexicographic = chronological) so the list is stable.
+    views.sort_by(|a, b| a.run_uid.cmp(&b.run_uid));
+    views
 }
 
 #[cfg(test)]
@@ -166,5 +344,125 @@ mod tests {
         assert_eq!(loaded.status, meta.status, "status must survive");
         assert_eq!(loaded.started_at, started, "started_at must survive");
         assert_eq!(loaded.ended_at, ended, "ended_at must survive");
+    }
+
+    /// A fixture with only an old `run.json` (no `tasks` field) must be surfaced
+    /// by `load_disk_run_views` as a [`RunView`].  This verifies the back-compat
+    /// path: old run records (pre-`TaskSnapshot`) still appear in the run list
+    /// when the process restarts.
+    #[test]
+    fn old_run_json_without_snapshot_still_loads() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        let run_uid = "01ABCDEF0123456789ABCDEFGH";
+
+        // Create a minimal run.json without the `tasks` field (simulating an old file).
+        let old_json = r#"{
+  "run_uid": "01ABCDEF0123456789ABCDEFGH",
+  "run_slug": "demo-plan",
+  "status": "completed",
+  "started_at": "2026-05-01T10:00:00Z",
+  "ended_at": "2026-05-02T10:00:00Z"
+}
+"#;
+
+        let run_dir = root.join(".makina").join("runs").join(run_uid);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+        std::fs::write(run_dir.join("run.json"), old_json).expect("write old run.json");
+
+        // load_disk_run_views (the disk half of runs()) must surface this run as a
+        // RunView even though it has no tasks field.
+        let mut next_id = 1u64;
+        let live: HashSet<String> = HashSet::new();
+        let views = load_disk_run_views(root, &live, &mut next_id);
+
+        assert_eq!(views.len(), 1, "runs() must yield exactly one RunView");
+        let view = &views[0];
+        assert_eq!(view.run_uid, run_uid, "run_uid must round-trip");
+        assert_eq!(view.status, RunStatus::Completed, "status must round-trip");
+        // Old run.json has no tasks — the RunView tasks list should be empty.
+        assert!(
+            view.tasks.is_empty(),
+            "old run.json without snapshot yields empty task list"
+        );
+    }
+
+    /// A fixture run directory containing a `run.json` with per-task snapshots
+    /// must be surfaced by `load_disk_run_views` as a [`RunView`] with the
+    /// correct task states and iteration counts.
+    #[tokio::test]
+    async fn open_finished_run_reconstructs_view() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        let started = fixed_ts(2026, 5, 1);
+        let ended = fixed_ts(2026, 5, 2);
+
+        let task_snapshots = vec![
+            TaskSnapshot {
+                id: "task-one".to_string(),
+                title: "First task".to_string(),
+                state: TaskState::Done,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+            },
+            TaskSnapshot {
+                id: "task-two".to_string(),
+                title: "Second task".to_string(),
+                state: TaskState::Done,
+                gate_iterations: 1,
+                review_iterations: 1,
+                depends_on: vec!["task-one".to_string()],
+            },
+        ];
+
+        let meta = RunMetadata::with_tasks(
+            "01ABCDEF0123456789ABCDEFGH".to_string(),
+            "demo-plan".to_string(),
+            RunStatus::Completed,
+            started,
+            ended,
+            task_snapshots,
+        );
+
+        write_run_metadata(&meta, root)
+            .await
+            .expect("write_run_metadata must succeed");
+
+        // load_disk_run_views (the disk half of runs()) must surface this run as a
+        // RunView with the correct task states and iteration counts — without any
+        // live registry.
+        let mut next_id = 1u64;
+        let live: HashSet<String> = HashSet::new();
+        let views = load_disk_run_views(root, &live, &mut next_id);
+
+        assert_eq!(views.len(), 1, "runs() must yield exactly one RunView");
+        let view = &views[0];
+        assert_eq!(view.run_uid, meta.run_uid(), "run_uid must round-trip");
+        assert_eq!(
+            view.status,
+            RunStatus::Completed,
+            "status must be Completed"
+        );
+
+        // Verify task states and iteration counts survived the round-trip.
+        assert_eq!(view.tasks.len(), 2, "two tasks must be reconstructed");
+
+        let t1 = &view.tasks[0];
+        assert_eq!(t1.id, TaskId::new("task-one"));
+        assert_eq!(t1.title, "First task");
+        assert_eq!(t1.state, TaskState::Done);
+        assert_eq!(t1.gate_iterations, 0);
+        assert_eq!(t1.review_iterations, 0);
+        assert!(t1.depends_on.is_empty());
+
+        let t2 = &view.tasks[1];
+        assert_eq!(t2.id, TaskId::new("task-two"));
+        assert_eq!(t2.title, "Second task");
+        assert_eq!(t2.state, TaskState::Done);
+        assert_eq!(t2.gate_iterations, 1);
+        assert_eq!(t2.review_iterations, 1);
+        assert_eq!(t2.depends_on, vec![TaskId::new("task-one")]);
     }
 }

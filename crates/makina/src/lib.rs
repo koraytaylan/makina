@@ -32,5 +32,6 @@ pub mod log;
 pub mod markup;
 #[cfg(test)]
 pub mod placeholder;
+pub mod replay;
 pub mod tui;
 pub mod ui;

@@ -695,9 +695,10 @@ fn dependency_levels(
 }
 
 fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool) {
-    // Determine which task's log to display.
+    // Determine which task's log to display using the composite (RunId, TaskId)
+    // key so logs from different runs with the same task slug never collide.
     let task_id = app.selected_task_id();
-    let log_opt = task_id.and_then(|id| app.exchange_logs.get(id));
+    let log_opt = app.selected_exchange_log();
 
     // Check if the selected task has a trailing incomplete response.
     let has_trailing_incomplete = log_opt
@@ -3804,7 +3805,7 @@ mod tests {
         // ──────────────────────────────────────────────────────────────────────
         let log = app
             .exchange_logs
-            .get(&TaskId::new("pane-fidelity"))
+            .get(&(RunId(1), TaskId::new("pane-fidelity")))
             .unwrap();
         let kinds: Vec<&str> = log
             .entries
