@@ -102,7 +102,8 @@ pub async fn drain_response(stream: makina_core::backend::ResponseStream) -> Str
             // Side-channel events do not contribute to the assembled answer.
             ResponseEvent::ThoughtChunk { .. }
             | ResponseEvent::ToolCall { .. }
-            | ResponseEvent::ToolCallUpdate { .. } => {}
+            | ResponseEvent::ToolCallUpdate { .. }
+            | ResponseEvent::CurrentModeUpdate { .. } => {}
             ResponseEvent::TurnComplete => break,
         }
     }

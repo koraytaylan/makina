@@ -192,6 +192,7 @@ async fn agent_disconnect_mid_turn_yields_error_then_ends() {
                 assert_eq!(t, "partial");
                 saw_text = true;
             }
+            Ok(AcpResponseChunk::CurrentModeUpdate { .. }) => {}
             // Rich side-channel chunks (thoughts/tool calls) are irrelevant to
             // this mid-turn-disconnect test; ignore them.
             Ok(AcpResponseChunk::Thought(_))

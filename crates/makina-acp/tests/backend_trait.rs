@@ -55,6 +55,7 @@ async fn drain_ok(stream: ResponseStream) -> (String, /* turn_complete_count */ 
                 assert!(!saw_complete_last, "no chunk may follow TurnComplete");
                 text.push_str(&chunk);
             }
+            ResponseEvent::CurrentModeUpdate { .. } => {}
             // Side-channel events do not contribute to the assembled answer; the
             // dedicated `non_message_updates_are_mapped_to_response_events` test
             // asserts their delivery.
@@ -138,6 +139,7 @@ async fn non_message_updates_are_mapped_to_response_events() {
                 assert!(!saw_complete_last, "no event may follow TurnComplete");
                 text.push_str(&chunk);
             }
+            ResponseEvent::CurrentModeUpdate { .. } => {}
             ResponseEvent::ThoughtChunk { text: t } => {
                 assert!(!saw_complete_last, "no event may follow TurnComplete");
                 thoughts.push(t);
@@ -295,6 +297,7 @@ async fn mid_turn_disconnect_surfaces_transport_error_no_false_turn_complete() {
                 assert_eq!(text, "partial");
                 saw_text = true;
             }
+            Ok(ResponseEvent::CurrentModeUpdate { .. }) => {}
             Ok(
                 ResponseEvent::ThoughtChunk { .. }
                 | ResponseEvent::ToolCall { .. }

@@ -212,6 +212,14 @@ pub enum ResponseEvent {
         title: Option<String>,
     },
 
+    /// The agent autonomously changed its operating mode.
+    ///
+    /// Side-channel only: consumers building the final answer ignore this.
+    CurrentModeUpdate {
+        /// The id of the mode the agent switched to.
+        current_mode_id: String,
+    },
+
     /// The agent has finished generating its response for this turn.
     ///
     /// This event MUST be the last item before the stream closes.
@@ -533,7 +541,8 @@ mod tests {
                 ResponseEvent::TextChunk { text } => answer.push_str(&text),
                 ResponseEvent::ThoughtChunk { .. }
                 | ResponseEvent::ToolCall { .. }
-                | ResponseEvent::ToolCallUpdate { .. } => {
+                | ResponseEvent::ToolCallUpdate { .. }
+                | ResponseEvent::CurrentModeUpdate { .. } => {
                     // Side-channel events do not contribute to the answer.
                 }
                 ResponseEvent::TurnComplete => break,

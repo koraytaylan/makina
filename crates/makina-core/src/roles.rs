@@ -572,7 +572,8 @@ mod tests {
                 // Side-channel events do not contribute to the developer output.
                 ResponseEvent::ThoughtChunk { .. }
                 | ResponseEvent::ToolCall { .. }
-                | ResponseEvent::ToolCallUpdate { .. } => {}
+                | ResponseEvent::ToolCallUpdate { .. }
+                | ResponseEvent::CurrentModeUpdate { .. } => {}
                 ResponseEvent::TurnComplete => break,
             }
         }

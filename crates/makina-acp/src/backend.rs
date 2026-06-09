@@ -582,6 +582,9 @@ async fn run_turn(
             Ok(AcpResponseChunk::ToolCallUpdate { id, status, title }) => {
                 Ok(ResponseEvent::ToolCallUpdate { id, status, title })
             }
+            Ok(AcpResponseChunk::CurrentModeUpdate { current_mode_id }) => {
+                Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })
+            }
             Ok(AcpResponseChunk::TurnComplete(_reason)) => {
                 // Final item on a clean turn. Forward it; whether or not the
                 // consumer is still listening, the turn is over. The ACP
@@ -898,7 +901,8 @@ mod tests {
                 // Side-channel events do not contribute to the assembled answer.
                 makina_core::backend::ResponseEvent::ThoughtChunk { .. }
                 | makina_core::backend::ResponseEvent::ToolCall { .. }
-                | makina_core::backend::ResponseEvent::ToolCallUpdate { .. } => {}
+                | makina_core::backend::ResponseEvent::ToolCallUpdate { .. }
+                | makina_core::backend::ResponseEvent::CurrentModeUpdate { .. } => {}
                 makina_core::backend::ResponseEvent::TurnComplete => completes += 1,
             }
         }

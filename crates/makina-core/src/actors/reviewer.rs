@@ -267,6 +267,14 @@ impl kameo::message::Message<Review> for Reviewer {
                         event: api::ExchangeEvent::ToolCallUpdate { id, status, title },
                     });
                 }
+                Ok(ResponseEvent::CurrentModeUpdate { current_mode_id }) => {
+                    (msg.sink)(api::Event::CurrentModeUpdate {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Reviewer,
+                        current_mode_id,
+                    });
+                }
                 Ok(ResponseEvent::TurnComplete) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,

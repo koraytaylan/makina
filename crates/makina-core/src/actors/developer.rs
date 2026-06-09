@@ -293,6 +293,14 @@ impl kameo::message::Message<Develop> for Developer {
                         event: api::ExchangeEvent::ToolCallUpdate { id, status, title },
                     });
                 }
+                Ok(ResponseEvent::CurrentModeUpdate { current_mode_id }) => {
+                    (msg.sink)(api::Event::CurrentModeUpdate {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Developer,
+                        current_mode_id,
+                    });
+                }
                 Ok(ResponseEvent::TurnComplete) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,

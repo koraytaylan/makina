@@ -748,7 +748,8 @@ impl TaskListInterpreter for ModelInterpreter {
                 // response; the interpreter only cares about the answer text.
                 ResponseEvent::ThoughtChunk { .. }
                 | ResponseEvent::ToolCall { .. }
-                | ResponseEvent::ToolCallUpdate { .. } => {}
+                | ResponseEvent::ToolCallUpdate { .. }
+                | ResponseEvent::CurrentModeUpdate { .. } => {}
                 ResponseEvent::TurnComplete => break,
             }
         }

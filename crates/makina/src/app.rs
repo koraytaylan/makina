@@ -607,6 +607,12 @@ pub struct App {
     /// [`App::mode`] is [`Mode::ProviderConfig`].
     pub provider_editor: Option<ProviderEditor>,
 
+    /// Most recent session capabilities (modes + config options) discovered from
+    /// a live agent. Used to seed/refresh the provider editor with what the agent
+    /// actually advertises, since capabilities arrive while a run is active —
+    /// often before the user opens the editor.
+    pub discovered_capabilities: Option<makina_core::api::SessionCapabilities>,
+
     /// The named providers loaded from config (used to seed the editor).
     pub providers: Vec<ProviderConfig>,
 
@@ -724,6 +730,7 @@ impl App {
             dependency_view: DependencyViewMode::Off,
             browser: None,
             provider_editor: None,
+            discovered_capabilities: None,
             providers: Vec::new(),
             roles: RolesConfig::default(),
             runs: initial_runs,
@@ -1064,11 +1071,16 @@ impl App {
             AppEvent::OpenProviderEditor => {
                 // Open the provider editor modal, seeded from the app's current
                 // providers/roles (loaded from config at startup).
+                let (available_modes, available_config_options) = self
+                    .discovered_capabilities
+                    .as_ref()
+                    .map(|c| (c.modes.clone(), c.config_options.clone()))
+                    .unwrap_or((None, vec![]));
                 self.provider_editor = Some(ProviderEditor {
                     providers: self.providers.clone(),
                     roles: self.roles.clone(),
-                    available_modes: None,
-                    available_config_options: vec![],
+                    available_modes,
+                    available_config_options,
                     selected_provider: if self.providers.is_empty() {
                         None
                     } else {
@@ -1274,24 +1286,43 @@ impl App {
                     tv.review_iterations = *review_iterations;
                 }
             }
-            // SessionCapabilities and CurrentModeUpdate are observability events
-            // for the provider editor (task 0041). For now, we ignore them at the
-            // app level; the TUI will subscribe to these to populate UI fields.
+            // The agent advertises its modes / model / effort options when a
+            // session opens. Remember them so the provider editor can show what
+            // the live agent actually supports, and refresh an already-open editor.
             Event::SessionCapabilities {
                 run: _,
                 task: _,
                 role: _,
-                capabilities: _,
+                capabilities,
             } => {
-                // TODO(0041): surface capabilities to the provider editor
+                self.discovered_capabilities = Some(capabilities.clone());
+                if let Some(editor) = self.provider_editor.as_mut() {
+                    editor.available_modes = capabilities.modes.clone();
+                    editor.available_config_options = capabilities.config_options.clone();
+                }
             }
+            // An autonomous mode switch: reflect it in the stored capabilities and
+            // in any open editor.
             Event::CurrentModeUpdate {
                 run: _,
                 task: _,
                 role: _,
-                current_mode_id: _,
+                current_mode_id,
             } => {
-                // TODO(0041): update the provider editor's current mode display
+                if let Some(modes) = self
+                    .discovered_capabilities
+                    .as_mut()
+                    .and_then(|c| c.modes.as_mut())
+                {
+                    modes.current_mode_id = current_mode_id.clone();
+                }
+                if let Some(modes) = self
+                    .provider_editor
+                    .as_mut()
+                    .and_then(|e| e.available_modes.as_mut())
+                {
+                    modes.current_mode_id = current_mode_id.clone();
+                }
             }
             // AgentExchange events accumulate into the per-task exchange log
             // (task 30: prompt-answer-stream).  The TUI stores ALL tasks' logs

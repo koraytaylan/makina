@@ -27,7 +27,8 @@ async fn drain(stream: makina_acp::PromptStream<'_>) -> (String, StopReason) {
             AcpResponseChunk::Text(t) => text.push_str(&t),
             AcpResponseChunk::Thought(_)
             | AcpResponseChunk::ToolCall { .. }
-            | AcpResponseChunk::ToolCallUpdate { .. } => {}
+            | AcpResponseChunk::ToolCallUpdate { .. }
+            | AcpResponseChunk::CurrentModeUpdate { .. } => {}
             AcpResponseChunk::TurnComplete(reason) => {
                 assert!(stop.is_none(), "TurnComplete must appear exactly once");
                 stop = Some(reason);

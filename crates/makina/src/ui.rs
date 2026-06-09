@@ -1339,6 +1339,62 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
         }
     }
 
+    // Discovered section: what the live agent actually advertises (modes +
+    // model/effort options), distinct from the declared config above. Only shown
+    // once a session has reported its capabilities.
+    let has_discovered =
+        editor.available_modes.is_some() || !editor.available_config_options.is_empty();
+    if has_discovered {
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "  Discovered (live agent):",
+            Style::default().fg(Color::Magenta),
+        )])));
+
+        if let Some(modes) = &editor.available_modes {
+            let names: Vec<String> = modes
+                .available_modes
+                .iter()
+                .map(|m| {
+                    if m.id == modes.current_mode_id {
+                        format!("[{}]", m.id)
+                    } else {
+                        m.id.clone()
+                    }
+                })
+                .collect();
+            items.push(ListItem::new(Line::from(vec![Span::styled(
+                format!("    modes: {}", names.join("  ")),
+                Style::default().fg(Color::Green),
+            )])));
+        }
+
+        // List each advertised model, annotated with the available effort
+        // (thought_level) choices, as "model · {effort options}".
+        let effort_choices: Vec<String> = editor
+            .available_config_options
+            .iter()
+            .find(|o| o.category == "thought_level")
+            .map(|o| o.options.iter().map(|c| c.value.clone()).collect())
+            .unwrap_or_default();
+        let effort_hint = if effort_choices.is_empty() {
+            String::new()
+        } else {
+            format!(" · {{{}}}", effort_choices.join("|"))
+        };
+        for opt in editor
+            .available_config_options
+            .iter()
+            .filter(|o| o.category == "model")
+        {
+            for choice in &opt.options {
+                items.push(ListItem::new(Line::from(vec![Span::styled(
+                    format!("    model: {}{}", choice.value, effort_hint),
+                    Style::default().fg(Color::Green),
+                )])));
+            }
+        }
+    }
+
     let highlight_style = Style::default()
         .fg(Color::Black)
         .bg(Color::Cyan)

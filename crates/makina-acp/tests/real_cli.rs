@@ -75,6 +75,7 @@ async fn real_cli_prompt_response() {
                     eprint!("{t}");
                     answer.push_str(&t);
                 }
+                AcpResponseChunk::CurrentModeUpdate { .. } => {}
                 // Rich side-channel chunks (thoughts/tool calls): this test only
                 // cares about the assistant text, so ignore them.
                 AcpResponseChunk::Thought(_)
@@ -141,6 +142,7 @@ async fn real_cli_prompt_response_through_the_backend_trait() {
                     eprint!("{text}");
                     answer.push_str(&text);
                 }
+                ResponseEvent::CurrentModeUpdate { .. } => {}
                 // Side-channel events do not contribute to the collected answer.
                 ResponseEvent::ThoughtChunk { .. }
                 | ResponseEvent::ToolCall { .. }

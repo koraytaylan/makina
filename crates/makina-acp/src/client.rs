@@ -221,6 +221,13 @@ pub enum AcpResponseChunk {
         /// Updated title, if the update carried one.
         title: Option<String>,
     },
+    /// The agent autonomously changed its operating mode (`current_mode_update`).
+    ///
+    /// Side channel: does not contribute to the assembled assistant text.
+    CurrentModeUpdate {
+        /// The id of the mode the agent switched to.
+        current_mode_id: String,
+    },
     /// The turn finished; carries the agent's stop reason.
     TurnComplete(StopReason),
 }
@@ -518,6 +525,45 @@ impl AcpClient {
         Ok(())
     }
 
+    /// Convenience: set the agent's model by locating the `model`-category
+    /// config option and applying it. Returns `Ok(false)` when the agent
+    /// advertised no `model` option (nothing to set).
+    pub async fn set_model(&mut self, model: &str) -> Result<bool> {
+        self.set_option_in_category("model", serde_json::Value::String(model.to_string()))
+            .await
+    }
+
+    /// Convenience: set the agent's reasoning effort by locating the
+    /// `thought_level`-category config option. Returns `Ok(false)` when the
+    /// agent advertised no such option.
+    pub async fn set_effort(&mut self, effort: &str) -> Result<bool> {
+        self.set_option_in_category(
+            "thought_level",
+            serde_json::Value::String(effort.to_string()),
+        )
+        .await
+    }
+
+    /// Locate the advertised config option whose `category` matches and set it.
+    async fn set_option_in_category(
+        &mut self,
+        category: &str,
+        value: serde_json::Value,
+    ) -> Result<bool> {
+        let option_id = self
+            .config_options
+            .iter()
+            .find(|o| o.category == category)
+            .map(|o| o.id.clone());
+        match option_id {
+            Some(id) => {
+                self.set_config_option(&id, value).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Send `text` as a single user turn and return an incremental stream of
     /// the agent's response.
     ///
@@ -792,8 +838,9 @@ impl PromptStream<'_> {
     /// Assistant/thought text chunks become [`AcpResponseChunk::Text`] /
     /// [`AcpResponseChunk::Thought`] (empty text is dropped); tool-call lifecycle
     /// updates become [`AcpResponseChunk::ToolCall`] /
-    /// [`AcpResponseChunk::ToolCallUpdate`]. User-message echoes, mode updates,
-    /// and unmodelled kinds (`SessionUpdate::Other`) return `None` and are skipped.
+    /// [`AcpResponseChunk::ToolCallUpdate`]; autonomous mode switches become
+    /// [`AcpResponseChunk::CurrentModeUpdate`]. User-message echoes and unmodelled
+    /// kinds (`SessionUpdate::Other`) return `None` and are skipped.
     fn classify_update(update: SessionUpdate) -> Option<AcpResponseChunk> {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => {
@@ -813,9 +860,10 @@ impl PromptStream<'_> {
                 status: u.status,
                 title: u.title,
             }),
-            SessionUpdate::UserMessageChunk(_)
-            | SessionUpdate::CurrentModeUpdate { .. }
-            | SessionUpdate::Other => None,
+            SessionUpdate::CurrentModeUpdate { current_mode_id } => {
+                Some(AcpResponseChunk::CurrentModeUpdate { current_mode_id })
+            }
+            SessionUpdate::UserMessageChunk(_) | SessionUpdate::Other => None,
         }
     }
 }
@@ -888,5 +936,26 @@ impl Stream for PromptStream<'_> {
                 StreamState::Done => return Poll::Ready(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod current_mode_tests {
+    use super::*;
+
+    #[test]
+    fn classify_update_maps_current_mode_update() {
+        // Regression: `current_mode_update` notifications used to be dropped
+        // (classified to `None`). They must now surface as a `CurrentModeUpdate`
+        // chunk so autonomous mode switches reach the TUI.
+        let chunk = PromptStream::classify_update(SessionUpdate::CurrentModeUpdate {
+            current_mode_id: "code".to_string(),
+        });
+        assert_eq!(
+            chunk,
+            Some(AcpResponseChunk::CurrentModeUpdate {
+                current_mode_id: "code".to_string(),
+            })
+        );
     }
 }

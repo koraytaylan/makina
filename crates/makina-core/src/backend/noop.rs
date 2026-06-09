@@ -580,7 +580,8 @@ mod tests {
                     // answer text.
                     ResponseEvent::ThoughtChunk { .. }
                     | ResponseEvent::ToolCall { .. }
-                    | ResponseEvent::ToolCallUpdate { .. } => {}
+                    | ResponseEvent::ToolCallUpdate { .. }
+                    | ResponseEvent::CurrentModeUpdate { .. } => {}
                     ResponseEvent::TurnComplete => break,
                 }
             }

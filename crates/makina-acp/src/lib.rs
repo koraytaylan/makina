@@ -53,7 +53,8 @@
 //!         // Thoughts and tool-call activity arrive as a side channel.
 //!         AcpResponseChunk::Thought(_)
 //!         | AcpResponseChunk::ToolCall { .. }
-//!         | AcpResponseChunk::ToolCallUpdate { .. } => {}
+//!         | AcpResponseChunk::ToolCallUpdate { .. }
+//!         | AcpResponseChunk::CurrentModeUpdate { .. } => {}
 //!         AcpResponseChunk::TurnComplete(_reason) => break,
 //!     }
 //! }

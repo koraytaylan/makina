@@ -297,7 +297,8 @@ while read -r _line; do :; done
             // this auth-verification turn; ignore them.
             makina_acp::AcpResponseChunk::Thought(_)
             | makina_acp::AcpResponseChunk::ToolCall { .. }
-            | makina_acp::AcpResponseChunk::ToolCallUpdate { .. } => {}
+            | makina_acp::AcpResponseChunk::ToolCallUpdate { .. }
+            | makina_acp::AcpResponseChunk::CurrentModeUpdate { .. } => {}
             makina_acp::AcpResponseChunk::TurnComplete(_) => break,
         }
     }
