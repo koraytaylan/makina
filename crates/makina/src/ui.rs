@@ -2719,7 +2719,7 @@ mod tests {
     /// The status bar does NOT show the `G`/`R` legend (it was removed).
     /// The iteration counts are now shown in the task detail pane instead.
     #[test]
-    fn render_status_bar_shows_gr_legend_when_counts_nonzero() {
+    fn render_status_bar_omits_gr_legend_when_counts_nonzero() {
         let mut terminal = make_terminal(120, 30);
         let app = task_status_app();
 

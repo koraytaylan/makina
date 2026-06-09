@@ -11,21 +11,27 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::path::Path;
 
-/// Helper to finalize a line with ANSI processing.
+/// Finalize a flushed run of spans into a [`Line`].
 fn finalize_line(spans: Vec<Span<'static>>) -> Line<'static> {
-    let processed = apply_ansi_to_spans_in_line(spans);
-    Line::from(processed)
+    Line::from(spans)
 }
 
 /// Strip ANSI escape sequences from text, keeping only the visible characters.
 fn strip_ansi(text: &str) -> String {
-    // Use ansi_to_tui to parse ANSI and extract plain text.
-    let lines = render_ansi(text);
-    lines
+    // Parse ANSI via ansi_to_tui and extract plain text, preserving line
+    // structure: join spans *within* a line, and lines with '\n'. Joining
+    // everything with "" would collapse multi-line content into one paragraph
+    // before Markdown parsing.
+    render_ansi(text)
         .iter()
-        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
-        .join("")
+        .join("\n")
 }
 
 /// Render CommonMark + GFM tables to styled lines, wrapped to `width`.
@@ -163,11 +169,6 @@ pub fn render_ansi(text: &str) -> Vec<Line<'static>> {
     }
 }
 
-/// Post-process spans in a line (currently a no-op since ANSI is stripped before Markdown parsing).
-fn apply_ansi_to_spans_in_line(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
-    spans
-}
-
 /// Rewrite absolute paths under the repo root (incl. the worktrees dir) to a
 /// compact repo-relative form. Non-matching text is returned unchanged.
 pub fn compact_paths(s: &str, repo_root: &Path) -> String {
@@ -224,15 +225,13 @@ mod tests {
         // Table should render to at least 2 lines (header and row)
         assert!(lines.len() >= 2);
 
-        // Assert that table content is present
+        // Assert that actual header AND cell text is present (not just "some output").
         let all_text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
 
-        assert!(
-            all_text.contains("Header 1") || all_text.contains("Header") || !all_text.is_empty()
-        );
+        assert!(all_text.contains("Header 1") && all_text.contains("Cell 1"));
     }
 
     #[test]
@@ -262,11 +261,14 @@ mod tests {
         // Should have rendered content
         assert!(!lines.is_empty());
 
-        // Should contain the warning text (note: Title may be stripped by ANSI rendering)
+        // Both the heading and the (de-ANSI'd) body survive: strip_ansi now
+        // preserves line structure, so the heading is no longer collapsed into
+        // the body line.
         let all_text: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
+        assert!(all_text.contains("Title"));
         assert!(all_text.contains("warning"));
 
         // Should NOT contain literal escape sequences

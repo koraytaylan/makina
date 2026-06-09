@@ -168,10 +168,10 @@ async fn transcript_is_written_and_parses() {
     .await;
     waited.expect("run must reach a terminal status within 30 seconds");
 
-    // Give the sink a brief moment to flush the last write (the file append is
-    // synchronous inside the sink, but there may be a scheduler yield between
-    // the event broadcast and the file-write completing on a busy runtime).
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // No sleep needed: each AgentExchange file append is synchronous inside the
+    // sink and completes before its event is broadcast, so by the time we have
+    // observed the terminal RunStatusChanged above, all transcript writes have
+    // already flushed to disk.
 
     // Assert: the transcript file exists for the task.
     let task_id = "solo-task";
