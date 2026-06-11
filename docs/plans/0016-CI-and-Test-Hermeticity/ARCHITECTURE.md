@@ -171,7 +171,7 @@ writing the new text.
    `RolesConfig` `config.rs:158`, carried on `GlobalConfig`
    `config.rs:293,297`), pointing at `config.rs` docs for the full shape.
 5. **Status blockquote (`README.md:14–16`)** — reframe the
-   `doc/trial/trial-findings.md` link as the *historical* trial record (its
+   `docs/trial/trial-findings.md` link as the *historical* trial record (its
    top-two gaps — permission flow `trial-findings.md:71`, persistence
    `trial-findings.md:134` — are both fixed); same for the closing pointer at
    `README.md:155–156`.

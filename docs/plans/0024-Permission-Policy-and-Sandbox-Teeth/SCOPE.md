@@ -8,7 +8,7 @@ Governance is the product's wedge, but the shipped permission policy is
 **vacuous** and the "Docker sandbox" gate isn't isolation. This plan is the
 follow-up to plan 0008 (Gate Sandboxing), which locked Docker + opt-in
 `image` per gate but shipped no isolation flags, and to the permission/audit
-gateway of plan 0002 (see also `doc/spec/acp-auth.md` for the trust model this
+gateway of plan 0002 (see also `docs/spec/acp-auth.md` for the trust model this
 plan leaves intact: the agent *CLI* is operator-trusted; its *tool calls* are
 not).
 
@@ -99,7 +99,7 @@ Work items in [TASKS.md](TASKS.md) (workstreams 0074–0076):
   `canonicalize` would fail on not-yet-created targets (diff destinations)
   and still wouldn't stop a symlink planted *inside* the worktree — symlink
   escapes are explicitly residual risk, deferred to OS-level enforcement
-  (`doc/plan/0001-Initial/FUTURE.md:52`, "Hard enforcement via sandboxing").
+  (`docs/plans/0001-Initial/FUTURE.md:52`, "Hard enforcement via sandboxing").
 - **Missing path data allows; malformed path data denies.** Tool calls with
   *no* locations/content paths (the normal shape for `execute`/terminal
   calls) keep today's behaviour — denying them would kill every shell command
@@ -138,7 +138,7 @@ Work items in [TASKS.md](TASKS.md) (workstreams 0074–0076):
 
 - OS-level (non-Docker) sandboxing of the **agent process** itself —
   filesystem/network namespaces around the CLI
-  (`doc/plan/0001-Initial/FUTURE.md:52`, "Hard enforcement via sandboxing";
+  (`docs/plans/0001-Initial/FUTURE.md:52`, "Hard enforcement via sandboxing";
   plan 0008 explicitly deferred it too).
 - Per-task gate overrides (gates remain per-project `makina.toml` config).
 - A policy DSL / config-file rule language beyond the worktree boundary +

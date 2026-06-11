@@ -32,7 +32,7 @@ model and `persist_graph` writes into a path (`persist.rs:176`, `:187`).
 
 1. In `crates/makina-core/src/task.rs`, next to `TaskId` (`task.rs:52`), add
    `pub struct Slug(String)` + `SlugError` with `Slug::parse` enforcing
-   artifact-schema §4.1 (`doc/spec/runtime-artifact-schema.md` §4.1):
+   artifact-schema §4.1 (`docs/spec/runtime-artifact-schema.md` §4.1):
    `[a-z0-9-]` only, starts and ends alphanumeric, no `--`, length ≥ 2.
    Implement `TryFrom<String>`, `From<Slug> for String`, `Display`,
    `AsRef<str>`, `as_str()`, and serde via

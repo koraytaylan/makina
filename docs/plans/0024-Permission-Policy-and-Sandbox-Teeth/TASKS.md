@@ -72,7 +72,7 @@ deny branch (`permission.rs:123–131`) is unreachable in production.
 
 2. Rewrite the MVP-limitation doc (`permission.rs:77–80`) to state the new
    behaviour, the missing-vs-malformed rationale, and the symlink residual
-   risk (deferred to `doc/plan/0001-Initial/FUTURE.md:52`).
+   risk (deferred to `docs/plans/0001-Initial/FUTURE.md:52`).
 
 3. Add tests:
 
@@ -267,7 +267,7 @@ hardening must be unit-testable without a docker daemon.
    is mounted read-write because gates must build in it.
 
 2. Cross-link the residual-risk notes: agent-process sandboxing is future
-   work (`doc/plan/0001-Initial/FUTURE.md:52`), slug validation is plan 0019.
+   work (`docs/plans/0001-Initial/FUTURE.md:52`), slug validation is plan 0019.
 
 - **Depends on:** harden-docker-gate-args
 - **Done when:** the README and `config.rs` docs describe the trust model and

@@ -49,7 +49,7 @@ This is the **engine-level complement to plan 0014**, which surfaces failure
 reasons at the *view* layer and explicitly deferred this work: its scope
 classifies "at the point of failure … even if the FSM event stays shared",
 and its out-of-scope list names the engine-level split
-(`doc/plan/0014-Failure-Reasons-and-Log-Access/SCOPE.md`, "Locked decisions" /
+(`docs/plans/0014-Failure-Reasons-and-Log-Access/SCOPE.md`, "Locked decisions" /
 "Out of scope"). This plan is that deferred engine work: the driver →
 scheduler → report channel becomes typed, so 0014's view mapping becomes a
 direct conversion instead of string classification. (0014 is not yet

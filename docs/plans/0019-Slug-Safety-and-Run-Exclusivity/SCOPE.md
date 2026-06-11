@@ -76,7 +76,7 @@ Work items in [TASKS.md](TASKS.md) (workstreams 0060–0061):
 
 ## Locked decisions
 
-- **`Slug` enforces artifact-schema §4.1** (`doc/spec/runtime-artifact-schema.md`
+- **`Slug` enforces artifact-schema §4.1** (`docs/spec/runtime-artifact-schema.md`
   §4.1): lowercase ASCII letters/digits/hyphens, starts and ends alphanumeric,
   **no consecutive hyphens**, minimum two characters. This is exactly what the
   derived slugs already satisfy (`run_slug`'s sanitizer targets §4.1 —
@@ -115,7 +115,7 @@ Work items in [TASKS.md](TASKS.md) (workstreams 0060–0061):
   the existing gate sandbox baseline).
 - **Multi-process / multi-user locking.** Exclusivity here is within one
   orchestrator process (the runs registry); cross-process coordination remains
-  future work ("Multi-user concurrency", `doc/plan/0001-Initial/mind-map.opml`).
+  future work ("Multi-user concurrency", `docs/plans/0001-Initial/mind-map.opml`).
 - **Changing the worktree reclaim heuristic** (see locked decisions — it is
   sound under exclusivity).
 - **Normalizing a safe-but-mismatched model slug** to the derived run slug
