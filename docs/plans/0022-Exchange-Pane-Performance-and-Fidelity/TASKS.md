@@ -265,9 +265,10 @@ replay cache-skip (`app.rs:1196–1199`) makes any live loss permanent
    ```
 
 - **Depends on:** surface-lag-and-backfill
-- **Done when:** the test passes; `App::update` performs no filesystem
-  access (grep: no `std::fs` in `app.rs` outside tests); cargo
-  test/clippy/fmt green.
+- **Done when:** the test passes; `app.rs` no longer calls
+  `replay::load_task_exchange` (grep: its only callers live in
+  `event.rs`/`replay.rs`), so `App::update` performs no filesystem access;
+  cargo test/clippy/fmt green.
 
 ### mouse-capture-and-page-keys — Make the scroll subsystem reachable
 
