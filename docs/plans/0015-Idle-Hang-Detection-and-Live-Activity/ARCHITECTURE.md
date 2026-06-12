@@ -37,10 +37,10 @@ Driver:
 
 Events / reasons:
 
-- Add `FailureKind::IdleTimeout` to the `FailureKind` enum (plan 0014; if 0014 is
-  not yet merged, introduce the enum here). The supervisor's failure classifier
-  (plan 0014, `supervisor.rs` failing transition) maps the idle abort to it.
-- Add an `ApiEvent::TaskIdle { task, idle_secs }` (or reuse the activity event
+- Add `FailureKind::IdleTimeout` to the `FailureKind` enum introduced by plan 0014
+  (merged to the base branch before this plan runs). The supervisor's failure
+  classifier (plan 0014, `supervisor.rs` failing transition) maps the idle abort to it.
+- Add an `Event::TaskIdle { task, idle_secs }` (or reuse the activity event
   from 0051) emitted when the watchdog fires, so the reason is visible without
   waiting for the next snapshot.
 

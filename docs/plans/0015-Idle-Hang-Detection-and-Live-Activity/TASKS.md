@@ -57,11 +57,12 @@ for the deltas. (The historical permission hang is already fixed via
 
 2. On elapse: abort/cancel the in-flight step via the existing wall-clock
    cancellation path, drive the task to `Failed`, and classify the failure as
-   `FailureKind::IdleTimeout` (add the variant to the `FailureKind` enum from plan
-   0014; if 0014 is not yet merged, introduce the enum here) with message
-   `no agent output for {idle}s`.
+   `FailureKind::IdleTimeout` (add the `IdleTimeout` variant to the `FailureKind`
+   enum introduced by plan 0014, which is merged to the base branch before this
+   plan runs) with message `no agent output for {idle}s`.
 
-3. Emit `ApiEvent::TaskIdle { task, idle_secs }` (new variant in `api.rs`) when the
+3. Emit `Event::TaskIdle { task, idle_secs }` (new variant in `api.rs`'s `Event`
+   enum) when the
    watchdog fires so the TUI sees it immediately.
 
 4. When `idle_secs` is `None`, leave the await as the bare `stream.next()` — no

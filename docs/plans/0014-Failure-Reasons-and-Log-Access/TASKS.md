@@ -31,7 +31,7 @@ reason to the view and populate it at the failing transition.
 1. In `crates/makina-core/src/api.rs`, add near `TaskState` (`api.rs:124`):
 
    ```rust
-   pub enum FailureKind { GateCap, ReviewCap, MergeConflict, HardError, WallClockCap, Cancelled }
+   pub enum FailureKind { GateCap, ReviewCap, MergeConflict, HardError, WallClockCap }
    pub struct FailureReason { pub kind: FailureKind, pub message: String }
    ```
 
@@ -43,7 +43,10 @@ reason to the view and populate it at the failing transition.
    gate-cap → `GateCap`; reviewer-exhaustion → `ReviewCap`; the merge-conflict
    path that reuses `ReviewCapReached` (`supervisor.rs:40,108`) → `MergeConflict`;
    `HardError` arms (`:23,:36,:41`) → `HardError`; `WallClockCapReached` (`:114`)
-   → `WallClockCap`; explicit cancel → `Cancelled`. Store the classified reason on
+   → `WallClockCap`. (Run-control cancel is an unimplemented seam today —
+   `supervisor.rs` docs note pause/cancel is not wired and no cancel reason is
+   pushed to `failed_tasks` — so there is no `Cancelled` variant; add one only if
+   a cancel→`Failed` transition is introduced.) Store the classified reason on
    the task record so the `TaskView` builder can read it; keep the human string as
    `message`.
 

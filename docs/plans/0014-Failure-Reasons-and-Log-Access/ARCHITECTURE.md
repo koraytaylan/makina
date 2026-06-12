@@ -19,7 +19,7 @@ Edits:
 
   ```rust
   #[derive(Debug, Clone, PartialEq, Eq)]
-  pub enum FailureKind { GateCap, ReviewCap, MergeConflict, HardError, WallClockCap, Cancelled }
+  pub enum FailureKind { GateCap, ReviewCap, MergeConflict, HardError, WallClockCap }
 
   #[derive(Debug, Clone, PartialEq, Eq)]
   pub struct FailureReason { pub kind: FailureKind, pub message: String }
@@ -36,8 +36,10 @@ Edits:
     (`supervisor.rs:40,108`) → `MergeConflict`;
   - hard merge / dispatch / create errors (`HardError`, `supervisor.rs:23,36,41`)
     → `HardError`;
-  - scheduler `WallClockCapReached` (`supervisor.rs:114`) → `WallClockCap`;
-  - explicit cancel → `Cancelled`.
+  - scheduler `WallClockCapReached` (`supervisor.rs:114`) → `WallClockCap`.
+
+  (Run-control cancel is an unimplemented seam — no cancel reason reaches
+  `failed_tasks` — so there is no `Cancelled` variant for now.)
   Keep the existing human `message` string as `FailureReason.message`.
 
 - **Carry it on the event/snapshot that builds `TaskView`.** The `TaskView`
@@ -64,7 +66,6 @@ Edits:
           FailureKind::MergeConflict => "merge conflict",
           FailureKind::HardError => "hard error",
           FailureKind::WallClockCap => "wall-clock cap",
-          FailureKind::Cancelled => "cancelled",
       };
       detail_lines.push(Line::from(Span::styled(
           format!("failed: {label} — {}", fr.message),
