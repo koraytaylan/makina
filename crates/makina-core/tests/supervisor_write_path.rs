@@ -25,18 +25,135 @@
 use std::process::Command;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
+use futures::stream;
 
 use makina_core::actors::{
     RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
 };
-use makina_core::backend::AgentBackend;
+use makina_core::api::FailureKind;
 use makina_core::backend::noop::NoopBackend;
+use makina_core::backend::{
+    AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
+};
 use makina_core::config::{CapsConfig, Config, GateConfig};
 use makina_core::persist::{load_graph, tasks_path};
 use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::worktree::WorktreeManager;
+
+// ── FileWritingBackend ─────────────────────────────────────────────────────────
+//
+// A test-only backend for `merge_conflict_classified_distinctly`.
+//
+// On `spawn`, writes a file to the task worktree (the session's `working_dir`)
+// so the Developer's `git add -A && git commit` captures a real file change on
+// the task branch.  It also writes a CONFLICTING version of that file to
+// `repo_root` and commits it on `develop` — the base branch — so that when the
+// supervisor tries to squash-merge the task branch, both branches have diverged
+// from the same base with different content, which guarantees a conflict.
+struct FileWritingBackend {
+    /// Name of the file to create both in the worktree and on develop.
+    file_name: String,
+    /// Content written to the file in the task worktree.
+    worktree_content: String,
+    /// Conflicting content committed on develop (must differ from `worktree_content`).
+    develop_content: String,
+    /// The base-checkout (develop) directory, so we can commit there too.
+    repo_root: std::path::PathBuf,
+    /// Canned response text for the agent prompt.
+    response: String,
+}
+
+impl FileWritingBackend {
+    fn new(
+        file_name: &str,
+        worktree_content: &str,
+        develop_content: &str,
+        repo_root: std::path::PathBuf,
+        response: &str,
+    ) -> Self {
+        Self {
+            file_name: file_name.to_string(),
+            worktree_content: worktree_content.to_string(),
+            develop_content: develop_content.to_string(),
+            repo_root,
+            response: response.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentBackend for FileWritingBackend {
+    async fn spawn(&self, config: SessionConfig) -> Result<Box<dyn AgentSession>, BackendError> {
+        // 1. Write the task-branch version into the worktree.
+        let worktree_path = config.working_dir.join(&self.file_name);
+        std::fs::write(&worktree_path, &self.worktree_content).map_err(|e| {
+            BackendError::Spawn {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // 2. Write the conflicting version into develop's checkout and commit it.
+        //    This ensures develop's HEAD diverges from the task branch's base,
+        //    guaranteeing a merge conflict when the supervisor squash-merges.
+        let develop_path = self.repo_root.join(&self.file_name);
+        std::fs::write(&develop_path, &self.develop_content).map_err(|e| BackendError::Spawn {
+            reason: e.to_string(),
+        })?;
+        let repo_str = self.repo_root.to_string_lossy().to_string();
+        let git_args = vec![
+            vec!["-C", &repo_str, "add", "-A"],
+            vec![
+                "-C",
+                &repo_str,
+                "commit",
+                "--allow-empty",
+                "-m",
+                "conflict: change on develop",
+            ],
+        ];
+        for args in git_args {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .status()
+                .map_err(|e| BackendError::Spawn {
+                    reason: e.to_string(),
+                })?;
+            if !status.success() {
+                return Err(BackendError::Spawn {
+                    reason: format!("git {:?} failed with {:?}", args, status.code()),
+                });
+            }
+        }
+
+        Ok(Box::new(CannedSession {
+            response: self.response.clone(),
+        }))
+    }
+}
+
+struct CannedSession {
+    response: String,
+}
+
+#[async_trait]
+impl AgentSession for CannedSession {
+    async fn prompt(&mut self, _prompt: Prompt) -> Result<ResponseStream, BackendError> {
+        let events: Vec<Result<ResponseEvent, BackendError>> = vec![
+            Ok(ResponseEvent::TextChunk {
+                text: self.response.clone(),
+            }),
+            Ok(ResponseEvent::TurnComplete),
+        ];
+        Ok(Box::pin(stream::iter(events)))
+    }
+
+    async fn terminate(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
 
 // ── Temp-repo helpers (mirror the other integration tests) ───────────────────────
 
@@ -102,6 +219,7 @@ fn task(id: &str, done_when: &str) -> Task {
         updated_at: now,
         started_at: None,
         finished_at: None,
+        failure_reason: None,
     }
 }
 
@@ -489,6 +607,217 @@ async fn persist_file_matches_snapshot_after_reviewer_cap_failed() {
     assert_eq!(
         disk_task.finished_at, snap_task.finished_at,
         "on-disk finished_at must match snapshot"
+    );
+
+    root.kill();
+}
+
+// ── Test 4: task_view_carries_failure_reason ─────────────────────────────────
+
+/// Drive a task to `Failed` via the gate cap and assert that the domain task's
+/// `failure_reason` is `Some(GateCap)` with a non-empty message — which is
+/// exactly what the `TaskView.failure_reason` exposes.
+#[tokio::test]
+async fn task_view_carries_failure_reason() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    let slug = "failure-reason-gate";
+
+    // Developer always "succeeds" (noop), but the gate always fails.
+    let backend = NoopBackend::with_responses(vec!["dev output".into()]);
+
+    let config = Config {
+        gates: vec![GateConfig {
+            name: "always-fail".into(),
+            command: "false".into(),
+            image: None,
+        }],
+        caps: CapsConfig {
+            gate_iterations: 2,
+            reviewer_iterations: 3,
+            wall_clock_secs: 60,
+        },
+        ..Config::resolve(
+            makina_core::config::GlobalConfig::default(),
+            makina_core::config::ProjectConfig::default(),
+        )
+    };
+
+    let (root, supervisor_ref) =
+        build_actor_tree(repo_root.clone(), Arc::new(backend), config).await;
+
+    let graph = TaskGraph {
+        slug: slug.into(),
+        tasks: vec![task("reason-task", "the gate passes")],
+    };
+    supervisor_ref
+        .ask(SetTaskGraph(graph))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = supervisor_ref
+        .ask(RunReadyTasks)
+        .send()
+        .await
+        .expect("RunReadyTasks must return");
+
+    assert_eq!(
+        report.outcomes,
+        vec![(TaskId::new("reason-task"), TaskState::Failed)],
+        "task must reach Failed (gate cap)"
+    );
+
+    // Retrieve the final in-memory snapshot and check the failure_reason.
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask must not fail")
+        .expect("graph must be Some");
+
+    let snap_task = snapshot
+        .get(&TaskId::new("reason-task"))
+        .expect("task must exist in snapshot");
+
+    let fr = snap_task
+        .failure_reason
+        .as_ref()
+        .expect("failure_reason must be Some for a Failed task");
+
+    assert_eq!(
+        fr.kind,
+        FailureKind::GateCap,
+        "gate-cap failure must classify as GateCap, got {:?}",
+        fr.kind
+    );
+    assert!(
+        !fr.message.is_empty(),
+        "failure_reason.message must be non-empty"
+    );
+
+    root.kill();
+}
+
+// ── Test 5: merge_conflict_classified_distinctly ──────────────────────────────
+
+/// Drive a task to `Failed` via a squash-merge conflict and assert that the
+/// task's `failure_reason.kind` is `MergeConflict` — NOT `ReviewCap`.
+///
+/// Setup:
+/// - `develop` carries a seeded file (`shared.txt = "from-develop\n"`).
+/// - A `FileWritingBackend` developer writes `"from-task\n"` to the same file
+///   in the task worktree; the developer's `git add -A && git commit` captures
+///   it as a real (non-empty) commit on the task branch.
+/// - The reviewer always approves.
+/// - When the supervisor tries to squash-merge, the two versions of `shared.txt`
+///   conflict → `MergeOutcome::Conflict` → `TaskEvent::MergeConflict` →
+///   `FailureKind::MergeConflict`.
+#[tokio::test]
+async fn merge_conflict_classified_distinctly() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // Seed a shared file on develop so both branches start from the same base.
+    // The FileWritingBackend will write conflicting content to both the task
+    // worktree AND develop (via a new commit) so that the squash-merge conflicts.
+    std::fs::write(repo_root.join("shared.txt"), "original\n").expect("write shared.txt");
+    run_git(&repo_root, &["add", "-A"]);
+    run_git(&repo_root, &["commit", "-m", "seed shared.txt"]);
+
+    let slug = "merge-conflict-class";
+
+    // The developer backend writes "from-task\n" to shared.txt in the worktree
+    // (so the task branch has a real file change) AND commits "from-develop-v2\n"
+    // to develop's checkout (a diverging change on the base branch) so the
+    // squash-merge will conflict.
+    let developer_backend = Arc::new(FileWritingBackend::new(
+        "shared.txt",
+        "from-task\n",
+        "from-develop-v2\n",
+        repo_root.clone(),
+        "Implemented the feature.",
+    )) as Arc<dyn AgentBackend>;
+    let reviewer_backend = Arc::new(NoopBackend::with_responses(vec![
+        r#"{"verdict":"approve"}"#.into(),
+    ])) as Arc<dyn AgentBackend>;
+
+    let config = Config::resolve(
+        makina_core::config::GlobalConfig::default(),
+        makina_core::config::ProjectConfig::default(),
+    );
+
+    // Build the actor tree manually (separate dev/reviewer backends).
+    let root = RootSupervisor::start();
+    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
+        &root,
+        SupervisorArgs {
+            worktree_manager: WorktreeManager::new(repo_root.clone(), "develop".into()),
+            config,
+        },
+        RestartConfig::default(),
+    )
+    .await;
+    supervisor_ref
+        .ask(SetSpokes {
+            root: root.clone(),
+            supervisor: supervisor_ref.clone(),
+            developer_backend,
+            reviewer_backend,
+        })
+        .send()
+        .await
+        .expect("SetSpokes must be accepted");
+
+    let graph = TaskGraph {
+        slug: slug.into(),
+        tasks: vec![task("conflict-task", "no conflict")],
+    };
+    supervisor_ref
+        .ask(SetTaskGraph(graph))
+        .send()
+        .await
+        .expect("SetTaskGraph must be accepted");
+
+    let report = supervisor_ref
+        .ask(RunReadyTasks)
+        .send()
+        .await
+        .expect("RunReadyTasks must return");
+
+    assert_eq!(
+        report.outcomes,
+        vec![(TaskId::new("conflict-task"), TaskState::Failed)],
+        "task must reach Failed (merge conflict)"
+    );
+
+    // Check the in-memory snapshot for the classified failure reason.
+    let snapshot = supervisor_ref
+        .ask(TaskGraphSnapshot)
+        .send()
+        .await
+        .expect("snapshot ask must not fail")
+        .expect("graph must be Some");
+
+    let snap_task = snapshot
+        .get(&TaskId::new("conflict-task"))
+        .expect("task must exist in snapshot");
+
+    let fr = snap_task
+        .failure_reason
+        .as_ref()
+        .expect("failure_reason must be Some for a Failed task");
+
+    assert_eq!(
+        fr.kind,
+        FailureKind::MergeConflict,
+        "merge-conflict failure must classify as MergeConflict, not {:?}",
+        fr.kind
+    );
+    assert!(
+        !fr.message.is_empty(),
+        "failure_reason.message must be non-empty"
     );
 
     root.kill();

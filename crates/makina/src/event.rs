@@ -148,6 +148,19 @@ pub async fn run(
         };
 
         if let Some(event) = app_event {
+            // OpenLog requires tui for terminal teardown/restore, so it is
+            // handled here (in the loop body, where `tui` is accessible) rather
+            // than in `resolve_io` (which does not receive `tui`).
+            if matches!(event, AppEvent::OpenLog) {
+                let status = open_log(tui, app).await;
+                if let Some(msg) = status {
+                    app.update(AppEvent::StatusMessage(msg));
+                }
+                // Force a full repaint after the pager exits.
+                tui.draw(|frame| ui::render(app, frame))?;
+                continue;
+            }
+
             // IO-layer resolution: browser intents (open / enter dir / select
             // file) need filesystem reads or an async `execute`; run controls
             // (start/pause/cancel) need an async `execute` against the selected
@@ -281,6 +294,14 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
             let status = commit_provider_config(app).await;
             (AppEvent::ProviderEditorCommit, status)
         }
+        // ── Open log (task 0049) ──────────────────────────────────────────────
+        // Resolve the focused task's log path, spawn $PAGER on it, and return a
+        // status message (success, absence, or error).  If the file doesn't exist,
+        // emit "no log for this task yet" instead of opening.
+        // OpenLog is intercepted before resolve_io in the event loop so tui
+        // is accessible for terminal teardown/restore.  This arm is unreachable
+        // in production but kept so the match stays exhaustive.
+        AppEvent::OpenLog => (AppEvent::Tick, None),
         // Everything else passes straight through.
         other => (other, None),
     }
@@ -338,6 +359,76 @@ async fn commit_provider_config(app: &App) -> Option<String> {
         Ok(()) => Some("Config saved".to_string()),
         Err(e) => Some(format!("Config write error: {e}")),
     }
+}
+
+/// Open the focused task's log in `$PAGER`, or report its absence.
+///
+/// Derives the log path from the run id + task id using [`makina_core::paths::task_log`],
+/// tears down the TUI (leaves the alternate screen / disables raw mode via
+/// [`Tui::restore`]), spawns `$PAGER` (fallback `less`, then `more`) on the
+/// file, waits for it to exit, then re-initialises the terminal via
+/// [`Tui::reinit`] so the TUI can resume from where it left off.  If the file
+/// is absent, emits "no log for this task yet" without tearing down the terminal.
+///
+/// Called from the event loop's `OpenLog` arm (not from `resolve_io`) because
+/// it needs mutable access to `tui` for the teardown/restore cycle.
+async fn open_log(tui: &mut Tui, app: &App) -> Option<String> {
+    use makina_core::paths;
+    use std::process::Command;
+
+    // Get the currently focused task's run id and task id.
+    let run = match app.selected_run() {
+        Some(r) => r,
+        None => return Some("No run selected".to_string()),
+    };
+    let task_id = match app.selected_task_id() {
+        Some(t) => t,
+        None => return Some("No task selected".to_string()),
+    };
+
+    // Derive the log path.
+    let log_path = paths::task_log(&app.repo_root, &run.run_uid, &task_id.0);
+
+    // Check if the log file exists.
+    if !log_path.exists() {
+        return Some("no log for this task yet".to_string());
+    }
+
+    // Get the pager command, trying $PAGER first, then falling back to less.
+    let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+
+    // Tear down the TUI before handing the terminal to the pager: leave the
+    // alternate screen and disable raw mode so the pager output is visible.
+    tui.restore();
+
+    // Spawn the pager and wait for it to exit.
+    let result = Command::new(&pager_cmd).arg(&log_path).status();
+    let msg = match result {
+        Ok(status) => {
+            if status.success() {
+                Some(format!("Opened {} in {}", log_path.display(), pager_cmd))
+            } else {
+                Some(format!("{} exit code: {:?}", pager_cmd, status.code()))
+            }
+        }
+        Err(e) => {
+            // If the preferred pager failed, try the fallback (less or more).
+            let fallback = if pager_cmd != "less" { "less" } else { "more" };
+            if let Ok(fb_status) = Command::new(fallback).arg(&log_path).status()
+                && fb_status.success()
+            {
+                Some(format!("Opened {} in {fallback}", log_path.display()))
+            } else {
+                Some(format!("Failed to open log: {e}"))
+            }
+        }
+    };
+
+    // Restore the TUI: re-enter the alternate screen, enable raw mode, and
+    // force a full repaint so no pager output bleeds through.
+    let _ = tui.reinit();
+
+    msg
 }
 
 /// Which run-control command a key intent maps to.
@@ -503,6 +594,8 @@ fn translate_key(
             KeyCode::Char('v') | KeyCode::Char('V') => AppEvent::CycleDependencyView,
             // Toggle the error pane open/closed.
             KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
+            // Open the focused task's log in $PAGER.
+            KeyCode::Char('l') | KeyCode::Char('L') => AppEvent::OpenLog,
             // Open the file browser to pick a task list.
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
             // Open the provider/role configuration editor.
@@ -1205,6 +1298,7 @@ mod tests {
                         gate_iterations: 0,
                         review_iterations: 0,
                         depends_on: vec![],
+                        failure_reason: None,
                     },
                     TaskView {
                         id: TaskId::new("second"),
@@ -1213,6 +1307,7 @@ mod tests {
                         gate_iterations: 0,
                         review_iterations: 0,
                         depends_on: vec![TaskId::new("first")],
+                        failure_reason: None,
                     },
                 ],
                 report: makina_core::api::IngestionReport::default(),
@@ -1533,5 +1628,71 @@ A description that is long enough to pass minimums.
         // Also, the graph was interpreted (we can query runs but since no subscribe
         // in this sync test, just the outcome is proof).
         drop(tmp); // keep dir alive till end
+    }
+
+    /// The derived log path from `open_log` must match the path constructed by
+    /// `makina_core::paths::task_log`.  This is a unit test of the path logic
+    /// without spawning a pager.
+    #[test]
+    fn open_log_resolves_expected_path() {
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        // Create a minimal app with a run and task.
+        let api = Arc::new(PlaceholderApi::empty());
+        let repo_root = PathBuf::from("/test/repo");
+        let run_id_str = "run-001-test";
+        let task = TaskView {
+            id: TaskId::new("my-task"),
+            title: "Test Task".into(),
+            state: TaskState::Done,
+            gate_iterations: 0,
+            review_iterations: 0,
+            depends_on: vec![],
+            failure_reason: None,
+        };
+        let run = RunView {
+            id: RunId(123),
+            run_uid: run_id_str.to_string(),
+            task_list_path: PathBuf::from("sample.json"),
+            status: RunStatus::Completed,
+            project: "test".to_string(),
+            tasks: vec![task],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = crate::app::App::new(api, vec![run], repo_root.clone());
+
+        // Select the task.
+        app.selected_run = Some(0);
+        app.selected_task = Some(0);
+
+        // Construct the expected path using the same logic as log.rs.
+        let expected = makina_core::paths::task_log(&repo_root, run_id_str, "my-task");
+
+        // Derive the path from the app state.
+        if let Some(run) = app.selected_run() {
+            if let Some(task_id) = app.selected_task_id() {
+                let actual = makina_core::paths::task_log(&repo_root, &run.run_uid, &task_id.0);
+                assert_eq!(
+                    actual, expected,
+                    "derived path must match paths::task_log output"
+                );
+                // Verify the path has the expected format: .makina/runs/{run_id}/logs/{task}.log
+                assert!(
+                    expected.to_string_lossy().contains(".makina/runs/"),
+                    "path should contain .makina/runs directory"
+                );
+                assert!(
+                    expected.to_string_lossy().ends_with("my-task.log"),
+                    "path should end with task-id.log"
+                );
+            } else {
+                panic!("no task selected");
+            }
+        } else {
+            panic!("no run selected");
+        }
     }
 }

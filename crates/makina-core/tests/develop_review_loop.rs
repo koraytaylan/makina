@@ -118,6 +118,7 @@ fn task(id: &str, done_when: &str, deps: &[&str]) -> Task {
         updated_at: now,
         started_at: None,
         finished_at: None,
+        failure_reason: None,
     }
 }
 

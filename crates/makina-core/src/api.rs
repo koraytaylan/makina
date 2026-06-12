@@ -159,6 +159,50 @@ impl From<crate::task::TaskState> for TaskState {
     }
 }
 
+/// Why a task reached the `Failed` terminal state.
+///
+/// Each variant maps to a distinct supervisor failure path:
+/// - [`GateCap`] — the gate-iteration cap fired (`GateCapReached` event).
+/// - [`ReviewCap`] — the reviewer-iteration cap fired (`ReviewCapReached` event).
+/// - [`MergeConflict`] — squash-merge produced a conflict; `develop` was
+///   restored cleanly by the merger (`MergeConflict` event — distinct from the
+///   reviewer cap, though both transition from `InReview`).
+/// - [`HardError`] — an unrecoverable infrastructure error (worktree-create
+///   failure, developer/reviewer dispatch failure, gate-launch failure, or a
+///   hard merge error) triggered the `HardError` FSM event.
+/// - [`WallClockCap`] — the per-task wall-clock deadline elapsed
+///   (`WallClockCapReached` event).
+///
+/// Run-control cancel is an unimplemented seam today; no `Cancelled` variant
+/// exists until a cancel→`Failed` transition is introduced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// Gate-iteration cap exhausted.
+    GateCap,
+    /// Reviewer-iteration cap exhausted.
+    ReviewCap,
+    /// Squash-merge conflict; `develop` was restored cleanly.
+    MergeConflict,
+    /// Unrecoverable infrastructure error.
+    HardError,
+    /// Per-task wall-clock deadline elapsed.
+    WallClockCap,
+}
+
+/// A typed failure reason attached to a [`TaskView`] in the `Failed` state.
+///
+/// Carries both a [`FailureKind`] (for programmatic matching / display) and
+/// the original human-readable `message` string the supervisor produced at the
+/// failure site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureReason {
+    /// The category of failure.
+    pub kind: FailureKind,
+    /// The human-readable message from the supervisor at the failure site.
+    pub message: String,
+}
+
 /// A snapshot of one task suitable for rendering in the TUI.
 ///
 /// This is a pure DTO; it holds no behaviour.  The TUI renders `state` as a
@@ -186,6 +230,13 @@ pub struct TaskView {
     /// IDs of tasks that must reach [`TaskState::Done`] before this task
     /// becomes [`TaskState::Ready`].
     pub depends_on: Vec<TaskId>,
+
+    /// Why the task reached `Failed`, or `None` for any non-`Failed` task.
+    ///
+    /// Populated by the supervisor at the failing transition and carried
+    /// through to the view so the TUI can display a human-readable reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<FailureReason>,
 }
 
 /// Aggregate status of a Run from the TUI's perspective.
@@ -858,6 +909,7 @@ mod tests {
                             gate_iterations: 0,
                             review_iterations: 0,
                             depends_on: vec![],
+                            failure_reason: None,
                         }],
                         report: IngestionReport::default(),
                     };
@@ -1141,6 +1193,7 @@ mod tests {
             gate_iterations: 2,
             review_iterations: 1,
             depends_on: vec![TaskId::new("t0")],
+            failure_reason: None,
         };
         let task2 = task.clone();
         let dbg = format!("{task2:?}");

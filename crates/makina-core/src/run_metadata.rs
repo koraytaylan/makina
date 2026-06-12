@@ -49,6 +49,10 @@ pub struct TaskSnapshot {
     /// IDs of tasks that must reach [`TaskState::Done`] before this task becomes ready.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Why the task reached `Failed`, or `None` for any non-`Failed` task.
+    /// Additive field: old `run.json` files without it still load with `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<crate::api::FailureReason>,
 }
 
 /// A durable snapshot of a Run's identity and lifecycle window.
@@ -218,6 +222,7 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
                 .iter()
                 .map(|d| TaskId::new(d.clone()))
                 .collect(),
+            failure_reason: t.failure_reason.clone(),
         })
         .collect();
 
@@ -406,6 +411,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             },
             TaskSnapshot {
                 id: "task-two".to_string(),
@@ -414,6 +420,7 @@ mod tests {
                 gate_iterations: 1,
                 review_iterations: 1,
                 depends_on: vec!["task-one".to_string()],
+                failure_reason: None,
             },
         ];
 

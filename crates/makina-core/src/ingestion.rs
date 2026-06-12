@@ -587,6 +587,7 @@ mod tests {
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         }
     }
 
@@ -1008,6 +1009,7 @@ Desc.
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         };
         let g = make_graph(vec![t]);
         let issues = qualify(&g);
@@ -1042,6 +1044,7 @@ Desc.
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         };
         let g = make_graph(vec![t]);
         let issues = qualify(&g);
@@ -1075,6 +1078,7 @@ Desc.
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         };
         let g = make_graph(vec![t]);
         let issues = qualify(&g);
@@ -1107,6 +1111,7 @@ Desc.
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         };
         let g = make_graph(vec![t]);
         let issues = qualify(&g);
@@ -1143,6 +1148,7 @@ Desc.
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         };
 
         let t2 = Task {
@@ -1159,6 +1165,7 @@ Desc.
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         };
 
         let g = make_graph(vec![t1, t2]);

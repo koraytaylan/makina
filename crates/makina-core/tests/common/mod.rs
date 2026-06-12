@@ -49,6 +49,7 @@ pub fn sample_task(id: impl Into<String>, deps: Vec<&str>) -> Task {
         updated_at: now,
         started_at: None,
         finished_at: None,
+        failure_reason: None,
     }
 }
 

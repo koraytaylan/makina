@@ -88,6 +88,7 @@ fn make_task(id: &str) -> Task {
         updated_at: now,
         started_at: None,
         finished_at: None,
+        failure_reason: None,
     }
 }
 

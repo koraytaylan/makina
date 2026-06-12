@@ -301,6 +301,7 @@ fn build_view(
             gate_iterations: task.gate_iterations,
             review_iterations: task.review_iterations,
             depends_on: task.depends_on.iter().map(Into::into).collect(),
+            failure_reason: task.failure_reason.clone(),
         })
         .collect();
 
@@ -493,6 +494,7 @@ impl CoreState {
                     gate_iterations: t.gate_iterations,
                     review_iterations: t.review_iterations,
                     depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                    failure_reason: t.failure_reason.clone(),
                 })
                 .collect();
             (terminal_status, snapshots)

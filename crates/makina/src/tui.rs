@@ -78,6 +78,30 @@ impl Tui {
         );
     }
 
+    /// Re-initialise the terminal after it was restored (e.g. to hand control to
+    /// an external pager and then resume the TUI).
+    ///
+    /// Re-enables raw mode, re-enters the alternate screen, hides the cursor, and
+    /// clears the terminal so the next [`draw`](Self::draw) produces a full
+    /// repaint.  The panic hook is **not** re-installed (it was installed once by
+    /// [`init`](Self::init) and remains in place).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if raw mode or the alternate-screen escape sequence
+    /// cannot be applied.
+    pub fn reinit(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            cursor::Hide
+        )?;
+        // Force a full repaint so no stale pager content bleeds through.
+        let _ = self.terminal.clear();
+        Ok(())
+    }
+
     /// Draw one frame using the provided closure.
     ///
     /// A thin wrapper around [`Terminal::draw`] so callers don't need to hold a

@@ -46,6 +46,7 @@ use ratatui::{
 };
 
 use crate::app::{App, DependencyViewMode, ExchangeEntry, Panel};
+use makina_core::api::FailureKind;
 
 /// Render the full TUI layout into `frame`.
 ///
@@ -304,9 +305,21 @@ pub fn render(app: &App, frame: &mut Frame) {
                             }
                             _ => badge.to_string(),
                         };
+                        // Append failure reason label for failed tasks.
+                        let state_cell =
+                            if matches!(task.state, makina_core::api::TaskState::Failed) {
+                                if let Some(reason) = &task.failure_reason {
+                                    let label = failure_kind_label(&reason.kind);
+                                    format!("{} {}", badge_with_spinner, label)
+                                } else {
+                                    badge_with_spinner
+                                }
+                            } else {
+                                badge_with_spinner
+                            };
                         Row::new(vec![
                             Cell::from(task.title.clone()).style(Style::default().fg(Color::White)),
-                            Cell::from(badge_with_spinner).style(Style::default().fg(badge_color)),
+                            Cell::from(state_cell).style(Style::default().fg(badge_color)),
                         ])
                     })
                     .collect();
@@ -398,14 +411,39 @@ pub fn render(app: &App, frame: &mut Frame) {
         DependencyViewMode::Tree => "tree",
         DependencyViewMode::Timeline => "timeline",
     };
+    // Build the error-hint badge: plain text when the pane is current, warn
+    // colour (Yellow) when unseen errors are present so the user notices.
+    let (error_badge_text, error_badge_style) = if app.unseen_errors {
+        let count = app.error_messages.len();
+        (
+            format!("[e] errors({})", count),
+            Style::default().bg(Color::DarkGray).fg(Color::Yellow),
+        )
+    } else {
+        (
+            "[e] errors".to_string(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        )
+    };
     // The blocked notice precedes the trailer so its full text stays inside the
     // visible width; the lower-priority trailer (focus/last-event hint) is the
     // part that gets clipped on narrow terminals.
-    let status_text = format!(
-        " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [v] view  [q/^C] quit  │  view: {view}{blocked_notice}{trailer}"
-    );
-    let status_bar =
-        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    //
+    // The status bar is built as a `Line` of `Span`s so the error-badge span
+    // can carry its own colour (warn/yellow) while the rest stays White/DarkGray.
+    let default_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let status_bar = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [v] view  [L] log  ",
+            default_style,
+        ),
+        Span::styled(error_badge_text, error_badge_style),
+        Span::styled(
+            format!("  [q/^C] quit  │  view: {view}{blocked_notice}{trailer}"),
+            default_style,
+        ),
+    ]))
+    .style(default_style);
     frame.render_widget(status_bar, status_area);
 
     // ── File-browser overlay ────────────────────────────────────────────────────
@@ -770,6 +808,17 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 };
                 detail_lines.push(Line::from(Span::styled(counts, style)));
                 detail_lines.push(Line::from(""));
+
+                // Add failure reason if the task is failed.
+                if let Some(reason) = &task.failure_reason {
+                    let label = failure_kind_label(&reason.kind);
+                    let reason_text = format!("failed: {} — {}", label, reason.message);
+                    detail_lines.push(Line::from(Span::styled(
+                        reason_text,
+                        Style::default().fg(Color::Red),
+                    )));
+                    detail_lines.push(Line::from(""));
+                }
             }
 
             let hint = if task_id.is_none() {
@@ -804,6 +853,17 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 };
                 detail_lines.push(Line::from(Span::styled(counts, style)));
                 detail_lines.push(Line::from(""));
+
+                // Add failure reason if the task is failed.
+                if let Some(reason) = &task.failure_reason {
+                    let label = failure_kind_label(&reason.kind);
+                    let reason_text = format!("failed: {} — {}", label, reason.message);
+                    detail_lines.push(Line::from(Span::styled(
+                        reason_text,
+                        Style::default().fg(Color::Red),
+                    )));
+                    detail_lines.push(Line::from(""));
+                }
             }
 
             detail_lines.push(Line::from(vec![Span::styled(
@@ -834,6 +894,17 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 };
                 lines.push(Line::from(Span::styled(counts, style)));
                 lines.push(Line::from(""));
+
+                // Add failure reason if the task is failed.
+                if let Some(reason) = &task.failure_reason {
+                    let label = failure_kind_label(&reason.kind);
+                    let reason_text = format!("failed: {} — {}", label, reason.message);
+                    lines.push(Line::from(Span::styled(
+                        reason_text,
+                        Style::default().fg(Color::Red),
+                    )));
+                    lines.push(Line::from(""));
+                }
             }
 
             for entry in &log.entries {
@@ -1531,6 +1602,17 @@ fn task_state_badge(s: &makina_core::api::TaskState) -> (&'static str, Color) {
     }
 }
 
+/// Short label for a failure reason kind.
+fn failure_kind_label(kind: &FailureKind) -> &'static str {
+    match kind {
+        FailureKind::GateCap => "gate cap",
+        FailureKind::ReviewCap => "review cap",
+        FailureKind::MergeConflict => "merge conflict",
+        FailureKind::HardError => "hard error",
+        FailureKind::WallClockCap => "wall-clock cap",
+    }
+}
+
 /// Spinner animation frames.
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -1733,6 +1815,56 @@ mod tests {
         );
     }
 
+    /// The status bar must advertise the `[e]` key for the error pane.
+    /// When unseen errors are present, it must show a count badge.
+    #[test]
+    fn status_bar_advertises_errors_key() {
+        use crate::app::{ErrorLevel, ErrorMessage};
+
+        let mut terminal = make_terminal(120, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Without errors, the status bar shows "[e] errors"
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("[e]"),
+            "status bar must advertise the [e] errors key"
+        );
+
+        // Add an error while the pane is closed — should mark unseen
+        app.push_error(ErrorMessage {
+            timestamp: std::time::SystemTime::now(),
+            level: ErrorLevel::Error,
+            text: "test error".to_string(),
+        });
+        assert!(app.unseen_errors, "unseen_errors flag should be set");
+
+        // With unseen errors, the status bar shows "[e] errors(count)"
+        let mut terminal = make_terminal(120, 24);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("[e] errors(1)"),
+            "status bar must show unseen error count"
+        );
+
+        // Opening the error pane clears the unseen flag
+        app.update(crate::app::AppEvent::ToggleErrorPane);
+        assert!(
+            !app.unseen_errors,
+            "unseen_errors flag should be cleared when pane opens"
+        );
+        let mut terminal = make_terminal(120, 24);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("[e] errors") && !screen.contains("[e] errors("),
+            "status bar must show [e] errors without count when pane is open"
+        );
+    }
+
     // ── Render: with runs ─────────────────────────────────────────────────────
 
     #[test]
@@ -1752,6 +1884,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -1872,7 +2005,9 @@ mod tests {
             RunView {
                 id: RunId(1),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from("docs/plans/0002-Governance-and-Persistence/TASKS.md"),
+                task_list_path: PathBuf::from(
+                    "docs/plans/0002-Governance-and-Persistence/TASKS.md",
+                ),
                 status: RunStatus::Running,
                 project: "makina".into(),
                 tasks: vec![],
@@ -2167,7 +2302,7 @@ mod tests {
 
     #[test]
     fn render_status_bar_shows_blocked_notice_when_report_blocked() {
-        let mut terminal = make_terminal(150, 30);
+        let mut terminal = make_terminal(200, 30);
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
@@ -2391,6 +2526,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 2,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("beta"),
@@ -2399,6 +2535,7 @@ mod tests {
                     gate_iterations: 1,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("alpha")],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("gamma"),
@@ -2407,6 +2544,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("beta")],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("delta"),
@@ -2415,6 +2553,7 @@ mod tests {
                     gate_iterations: 3,
                     review_iterations: 1,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2534,6 +2673,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("a"), TaskId::new("b")],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("a"),
@@ -2542,6 +2682,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("c")],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("b"),
@@ -2550,6 +2691,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("c"),
@@ -2558,6 +2700,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2649,6 +2792,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             },
             TaskView {
                 id: TaskId::new("B"),
@@ -2657,6 +2801,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             },
             TaskView {
                 id: TaskId::new("C"),
@@ -2665,6 +2810,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![TaskId::new("A")],
+                failure_reason: None,
             },
         ];
 
@@ -2711,6 +2857,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("beta"),
@@ -2719,6 +2866,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("gamma"),
@@ -2727,6 +2875,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("alpha")],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2813,6 +2962,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("beta"),
@@ -2821,6 +2971,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2937,6 +3088,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -3033,6 +3185,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("task-b"),
@@ -3041,6 +3194,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -3218,6 +3372,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -3309,6 +3464,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -3401,6 +3557,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -3649,6 +3806,7 @@ mod tests {
                     gate_iterations: 2,
                     review_iterations: 1,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("beta"),
@@ -3657,6 +3815,7 @@ mod tests {
                     gate_iterations: 1,
                     review_iterations: 3,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -3711,6 +3870,7 @@ mod tests {
                 gate_iterations: 2,
                 review_iterations: 1,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -3732,6 +3892,66 @@ mod tests {
             screen.contains("review ×1"),
             "task detail must show 'review ×1' for review_iterations=1"
         );
+    }
+
+    #[test]
+    fn failed_detail_renders_reason() {
+        use makina_core::api::{
+            FailureKind, FailureReason, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Failed,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("delta"),
+                title: "Delta task".into(),
+                state: TaskState::Failed,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                failure_reason: Some(FailureReason {
+                    kind: FailureKind::MergeConflict,
+                    message: "squash merge conflict detected".into(),
+                }),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+
+        // Select the run (index 0 by default) and task (index 0).
+        app.selected_run = Some(0);
+        app.selected_task = Some(0);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Assert that the failure reason appears in the rendered output.
+        assert!(
+            screen.contains("failed:"),
+            "task detail must contain 'failed:' label for failed task"
+        );
+        assert!(
+            screen.contains("merge conflict"),
+            "task detail must show 'merge conflict' for MergeConflict kind"
+        );
+        assert!(
+            screen.contains("squash merge conflict detected"),
+            "task detail must show the failure reason message"
+        );
+
+        // Assert that the failure reason is rendered in red.
+        let buf = terminal.backend().buffer().clone();
+        let has_red = buf
+            .content()
+            .iter()
+            .any(|cell| cell.fg == ratatui::style::Color::Red);
+        assert!(has_red, "failure reason line must use Red foreground");
     }
 
     /// **Tool title path compaction:** A Tool entry whose title contains a
@@ -3819,6 +4039,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -3879,6 +4100,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };

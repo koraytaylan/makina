@@ -341,6 +341,7 @@ mod tests {
                     updated_at: t1,
                     started_at: Some(t0),
                     finished_at: Some(t1),
+                    failure_reason: None,
                 },
                 Task {
                     id: TaskId::new("second-task"),
@@ -356,6 +357,7 @@ mod tests {
                     updated_at: t0,
                     started_at: None,
                     finished_at: None,
+                    failure_reason: None,
                 },
             ],
         }
@@ -614,6 +616,7 @@ mod tests {
             } else {
                 None
             },
+            failure_reason: None,
         }
     }
 
@@ -712,6 +715,129 @@ mod tests {
         assert_eq!(
             graph, before,
             "a clean graph must be unchanged by recover_for_resume"
+        );
+    }
+
+    // ── Test 7: snapshot_roundtrips_failure_reason ─────────────────────────────
+
+    /// A task's `failure_reason` must survive a persist → load roundtrip, and
+    /// a snapshot lacking the field (pre-0014) must still deserialise correctly
+    /// via `#[serde(default)]`.
+    #[tokio::test]
+    async fn snapshot_roundtrips_failure_reason() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        let t0 = fixed_ts(2026, 5, 1);
+        let t1 = fixed_ts(2026, 5, 2);
+
+        // Create a graph with a failed task carrying a failure reason.
+        let original = TaskGraph {
+            slug: "failure-test".to_string(),
+            tasks: vec![Task {
+                id: crate::task::TaskId::new("failed-task"),
+                title: "A task that failed".to_string(),
+                description: "This task will fail.".to_string(),
+                done_when: "should not complete".to_string(),
+                depends_on: vec![],
+                section: None,
+                state: crate::task::TaskState::Failed,
+                gate_iterations: 2,
+                review_iterations: 0,
+                created_at: t0,
+                updated_at: t1,
+                started_at: Some(t0),
+                finished_at: Some(t1),
+                failure_reason: Some(crate::api::FailureReason {
+                    kind: crate::api::FailureKind::GateCap,
+                    message: "gate cap reached after 2 iterations".to_string(),
+                }),
+            }],
+        };
+
+        // Persist and reload.
+        persist_graph(&original, root)
+            .await
+            .expect("persist_graph must succeed");
+
+        let loaded = load_graph(root, &original.slug)
+            .await
+            .expect("load_graph must succeed")
+            .expect("file must exist after persist_graph");
+
+        // Verify the failure_reason survived the roundtrip.
+        assert_eq!(
+            original.tasks[0].failure_reason, loaded.tasks[0].failure_reason,
+            "failure_reason must survive persist → load roundtrip"
+        );
+
+        let failure_reason = loaded.tasks[0].failure_reason.as_ref();
+        assert!(
+            failure_reason.is_some(),
+            "failure_reason must be Some after roundtrip"
+        );
+        if let Some(fr) = failure_reason {
+            assert_eq!(
+                fr.kind,
+                crate::api::FailureKind::GateCap,
+                "failure_reason.kind must be GateCap"
+            );
+            assert_eq!(
+                fr.message, "gate cap reached after 2 iterations",
+                "failure_reason.message must be preserved"
+            );
+        }
+    }
+
+    /// A pre-0014 snapshot lacking the `failure_reason` field must still
+    /// deserialise correctly via `#[serde(default)]`.
+    #[tokio::test]
+    async fn old_snapshot_without_failure_reason_still_loads() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // Manually craft a JSON snapshot without the failure_reason field,
+        // simulating a pre-0014 snapshot.
+        let old_json = r#"{
+  "slug": "legacy-test",
+  "tasks": [
+    {
+      "id": "old-task",
+      "title": "An old task",
+      "description": "From pre-0014",
+      "done_when": "legacy check",
+      "depends_on": [],
+      "state": "done",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-01T10:00:00Z",
+      "updated_at": "2026-05-01T10:00:00Z"
+    }
+  ]
+}"#;
+
+        let tasks_dir = root.join(".makina").join("tasks");
+        tokio::fs::create_dir_all(&tasks_dir)
+            .await
+            .expect("create tasks dir");
+
+        let path = tasks_path(root, "legacy-test");
+        tokio::fs::write(&path, old_json)
+            .await
+            .expect("write old snapshot");
+
+        // Load the pre-0014 snapshot without error.
+        let loaded = load_graph(root, "legacy-test")
+            .await
+            .expect("load_graph must succeed")
+            .expect("file must exist");
+
+        // Verify the task loaded and failure_reason is None (default).
+        assert_eq!(loaded.slug, "legacy-test");
+        assert_eq!(loaded.tasks.len(), 1);
+        assert_eq!(
+            loaded.tasks[0].failure_reason, None,
+            "failure_reason must default to None for old snapshots"
         );
     }
 }

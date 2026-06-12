@@ -121,6 +121,7 @@ fn make_task(id: &str, state: TaskState, depends_on: Vec<&str>) -> Task {
         } else {
             None
         },
+        failure_reason: None,
     }
 }
 
@@ -541,6 +542,7 @@ async fn open_run_falls_back_to_fresh_interpret_when_artifact_fails_validation()
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         }],
     };
 

@@ -467,6 +467,8 @@ pub enum AppEvent {
     Tick,
     /// Toggle the error pane open/closed (`e` / `E`).
     ToggleErrorPane,
+    /// Open the focused task's log in `$PAGER` (`L`).
+    OpenLog,
 
     // ── Task-status view (task 29) ────────────────────────────────────────────
     /// A full [`RunView`] (with its task list) was fetched from the api and
@@ -691,6 +693,10 @@ pub struct App {
     /// by evicting the oldest; see [`App::push_error`].
     pub error_messages: Vec<ErrorMessage>,
 
+    /// Whether there are unseen error messages since the error pane was last opened.
+    /// Cleared when the error pane opens; set when a new error message arrives.
+    pub unseen_errors: bool,
+
     /// The root directory of the repository, used for compacting tool paths.
     pub repo_root: PathBuf,
 
@@ -744,6 +750,7 @@ impl App {
             status_message: None,
             error_pane_open: false,
             error_messages: Vec::new(),
+            unseen_errors: false,
             repo_root,
             tick: 0,
         }
@@ -770,11 +777,16 @@ impl App {
     ///
     /// Mirrors [`ExchangeLog::push`]: maintains the [`ERROR_MESSAGES_CAP`]
     /// bound so the buffer cannot grow without limit.
+    /// Marks the errors as unseen if the pane is not currently open.
     pub fn push_error(&mut self, msg: ErrorMessage) {
         self.error_messages.push(msg);
         if self.error_messages.len() > ERROR_MESSAGES_CAP {
             // Drop the oldest message to maintain the bound.
             self.error_messages.remove(0);
+        }
+        // Mark errors as unseen if the pane is not currently open.
+        if !self.error_pane_open {
+            self.unseen_errors = true;
         }
     }
 
@@ -906,6 +918,15 @@ impl App {
             }
             AppEvent::ToggleErrorPane => {
                 self.error_pane_open = !self.error_pane_open;
+                // Clear the unseen errors flag when the pane opens.
+                if self.error_pane_open {
+                    self.unseen_errors = false;
+                }
+                true
+            }
+            AppEvent::OpenLog => {
+                // This is an intent; the IO layer handles the actual file I/O.
+                // `update` returns true to trigger a redraw.
                 true
             }
             AppEvent::SelectUp => {
@@ -1527,6 +1548,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -1563,6 +1585,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -1920,6 +1943,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -1974,6 +1998,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("t2"),
@@ -1982,6 +2007,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("t1")],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2022,6 +2048,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -2058,6 +2085,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -2108,6 +2136,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("t2"),
@@ -2116,6 +2145,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2160,6 +2190,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("t2"),
@@ -2168,6 +2199,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2431,6 +2463,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("task-b"),
@@ -2439,6 +2472,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2886,6 +2920,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
                 TaskView {
                     id: TaskId::new("t2"),
@@ -2894,6 +2929,7 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    failure_reason: None,
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -2911,6 +2947,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -3492,6 +3529,7 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
         };

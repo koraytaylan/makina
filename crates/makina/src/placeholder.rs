@@ -208,6 +208,7 @@ fn sample_run(id: RunId) -> RunView {
                 gate_iterations: 0,
                 review_iterations: 1,
                 depends_on: vec![],
+                failure_reason: None,
             },
             TaskView {
                 id: TaskId::new("tui-scaffold"),
@@ -216,6 +217,7 @@ fn sample_run(id: RunId) -> RunView {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![TaskId::new("core-api")],
+                failure_reason: None,
             },
             TaskView {
                 id: TaskId::new("runs-sidebar"),
@@ -224,6 +226,7 @@ fn sample_run(id: RunId) -> RunView {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![TaskId::new("tui-scaffold")],
+                failure_reason: None,
             },
         ],
         report: makina_core::api::IngestionReport::default(),

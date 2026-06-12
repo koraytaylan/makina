@@ -171,6 +171,14 @@ pub struct Task {
     /// [`TaskState::Failed`]).  `None` until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
+
+    /// Why the task reached [`TaskState::Failed`], if applicable.
+    ///
+    /// Set by the supervisor at the failing transition.  `None` for tasks that
+    /// are not `Failed` (or failed before plan 0014 populated this field — the
+    /// `#[serde(default)]` ensures older snapshots still deserialise cleanly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<crate::api::FailureReason>,
 }
 
 // ── TaskGraph ─────────────────────────────────────────────────────────────────
@@ -311,6 +319,7 @@ mod tests {
                     updated_at: t1,
                     started_at: Some(t0),
                     finished_at: Some(t1),
+                    failure_reason: None,
                 },
                 Task {
                     id: TaskId::new("task-model"),
@@ -328,6 +337,7 @@ mod tests {
                     updated_at: t2,
                     started_at: Some(t2),
                     finished_at: None,
+                    failure_reason: None,
                 },
                 Task {
                     id: TaskId::new("config-loading"),
@@ -343,6 +353,7 @@ mod tests {
                     updated_at: t0,
                     started_at: None,
                     finished_at: None,
+                    failure_reason: None,
                 },
             ],
         }
@@ -420,6 +431,7 @@ mod tests {
                 updated_at: t0,
                 started_at: None,
                 finished_at: None,
+                failure_reason: None,
             }],
         };
 
@@ -452,6 +464,7 @@ mod tests {
             updated_at: t0,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         };
         let graph = TaskGraph {
             slug: "dup-graph".to_string(),

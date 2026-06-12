@@ -1240,19 +1240,12 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // wall-clock arms, transitively `Skipped` its dependents so they do
                 // not dangle non-terminal (a non-`Done` dep never unlocks them).
                 if state == TaskState::Failed {
-                    // Derive WHICH cap fired from the task's iteration counts under
-                    // the lock so the report records *why* it failed
-                    // (sched-run-status-failed): a task that went through review
-                    // (`review_iterations > 0`) surfaced its terminal `Failed` via
-                    // the reviewer cap; otherwise the gate-iteration cap fired.
+                    // Read the failure reason the driver stored on the task at the
+                    // failure site (set_failure_reason_locked); skip dependents.
                     let (skipped, reason) = {
                         let mut graph = ctx.graph.lock().await;
-                        let reviewed = review_iterations_locked(&graph, &id).unwrap_or(0) > 0;
-                        let reason = if reviewed {
-                            "review-cap-reached".to_string()
-                        } else {
-                            "gate-cap-reached".to_string()
-                        };
+                        let reason = stored_failure_reason_message_locked(&graph, &id)
+                            .unwrap_or_else(|| "cap-reached".to_string());
                         let skipped = mark_dependents_skipped(&mut graph, &id);
                         (skipped, reason)
                     };
@@ -1321,6 +1314,12 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                         match apply_event_locked(&mut graph, &id, TaskEvent::WallClockCapReached) {
                             Ok(()) => {
                                 mark_finished_locked(&mut graph, &id);
+                                set_failure_reason_locked(
+                                    &mut graph,
+                                    &id,
+                                    api::FailureKind::WallClockCap,
+                                    format!("wall-clock cap reached for {id}"),
+                                );
                                 TaskState::Failed
                             }
                             Err(_) => {
@@ -1599,17 +1598,24 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     {
         Ok(wt) => wt,
         Err(e) => {
+            let msg = format!("worktree create failed for {task_id}: {e}");
             {
                 let mut graph = ctx.graph.lock().await;
                 apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                 mark_finished_locked(&mut graph, task_id);
+                set_failure_reason_locked(
+                    &mut graph,
+                    task_id,
+                    api::FailureKind::HardError,
+                    msg.clone(),
+                );
             }
             // Persist Ready→Failed (best-effort; lock released above).
             ctx.persist().await;
             // No worktree was created, so there is nothing to remove; mark the
             // guard so it does not attempt a redundant best-effort teardown.
             guard.worktree_removed = true;
-            return Err(format!("worktree create failed for {task_id}: {e}"));
+            return Err(msg);
         }
     };
 
@@ -1707,16 +1713,23 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
         let verdict = match review_result {
             Ok(v) => v,
             Err(e) => {
+                let msg = format!("reviewer dispatch failed for {task_id}: {e}");
                 {
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                     mark_finished_locked(&mut graph, task_id);
+                    set_failure_reason_locked(
+                        &mut graph,
+                        task_id,
+                        api::FailureKind::HardError,
+                        msg.clone(),
+                    );
                 }
                 // Persist InReview→Failed (best-effort; lock released above).
                 ctx.persist().await;
                 remove_worktree(ctx, task_id).await;
                 guard.worktree_removed = true;
-                return Err(format!("reviewer dispatch failed for {task_id}: {e}"));
+                return Err(msg);
             }
         };
 
@@ -1756,16 +1769,23 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         // legal, so drive the task terminal (HardError is reserved
                         // for hard failures; ReviewCapReached stays the reviewer
                         // cap).  Then clean up + propagate.
+                        let msg = format!("squash-merge failed for {task_id}: {e}");
                         {
                             let mut graph = ctx.graph.lock().await;
                             apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                             mark_finished_locked(&mut graph, task_id);
+                            set_failure_reason_locked(
+                                &mut graph,
+                                task_id,
+                                api::FailureKind::HardError,
+                                msg.clone(),
+                            );
                         }
                         // Persist InReview→Failed (best-effort; lock released above).
                         ctx.persist().await;
                         remove_worktree(ctx, task_id).await;
                         guard.worktree_removed = true;
-                        return Err(format!("squash-merge failed for {task_id}: {e}"));
+                        return Err(msg);
                     }
                 };
 
@@ -1796,11 +1816,19 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         // dedicated `MergeConflict` event (InReview → Failed).
                         // This distinguishes it from reviewer-cap exhaustion
                         // (still ReviewCapReached) and hard merge errors (HardError).
-                        let _ = details; // surfaced to the seam; logged by a later task.
+                        // `details` is surfaced to the conflict message; agent-driven
+                        // reconciliation is a seam for a later task.
+                        let conflict_msg = format!("merge conflict for {task_id}: {details}");
                         {
                             let mut graph = ctx.graph.lock().await;
                             apply_event_locked(&mut graph, task_id, TaskEvent::MergeConflict)?;
                             mark_finished_locked(&mut graph, task_id);
+                            set_failure_reason_locked(
+                                &mut graph,
+                                task_id,
+                                api::FailureKind::MergeConflict,
+                                conflict_msg,
+                            );
                         }
                         // Persist InReview→Failed (MergeConflict; best-effort; lock
                         // released above).
@@ -1844,15 +1872,22 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     // this final rejection in `review_iterations` first (so the
                     // recorded count equals the cap), then transition InReview →
                     // Failed via ReviewCapReached.
+                    let cap = ctx.config.caps.reviewer_iterations;
                     let (gate_iters, review_iters) = {
                         let mut graph = ctx.graph.lock().await;
                         increment_review_iterations_locked(&mut graph, task_id);
                         apply_event_locked(&mut graph, task_id, TaskEvent::ReviewCapReached)?;
                         mark_finished_locked(&mut graph, task_id);
-                        (
-                            gate_iterations_locked(&graph, task_id)?,
-                            review_iterations_locked(&graph, task_id)?,
-                        )
+                        let review_iters = review_iterations_locked(&graph, task_id)?;
+                        set_failure_reason_locked(
+                            &mut graph,
+                            task_id,
+                            api::FailureKind::ReviewCap,
+                            format!(
+                                "reviewer cap reached for {task_id}: {review_iters}/{cap} rejections"
+                            ),
+                        );
+                        (gate_iterations_locked(&graph, task_id)?, review_iters)
                     }; // guard dropped before emit.
                     // Persist InReview→Failed (ReviewCapReached; best-effort; lock
                     // released above).
@@ -1958,15 +1993,22 @@ async fn develop_until_gates_pass(
 
         if let Err(e) = develop_result {
             // Hard error during development → InProgress → Failed (HardError).
+            let msg = format!("developer dispatch failed for {task_id}: {e}");
             {
                 let mut graph = ctx.graph.lock().await;
                 apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                 mark_finished_locked(&mut graph, task_id);
+                set_failure_reason_locked(
+                    &mut graph,
+                    task_id,
+                    api::FailureKind::HardError,
+                    msg.clone(),
+                );
             }
             // Persist InProgress→Failed (best-effort; lock released above).
             ctx.persist().await;
             remove_worktree(ctx, task_id).await;
-            return Err(format!("developer dispatch failed for {task_id}: {e}"));
+            return Err(msg);
         }
 
         // ── Gate turn: run ALL configured gates in the worktree ────────────────
@@ -2048,10 +2090,19 @@ async fn develop_until_gates_pass(
                     // GateCapReached: InProgress → Failed (terminal).  The terminal
                     // Failed state is emitted by the scheduler when this driver
                     // returns Ok(GateCapReached) → Ok(Failed).
+                    let cap = ctx.config.caps.gate_iterations;
                     {
                         let mut graph = ctx.graph.lock().await;
                         apply_event_locked(&mut graph, task_id, TaskEvent::GateCapReached)?;
                         mark_finished_locked(&mut graph, task_id);
+                        set_failure_reason_locked(
+                            &mut graph,
+                            task_id,
+                            api::FailureKind::GateCap,
+                            format!(
+                                "gate cap reached for {task_id}: {iterations}/{cap} iterations"
+                            ),
+                        );
                     }
                     // Persist InProgress→Failed (GateCapReached; best-effort; lock
                     // released above).
@@ -2069,16 +2120,23 @@ async fn develop_until_gates_pass(
             Err(e) => {
                 // The gate command could not be LAUNCHED (infra failure). Treat as
                 // a hard error: we are in InProgress, so HardError → Failed.
+                let msg = format!("gate launch failed for {task_id}: {e}");
                 {
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                     mark_finished_locked(&mut graph, task_id);
+                    set_failure_reason_locked(
+                        &mut graph,
+                        task_id,
+                        api::FailureKind::HardError,
+                        msg.clone(),
+                    );
                 }
                 // Persist InProgress→Failed (gate launch HardError; best-effort;
                 // lock released above).
                 ctx.persist().await;
                 remove_worktree(ctx, task_id).await;
-                return Err(format!("gate launch failed for {task_id}: {e}"));
+                return Err(msg);
             }
         }
     }
@@ -2200,6 +2258,31 @@ fn mark_finished_locked(graph: &mut TaskGraph, task_id: &TaskId) {
     }
 }
 
+/// Record the classified [`api::FailureReason`] on the task at the failure site.
+///
+/// Called immediately after `apply_event_locked` (or `mark_finished_locked`)
+/// when the task transitions to `Failed`, so the scheduler can read the stored
+/// reason directly without re-deriving it from iteration counts.
+fn set_failure_reason_locked(
+    graph: &mut TaskGraph,
+    task_id: &TaskId,
+    kind: api::FailureKind,
+    message: String,
+) {
+    if let Ok(task) = task_mut_locked(graph, task_id) {
+        task.failure_reason = Some(api::FailureReason { kind, message });
+    }
+}
+
+/// Read the stored [`api::FailureReason`] from the locked graph, returning
+/// its `message` string, or `None` if no reason was set.
+fn stored_failure_reason_message_locked(graph: &TaskGraph, task_id: &TaskId) -> Option<String> {
+    graph
+        .get(task_id)
+        .and_then(|t| t.failure_reason.as_ref())
+        .map(|fr| fr.message.clone())
+}
+
 /// Move the transitive dependents of a just-`Failed` task to [`TaskState::Skipped`].
 ///
 /// `depends_on` lists each task's *prerequisites*, so a failed task's dependents
@@ -2286,6 +2369,7 @@ mod tests {
             updated_at: now,
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         }
     }
 
