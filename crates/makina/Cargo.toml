@@ -25,6 +25,9 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
+# Compatibility pin for ratatui-widgets 0.3.x: time 0.3.48 introduced a
+# coherence conflict with its blanket From<T> impls during fresh installs.
+time = "=0.3.47"
 pulldown-cmark = { version = "0.12", default-features = false }
 ansi-to-tui = "8"
 # JSON serialization for replay module (reading transcripts)
