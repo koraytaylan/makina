@@ -114,6 +114,7 @@ fn config_with_gates(gates: Vec<GateConfig>, gate_iterations: u32) -> Config {
             gate_iterations,
             reviewer_iterations: 5,
             wall_clock_secs: 1800,
+            idle_secs: None,
         },
         concurrency: 1,
         gates,

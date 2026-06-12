@@ -294,6 +294,7 @@ mod tests {
                 // Smoke test: no run context; a no-op sink (events are additive).
                 run: crate::api::RunId(0),
                 sink: std::sync::Arc::new(|_| {}),
+                idle_secs: None,
             })
             .send()
             .await
@@ -318,6 +319,7 @@ mod tests {
                 worktree: PathBuf::from("/tmp/test-worktree"),
                 run: crate::api::RunId(0),
                 sink: std::sync::Arc::new(|_| {}),
+                idle_secs: None,
             })
             .send()
             .await
@@ -423,6 +425,7 @@ mod tests {
                 feedback: None,
                 run: api::RunId(7),
                 sink,
+                idle_secs: None,
             })
             .send()
             .await

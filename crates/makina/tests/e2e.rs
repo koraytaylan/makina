@@ -535,6 +535,11 @@ fn log_event(ev: &Event) {
                 eprintln!("  · {role:?}[{}] → [turn complete]", task.0)
             }
         },
+        Event::TaskIdle {
+            task, idle_secs, ..
+        } => {
+            eprintln!("  · TaskIdle {}[idle timeout: {idle_secs}s]", task.0)
+        }
     }
 }
 

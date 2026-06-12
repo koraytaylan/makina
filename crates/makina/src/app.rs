@@ -648,6 +648,31 @@ pub struct App {
     /// the currently focused task when rendering the exchange pane.
     pub exchange_logs: HashMap<(RunId, TaskId), ExchangeLog>,
 
+    /// Per-task last-activity tick, updated whenever an exchange event arrives.
+    ///
+    /// Keyed by `(RunId, TaskId)` to match `exchange_logs`. Used to compute
+    /// the idle duration for the focused in-progress task in the exchange header.
+    pub task_last_activity_tick: HashMap<(RunId, TaskId), u64>,
+
+    /// Per-task step-start tick, recorded when a task enters `InProgress`/`InReview`.
+    ///
+    /// Keyed by `(RunId, TaskId)` to match `exchange_logs`. Used to compute
+    /// the wall-clock countdown toward `wall_clock_secs` in the exchange header.
+    pub task_step_start_tick: HashMap<(RunId, TaskId), u64>,
+
+    /// The configured idle timeout in seconds (discovered from `TaskIdle` events).
+    ///
+    /// Used to style the idle indicator in the exchange header (amber past half,
+    /// red as it approaches). `None` until a TaskIdle event is received.
+    pub idle_secs_config: Option<u64>,
+
+    /// The configured wall-clock timeout in seconds.
+    ///
+    /// For now, this is a hardcoded reasonable default; in a future enhancement
+    /// it could be discovered from events. Used to compute the countdown in
+    /// the exchange header.
+    pub wall_clock_secs_config: u64,
+
     /// Manual scroll offset for the exchange pane, in lines from the top.
     ///
     /// `App` does not know the rendered line count or pane height, so the
@@ -743,6 +768,8 @@ impl App {
             selected_run,
             selected_task,
             exchange_logs: HashMap::new(),
+            task_last_activity_tick: HashMap::new(),
+            task_step_start_tick: HashMap::new(),
             exchange_scroll: 0,
             exchange_auto_follow: true,
             last_scroll_max: std::cell::Cell::new(0),
@@ -753,6 +780,8 @@ impl App {
             unseen_errors: false,
             repo_root,
             tick: 0,
+            idle_secs_config: None,
+            wall_clock_secs_config: 600, // 10 minutes as a reasonable default
         }
     }
 
@@ -1276,6 +1305,14 @@ impl App {
                     && let Some(tv) = rv.tasks.iter_mut().find(|t| t.id == *task)
                 {
                     tv.state = state.clone();
+                    // When entering InProgress or InReview, record the step start tick.
+                    if matches!(state, TaskState::InProgress | TaskState::InReview) {
+                        self.task_step_start_tick
+                            .insert((*run, task.clone()), self.tick);
+                        // Initialize last activity to step start as well.
+                        self.task_last_activity_tick
+                            .insert((*run, task.clone()), self.tick);
+                    }
                     // Recompute aggregate run status from task states (simple heuristic).
                     let any_failed = rv.tasks.iter().any(|t| t.state == TaskState::Failed);
                     let all_done = rv.tasks.iter().all(|t| t.state == TaskState::Done);
@@ -1358,6 +1395,20 @@ impl App {
             } => {
                 let log = self.exchange_logs.entry((*run, task.clone())).or_default();
                 apply_exchange_event(log, role.clone(), exchange_ev);
+                // Update last-activity tick whenever an exchange event arrives.
+                self.task_last_activity_tick
+                    .insert((*run, task.clone()), self.tick);
+            }
+            // Idle watchdog event: a task stalled with no output for idle_secs.
+            // Record the idle_secs config for styling the idle indicator in the
+            // exchange header.
+            Event::TaskIdle {
+                run: _,
+                task: _,
+                idle_secs,
+            } => {
+                // Record the idle timeout config for use in rendering the idle indicator.
+                self.idle_secs_config = Some(*idle_secs);
             }
         }
 

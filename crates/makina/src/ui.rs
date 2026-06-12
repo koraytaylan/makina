@@ -741,6 +741,70 @@ fn dependency_levels(
     levels
 }
 
+/// Render the activity indicators (idle time and wall-clock countdown) for a task.
+///
+/// Returns a vector of Spans to be added to the task detail line, showing:
+/// - `idle {n}s` with color based on idle threshold (dim → amber → red)
+/// - `wall-clock {m}m {s}s left` countdown
+fn task_activity_indicators(app: &App, task: &makina_core::api::TaskView) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span> = Vec::new();
+
+    if !matches!(
+        task.state,
+        makina_core::api::TaskState::InProgress | makina_core::api::TaskState::InReview
+    ) {
+        return spans;
+    }
+
+    if let Some(run) = app.selected_run() {
+        let key = (run.id, task.id.clone());
+
+        // Add idle time indicator.
+        if let Some(last_activity_tick) = app.task_last_activity_tick.get(&key) {
+            // Tick interval is 250ms, so 4 ticks per second.
+            let idle_secs = (app.tick - last_activity_tick) / 4;
+            let idle_color = if let Some(idle_cap) = app.idle_secs_config {
+                if idle_secs >= idle_cap {
+                    Color::Red
+                } else if idle_secs >= idle_cap / 2 {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }
+            } else {
+                Color::DarkGray
+            };
+            spans.push(Span::styled(
+                format!("  idle {}s", idle_secs),
+                Style::default().fg(idle_color),
+            ));
+        }
+
+        // Add wall-clock countdown.
+        if let Some(step_start_tick) = app.task_step_start_tick.get(&key) {
+            // Tick interval is 250ms, so 4 ticks per second.
+            let elapsed_secs = (app.tick - step_start_tick) / 4;
+            let wall_clock_cap = app.wall_clock_secs_config;
+            if elapsed_secs < wall_clock_cap {
+                let remaining_secs = wall_clock_cap - elapsed_secs;
+                let minutes = remaining_secs / 60;
+                let secs = remaining_secs % 60;
+                spans.push(Span::styled(
+                    format!("  · wall-clock {}m {}s left", minutes, secs),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "  · wall-clock exceeded",
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        }
+    }
+
+    spans
+}
+
 fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool) {
     // Determine which task's log to display using the composite (RunId, TaskId)
     // key so logs from different runs with the same task slug never collide.
@@ -807,6 +871,13 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     Style::default().fg(Color::Yellow)
                 };
                 detail_lines.push(Line::from(Span::styled(counts, style)));
+
+                // Add idle time and wall-clock countdown for in-progress tasks.
+                let activity_indicators = task_activity_indicators(app, task);
+                if !activity_indicators.is_empty() {
+                    detail_lines.push(Line::from(activity_indicators));
+                }
+
                 detail_lines.push(Line::from(""));
 
                 // Add failure reason if the task is failed.
@@ -852,6 +923,13 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     Style::default().fg(Color::Yellow)
                 };
                 detail_lines.push(Line::from(Span::styled(counts, style)));
+
+                // Add idle time and wall-clock countdown for in-progress tasks.
+                let activity_indicators = task_activity_indicators(app, task);
+                if !activity_indicators.is_empty() {
+                    detail_lines.push(Line::from(activity_indicators));
+                }
+
                 detail_lines.push(Line::from(""));
 
                 // Add failure reason if the task is failed.
@@ -893,6 +971,13 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     Style::default().fg(Color::Yellow)
                 };
                 lines.push(Line::from(Span::styled(counts, style)));
+
+                // Add idle time and wall-clock countdown for in-progress tasks.
+                let activity_indicators = task_activity_indicators(app, task);
+                if !activity_indicators.is_empty() {
+                    lines.push(Line::from(activity_indicators));
+                }
+
                 lines.push(Line::from(""));
 
                 // Add failure reason if the task is failed.
@@ -1610,6 +1695,7 @@ fn failure_kind_label(kind: &FailureKind) -> &'static str {
         FailureKind::MergeConflict => "merge conflict",
         FailureKind::HardError => "hard error",
         FailureKind::WallClockCap => "wall-clock cap",
+        FailureKind::IdleTimeout => "idle timeout",
     }
 }
 
@@ -1643,6 +1729,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::SessionCapabilities { .. } => "SessionCapabilities",
         Event::CurrentModeUpdate { .. } => "CurrentModeUpdate",
         Event::AgentExchange { .. } => "AgentExchange",
+        Event::TaskIdle { .. } => "TaskIdle",
     }
 }
 
@@ -4278,6 +4365,81 @@ mod tests {
         assert!(
             log.entries.iter().all(|e| e.complete()),
             "after TurnComplete, all entries must be marked complete"
+        );
+    }
+
+    /// **Live activity header shows idle and wall-clock:** When a task is
+    /// in-progress, the exchange pane header displays:
+    /// - `idle {n}s` with color based on idle threshold (dim → amber → red)
+    /// - `wall-clock {m}m {s}s left` countdown toward the wall-clock limit
+    #[test]
+    fn header_shows_idle_and_countdown() {
+        use crate::app::AppEvent;
+        use makina_core::api::{Event, RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("test-task"),
+                title: "Test task".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+
+        // Initialize: task is at tick 0 when InProgress starts
+        app.update(AppEvent::ApiEvent(Event::TaskStateChanged {
+            run: RunId(1),
+            task: TaskId::new("test-task"),
+            state: TaskState::InProgress,
+        }));
+
+        // Advance to tick 100 (simulating ~50 seconds of elapsed time at ~2 ticks/sec)
+        for _ in 0..100 {
+            app.update(AppEvent::Tick);
+        }
+
+        // Now simulate activity at tick 110 (so idle = 0s, since last activity is at tick 110)
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("test-task"),
+            role: makina_core::api::AgentRole::Developer,
+            event: makina_core::api::ExchangeEvent::ResponseChunk {
+                text: "Starting work...".into(),
+            },
+        }));
+
+        // Record the idle secs config via a TaskIdle event
+        app.update(AppEvent::ApiEvent(Event::TaskIdle {
+            run: RunId(1),
+            task: TaskId::new("test-task"),
+            idle_secs: 30,
+        }));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The screen must contain an idle indicator.
+        assert!(
+            screen.contains("idle") || screen.contains("idle 0s"),
+            "exchange header must show an idle indicator when task is in-progress"
+        );
+
+        // The screen must contain a wall-clock countdown indicator.
+        assert!(
+            screen.contains("wall-clock") && screen.contains("left"),
+            "exchange header must show a wall-clock countdown when task is in-progress"
         );
     }
 }

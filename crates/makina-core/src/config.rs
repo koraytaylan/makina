@@ -251,6 +251,13 @@ pub struct CapsConfig {
     /// If a task is still in-progress after this many seconds it is forcibly
     /// failed.
     pub wall_clock_secs: u64,
+
+    /// Optional idle timeout in seconds.
+    ///
+    /// If set, a task step will be aborted if no output is received for this
+    /// many seconds. Must be at least 1 if specified.
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
 }
 
 impl Default for CapsConfig {
@@ -259,6 +266,7 @@ impl Default for CapsConfig {
             gate_iterations: 5,
             reviewer_iterations: 5,
             wall_clock_secs: 1800, // 30 minutes
+            idle_secs: None,
         }
     }
 }
@@ -394,6 +402,13 @@ pub struct CapsOverride {
 
     /// Override [`CapsConfig::wall_clock_secs`] if `Some`.
     pub wall_clock_secs: Option<u64>,
+
+    /// Override [`CapsConfig::idle_secs`] if present in the TOML.
+    ///
+    /// When `Some`, this value overrides the global `idle_secs`.
+    /// The inner `Option<u64>` allows specifying `idle_secs = None` explicitly
+    /// to disable idle timeout for a project.
+    pub idle_secs: Option<Option<u64>>,
 }
 
 /// Project-level configuration, stored at `makina.toml` in the repo root.
@@ -498,6 +513,7 @@ impl Config {
                     .reviewer_iterations
                     .unwrap_or(global.caps.reviewer_iterations),
                 wall_clock_secs: ov.wall_clock_secs.unwrap_or(global.caps.wall_clock_secs),
+                idle_secs: ov.idle_secs.unwrap_or(global.caps.idle_secs),
             }
         } else {
             global.caps.clone()
@@ -651,6 +667,20 @@ impl Config {
             return Err(ConfigError::Validation {
                 reason: "caps.wall_clock_secs must be at least 1".to_string(),
             });
+        }
+
+        if let Some(idle_secs) = self.caps.idle_secs {
+            if idle_secs == 0 {
+                return Err(ConfigError::Validation {
+                    reason: "caps.idle_secs must be at least 1".to_string(),
+                });
+            }
+            if idle_secs >= self.caps.wall_clock_secs {
+                warn!(
+                    "caps.idle_secs ({}) is >= wall_clock_secs ({}), idle watchdog will never trigger",
+                    idle_secs, self.caps.wall_clock_secs
+                );
+            }
         }
 
         if self.concurrency == 0 {
@@ -1085,6 +1115,63 @@ mod tests {
         assert_eq!(caps.gate_iterations, 5);
         assert_eq!(caps.reviewer_iterations, 5);
         assert_eq!(caps.wall_clock_secs, 1800);
+    }
+
+    /// `idle_secs` validation: Some(0) fails, Some(30) succeeds, None succeeds.
+    #[test]
+    fn idle_cap_validates() {
+        // Test 1: idle_secs = Some(0) should fail validation
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+            [caps]
+            idle_secs = 0
+            "#,
+            "test-global",
+        )
+        .expect("valid TOML");
+        let project = ProjectConfig::from_toml_str("", "test-project").expect("empty project");
+        let config = Config::resolve(global, project);
+        let err = config
+            .validate()
+            .expect_err("idle_secs = 0 should fail validation");
+        assert_eq!(
+            err.to_string(),
+            "invalid config: caps.idle_secs must be at least 1"
+        );
+
+        // Test 2: idle_secs = Some(30) should succeed
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+            [caps]
+            idle_secs = 30
+            "#,
+            "test-global",
+        )
+        .expect("valid TOML");
+        let project = ProjectConfig::from_toml_str("", "test-project").expect("empty project");
+        let config = Config::resolve(global, project);
+        config.validate().expect("idle_secs = 30 should validate");
+
+        // Test 3: idle_secs = None (default) should succeed
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+            "#,
+            "test-global",
+        )
+        .expect("valid TOML");
+        let project = ProjectConfig::from_toml_str("", "test-project").expect("empty project");
+        let config = Config::resolve(global, project);
+        config.validate().expect("idle_secs = None should validate");
+        assert_eq!(
+            config.caps.idle_secs, None,
+            "idle_secs should default to None"
+        );
     }
 
     /// Global default concurrency is 3.

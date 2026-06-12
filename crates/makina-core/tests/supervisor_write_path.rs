@@ -402,6 +402,7 @@ async fn persist_file_matches_snapshot_after_gate_cap_failed() {
             gate_iterations: 2, // fail after 2 gate iterations
             reviewer_iterations: 3,
             wall_clock_secs: 60,
+            idle_secs: None,
         },
         ..Config::resolve(
             makina_core::config::GlobalConfig::default(),
@@ -522,6 +523,7 @@ async fn persist_file_matches_snapshot_after_reviewer_cap_failed() {
             gate_iterations: 5,
             reviewer_iterations: cap,
             wall_clock_secs: 60,
+            idle_secs: None,
         },
         ..Config::resolve(
             makina_core::config::GlobalConfig::default(),
@@ -637,6 +639,7 @@ async fn task_view_carries_failure_reason() {
             gate_iterations: 2,
             reviewer_iterations: 3,
             wall_clock_secs: 60,
+            idle_secs: None,
         },
         ..Config::resolve(
             makina_core::config::GlobalConfig::default(),

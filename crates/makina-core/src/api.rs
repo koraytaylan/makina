@@ -188,6 +188,8 @@ pub enum FailureKind {
     HardError,
     /// Per-task wall-clock deadline elapsed.
     WallClockCap,
+    /// Idle watchdog fired: no agent output for the configured duration.
+    IdleTimeout,
 }
 
 /// A typed failure reason attached to a [`TaskView`] in the `Failed` state.
@@ -735,6 +737,20 @@ pub enum Event {
         /// kinds are observability-only and do not contribute to the final
         /// answer text.
         event: ExchangeEvent,
+    },
+
+    /// The idle watchdog fired on a task: no agent output for the configured duration.
+    ///
+    /// Emitted when a step stalls (produces no output) for longer than the
+    /// configured `caps.idle_secs` threshold. The task will transition to
+    /// `Failed` with `FailureKind::IdleTimeout`.
+    TaskIdle {
+        /// The Run containing the task.
+        run: RunId,
+        /// The task that stalled.
+        task: TaskId,
+        /// The idle timeout duration in seconds.
+        idle_secs: u64,
     },
 }
 

@@ -266,6 +266,7 @@ async fn gate_cap_drives_task_to_failed() {
             gate_iterations: cap,
             reviewer_iterations: 5,
             wall_clock_secs: 1800,
+            idle_secs: None,
         },
     );
 
@@ -378,6 +379,7 @@ async fn reviewer_cap_drives_task_to_failed() {
             gate_iterations: 5,
             reviewer_iterations: cap,
             wall_clock_secs: 1800,
+            idle_secs: None,
         },
     );
 
@@ -584,6 +586,7 @@ async fn wall_clock_cap_drives_task_to_failed() {
             gate_iterations: 5,
             reviewer_iterations: 5,
             wall_clock_secs: 1, // tiny per-task deadline
+            idle_secs: None,
         },
     );
 
@@ -696,6 +699,7 @@ async fn dependents_of_failed_task_are_skipped() {
             gate_iterations: 2,
             reviewer_iterations: 5,
             wall_clock_secs: 1800,
+            idle_secs: None,
         },
     );
     cfg.concurrency = 2;

@@ -44,6 +44,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use kameo::actor::ActorRef;
@@ -55,6 +56,34 @@ use crate::roles::{Role, parse_review_verdict, session_config_for};
 use crate::task::Task;
 
 use super::supervisor::{EventSink, Supervisor};
+
+// ── Typed error for the Review reply ─────────────────────────────────────────
+
+/// Typed failure returned by the [`Review`] message handler.
+///
+/// Having a typed enum (rather than a bare `String`) lets the Supervisor
+/// classify the failure without fragile substring matching.
+#[derive(Debug)]
+pub enum ReviewerError {
+    /// The idle watchdog fired: no agent output for the configured duration.
+    IdleTimeout {
+        /// The idle timeout in seconds that was exceeded.
+        idle_secs: u64,
+    },
+    /// Any other error (backend spawn, transport, verdict parse failure, etc.).
+    Other(String),
+}
+
+impl std::fmt::Display for ReviewerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReviewerError::IdleTimeout { idle_secs } => {
+                write!(f, "no agent output for {idle_secs}s")
+            }
+            ReviewerError::Other(msg) => f.write_str(msg),
+        }
+    }
+}
 
 // ── ReviewVerdict re-export ───────────────────────────────────────────────────
 
@@ -143,20 +172,22 @@ pub struct Review {
     pub run: api::RunId,
     /// Live-event sink: where `AgentExchange` events are published.
     pub sink: EventSink,
+    /// Idle timeout in seconds; `None` means no idle watchdog.
+    pub idle_secs: Option<u64>,
 }
 
 /// Reply returned by the [`Review`] handler.
 ///
 /// `Ok(ReviewVerdict)` carries the parsed verdict (approve / reject+feedback);
-/// `Err(String)` signals a handler-level failure (backend spawn/prompt/transport
-/// error, or a verdict that could not be parsed).  The `Result` wrapper also
-/// satisfies kameo's `Reply` bound via the blanket `impl Reply for Result<T, E>`
-/// (`ReviewVerdict` itself does not implement `Reply`).
+/// `Err(ReviewerError)` signals a handler-level failure (backend spawn,
+/// transport, verdict parse failure, or idle timeout).  The Supervisor inspects
+/// the typed error to decide the [`crate::api::FailureKind`] without string
+/// matching.
 ///
 /// This alias mirrors [`DevelopAck`](super::developer::DevelopAck) and
 /// [`InterpretTaskListAck`](super::planner::InterpretTaskListAck) for consistency
 /// across the spokes (addressing the actor-traits review note).
-pub type ReviewReply = Result<ReviewVerdict, String>;
+pub type ReviewReply = Result<ReviewVerdict, ReviewerError>;
 
 impl kameo::message::Message<Review> for Reviewer {
     type Reply = ReviewReply;
@@ -179,7 +210,7 @@ impl kameo::message::Message<Review> for Reviewer {
             .backend
             .spawn(config)
             .await
-            .map_err(|e| format!("reviewer backend spawn failed: {e}"))?;
+            .map_err(|e| ReviewerError::Other(format!("reviewer backend spawn failed: {e}")))?;
 
         let task_id = api::TaskId(msg.task.id.0.clone());
 
@@ -210,17 +241,40 @@ impl kameo::message::Message<Review> for Reviewer {
             Ok(stream) => stream,
             Err(e) => {
                 let _ = session.terminate().await;
-                return Err(format!("reviewer prompt failed: {e}"));
+                return Err(ReviewerError::Other(format!("reviewer prompt failed: {e}")));
             }
         };
 
         // 4. Drain the response stream into the raw verdict text, publishing each
         //    chunk as a live `ResponseChunk` and the turn end as `TurnComplete`.
+        //    When `idle_secs` is configured, wrap each next() await with a timeout
+        //    so the watchdog fires on prolonged silence.
         let mut output = String::new();
         let mut events = stream;
-        while let Some(item) = events.next().await {
+        loop {
+            let item = match msg.idle_secs {
+                Some(idle) => {
+                    let timeout_duration = Duration::from_secs(idle);
+                    match tokio::time::timeout(timeout_duration, events.next()).await {
+                        Ok(item) => item,
+                        Err(_elapsed) => {
+                            // Idle timeout fired: no output for idle_secs.
+                            drop(events);
+                            let _ = session.terminate().await;
+                            (msg.sink)(api::Event::TaskIdle {
+                                run: msg.run,
+                                task: task_id.clone(),
+                                idle_secs: idle,
+                            });
+                            return Err(ReviewerError::IdleTimeout { idle_secs: idle });
+                        }
+                    }
+                }
+                None => events.next().await,
+            };
+
             match item {
-                Ok(ResponseEvent::TextChunk { text }) => {
+                Some(Ok(ResponseEvent::TextChunk { text })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
@@ -233,7 +287,7 @@ impl kameo::message::Message<Review> for Reviewer {
                 // forwarded to the live `AgentExchange` stream for observability
                 // but MUST NOT contribute to `output` (the verdict text is built
                 // solely from `TextChunk`/`ResponseChunk`).
-                Ok(ResponseEvent::ThoughtChunk { text }) => {
+                Some(Ok(ResponseEvent::ThoughtChunk { text })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
@@ -241,12 +295,12 @@ impl kameo::message::Message<Review> for Reviewer {
                         event: api::ExchangeEvent::ThoughtChunk { text },
                     });
                 }
-                Ok(ResponseEvent::ToolCall {
+                Some(Ok(ResponseEvent::ToolCall {
                     id,
                     title,
                     kind,
                     status,
-                }) => {
+                })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
@@ -259,7 +313,7 @@ impl kameo::message::Message<Review> for Reviewer {
                         },
                     });
                 }
-                Ok(ResponseEvent::ToolCallUpdate { id, status, title }) => {
+                Some(Ok(ResponseEvent::ToolCallUpdate { id, status, title })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
@@ -267,7 +321,7 @@ impl kameo::message::Message<Review> for Reviewer {
                         event: api::ExchangeEvent::ToolCallUpdate { id, status, title },
                     });
                 }
-                Ok(ResponseEvent::CurrentModeUpdate { current_mode_id }) => {
+                Some(Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })) => {
                     (msg.sink)(api::Event::CurrentModeUpdate {
                         run: msg.run,
                         task: task_id.clone(),
@@ -275,7 +329,7 @@ impl kameo::message::Message<Review> for Reviewer {
                         current_mode_id,
                     });
                 }
-                Ok(ResponseEvent::TurnComplete) => {
+                Some(Ok(ResponseEvent::TurnComplete)) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
@@ -284,10 +338,17 @@ impl kameo::message::Message<Review> for Reviewer {
                     });
                     break;
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     drop(events);
                     let _ = session.terminate().await;
-                    return Err(format!("reviewer stream error: {e}"));
+                    return Err(ReviewerError::Other(format!("reviewer stream error: {e}")));
+                }
+                None => {
+                    drop(events);
+                    let _ = session.terminate().await;
+                    return Err(ReviewerError::Other(
+                        "reviewer stream ended unexpectedly".to_string(),
+                    ));
                 }
             }
         }
@@ -297,7 +358,8 @@ impl kameo::message::Message<Review> for Reviewer {
         let _ = session.terminate().await;
 
         // 6. Parse the agent's output into a structured verdict.
-        parse_review_verdict(&output).map_err(|e| format!("failed to parse review verdict: {e}"))
+        parse_review_verdict(&output)
+            .map_err(|e| ReviewerError::Other(format!("failed to parse review verdict: {e}")))
     }
 }
 

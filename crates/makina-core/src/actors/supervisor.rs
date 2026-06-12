@@ -160,9 +160,9 @@ use crate::supervision::{RestartConfig, RootSupervisor};
 use crate::task::{Task, TaskGraph, TaskId, TaskState};
 use crate::worktree::WorktreeManager;
 
-use super::developer::{Develop, Developer, DeveloperArgs};
+use super::developer::{Develop, Developer, DeveloperArgs, DeveloperError};
 use super::planner::{Planner, PlannerArgs};
-use super::reviewer::{Review, ReviewVerdict, Reviewer, ReviewerArgs};
+use super::reviewer::{Review, ReviewVerdict, Reviewer, ReviewerArgs, ReviewerError};
 
 // ── Live event emission (task 31: run-control) ──────────────────────────────────
 
@@ -1702,6 +1702,7 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 worktree: worktree.path.clone(),
                 run: ctx.control.run,
                 sink: Arc::clone(&ctx.control.sink),
+                idle_secs: ctx.config.caps.idle_secs,
             })
             .send()
             .await;
@@ -1712,18 +1713,26 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
         // the worktree, and propagate the error.
         let verdict = match review_result {
             Ok(v) => v,
-            Err(e) => {
-                let msg = format!("reviewer dispatch failed for {task_id}: {e}");
+            Err(rev_err) => {
+                // Classify the typed error — no string matching needed.
+                let (failure_kind, msg): (api::FailureKind, String) = match rev_err {
+                    kameo::error::SendError::HandlerError(ReviewerError::IdleTimeout {
+                        idle_secs,
+                    }) => (
+                        api::FailureKind::IdleTimeout,
+                        format!("no agent output for {idle_secs}s"),
+                    ),
+                    other => (
+                        api::FailureKind::HardError,
+                        format!("reviewer dispatch failed for {task_id}: {other}"),
+                    ),
+                };
+
                 {
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                     mark_finished_locked(&mut graph, task_id);
-                    set_failure_reason_locked(
-                        &mut graph,
-                        task_id,
-                        api::FailureKind::HardError,
-                        msg.clone(),
-                    );
+                    set_failure_reason_locked(&mut graph, task_id, failure_kind, msg.clone());
                 }
                 // Persist InReview→Failed (best-effort; lock released above).
                 ctx.persist().await;
@@ -1987,23 +1996,31 @@ async fn develop_until_gates_pass(
                 feedback: feedback.take(),
                 run: ctx.control.run,
                 sink: Arc::clone(&ctx.control.sink),
+                idle_secs: ctx.config.caps.idle_secs,
             })
             .send()
             .await;
 
-        if let Err(e) = develop_result {
-            // Hard error during development → InProgress → Failed (HardError).
-            let msg = format!("developer dispatch failed for {task_id}: {e}");
+        if let Err(dev_err) = develop_result {
+            // Classify the typed error — no string matching needed.
+            let (failure_kind, msg): (api::FailureKind, String) = match dev_err {
+                kameo::error::SendError::HandlerError(DeveloperError::IdleTimeout {
+                    idle_secs,
+                }) => (
+                    api::FailureKind::IdleTimeout,
+                    format!("no agent output for {idle_secs}s"),
+                ),
+                other => (
+                    api::FailureKind::HardError,
+                    format!("developer dispatch failed for {task_id}: {other}"),
+                ),
+            };
+
             {
                 let mut graph = ctx.graph.lock().await;
                 apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                 mark_finished_locked(&mut graph, task_id);
-                set_failure_reason_locked(
-                    &mut graph,
-                    task_id,
-                    api::FailureKind::HardError,
-                    msg.clone(),
-                );
+                set_failure_reason_locked(&mut graph, task_id, failure_kind, msg.clone());
             }
             // Persist InProgress→Failed (best-effort; lock released above).
             ctx.persist().await;
