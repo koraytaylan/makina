@@ -740,12 +740,15 @@ fn translate_terminal_event(
         ),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
-        // `browsing` flag (the exchange pane is not the browser).  Other mouse
-        // kinds (clicks, drags, moves) are ignored → harmless Tick redraw.
+        // `browsing` flag (the exchange pane is not the browser).
+        // Down/Up/Drag/Moved → no-op so native modifier-drag selection works:
+        // the terminal's bypass modifier (Shift on most terminals; Option/Alt
+        // in iTerm2) lets the user select & copy text even with capture on,
+        // because the app never consumes those event kinds.
         CrosstermEvent::Mouse(m) => match m.kind {
             MouseEventKind::ScrollUp => AppEvent::ScrollUp,
             MouseEventKind::ScrollDown => AppEvent::ScrollDown,
-            _ => AppEvent::Tick,
+            _ => AppEvent::Tick, // Down/Up/Drag/Moved → no-op so native selection works
         },
         // Paste, focus, etc. — ignored for now.
         _ => AppEvent::Tick,
@@ -858,7 +861,7 @@ fn translate_key(
 mod tests {
     use super::*;
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     };
 
     fn key_press(code: KeyCode, modifiers: KeyModifiers) -> CrosstermEvent {
@@ -905,6 +908,30 @@ mod tests {
             ),
             AppEvent::ScrollDown
         ));
+    }
+
+    /// Drag and move events must map to `AppEvent::Tick` (no-op) so the
+    /// terminal's modifier-bypass selection (Shift-drag; Option-drag in iTerm2)
+    /// continues to work even when mouse capture is enabled.
+    #[test]
+    fn mouse_drag_is_noop() {
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left));
+        assert!(
+            matches!(
+                translate_terminal_event(drag, false, false, false, crate::app::Panel::Sidebar),
+                AppEvent::Tick
+            ),
+            "Drag(Left) must translate to Tick so native selection coexists"
+        );
+
+        let moved = wheel(MouseEventKind::Moved);
+        assert!(
+            matches!(
+                translate_terminal_event(moved, false, false, false, crate::app::Panel::Sidebar),
+                AppEvent::Tick
+            ),
+            "Moved must translate to Tick so native selection coexists"
+        );
     }
 
     #[test]

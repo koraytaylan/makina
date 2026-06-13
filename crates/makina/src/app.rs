@@ -3565,6 +3565,54 @@ mod tests {
         );
     }
 
+    /// App with scroll state set; ScrollDown and ScrollUp events adjust the
+    /// exchange pane scroll offset while keeping task selection unchanged
+    /// (task `re-enable-mouse-capture`).
+    ///
+    /// This test verifies that the mouse wheel events work correctly when
+    /// mouse capture is re-enabled: scrolling moves the exchange_scroll offset
+    /// (and may disengage auto-follow), but leaves selected_task untouched.
+    #[test]
+    fn scroll_events_adjust_exchange_state() {
+        let mut app = make_app_with_tasks();
+        let max: u16 = 5;
+
+        // Simulate a multi-line pane.
+        app.last_scroll_max.set(max);
+
+        // Record the task selection before scrolling.
+        let selected_before = app.selected_task;
+        assert_eq!(selected_before, Some(0));
+
+        // ScrollDown should move the exchange_scroll offset.
+        let offset_before = app.exchange_scroll;
+        app.update(AppEvent::ScrollDown);
+        assert_ne!(
+            app.exchange_scroll, offset_before,
+            "ScrollDown must adjust exchange_scroll"
+        );
+        assert_eq!(
+            app.selected_task, selected_before,
+            "ScrollDown must NOT change selected_task"
+        );
+
+        // ScrollUp should move the offset back and disengage auto-follow.
+        let offset_after_down = app.exchange_scroll;
+        app.update(AppEvent::ScrollUp);
+        assert_ne!(
+            app.exchange_scroll, offset_after_down,
+            "ScrollUp must adjust exchange_scroll"
+        );
+        assert!(
+            !app.exchange_auto_follow,
+            "ScrollUp must disengage exchange_auto_follow"
+        );
+        assert_eq!(
+            app.selected_task, selected_before,
+            "ScrollUp must NOT change selected_task"
+        );
+    }
+
     /// Regression (fix `tui-scroll-and-restore` #1): the FIRST wheel-up from
     /// auto-follow must move up by exactly one line (`scroll_max - 1`), NOT snap
     /// to the top (offset 0).

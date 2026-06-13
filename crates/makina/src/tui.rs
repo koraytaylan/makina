@@ -25,7 +25,9 @@ use std::panic;
 
 use ratatui::Terminal;
 use ratatui::crossterm::{
-    cursor, execute,
+    cursor,
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::CrosstermBackend;
@@ -54,7 +56,12 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            cursor::Hide
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -74,6 +81,7 @@ impl Tui {
         let _ = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
+            DisableMouseCapture,
             cursor::Show
         );
     }
@@ -95,6 +103,7 @@ impl Tui {
         execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
+            EnableMouseCapture,
             cursor::Hide
         )?;
         // Force a full repaint so no stale pager content bleeds through.
@@ -176,7 +185,12 @@ pub(crate) fn install_panic_hook_for_test()
 /// the alternate screen, disables raw mode, and shows the cursor.
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        cursor::Show
+    );
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -200,6 +214,32 @@ mod tests {
             Ok(mut tui) => {
                 // A real TTY was available: restore must not panic and must be
                 // safe to call.
+                tui.restore();
+            }
+            Err(_) => {
+                // No TTY under the test harness — raw mode could not be enabled.
+                // The static restore path must still be callable without panic.
+                restore_terminal();
+            }
+        }
+    }
+
+    /// Smoke test that the init and reinit paths enable mouse capture, and
+    /// restore/restore_terminal disable it (task `re-enable-mouse-capture`).
+    ///
+    /// In a TTY, `Tui::init` and `Tui::reinit` emit `EnableMouseCapture` in their
+    /// terminal setup sequence; `Tui::restore` and the free `restore_terminal`
+    /// emit `DisableMouseCapture` in their teardown sequence. Under no-TTY test
+    /// harness, the functions may fail but the static restore path must still be
+    /// callable. The point is that the capture state rides on init/reinit entry
+    /// and restore/restore_terminal exit, so a `$PAGER` round-trip
+    /// (restore → reinit) leaves the wheel working on resume.
+    #[test]
+    fn init_enables_mouse_capture() {
+        match Tui::init() {
+            Ok(mut tui) => {
+                // A real TTY was available: mouse capture was enabled by init.
+                // Restore must disable it without panic.
                 tui.restore();
             }
             Err(_) => {

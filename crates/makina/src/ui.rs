@@ -409,7 +409,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let default_style = Style::default().bg(Color::DarkGray).fg(Color::White);
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            " [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [L] log  [?] doctor  ",
+            " [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [L] log  [?] doctor  [wheel] scroll  ",
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -2044,7 +2044,7 @@ mod tests {
     /// When `app.status_message` is set, it is rendered in the status bar.
     #[test]
     fn render_status_bar_shows_status_message() {
-        let mut terminal = make_terminal(150, 24);
+        let mut terminal = make_terminal(180, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
         app.update(crate::app::AppEvent::StatusMessage("Start run:1".into()));
@@ -2077,10 +2077,10 @@ mod tests {
     /// The status bar must show the current dependency view label.
     #[test]
     fn status_bar_shows_current_view_label() {
-        // The status bar carries more hints now ([e] errors badge + [?] doctor),
-        // so use a wider terminal to ensure the trailing `view:` label is not
-        // clipped before the assertions run.
-        let mut terminal = make_terminal(140, 24);
+        // The status bar carries more hints now ([e] errors badge + [?] doctor
+        // + [wheel] scroll), so use a wider terminal to ensure the trailing
+        // `view:` label is not clipped before the assertions run.
+        let mut terminal = make_terminal(180, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
@@ -2094,7 +2094,7 @@ mod tests {
 
         // Cycle to List
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(140, 24);
+        let mut terminal = make_terminal(180, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2104,7 +2104,7 @@ mod tests {
 
         // Cycle to Tree
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(140, 24);
+        let mut terminal = make_terminal(180, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2114,7 +2114,7 @@ mod tests {
 
         // Cycle to Timeline
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(140, 24);
+        let mut terminal = make_terminal(180, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2129,7 +2129,7 @@ mod tests {
     fn status_bar_advertises_errors_key() {
         use crate::app::{ErrorLevel, ErrorMessage};
 
-        let mut terminal = make_terminal(120, 24);
+        let mut terminal = make_terminal(140, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
@@ -2150,7 +2150,7 @@ mod tests {
         assert!(app.unseen_errors, "unseen_errors flag should be set");
 
         // With unseen errors, the status bar shows "[e] errors(count)"
-        let mut terminal = make_terminal(120, 24);
+        let mut terminal = make_terminal(140, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2164,7 +2164,7 @@ mod tests {
             !app.unseen_errors,
             "unseen_errors flag should be cleared when pane opens"
         );
-        let mut terminal = make_terminal(120, 24);
+        let mut terminal = make_terminal(140, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2644,7 +2644,7 @@ mod tests {
 
     #[test]
     fn render_focus_label_changes_with_panel() {
-        let mut terminal = make_terminal(150, 24);
+        let mut terminal = make_terminal(180, 24);
         let api = Arc::new(PlaceholderApi::new());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 

@@ -117,7 +117,7 @@ cargo run -p makina    # requires the two config files above
 Keys:
 
 - **`o`** — open the file browser and pick a task list (starts a Run)
-- **`↑/↓`** (or `j/k`) — navigate · **`Tab`** — switch panel (Runs ↔ Detail)
+- **`↑/↓`** (or `j/k`) — navigate · **`Tab`** — switch panel (Runs ↔ Detail) · **wheel** — scroll content · hold **Shift** (or **Option** in iTerm2) and drag to select & copy text
 - **`s` / `p` / `c`** — start / pause / cancel the selected Run
 - **`q`** / `Esc` / `Ctrl-C` — quit
 
