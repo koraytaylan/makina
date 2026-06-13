@@ -121,12 +121,14 @@ pub async fn run(
         let browsing = app.is_browsing();
         let editing_providers = app.is_editing_providers();
         let viewing_doctor = app.is_viewing_doctor();
+        let command_palette = app.is_command_palette();
+        let settings = app.is_settings();
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
             biased;
 
             maybe_term = term_rx.recv() => {
-                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers, viewing_doctor, app.focused_panel))
+                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers, viewing_doctor, command_palette, settings, app.focused_panel))
             }
 
             maybe_api = api_stream.next() => {
@@ -297,6 +299,18 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
             let status = commit_provider_config(app).await;
             (AppEvent::ProviderEditorCommit, status)
         }
+        // ── Settings commit (plan 0070) ──────────────────────────────────────
+        // Write the edited caps and concurrency back to the config file
+        // (`{repo_root}/.makina/config.toml`). Validates all fields first;
+        // on any error, returns the reason without writing. Like
+        // commit_provider_config, this round-trips through GlobalConfig (which
+        // has no gates/base_branch field), so ProjectConfig entries are NOT
+        // preserved. The actual state update (closing the modal, applying values
+        // to app.caps/concurrency) is handled by App::update after this returns.
+        AppEvent::SettingsCommit => {
+            let status = commit_settings(app).await;
+            (AppEvent::SettingsCommit, status)
+        }
         // ── Doctor scaffold (task 0046) ──────────────────────────────────────
         // Write starter config templates to both config paths if neither exists.
         // Never overwrite existing files; re-check and refuse if present.
@@ -312,6 +326,23 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
         // is accessible for terminal teardown/restore.  This arm is unreachable
         // in production but kept so the match stays exhaustive.
         AppEvent::OpenLog => (AppEvent::Tick, None),
+        // ── Command palette execute (task command-palette-keys) ──────────────────
+        // Extract the selected action's event from the palette before App::update
+        // clears it, then re-dispatch that event through the normal intent path so
+        // the event loop processes it exactly as a fresh intent.
+        AppEvent::CommandPaletteExecute => {
+            let selected_event = app.command_palette.as_ref().and_then(|palette| {
+                let filtered = palette.filtered();
+                filtered
+                    .get(palette.selected)
+                    .map(|action| action.event.clone())
+            });
+            match selected_event {
+                Some(event) => (event, None),
+                // No valid selection (shouldn't happen) — just tick.
+                None => (AppEvent::Tick, None),
+            }
+        }
         // Everything else passes straight through.
         other => (other, None),
     }
@@ -367,6 +398,140 @@ async fn commit_provider_config(app: &App) -> Option<String> {
     // Write the file.
     match tokio::fs::write(&config_path, toml_str).await {
         Ok(()) => Some("Config saved".to_string()),
+        Err(e) => Some(format!("Config write error: {e}")),
+    }
+}
+
+/// Commit edited settings (caps and concurrency) to the config file.
+///
+/// Follows the same pattern as `commit_provider_config`: read the current
+/// on-disk config (if any), rebuild it with the new caps/concurrency while
+/// preserving all other fields, and write it back. Validates all fields
+/// before writing; on any error returns Some(reason) without writing.
+///
+/// Note: this writer round-trips through `GlobalConfig`, which has no
+/// `gates`/`base_branch` field, so the `ProjectConfig` `[[gates]]` /
+/// `base_branch` tables are NOT preserved. The gates-aware project-config
+/// writer lands in plan 0025.
+async fn commit_settings(app: &App) -> Option<String> {
+    use makina_core::config::{CapsConfig, GlobalConfig};
+    use makina_core::paths::config_file;
+
+    let settings = app.settings.as_ref()?;
+
+    // Parse and validate every field.
+    let gate_iterations = match settings.gate_iterations.parse::<u32>() {
+        Ok(val) => {
+            if val >= 1 {
+                val
+            } else {
+                return Some("caps.gate_iterations must be at least 1".to_string());
+            }
+        }
+        Err(_) => {
+            return Some("caps.gate_iterations must be a positive integer".to_string());
+        }
+    };
+
+    let reviewer_iterations = match settings.reviewer_iterations.parse::<u32>() {
+        Ok(val) => {
+            if val >= 1 {
+                val
+            } else {
+                return Some("caps.reviewer_iterations must be at least 1".to_string());
+            }
+        }
+        Err(_) => {
+            return Some("caps.reviewer_iterations must be a positive integer".to_string());
+        }
+    };
+
+    let wall_clock_secs = match settings.wall_clock_secs.parse::<u64>() {
+        Ok(val) => {
+            if val >= 1 {
+                val
+            } else {
+                return Some("caps.wall_clock_secs must be at least 1".to_string());
+            }
+        }
+        Err(_) => {
+            return Some("caps.wall_clock_secs must be a positive integer".to_string());
+        }
+    };
+
+    let idle_secs = if settings.idle_secs.is_empty() {
+        None
+    } else {
+        match settings.idle_secs.parse::<u64>() {
+            Ok(val) => {
+                if val >= 1 {
+                    Some(val)
+                } else {
+                    return Some("caps.idle_secs must be at least 1".to_string());
+                }
+            }
+            Err(_) => {
+                return Some("caps.idle_secs must be a positive integer".to_string());
+            }
+        }
+    };
+
+    let concurrency = match settings.concurrency.parse::<usize>() {
+        Ok(val) => {
+            if val >= 1 {
+                val
+            } else {
+                return Some("concurrency must be at least 1".to_string());
+            }
+        }
+        Err(_) => {
+            return Some("concurrency must be a positive integer".to_string());
+        }
+    };
+
+    // Read the current on-disk config (if any) so we don't lose fields we
+    // don't manage (e.g. providers, roles, project gates, base_branch).
+    let config_path = config_file(&app.repo_root);
+    let existing_global: GlobalConfig = if config_path.exists() {
+        match tokio::fs::read_to_string(&config_path).await {
+            Ok(s) => toml::from_str::<GlobalConfig>(&s).unwrap_or_default(),
+            Err(_) => GlobalConfig::default(),
+        }
+    } else {
+        GlobalConfig::default()
+    };
+
+    // Build the updated global config: preserve all existing fields but
+    // replace caps and concurrency with the new values.
+    let updated = GlobalConfig {
+        caps: CapsConfig {
+            gate_iterations,
+            reviewer_iterations,
+            wall_clock_secs,
+            idle_secs,
+        },
+        concurrency,
+        ..existing_global
+    };
+
+    // Serialise to TOML.
+    let toml_str = match toml::to_string_pretty(&updated) {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(format!("Config serialise error: {e}"));
+        }
+    };
+
+    // Ensure the parent directory exists.
+    if let Some(parent) = config_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return Some(format!("Config write error: {e}"));
+    }
+
+    // Write the file.
+    match tokio::fs::write(&config_path, toml_str).await {
+        Ok(()) => Some("Settings saved".to_string()),
         Err(e) => Some(format!("Config write error: {e}")),
     }
 }
@@ -728,6 +893,8 @@ fn translate_terminal_event(
     browsing: bool,
     editing_providers: bool,
     viewing_doctor: bool,
+    command_palette: bool,
+    settings: bool,
     focused_panel: crate::app::Panel,
 ) -> AppEvent {
     match ev {
@@ -736,6 +903,8 @@ fn translate_terminal_event(
             browsing,
             editing_providers,
             viewing_doctor,
+            command_palette,
+            settings,
             focused_panel,
         ),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
@@ -761,6 +930,8 @@ fn translate_key(
     browsing: bool,
     editing_providers: bool,
     viewing_doctor: bool,
+    command_palette: bool,
+    settings: bool,
     focused_panel: crate::app::Panel,
 ) -> AppEvent {
     use crossterm::event::KeyEventKind;
@@ -774,7 +945,25 @@ fn translate_key(
         return AppEvent::Quit;
     }
 
-    if browsing {
+    // Ctrl-P opens the command palette in Normal mode (before the per-mode cascade).
+    if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return AppEvent::OpenCommandPalette;
+    }
+
+    if command_palette {
+        // ── Command palette keymap ────────────────────────────────────────────
+        // Esc closes the palette; Enter executes the selected action; Up/Down move
+        // the selection; Backspace removes filter chars; letters feed the filter.
+        match key.code {
+            KeyCode::Esc => AppEvent::CloseCommandPalette,
+            KeyCode::Enter => AppEvent::CommandPaletteExecute,
+            KeyCode::Up => AppEvent::CommandPaletteUp,
+            KeyCode::Down => AppEvent::CommandPaletteDown,
+            KeyCode::Backspace => AppEvent::CommandPaletteBackspace,
+            KeyCode::Char(c) => AppEvent::CommandPaletteInput(c),
+            _ => AppEvent::Tick,
+        }
+    } else if browsing {
         // ── File-browser keymap ──────────────────────────────────────────────
         // Esc closes the browser (does NOT quit the app); Enter activates the
         // selection; Backspace goes to the parent dir; j/k/arrows navigate.
@@ -794,6 +983,19 @@ fn translate_key(
             KeyCode::Enter => AppEvent::ProviderEditorCommit,
             KeyCode::Up | KeyCode::Char('k') => AppEvent::ProviderEditorUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::ProviderEditorDown,
+            _ => AppEvent::Tick,
+        }
+    } else if settings {
+        // ── Settings modal keymap ────────────────────────────────────────────
+        // Esc closes without saving; Enter commits; Up/Down navigate fields;
+        // 0-9 and Backspace edit the focused numeric field.
+        match key.code {
+            KeyCode::Esc => AppEvent::CloseSettings,
+            KeyCode::Enter => AppEvent::SettingsCommit,
+            KeyCode::Up => AppEvent::SettingsUp,
+            KeyCode::Down => AppEvent::SettingsDown,
+            KeyCode::Backspace => AppEvent::SettingsBackspace,
+            KeyCode::Char(c) => AppEvent::SettingsInput(c),
             _ => AppEvent::Tick,
         }
     } else if viewing_doctor {
@@ -899,6 +1101,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
                 crate::app::Panel::Sidebar
             ),
             AppEvent::ScrollUp
@@ -906,6 +1110,8 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 wheel(MouseEventKind::ScrollDown),
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -923,7 +1129,15 @@ mod tests {
         let drag = wheel(MouseEventKind::Drag(MouseButton::Left));
         assert!(
             matches!(
-                translate_terminal_event(drag, false, false, false, crate::app::Panel::Sidebar),
+                translate_terminal_event(
+                    drag,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    crate::app::Panel::Sidebar
+                ),
                 AppEvent::Tick
             ),
             "Drag(Left) must translate to Tick so native selection coexists"
@@ -932,7 +1146,15 @@ mod tests {
         let moved = wheel(MouseEventKind::Moved);
         assert!(
             matches!(
-                translate_terminal_event(moved, false, false, false, crate::app::Panel::Sidebar),
+                translate_terminal_event(
+                    moved,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    crate::app::Panel::Sidebar
+                ),
                 AppEvent::Tick
             ),
             "Moved must translate to Tick so native selection coexists"
@@ -943,7 +1165,15 @@ mod tests {
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::Quit
         ));
     }
@@ -952,7 +1182,15 @@ mod tests {
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::Quit
         ));
     }
@@ -961,7 +1199,15 @@ mod tests {
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::Quit
         ));
     }
@@ -970,7 +1216,15 @@ mod tests {
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::FocusNext
         ));
     }
@@ -980,6 +1234,8 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('v'), KeyModifiers::NONE),
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -997,6 +1253,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
                 crate::app::Panel::Sidebar
             ),
             AppEvent::ToggleErrorPane
@@ -1009,6 +1267,8 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('r'), KeyModifiers::NONE),
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -1029,7 +1289,15 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::Tick
         ));
     }
@@ -1038,7 +1306,15 @@ mod tests {
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -1047,7 +1323,15 @@ mod tests {
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::SelectUp
         ));
     }
@@ -1056,7 +1340,15 @@ mod tests {
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::SelectDown
         ));
     }
@@ -1065,7 +1357,15 @@ mod tests {
     fn right_arrow_translates_to_focus_right_or_expand() {
         let ev = key_press(KeyCode::Right, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::FocusRightOrExpand
         ));
     }
@@ -1074,7 +1374,15 @@ mod tests {
     fn left_arrow_translates_to_focus_left_or_collapse() {
         let ev = key_press(KeyCode::Left, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::FocusLeftOrCollapse
         ));
     }
@@ -1083,7 +1391,15 @@ mod tests {
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::SelectUp
         ));
     }
@@ -1092,7 +1408,15 @@ mod tests {
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::SelectDown
         ));
     }
@@ -1103,7 +1427,15 @@ mod tests {
     fn o_key_opens_browser_in_normal_mode() {
         let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::OpenBrowser
         ));
     }
@@ -1114,7 +1446,15 @@ mod tests {
     fn s_key_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::StartRun
         ));
     }
@@ -1123,7 +1463,15 @@ mod tests {
     fn p_key_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::PauseRun
         ));
     }
@@ -1133,7 +1481,15 @@ mod tests {
         // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::CancelRun
         ));
     }
@@ -1146,7 +1502,15 @@ mod tests {
             let ev = key_press(KeyCode::Char(ch), KeyModifiers::NONE);
             assert!(
                 matches!(
-                    translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
+                    translate_terminal_event(
+                        ev,
+                        true,
+                        false,
+                        false,
+                        false,
+                        false,
+                        crate::app::Panel::Sidebar
+                    ),
                     AppEvent::Tick
                 ),
                 "'{ch}' must be inert in browser mode"
@@ -1158,7 +1522,15 @@ mod tests {
     fn enter_in_browser_activates_selection() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                true,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::BrowserActivate
         ));
     }
@@ -1168,7 +1540,15 @@ mod tests {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         // In browser mode, Esc must close the browser, NOT quit the app.
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                true,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::CloseBrowser
         ));
     }
@@ -1177,7 +1557,15 @@ mod tests {
     fn backspace_in_browser_goes_to_parent() {
         let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                true,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::BrowserParent
         ));
     }
@@ -1186,12 +1574,28 @@ mod tests {
     fn jk_in_browser_navigate_browser_not_sidebar() {
         let down = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(down, true, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                down,
+                true,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::BrowserDown
         ));
         let up = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(up, true, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                up,
+                true,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::BrowserUp
         ));
     }
@@ -1200,7 +1604,15 @@ mod tests {
     fn ctrl_c_quits_even_in_browser_mode() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                true,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::Quit
         ));
     }
@@ -1211,7 +1623,15 @@ mod tests {
         // (it falls through to Tick so the user can keep browsing).
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
+            translate_terminal_event(
+                ev,
+                true,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::Tick
         ));
     }
@@ -1228,6 +1648,8 @@ mod tests {
 
         let ev = translate_terminal_event(
             key_press(KeyCode::Char('q'), KeyModifiers::NONE),
+            false,
+            false,
             false,
             false,
             false,
@@ -2299,5 +2721,292 @@ A description that is long enough to pass minimums.
             rendered.contains("[r]"),
             "the status bar must advertise the [r] retry key; rendered: {rendered}"
         );
+    }
+
+    #[test]
+    fn ctrl_p_opens_palette() {
+        // Ctrl+P from Normal mode (all flags false) must open the palette.
+        let ev = key_press(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::OpenCommandPalette
+        ));
+    }
+
+    #[tokio::test]
+    async fn palette_enter_executes_selected_action() {
+        // With command_palette=true, Enter must map to CommandPaletteExecute.
+        let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                true,
+                false,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::CommandPaletteExecute
+        ));
+
+        // resolve_io must extract the selected action's event and re-dispatch it.
+        // Create an app with an open palette and a selected action.
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Open the palette.
+        app.update(AppEvent::OpenCommandPalette);
+        assert!(app.is_command_palette());
+        assert!(app.command_palette.is_some());
+
+        // The default palette has multiple actions. Manually set selected to point
+        // to the "Settings" action (which is at index 2 in default_actions).
+        if let Some(ref mut palette) = app.command_palette {
+            palette.selected = 2; // Settings
+        }
+
+        // Resolve CommandPaletteExecute; it should extract the Settings event.
+        let (resolved_event, _) = resolve_io(&app, AppEvent::CommandPaletteExecute).await;
+
+        // The resolved event should be OpenSettings.
+        assert!(
+            matches!(resolved_event, AppEvent::OpenSettings),
+            "palette execute with Settings selected must resolve to OpenSettings"
+        );
+    }
+
+    #[test]
+    fn palette_esc_closes() {
+        // Esc from the palette must map to CloseCommandPalette.
+        let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                true,
+                false,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::CloseCommandPalette
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_and_commit_writes_config() {
+        // Create a temp directory for the repo root.
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path();
+
+        // Write a pre-existing config with unrelated fields (e.g., [[providers]]).
+        let existing_config = r#"
+[[providers]]
+name = "claude"
+command = "claude-acp"
+
+[roles]
+developer = { provider = "claude" }
+reviewer = { provider = "claude" }
+
+[caps]
+gate_iterations = 7
+reviewer_iterations = 3
+wall_clock_secs = 1200
+"#;
+        let config_path = repo_root.join(".makina/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&config_path, existing_config).expect("write existing");
+
+        // Create an app with known caps and concurrency.
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], repo_root.to_path_buf());
+        app.caps = makina_core::config::CapsConfig {
+            gate_iterations: 7,
+            reviewer_iterations: 3,
+            wall_clock_secs: 1200,
+            idle_secs: None,
+        };
+        app.concurrency = 4;
+
+        // Open settings and edit a field.
+        app.update(AppEvent::OpenSettings);
+        assert!(app.is_settings());
+
+        // Modify gate_iterations to "10".
+        app.settings.as_mut().unwrap().gate_iterations.clear();
+        app.update(AppEvent::SettingsInput('1'));
+        app.update(AppEvent::SettingsInput('0'));
+
+        // Move to concurrency and modify it to "8".
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.settings.as_mut().unwrap().concurrency.clear();
+        app.update(AppEvent::SettingsInput('8'));
+
+        // Commit settings via resolve_io.
+        let (_resolved_event, status) = resolve_io(&app, AppEvent::SettingsCommit).await;
+
+        // Status should be "Settings saved".
+        assert_eq!(status, Some("Settings saved".to_string()));
+
+        // Now process the SettingsCommit through update (in production, the loop does this).
+        // For this test, we manually apply the values since resolve_io doesn't mutate app.
+        // (In production, the loop calls update(SettingsCommit) after resolve_io returns.)
+        // Instead, just verify the file was written correctly.
+
+        // Re-read the config file and verify it was updated.
+        let new_config_str = std::fs::read_to_string(&config_path).expect("read config");
+        let new_config: makina_core::config::GlobalConfig =
+            toml::from_str(&new_config_str).expect("parse config");
+
+        // Verify the new caps.
+        assert_eq!(
+            new_config.caps.gate_iterations, 10,
+            "gate_iterations must be updated"
+        );
+        assert_eq!(new_config.concurrency, 8, "concurrency must be updated");
+        assert_eq!(
+            new_config.caps.reviewer_iterations, 3,
+            "reviewer_iterations must be unchanged"
+        );
+        assert_eq!(
+            new_config.caps.wall_clock_secs, 1200,
+            "wall_clock_secs must be unchanged"
+        );
+
+        // Verify unrelated fields are preserved.
+        assert!(
+            !new_config.providers.is_empty(),
+            "providers must be preserved"
+        );
+        assert_eq!(new_config.providers[0].name, "claude");
+        assert!(
+            new_config.roles.developer.is_some(),
+            "roles must be preserved"
+        );
+    }
+
+    #[test]
+    fn settings_esc_closes() {
+        // Esc in settings must map to CloseSettings.
+        let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                true,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::CloseSettings
+        ));
+    }
+
+    #[test]
+    fn settings_enter_commits() {
+        // Enter in settings must map to SettingsCommit.
+        let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                true,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::SettingsCommit
+        ));
+    }
+
+    #[test]
+    fn settings_arrows_navigate() {
+        // Up/Down in settings must map to SettingsUp/SettingsDown.
+        let up = key_press(KeyCode::Up, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                up,
+                false,
+                false,
+                false,
+                false,
+                true,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::SettingsUp
+        ));
+
+        let down = key_press(KeyCode::Down, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                down,
+                false,
+                false,
+                false,
+                false,
+                true,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::SettingsDown
+        ));
+    }
+
+    #[test]
+    fn settings_digit_input() {
+        // Typing a digit in settings must map to SettingsInput.
+        let ev = key_press(KeyCode::Char('5'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                true,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::SettingsInput('5')
+        ));
+    }
+
+    #[test]
+    fn settings_backspace_deletes() {
+        // Backspace in settings must map to SettingsBackspace.
+        let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                false,
+                false,
+                false,
+                false,
+                true,
+                crate::app::Panel::Sidebar
+            ),
+            AppEvent::SettingsBackspace
+        ));
     }
 }

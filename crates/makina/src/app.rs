@@ -409,6 +409,111 @@ pub enum Mode {
     ProviderConfig,
     /// The modal doctor health-check overlay.
     Doctor,
+    /// The command palette modal (task 0069).
+    CommandPalette,
+    /// The settings modal (task 0070).
+    Settings,
+}
+
+// ── Command palette ──────────────────────────────────────────────────────────
+
+/// A single selectable command in the palette: its display label and the
+/// `AppEvent` `Enter` re-dispatches through the normal update path.
+#[derive(Debug, Clone)]
+pub struct PaletteAction {
+    /// The display label for this action.
+    pub label: &'static str,
+    /// The event to dispatch when this action is executed.
+    pub event: AppEvent,
+}
+
+/// State for the Ctrl+P command-palette modal.
+#[derive(Debug, Clone)]
+pub struct CommandPalette {
+    /// Type-to-filter query (case-insensitive substring match on `label`).
+    pub filter: String,
+    /// The full static action set, in display order.
+    pub actions: Vec<PaletteAction>,
+    /// Selected index *into the filtered view* (clamped on every filter change).
+    pub selected: usize,
+}
+
+impl CommandPalette {
+    /// The default action set. Most entries carry an existing intent
+    /// (`OpenBrowser`, `OpenDoctor`, `OpenProviderEditor`, `OpenSettings`,
+    /// `Quit`); forward-referenced ones (`RetryFocusedTask`, `DiscoverProject`)
+    /// carry the new stub variant.
+    pub fn default_actions() -> Vec<PaletteAction> {
+        vec![
+            PaletteAction {
+                label: "Open task list",
+                event: AppEvent::OpenBrowser,
+            },
+            PaletteAction {
+                label: "Configure providers & roles",
+                event: AppEvent::OpenProviderEditor,
+            },
+            PaletteAction {
+                label: "Settings",
+                event: AppEvent::OpenSettings,
+            },
+            PaletteAction {
+                label: "Doctor",
+                event: AppEvent::OpenDoctor,
+            },
+            PaletteAction {
+                label: "Retry failed task",
+                event: AppEvent::RetryFocusedTask,
+            },
+            PaletteAction {
+                label: "Discover project",
+                event: AppEvent::DiscoverProject,
+            },
+            PaletteAction {
+                label: "Quit",
+                event: AppEvent::Quit,
+            },
+        ]
+    }
+
+    /// Actions whose lowercased `label` contains the lowercased `filter`.
+    pub fn filtered(&self) -> Vec<&PaletteAction> {
+        if self.filter.is_empty() {
+            self.actions.iter().collect()
+        } else {
+            let filter_lower = self.filter.to_lowercase();
+            self.actions
+                .iter()
+                .filter(|action| action.label.to_lowercase().contains(&filter_lower))
+                .collect()
+        }
+    }
+}
+
+// ── Settings modal (plan 0070) ────────────────────────────────────────────────
+
+/// Which settings field is focused / being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsField {
+    GateIterations,
+    ReviewerIterations,
+    WallClockSecs,
+    IdleSecs, // empty buffer ⇒ None (disabled)
+    Concurrency,
+}
+
+/// State for the settings modal: an editable text buffer per numeric field,
+/// seeded from the App's loaded caps, plus the focused field.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub gate_iterations: String,
+    pub reviewer_iterations: String,
+    pub wall_clock_secs: String,
+    pub idle_secs: String, // "" ⇒ None
+    pub concurrency: String,
+    pub focused: SettingsField,
+    /// Last validation error (rendered under the field), or `None`.
+    pub error: Option<String>,
 }
 
 // ── Provider configuration editor ──────────────────────────────────────────────
@@ -643,6 +748,44 @@ pub enum AppEvent {
     /// Write starter config templates (pressed `w` in doctor).
     DoctorWriteScaffold,
 
+    // ── Command palette (plan 0069) ───────────────────────────────────────────
+    /// User requested to open the command palette (pressed `Ctrl+P`).
+    OpenCommandPalette,
+    /// Move the palette selection one row up.
+    CommandPaletteUp,
+    /// Move the palette selection one row down.
+    CommandPaletteDown,
+    /// User typed a character into the palette filter.
+    CommandPaletteInput(char),
+    /// User pressed backspace in the palette filter.
+    CommandPaletteBackspace,
+    /// User pressed enter to execute the selected action.
+    CommandPaletteExecute,
+    /// Close the command palette and return to normal mode.
+    CloseCommandPalette,
+
+    // ── Settings screen (plan 0070) ───────────────────────────────────────────
+    /// User requested to open the settings screen.
+    OpenSettings,
+    /// Move settings focus one field up.
+    SettingsUp,
+    /// Move settings focus one field down.
+    SettingsDown,
+    /// User typed a digit into the focused settings field.
+    SettingsInput(char),
+    /// User pressed backspace in the focused settings field.
+    SettingsBackspace,
+    /// User pressed enter to save settings.
+    SettingsCommit,
+    /// Close the settings screen without saving.
+    CloseSettings,
+
+    // ── Placeholder stubs for forward-referenced plans ────────────────────────
+    /// User requested to retry the focused task (plan 0017).
+    RetryFocusedTask,
+    /// User requested to discover the project (plan 0025).
+    DiscoverProject,
+
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
     /// Toggle verbose mode on/off (`Ctrl+O`).
     ///
@@ -850,6 +993,24 @@ pub struct App {
     /// a check in the health checklist.
     pub base_branch_exists: bool,
 
+    /// Command palette state. `Some` only while [`App::mode`] is
+    /// [`Mode::CommandPalette`].
+    pub command_palette: Option<CommandPalette>,
+
+    // ── Settings (plan 0070) ──────────────────────────────────────────────────
+    /// Settings modal state. `Some` only while [`App::mode`] is
+    /// [`Mode::Settings`].
+    pub settings: Option<Settings>,
+
+    /// The resolved run capabilities (gate/reviewer iterations, wall-clock/idle
+    /// timeouts). Seeded from the loaded config and editable via the settings
+    /// modal.
+    pub caps: makina_core::config::CapsConfig,
+
+    /// The resolved task concurrency limit (parallelism). Seeded from the loaded
+    /// config and editable via the settings modal.
+    pub concurrency: usize,
+
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
     /// Whether verbose mode is currently on.
     ///
@@ -1040,6 +1201,10 @@ impl App {
                 project: None,
             },
             base_branch_exists: false,
+            command_palette: None,
+            settings: None,
+            caps: makina_core::config::CapsConfig::default(),
+            concurrency: 3,
             verbose_mode: false,
         }
     }
@@ -1059,6 +1224,8 @@ impl App {
         provider_probes: Vec<makina_core::preflight::ProviderProbe>,
         config_paths: makina_core::config::ConfigPaths,
         base_branch_exists: bool,
+        caps: makina_core::config::CapsConfig,
+        concurrency: usize,
     ) -> Self {
         let mut app = Self::new(api, initial_runs, repo_root);
         app.providers = providers;
@@ -1066,6 +1233,8 @@ impl App {
         app.provider_probes = provider_probes;
         app.config_paths = config_paths;
         app.base_branch_exists = base_branch_exists;
+        app.caps = caps;
+        app.concurrency = concurrency;
         app
     }
 
@@ -1099,6 +1268,16 @@ impl App {
     /// Whether the doctor health-check overlay is currently active.
     pub fn is_viewing_doctor(&self) -> bool {
         self.mode == Mode::Doctor
+    }
+
+    /// Whether the command palette is currently active.
+    pub fn is_command_palette(&self) -> bool {
+        self.mode == Mode::CommandPalette
+    }
+
+    /// Whether the settings modal is currently active.
+    pub fn is_settings(&self) -> bool {
+        self.mode == Mode::Settings
     }
 
     /// Return the currently selected [`RunView`], if any.
@@ -1517,6 +1696,413 @@ impl App {
                 // The IO layer (resolve_io in event.rs) handles the actual file writes.
                 // Here we just signal that the action is requested; the IO layer
                 // will emit a StatusMessage with the outcome.
+                true
+            }
+
+            // ── Command palette (plan 0069) ───────────────────────────────────────
+            AppEvent::OpenCommandPalette => {
+                self.command_palette = Some(CommandPalette {
+                    filter: String::new(),
+                    actions: CommandPalette::default_actions(),
+                    selected: 0,
+                });
+                self.mode = Mode::CommandPalette;
+                true
+            }
+            AppEvent::CommandPaletteInput(c) => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.filter.push(c);
+                    // Clamp selected to the filtered list length
+                    let filtered_len = palette.filtered().len();
+                    palette.selected = palette.selected.min(filtered_len.saturating_sub(1));
+                }
+                true
+            }
+            AppEvent::CommandPaletteBackspace => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.filter.pop();
+                    // Clamp selected to the filtered list length
+                    let filtered_len = palette.filtered().len();
+                    palette.selected = palette.selected.min(filtered_len.saturating_sub(1));
+                }
+                true
+            }
+            AppEvent::CommandPaletteUp => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.selected = palette.selected.saturating_sub(1);
+                }
+                true
+            }
+            AppEvent::CommandPaletteDown => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    let filtered_len = palette.filtered().len();
+                    palette.selected = (palette.selected + 1).min(filtered_len.saturating_sub(1));
+                }
+                true
+            }
+            AppEvent::CommandPaletteExecute => {
+                self.mode = Mode::Normal;
+                self.command_palette = None;
+                true
+            }
+            AppEvent::CloseCommandPalette => {
+                self.mode = Mode::Normal;
+                self.command_palette = None;
+                true
+            }
+
+            // ── Settings screen (plan 0070) ───────────────────────────────────────
+            AppEvent::OpenSettings => {
+                self.settings = Some(Settings {
+                    gate_iterations: self.caps.gate_iterations.to_string(),
+                    reviewer_iterations: self.caps.reviewer_iterations.to_string(),
+                    wall_clock_secs: self.caps.wall_clock_secs.to_string(),
+                    idle_secs: self
+                        .caps
+                        .idle_secs
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    concurrency: self.concurrency.to_string(),
+                    focused: SettingsField::GateIterations,
+                    error: None,
+                });
+                self.mode = Mode::Settings;
+                true
+            }
+
+            // ── Settings navigation and editing (plan 0070) ─────────────────────────
+            AppEvent::SettingsUp => {
+                if let Some(settings) = &mut self.settings {
+                    settings.focused = match settings.focused {
+                        SettingsField::GateIterations => SettingsField::Concurrency,
+                        SettingsField::ReviewerIterations => SettingsField::GateIterations,
+                        SettingsField::WallClockSecs => SettingsField::ReviewerIterations,
+                        SettingsField::IdleSecs => SettingsField::WallClockSecs,
+                        SettingsField::Concurrency => SettingsField::IdleSecs,
+                    };
+                }
+                true
+            }
+
+            AppEvent::SettingsDown => {
+                if let Some(settings) = &mut self.settings {
+                    settings.focused = match settings.focused {
+                        SettingsField::GateIterations => SettingsField::ReviewerIterations,
+                        SettingsField::ReviewerIterations => SettingsField::WallClockSecs,
+                        SettingsField::WallClockSecs => SettingsField::IdleSecs,
+                        SettingsField::IdleSecs => SettingsField::Concurrency,
+                        SettingsField::Concurrency => SettingsField::GateIterations,
+                    };
+                }
+                true
+            }
+
+            AppEvent::SettingsInput(c) => {
+                if let Some(settings) = &mut self.settings
+                    && c.is_ascii_digit()
+                {
+                    match settings.focused {
+                        SettingsField::GateIterations => {
+                            settings.gate_iterations.push(c);
+                        }
+                        SettingsField::ReviewerIterations => {
+                            settings.reviewer_iterations.push(c);
+                        }
+                        SettingsField::WallClockSecs => {
+                            settings.wall_clock_secs.push(c);
+                        }
+                        SettingsField::IdleSecs => {
+                            settings.idle_secs.push(c);
+                        }
+                        SettingsField::Concurrency => {
+                            settings.concurrency.push(c);
+                        }
+                    }
+                    // Re-validate the focused field inline.
+                    settings.error = None;
+                    match settings.focused {
+                        SettingsField::GateIterations => {
+                            if let Ok(val) = settings.gate_iterations.parse::<u32>() {
+                                if val < 1 {
+                                    settings.error =
+                                        Some("caps.gate_iterations must be at least 1".to_string());
+                                }
+                            } else if !settings.gate_iterations.is_empty() {
+                                settings.error = Some(
+                                    "caps.gate_iterations must be a positive integer".to_string(),
+                                );
+                            }
+                        }
+                        SettingsField::ReviewerIterations => {
+                            if let Ok(val) = settings.reviewer_iterations.parse::<u32>() {
+                                if val < 1 {
+                                    settings.error = Some(
+                                        "caps.reviewer_iterations must be at least 1".to_string(),
+                                    );
+                                }
+                            } else if !settings.reviewer_iterations.is_empty() {
+                                settings.error = Some(
+                                    "caps.reviewer_iterations must be a positive integer"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        SettingsField::WallClockSecs => {
+                            if let Ok(val) = settings.wall_clock_secs.parse::<u64>() {
+                                if val < 1 {
+                                    settings.error =
+                                        Some("caps.wall_clock_secs must be at least 1".to_string());
+                                }
+                            } else if !settings.wall_clock_secs.is_empty() {
+                                settings.error = Some(
+                                    "caps.wall_clock_secs must be a positive integer".to_string(),
+                                );
+                            }
+                        }
+                        SettingsField::IdleSecs => {
+                            if !settings.idle_secs.is_empty() {
+                                if let Ok(val) = settings.idle_secs.parse::<u64>() {
+                                    if val < 1 {
+                                        settings.error =
+                                            Some("caps.idle_secs must be at least 1".to_string());
+                                    }
+                                } else {
+                                    settings.error = Some(
+                                        "caps.idle_secs must be a positive integer".to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        SettingsField::Concurrency => {
+                            if let Ok(val) = settings.concurrency.parse::<usize>() {
+                                if val < 1 {
+                                    settings.error =
+                                        Some("concurrency must be at least 1".to_string());
+                                }
+                            } else if !settings.concurrency.is_empty() {
+                                settings.error =
+                                    Some("concurrency must be a positive integer".to_string());
+                            }
+                        }
+                    }
+                }
+                true
+            }
+
+            AppEvent::SettingsBackspace => {
+                if let Some(settings) = &mut self.settings {
+                    match settings.focused {
+                        SettingsField::GateIterations => {
+                            settings.gate_iterations.pop();
+                        }
+                        SettingsField::ReviewerIterations => {
+                            settings.reviewer_iterations.pop();
+                        }
+                        SettingsField::WallClockSecs => {
+                            settings.wall_clock_secs.pop();
+                        }
+                        SettingsField::IdleSecs => {
+                            settings.idle_secs.pop();
+                        }
+                        SettingsField::Concurrency => {
+                            settings.concurrency.pop();
+                        }
+                    }
+                    // Re-validate the focused field inline.
+                    settings.error = None;
+                    match settings.focused {
+                        SettingsField::GateIterations => {
+                            if let Ok(val) = settings.gate_iterations.parse::<u32>() {
+                                if val < 1 {
+                                    settings.error =
+                                        Some("caps.gate_iterations must be at least 1".to_string());
+                                }
+                            } else if !settings.gate_iterations.is_empty() {
+                                settings.error = Some(
+                                    "caps.gate_iterations must be a positive integer".to_string(),
+                                );
+                            }
+                        }
+                        SettingsField::ReviewerIterations => {
+                            if let Ok(val) = settings.reviewer_iterations.parse::<u32>() {
+                                if val < 1 {
+                                    settings.error = Some(
+                                        "caps.reviewer_iterations must be at least 1".to_string(),
+                                    );
+                                }
+                            } else if !settings.reviewer_iterations.is_empty() {
+                                settings.error = Some(
+                                    "caps.reviewer_iterations must be a positive integer"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        SettingsField::WallClockSecs => {
+                            if let Ok(val) = settings.wall_clock_secs.parse::<u64>() {
+                                if val < 1 {
+                                    settings.error =
+                                        Some("caps.wall_clock_secs must be at least 1".to_string());
+                                }
+                            } else if !settings.wall_clock_secs.is_empty() {
+                                settings.error = Some(
+                                    "caps.wall_clock_secs must be a positive integer".to_string(),
+                                );
+                            }
+                        }
+                        SettingsField::IdleSecs => {
+                            if !settings.idle_secs.is_empty() {
+                                if let Ok(val) = settings.idle_secs.parse::<u64>() {
+                                    if val < 1 {
+                                        settings.error =
+                                            Some("caps.idle_secs must be at least 1".to_string());
+                                    }
+                                } else {
+                                    settings.error = Some(
+                                        "caps.idle_secs must be a positive integer".to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        SettingsField::Concurrency => {
+                            if let Ok(val) = settings.concurrency.parse::<usize>() {
+                                if val < 1 {
+                                    settings.error =
+                                        Some("concurrency must be at least 1".to_string());
+                                }
+                            } else if !settings.concurrency.is_empty() {
+                                settings.error =
+                                    Some("concurrency must be a positive integer".to_string());
+                            }
+                        }
+                    }
+                }
+                true
+            }
+
+            AppEvent::CloseSettings => {
+                self.mode = Mode::Normal;
+                self.settings = None;
+                true
+            }
+
+            AppEvent::SettingsCommit => {
+                if let Some(settings) = &mut self.settings {
+                    // Validate all fields before applying.
+                    let mut has_error = false;
+                    let mut gate_iterations = 0u32;
+                    let mut reviewer_iterations = 0u32;
+                    let mut wall_clock_secs = 0u64;
+                    let mut idle_secs = None;
+                    let mut concurrency = 0usize;
+
+                    // Parse gate_iterations
+                    if let Ok(val) = settings.gate_iterations.parse::<u32>() {
+                        if val >= 1 {
+                            gate_iterations = val;
+                        } else {
+                            settings.error =
+                                Some("caps.gate_iterations must be at least 1".to_string());
+                            has_error = true;
+                        }
+                    } else {
+                        settings.error =
+                            Some("caps.gate_iterations must be a positive integer".to_string());
+                        has_error = true;
+                    }
+
+                    // Parse reviewer_iterations
+                    if !has_error {
+                        if let Ok(val) = settings.reviewer_iterations.parse::<u32>() {
+                            if val >= 1 {
+                                reviewer_iterations = val;
+                            } else {
+                                settings.error =
+                                    Some("caps.reviewer_iterations must be at least 1".to_string());
+                                has_error = true;
+                            }
+                        } else {
+                            settings.error = Some(
+                                "caps.reviewer_iterations must be a positive integer".to_string(),
+                            );
+                            has_error = true;
+                        }
+                    }
+
+                    // Parse wall_clock_secs
+                    if !has_error {
+                        if let Ok(val) = settings.wall_clock_secs.parse::<u64>() {
+                            if val >= 1 {
+                                wall_clock_secs = val;
+                            } else {
+                                settings.error =
+                                    Some("caps.wall_clock_secs must be at least 1".to_string());
+                                has_error = true;
+                            }
+                        } else {
+                            settings.error =
+                                Some("caps.wall_clock_secs must be a positive integer".to_string());
+                            has_error = true;
+                        }
+                    }
+
+                    // Parse idle_secs (optional)
+                    if !has_error {
+                        if settings.idle_secs.is_empty() {
+                            idle_secs = None;
+                        } else if let Ok(val) = settings.idle_secs.parse::<u64>() {
+                            if val >= 1 {
+                                idle_secs = Some(val);
+                            } else {
+                                settings.error =
+                                    Some("caps.idle_secs must be at least 1".to_string());
+                                has_error = true;
+                            }
+                        } else {
+                            settings.error =
+                                Some("caps.idle_secs must be a positive integer".to_string());
+                            has_error = true;
+                        }
+                    }
+
+                    // Parse concurrency
+                    if !has_error {
+                        if let Ok(val) = settings.concurrency.parse::<usize>() {
+                            if val >= 1 {
+                                concurrency = val;
+                            } else {
+                                settings.error = Some("concurrency must be at least 1".to_string());
+                                has_error = true;
+                            }
+                        } else {
+                            settings.error =
+                                Some("concurrency must be a positive integer".to_string());
+                            has_error = true;
+                        }
+                    }
+
+                    if !has_error {
+                        // All validation passed; apply the values.
+                        self.caps.gate_iterations = gate_iterations;
+                        self.caps.reviewer_iterations = reviewer_iterations;
+                        self.caps.wall_clock_secs = wall_clock_secs;
+                        self.caps.idle_secs = idle_secs;
+                        self.concurrency = concurrency;
+                        self.mode = Mode::Normal;
+                        self.settings = None;
+                    }
+                    // If has_error, keep the modal open with the error set.
+                }
+                true
+            }
+
+            // ── Placeholder stubs for forward-referenced plans ────────────────────
+            AppEvent::RetryFocusedTask => {
+                self.status_message = Some("retry not yet available (plan 0017)".to_string());
+                true
+            }
+            AppEvent::DiscoverProject => {
+                self.status_message =
+                    Some("project discovery not yet available (plan 0025)".to_string());
                 true
             }
 
@@ -3246,6 +3832,8 @@ mod tests {
                 project: None,
             },
             false,
+            makina_core::config::CapsConfig::default(),
+            3,
         );
 
         // Sanity: starts in Normal mode with no editor open.
@@ -4700,6 +5288,148 @@ mod tests {
         }
     }
 
+    // ── Command palette (plan 0069) ───────────────────────────────────────────
+
+    /// `AppEvent::OpenCommandPalette` must set mode and seed actions.
+    #[test]
+    fn open_command_palette_sets_mode_and_seeds_actions() {
+        let mut app = make_app();
+
+        // Mode starts as Normal.
+        assert_eq!(app.mode, Mode::Normal, "initial mode must be Normal");
+        assert!(
+            app.command_palette.is_none(),
+            "command_palette must start None"
+        );
+
+        // Open the palette.
+        let changed = app.update(AppEvent::OpenCommandPalette);
+        assert!(changed, "OpenCommandPalette must request a redraw");
+
+        // Mode is now CommandPalette.
+        assert_eq!(
+            app.mode,
+            Mode::CommandPalette,
+            "mode must be CommandPalette after open"
+        );
+
+        // Palette is Some and seeded.
+        assert!(
+            app.command_palette.is_some(),
+            "command_palette must be Some after open"
+        );
+        let palette = app.command_palette.as_ref().unwrap();
+
+        // Default actions are non-empty.
+        assert!(
+            !palette.actions.is_empty(),
+            "default_actions must be non-empty"
+        );
+
+        // Selected is 0.
+        assert_eq!(palette.selected, 0, "selected must be 0");
+
+        // Filter starts empty.
+        assert_eq!(palette.filter, "", "filter must be empty initially");
+    }
+
+    /// Filtering must narrow the action list case-insensitively and clamp selection.
+    #[test]
+    fn palette_filter_narrows_and_clamps_selection() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenCommandPalette);
+
+        // Palette has all 7 default actions.
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.filtered().len(), 7, "full list must have 7 actions");
+
+        // Type "doc" (case-insensitive).
+        app.update(AppEvent::CommandPaletteInput('d'));
+        app.update(AppEvent::CommandPaletteInput('o'));
+        app.update(AppEvent::CommandPaletteInput('c'));
+
+        let palette = app.command_palette.as_ref().unwrap();
+
+        // Filter should match "Doctor" case-insensitively.
+        assert_eq!(palette.filter, "doc", "filter must be 'doc'");
+
+        let filtered = palette.filtered();
+        assert_eq!(filtered.len(), 1, "filtered list must have 1 item");
+        assert_eq!(
+            filtered[0].label, "Doctor",
+            "filtered item must be 'Doctor'"
+        );
+
+        // Selected must be clamped to 0 (the only item).
+        assert_eq!(
+            palette.selected, 0,
+            "selected must be clamped to 0 for single-item list"
+        );
+
+        // Backspace to clear the filter.
+        app.update(AppEvent::CommandPaletteBackspace);
+        app.update(AppEvent::CommandPaletteBackspace);
+        app.update(AppEvent::CommandPaletteBackspace);
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.filter, "", "filter must be empty after backspaces");
+
+        // Full list restored.
+        assert_eq!(
+            palette.filtered().len(),
+            7,
+            "full list restored after filter cleared"
+        );
+    }
+
+    /// `CommandPaletteExecute` and `CloseCommandPalette` must return to normal mode.
+    #[test]
+    fn palette_execute_and_close_return_to_normal() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenCommandPalette);
+
+        // Mode is CommandPalette.
+        assert_eq!(
+            app.mode,
+            Mode::CommandPalette,
+            "mode must be CommandPalette"
+        );
+        assert!(
+            app.command_palette.is_some(),
+            "command_palette must be Some"
+        );
+
+        // Execute the selected action.
+        let changed = app.update(AppEvent::CommandPaletteExecute);
+        assert!(changed, "CommandPaletteExecute must request a redraw");
+
+        // Mode is Normal and palette is gone.
+        assert_eq!(app.mode, Mode::Normal, "mode must be Normal after execute");
+        assert!(
+            app.command_palette.is_none(),
+            "command_palette must be None after execute"
+        );
+
+        // Open again and test close.
+        app.update(AppEvent::OpenCommandPalette);
+        assert_eq!(
+            app.mode,
+            Mode::CommandPalette,
+            "mode must be CommandPalette"
+        );
+
+        // Close the palette.
+        let changed = app.update(AppEvent::CloseCommandPalette);
+        assert!(changed, "CloseCommandPalette must request a redraw");
+
+        // Mode is Normal and palette is gone.
+        assert_eq!(app.mode, Mode::Normal, "mode must be Normal after close");
+        assert!(
+            app.command_palette.is_none(),
+            "command_palette must be None after close"
+        );
+    }
+
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
 
     /// `AppEvent::ToggleVerbose` must flip `App::verbose_mode` true↔false.
@@ -4724,5 +5454,314 @@ mod tests {
             !app.verbose_mode,
             "verbose_mode must be false after second toggle"
         );
+    }
+
+    #[test]
+    fn open_settings_lists_current_caps() {
+        // --- Case 1: caps.idle_secs = None, idle_secs_config = None ---
+        // Both sources produce the same empty string for idle_secs; this
+        // verifies the basic wiring for the None case.
+        let mut app = make_app();
+        app.caps = makina_core::config::CapsConfig {
+            gate_iterations: 7,
+            reviewer_iterations: 3,
+            wall_clock_secs: 1200,
+            idle_secs: None,
+        };
+        app.concurrency = 4;
+        app.idle_secs_config = None;
+
+        // Open settings.
+        let changed = app.update(AppEvent::OpenSettings);
+        assert!(changed, "OpenSettings must request a redraw");
+        assert_eq!(app.mode, Mode::Settings, "mode must be Settings");
+        assert!(app.settings.is_some(), "settings must be Some");
+
+        // Verify settings are seeded from caps.
+        let settings = app.settings.as_ref().unwrap();
+        assert_eq!(settings.gate_iterations, "7");
+        assert_eq!(settings.reviewer_iterations, "3");
+        assert_eq!(settings.wall_clock_secs, "1200");
+        assert_eq!(settings.idle_secs, "", "idle_secs must be empty when None");
+        assert_eq!(settings.concurrency, "4");
+        assert_eq!(
+            settings.focused,
+            SettingsField::GateIterations,
+            "focused must start on GateIterations"
+        );
+        assert_eq!(settings.error, None, "error must be None initially");
+
+        // --- Case 2: caps.idle_secs = Some(30), idle_secs_config = None ---
+        // This distinguishes the correct source (caps.idle_secs) from the wrong
+        // one (idle_secs_config).  If OpenSettings reads idle_secs_config the
+        // field would be "" despite the config having 30s configured.
+        let mut app2 = make_app();
+        app2.caps = makina_core::config::CapsConfig {
+            gate_iterations: 2,
+            reviewer_iterations: 2,
+            wall_clock_secs: 900,
+            idle_secs: Some(30),
+        };
+        app2.concurrency = 2;
+        // idle_secs_config is left at None (the default), simulating a scenario
+        // where the user configured idle_secs=30 in config.toml but no TaskIdle
+        // event has fired yet.
+        assert_eq!(app2.idle_secs_config, None);
+
+        app2.update(AppEvent::OpenSettings);
+        let settings2 = app2.settings.as_ref().unwrap();
+        assert_eq!(
+            settings2.idle_secs, "30",
+            "idle_secs must be seeded from caps.idle_secs, not idle_secs_config"
+        );
+        assert_eq!(settings2.gate_iterations, "2");
+        assert_eq!(settings2.concurrency, "2");
+    }
+
+    #[test]
+    fn invalid_value_rejected() {
+        // Seed settings with some values, then clear gate_iterations and enter '0'.
+        let mut app = make_app();
+        app.caps = makina_core::config::CapsConfig {
+            gate_iterations: 7,
+            reviewer_iterations: 3,
+            wall_clock_secs: 1200,
+            idle_secs: None,
+        };
+        app.concurrency = 4;
+
+        // Open settings to populate the modal.
+        app.update(AppEvent::OpenSettings);
+        assert!(app.settings.is_some(), "settings must be Some");
+
+        let settings = app.settings.as_ref().unwrap();
+        assert_eq!(settings.focused, SettingsField::GateIterations);
+
+        // Clear the buffer and input '0'.
+        app.settings.as_mut().unwrap().gate_iterations.clear();
+        app.update(AppEvent::SettingsInput('0'));
+
+        // Check that error was set.
+        let settings = app.settings.as_ref().unwrap();
+        assert_eq!(
+            settings.error,
+            Some("caps.gate_iterations must be at least 1".to_string()),
+            "error must be set for value 0"
+        );
+        assert_eq!(settings.gate_iterations, "0");
+
+        // Try to commit — should fail and keep modal open.
+        let changed = app.update(AppEvent::SettingsCommit);
+        assert!(changed);
+        assert_eq!(
+            app.mode,
+            Mode::Settings,
+            "mode must remain Settings after failed validation"
+        );
+        assert!(app.settings.is_some(), "settings must remain Some");
+
+        // Verify caps were NOT mutated.
+        assert_eq!(
+            app.caps.gate_iterations, 7,
+            "caps.gate_iterations must not be mutated on failed validation"
+        );
+        assert_eq!(
+            app.concurrency, 4,
+            "concurrency must not be mutated on failed validation"
+        );
+    }
+
+    #[test]
+    fn settings_navigation_cycles_through_fields() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenSettings);
+        let settings = app.settings.as_ref().unwrap();
+        assert_eq!(settings.focused, SettingsField::GateIterations);
+
+        // Down should move to ReviewerIterations.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::ReviewerIterations
+        );
+
+        // Down again -> WallClockSecs.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::WallClockSecs
+        );
+
+        // Down again -> IdleSecs.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::IdleSecs
+        );
+
+        // Down again -> Concurrency.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::Concurrency
+        );
+
+        // Down again -> wraps to GateIterations.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::GateIterations
+        );
+
+        // Up should go backward.
+        app.update(AppEvent::SettingsUp);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::Concurrency
+        );
+    }
+
+    #[test]
+    fn settings_input_and_backspace_edit_focused_field() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenSettings);
+
+        // Initially on GateIterations, which is "5" (the default).
+        assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "5");
+
+        // Type "99" — should append to the field.
+        app.update(AppEvent::SettingsInput('9'));
+        assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "59");
+
+        app.update(AppEvent::SettingsInput('9'));
+        assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "599");
+
+        // Backspace once — should pop.
+        app.update(AppEvent::SettingsBackspace);
+        assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "59");
+
+        // Move to Concurrency and edit it.
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::Concurrency
+        );
+        assert_eq!(app.settings.as_ref().unwrap().concurrency, "3");
+
+        app.update(AppEvent::SettingsInput('5'));
+        assert_eq!(app.settings.as_ref().unwrap().concurrency, "35");
+
+        app.update(AppEvent::SettingsBackspace);
+        assert_eq!(app.settings.as_ref().unwrap().concurrency, "3");
+    }
+
+    #[test]
+    fn settings_close_discards_changes() {
+        let mut app = make_app();
+        app.caps = makina_core::config::CapsConfig {
+            gate_iterations: 7,
+            reviewer_iterations: 3,
+            wall_clock_secs: 1200,
+            idle_secs: None,
+        };
+        app.concurrency = 4;
+
+        app.update(AppEvent::OpenSettings);
+        assert_eq!(app.mode, Mode::Settings);
+
+        // Edit a field.
+        app.update(AppEvent::SettingsInput('9'));
+        assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "79");
+
+        // Close without saving.
+        app.update(AppEvent::CloseSettings);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.settings.is_none());
+
+        // Verify caps were not mutated.
+        assert_eq!(app.caps.gate_iterations, 7);
+        assert_eq!(app.concurrency, 4);
+    }
+
+    #[test]
+    fn settings_commit_applies_valid_values() {
+        let mut app = make_app();
+        app.caps = makina_core::config::CapsConfig {
+            gate_iterations: 7,
+            reviewer_iterations: 3,
+            wall_clock_secs: 1200,
+            idle_secs: None,
+        };
+        app.concurrency = 4;
+
+        app.update(AppEvent::OpenSettings);
+
+        // Clear GateIterations and set to "10".
+        app.settings.as_mut().unwrap().gate_iterations.clear();
+        app.update(AppEvent::SettingsInput('1'));
+        app.update(AppEvent::SettingsInput('0'));
+        assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "10");
+
+        // Move to Concurrency and set to "8".
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.settings.as_mut().unwrap().concurrency.clear();
+        app.update(AppEvent::SettingsInput('8'));
+        assert_eq!(app.settings.as_ref().unwrap().concurrency, "8");
+
+        // Commit.
+        app.update(AppEvent::SettingsCommit);
+
+        // Verify caps were updated.
+        assert_eq!(app.caps.gate_iterations, 10);
+        assert_eq!(app.concurrency, 8);
+        assert_eq!(app.caps.reviewer_iterations, 3);
+        assert_eq!(app.caps.wall_clock_secs, 1200);
+        assert_eq!(app.caps.idle_secs, None);
+
+        // Verify modal was closed.
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.settings.is_none());
+    }
+
+    #[test]
+    fn settings_idle_secs_optional() {
+        let mut app = make_app();
+        app.caps = makina_core::config::CapsConfig {
+            gate_iterations: 7,
+            reviewer_iterations: 3,
+            wall_clock_secs: 1200,
+            idle_secs: Some(30),
+        };
+        app.concurrency = 4;
+
+        app.update(AppEvent::OpenSettings);
+        assert_eq!(app.settings.as_ref().unwrap().idle_secs, "30");
+
+        // Move to IdleSecs field.
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::IdleSecs
+        );
+
+        // Clear it.
+        app.settings.as_mut().unwrap().idle_secs.clear();
+        assert_eq!(app.settings.as_ref().unwrap().idle_secs, "");
+        assert_eq!(app.settings.as_ref().unwrap().error, None);
+
+        // Commit with empty idle_secs.
+        app.update(AppEvent::SettingsCommit);
+
+        // Verify it's now None.
+        assert_eq!(app.caps.idle_secs, None);
+        assert_eq!(app.mode, Mode::Normal);
     }
 }

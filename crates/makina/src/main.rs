@@ -262,9 +262,11 @@ async fn main() {
         !stdout.trim().is_empty()
     };
 
-    // Clone providers and roles before config is moved into the API.
+    // Clone providers, roles, caps, and concurrency before config is moved into the API.
     let providers_for_app = config.providers.clone();
     let roles_for_app = config.roles.clone();
+    let caps_for_app = config.caps.clone();
+    let concurrency_for_app = config.concurrency;
 
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
         ingestion_interpreter,
@@ -288,6 +290,8 @@ async fn main() {
         provider_probes,
         load_paths,
         base_branch_exists,
+        caps_for_app,
+        concurrency_for_app,
     );
     app.load_initial_exchanges();
 

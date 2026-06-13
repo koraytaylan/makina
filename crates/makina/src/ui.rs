@@ -411,7 +411,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let default_style = Style::default().bg(Color::DarkGray).fg(Color::White);
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!(" [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] doctor  [wheel] scroll  "),
+            format!(" [^P] cmds  [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] doctor  [wheel] scroll  "),
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -444,6 +444,22 @@ pub fn render(app: &App, frame: &mut Frame) {
     // Drawn last so it sits on top of all other overlays.
     if app.is_viewing_doctor() {
         render_doctor(app, frame, area);
+    }
+
+    // ── Command palette overlay (plan 0069) ────────────────────────────────────
+    // Drawn after doctor so it sits on top when both might be open.
+    if app.is_command_palette()
+        && let Some(p) = app.command_palette.as_ref()
+    {
+        render_command_palette(p, frame, area);
+    }
+
+    // ── Settings overlay (plan 0070) ──────────────────────────────────────────────
+    // Drawn after command palette so it sits on top when both might be open.
+    if app.is_settings()
+        && let Some(s) = app.settings.as_ref()
+    {
+        render_settings(s, frame, area);
     }
 }
 
@@ -1623,6 +1639,192 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
     frame.render_widget(footer, footer_area);
 }
 
+/// Render the command palette modal.
+///
+/// A modal that lists all available commands, filtered by user input,
+/// with navigation and selection highlighting.
+fn render_command_palette(palette: &crate::app::CommandPalette, frame: &mut Frame, area: Rect) {
+    // Centre a box ~60% wide / 60% tall.
+    let popup = centered_rect(60, 60, area);
+
+    // Clear the region first so the popup is opaque.
+    frame.render_widget(Clear, popup);
+
+    let title = " Command Palette ";
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split the popup into filter area, list area, and footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    let filter_area = chunks[0];
+    let list_area = chunks[1];
+    let footer_area = chunks[2];
+
+    // Render the filter line as "> {filter}▏"
+    let filter_text = Line::from(vec![Span::raw(format!("> {}▏", palette.filter))]);
+    let filter_widget = Paragraph::new(filter_text);
+    frame.render_widget(filter_widget, filter_area);
+
+    // Build the list of items from filtered actions
+    let filtered_actions = palette.filtered();
+    let items: Vec<ListItem> = filtered_actions
+        .iter()
+        .map(|action| ListItem::new(Line::from(vec![Span::raw(action.label)])))
+        .collect();
+
+    // Highlight style for selected row
+    let highlight_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let list = List::new(items)
+        .highlight_style(highlight_style)
+        .highlight_symbol("▶ ");
+
+    let mut state = ListState::default();
+    // Select the appropriate row, clamping to the filtered list size
+    if !filtered_actions.is_empty() {
+        state.select(Some(palette.selected.min(filtered_actions.len() - 1)));
+    }
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    // Footer with hints
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "↑/↓ select · Enter run · Esc close",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(footer, footer_area);
+}
+
+/// Render the settings modal.
+///
+/// A modal that displays editable configuration fields (gate iterations,
+/// reviewer iterations, wall-clock seconds, idle seconds, concurrency),
+/// with highlighting for the focused field and error messages.
+fn render_settings(settings: &crate::app::Settings, frame: &mut Frame, area: Rect) {
+    // Centre a box ~70% wide / 70% tall.
+    let popup = centered_rect(70, 70, area);
+
+    // Clear the region first so the popup is opaque.
+    frame.render_widget(Clear, popup);
+
+    let title = " Settings ";
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split the popup into list area, error area (if present), and footer
+    let error_height = if settings.error.is_some() { 1 } else { 0 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),               // list
+            Constraint::Length(error_height), // error (0 or 1)
+            Constraint::Length(2),            // footer
+        ])
+        .split(inner);
+    let list_area = chunks[0];
+    let error_area = chunks[1];
+    let footer_area = chunks[2];
+
+    // Build the list of settings fields
+    let mut items: Vec<ListItem> = vec![];
+
+    let fields = vec![
+        (
+            "Gate iterations",
+            &settings.gate_iterations,
+            crate::app::SettingsField::GateIterations,
+        ),
+        (
+            "Reviewer iterations",
+            &settings.reviewer_iterations,
+            crate::app::SettingsField::ReviewerIterations,
+        ),
+        (
+            "Wall-clock (s)",
+            &settings.wall_clock_secs,
+            crate::app::SettingsField::WallClockSecs,
+        ),
+        (
+            "Idle (s)",
+            &settings.idle_secs,
+            crate::app::SettingsField::IdleSecs,
+        ),
+        (
+            "Concurrency",
+            &settings.concurrency,
+            crate::app::SettingsField::Concurrency,
+        ),
+    ];
+
+    for (label, value, field) in fields {
+        let is_focused = field == settings.focused;
+        let display_value = if value.is_empty() {
+            "—".to_string()
+        } else {
+            value.to_string()
+        };
+
+        let text = if is_focused {
+            format!("  {}: {}▏", label, display_value)
+        } else {
+            format!("  {}: {}", label, display_value)
+        };
+
+        let style = if is_focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let line = Line::from(vec![Span::styled(text, style)]);
+        items.push(ListItem::new(line));
+    }
+
+    let list = List::new(items);
+    frame.render_widget(list, list_area);
+
+    // If there's an error, render it in red
+    if let Some(error) = &settings.error {
+        let error_style = Style::default().fg(Color::Red);
+        let error_line = Line::from(vec![Span::styled(error.clone(), error_style)]);
+        let error_para = Paragraph::new(error_line);
+        frame.render_widget(error_para, error_area);
+    }
+
+    // Footer with hints
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "↑/↓ field · 0-9 edit · Enter save · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(footer, footer_area);
+}
+
 /// Probe whether a directory is writable.
 ///
 /// Reads the directory's metadata and reports writability. On Unix the mode
@@ -2112,10 +2314,10 @@ mod tests {
     /// The status bar must show the current dependency view label.
     #[test]
     fn status_bar_shows_current_view_label() {
-        // The status bar carries more hints now ([e] errors badge + [?] doctor
+        // The status bar carries more hints now ([^P] cmds + [e] errors badge + [?] doctor
         // + [wheel] scroll), so use a wider terminal to ensure the trailing
         // `view:` label is not clipped before the assertions run.
-        let mut terminal = make_terminal(180, 24);
+        let mut terminal = make_terminal(220, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
@@ -2129,7 +2331,7 @@ mod tests {
 
         // Cycle to List
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(180, 24);
+        let mut terminal = make_terminal(220, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2139,7 +2341,7 @@ mod tests {
 
         // Cycle to Tree
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(180, 24);
+        let mut terminal = make_terminal(220, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2149,7 +2351,7 @@ mod tests {
 
         // Cycle to Timeline
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(180, 24);
+        let mut terminal = make_terminal(220, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -5194,6 +5396,96 @@ mod tests {
         assert!(
             screen.contains("[^O] verbose"),
             "status bar must contain '[^O] verbose' hint; got:\n{screen}"
+        );
+    }
+
+    // ── Command palette (plan 0069) ───────────────────────────────────────────
+
+    /// The command palette renders filtered actions with the filter input and footer.
+    #[test]
+    fn palette_renders_filtered_actions() {
+        let mut terminal = make_terminal(160, 40);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Set up command palette with a filter
+        app.mode = crate::app::Mode::CommandPalette;
+        app.command_palette = Some(crate::app::CommandPalette {
+            filter: "set".to_string(),
+            actions: crate::app::CommandPalette::default_actions(),
+            selected: 0,
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Verify title appears
+        assert!(
+            screen.contains("Command Palette"),
+            "modal must contain title 'Command Palette'; got:\n{screen}"
+        );
+
+        // Verify filter is visible
+        assert!(
+            screen.contains("set"),
+            "modal must show filter input 'set'; got:\n{screen}"
+        );
+
+        // Verify "Settings" is in the filtered output
+        assert!(
+            screen.contains("Settings"),
+            "modal must show 'Settings' (matches filter 'set'); got:\n{screen}"
+        );
+
+        // Verify "Doctor" is NOT in the filtered output (doesn't match 'set')
+        assert!(
+            !screen.contains("Doctor"),
+            "modal must NOT show 'Doctor' (doesn't match filter 'set'); got:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn settings_renders_current_values() {
+        let mut terminal = make_terminal(160, 40);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Set up settings with known values
+        app.mode = crate::app::Mode::Settings;
+        app.settings = Some(crate::app::Settings {
+            gate_iterations: "7".to_string(),
+            reviewer_iterations: "3".to_string(),
+            wall_clock_secs: "600".to_string(),
+            idle_secs: "".to_string(),
+            concurrency: "4".to_string(),
+            focused: crate::app::SettingsField::GateIterations,
+            error: None,
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Verify title appears
+        assert!(
+            screen.contains("Settings"),
+            "modal must contain title 'Settings'; got:\n{screen}"
+        );
+
+        // Verify field values appear
+        assert!(
+            screen.contains("7"),
+            "modal must show gate_iterations value '7'; got:\n{screen}"
+        );
+
+        assert!(
+            screen.contains("4"),
+            "modal must show concurrency value '4'; got:\n{screen}"
+        );
+
+        // Verify empty idle_secs is shown as "—"
+        assert!(
+            screen.contains("—"),
+            "modal must show empty idle_secs as '—'; got:\n{screen}"
         );
     }
 }
