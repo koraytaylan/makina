@@ -564,6 +564,19 @@ pub enum AppEvent {
     /// re-ingest source to recompute report and graph).
     Reinterpret,
 
+    /// User pressed `r` / `R` — context-sensitive retry on the focused tree node
+    /// (plan 0017).
+    ///
+    /// Resolved by the IO layer via [`App::focused_node`]: a focused `Failed`
+    /// task dispatches [`makina_core::api::Command::RetryTask`]; a focused run
+    /// with any `Failed` task dispatches
+    /// [`makina_core::api::Command::RetryFailedTasks`]; if nothing is retryable,
+    /// it falls back to re-interpreting a still-`Pending` run, else surfaces a
+    /// `nothing to retry here` status message.  `update` itself does nothing for
+    /// this variant (the async command runs in the IO layer), keeping `update`
+    /// pure.
+    RetryFocused,
+
     /// A transient status-bar message to display (command outcome or error).
     ///
     /// Set by the IO layer after an `api.execute(...)` resolves so the user sees
@@ -1394,7 +1407,8 @@ impl App {
             AppEvent::StartRun
             | AppEvent::PauseRun
             | AppEvent::CancelRun
-            | AppEvent::Reinterpret => true,
+            | AppEvent::Reinterpret
+            | AppEvent::RetryFocused => true,
 
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
@@ -1642,6 +1656,15 @@ impl App {
             } => {
                 // Record the idle timeout config for use in rendering the idle indicator.
                 self.idle_secs_config = Some(*idle_secs);
+            }
+            // A failed (or skipped-cascade) task was reset for retry (plan 0017).
+            // Clear the task's stale per-step timing so it is treated as fresh; the
+            // companion `TaskStateChanged` updates its badge back to New/Ready and
+            // re-stamps activity once it is dispatched again.
+            Event::TaskRetried { run, task } => {
+                self.task_step_start_tick.remove(&(*run, task.clone()));
+                self.task_last_activity_tick.remove(&(*run, task.clone()));
+                self.status_message = Some(format!("retrying {}", task.0));
             }
         }
 

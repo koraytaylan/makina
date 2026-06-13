@@ -160,6 +160,86 @@ impl Api for PlaceholderApi {
                     Err(ApiError::UnknownRun { run })
                 }
             }
+            // Plan 0017: flip the targeted Failed task(s) back to Ready, mark the
+            // run Running, and broadcast TaskRetried + the state changes — enough
+            // for TUI tests to observe a retry without a real scheduler.
+            Command::RetryTask { run, task } => {
+                let mut runs = self.runs.lock().unwrap();
+                let Some(rv) = runs.iter_mut().find(|r| r.id == run) else {
+                    return Err(ApiError::UnknownRun { run });
+                };
+                let Some(tv) = rv.tasks.iter_mut().find(|t| t.id == task) else {
+                    return Err(ApiError::InvalidCommand {
+                        reason: format!("task {} is not in run {run}", task.0),
+                    });
+                };
+                if tv.state != TaskState::Failed {
+                    return Err(ApiError::InvalidCommand {
+                        reason: format!(
+                            "task {} is in state {:?}, not Failed; cannot retry",
+                            task.0, tv.state
+                        ),
+                    });
+                }
+                tv.state = TaskState::Ready;
+                tv.failure_reason = None;
+                tv.gate_iterations = 0;
+                tv.review_iterations = 0;
+                rv.status = RunStatus::Running;
+                drop(runs);
+                let _ = self.event_tx.send(Event::TaskRetried {
+                    run,
+                    task: task.clone(),
+                });
+                let _ = self.event_tx.send(Event::TaskStateChanged {
+                    run,
+                    task,
+                    state: TaskState::Ready,
+                });
+                let _ = self.event_tx.send(Event::RunStatusChanged {
+                    run,
+                    status: RunStatus::Running,
+                });
+                Ok(CommandOutcome::Acknowledged)
+            }
+            Command::RetryFailedTasks { run } => {
+                let mut runs = self.runs.lock().unwrap();
+                let Some(rv) = runs.iter_mut().find(|r| r.id == run) else {
+                    return Err(ApiError::UnknownRun { run });
+                };
+                let retried: Vec<TaskId> = rv
+                    .tasks
+                    .iter()
+                    .filter(|t| t.state == TaskState::Failed)
+                    .map(|t| t.id.clone())
+                    .collect();
+                for tv in rv.tasks.iter_mut().filter(|t| t.state == TaskState::Failed) {
+                    tv.state = TaskState::Ready;
+                    tv.failure_reason = None;
+                    tv.gate_iterations = 0;
+                    tv.review_iterations = 0;
+                }
+                if !retried.is_empty() {
+                    rv.status = RunStatus::Running;
+                }
+                drop(runs);
+                for task in retried {
+                    let _ = self.event_tx.send(Event::TaskRetried {
+                        run,
+                        task: task.clone(),
+                    });
+                    let _ = self.event_tx.send(Event::TaskStateChanged {
+                        run,
+                        task,
+                        state: TaskState::Ready,
+                    });
+                }
+                let _ = self.event_tx.send(Event::RunStatusChanged {
+                    run,
+                    status: RunStatus::Running,
+                });
+                Ok(CommandOutcome::Acknowledged)
+            }
         }
     }
 

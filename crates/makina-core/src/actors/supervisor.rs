@@ -2364,6 +2364,149 @@ fn mark_dependents_skipped(graph: &mut TaskGraph, failed_task_id: &TaskId) -> Ve
     skipped
 }
 
+// ── Retry / un-skip graph mutations (plan 0017) ──────────────────────────────────
+//
+// These mirror the lock discipline of the helpers above: each takes a borrowed
+// `&mut TaskGraph` while the caller holds the `tokio::sync::Mutex<TaskGraph>`
+// guard, never awaits, and returns plain values so the guard can be dropped
+// before the caller's next await point.
+
+/// Reset a single permanently-`Failed` task so it can run again (user retry).
+///
+/// Requires the task to be in [`TaskState::Failed`]; returns `Err` otherwise
+/// (the command layer pre-validates, but this keeps the helper total). Clears
+/// `failure_reason`, zeroes `gate_iterations`/`review_iterations`, clears
+/// `finished_at`, applies [`TaskEvent::RetryRequested`] (`Failed → New`), and
+/// bumps `updated_at` — giving the task a fresh budget on the next dispatch.
+pub(crate) fn reset_task_for_retry_locked(
+    graph: &mut TaskGraph,
+    task_id: &TaskId,
+) -> Result<(), String> {
+    let state = task_state_locked(graph, task_id)?;
+    if state != TaskState::Failed {
+        return Err(format!(
+            "task {task_id} is in state {state:?}, not Failed; cannot retry"
+        ));
+    }
+    // FSM first (rejects anything but Failed → New), then clear the metadata.
+    apply_event_locked(graph, task_id, TaskEvent::RetryRequested)?;
+    let task = task_mut_locked(graph, task_id)?;
+    task.failure_reason = None;
+    task.gate_iterations = 0;
+    task.review_iterations = 0;
+    task.finished_at = None;
+    task.updated_at = chrono::Utc::now();
+    Ok(())
+}
+
+/// Un-skip the transitive dependents that were `Skipped` solely because of the
+/// failure(s) now being retried — the inverse of [`mark_dependents_skipped`].
+///
+/// `reset_task_ids` are the tasks just revived (out of `Failed`). Performs a
+/// **fixed-point** sweep over the forward-dependents: repeat until no change,
+/// for every task currently in [`TaskState::Skipped`] whose `depends_on`
+/// contains an already-revived id, revive it (clear `finished_at`, apply
+/// [`TaskEvent::DependencyReset`] → `New`) **iff none** of its `depends_on` is
+/// still in [`TaskState::Failed`] **and none** is still in
+/// [`TaskState::Skipped`]. A task blocked by an unrelated still-`Failed` or
+/// still-`Skipped` prerequisite is left `Skipped`.
+///
+/// Called under the held graph guard (no `.await`). Returns the ids freshly
+/// revived to `New`, so the caller can emit them after the guard is dropped.
+pub(crate) fn unskip_dependents_locked(
+    graph: &mut TaskGraph,
+    reset_task_ids: &[TaskId],
+) -> Vec<TaskId> {
+    // `revived` seeds the frontier with the already-reset roots; `unskipped`
+    // accumulates only the ids we actually moved `Skipped → New`.
+    let mut revived: std::collections::HashSet<TaskId> = reset_task_ids.iter().cloned().collect();
+    let mut unskipped: Vec<TaskId> = Vec::new();
+
+    loop {
+        let mut changed = false;
+
+        // Candidates: still-`Skipped` tasks that depend on an already-revived id
+        // and are not themselves already in the revived set.
+        let candidates: Vec<TaskId> = graph
+            .tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Skipped)
+            .filter(|t| !revived.contains(&t.id))
+            .filter(|t| t.depends_on.iter().any(|dep| revived.contains(dep)))
+            .map(|t| t.id.clone())
+            .collect();
+
+        for id in candidates {
+            // Precise revive guard: revive only if NONE of this task's deps is
+            // still `Failed` or still `Skipped`. A dep that is `Skipped` but will
+            // itself be revived later in this same fixed-point sweep blocks the
+            // revive on this pass; a subsequent pass re-evaluates it once the dep
+            // flips to `New`, so authored order is irrelevant.
+            let deps: Vec<TaskId> = graph
+                .get(&id)
+                .map(|t| t.depends_on.clone())
+                .unwrap_or_default();
+            let blocked = deps.iter().any(|dep| {
+                matches!(
+                    task_state_locked(graph, dep).ok(),
+                    Some(TaskState::Failed) | Some(TaskState::Skipped)
+                )
+            });
+            if blocked {
+                continue;
+            }
+            if apply_event_locked(graph, &id, TaskEvent::DependencyReset).is_ok() {
+                if let Ok(task) = task_mut_locked(graph, &id) {
+                    task.finished_at = None;
+                    task.updated_at = chrono::Utc::now();
+                }
+                revived.insert(id.clone());
+                unskipped.push(id);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    unskipped
+}
+
+/// Re-mark readiness after a retry reset: every task now in [`TaskState::New`]
+/// whose `depends_on` are all [`TaskState::Done`] is advanced to
+/// [`TaskState::Ready`] via [`TaskEvent::DependenciesSatisfied`], mirroring the
+/// scheduler's initial `New → Ready` sweep so the fresh scheduler can pick them
+/// up.
+///
+/// Called under the held graph guard (no `.await`). Returns the ids moved to
+/// `Ready`.
+pub(crate) fn remark_ready_locked(graph: &mut TaskGraph) -> Vec<TaskId> {
+    let ready_candidates: Vec<TaskId> = graph
+        .tasks
+        .iter()
+        .filter(|t| t.state == TaskState::New)
+        .filter(|t| {
+            t.depends_on.iter().all(|dep| {
+                graph
+                    .get(dep)
+                    .map(|d| d.state == TaskState::Done)
+                    .unwrap_or(false)
+            })
+        })
+        .map(|t| t.id.clone())
+        .collect();
+
+    let mut readied = Vec::new();
+    for id in ready_candidates {
+        if apply_event_locked(graph, &id, TaskEvent::DependenciesSatisfied).is_ok() {
+            readied.push(id);
+        }
+    }
+    readied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2461,5 +2604,159 @@ mod tests {
             None => Ok(()),
         };
         result.expect("the run must NOT hard-error on a task-level advance failure");
+    }
+
+    // ── Retry / un-skip graph mutations (plan 0017) ──────────────────────────
+
+    /// Build a `Task` with an explicit `depends_on` list (helper for cascade
+    /// fixtures).
+    fn task_dep(id: &str, state: TaskState, depends_on: &[&str]) -> Task {
+        let mut t = task_in(id, state);
+        t.depends_on = depends_on.iter().map(|d| TaskId::new(*d)).collect();
+        t
+    }
+
+    /// `reset_task_for_retry_locked` clears all failure metadata and drives a
+    /// `Failed` task back to `New` with a fresh budget.
+    #[test]
+    fn reset_clears_failure_metadata() {
+        let mut failed = task_in("a", TaskState::Failed);
+        failed.gate_iterations = 3;
+        failed.review_iterations = 2;
+        failed.finished_at = Some(Utc::now());
+        failed.failure_reason = Some(api::FailureReason {
+            kind: api::FailureKind::GateCap,
+            message: "gate cap exhausted".into(),
+        });
+        let mut graph = TaskGraph {
+            slug: "reset-meta".into(),
+            tasks: vec![failed],
+        };
+
+        reset_task_for_retry_locked(&mut graph, &TaskId::new("a"))
+            .expect("reset of a Failed task must succeed");
+
+        let t = graph.get(&TaskId::new("a")).unwrap();
+        assert_eq!(t.state, TaskState::New, "Failed must reset to New");
+        assert_eq!(t.gate_iterations, 0, "gate budget must be zeroed");
+        assert_eq!(t.review_iterations, 0, "review budget must be zeroed");
+        assert!(t.failure_reason.is_none(), "failure_reason must be cleared");
+        assert!(t.finished_at.is_none(), "finished_at must be cleared");
+    }
+
+    /// `unskip_dependents_locked` revives only the cascade of the retried task,
+    /// leaving an unrelated still-failed cascade `Skipped`.
+    #[test]
+    fn unskip_revives_only_this_cascade() {
+        // A ← B ← C and X ← Y.  Fail A (=> B,C Skipped) and X (=> Y Skipped).
+        let mut graph = TaskGraph {
+            slug: "cascade".into(),
+            tasks: vec![
+                task_in("a", TaskState::Failed),
+                task_dep("b", TaskState::Skipped, &["a"]),
+                task_dep("c", TaskState::Skipped, &["b"]),
+                task_in("x", TaskState::Failed),
+                task_dep("y", TaskState::Skipped, &["x"]),
+            ],
+        };
+
+        // Reset only A, then un-skip its cascade.
+        reset_task_for_retry_locked(&mut graph, &TaskId::new("a")).unwrap();
+        let revived = unskip_dependents_locked(&mut graph, &[TaskId::new("a")]);
+
+        assert_eq!(
+            graph.get(&TaskId::new("b")).unwrap().state,
+            TaskState::New,
+            "B's only dep A is reset, so B must revive"
+        );
+        assert_eq!(
+            graph.get(&TaskId::new("c")).unwrap().state,
+            TaskState::New,
+            "C's only dep B is revived, so C must revive"
+        );
+        assert_eq!(
+            graph.get(&TaskId::new("y")).unwrap().state,
+            TaskState::Skipped,
+            "Y is not in A's cascade and X is still Failed; Y stays Skipped"
+        );
+        let revived_set: std::collections::HashSet<_> = revived.into_iter().collect();
+        assert!(revived_set.contains(&TaskId::new("b")));
+        assert!(revived_set.contains(&TaskId::new("c")));
+        assert!(!revived_set.contains(&TaskId::new("y")));
+    }
+
+    /// A `Skipped` task that depends on the retried failure AND an unrelated
+    /// still-`Failed` task stays `Skipped` (multi-dependency guard).
+    #[test]
+    fn unskip_leaves_task_blocked_by_other_failure() {
+        // Z depends on BOTH A and X; fail A and X (=> Z Skipped). Retry A only.
+        let mut graph = TaskGraph {
+            slug: "multi-dep".into(),
+            tasks: vec![
+                task_in("a", TaskState::Failed),
+                task_in("x", TaskState::Failed),
+                task_dep("z", TaskState::Skipped, &["a", "x"]),
+            ],
+        };
+        reset_task_for_retry_locked(&mut graph, &TaskId::new("a")).unwrap();
+        let revived = unskip_dependents_locked(&mut graph, &[TaskId::new("a")]);
+        assert_eq!(
+            graph.get(&TaskId::new("z")).unwrap().state,
+            TaskState::Skipped,
+            "Z still depends on Failed X, so the guard must leave Z Skipped"
+        );
+        assert!(revived.is_empty(), "no task should be revived");
+    }
+
+    /// `reset_task_for_retry_locked` rejects a non-`Failed` target (the
+    /// command layer surfaces this as `InvalidCommand`).
+    #[test]
+    fn reset_rejects_non_failed() {
+        for state in [
+            TaskState::Done,
+            TaskState::InProgress,
+            TaskState::New,
+            TaskState::Ready,
+            TaskState::Skipped,
+        ] {
+            let mut graph = TaskGraph {
+                slug: "reject".into(),
+                tasks: vec![task_in("a", state)],
+            };
+            let err = reset_task_for_retry_locked(&mut graph, &TaskId::new("a"))
+                .expect_err("reset of a non-Failed task must error");
+            assert!(
+                err.contains("not Failed") || err.contains("cannot retry"),
+                "error must explain the non-Failed rejection; got {err:?}"
+            );
+        }
+    }
+
+    /// `remark_ready_locked` advances a `New` task whose deps are all `Done`
+    /// back to `Ready`, but leaves one with a non-`Done` dep in `New`.
+    #[test]
+    fn remark_ready_advances_only_satisfied() {
+        let mut graph = TaskGraph {
+            slug: "remark".into(),
+            tasks: vec![
+                task_in("done", TaskState::Done),
+                task_dep("ready-me", TaskState::New, &["done"]),
+                task_dep("blocked", TaskState::New, &["new-dep"]),
+                task_in("new-dep", TaskState::New),
+            ],
+        };
+        let readied = remark_ready_locked(&mut graph);
+        assert_eq!(
+            graph.get(&TaskId::new("ready-me")).unwrap().state,
+            TaskState::Ready,
+            "a New task with all-Done deps must advance to Ready"
+        );
+        assert_eq!(
+            graph.get(&TaskId::new("blocked")).unwrap().state,
+            TaskState::New,
+            "a New task with a non-Done dep must stay New"
+        );
+        assert!(readied.contains(&TaskId::new("ready-me")));
+        assert!(!readied.contains(&TaskId::new("blocked")));
     }
 }

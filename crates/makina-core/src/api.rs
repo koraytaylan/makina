@@ -398,6 +398,46 @@ pub enum Command {
         /// The Run to re-interpret.
         run: RunId,
     },
+
+    /// Reset a single [`TaskState::Failed`] task (and the cascade of
+    /// dependents it skipped), give it a fresh budget, and re-dispatch the run.
+    ///
+    /// The supervisor clears the task's failure metadata, zeroes its iteration
+    /// counters, drives it `Failed → New`, un-skips the dependents that were
+    /// skipped solely because of this failure, re-marks readiness, persists the
+    /// reset graph, and spawns a fresh scheduler over it. The run flips
+    /// `Failed → Running` and aggregates to `Completed`/`Failed` again on drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::UnknownRun`] if `run` does not identify an open Run.
+    /// Returns [`ApiError::InvalidCommand`] if `task` is not in state
+    /// [`TaskState::Failed`], or if the run is still actively
+    /// [`RunStatus::Running`] (only `Failed`/`Paused`/`Completed` runs are
+    /// retryable).
+    RetryTask {
+        /// The Run that contains the failed task.
+        run: RunId,
+        /// The failed task to reset and re-dispatch.
+        task: TaskId,
+    },
+
+    /// Reset **every** [`TaskState::Failed`] task in the run (and the cascade of
+    /// dependents they skipped), give them fresh budgets, and re-dispatch.
+    ///
+    /// Equivalent to [`Command::RetryTask`] applied to all failed tasks under a
+    /// single graph lock, un-skip sweep, readiness re-mark, persist, and one
+    /// re-dispatch spawn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::UnknownRun`] if `run` does not identify an open Run.
+    /// Returns [`ApiError::InvalidCommand`] if the run is still actively
+    /// [`RunStatus::Running`].
+    RetryFailedTasks {
+        /// The Run whose failed tasks should be reset and re-dispatched.
+        run: RunId,
+    },
 }
 
 /// The successful outcome of a [`Command`] executed via [`Api::execute`].
@@ -752,6 +792,21 @@ pub enum Event {
         /// The idle timeout duration in seconds.
         idle_secs: u64,
     },
+
+    /// A previously-`Failed` task was reset for retry (plan 0017).
+    ///
+    /// Emitted once per task that the supervisor reset during a
+    /// [`Command::RetryTask`] / [`Command::RetryFailedTasks`] — both the
+    /// explicitly retried task and each dependent revived from `Skipped`. The
+    /// task has had its failure metadata and iteration budget cleared and is
+    /// back in `New`/`Ready`; the run is being re-dispatched. The TUI can use it
+    /// to surface a "retried" status message.
+    TaskRetried {
+        /// The Run that contains the reset task.
+        run: RunId,
+        /// The task that was reset for retry.
+        task: TaskId,
+    },
 }
 
 // ── Stream type alias ─────────────────────────────────────────────────────────
@@ -965,6 +1020,14 @@ mod tests {
                     }
                 }
                 Command::ReinterpretRun { run } => {
+                    let runs = self.runs.lock().unwrap();
+                    if runs.iter().any(|r| r.id == run) {
+                        Ok(CommandOutcome::Acknowledged)
+                    } else {
+                        Err(ApiError::UnknownRun { run })
+                    }
+                }
+                Command::RetryTask { run, .. } | Command::RetryFailedTasks { run } => {
                     let runs = self.runs.lock().unwrap();
                     if runs.iter().any(|r| r.id == run) {
                         Ok(CommandOutcome::Acknowledged)

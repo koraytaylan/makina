@@ -285,6 +285,8 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
             AppEvent::Tick,
             run_control(app, ControlKind::Reinterpret).await,
         ),
+        // ── Context-sensitive retry (plan 0017) ───────────────────────────────
+        AppEvent::RetryFocused => (AppEvent::Tick, retry_focused(app).await),
         // ── Provider configuration editor commit (task 0041) ──────────────────
         // Write the editor's current providers + roles back to the project config
         // file (`{repo_root}/.makina/config.toml`).  Best-effort: on IO/serialise
@@ -589,6 +591,78 @@ async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
     }
 }
 
+/// Resolve a context-sensitive retry on the focused sidebar tree node (plan
+/// 0017) and return a status message describing the outcome.
+///
+/// - A focused `Failed` task → [`Command::RetryTask`].
+/// - A focused run with any `Failed` task → [`Command::RetryFailedTasks`].
+/// - Otherwise, if the focused run is still `Pending`, fall back to
+///   [`Command::ReinterpretRun`] (the recover-from-blocking flow that `[r]`
+///   previously served), so a single key still serves both purposes.
+/// - Otherwise emit `nothing to retry here` and issue no command.
+///
+/// The actual state changes (task resets, run resuming) flow back through
+/// `api.subscribe()`; this only surfaces the command's immediate acknowledgement
+/// / error in the status bar.
+async fn retry_focused(app: &App) -> Option<String> {
+    use crate::app::TreeNode;
+    use makina_core::api::{Command, RunStatus, TaskState};
+
+    // Resolve the focused node into an optional retry command + a label.
+    let command: Option<(Command, String)> = match app.focused_node() {
+        Some(TreeNode::Task { run, task }) => {
+            let rv = app.runs.get(run)?;
+            let tv = rv.tasks.get(task)?;
+            if tv.state == TaskState::Failed {
+                Some((
+                    Command::RetryTask {
+                        run: rv.id,
+                        task: tv.id.clone(),
+                    },
+                    format!("retry {}", tv.id.0),
+                ))
+            } else {
+                None
+            }
+        }
+        Some(TreeNode::Run { run }) => {
+            let rv = app.runs.get(run)?;
+            if rv.tasks.iter().any(|t| t.state == TaskState::Failed) {
+                Some((
+                    Command::RetryFailedTasks { run: rv.id },
+                    format!("retry failed tasks in {}", rv.id),
+                ))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    if let Some((command, verb)) = command {
+        return match app.api.execute(command).await {
+            Ok(_) => Some(verb),
+            Err(e) => Some(format!("{verb} failed: {e}")),
+        };
+    }
+
+    // Nothing retryable. Fall back to re-interpreting a still-Pending run so the
+    // single `[r]` key still serves the recover-from-blocking flow; otherwise a
+    // no-op message.
+    if app
+        .focused_node()
+        .and_then(|node| match node {
+            TreeNode::Run { run } | TreeNode::Task { run, .. } => app.runs.get(run),
+        })
+        .map(|rv| rv.status == RunStatus::Pending)
+        .unwrap_or(false)
+    {
+        return run_control(app, ControlKind::Reinterpret).await;
+    }
+
+    Some("nothing to retry here".to_string())
+}
+
 /// Read `dir` and build a [`AppEvent::BrowserOpened`] event from its entries.
 ///
 /// Entries are sorted directories-first, then alphabetically (case-insensitive),
@@ -751,8 +825,11 @@ fn translate_key(
             KeyCode::Char('s') | KeyCode::Char('S') => AppEvent::StartRun,
             KeyCode::Char('p') | KeyCode::Char('P') => AppEvent::PauseRun,
             KeyCode::Char('c') | KeyCode::Char('C') => AppEvent::CancelRun,
-            // Re-interpret the selected run (e.g. after fixing blocking issues).
-            KeyCode::Char('r') | KeyCode::Char('R') => AppEvent::Reinterpret,
+            // Context-sensitive retry (plan 0017): retry the focused failed task
+            // or the focused run's failures.  Falls back to re-interpreting a
+            // still-Pending run (the recover-from-blocking flow) when nothing is
+            // retryable.
+            KeyCode::Char('r') | KeyCode::Char('R') => AppEvent::RetryFocused,
             // Dismiss the provider-missing warning banner (non-fatal; just hides it).
             KeyCode::Char('d') | KeyCode::Char('D') => AppEvent::DismissProviderWarning,
             // Sidebar navigation: arrow keys and vim-style j/k.
@@ -891,7 +968,8 @@ mod tests {
     }
 
     #[test]
-    fn r_key_translates_to_reinterpret() {
+    fn r_key_translates_to_retry_focused() {
+        // Plan 0017 repurposes `r` from Reinterpret to context-sensitive retry.
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('r'), KeyModifiers::NONE),
@@ -900,7 +978,7 @@ mod tests {
                 false,
                 crate::app::Panel::Sidebar
             ),
-            AppEvent::Reinterpret
+            AppEvent::RetryFocused
         ));
     }
 
@@ -1960,5 +2038,204 @@ A description that is long enough to pass minimums.
         let project_contents = std::fs::read_to_string(&project_path).expect("read project config");
         let _: toml::Value =
             toml::from_str(&project_contents).expect("scaffold project config must be valid TOML");
+    }
+
+    // ── Context-sensitive retry key (plan 0017) ───────────────────────────────
+
+    use async_trait::async_trait;
+    use makina_core::api::{
+        Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunStatus, RunView,
+        TaskId, TaskState, TaskView,
+    };
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    /// A stub api that records every `Command` it executes (for retry-key tests).
+    struct RetryRecordingApi {
+        commands: StdMutex<Vec<Command>>,
+    }
+
+    impl RetryRecordingApi {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                commands: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Api for RetryRecordingApi {
+        async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+            self.commands.lock().unwrap().push(command.clone());
+            match command {
+                Command::OpenRun { .. } => Ok(CommandOutcome::RunOpened { run: RunId(1) }),
+                _ => Ok(CommandOutcome::Acknowledged),
+            }
+        }
+        async fn runs(&self) -> Vec<RunView> {
+            vec![]
+        }
+        async fn run(&self, _id: RunId) -> Option<RunView> {
+            None
+        }
+        fn subscribe(&self) -> EventStream {
+            Box::pin(futures::stream::empty::<Event>())
+        }
+    }
+
+    fn task_view(id: &str, state: TaskState) -> TaskView {
+        TaskView {
+            id: TaskId::new(id),
+            title: format!("Task {id}"),
+            state,
+            gate_iterations: 0,
+            review_iterations: 0,
+            depends_on: vec![],
+            failure_reason: None,
+        }
+    }
+
+    /// Build a single-run App with the given tasks and run status, backed by a
+    /// recording api. Runs are expanded by default so task nodes are focusable.
+    fn retry_app(
+        tasks: Vec<TaskView>,
+        status: RunStatus,
+    ) -> (crate::app::App, Arc<RetryRecordingApi>) {
+        use crate::app::App;
+        let api = RetryRecordingApi::new();
+        let run = RunView {
+            id: RunId(7),
+            run_uid: String::new(),
+            task_list_path: std::path::PathBuf::from(".tasks/retry.json"),
+            status,
+            project: String::new(),
+            tasks,
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![run],
+            std::path::PathBuf::from("."),
+        );
+        (app, api)
+    }
+
+    /// Focusing a `Failed` task and pressing `[r]` issues `RetryTask` with the
+    /// focused run + task.
+    #[tokio::test]
+    async fn retry_key_on_failed_task_issues_retry_task() {
+        use crate::app::{AppEvent, TreeNode};
+        let (mut app, api) = retry_app(vec![task_view("a", TaskState::Failed)], RunStatus::Failed);
+        // tree_cursor starts on the Run node; move down to the (Failed) task node.
+        app.tree_move(1);
+        assert!(
+            matches!(app.focused_node(), Some(TreeNode::Task { task: 0, .. })),
+            "the focused node must be the failed task"
+        );
+
+        let (_ev, status) = resolve_io(&app, AppEvent::RetryFocused).await;
+        assert!(status.is_some(), "retry must surface a status message");
+
+        let cmds = api.commands.lock().unwrap().clone();
+        assert_eq!(cmds.len(), 1, "exactly one command must be issued");
+        assert!(
+            matches!(
+                &cmds[0],
+                Command::RetryTask { run: RunId(7), task } if task.0 == "a"
+            ),
+            "RetryFocused on a Failed task must issue RetryTask{{run:7, task:a}}; got {:?}",
+            cmds[0]
+        );
+    }
+
+    /// Focusing a run node with at least one `Failed` task and pressing `[r]`
+    /// issues `RetryFailedTasks`.
+    #[tokio::test]
+    async fn retry_key_on_run_node_issues_retry_failed() {
+        use crate::app::{AppEvent, TreeNode};
+        let (app, api) = retry_app(
+            vec![
+                task_view("a", TaskState::Done),
+                task_view("b", TaskState::Failed),
+            ],
+            RunStatus::Failed,
+        );
+        // tree_cursor starts on the Run node.
+        assert!(
+            matches!(app.focused_node(), Some(TreeNode::Run { .. })),
+            "the focused node must be the run header"
+        );
+
+        let (_ev, status) = resolve_io(&app, AppEvent::RetryFocused).await;
+        assert!(status.is_some());
+
+        let cmds = api.commands.lock().unwrap().clone();
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(&cmds[0], Command::RetryFailedTasks { run: RunId(7) }),
+            "RetryFocused on a run with failures must issue RetryFailedTasks; got {:?}",
+            cmds[0]
+        );
+    }
+
+    /// Focusing a `Done` task (nothing retryable, run not Pending) issues no
+    /// command and sets the `nothing to retry here` status message.
+    #[tokio::test]
+    async fn retry_key_noop_when_nothing_failed() {
+        use crate::app::{AppEvent, TreeNode};
+        let (mut app, api) = retry_app(vec![task_view("a", TaskState::Done)], RunStatus::Completed);
+        app.tree_move(1); // focus the Done task.
+        assert!(matches!(
+            app.focused_node(),
+            Some(TreeNode::Task { task: 0, .. })
+        ));
+
+        let (_ev, status) = resolve_io(&app, AppEvent::RetryFocused).await;
+        assert_eq!(
+            status.as_deref(),
+            Some("nothing to retry here"),
+            "a Done task in a non-Pending run must yield the no-op message"
+        );
+        assert!(
+            api.commands.lock().unwrap().is_empty(),
+            "no command must be issued when nothing is retryable"
+        );
+    }
+
+    /// The status bar advertises the `[r]` retry key.
+    #[test]
+    fn status_bar_advertises_retry_key() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let api = RetryRecordingApi::new();
+        let run = RunView {
+            id: RunId(7),
+            run_uid: String::new(),
+            task_list_path: std::path::PathBuf::from(".tasks/retry.json"),
+            status: RunStatus::Failed,
+            project: String::new(),
+            tasks: vec![task_view("a", TaskState::Failed)],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![run],
+            std::path::PathBuf::from("."),
+        );
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(&app, f))
+            .expect("render");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            rendered.contains("[r]"),
+            "the status bar must advertise the [r] retry key; rendered: {rendered}"
+        );
     }
 }

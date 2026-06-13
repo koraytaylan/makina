@@ -45,13 +45,17 @@
 //! │ InReview     │ MergeConflict        │ Failed      │ ← squash-merge conflict (dedicated event)
 //! │ InReview     │ HardError            │ Failed      │ ← review-time/merge hard error (task 25)
 //! │ InReview     │ WallClockCapReached  │ Failed      │ ← deadline (task 25)
+//! │ Failed       │ RetryRequested       │ New         │ ← user retry (plan 0017)
+//! │ Skipped      │ DependencyReset      │ New         │ ← cascade un-skip (plan 0017)
 //! └──────────────┴──────────────────────┴─────────────┘
 //! ```
 //!
-//! `Done` and `Failed` are terminal: no outgoing transitions exist for any
-//! event.  `WallClockCapReached` is **not** legal from `New`: the per-task
-//! wall-clock deadline starts at dispatch (when the driver begins), so a task
-//! that has not been picked up yet cannot time out.
+//! `Done` is terminal: no outgoing transitions exist for any event.  `Failed`
+//! and `Skipped` are terminal *except* for their single reset edge — the
+//! plan-0017 retry path applies `RetryRequested`/`DependencyReset` to bring them
+//! back to `New`.  `WallClockCapReached` is **not** legal from `New`: the
+//! per-task wall-clock deadline starts at dispatch (when the driver begins), so a
+//! task that has not been picked up yet cannot time out.
 
 use thiserror::Error;
 
@@ -154,6 +158,25 @@ pub enum TaskEvent {
     /// (`Done`, `Failed`, `Skipped`).  Enforced externally (the scheduler walks
     /// the reverse dependency edges when a task fails).
     DependencyFailed,
+
+    /// A user-initiated retry resets a permanently-`Failed` task so it can run
+    /// again.
+    ///
+    /// The **only** legal exit from [`TaskState::Failed`]:
+    /// [`TaskState::Failed`] → [`TaskState::New`]. Illegal from every other state
+    /// (retry only applies to a failed task). The Supervisor clears the task's
+    /// failure metadata and iteration budgets externally before re-dispatch.
+    RetryRequested,
+
+    /// A dependency-skipped task is un-skipped because the blocking failure it
+    /// cascaded from is being retried.
+    ///
+    /// The **only** legal exit from [`TaskState::Skipped`]:
+    /// [`TaskState::Skipped`] → [`TaskState::New`]. Illegal from every other
+    /// state. Applied by the un-skip cascade (the inverse of
+    /// `mark_dependents_skipped`) only when none of the task's prerequisites is
+    /// still `Failed`/`Skipped`.
+    DependencyReset,
 }
 
 // ── IllegalTransition ─────────────────────────────────────────────────────────
@@ -232,6 +255,10 @@ pub fn transition(from: TaskState, event: TaskEvent) -> Result<TaskState, Illega
         // ── DependencyFailed (active → Skipped) ───────────────────────────────
         (New | Ready | InProgress | InReview, DependencyFailed) => Ok(Skipped),
 
+        // ── Reset transitions (terminal failure → New) ────────────────────────
+        (Failed, RetryRequested) => Ok(New), // user-initiated retry
+        (Skipped, DependencyReset) => Ok(New), // cascade un-skip
+
         // ── Everything else (illegal) ─────────────────────────────────────────
         _ => Err(IllegalTransition { from, event }),
     }
@@ -252,8 +279,10 @@ pub fn is_terminal(state: TaskState) -> bool {
 
 /// Returns the complete list of [`TaskEvent`]s that are legal in `state`.
 ///
-/// For terminal states (`Done`, `Failed`) this is always empty.  Useful for
-/// exhaustive test construction and for supervisor introspection.
+/// For `Done` this is always empty. `Failed` and `Skipped` are terminal but
+/// each accept their single 0017 reset event (`RetryRequested` /
+/// `DependencyReset`). Useful for exhaustive test construction and for
+/// supervisor introspection.
 pub fn legal_events(from: TaskState) -> Vec<TaskEvent> {
     use TaskEvent::*;
     use TaskState::*;
@@ -278,7 +307,9 @@ pub fn legal_events(from: TaskState) -> Vec<TaskEvent> {
             WallClockCapReached,
             DependencyFailed,
         ],
-        Done | Failed | Skipped => vec![],
+        Done => vec![],
+        Failed => vec![RetryRequested],
+        Skipped => vec![DependencyReset],
     }
 }
 
@@ -339,6 +370,8 @@ mod tests {
             (Ready, DependencyFailed, Skipped),
             (InProgress, DependencyFailed, Skipped),
             (InReview, DependencyFailed, Skipped),
+            (Failed, RetryRequested, New), // user-initiated retry (0017)
+            (Skipped, DependencyReset, New), // cascade un-skip (0017)
         ]
     }
 
@@ -364,6 +397,8 @@ mod tests {
             MergeConflict,
             WallClockCapReached,
             DependencyFailed,
+            RetryRequested,
+            DependencyReset,
         ]
     }
 
@@ -392,7 +427,7 @@ mod tests {
         let events = all_events();
 
         let total = states.len() * events.len();
-        assert_eq!(total, 84, "expected 7 states × 12 events = 84 pairs");
+        assert_eq!(total, 98, "expected 7 states × 14 events = 98 pairs");
 
         let mut legal_count = 0usize;
         let mut illegal_count = 0usize;
@@ -419,8 +454,8 @@ mod tests {
             }
         }
 
-        assert_eq!(legal_count, 19, "expected exactly 19 legal transitions");
-        assert_eq!(illegal_count, 65, "expected exactly 65 illegal transitions");
+        assert_eq!(legal_count, 21, "expected exactly 21 legal transitions");
+        assert_eq!(illegal_count, 77, "expected exactly 77 illegal transitions");
     }
 
     // ── is_terminal ───────────────────────────────────────────────────────────
@@ -439,21 +474,44 @@ mod tests {
         assert!(!is_terminal(InReview), "InReview must not be terminal");
     }
 
-    /// No event is legal in a terminal state.
+    /// `Done` rejects every event (no reset transition leaves it).
     #[test]
-    fn terminal_states_have_no_legal_events() {
+    fn done_has_no_legal_events() {
         use TaskState::*;
 
-        for state in [Done, Failed] {
+        assert!(
+            legal_events(Done).is_empty(),
+            "Done must have no legal events"
+        );
+        // Also verify via transition directly.
+        for &event in &all_events() {
             assert!(
-                legal_events(state).is_empty(),
-                "terminal state {state:?} must have no legal events"
+                transition(Done, event).is_err(),
+                "Done must reject event {event:?}"
             );
-            // Also verify via transition directly.
-            for &event in &all_events() {
+        }
+    }
+
+    /// `Failed` and `Skipped` are terminal but each have exactly one reset exit
+    /// (0017 retry/un-skip); no *other* event is legal from them.
+    #[test]
+    fn failed_and_skipped_only_accept_their_reset_event() {
+        use TaskState::*;
+
+        assert_eq!(legal_events(Failed), vec![TaskEvent::RetryRequested]);
+        assert_eq!(legal_events(Skipped), vec![TaskEvent::DependencyReset]);
+
+        for &event in &all_events() {
+            if event != TaskEvent::RetryRequested {
                 assert!(
-                    transition(state, event).is_err(),
-                    "terminal state {state:?} must reject event {event:?}"
+                    transition(Failed, event).is_err(),
+                    "Failed must reject every event but RetryRequested; got {event:?}"
+                );
+            }
+            if event != TaskEvent::DependencyReset {
+                assert!(
+                    transition(Skipped, event).is_err(),
+                    "Skipped must reject every event but DependencyReset; got {event:?}"
                 );
             }
         }
@@ -692,6 +750,50 @@ mod tests {
         assert!(
             is_terminal(TaskState::Skipped),
             "Skipped must be a terminal state"
+        );
+    }
+
+    // ── Task fsm-reset-transitions assertions (0017) ──────────────────────────
+
+    /// `RetryRequested` resets a `Failed` task to `New`; it is illegal from any
+    /// non-`Failed` state.
+    #[test]
+    fn retry_requested_resets_failed_to_new() {
+        assert_eq!(
+            transition(TaskState::Failed, TaskEvent::RetryRequested),
+            Ok(TaskState::New),
+            "RetryRequested must reset Failed → New",
+        );
+        assert!(
+            transition(TaskState::Done, TaskEvent::RetryRequested).is_err(),
+            "RetryRequested must be illegal from Done",
+        );
+        assert!(
+            transition(TaskState::InProgress, TaskEvent::RetryRequested).is_err(),
+            "RetryRequested must be illegal from InProgress",
+        );
+        assert!(
+            transition(TaskState::Skipped, TaskEvent::RetryRequested).is_err(),
+            "RetryRequested must be illegal from Skipped",
+        );
+    }
+
+    /// `DependencyReset` un-skips a `Skipped` task to `New`; it is illegal from
+    /// any non-`Skipped` state.
+    #[test]
+    fn dependency_reset_unskips_to_new() {
+        assert_eq!(
+            transition(TaskState::Skipped, TaskEvent::DependencyReset),
+            Ok(TaskState::New),
+            "DependencyReset must un-skip Skipped → New",
+        );
+        assert!(
+            transition(TaskState::Ready, TaskEvent::DependencyReset).is_err(),
+            "DependencyReset must be illegal from Ready",
+        );
+        assert!(
+            transition(TaskState::Failed, TaskEvent::DependencyReset).is_err(),
+            "DependencyReset must be illegal from Failed",
         );
     }
 }

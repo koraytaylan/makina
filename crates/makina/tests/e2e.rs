@@ -540,6 +540,9 @@ fn log_event(ev: &Event) {
         } => {
             eprintln!("  · TaskIdle {}[idle timeout: {idle_secs}s]", task.0)
         }
+        Event::TaskRetried { task, .. } => {
+            eprintln!("  · TaskRetried {}", task.0)
+        }
     }
 }
 

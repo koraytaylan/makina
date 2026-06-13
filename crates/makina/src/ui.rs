@@ -409,7 +409,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let default_style = Style::default().bg(Color::DarkGray).fg(Color::White);
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [v] view  [L] log  [?] doctor  ",
+            " [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [L] log  [?] doctor  ",
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -1947,6 +1947,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::CurrentModeUpdate { .. } => "CurrentModeUpdate",
         Event::AgentExchange { .. } => "AgentExchange",
         Event::TaskIdle { .. } => "TaskIdle",
+        Event::TaskRetried { .. } => "TaskRetried",
     }
 }
 

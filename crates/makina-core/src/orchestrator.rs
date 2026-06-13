@@ -920,6 +920,31 @@ impl CoreApi {
             )
         }; // registry guard dropped here.
 
+        self.spawn_run_scheduler(run, graph, cancel, pause, run_slug, run_uid, plan_slug);
+
+        Ok(CommandOutcome::Acknowledged)
+    }
+
+    /// Build the per-run [`RunControl`] and `tokio::spawn` the Supervisor
+    /// scheduler over `graph`, finalizing the registry status when it drains.
+    ///
+    /// Shared by [`CoreApi::start_run`] and the retry re-dispatch path
+    /// ([`CoreApi::retry_task`] / [`CoreApi::retry_failed_tasks`]).  The caller
+    /// must have already recorded the [`RunHandle`] (`cancel`/`pause`) in the
+    /// registry and dropped the registry guard.  The scheduler creates its own
+    /// fresh `Semaphore::new(concurrency)` internally — correct for retry because
+    /// the prior scheduler already exited.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_run_scheduler(
+        &self,
+        run: RunId,
+        graph: Arc<AsyncMutex<TaskGraph>>,
+        cancel: CancellationToken,
+        pause: Arc<AtomicBool>,
+        run_slug: String,
+        run_uid: String,
+        plan_slug: String,
+    ) {
         // Build the per-run control (sink → broadcast, pause flag, cancel token).
         let control = RunControl {
             run,
@@ -928,8 +953,8 @@ impl CoreApi {
             cancel,
         };
 
-        // Create the per-run logs directory up front (best-effort). `start_run`
-        // is synchronous, so use `std::fs::create_dir_all` (via the paths
+        // Create the per-run logs directory up front (best-effort). This is a
+        // synchronous call, so use `std::fs::create_dir_all` (via the paths
         // helper), not `tokio::fs`. On failure we warn and continue — never
         // abort the run. Mirrors the best-effort dir-create+warn in `audit.rs`.
         if let Err(e) = paths::run_logs_dir(&self.state.worktree_manager.repo_root, &run_uid) {
@@ -973,8 +998,6 @@ impl CoreApi {
             .await;
             state.finalize_run_status(run).await;
         });
-
-        Ok(CommandOutcome::Acknowledged)
     }
 
     /// Implement `PauseRun`: stop launching NEW tasks (in-flight finish).
@@ -1122,6 +1145,226 @@ impl CoreApi {
         Ok(CommandOutcome::Acknowledged)
     }
 
+    /// Implement `RetryTask`: reset one `Failed` task (and its skipped cascade),
+    /// give it a fresh budget, persist, and re-dispatch (plan 0017).
+    ///
+    /// Validates the run is open and retryable (not actively `Running`) and that
+    /// the named task is in [`crate::task::TaskState::Failed`].  Under the graph
+    /// lock it resets the task (`Failed → New`, metadata cleared), un-skips the
+    /// dependents skipped solely because of this failure, and re-marks readiness.
+    /// Persists the reset graph + run snapshot, emits one `TaskRetried` per reset
+    /// task, flips the run `Failed → Running`, and spawns a fresh scheduler.
+    async fn retry_task(
+        &self,
+        run: RunId,
+        task: crate::api::TaskId,
+    ) -> Result<CommandOutcome, ApiError> {
+        self.retry_impl(run, Some(task)).await
+    }
+
+    /// Implement `RetryFailedTasks`: reset every `Failed` task in the run (and
+    /// their skipped cascades) under a single lock + un-skip sweep + readiness
+    /// re-mark, persist, and re-dispatch (plan 0017).
+    async fn retry_failed_tasks(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        self.retry_impl(run, None).await
+    }
+
+    /// Shared implementation for `RetryTask`/`RetryFailedTasks`.
+    ///
+    /// `task == Some(id)` retries exactly one named `Failed` task (rejecting a
+    /// non-`Failed` target); `task == None` retries every `Failed` task in the
+    /// run.  Both paths share one graph lock, one un-skip sweep, one readiness
+    /// re-mark, one persist, and one re-dispatch spawn.
+    async fn retry_impl(
+        &self,
+        run: RunId,
+        task: Option<crate::api::TaskId>,
+    ) -> Result<CommandOutcome, ApiError> {
+        use crate::task::{TaskId as DomainTaskId, TaskState as DomainTaskState};
+
+        // 1. Lock the registry: validate the run is open + retryable, snapshot the
+        //    graph handle and run identity, then drop the guard before awaiting.
+        let (graph, run_uid, run_slug, plan_slug, started_at) = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            // Idempotence / race guard: only Failed/Paused/Completed runs are
+            // retryable. A still-actively-Running (or Pending) run is rejected so
+            // a retry never races the live scheduler.
+            if !matches!(
+                entry.status,
+                RunStatus::Failed | RunStatus::Paused | RunStatus::Completed
+            ) {
+                return Err(ApiError::InvalidCommand {
+                    reason: format!(
+                        "cannot retry a run in status {:?}; only Failed/Paused/Completed runs are retryable",
+                        entry.status
+                    ),
+                });
+            }
+            (
+                Arc::clone(&entry.graph),
+                entry.run_uid.clone(),
+                entry.run_slug.clone(),
+                entry.plan_slug.clone(),
+                entry.started_at,
+            )
+        }; // registry guard dropped before awaiting the graph lock.
+
+        // 2. Reset the target task(s) under the graph lock; collect every reset
+        //    (and revived) id so we can emit + persist after dropping the guard.
+        //    Returns the cloned reset graph for persistence too.
+        let (reset_ids, graph_snapshot) = {
+            let mut g = graph.lock().await;
+
+            // Determine which Failed tasks to reset.
+            let targets: Vec<DomainTaskId> = match &task {
+                Some(t) => vec![DomainTaskId(t.0.clone())],
+                None => g
+                    .tasks
+                    .iter()
+                    .filter(|t| t.state == DomainTaskState::Failed)
+                    .map(|t| t.id.clone())
+                    .collect(),
+            };
+
+            // RetryTask on a non-Failed (or missing) target is an InvalidCommand.
+            if let Some(t) = &task {
+                let target = DomainTaskId(t.0.clone());
+                let state = g.get(&target).map(|task| task.state);
+                if state != Some(DomainTaskState::Failed) {
+                    return Err(ApiError::InvalidCommand {
+                        reason: match state {
+                            Some(s) => {
+                                format!("task {} is in state {s:?}, not Failed; cannot retry", t.0)
+                            }
+                            None => format!("task {} is not in run {run}", t.0),
+                        },
+                    });
+                }
+            }
+
+            // No failed tasks to retry (RetryFailedTasks on a clean run) is a no-op
+            // success: nothing to reset, nothing to dispatch.
+            if targets.is_empty() {
+                return Ok(CommandOutcome::Acknowledged);
+            }
+
+            // Reset each Failed target (Failed → New, fresh budget).
+            let mut reset_ids: Vec<DomainTaskId> = Vec::new();
+            for id in &targets {
+                crate::actors::supervisor::reset_task_for_retry_locked(&mut g, id)
+                    .map_err(|reason| ApiError::InvalidCommand { reason })?;
+                reset_ids.push(id.clone());
+            }
+
+            // Un-skip the dependents that were skipped solely because of these
+            // failures, then re-mark readiness for everything now eligible.
+            let revived = crate::actors::supervisor::unskip_dependents_locked(&mut g, &reset_ids);
+            reset_ids.extend(revived);
+            crate::actors::supervisor::remark_ready_locked(&mut g);
+
+            (reset_ids, g.clone())
+        }; // graph guard dropped before persisting / spawning.
+
+        // 3. Persist the reset graph (best-effort; warn on failure).
+        if let Err(e) =
+            crate::persist::persist_graph(&graph_snapshot, &self.state.worktree_manager.repo_root)
+                .await
+        {
+            tracing::warn!(
+                run_uid = %run_uid,
+                error = %e,
+                "failed to persist reset graph after retry; continuing",
+            );
+        }
+
+        // 4. Refresh the run snapshot (`run.json`) so a restart sees the reset
+        //    states; best-effort, mirroring `finalize_run_status`.
+        let task_snapshots: Vec<TaskSnapshot> = graph_snapshot
+            .tasks
+            .iter()
+            .map(|t| TaskSnapshot {
+                id: t.id.0.clone(),
+                title: t.title.clone(),
+                state: crate::api::TaskState::from(t.state),
+                gate_iterations: t.gate_iterations,
+                review_iterations: t.review_iterations,
+                depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                failure_reason: t.failure_reason.clone(),
+            })
+            .collect();
+        let started_at = started_at.unwrap_or_else(Utc::now);
+        let meta = RunMetadata::with_tasks(
+            run_uid.clone(),
+            run_slug.clone(),
+            RunStatus::Running,
+            started_at,
+            Utc::now(),
+            task_snapshots,
+        );
+        if let Err(e) = write_run_metadata(&meta, &self.state.worktree_manager.repo_root).await {
+            tracing::warn!(run_uid = %run_uid, error = %e, "run.json refresh failed after retry");
+        }
+
+        // 5. Emit a `TaskRetried` + `TaskStateChanged` per reset/revived task so
+        //    the TUI animates them back to New/Ready.
+        for id in &reset_ids {
+            let view_task = crate::api::TaskId(id.0.clone());
+            let _ = self.state.event_tx.send(Event::TaskRetried {
+                run,
+                task: view_task.clone(),
+            });
+            let new_state = {
+                let g = graph_snapshot.get(id).map(|t| t.state);
+                g.map(crate::api::TaskState::from)
+            };
+            if let Some(state) = new_state {
+                let _ = self.state.event_tx.send(Event::TaskStateChanged {
+                    run,
+                    task: view_task,
+                    state,
+                });
+            }
+        }
+
+        // 6. Record a fresh RunHandle, flip the run Failed → Running, and spawn a
+        //    fresh scheduler over the reset graph (mirroring `start_run`).
+        let cancel = CancellationToken::new();
+        let pause = Arc::new(AtomicBool::new(false));
+        {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            if let Some(old) = entry.handle.take() {
+                old.cancel.cancel();
+            }
+            entry.handle = Some(RunHandle {
+                cancel: cancel.clone(),
+                pause: Arc::clone(&pause),
+            });
+            entry.status = RunStatus::Running;
+            if entry.started_at.is_none() {
+                entry.started_at = Some(started_at);
+            }
+        } // registry guard dropped before broadcast + spawn.
+
+        let _ = self.state.event_tx.send(Event::RunStatusChanged {
+            run,
+            status: RunStatus::Running,
+        });
+
+        self.spawn_run_scheduler(run, graph, cancel, pause, run_slug, run_uid, plan_slug);
+
+        Ok(CommandOutcome::Acknowledged)
+    }
+
     /// Snapshot a single Run's view, locking the registry then the graph (never
     /// both at once, never the registry lock across the `.await`).
     async fn view_of(&self, id: RunId) -> Option<RunView> {
@@ -1167,6 +1410,8 @@ impl Api for CoreApi {
     /// * [`Command::PauseRun`] stops the scheduler launching NEW tasks.
     /// * [`Command::CancelRun`] aborts the scheduler and cleans up.
     /// * [`Command::ReinterpretRun`] re-reads the source (async, like OpenRun).
+    /// * [`Command::RetryTask`] / [`Command::RetryFailedTasks`] reset the failed
+    ///   task(s) + skipped cascade, persist, and re-dispatch (async, plan 0017).
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
             Command::OpenRun { task_list_path } => self.open_run(task_list_path).await,
@@ -1178,6 +1423,9 @@ impl Api for CoreApi {
             Command::PauseRun { run } => self.pause_run(run),
             Command::CancelRun { run } => self.cancel_run(run),
             Command::ReinterpretRun { run } => self.reinterpret_run(run).await,
+            // Retry is async: it persists the reset graph + run snapshot.
+            Command::RetryTask { run, task } => self.retry_task(run, task).await,
+            Command::RetryFailedTasks { run } => self.retry_failed_tasks(run).await,
         }
     }
 
@@ -1495,6 +1743,129 @@ Do the thing in `lib.rs`.
             Arc::new(NoopAuditRegistry),
         );
         (api, repo_dir)
+    }
+
+    /// Like [`execution_core_api`] but with a caller-supplied backend (used by the
+    /// retry tests to inject a "fail once then succeed" backend).
+    fn execution_core_api_with_backend(
+        backend: Arc<dyn AgentBackend>,
+    ) -> (CoreApi, tempfile::TempDir) {
+        let ingestion = Arc::new(EdgeInferrer::new(
+            Arc::new(StructuredTextInterpreter::new()),
+        ));
+        let planner = crate::interpreter::build_planner_interpreter(
+            &crate::config::PlannerMechanism::OneShotAgent,
+            None,
+        )
+        .expect("planner build must succeed with None backend");
+        let repo_dir = setup_temp_repo();
+        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
+        let api = CoreApi::with_audit_registry(
+            ingestion,
+            planner,
+            Arc::clone(&backend),
+            backend,
+            wm,
+            no_gate_config(),
+            Arc::new(NoopAuditRegistry),
+        );
+        (api, repo_dir)
+    }
+
+    /// Derive a task id from the per-task worktree dir (final path component is
+    /// `{plan_slug}--{task_id}`; `--` is the delimiter). Mirrors
+    /// `continue_on_failure.rs::task_id_of`.
+    fn backend_task_id(config: &crate::backend::SessionConfig) -> String {
+        config
+            .working_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.rsplit("--").next().unwrap_or(s).to_string())
+            .unwrap_or_default()
+    }
+
+    /// A backend that hard-errors the developer prompt for the task named
+    /// `fail_id` on its FIRST attempt, then succeeds on every later attempt — so a
+    /// retry drives the previously-`Failed` task to `Done`. All other tasks (and
+    /// the reviewer) always succeed/approve. The attempt count is keyed by task id
+    /// and shared across sessions via an `Arc<Mutex<…>>`.
+    #[derive(Clone)]
+    struct FailOnceBackend {
+        fail_id: String,
+        attempts: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    }
+
+    impl FailOnceBackend {
+        fn new(fail_id: impl Into<String>) -> Self {
+            Self {
+                fail_id: fail_id.into(),
+                attempts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentBackend for FailOnceBackend {
+        async fn spawn(
+            &self,
+            config: crate::backend::SessionConfig,
+        ) -> Result<Box<dyn crate::backend::AgentSession>, crate::backend::BackendError> {
+            let is_reviewer = config.system_prompt.to_lowercase().contains("review");
+            let task_id = backend_task_id(&config);
+            // Decide failure at developer-spawn time: only the developer role for
+            // the target task, and only on the first attempt.
+            let should_fail = if !is_reviewer && task_id == self.fail_id {
+                let mut attempts = self.attempts.lock().unwrap();
+                let n = attempts.entry(task_id.clone()).or_insert(0);
+                *n += 1;
+                *n == 1 // fail only the first developer attempt
+            } else {
+                false
+            };
+            Ok(Box::new(FailOnceSession {
+                terminated: false,
+                should_fail,
+                is_reviewer,
+            }))
+        }
+    }
+
+    struct FailOnceSession {
+        terminated: bool,
+        should_fail: bool,
+        is_reviewer: bool,
+    }
+
+    #[async_trait]
+    impl crate::backend::AgentSession for FailOnceSession {
+        async fn prompt(
+            &mut self,
+            _prompt: crate::backend::Prompt,
+        ) -> Result<crate::backend::ResponseStream, crate::backend::BackendError> {
+            use crate::backend::{BackendError, ResponseEvent};
+            if self.terminated {
+                return Err(BackendError::Terminated);
+            }
+            if self.should_fail {
+                return Err(BackendError::Transport {
+                    reason: "injected first-attempt developer failure".into(),
+                });
+            }
+            let text = if self.is_reviewer {
+                r#"{"verdict":"approve"}"#.to_string()
+            } else {
+                "developer output".to_string()
+            };
+            let events: Vec<Result<ResponseEvent, BackendError>> = vec![
+                Ok(ResponseEvent::TextChunk { text }),
+                Ok(ResponseEvent::TurnComplete),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+        async fn terminate(&mut self) -> Result<(), crate::backend::BackendError> {
+            self.terminated = true;
+            Ok(())
+        }
     }
 
     /// Write `contents` to a uniquely-named markdown file in a fresh tempdir and
@@ -3009,5 +3380,332 @@ Description text that is long enough for parser.
             "expected Blocking 'vague-done-when' issue in report; got {:?}",
             vague_view.report.issues
         );
+    }
+
+    // ── Retry: command validation + reset persistence (0056) ──────────────────
+
+    /// Open + run `SAMPLE_TASK_LIST` with a backend that fails `task-one` once,
+    /// returning the api, run id, and both temp dirs once the run has reached
+    /// `Failed` with `task-one` Failed and `task-two` Skipped. The caller keeps
+    /// both dirs alive for the test's lifetime.
+    async fn run_to_failed_with_skip() -> (Arc<CoreApi>, RunId, tempfile::TempDir, tempfile::TempDir)
+    {
+        let backend: Arc<dyn AgentBackend> = Arc::new(FailOnceBackend::new("task-one"));
+        let (api, repo) = execution_core_api_with_backend(backend);
+        let api = Arc::new(api);
+        let (task_dir, path) = write_task_list(SAMPLE_TASK_LIST);
+
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+        api.execute(Command::StartRun { run }).await.unwrap();
+
+        let api_poll = Arc::clone(&api);
+        poll_until(
+            || {
+                let api = Arc::clone(&api_poll);
+                async move {
+                    match api.run(run).await {
+                        Some(v) => {
+                            v.status == RunStatus::Failed
+                                && v.tasks
+                                    .iter()
+                                    .any(|t| t.id.0 == "task-one" && t.state == TaskState::Failed)
+                                && v.tasks
+                                    .iter()
+                                    .any(|t| t.id.0 == "task-two" && t.state == TaskState::Skipped)
+                        }
+                        None => false,
+                    }
+                }
+            },
+            "run to reach Failed with task-one Failed and task-two Skipped",
+        )
+        .await;
+
+        (api, run, repo, task_dir)
+    }
+
+    /// `RetryTask` on a non-`Failed` task is rejected with `InvalidCommand`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_task_rejects_non_failed() {
+        let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
+        // task-two is Skipped (not Failed) here — RetryTask on it must reject.
+        let err = api
+            .execute(Command::RetryTask {
+                run,
+                task: crate::api::TaskId::new("task-two"),
+            })
+            .await;
+        assert!(
+            matches!(err, Err(ApiError::InvalidCommand { .. })),
+            "RetryTask on a non-Failed task must yield InvalidCommand; got {err:?}"
+        );
+
+        // An unknown run id is UnknownRun.
+        let err = api
+            .execute(Command::RetryTask {
+                run: RunId(9999),
+                task: crate::api::TaskId::new("task-one"),
+            })
+            .await;
+        assert!(
+            matches!(err, Err(ApiError::UnknownRun { .. })),
+            "RetryTask on an unknown run must yield UnknownRun; got {err:?}"
+        );
+    }
+
+    /// After `RetryTask`, the on-disk persisted graph shows the reset task back
+    /// in a non-terminal state with cleared failure metadata.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_persists_reset_graph() {
+        let (api, run, repo, _task_dir) = run_to_failed_with_skip().await;
+        let repo_root = repo.path().to_path_buf();
+
+        api.execute(Command::RetryTask {
+            run,
+            task: crate::api::TaskId::new("task-one"),
+        })
+        .await
+        .expect("RetryTask on a Failed task must succeed");
+
+        // Reload the persisted graph and assert task-one is reset (non-terminal,
+        // cleared metadata). The slug is derived from the task-list path.
+        let view = api.run(run).await.expect("run still open");
+        // Find the persisted graph by scanning the tasks dir for the only slug.
+        let tasks_dir = repo_root.join(".makina").join("tasks");
+        let slug = std::fs::read_dir(&tasks_dir)
+            .expect("tasks dir exists after retry persist")
+            .filter_map(|e| e.ok())
+            .find_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.strip_suffix(".json").map(|s| s.to_string())
+            })
+            .expect("a persisted {slug}.json exists");
+        let loaded = crate::persist::load_graph(&repo_root, &slug)
+            .await
+            .expect("load_graph ok")
+            .expect("graph present");
+        let t1 = loaded
+            .tasks
+            .iter()
+            .find(|t| t.id.0 == "task-one")
+            .expect("task-one present in persisted graph");
+        assert!(
+            !crate::state_machine::is_terminal(t1.state),
+            "persisted task-one must be non-terminal after retry; got {:?}",
+            t1.state
+        );
+        assert_eq!(t1.gate_iterations, 0, "gate budget reset");
+        assert_eq!(t1.review_iterations, 0, "review budget reset");
+        assert!(t1.failure_reason.is_none(), "failure_reason cleared");
+        assert!(t1.finished_at.is_none(), "finished_at cleared");
+        // The live view also reflects the reset (not Failed).
+        let t1_view = view.tasks.iter().find(|t| t.id.0 == "task-one").unwrap();
+        assert_ne!(t1_view.state, TaskState::Failed);
+    }
+
+    // ── Retry: re-dispatch (0057) ─────────────────────────────────────────────
+
+    /// `RetryTask` re-dispatches: the previously-`Failed` task reaches `Done` and
+    /// its revived `Skipped` dependent reaches `Done` too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retried_task_runs_to_terminal_again() {
+        let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
+
+        api.execute(Command::RetryTask {
+            run,
+            task: crate::api::TaskId::new("task-one"),
+        })
+        .await
+        .expect("RetryTask must succeed");
+
+        let api_poll = Arc::clone(&api);
+        poll_until(
+            || {
+                let api = Arc::clone(&api_poll);
+                async move {
+                    match api.run(run).await {
+                        Some(v) => {
+                            v.status == RunStatus::Completed
+                                && v.tasks.iter().all(|t| t.state == TaskState::Done)
+                        }
+                        None => false,
+                    }
+                }
+            },
+            "retried run to reach Completed with all tasks Done",
+        )
+        .await;
+
+        let view = api.run(run).await.unwrap();
+        assert!(
+            view.tasks
+                .iter()
+                .find(|t| t.id.0 == "task-one")
+                .map(|t| t.state == TaskState::Done)
+                .unwrap_or(false),
+            "the retried task-one must reach Done"
+        );
+        assert!(
+            view.tasks
+                .iter()
+                .find(|t| t.id.0 == "task-two")
+                .map(|t| t.state == TaskState::Done)
+                .unwrap_or(false),
+            "the revived dependent task-two must reach Done"
+        );
+    }
+
+    /// `RetryFailedTasks` flips the run `Failed → Running` (observed on the
+    /// stream) and then re-aggregates to `Completed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_flips_run_status_running_then_completed() {
+        let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
+
+        // Subscribe BEFORE issuing retry so we capture the Running flip.
+        let (collector, events) = collect_events(&api);
+
+        api.execute(Command::RetryFailedTasks { run })
+            .await
+            .expect("RetryFailedTasks must succeed");
+
+        let api_poll = Arc::clone(&api);
+        poll_until(
+            || {
+                let api = Arc::clone(&api_poll);
+                async move {
+                    matches!(
+                        api.run(run).await.map(|v| v.status),
+                        Some(RunStatus::Completed)
+                    )
+                }
+            },
+            "retried run to reach Completed",
+        )
+        .await;
+
+        // Allow the final RunStatusChanged{Completed} to drain.
+        poll_until(
+            || {
+                let events = Arc::clone(&events);
+                async move {
+                    events.lock().unwrap().iter().any(|e| {
+                        matches!(
+                            e,
+                            Event::RunStatusChanged {
+                                status: RunStatus::Completed,
+                                ..
+                            }
+                        )
+                    })
+                }
+            },
+            "RunStatusChanged{Completed} after retry",
+        )
+        .await;
+
+        let evs = events.lock().unwrap().clone();
+        collector.abort();
+
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                Event::RunStatusChanged {
+                    run: r,
+                    status: RunStatus::Running,
+                } if *r == run
+            )),
+            "retry must emit RunStatusChanged{{Running}}; got {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                Event::RunStatusChanged {
+                    run: r,
+                    status: RunStatus::Completed,
+                } if *r == run
+            )),
+            "retried run must aggregate to Completed"
+        );
+        // A TaskRetried event was emitted for the reset task.
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                Event::TaskRetried { run: r, task } if *r == run && task.0 == "task-one"
+            )),
+            "retry must emit TaskRetried for task-one; got {evs:?}"
+        );
+    }
+
+    /// A retry targeting a run while it is still actively `Running` is rejected
+    /// with `InvalidCommand` (only Failed/Paused/Completed runs are retryable).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_rejected_while_run_active() {
+        // A backend that blocks the first developer prompt so the run is provably
+        // still Running when we issue the retry.
+        let (backend, release) = GatedBackend::new();
+        let (api, _repo) = execution_core_api_with_backend(backend);
+        let api = Arc::new(api);
+        let (_task_dir, path) = write_task_list(ONE_TASK_LIST);
+
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+        api.execute(Command::StartRun { run }).await.unwrap();
+
+        // Wait until the run is observably Running (the gated backend holds the
+        // first developer prompt, so the run cannot finish).
+        let api_poll = Arc::clone(&api);
+        poll_until(
+            || {
+                let api = Arc::clone(&api_poll);
+                async move {
+                    matches!(
+                        api.run(run).await.map(|v| v.status),
+                        Some(RunStatus::Running)
+                    )
+                }
+            },
+            "run to be observably Running",
+        )
+        .await;
+
+        let err = api.execute(Command::RetryFailedTasks { run }).await;
+        assert!(
+            matches!(err, Err(ApiError::InvalidCommand { .. })),
+            "retry on an actively-Running run must yield InvalidCommand; got {err:?}"
+        );
+
+        // Release the gate so the run can finish and the test exits cleanly.
+        release.notify_one();
+        let api_poll = Arc::clone(&api);
+        poll_until(
+            || {
+                let api = Arc::clone(&api_poll);
+                async move {
+                    matches!(
+                        api.run(run).await.map(|v| v.status),
+                        Some(RunStatus::Completed)
+                    )
+                }
+            },
+            "gated run to drain to Completed",
+        )
+        .await;
     }
 }
