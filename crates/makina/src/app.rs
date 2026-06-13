@@ -6,7 +6,7 @@
 //! Keeping `update` a synchronous, pure function means every state transition
 //! is unit-testable without a real terminal or async runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -437,6 +437,18 @@ pub enum Panel {
     Main,
 }
 
+/// A node in the sidebar tree: either a run header or one of its tasks.
+///
+/// Built on-demand by [`App::visible_tree_nodes`] to flatten the run/task
+/// hierarchy into a single linear list for cursor-based navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeNode {
+    /// The run at `runs[run]`.
+    Run { run: usize },
+    /// Task at `runs[run].tasks[task]`.
+    Task { run: usize, task: usize },
+}
+
 // ── App input event ───────────────────────────────────────────────────────────
 
 /// An event consumed by [`App::update`].
@@ -459,6 +471,8 @@ pub enum AppEvent {
     SelectUp,
     /// Move the sidebar selection one row down (`↓` / `j`).
     SelectDown,
+    /// Space key — toggle expand/collapse the focused tree node's run (sidebar focus only).
+    ToggleTreeNode,
     /// Scroll the focused exchange pane one line up (mouse wheel up).
     ScrollUp,
     /// Scroll the focused exchange pane one line down (mouse wheel down).
@@ -652,6 +666,14 @@ pub struct App {
     /// the selected run has no tasks.
     pub selected_task: Option<usize>,
 
+    /// Run ids whose task children are collapsed in the sidebar tree.
+    /// Absent ⇒ expanded (runs default to expanded).
+    pub collapsed_runs: HashSet<RunId>,
+
+    /// Index into `visible_tree_nodes()` of the focused sidebar node.
+    /// `None` when no runs are open.
+    pub tree_cursor: Option<usize>,
+
     /// Per-task exchange logs, keyed by `(RunId, TaskId)`.
     ///
     /// Keying by the composite `(RunId, TaskId)` ensures that switching between
@@ -782,6 +804,121 @@ impl App {
         self.load_exchanges_for_selected_run();
     }
 
+    /// Flatten open runs + the tasks of expanded runs into the visible-node
+    /// order shown in the sidebar (run, then its tasks if expanded, repeat).
+    pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
+        let mut nodes = Vec::new();
+        for (run_idx, run) in self.runs.iter().enumerate() {
+            nodes.push(TreeNode::Run { run: run_idx });
+            // Only include tasks if this run is expanded (not in collapsed_runs).
+            if !self.collapsed_runs.contains(&run.id) {
+                for task_idx in 0..run.tasks.len() {
+                    nodes.push(TreeNode::Task {
+                        run: run_idx,
+                        task: task_idx,
+                    });
+                }
+            }
+        }
+        nodes
+    }
+
+    /// The node currently under the tree cursor, if any.
+    pub fn focused_node(&self) -> Option<TreeNode> {
+        let nodes = self.visible_tree_nodes();
+        self.tree_cursor
+            .and_then(|cursor| nodes.get(cursor).copied())
+    }
+
+    /// Recompute `selected_run`/`selected_task` from the focused node and,
+    /// when the run changed, load that run's exchanges.
+    fn sync_selection_from_cursor(&mut self) {
+        let prev_run = self.selected_run;
+        match self.focused_node() {
+            None => {
+                self.selected_run = None;
+                self.selected_task = None;
+            }
+            Some(TreeNode::Run { run }) => {
+                self.selected_run = Some(run);
+                // For a run node, set selected_task to the first task of that run,
+                // or None if the run has no tasks.
+                self.selected_task = self
+                    .runs
+                    .get(run)
+                    .and_then(|r| if r.tasks.is_empty() { None } else { Some(0) });
+            }
+            Some(TreeNode::Task { run, task }) => {
+                self.selected_run = Some(run);
+                self.selected_task = Some(task);
+            }
+        }
+        // Load exchanges if the run changed.
+        if self.selected_run != prev_run {
+            self.load_exchanges_for_selected_run();
+        }
+    }
+
+    /// Move the cursor by ±1 within the visible nodes (clamped), then
+    /// `sync_selection_from_cursor`. Returns whether the cursor moved.
+    pub fn tree_move(&mut self, delta: isize) -> bool {
+        let nodes = self.visible_tree_nodes();
+        if nodes.is_empty() {
+            return false;
+        }
+
+        let old_cursor = self.tree_cursor;
+        let new_cursor = match self.tree_cursor {
+            None => 0,
+            Some(c) => {
+                let new_val = (c as isize) + delta;
+                // Clamp to valid range [0, nodes.len() - 1].
+                (new_val.max(0) as usize).min(nodes.len() - 1)
+            }
+        };
+
+        self.tree_cursor = Some(new_cursor);
+        self.sync_selection_from_cursor();
+
+        old_cursor != Some(new_cursor)
+    }
+
+    /// Toggle collapse on the focused node's run; keep the cursor on the run header;
+    /// re-sync. Returns whether the operation succeeded (i.e., there was a focused node).
+    pub fn tree_toggle_expand(&mut self) -> bool {
+        let focused = self.focused_node();
+        let run_idx = match focused {
+            None => return false,
+            Some(TreeNode::Run { run }) => run,
+            Some(TreeNode::Task { run, .. }) => run,
+        };
+
+        // Get the run id.
+        if let Some(run) = self.runs.get(run_idx) {
+            let run_id = run.id;
+            // Toggle the collapse state.
+            if self.collapsed_runs.contains(&run_id) {
+                self.collapsed_runs.remove(&run_id);
+            } else {
+                self.collapsed_runs.insert(run_id);
+            }
+
+            // Move cursor to the run's header node.
+            let nodes = self.visible_tree_nodes();
+            if let Some(idx) = nodes
+                .iter()
+                .position(|node| matches!(node, TreeNode::Run { run: r } if *r == run_idx))
+            {
+                self.tree_cursor = Some(idx);
+            }
+
+            self.sync_selection_from_cursor();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Build a new [`App`] with the given api, initial run list, and repo root.
     ///
     /// Call `api.runs().await` before constructing to obtain `initial_runs`.
@@ -795,6 +932,11 @@ impl App {
         let selected_task = initial_runs
             .first()
             .and_then(|r| if r.tasks.is_empty() { None } else { Some(0) });
+        let tree_cursor = if initial_runs.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         Self {
             should_quit: false,
             api,
@@ -809,6 +951,8 @@ impl App {
             runs: initial_runs,
             selected_run,
             selected_task,
+            collapsed_runs: HashSet::new(),
+            tree_cursor,
             exchange_logs: HashMap::new(),
             task_last_activity_tick: HashMap::new(),
             task_step_start_tick: HashMap::new(),
@@ -1023,17 +1167,8 @@ impl App {
             AppEvent::SelectUp => {
                 match self.focused_panel {
                     Panel::Sidebar => {
-                        // Sidebar focus: navigate runs.
-                        if let Some(current) = self.selected_run {
-                            let new_idx = current.saturating_sub(1);
-                            if new_idx != current {
-                                self.selected_run = Some(new_idx);
-                                // Re-clamp selected_task to the new run's task list.
-                                self.clamp_selected_task();
-                                // Load transcripts for the newly selected run.
-                                self.load_exchanges_for_selected_run();
-                            }
-                        }
+                        // Sidebar focus: walk the tree nodes up.
+                        self.tree_move(-1);
                     }
                     Panel::Main => {
                         // Main focus: navigate tasks within the selected run.
@@ -1047,18 +1182,8 @@ impl App {
             AppEvent::SelectDown => {
                 match self.focused_panel {
                     Panel::Sidebar => {
-                        // Sidebar focus: navigate runs.
-                        if let Some(current) = self.selected_run {
-                            let last = self.runs.len().saturating_sub(1);
-                            let new_idx = (current + 1).min(last);
-                            if new_idx != current {
-                                self.selected_run = Some(new_idx);
-                                // Re-clamp selected_task to the new run's task list.
-                                self.clamp_selected_task();
-                                // Load transcripts for the newly selected run.
-                                self.load_exchanges_for_selected_run();
-                            }
-                        }
+                        // Sidebar focus: walk the tree nodes down.
+                        self.tree_move(1);
                     }
                     Panel::Main => {
                         // Main focus: navigate tasks within the selected run.
@@ -1090,6 +1215,15 @@ impl App {
                 // in `scroll_down`; otherwise `exchange_scroll == scroll_max`
                 // could never hold and auto-follow would never re-engage.
                 self.scroll_down(self.last_scroll_max.get());
+                true
+            }
+            AppEvent::ToggleTreeNode => {
+                // Toggle expand/collapse on the focused tree node's run.
+                // Guard on sidebar focus so that programmatic emission when the
+                // main panel is active has no effect.
+                if self.focused_panel == Panel::Sidebar {
+                    self.tree_toggle_expand();
+                }
                 true
             }
             AppEvent::ApiEvent(ev) => {
@@ -1124,6 +1258,22 @@ impl App {
                 // clamp selected_task so it points to a valid slot.
                 if is_selected || self.selected_run == Some(self.runs.len().saturating_sub(1)) {
                     self.clamp_selected_task();
+                }
+                // Clamp tree_cursor to stay within the new visible-node list and
+                // re-sync selection so selected_run/selected_task stay consistent
+                // even if the run that was updated now has fewer tasks (i.e., the
+                // cursor was pointing at a task node that no longer exists).
+                {
+                    let max_idx = self.visible_tree_nodes().len().saturating_sub(1);
+                    if let Some(cursor) = self.tree_cursor {
+                        if cursor > max_idx {
+                            self.tree_cursor = Some(max_idx);
+                        }
+                    } else if !self.runs.is_empty() {
+                        // Runs exist but cursor was None; initialise to node 0.
+                        self.tree_cursor = Some(0);
+                    }
+                    self.sync_selection_from_cursor();
                 }
                 // Tiny state rule: on RunLoaded (or RunOpened producing a loaded view)
                 // the status is cleared unless it was an error. This ensures a
@@ -1550,6 +1700,325 @@ mod tests {
             app.error_messages.last().unwrap().text,
             format!("msg {}", total - 1),
             "most recent message must be retained"
+        );
+    }
+
+    // ── Sidebar tree model ─────────────────────────────────────────────────────
+
+    /// Create a test app with 2 runs: run0 has 2 tasks, run1 has 1 task.
+    fn make_app_with_runs() -> App {
+        use makina_core::api::{RunStatus, TaskState, TaskView};
+
+        let api = Arc::new(PlaceholderApi::new());
+        let run0 = RunView {
+            id: RunId(100),
+            run_uid: "run0".into(),
+            task_list_path: PathBuf::from("tasks0.md"),
+            project: "proj".into(),
+            status: RunStatus::Running,
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("task00"),
+                    title: "Task 0-0".into(),
+                    state: TaskState::Done,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                    failure_reason: None,
+                },
+                TaskView {
+                    id: TaskId::new("task01"),
+                    title: "Task 0-1".into(),
+                    state: TaskState::InProgress,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                    failure_reason: None,
+                },
+            ],
+            report: makina_core::api::IngestionReport::default(),
+        };
+
+        let run1 = RunView {
+            id: RunId(101),
+            run_uid: "run1".into(),
+            task_list_path: PathBuf::from("tasks1.md"),
+            project: "proj".into(),
+            status: RunStatus::Completed,
+            tasks: vec![TaskView {
+                id: TaskId::new("task10"),
+                title: "Task 1-0".into(),
+                state: TaskState::Done,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+
+        App::new(api, vec![run0, run1], PathBuf::from("."))
+    }
+
+    #[test]
+    fn visible_nodes_expand_and_collapse() {
+        let mut app = make_app_with_runs();
+
+        // Initially both runs expanded.
+        let nodes = app.visible_tree_nodes();
+        assert_eq!(
+            nodes,
+            vec![
+                TreeNode::Run { run: 0 },
+                TreeNode::Task { run: 0, task: 0 },
+                TreeNode::Task { run: 0, task: 1 },
+                TreeNode::Run { run: 1 },
+                TreeNode::Task { run: 1, task: 0 },
+            ],
+            "Initially both runs are expanded, so all nodes should be visible"
+        );
+
+        // Collapse run0.
+        app.collapsed_runs.insert(RunId(100));
+        let nodes = app.visible_tree_nodes();
+        assert_eq!(
+            nodes,
+            vec![
+                TreeNode::Run { run: 0 },
+                TreeNode::Run { run: 1 },
+                TreeNode::Task { run: 1, task: 0 },
+            ],
+            "After collapsing run0, its tasks should disappear"
+        );
+
+        // Expand run0 again.
+        app.collapsed_runs.remove(&RunId(100));
+        let nodes = app.visible_tree_nodes();
+        assert_eq!(
+            nodes,
+            vec![
+                TreeNode::Run { run: 0 },
+                TreeNode::Task { run: 0, task: 0 },
+                TreeNode::Task { run: 0, task: 1 },
+                TreeNode::Run { run: 1 },
+                TreeNode::Task { run: 1, task: 0 },
+            ],
+            "After expanding run0 again, all tasks should reappear"
+        );
+    }
+
+    #[test]
+    fn tree_move_clamps_and_syncs_selection() {
+        let mut app = make_app_with_runs();
+
+        // Initially at node 0 (Run0).
+        assert_eq!(app.tree_cursor, Some(0));
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
+        assert_eq!(app.selected_run, Some(0));
+        assert_eq!(app.selected_task, Some(0)); // First task of run0.
+
+        // Move down to node 1 (Task00).
+        let moved = app.tree_move(1);
+        assert!(moved, "tree_move(1) should return true when cursor moves");
+        assert_eq!(app.tree_cursor, Some(1));
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 0 }));
+        assert_eq!(app.selected_run, Some(0));
+        assert_eq!(app.selected_task, Some(0));
+
+        // Move down to node 2 (Task01).
+        let moved = app.tree_move(1);
+        assert!(moved);
+        assert_eq!(app.tree_cursor, Some(2));
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 1 }));
+        assert_eq!(app.selected_run, Some(0));
+        assert_eq!(app.selected_task, Some(1));
+
+        // Move back up to node 1 (Task00).
+        let moved = app.tree_move(-1);
+        assert!(moved);
+        assert_eq!(app.tree_cursor, Some(1));
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 0 }));
+
+        // Move up to node 0 (Run0).
+        let moved = app.tree_move(-1);
+        assert!(moved);
+        assert_eq!(app.tree_cursor, Some(0));
+
+        // Try to move up from node 0 (should clamp to 0).
+        let moved = app.tree_move(-1);
+        assert!(!moved, "tree_move(-1) at top should return false (no move)");
+        assert_eq!(app.tree_cursor, Some(0));
+
+        // Move to the end and then try to move past it.
+        app.tree_cursor = Some(4); // Last node (Task10).
+        let moved = app.tree_move(1);
+        assert!(!moved, "tree_move(1) at end should return false");
+        assert_eq!(app.tree_cursor, Some(4));
+    }
+
+    #[test]
+    fn toggle_expand_keeps_cursor_on_run_and_collapses() {
+        let mut app = make_app_with_runs();
+
+        // Navigate to Task01 (node 2) via tree_move to ensure sync happens.
+        app.tree_move(1); // Move to node 1 (Task00)
+        app.tree_move(1); // Move to node 2 (Task01)
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Task { run: 0, task: 1 }),
+            "Should start at Task01"
+        );
+        assert_eq!(app.selected_task, Some(1), "Task01 should be selected");
+
+        // Toggle expand (should collapse run0 and move cursor to its Run header).
+        let toggled = app.tree_toggle_expand();
+        assert!(toggled, "toggle_expand should succeed");
+
+        // Run0 should be collapsed.
+        assert!(
+            app.collapsed_runs.contains(&RunId(100)),
+            "run0 should be collapsed"
+        );
+
+        // Cursor should be on Run0's header.
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Run { run: 0 }),
+            "Cursor should move to Run0 header after toggle"
+        );
+
+        // selected_task should be Some(0) (first task of run0 when run node is focused).
+        assert_eq!(
+            app.selected_task,
+            Some(0),
+            "selected_task should be first task of run when focused on run header"
+        );
+
+        // Toggle expand again (should expand run0).
+        let toggled = app.tree_toggle_expand();
+        assert!(toggled);
+        assert!(
+            !app.collapsed_runs.contains(&RunId(100)),
+            "run0 should be expanded"
+        );
+
+        // Cursor should still be on Run0's header.
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Run { run: 0 }),
+            "Cursor should stay on Run0 header"
+        );
+    }
+
+    #[test]
+    fn select_down_in_sidebar_walks_tree_nodes() {
+        let mut app = make_app_with_runs();
+
+        // Initially at Run0 header.
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
+        assert_eq!(app.selected_run, Some(0));
+        assert_eq!(app.selected_task, Some(0));
+
+        // SelectDown moves to Task00.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Task { run: 0, task: 0 }),
+            "SelectDown from Run0 should move to Task00"
+        );
+        assert_eq!(app.selected_task, Some(0));
+
+        // SelectDown moves to Task01.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Task { run: 0, task: 1 }),
+            "SelectDown from Task00 should move to Task01"
+        );
+        assert_eq!(app.selected_task, Some(1));
+    }
+
+    #[test]
+    fn toggle_tree_node_collapses_focused_run() {
+        let mut app = make_app_with_runs();
+
+        // Navigate to Task01.
+        app.tree_move(1);
+        app.tree_move(1);
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 1 }));
+
+        // Toggle to collapse.
+        app.update(AppEvent::ToggleTreeNode);
+
+        // Run0 should be collapsed.
+        assert!(
+            app.collapsed_runs.contains(&RunId(100)),
+            "run0 should be collapsed"
+        );
+
+        // Cursor should be on Run0 header.
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Run { run: 0 }),
+            "After toggle, cursor should be on Run0 header"
+        );
+    }
+
+    #[test]
+    fn cursor_survives_runs_update() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+
+        let mut app = make_app_with_runs();
+
+        // Initial visible nodes (both runs expanded):
+        //   [Run0(0), Task00(1), Task01(2), Run1(3), Task10(4)]
+        // Navigate to the last node — Task10 (index 4) in Run1.
+        app.tree_move(1); // -> Task00 (1)
+        app.tree_move(1); // -> Task01 (2)
+        app.tree_move(1); // -> Run1   (3)
+        app.tree_move(1); // -> Task10 (4)
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Task { run: 1, task: 0 }),
+            "cursor should be at Task10 before update"
+        );
+        assert_eq!(app.tree_cursor, Some(4));
+
+        // Simulate a RunLoaded that *shrinks* Run1 to zero tasks.
+        // New visible nodes: [Run0(0), Task00(1), Task01(2), Run1(3)] — 4 nodes.
+        // The old cursor (4) is now out of bounds; the handler must clamp it.
+        let shrunk_run1 = RunView {
+            id: RunId(101),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/run1.json"),
+            status: RunStatus::Completed,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        app.update(AppEvent::RunLoaded(shrunk_run1));
+
+        // tree_cursor must be clamped to a valid index (≤ 3, the new last index).
+        let cursor = app
+            .tree_cursor
+            .expect("tree_cursor must not be None after runs update");
+        let node_count = app.visible_tree_nodes().len();
+        assert!(
+            cursor < node_count,
+            "tree_cursor ({cursor}) must be within visible node count ({node_count})"
+        );
+        // focused_node() must return Some — i.e., the cursor resolves to a real node.
+        assert!(
+            app.focused_node().is_some(),
+            "focused_node() must be Some after cursor clamping"
+        );
+        // selected_run must point at a valid run.
+        assert!(
+            app.selected_run
+                .map(|i| i < app.runs.len())
+                .unwrap_or(false),
+            "selected_run must be a valid index after runs update"
         );
     }
 
@@ -3093,20 +3562,37 @@ mod tests {
         };
         let mut app = App::new(api, vec![run1, run2], PathBuf::from("."));
 
-        // Initially: sidebar focused, run index 0, task index 0.
+        // Initially: sidebar focused, cursor at 0 (Run0), run=0, task=0.
         assert_eq!(app.focused_panel, Panel::Sidebar);
         assert_eq!(app.selected_run, Some(0));
         assert_eq!(app.selected_task, Some(0));
+        assert_eq!(app.tree_cursor, Some(0));
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
 
-        // Navigate to run 1 via sidebar.
+        // Navigate down via sidebar tree: SelectDown moves to the first task of Run0.
         app.update(AppEvent::SelectDown);
-        assert_eq!(app.selected_run, Some(1), "run selection must move");
-        // task index should be clamped to the new run's bounds (run1 has 1 task).
         assert_eq!(
-            app.selected_task,
-            Some(0),
-            "task selection clamped to new run's bounds"
+            app.tree_cursor,
+            Some(1),
+            "cursor moves to next node (Task0 of Run0)"
         );
+        assert_eq!(app.selected_run, Some(0), "still on run 0");
+        assert_eq!(app.selected_task, Some(0), "now on task 0");
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 0 }));
+
+        // Navigate down: next is Task1 of Run0.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.tree_cursor, Some(2));
+        assert_eq!(app.selected_run, Some(0));
+        assert_eq!(app.selected_task, Some(1));
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 1 }));
+
+        // Navigate down: next is Run1 header.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(app.tree_cursor, Some(3));
+        assert_eq!(app.selected_run, Some(1), "moved to run 1");
+        assert_eq!(app.selected_task, Some(0), "run 1 has 1 task, so task is 0");
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 1 }));
     }
 
     /// **Bounding:** feeding many chunks/turns must cap the exchange log at

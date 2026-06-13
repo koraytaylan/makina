@@ -126,7 +126,7 @@ pub async fn run(
             biased;
 
             maybe_term = term_rx.recv() => {
-                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers, viewing_doctor))
+                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers, viewing_doctor, app.focused_panel))
             }
 
             maybe_api = api_stream.next() => {
@@ -645,6 +645,7 @@ async fn read_dir_event(dir: &std::path::Path) -> AppEvent {
 /// `browsing` selects the keymap: the modal file browser (task 28) captures
 /// navigation keys (Enter / Backspace / Esc) differently from the normal view.
 /// Similarly, `editing_providers` activates the provider editor keymap.
+/// `focused_panel` determines whether Space emits `ToggleTreeNode` (sidebar only).
 ///
 /// Returns [`AppEvent::Tick`] for events the TUI doesn't handle (e.g. mouse
 /// events); those simply trigger a harmless redraw.
@@ -653,9 +654,16 @@ fn translate_terminal_event(
     browsing: bool,
     editing_providers: bool,
     viewing_doctor: bool,
+    focused_panel: crate::app::Panel,
 ) -> AppEvent {
     match ev {
-        CrosstermEvent::Key(key) => translate_key(key, browsing, editing_providers, viewing_doctor),
+        CrosstermEvent::Key(key) => translate_key(
+            key,
+            browsing,
+            editing_providers,
+            viewing_doctor,
+            focused_panel,
+        ),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
         // `browsing` flag (the exchange pane is not the browser).  Other mouse
@@ -676,6 +684,7 @@ fn translate_key(
     browsing: bool,
     editing_providers: bool,
     viewing_doctor: bool,
+    focused_panel: crate::app::Panel,
 ) -> AppEvent {
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
@@ -749,6 +758,14 @@ fn translate_key(
             // Sidebar navigation: arrow keys and vim-style j/k.
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
+            // Space: toggle expand/collapse the focused tree node (sidebar focus only).
+            KeyCode::Char(' ') => {
+                use crate::app::Panel;
+                match focused_panel {
+                    Panel::Sidebar => AppEvent::ToggleTreeNode,
+                    Panel::Main => AppEvent::Tick,
+                }
+            }
             _ => AppEvent::Tick,
         }
     }
@@ -788,11 +805,23 @@ mod tests {
         // Wheel events route to the exchange-pane scroll helpers regardless of
         // the `browsing` flag (the exchange pane is not the browser).
         assert!(matches!(
-            translate_terminal_event(wheel(MouseEventKind::ScrollUp), false, false, false),
+            translate_terminal_event(
+                wheel(MouseEventKind::ScrollUp),
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::ScrollUp
         ));
         assert!(matches!(
-            translate_terminal_event(wheel(MouseEventKind::ScrollDown), false, false, false),
+            translate_terminal_event(
+                wheel(MouseEventKind::ScrollDown),
+                false,
+                false,
+                false,
+                crate::app::Panel::Sidebar
+            ),
             AppEvent::ScrollDown
         ));
     }
@@ -801,7 +830,7 @@ mod tests {
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::Quit
         ));
     }
@@ -810,7 +839,7 @@ mod tests {
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::Quit
         ));
     }
@@ -819,7 +848,7 @@ mod tests {
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::Quit
         ));
     }
@@ -828,7 +857,7 @@ mod tests {
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::FocusNext
         ));
     }
@@ -840,7 +869,8 @@ mod tests {
                 key_press(KeyCode::Char('v'), KeyModifiers::NONE),
                 false,
                 false,
-                false
+                false,
+                crate::app::Panel::Sidebar
             ),
             AppEvent::CycleDependencyView
         ));
@@ -853,7 +883,8 @@ mod tests {
                 key_press(KeyCode::Char('e'), KeyModifiers::NONE),
                 false,
                 false,
-                false
+                false,
+                crate::app::Panel::Sidebar
             ),
             AppEvent::ToggleErrorPane
         ));
@@ -866,7 +897,8 @@ mod tests {
                 key_press(KeyCode::Char('r'), KeyModifiers::NONE),
                 false,
                 false,
-                false
+                false,
+                crate::app::Panel::Sidebar
             ),
             AppEvent::Reinterpret
         ));
@@ -883,7 +915,7 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::Tick
         ));
     }
@@ -892,7 +924,7 @@ mod tests {
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -901,7 +933,7 @@ mod tests {
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::SelectUp
         ));
     }
@@ -910,7 +942,7 @@ mod tests {
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::SelectDown
         ));
     }
@@ -919,7 +951,7 @@ mod tests {
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::SelectUp
         ));
     }
@@ -928,7 +960,7 @@ mod tests {
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::SelectDown
         ));
     }
@@ -939,7 +971,7 @@ mod tests {
     fn o_key_opens_browser_in_normal_mode() {
         let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::OpenBrowser
         ));
     }
@@ -950,7 +982,7 @@ mod tests {
     fn s_key_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::StartRun
         ));
     }
@@ -959,7 +991,7 @@ mod tests {
     fn p_key_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::PauseRun
         ));
     }
@@ -969,7 +1001,7 @@ mod tests {
         // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false, false),
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::CancelRun
         ));
     }
@@ -982,7 +1014,7 @@ mod tests {
             let ev = key_press(KeyCode::Char(ch), KeyModifiers::NONE);
             assert!(
                 matches!(
-                    translate_terminal_event(ev, true, false, false),
+                    translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
                     AppEvent::Tick
                 ),
                 "'{ch}' must be inert in browser mode"
@@ -994,7 +1026,7 @@ mod tests {
     fn enter_in_browser_activates_selection() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false),
+            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
             AppEvent::BrowserActivate
         ));
     }
@@ -1004,7 +1036,7 @@ mod tests {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         // In browser mode, Esc must close the browser, NOT quit the app.
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false),
+            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
             AppEvent::CloseBrowser
         ));
     }
@@ -1013,7 +1045,7 @@ mod tests {
     fn backspace_in_browser_goes_to_parent() {
         let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false),
+            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
             AppEvent::BrowserParent
         ));
     }
@@ -1022,12 +1054,12 @@ mod tests {
     fn jk_in_browser_navigate_browser_not_sidebar() {
         let down = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(down, true, false, false),
+            translate_terminal_event(down, true, false, false, crate::app::Panel::Sidebar),
             AppEvent::BrowserDown
         ));
         let up = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(up, true, false, false),
+            translate_terminal_event(up, true, false, false, crate::app::Panel::Sidebar),
             AppEvent::BrowserUp
         ));
     }
@@ -1036,7 +1068,7 @@ mod tests {
     fn ctrl_c_quits_even_in_browser_mode() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false),
+            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
             AppEvent::Quit
         ));
     }
@@ -1047,7 +1079,7 @@ mod tests {
         // (it falls through to Tick so the user can keep browsing).
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false, false),
+            translate_terminal_event(ev, true, false, false, crate::app::Panel::Sidebar),
             AppEvent::Tick
         ));
     }
@@ -1067,6 +1099,7 @@ mod tests {
             false,
             false,
             false,
+            crate::app::Panel::Sidebar,
         );
         app.update(ev);
         assert!(app.should_quit);
