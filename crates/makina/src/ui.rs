@@ -34,6 +34,7 @@
 //!   table and shows the focused task's prompts and streamed answers in order.
 //! * Task 31 (run-control): add keybind hints to the status bar.
 
+use chrono::{DateTime, Utc};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -557,38 +558,88 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
             frame.render_widget(para, inner);
         }
         DependencyViewMode::Timeline => {
-            // Lane view over scheduling order: one ROW per longest-path level,
-            // with same-level (parallelisable) tasks side-by-side and every
-            // dependent in a strictly later row than its prerequisites.
+            // Time-scaled Gantt: one row per task, bar scaled to wall-clock window.
+            // Read the clock ONCE at render; pass it into the pure helper.
+            let now = chrono::Utc::now();
             let run = app.selected_run();
             let lines: Vec<Line> = match run {
                 Some(run) if !run.tasks.is_empty() => {
-                    let levels = dependency_levels(&run.tasks);
-                    levels
-                        .iter()
-                        .map(|lane| {
-                            // Reuse the `[state] id` badge format, side-by-side.
-                            let mut spans: Vec<Span> = Vec::new();
-                            for (i, task) in lane.iter().enumerate() {
-                                if i > 0 {
-                                    spans.push(Span::raw("  "));
-                                }
-                                let (badge, color) = task_state_badge(&task.state);
-                                spans.push(Span::styled(
-                                    format!("{} {}", badge, task.id.0),
-                                    Style::default().fg(color),
-                                ));
+                    // Span: min started_at over started tasks → max(finished_at,
+                    // or `now` for any task still running).
+                    let span_start = run.tasks.iter().filter_map(|t| t.started_at).min();
+                    match span_start {
+                        None => {
+                            // Nothing has started yet — friendly placeholder.
+                            vec![Line::from(vec![Span::styled(
+                                "  No timing yet.",
+                                Style::default().fg(Color::DarkGray),
+                            )])]
+                        }
+                        Some(span_start) => {
+                            let mut span_end = run
+                                .tasks
+                                .iter()
+                                .filter_map(|t| t.finished_at)
+                                .max()
+                                .unwrap_or(span_start);
+                            let any_running = run
+                                .tasks
+                                .iter()
+                                .any(|t| t.started_at.is_some() && t.finished_at.is_none());
+                            if any_running {
+                                span_end = span_end.max(now);
                             }
-                            Line::from(spans)
-                        })
-                        .collect()
+                            // Guard: ensure span is at least 1 second wide to avoid
+                            // division by zero inside gantt_bar_cols.
+                            if span_end <= span_start {
+                                span_end = span_start + chrono::Duration::seconds(1);
+                            }
+
+                            // Label columns + bar columns = inner.width.
+                            let bar_width = inner.width.saturating_sub(LABEL_COLS);
+                            run.tasks
+                                .iter()
+                                .map(|task| {
+                                    let (_badge, color) = task_state_badge(&task.state);
+                                    let label = truncate_label(&task.id.0, LABEL_COLS);
+                                    let bar: String = if bar_width == 0 {
+                                        // Pane too narrow — omit bar.
+                                        String::new()
+                                    } else {
+                                        match task.started_at {
+                                            None => {
+                                                // Not started yet: ghost slot with dim dots.
+                                                "·".repeat(bar_width as usize)
+                                            }
+                                            Some(start) => {
+                                                let end = task.finished_at.unwrap_or(now);
+                                                let (a, b) = gantt_bar_cols(
+                                                    span_start, span_end, start, end, bar_width,
+                                                );
+                                                // Spaces before [a), '█' across [a,b), spaces after.
+                                                let before = " ".repeat(a as usize);
+                                                let filled =
+                                                    "█".repeat((b.saturating_sub(a)) as usize);
+                                                let after = " "
+                                                    .repeat(bar_width.saturating_sub(b) as usize);
+                                                format!("{before}{filled}{after}")
+                                            }
+                                        }
+                                    };
+                                    Line::from(vec![
+                                        Span::raw(label),
+                                        Span::styled(bar, Style::default().fg(color)),
+                                    ])
+                                })
+                                .collect()
+                        }
+                    }
                 }
                 _ => vec![Line::from(vec![Span::styled(
                     "  No tasks.",
                     Style::default().fg(Color::DarkGray),
                 )])],
             };
-            // Respect the pane height: only as many lanes as fit are drawn.
             let para = Paragraph::new(lines);
             frame.render_widget(para, inner);
         }
@@ -653,74 +704,48 @@ fn render_dependency_tree_children(
     }
 }
 
-/// Assign each task a static *longest-path* dependency level and group the
-/// tasks into lanes by that level for the `Timeline` view.
+/// Number of terminal columns reserved for the task-id label in the Gantt view.
+const LABEL_COLS: u16 = 12;
+
+/// Map a task's wall-clock window onto bar columns within `width`.
 ///
-/// `level(t) = 0` when `t.depends_on` is empty, otherwise
-/// `1 + max(level(d) for d in t.depends_on)` over the run's `tasks`.  A
-/// `depends_on` id that is not present in `tasks` is treated as level `0`
-/// (an unknown-id / cycle guard so the computation always terminates).
+/// `span_start`/`span_end` define the overall run window (callers guarantee
+/// `span_end > span_start`).  `start`/`end` are the task's own window.
+/// Returns `(start_col, end_col)` with `0 <= start_col <= end_col <= width`,
+/// scaled linearly by elapsed nanoseconds.  A non-zero-duration task is rounded
+/// up to at least one cell.  **No clock is read here.**
+fn gantt_bar_cols(
+    span_start: DateTime<Utc>,
+    span_end: DateTime<Utc>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    width: u16,
+) -> (u16, u16) {
+    let total = (span_end - span_start)
+        .num_nanoseconds()
+        .unwrap_or(1)
+        .max(1);
+    let off = (start - span_start).num_nanoseconds().unwrap_or(0).max(0);
+    let len = (end - start).num_nanoseconds().unwrap_or(0).max(0);
+    let w = width as i128;
+    let start_col = ((off as i128 * w) / total as i128) as u16;
+    // Round the end up so a non-zero-duration task always shows ≥1 cell.
+    let raw_end = (((off + len) as i128 * w) / total as i128) as u16;
+    let end_col = raw_end.max(start_col.saturating_add(1)).min(width);
+    (start_col.min(width), end_col)
+}
+
+/// Truncate (or pad) `s` to exactly `cols` terminal columns for the Gantt label.
 ///
-/// The returned `Vec` has one inner `Vec` per level: index `i` holds every
-/// task whose level is `i`, in the input order.  Trailing empty levels do not
-/// occur because a level is only created when at least one task occupies it.
-/// Because a dependent's level is strictly greater than each of its
-/// prerequisites' levels, a task always lands in a lane *after* all of its
-/// prerequisites — i.e. tasks in the same inner `Vec` can run in parallel and
-/// dependents appear in strictly later lanes.
-fn dependency_levels(
-    tasks: &[makina_core::api::TaskView],
-) -> Vec<Vec<&makina_core::api::TaskView>> {
-    use std::collections::HashMap;
-
-    // Index tasks by id for O(1) prerequisite lookup.
-    let by_id: HashMap<&makina_core::api::TaskId, &makina_core::api::TaskView> =
-        tasks.iter().map(|t| (&t.id, t)).collect();
-
-    // Memoised longest-path level per task id.  `in_progress` tracks ids on the
-    // current DFS stack so a dependency cycle is broken (treated as level 0)
-    // rather than recursing forever.
-    fn level_of<'a>(
-        id: &'a makina_core::api::TaskId,
-        by_id: &HashMap<&'a makina_core::api::TaskId, &'a makina_core::api::TaskView>,
-        memo: &mut HashMap<&'a makina_core::api::TaskId, usize>,
-        in_progress: &mut std::collections::HashSet<&'a makina_core::api::TaskId>,
-    ) -> usize {
-        if let Some(&lvl) = memo.get(id) {
-            return lvl;
-        }
-        // Unknown id (not in this run) or a cycle back-edge → level 0 guard.
-        let Some(task) = by_id.get(id) else {
-            return 0;
-        };
-        if !in_progress.insert(id) {
-            return 0;
-        }
-        let lvl = if task.depends_on.is_empty() {
-            0
-        } else {
-            task.depends_on
-                .iter()
-                .map(|dep| 1 + level_of(dep, by_id, memo, in_progress))
-                .max()
-                .unwrap_or(0)
-        };
-        in_progress.remove(id);
-        memo.insert(id, lvl);
-        lvl
+/// If `s` is longer than `cols` it is truncated; if shorter, it is padded with
+/// trailing spaces so the bar column always starts at the same offset.
+fn truncate_label(s: &str, cols: u16) -> String {
+    let cols = cols as usize;
+    let mut out: String = s.chars().take(cols).collect();
+    while out.chars().count() < cols {
+        out.push(' ');
     }
-
-    let mut memo: HashMap<&makina_core::api::TaskId, usize> = HashMap::new();
-    let mut levels: Vec<Vec<&makina_core::api::TaskView>> = Vec::new();
-    for task in tasks {
-        let mut in_progress = std::collections::HashSet::new();
-        let lvl = level_of(&task.id, &by_id, &mut memo, &mut in_progress);
-        if lvl >= levels.len() {
-            levels.resize_with(lvl + 1, Vec::new);
-        }
-        levels[lvl].push(task);
-    }
-    levels
+    out
 }
 
 /// Render the activity indicators (idle time and wall-clock countdown) for a task.
@@ -2202,6 +2227,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -2844,6 +2871,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 2,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -2853,6 +2882,8 @@ mod tests {
                     gate_iterations: 1,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("alpha")],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -2862,6 +2893,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("beta")],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -2871,6 +2904,8 @@ mod tests {
                     gate_iterations: 3,
                     review_iterations: 1,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],
@@ -2991,6 +3026,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("a"), TaskId::new("b")],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -3000,6 +3037,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![TaskId::new("c")],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -3009,6 +3048,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -3018,6 +3059,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],
@@ -3100,104 +3143,64 @@ mod tests {
         );
     }
 
-    /// `dependency_levels` assigns parallelisable siblings (no deps) the same
-    /// level 0 and a dependent the next level up.  Fixture: A (no deps),
-    /// B (no deps), C (`depends_on A`) ⇒ level(A) == level(B) == 0, level(C) == 1.
+    /// `gantt_bar_cols` positions bars by wall-clock time.
+    ///
+    /// Span: [t0, t0+100s], width=100.  A task [t0+20s, t0+50s] should map to
+    /// columns (20, 50).
     #[test]
-    fn dependency_levels_assigns_parallel_siblings_same_level() {
-        use makina_core::api::{TaskId, TaskState, TaskView};
+    fn gantt_positions_bars_by_time() {
+        use chrono::TimeZone;
 
-        let tasks = vec![
-            TaskView {
-                id: TaskId::new("A"),
-                title: "A".into(),
-                state: TaskState::Ready,
-                gate_iterations: 0,
-                review_iterations: 0,
-                depends_on: vec![],
-                failure_reason: None,
-            },
-            TaskView {
-                id: TaskId::new("B"),
-                title: "B".into(),
-                state: TaskState::Ready,
-                gate_iterations: 0,
-                review_iterations: 0,
-                depends_on: vec![],
-                failure_reason: None,
-            },
-            TaskView {
-                id: TaskId::new("C"),
-                title: "C".into(),
-                state: TaskState::New,
-                gate_iterations: 0,
-                review_iterations: 0,
-                depends_on: vec![TaskId::new("A")],
-                failure_reason: None,
-            },
-        ];
+        let t0 = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let span_start = t0;
+        let span_end = t0 + chrono::Duration::seconds(100);
+        let task_start = t0 + chrono::Duration::seconds(20);
+        let task_end = t0 + chrono::Duration::seconds(50);
 
-        let levels = dependency_levels(&tasks);
-        // Helper: the level index a given task id landed in.
-        let level_of_id = |id: &str| -> usize {
-            levels
-                .iter()
-                .position(|lane| lane.iter().any(|t| t.id.0 == id))
-                .expect("task should appear in some level")
-        };
-
-        assert_eq!(level_of_id("A"), 0, "A has no deps → level 0");
-        assert_eq!(level_of_id("B"), 0, "B has no deps → level 0");
-        assert_eq!(
-            level_of_id("A"),
-            level_of_id("B"),
-            "A and B are parallel siblings"
-        );
-        assert_eq!(level_of_id("C"), 1, "C depends on A → level 1");
+        let (start_col, end_col) = gantt_bar_cols(span_start, span_end, task_start, task_end, 100);
+        assert_eq!(start_col, 20, "task starts at 20% of span → column 20");
+        assert_eq!(end_col, 50, "task ends at 50% of span → column 50");
     }
 
-    /// With [`DependencyViewMode::Timeline`] active, the dependency sub-pane
-    /// renders a lane view: independent tasks A and B (level 0) share the same
-    /// terminal row while dependent C (`depends_on A`, level 1) renders on a
-    /// strictly later row.
+    /// A task with `started_at == None` renders as a ghost slot (dim dots), not
+    /// a solid bar of '█' glyphs, when the Timeline view is active.
     #[test]
-    fn timeline_groups_independent_tasks_and_orders_dependents() {
+    fn pending_task_has_no_solid_bar() {
         use crate::app::DependencyViewMode;
-        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        use chrono::TimeZone;
+
+        let t0 = chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
 
         let api = Arc::new(PlaceholderApi::empty());
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/timeline-test.json"),
+            task_list_path: PathBuf::from(".tasks/gantt-test.json"),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
+                // Task 1: has started and finished — shows a solid bar.
                 TaskView {
-                    id: TaskId::new("alpha"),
-                    title: "Alpha task".into(),
-                    state: TaskState::Ready,
+                    id: TaskId::new("started"),
+                    title: "Started task".into(),
+                    state: TaskState::Done,
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: Some(t0),
+                    finished_at: Some(t0 + chrono::Duration::seconds(60)),
                     failure_reason: None,
                 },
+                // Task 2: not yet started — must show ghost, not '█'.
                 TaskView {
-                    id: TaskId::new("beta"),
-                    title: "Beta task".into(),
-                    state: TaskState::Ready,
-                    gate_iterations: 0,
-                    review_iterations: 0,
-                    depends_on: vec![],
-                    failure_reason: None,
-                },
-                TaskView {
-                    id: TaskId::new("gamma"),
-                    title: "Gamma task".into(),
+                    id: TaskId::new("pending"),
+                    title: "Pending task".into(),
                     state: TaskState::New,
                     gate_iterations: 0,
                     review_iterations: 0,
-                    depends_on: vec![TaskId::new("alpha")],
+                    depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],
@@ -3210,37 +3213,77 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
 
-        // `screen` is a flat `width * height` char string laid out row-major;
-        // split it into 120-char rows on char boundaries.
+        // Find the row containing "pending" and assert it has no '█'.
         let chars: Vec<char> = screen.chars().collect();
         let rows: Vec<Vec<char>> = chars.chunks(120).map(|c| c.to_vec()).collect();
-        // Locate each id's row by scanning the rendered lines.
-        let row_of = |id: &str| -> usize {
-            rows.iter()
-                .position(|row| {
-                    let s: String = row.iter().collect();
-                    s.contains(id)
-                })
-                .unwrap_or(usize::MAX)
-        };
-        let alpha_row = row_of("alpha");
-        let beta_row = row_of("beta");
-        let gamma_row = row_of("gamma");
-
-        assert_ne!(alpha_row, usize::MAX, "alpha must render somewhere");
-        assert_ne!(beta_row, usize::MAX, "beta must render somewhere");
-        assert_ne!(gamma_row, usize::MAX, "gamma must render somewhere");
-
-        // alpha and beta (level 0) share the same terminal row.
-        assert_eq!(
-            alpha_row, beta_row,
-            "independent tasks alpha and beta must appear on the SAME row"
-        );
-        // gamma (level 1, depends_on alpha) is on a strictly later row.
+        let pending_row = rows.iter().find(|row| {
+            let s: String = row.iter().collect();
+            s.contains("pending")
+        });
         assert!(
-            gamma_row > alpha_row,
-            "dependent gamma must appear on a strictly LATER row than alpha \
-             (alpha_row={alpha_row}, gamma_row={gamma_row})"
+            pending_row.is_some(),
+            "pending task must appear in the Timeline render"
+        );
+        let pending_row = pending_row.unwrap();
+        assert!(
+            !pending_row.contains(&'█'),
+            "not-yet-started task must NOT have a solid '█' bar; \
+             row: {}",
+            pending_row.iter().collect::<String>()
+        );
+    }
+
+    /// When every task has `started_at == None`, the Timeline view renders the
+    /// "No timing yet." placeholder and must not panic.
+    #[test]
+    fn empty_span_shows_placeholder() {
+        use crate::app::DependencyViewMode;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/empty-timing.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![
+                TaskView {
+                    id: TaskId::new("task-a"),
+                    title: "Task A".into(),
+                    state: TaskState::New,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
+                    failure_reason: None,
+                },
+                TaskView {
+                    id: TaskId::new("task-b"),
+                    title: "Task B".into(),
+                    state: TaskState::Ready,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
+                    failure_reason: None,
+                },
+            ],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+        app.dependency_view = DependencyViewMode::Timeline;
+
+        // Must not panic.
+        let mut terminal = make_terminal(120, 40);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("No timing yet"),
+            "Timeline with no started tasks must show 'No timing yet' placeholder; \
+             got:\n{screen}"
         );
     }
 
@@ -3285,6 +3328,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -3294,6 +3339,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],
@@ -3413,6 +3460,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -3510,6 +3559,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -3519,6 +3570,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],
@@ -3699,6 +3752,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -3791,6 +3846,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -3884,6 +3941,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -4136,6 +4195,8 @@ mod tests {
                     gate_iterations: 2,
                     review_iterations: 1,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -4145,6 +4206,8 @@ mod tests {
                     gate_iterations: 1,
                     review_iterations: 3,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],
@@ -4193,6 +4256,8 @@ mod tests {
                 gate_iterations: 2,
                 review_iterations: 1,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -4238,6 +4303,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: Some(FailureReason {
                     kind: FailureKind::MergeConflict,
                     message: "squash merge conflict detected".into(),
@@ -4362,6 +4429,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -4423,6 +4492,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -4630,6 +4701,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -4756,6 +4829,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -4765,6 +4840,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: Some(FailureReason {
                         kind: FailureKind::HardError,
                         message: "test error".into(),
@@ -4848,6 +4925,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -4857,6 +4936,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],
@@ -4925,6 +5006,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
                 TaskView {
@@ -4934,6 +5017,8 @@ mod tests {
                     gate_iterations: 0,
                     review_iterations: 0,
                     depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
                     failure_reason: None,
                 },
             ],

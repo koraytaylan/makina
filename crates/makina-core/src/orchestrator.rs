@@ -301,6 +301,8 @@ fn build_view(
             gate_iterations: task.gate_iterations,
             review_iterations: task.review_iterations,
             depends_on: task.depends_on.iter().map(Into::into).collect(),
+            started_at: task.started_at,
+            finished_at: task.finished_at,
             failure_reason: task.failure_reason.clone(),
         })
         .collect();
@@ -494,6 +496,8 @@ impl CoreState {
                     gate_iterations: t.gate_iterations,
                     review_iterations: t.review_iterations,
                     depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                    started_at: t.started_at,
+                    finished_at: t.finished_at,
                     failure_reason: t.failure_reason.clone(),
                 })
                 .collect();
@@ -1294,6 +1298,8 @@ impl CoreApi {
                 gate_iterations: t.gate_iterations,
                 review_iterations: t.review_iterations,
                 depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                started_at: t.started_at,
+                finished_at: t.finished_at,
                 failure_reason: t.failure_reason.clone(),
             })
             .collect();
@@ -3707,5 +3713,99 @@ Description text that is long enough for parser.
             "gated run to drain to Completed",
         )
         .await;
+    }
+
+    /// A `Task` with `started_at = Some(t0)` and `finished_at = Some(t1)` is
+    /// projected through the orchestrator's `build_view` (the `TaskView` builder
+    /// called by `CoreApi::run` / `runs`): the resulting `TaskView` carries both
+    /// timestamps as `Some`. A not-yet-started `Task` (both fields `None`) yields
+    /// `None/None` in the corresponding `TaskView`.
+    #[test]
+    fn task_view_carries_timestamps() {
+        use chrono::TimeZone;
+
+        let t0 = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 10, 0, 0)
+            .single()
+            .unwrap();
+        let t1 = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 11, 0, 0)
+            .single()
+            .unwrap();
+        let now = chrono::Utc::now();
+
+        // Build a graph with two tasks: one started+finished, one not yet started.
+        let started_task = crate::task::Task {
+            id: crate::task::TaskId("started-task".into()),
+            title: "Started task".into(),
+            description: String::new(),
+            done_when: String::new(),
+            depends_on: vec![],
+            section: None,
+            state: crate::task::TaskState::Done,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: Some(t0),
+            finished_at: Some(t1),
+            failure_reason: None,
+        };
+        let pending_task = crate::task::Task {
+            id: crate::task::TaskId("pending-task".into()),
+            title: "Pending task".into(),
+            description: String::new(),
+            done_when: String::new(),
+            depends_on: vec![],
+            section: None,
+            state: crate::task::TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        };
+
+        let graph = crate::task::TaskGraph {
+            slug: "test-graph".into(),
+            tasks: vec![started_task, pending_task],
+        };
+
+        let repo_root = std::path::Path::new("/tmp/fake-repo");
+        let view = build_view(
+            RunId(1),
+            "test-run-uid".into(),
+            std::path::PathBuf::from(".tasks/test.json"),
+            RunStatus::Running,
+            repo_root,
+            &graph,
+            crate::ingestion::IngestionReport::default(),
+        );
+
+        assert_eq!(view.tasks.len(), 2);
+
+        // The started+finished task must carry both timestamps through.
+        assert_eq!(
+            view.tasks[0].started_at,
+            Some(t0),
+            "started task: started_at must be Some(t0)"
+        );
+        assert_eq!(
+            view.tasks[0].finished_at,
+            Some(t1),
+            "started task: finished_at must be Some(t1)"
+        );
+
+        // The not-yet-started task must yield None/None.
+        assert_eq!(
+            view.tasks[1].started_at, None,
+            "pending task: started_at must be None"
+        );
+        assert_eq!(
+            view.tasks[1].finished_at, None,
+            "pending task: finished_at must be None"
+        );
     }
 }

@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
@@ -232,6 +233,17 @@ pub struct TaskView {
     /// IDs of tasks that must reach [`TaskState::Done`] before this task
     /// becomes [`TaskState::Ready`].
     pub depends_on: Vec<TaskId>,
+
+    /// When a Developer agent first picked up this task; `None` until then.
+    /// Carried from the domain `Task` so the Gantt can scale a bar to the
+    /// task's real start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+
+    /// When the task reached a terminal state (`Done`/`Failed`); `None` while
+    /// it is still running or not yet started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
 
     /// Why the task reached `Failed`, or `None` for any non-`Failed` task.
     ///
@@ -990,6 +1002,8 @@ mod tests {
                             gate_iterations: 0,
                             review_iterations: 0,
                             depends_on: vec![],
+                            started_at: None,
+                            finished_at: None,
                             failure_reason: None,
                         }],
                         report: IngestionReport::default(),
@@ -1282,6 +1296,8 @@ mod tests {
             gate_iterations: 2,
             review_iterations: 1,
             depends_on: vec![TaskId::new("t0")],
+            started_at: None,
+            finished_at: None,
             failure_reason: None,
         };
         let task2 = task.clone();

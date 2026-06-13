@@ -72,6 +72,8 @@ fn exchange_app() -> App {
             gate_iterations: 0,
             review_iterations: 0,
             depends_on: vec![],
+            started_at: None,
+            finished_at: None,
             failure_reason: None,
         }],
         report: makina_core::api::IngestionReport::default(),

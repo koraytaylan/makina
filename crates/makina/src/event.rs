@@ -1608,6 +1608,8 @@ mod tests {
                         gate_iterations: 0,
                         review_iterations: 0,
                         depends_on: vec![],
+                        started_at: None,
+                        finished_at: None,
                         failure_reason: None,
                     },
                     TaskView {
@@ -1617,6 +1619,8 @@ mod tests {
                         gate_iterations: 0,
                         review_iterations: 0,
                         depends_on: vec![TaskId::new("first")],
+                        started_at: None,
+                        finished_at: None,
                         failure_reason: None,
                     },
                 ],
@@ -1961,6 +1965,8 @@ A description that is long enough to pass minimums.
             gate_iterations: 0,
             review_iterations: 0,
             depends_on: vec![],
+            started_at: None,
+            finished_at: None,
             failure_reason: None,
         };
         let run = RunView {
@@ -2145,6 +2151,8 @@ A description that is long enough to pass minimums.
             gate_iterations: 0,
             review_iterations: 0,
             depends_on: vec![],
+            started_at: None,
+            finished_at: None,
             failure_reason: None,
         }
     }

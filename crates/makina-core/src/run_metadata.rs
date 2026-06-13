@@ -49,6 +49,13 @@ pub struct TaskSnapshot {
     /// IDs of tasks that must reach [`TaskState::Done`] before this task becomes ready.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// When the task first entered `InProgress`. Additive: old `run.json`
+    /// files without it still load with `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the task reached its terminal state. Additive, as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
     /// Why the task reached `Failed`, or `None` for any non-`Failed` task.
     /// Additive field: old `run.json` files without it still load with `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +229,8 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
                 .iter()
                 .map(|d| TaskId::new(d.clone()))
                 .collect(),
+            started_at: t.started_at,
+            finished_at: t.finished_at,
             failure_reason: t.failure_reason.clone(),
         })
         .collect();
@@ -411,6 +420,8 @@ mod tests {
                 gate_iterations: 0,
                 review_iterations: 0,
                 depends_on: vec![],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             },
             TaskSnapshot {
@@ -420,6 +431,8 @@ mod tests {
                 gate_iterations: 1,
                 review_iterations: 1,
                 depends_on: vec!["task-one".to_string()],
+                started_at: None,
+                finished_at: None,
                 failure_reason: None,
             },
         ];
@@ -471,5 +484,64 @@ mod tests {
         assert_eq!(t2.gate_iterations, 1);
         assert_eq!(t2.review_iterations, 1);
         assert_eq!(t2.depends_on, vec![TaskId::new("task-one")]);
+    }
+
+    /// A [`TaskSnapshot`] with `started_at`/`finished_at` set survives a
+    /// `serde_json` round-trip with the values intact.  Additionally, a
+    /// `TaskSnapshot` deserialized from JSON that **lacks** both fields (an old
+    /// `run.json`) still loads cleanly with `None/None` — verifying the
+    /// `#[serde(default)]` backward-compat contract.
+    #[test]
+    fn snapshot_roundtrips_timestamps() {
+        let ts0 = fixed_ts(2026, 3, 1);
+        let ts1 = fixed_ts(2026, 3, 2);
+
+        // --- case 1: snapshot with both timestamps set ---
+        let snap = TaskSnapshot {
+            id: "my-task".to_string(),
+            title: "My task".to_string(),
+            state: TaskState::Done,
+            gate_iterations: 0,
+            review_iterations: 0,
+            depends_on: vec![],
+            started_at: Some(ts0),
+            finished_at: Some(ts1),
+            failure_reason: None,
+        };
+
+        let json = serde_json::to_string(&snap).expect("serialize TaskSnapshot");
+        let back: TaskSnapshot = serde_json::from_str(&json).expect("deserialize TaskSnapshot");
+
+        assert_eq!(
+            back.started_at,
+            Some(ts0),
+            "started_at must survive serde_json round-trip"
+        );
+        assert_eq!(
+            back.finished_at,
+            Some(ts1),
+            "finished_at must survive serde_json round-trip"
+        );
+
+        // --- case 2: old JSON without started_at/finished_at still deserializes ---
+        let old_json = r#"{
+            "id": "old-task",
+            "title": "Old task",
+            "state": "done",
+            "gate_iterations": 0,
+            "review_iterations": 0,
+            "depends_on": []
+        }"#;
+        let old_snap: TaskSnapshot =
+            serde_json::from_str(old_json).expect("old JSON without timestamps must deserialize");
+
+        assert_eq!(
+            old_snap.started_at, None,
+            "old snapshot without started_at must deserialize to None"
+        );
+        assert_eq!(
+            old_snap.finished_at, None,
+            "old snapshot without finished_at must deserialize to None"
+        );
     }
 }

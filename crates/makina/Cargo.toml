@@ -32,6 +32,8 @@ pulldown-cmark = { version = "0.12", default-features = false }
 ansi-to-tui = "8"
 # JSON serialization for replay module (reading transcripts)
 serde_json = { workspace = true }
+# Chrono for DateTime<Utc> / Utc::now() in the Gantt Timeline render.
+chrono = { workspace = true }
 # TOML serialization for writing provider/role config back to disk (task 0041)
 toml = { workspace = true }
 serde = { workspace = true }
