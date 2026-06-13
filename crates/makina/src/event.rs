@@ -120,12 +120,13 @@ pub async fn run(
     loop {
         let browsing = app.is_browsing();
         let editing_providers = app.is_editing_providers();
+        let viewing_doctor = app.is_viewing_doctor();
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
             biased;
 
             maybe_term = term_rx.recv() => {
-                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers))
+                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers, viewing_doctor))
             }
 
             maybe_api = api_stream.next() => {
@@ -294,6 +295,13 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
             let status = commit_provider_config(app).await;
             (AppEvent::ProviderEditorCommit, status)
         }
+        // ── Doctor scaffold (task 0046) ──────────────────────────────────────
+        // Write starter config templates to both config paths if neither exists.
+        // Never overwrite existing files; re-check and refuse if present.
+        AppEvent::DoctorWriteScaffold => {
+            let status = write_doctor_scaffold(app).await;
+            (AppEvent::Tick, status)
+        }
         // ── Open log (task 0049) ──────────────────────────────────────────────
         // Resolve the focused task's log path, spawn $PAGER on it, and return a
         // status message (success, absence, or error).  If the file doesn't exist,
@@ -358,6 +366,122 @@ async fn commit_provider_config(app: &App) -> Option<String> {
     match tokio::fs::write(&config_path, toml_str).await {
         Ok(()) => Some("Config saved".to_string()),
         Err(e) => Some(format!("Config write error: {e}")),
+    }
+}
+
+/// Write starter config templates when no config files exist.
+///
+/// Writes commented template files to both ~/.makina/config.toml (global)
+/// and .makina/config.toml (project). Never overwrites existing files;
+/// if either already exists after the check, returns a refusal message.
+async fn write_doctor_scaffold(app: &App) -> Option<String> {
+    // Recheck: neither config file should exist
+    let global_exists = app.config_paths.global.as_ref().is_some_and(|p| p.exists());
+    let project_exists = app
+        .config_paths
+        .project
+        .as_ref()
+        .is_some_and(|p| p.exists());
+
+    if global_exists || project_exists {
+        return Some(
+            "Config file already exists; not overwriting. Edit it directly or delete to scaffold."
+                .to_string(),
+        );
+    }
+
+    // Global config template (~/.makina/config.toml)
+    let global_template = r#"# Makina global configuration — machine-specific, not committed.
+# Place at ~/.makina/config.toml
+
+[backend]
+# The command to invoke your agent (must support ACP --acp flag).
+# Examples: "gemini", "grok", or "claude-acp"
+command = "gemini"
+# Optional arguments passed to the agent CLI.
+args = ["--acp", "--yolo"]
+
+[planner]
+# The planner mechanism: one-shot-agent or persistent-session.
+mechanism = "one-shot-agent"
+"#;
+
+    // Project config template (.makina/config.toml)
+    let project_template = r#"# Makina project configuration — committed with the repository.
+# Place at .makina/config.toml
+
+base_branch = "develop"
+concurrency = 2
+
+[caps]
+gate_iterations = 5
+reviewer_iterations = 3
+wall_clock_secs = 1200
+
+[[gates]]
+name = "test"
+command = "cargo test"
+
+[[gates]]
+name = "clippy"
+command = "cargo clippy -- -D warnings"
+
+[[gates]]
+name = "fmt"
+command = "cargo fmt --check"
+"#;
+
+    // Write global config if global path exists
+    let mut written_paths = vec![];
+
+    if let Some(global_path) = &app.config_paths.global {
+        // Ensure the parent directory exists
+        if let Some(parent) = global_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+
+        match tokio::fs::write(global_path, global_template).await {
+            Ok(()) => {
+                written_paths.push(global_path.display().to_string());
+            }
+            Err(e) => {
+                return Some(format!(
+                    "Failed to write global config {}: {}",
+                    global_path.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    // Write project config if project path exists (it should always resolve)
+    if let Some(project_path) = &app.config_paths.project {
+        // Ensure the parent directory exists
+        if let Some(parent) = project_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+
+        match tokio::fs::write(project_path, project_template).await {
+            Ok(()) => {
+                written_paths.push(project_path.display().to_string());
+            }
+            Err(e) => {
+                return Some(format!(
+                    "Failed to write project config {}: {}",
+                    project_path.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    if written_paths.is_empty() {
+        Some("No valid config path to write to.".to_string())
+    } else {
+        Some(format!(
+            "Starter configs written to: {}",
+            written_paths.join(", ")
+        ))
     }
 }
 
@@ -528,9 +652,10 @@ fn translate_terminal_event(
     ev: CrosstermEvent,
     browsing: bool,
     editing_providers: bool,
+    viewing_doctor: bool,
 ) -> AppEvent {
     match ev {
-        CrosstermEvent::Key(key) => translate_key(key, browsing, editing_providers),
+        CrosstermEvent::Key(key) => translate_key(key, browsing, editing_providers, viewing_doctor),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
         // `browsing` flag (the exchange pane is not the browser).  Other mouse
@@ -550,6 +675,7 @@ fn translate_key(
     key: crossterm::event::KeyEvent,
     browsing: bool,
     editing_providers: bool,
+    viewing_doctor: bool,
 ) -> AppEvent {
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
@@ -584,6 +710,14 @@ fn translate_key(
             KeyCode::Down | KeyCode::Char('j') => AppEvent::ProviderEditorDown,
             _ => AppEvent::Tick,
         }
+    } else if viewing_doctor {
+        // ── Doctor overlay keymap ────────────────────────────────────────────
+        // Esc closes the doctor; w writes starter config (if no config exists).
+        match key.code {
+            KeyCode::Esc => AppEvent::CloseDoctor,
+            KeyCode::Char('w') | KeyCode::Char('W') => AppEvent::DoctorWriteScaffold,
+            _ => AppEvent::Tick,
+        }
     } else {
         // ── Normal keymap ────────────────────────────────────────────────────
         match key.code {
@@ -600,6 +734,8 @@ fn translate_key(
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
             // Open the provider/role configuration editor.
             KeyCode::Char('g') | KeyCode::Char('G') => AppEvent::OpenProviderEditor,
+            // Open the doctor health-check overlay.
+            KeyCode::Char('?') => AppEvent::OpenDoctor,
             // ── Run control (task 31): act on the selected Run ────────────────
             // s = Start/resume, p = Pause, c = Cancel.  These are intents; the IO
             // layer resolves them into the async `api.execute(...)` call.
@@ -608,6 +744,8 @@ fn translate_key(
             KeyCode::Char('c') | KeyCode::Char('C') => AppEvent::CancelRun,
             // Re-interpret the selected run (e.g. after fixing blocking issues).
             KeyCode::Char('r') | KeyCode::Char('R') => AppEvent::Reinterpret,
+            // Dismiss the provider-missing warning banner (non-fatal; just hides it).
+            KeyCode::Char('d') | KeyCode::Char('D') => AppEvent::DismissProviderWarning,
             // Sidebar navigation: arrow keys and vim-style j/k.
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
@@ -650,11 +788,11 @@ mod tests {
         // Wheel events route to the exchange-pane scroll helpers regardless of
         // the `browsing` flag (the exchange pane is not the browser).
         assert!(matches!(
-            translate_terminal_event(wheel(MouseEventKind::ScrollUp), false, false),
+            translate_terminal_event(wheel(MouseEventKind::ScrollUp), false, false, false),
             AppEvent::ScrollUp
         ));
         assert!(matches!(
-            translate_terminal_event(wheel(MouseEventKind::ScrollDown), false, false),
+            translate_terminal_event(wheel(MouseEventKind::ScrollDown), false, false, false),
             AppEvent::ScrollDown
         ));
     }
@@ -663,7 +801,7 @@ mod tests {
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::Quit
         ));
     }
@@ -672,7 +810,7 @@ mod tests {
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::Quit
         ));
     }
@@ -681,7 +819,7 @@ mod tests {
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::Quit
         ));
     }
@@ -690,7 +828,7 @@ mod tests {
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::FocusNext
         ));
     }
@@ -700,6 +838,7 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('v'), KeyModifiers::NONE),
+                false,
                 false,
                 false
             ),
@@ -713,6 +852,7 @@ mod tests {
             translate_terminal_event(
                 key_press(KeyCode::Char('e'), KeyModifiers::NONE),
                 false,
+                false,
                 false
             ),
             AppEvent::ToggleErrorPane
@@ -724,6 +864,7 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('r'), KeyModifiers::NONE),
+                false,
                 false,
                 false
             ),
@@ -742,7 +883,7 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::Tick
         ));
     }
@@ -751,7 +892,7 @@ mod tests {
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -760,7 +901,7 @@ mod tests {
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::SelectUp
         ));
     }
@@ -769,7 +910,7 @@ mod tests {
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::SelectDown
         ));
     }
@@ -778,7 +919,7 @@ mod tests {
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::SelectUp
         ));
     }
@@ -787,7 +928,7 @@ mod tests {
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::SelectDown
         ));
     }
@@ -798,7 +939,7 @@ mod tests {
     fn o_key_opens_browser_in_normal_mode() {
         let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::OpenBrowser
         ));
     }
@@ -809,7 +950,7 @@ mod tests {
     fn s_key_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::StartRun
         ));
     }
@@ -818,7 +959,7 @@ mod tests {
     fn p_key_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::PauseRun
         ));
     }
@@ -828,7 +969,7 @@ mod tests {
         // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, false, false),
+            translate_terminal_event(ev, false, false, false),
             AppEvent::CancelRun
         ));
     }
@@ -840,7 +981,10 @@ mod tests {
         for ch in ['s', 'p', 'c'] {
             let ev = key_press(KeyCode::Char(ch), KeyModifiers::NONE);
             assert!(
-                matches!(translate_terminal_event(ev, true, false), AppEvent::Tick),
+                matches!(
+                    translate_terminal_event(ev, true, false, false),
+                    AppEvent::Tick
+                ),
                 "'{ch}' must be inert in browser mode"
             );
         }
@@ -850,7 +994,7 @@ mod tests {
     fn enter_in_browser_activates_selection() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false),
+            translate_terminal_event(ev, true, false, false),
             AppEvent::BrowserActivate
         ));
     }
@@ -860,7 +1004,7 @@ mod tests {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         // In browser mode, Esc must close the browser, NOT quit the app.
         assert!(matches!(
-            translate_terminal_event(ev, true, false),
+            translate_terminal_event(ev, true, false, false),
             AppEvent::CloseBrowser
         ));
     }
@@ -869,7 +1013,7 @@ mod tests {
     fn backspace_in_browser_goes_to_parent() {
         let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false),
+            translate_terminal_event(ev, true, false, false),
             AppEvent::BrowserParent
         ));
     }
@@ -878,12 +1022,12 @@ mod tests {
     fn jk_in_browser_navigate_browser_not_sidebar() {
         let down = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(down, true, false),
+            translate_terminal_event(down, true, false, false),
             AppEvent::BrowserDown
         ));
         let up = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(up, true, false),
+            translate_terminal_event(up, true, false, false),
             AppEvent::BrowserUp
         ));
     }
@@ -892,7 +1036,7 @@ mod tests {
     fn ctrl_c_quits_even_in_browser_mode() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, true, false),
+            translate_terminal_event(ev, true, false, false),
             AppEvent::Quit
         ));
     }
@@ -903,7 +1047,7 @@ mod tests {
         // (it falls through to Tick so the user can keep browsing).
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, true, false),
+            translate_terminal_event(ev, true, false, false),
             AppEvent::Tick
         ));
     }
@@ -920,6 +1064,7 @@ mod tests {
 
         let ev = translate_terminal_event(
             key_press(KeyCode::Char('q'), KeyModifiers::NONE),
+            false,
             false,
             false,
         );
@@ -1694,5 +1839,93 @@ A description that is long enough to pass minimums.
         } else {
             panic!("no run selected");
         }
+    }
+
+    /// The doctor scaffold action must refuse to run when a config file already
+    /// exists on disk: it returns a refusal status message and leaves the
+    /// existing file's contents untouched (it does NOT overwrite).
+    #[tokio::test]
+    async fn doctor_scaffold_refuses_when_present() {
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        // Create a REAL config file on disk so the `p.exists()` guard fires.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo_root = tmp.path().to_path_buf();
+        let config_path = repo_root.join(".makina").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("create .makina dir");
+        let original_contents =
+            "# user's existing config — must not be overwritten\nbase_branch = \"main\"\n";
+        std::fs::write(&config_path, original_contents).expect("seed existing config");
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn makina_core::api::Api>,
+            vec![],
+            repo_root.clone(),
+        );
+        // Point the project config path at the real, existing file.
+        app.config_paths = makina_core::config::ConfigPaths {
+            global: None,
+            project: Some(config_path.clone()),
+        };
+
+        // Invoke the IO path that performs the write.
+        let status = write_doctor_scaffold(&app).await;
+
+        // (a) It must return a refusal status message.
+        let msg = status.expect("scaffold must emit a status message when refusing");
+        assert!(
+            msg.contains("already exists") && msg.contains("not overwriting"),
+            "refusal message must explain the file exists and is not overwritten; got {msg:?}"
+        );
+
+        // (b) It must NOT overwrite the existing file.
+        let after = std::fs::read_to_string(&config_path).expect("read config back");
+        assert_eq!(
+            after, original_contents,
+            "existing config contents must be left untouched by the refused scaffold"
+        );
+    }
+
+    /// The doctor scaffold writes both starter templates when no config exists,
+    /// reports the written paths, and produces parseable TOML.
+    #[tokio::test]
+    async fn doctor_scaffold_writes_when_absent() {
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo_root = tmp.path().to_path_buf();
+        // Both target paths point inside the tempdir and do NOT exist yet.
+        let global_path = repo_root.join("global").join("config.toml");
+        let project_path = repo_root.join(".makina").join("config.toml");
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn makina_core::api::Api>,
+            vec![],
+            repo_root.clone(),
+        );
+        app.config_paths = makina_core::config::ConfigPaths {
+            global: Some(global_path.clone()),
+            project: Some(project_path.clone()),
+        };
+
+        let status = write_doctor_scaffold(&app).await;
+        let msg = status.expect("scaffold must emit a status message");
+        assert!(
+            msg.contains("written"),
+            "status must name the written files; got {msg:?}"
+        );
+
+        // Both files must now exist with non-empty, parseable contents.
+        assert!(global_path.exists(), "global config must be written");
+        assert!(project_path.exists(), "project config must be written");
+        let project_contents = std::fs::read_to_string(&project_path).expect("read project config");
+        let _: toml::Value =
+            toml::from_str(&project_contents).expect("scaffold project config must be valid TOML");
     }
 }

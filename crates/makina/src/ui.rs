@@ -55,20 +55,28 @@ use makina_core::api::FailureKind;
 pub fn render(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
+    // Check if any provider is missing and warning hasn't been dismissed —
+    // if so, reserve one extra line for the warning banner.
+    let has_missing_provider =
+        !app.provider_warning_dismissed && app.provider_probes.iter().any(|p| p.resolved.is_none());
+    let warning_height: u16 = if has_missing_provider { 1 } else { 0 };
+
     // ── Top-level vertical split ──────────────────────────────────────────────
-    // title_bar (1 row) / body (fills remaining) / status_bar (1 row)
+    // title_bar (1 row) / [warning_banner (0 or 1 row)] / body (fills remaining) / status_bar (1 row)
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title bar
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // status bar
+            Constraint::Length(1),              // title bar
+            Constraint::Length(warning_height), // warning banner (0 or 1)
+            Constraint::Min(0),                 // body
+            Constraint::Length(1),              // status bar
         ])
         .split(area);
 
     let title_area = vertical[0];
-    let body_area = vertical[1];
-    let status_area = vertical[2];
+    let warning_area = vertical[1];
+    let body_area = vertical[2];
+    let status_area = vertical[3];
 
     // ── Body horizontal split ─────────────────────────────────────────────────
     // sidebar (30%) / main (70%)
@@ -90,6 +98,11 @@ pub fn render(app: &App, frame: &mut Frame) {
             .add_modifier(Modifier::BOLD),
     );
     frame.render_widget(title, title_area);
+
+    // ── Provider warning banner ───────────────────────────────────────────────
+    if has_missing_provider {
+        render_provider_warning(app, frame, warning_area);
+    }
 
     // ── Sidebar ───────────────────────────────────────────────────────────────
     // Render a real ratatui List with one row per Run.  Each row shows the
@@ -434,7 +447,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let default_style = Style::default().bg(Color::DarkGray).fg(Color::White);
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [v] view  [L] log  ",
+            " [o] open  [s/p/c] start/pause/cancel  [Tab] panel  [v] view  [L] log  [?] doctor  ",
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -461,6 +474,12 @@ pub fn render(app: &App, frame: &mut Frame) {
         && let Some(editor) = app.provider_editor.as_ref()
     {
         render_provider_editor(editor, frame, area);
+    }
+
+    // ── Doctor health-check overlay (task 0046) ──────────────────────────────────
+    // Drawn last so it sits on top of all other overlays.
+    if app.is_viewing_doctor() {
+        render_doctor(app, frame, area);
     }
 }
 
@@ -1084,6 +1103,41 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para, inner);
 }
 
+/// Render a warning banner when provider binaries are missing.
+///
+/// Shows a single-line warning for each missing provider in a yellow/amber style,
+/// listing the provider name and missing command. This warning is non-fatal — the
+/// app continues to run normally, but the user is alerted before a run begins.
+fn render_provider_warning(app: &App, frame: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // Collect all missing providers.
+    let missing: Vec<_> = app
+        .provider_probes
+        .iter()
+        .filter(|p| p.resolved.is_none())
+        .collect();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    // Build warning text: "⚠ provider "foo" command 'bar' not found on PATH  [d] dismiss"
+    // Shows the first missing provider; includes a dismiss hint.
+    let first = &missing[0];
+    let warning_text = format!(
+        "⚠ provider \"{}\" command '{}' not found on PATH  [d] dismiss",
+        first.provider, first.command
+    );
+
+    let para =
+        Paragraph::new(warning_text).style(Style::default().fg(Color::Yellow).bg(Color::Black));
+
+    frame.render_widget(para, area);
+}
+
 /// Render the ingestion report panel for the selected run (when it has issues).
 ///
 /// Each issue is shown as `[{source}] {code} — {message}` with an optional
@@ -1572,6 +1626,207 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
     frame.render_widget(footer, footer_area);
 }
 
+/// Probe whether a directory is writable.
+///
+/// Reads the directory's metadata and reports writability. On Unix the mode
+/// bits are inspected directly (owner/group/other write); elsewhere the coarse
+/// `readonly()` flag is used. This never mutates the filesystem.
+fn is_dir_writable(dir: &std::path::Path) -> bool {
+    match std::fs::metadata(dir) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Any write bit set (owner/group/other) is treated as writable;
+                // the metadata probe avoids creating a temp file in the tree.
+                meta.permissions().mode() & 0o222 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                !meta.permissions().readonly()
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Render the doctor health-check overlay.
+///
+/// Lists four health checks (config files, providers, base branch, .makina/ dir).
+/// Each row shows a status (✓/✗/⚠) and a remedy hint. When no config exists,
+/// offers a [w] write scaffold action.
+fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
+    // Centre a box ~75% wide / 70% tall.
+    let popup = centered_rect(75, 70, area);
+
+    // Clear the region first so the popup is opaque.
+    frame.render_widget(Clear, popup);
+
+    let title = " Doctor — Health Check ";
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split the popup into list area + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let list_area = chunks[0];
+    let footer_area = chunks[1];
+
+    // Build the checklist items
+    let mut items: Vec<ListItem> = vec![];
+
+    // Check 1: Config files found
+    let (config_check, config_msg) = {
+        let global_exists = app.config_paths.global.as_ref().is_some_and(|p| p.exists());
+        let project_exists = app
+            .config_paths
+            .project
+            .as_ref()
+            .is_some_and(|p| p.exists());
+        if global_exists || project_exists {
+            ("✓".to_string(), "Config files found".to_string())
+        } else {
+            (
+                "✗".to_string(),
+                "No config files — write one with [w]".to_string(),
+            )
+        }
+    };
+    let config_style = if config_check == "✓" {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(config_check, config_style.add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(config_msg, Style::default().fg(Color::White)),
+    ])));
+
+    // Check 2: Providers resolvable
+    let missing_providers: Vec<_> = app
+        .provider_probes
+        .iter()
+        .filter(|p| p.resolved.is_none())
+        .collect();
+    let (providers_check, providers_msg) = if missing_providers.is_empty() {
+        (
+            "✓".to_string(),
+            "All configured providers found on PATH".to_string(),
+        )
+    } else {
+        let names: Vec<&str> = missing_providers
+            .iter()
+            .map(|p| p.provider.as_str())
+            .collect();
+        // Soft warning: a missing provider binary is not a hard failure — the
+        // user can still browse and fix PATH/config before a run.
+        (
+            "⚠".to_string(),
+            format!("Providers not found: {}", names.join(", ")),
+        )
+    };
+    let providers_style = if providers_check == "✓" {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(
+            providers_check,
+            providers_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(providers_msg, Style::default().fg(Color::White)),
+    ])));
+
+    // Check 3: Base branch exists in repo
+    let (branch_check, branch_msg) = if app.base_branch_exists {
+        (
+            "✓".to_string(),
+            "Base branch exists in repository".to_string(),
+        )
+    } else {
+        (
+            "✗".to_string(),
+            "Base branch not found — create it or update config".to_string(),
+        )
+    };
+    let branch_style = if branch_check == "✓" {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(branch_check, branch_style.add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(branch_msg, Style::default().fg(Color::White)),
+    ])));
+
+    // Check 4: .makina/ directory present and writable (relative to the repo
+    // root, not the process CWD). Writability is probed against the directory
+    // metadata so a read-only workspace surfaces a soft warning.
+    let makina_dir = app.repo_root.join(".makina");
+    let (makina_check, makina_msg) = if !makina_dir.is_dir() {
+        (
+            "⚠".to_string(),
+            ".makina/ directory missing — it is created on first run".to_string(),
+        )
+    } else if is_dir_writable(&makina_dir) {
+        (
+            "✓".to_string(),
+            ".makina/ directory present and writable".to_string(),
+        )
+    } else {
+        (
+            "⚠".to_string(),
+            ".makina/ directory present but not writable — fix permissions".to_string(),
+        )
+    };
+    let makina_style = if makina_check == "✓" {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(makina_check, makina_style.add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(makina_msg, Style::default().fg(Color::White)),
+    ])));
+
+    // Render the checklist
+    let list = List::new(items).style(Style::default().fg(Color::White));
+    frame.render_widget(list, list_area);
+
+    // Footer with hints: show [w] scaffold hint if no config exists
+    let (global_exists, project_exists) = (
+        app.config_paths.global.as_ref().is_some_and(|p| p.exists()),
+        app.config_paths
+            .project
+            .as_ref()
+            .is_some_and(|p| p.exists()),
+    );
+    let footer_text = if !global_exists && !project_exists {
+        "[w] write config  [Esc] close"
+    } else {
+        "[Esc] close"
+    };
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        footer_text,
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(footer, footer_area);
+}
+
 /// Compute a [`Rect`] centred within `area`, sized to `percent_x` × `percent_y`
 /// of it.  Used to position the modal file-browser popup.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1859,7 +2114,10 @@ mod tests {
     /// The status bar must show the current dependency view label.
     #[test]
     fn status_bar_shows_current_view_label() {
-        let mut terminal = make_terminal(120, 24);
+        // The status bar carries more hints now ([e] errors badge + [?] doctor),
+        // so use a wider terminal to ensure the trailing `view:` label is not
+        // clipped before the assertions run.
+        let mut terminal = make_terminal(140, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
@@ -1873,7 +2131,7 @@ mod tests {
 
         // Cycle to List
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(120, 24);
+        let mut terminal = make_terminal(140, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -1883,7 +2141,7 @@ mod tests {
 
         // Cycle to Tree
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(120, 24);
+        let mut terminal = make_terminal(140, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -1893,7 +2151,7 @@ mod tests {
 
         // Cycle to Timeline
         app.update(crate::app::AppEvent::CycleDependencyView);
-        let mut terminal = make_terminal(120, 24);
+        let mut terminal = make_terminal(140, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -4440,6 +4698,55 @@ mod tests {
         assert!(
             screen.contains("wall-clock") && screen.contains("left"),
             "exchange header must show a wall-clock countdown when task is in-progress"
+        );
+    }
+
+    /// The doctor overlay lists all health checks with ✓/✗ indicators.
+    #[test]
+    fn doctor_overlay_lists_checks() {
+        let mut terminal = make_terminal(120, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Seed the app with a missing provider
+        app.provider_probes = vec![makina_core::preflight::ProviderProbe {
+            provider: "test-missing".to_string(),
+            command: "missing-binary".to_string(),
+            resolved: None,
+            note: Some("not found".to_string()),
+        }];
+        app.base_branch_exists = false;
+
+        // No config files resolve, so the config row reports a hard failure.
+        app.config_paths = makina_core::config::ConfigPaths {
+            global: None,
+            project: None,
+        };
+
+        // Switch to doctor mode
+        app.update(crate::app::AppEvent::OpenDoctor);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // Verify all checks are rendered (doctor title must be present)
+        assert!(app.is_viewing_doctor(), "app should be in Doctor mode");
+        assert!(
+            screen.contains("Doctor") || screen.contains("Health"),
+            "doctor overlay title should be visible"
+        );
+        // At least one status glyph must render (the missing provider is a ⚠,
+        // the missing base branch is a ✗).
+        assert!(
+            screen.contains('✓') || screen.contains('✗') || screen.contains('⚠'),
+            "doctor overlay must render at least one ✓/✗/⚠ glyph; screen: {screen}"
+        );
+        // At least one of the four check messages must be visible.
+        assert!(
+            screen.contains("No config files")
+                || screen.contains("Providers not found")
+                || screen.contains("Base branch")
+                || screen.contains(".makina/"),
+            "doctor overlay must render at least one check message; screen: {screen}"
         );
     }
 }

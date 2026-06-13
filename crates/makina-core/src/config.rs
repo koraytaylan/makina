@@ -77,6 +77,29 @@ pub enum ConfigError {
     },
 }
 
+// ── Config load paths ─────────────────────────────────────────────────────────
+
+/// The resolved file-system paths checked by [`Config::load_defaults`].
+///
+/// Returned by [`Config::load_defaults_with_paths`] so that callers (e.g. the
+/// binary entry point) can include path information in user-facing error
+/// messages — naming which file was checked, whether it existed, and which
+/// layer wins on merge.
+#[derive(Debug, Clone)]
+pub struct ConfigPaths {
+    /// Resolved path for the global config (`~/.makina/config.toml`).
+    /// `None` when `$HOME` is unset.
+    pub global: Option<PathBuf>,
+    /// Resolved path for the project config (`.makina/config.toml` or legacy
+    /// `./makina.toml`).
+    ///
+    /// **Invariant:** always `Some`. `resolve_project_config_path` defaults to
+    /// the preferred `.makina/config.toml` path even when neither config file
+    /// exists, so this field is never `None`. The `Option` wrapper is retained
+    /// to mirror `global` and to allow callers to treat both fields uniformly.
+    pub project: Option<PathBuf>,
+}
+
 // ── Backend config ────────────────────────────────────────────────────────────
 
 /// Configuration for the external agent backend CLI.
@@ -635,10 +658,17 @@ impl Config {
             if let Some(assignment) = assignment
                 && !provider_names.contains(&assignment.provider)
             {
+                let provider_list = if self.providers.is_empty() {
+                    "no [[providers]] are defined".to_string()
+                } else {
+                    let names: Vec<String> =
+                        self.providers.iter().map(|p| p.name.clone()).collect();
+                    format!("defined providers: [{}]", names.join(", "))
+                };
                 return Err(ConfigError::Validation {
                     reason: format!(
-                        "role '{}' references unknown provider {:?}",
-                        role_name, assignment.provider
+                        "role '{}' references unknown provider {:?} — {}",
+                        role_name, assignment.provider, provider_list
                     ),
                 });
             }
@@ -735,6 +765,22 @@ impl Config {
         global_path: Option<&Path>,
         project_path: Option<&Path>,
     ) -> Result<Config, ConfigError> {
+        Config::load_with_labels(global_path, None, project_path, None)
+    }
+
+    /// Load config with explicit source labels for error messages.
+    ///
+    /// This is the internal implementation that supports both `load()` (for tests)
+    /// and `load_defaults()` (which provides human-friendly labels).
+    ///
+    /// If `global_label` or `project_label` is `None`, the path's `display()`
+    /// is used as a fallback label.
+    fn load_with_labels(
+        global_path: Option<&Path>,
+        global_label: Option<&str>,
+        project_path: Option<&Path>,
+        project_label: Option<&str>,
+    ) -> Result<Config, ConfigError> {
         let global = match global_path {
             None => GlobalConfig::default(),
             Some(path) => {
@@ -743,7 +789,14 @@ impl Config {
                         path: path.display().to_string(),
                         message: e.to_string(),
                     })?;
-                    GlobalConfig::from_toml_str(&toml_str, &path.display().to_string())?
+                    let default_label;
+                    let label = if let Some(lbl) = global_label {
+                        lbl
+                    } else {
+                        default_label = path.display().to_string();
+                        &default_label
+                    };
+                    GlobalConfig::from_toml_str(&toml_str, label)?
                 } else {
                     GlobalConfig::default()
                 }
@@ -758,7 +811,14 @@ impl Config {
                         path: path.display().to_string(),
                         message: e.to_string(),
                     })?;
-                    ProjectConfig::from_toml_str(&toml_str, &path.display().to_string())?
+                    let default_label;
+                    let label = if let Some(lbl) = project_label {
+                        lbl
+                    } else {
+                        default_label = path.display().to_string();
+                        &default_label
+                    };
+                    ProjectConfig::from_toml_str(&toml_str, label)?
                 } else {
                     ProjectConfig::default()
                 }
@@ -771,7 +831,7 @@ impl Config {
     }
 
     /// Convenience wrapper that resolves the real default paths and calls
-    /// [`Config::load`].
+    /// [`Config::load_with_labels`] with human-friendly labels.
     ///
     /// - Global:  `~/.makina/config.toml`
     /// - Project: resolved against the current working directory with the
@@ -787,11 +847,38 @@ impl Config {
     ///
     /// Same as [`Config::load`].
     pub fn load_defaults() -> Result<Config, ConfigError> {
+        let (result, _paths) = Self::load_defaults_with_paths();
+        result
+    }
+
+    /// Like [`Config::load_defaults`] but returns `(Result<Config, ConfigError>,
+    /// ConfigPaths)` — the resolved paths are **always** available, even when
+    /// loading fails.  This lets the binary entry point name the files that were
+    /// checked in its error message without re-deriving the paths independently.
+    ///
+    /// # Return value
+    ///
+    /// - `.0` — the load result, which may be an error.
+    /// - `.1` — the [`ConfigPaths`] that were resolved before the load attempt.
+    ///   These are valid regardless of whether `.0` is `Ok` or `Err`.
+    pub fn load_defaults_with_paths() -> (Result<Config, ConfigError>, ConfigPaths) {
         let global_path = home_dir().map(|h| h.join(".makina").join("config.toml"));
         let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let (project_path, _legacy) = resolve_project_config_path(&repo_root);
 
-        Config::load(global_path.as_deref(), project_path.as_deref())
+        let paths = ConfigPaths {
+            global: global_path.clone(),
+            project: project_path.clone(),
+        };
+
+        let result = Config::load_with_labels(
+            global_path.as_deref(),
+            Some("global (~/.makina/config.toml)"),
+            project_path.as_deref(),
+            Some("project (.makina/config.toml)"),
+        );
+
+        (result, paths)
     }
 }
 
@@ -1438,6 +1525,91 @@ mod tests {
         assert!(
             err.to_string().contains("unknown provider"),
             "error should mention 'unknown provider', got: {err}"
+        );
+    }
+
+    /// **Acceptance criterion — enrich-config-errors (test 1):**
+    /// The unknown-provider `reason` includes the defined provider names.
+    ///
+    /// Given a config with `roles.developer.provider="nope"` and
+    /// `providers=[a, default]`, the validation error reason should contain
+    /// the bad provider name "nope" AND the valid provider names "a" and "default".
+    #[test]
+    fn config_error_lists_defined_providers() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [[providers]]
+            name = "a"
+            command = "provider-a"
+
+            [[providers]]
+            name = "default"
+            command = "default-provider"
+
+            [roles.developer]
+            provider = "nope"
+            "#,
+            "test-global",
+        )
+        .expect("valid TOML");
+
+        let project = ProjectConfig::default();
+        let config = Config::resolve(global, project);
+
+        let err = config
+            .validate()
+            .expect_err("developer referencing unknown provider 'nope' should fail validation");
+
+        let error_msg = err.to_string();
+        assert!(
+            error_msg.contains("nope"),
+            "error should mention the bad provider 'nope', got: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("a"),
+            "error should mention the defined provider 'a', got: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("default"),
+            "error should mention the defined provider 'default', got: {error_msg}"
+        );
+    }
+
+    /// **Acceptance criterion — enrich-config-errors (test 2a):**
+    /// Parse errors name the project file.
+    ///
+    /// Given a malformed project TOML, the parse error should contain the
+    /// project-specific label "project (.makina/config.toml)".
+    #[test]
+    fn parse_error_names_source_file() {
+        let bad_toml = "[gates\nname = broken";
+
+        let err = ProjectConfig::from_toml_str(bad_toml, "project (.makina/config.toml)")
+            .expect_err("malformed TOML should return an error");
+
+        let error_msg = err.to_string();
+        assert!(
+            error_msg.contains("project (.makina/config.toml)"),
+            "error should contain the project-specific label, got: {error_msg}"
+        );
+    }
+
+    /// **Acceptance criterion — enrich-config-errors (test 2b):**
+    /// Parse errors name the global file.
+    ///
+    /// Given a malformed global TOML, the parse error should contain the
+    /// global-specific label "global (~/.makina/config.toml)".
+    #[test]
+    fn parse_error_names_global_source_file() {
+        let bad_toml = "this is not valid = = toml!!!";
+
+        let err = GlobalConfig::from_toml_str(bad_toml, "global (~/.makina/config.toml)")
+            .expect_err("malformed TOML should return an error");
+
+        let error_msg = err.to_string();
+        assert!(
+            error_msg.contains("global (~/.makina/config.toml)"),
+            "error should contain the global-specific label, got: {error_msg}"
         );
     }
 }

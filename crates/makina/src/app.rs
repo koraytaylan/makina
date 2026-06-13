@@ -378,6 +378,8 @@ pub enum Mode {
     FileBrowser,
     /// The modal provider/role configuration editor.
     ProviderConfig,
+    /// The modal doctor health-check overlay.
+    Doctor,
 }
 
 // ── Provider configuration editor ──────────────────────────────────────────────
@@ -564,6 +566,20 @@ pub enum AppEvent {
     /// `update` pushes it via [`App::push_error`] (respecting
     /// [`ERROR_MESSAGES_CAP`]).
     ErrorMessageArrived { msg: ErrorMessage },
+
+    /// Dismiss the provider-missing warning banner.
+    ///
+    /// Bound to `d` (in Normal mode) by the event layer.  Sets
+    /// [`App::provider_warning_dismissed`] so the banner stops rendering.
+    DismissProviderWarning,
+
+    // ── Doctor health-check overlay (task 0046) ──────────────────────────────
+    /// User requested to open the doctor health-check overlay (pressed `?`).
+    OpenDoctor,
+    /// Close the doctor overlay and return to the normal view (Esc).
+    CloseDoctor,
+    /// Write starter config templates (pressed `w` in doctor).
+    DoctorWriteScaffold,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -728,6 +744,32 @@ pub struct App {
     /// Tick counter, incremented on each [`AppEvent::Tick`].
     /// Used to drive animations like the working spinner.
     pub tick: u64,
+
+    /// Provider preflight probe results.
+    ///
+    /// Stores the result of probing each configured provider's command for
+    /// presence on the filesystem. Used to render a non-fatal warning when a
+    /// provider binary is missing.
+    pub provider_probes: Vec<makina_core::preflight::ProviderProbe>,
+
+    /// Whether the provider-missing warning banner has been dismissed by the user.
+    ///
+    /// Set to `true` when the user activates [`AppEvent::DismissProviderWarning`].
+    /// The warning banner is not rendered once this flag is set, even if missing
+    /// probes remain.
+    pub provider_warning_dismissed: bool,
+
+    /// Resolved config file paths for the doctor view.
+    ///
+    /// Holds the global and project config paths so the doctor can report which
+    /// files exist and where to write scaffold templates.
+    pub config_paths: makina_core::config::ConfigPaths,
+
+    /// Whether the configured base_branch exists in the repository.
+    ///
+    /// Computed once at startup and cached for the doctor view. Used to render
+    /// a check in the health checklist.
+    pub base_branch_exists: bool,
 }
 
 impl App {
@@ -782,23 +824,38 @@ impl App {
             tick: 0,
             idle_secs_config: None,
             wall_clock_secs_config: 600, // 10 minutes as a reasonable default
+            provider_probes: Vec::new(),
+            provider_warning_dismissed: false,
+            config_paths: makina_core::config::ConfigPaths {
+                global: None,
+                project: None,
+            },
+            base_branch_exists: false,
         }
     }
 
-    /// Build a new [`App`] with explicit providers and roles from a resolved config.
+    /// Build a new [`App`] with explicit providers, roles, probes, and doctor state from a resolved config.
     ///
     /// Use this variant when a config is available (main.rs) so the provider
-    /// editor is seeded with the current configuration.
+    /// editor is seeded with the current configuration, probes are available
+    /// for warning display, and the doctor has the config paths and base branch state.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         api: Arc<dyn Api>,
         initial_runs: Vec<RunView>,
         repo_root: PathBuf,
         providers: Vec<ProviderConfig>,
         roles: RolesConfig,
+        provider_probes: Vec<makina_core::preflight::ProviderProbe>,
+        config_paths: makina_core::config::ConfigPaths,
+        base_branch_exists: bool,
     ) -> Self {
         let mut app = Self::new(api, initial_runs, repo_root);
         app.providers = providers;
         app.roles = roles;
+        app.provider_probes = provider_probes;
+        app.config_paths = config_paths;
+        app.base_branch_exists = base_branch_exists;
         app
     }
 
@@ -827,6 +884,11 @@ impl App {
     /// Whether the provider configuration editor is currently active.
     pub fn is_editing_providers(&self) -> bool {
         self.mode == Mode::ProviderConfig
+    }
+
+    /// Whether the doctor health-check overlay is currently active.
+    pub fn is_viewing_doctor(&self) -> bool {
+        self.mode == Mode::Doctor
     }
 
     /// Return the currently selected [`RunView`], if any.
@@ -1191,6 +1253,27 @@ impl App {
 
             AppEvent::ErrorMessageArrived { msg } => {
                 self.push_error(msg);
+                true
+            }
+
+            AppEvent::DismissProviderWarning => {
+                self.provider_warning_dismissed = true;
+                true
+            }
+
+            // ── Doctor health-check overlay (task 0046) ──────────────────────────
+            AppEvent::OpenDoctor => {
+                self.mode = Mode::Doctor;
+                true
+            }
+            AppEvent::CloseDoctor => {
+                self.mode = Mode::Normal;
+                true
+            }
+            AppEvent::DoctorWriteScaffold => {
+                // The IO layer (resolve_io in event.rs) handles the actual file writes.
+                // Here we just signal that the action is requested; the IO layer
+                // will emit a StatusMessage with the outcome.
                 true
             }
         }
@@ -2460,6 +2543,12 @@ mod tests {
             PathBuf::from("."),
             providers.clone(),
             roles.clone(),
+            vec![],
+            makina_core::config::ConfigPaths {
+                global: None,
+                project: None,
+            },
+            false,
         );
 
         // Sanity: starts in Normal mode with no editor open.

@@ -21,12 +21,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
 use makina::{app, event, exit, log, tui};
 use makina_acp::AcpBackend;
 use makina_core::audit::JsonlAuditSink;
 use makina_core::backend::AgentBackend;
 use makina_core::config::Config;
 use makina_core::orchestrator::CoreApi;
+use makina_core::preflight::probe_providers;
 use makina_core::worktree::WorktreeManager;
 
 #[tokio::main]
@@ -36,10 +40,48 @@ async fn main() {
     // ./makina.toml).  Supplies the agent backend command, the gates, the caps,
     // the concurrency limit, and the base branch the orchestrator drives runs
     // with.  A load/validation failure is fatal (we cannot run without it).
-    let config = match Config::load_defaults() {
+    //
+    // On failure we emit a multi-line guidance block naming which files were
+    // checked, whether each existed, the "project overrides global" precedence
+    // note, and a pointer to the README "Configure" section.
+    //
+    // `load_defaults_with_paths` returns `(Result<Config, ConfigError>, ConfigPaths)`
+    // so the resolved paths are in hand even when loading fails — no need to
+    // re-derive them in the error arm.
+    let (load_result, load_paths) = Config::load_defaults_with_paths();
+    let config = match load_result {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("failed to load configuration: {e}");
+            let global_status = match &load_paths.global {
+                None => "  global  : (HOME unset — skipped)".to_string(),
+                Some(p) => {
+                    if p.exists() {
+                        format!("  global  : {} (found)", p.display())
+                    } else {
+                        format!("  global  : {} (not found — using defaults)", p.display())
+                    }
+                }
+            };
+            let project_status = match &load_paths.project {
+                None => "  project : (could not resolve — using defaults)".to_string(),
+                Some(p) => {
+                    if p.exists() {
+                        format!("  project : {} (found)", p.display())
+                    } else {
+                        format!("  project : {} (not found — using defaults)", p.display())
+                    }
+                }
+            };
+
+            eprintln!(
+                "error: failed to load configuration: {e}\n\
+                 \n\
+                 Files checked (project overrides global):\n\
+                 {global_status}\n\
+                 {project_status}\n\
+                 \n\
+                 See README § Configure for a minimal config example."
+            );
             std::process::exit(1);
         }
     };
@@ -201,6 +243,29 @@ async fn main() {
         }
     };
 
+    // Probe each provider's command for presence on the filesystem before
+    // moving config into the API.
+    let provider_probes = probe_providers(&config);
+
+    // Check if the configured base branch exists in the repository (for doctor view).
+    let base_branch_exists = {
+        let output = std::process::Command::new("git")
+            .args(["branch", "--list", &config.base_branch])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap_or_else(|_| std::process::Output {
+                status: std::process::ExitStatus::from_raw(1),
+                stdout: vec![],
+                stderr: vec![],
+            });
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        !stdout.trim().is_empty()
+    };
+
+    // Clone providers and roles before config is moved into the API.
+    let providers_for_app = config.providers.clone();
+    let roles_for_app = config.roles.clone();
+
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
         ingestion_interpreter,
         planner_interpreter,
@@ -213,7 +278,17 @@ async fn main() {
 
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;
-    let mut app = app::App::new(Arc::clone(&api), initial_runs, repo_root);
+
+    let mut app = app::App::with_config(
+        Arc::clone(&api),
+        initial_runs,
+        repo_root,
+        providers_for_app,
+        roles_for_app,
+        provider_probes,
+        load_paths,
+        base_branch_exists,
+    );
     app.load_initial_exchanges();
 
     // ── Terminal lifecycle ────────────────────────────────────────────────────
