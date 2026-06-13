@@ -1,8 +1,3 @@
 .DS_Store
 
 /target
-
-# implement-plan task worktrees (per-task isolated checkouts)
-/.worktrees/
-# sandboxed cargo home / registry cache created by isolated runs
-/.cargo/
