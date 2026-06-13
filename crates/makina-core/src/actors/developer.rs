@@ -858,6 +858,8 @@ mod tests {
             mode: None,
             model: Some("test-model".to_string()),
             effort: None,
+            system_prompt: None,
+            system_prompt_mode: None,
         };
 
         // ── Spawn actors ─────────────────────────────────────────────────────

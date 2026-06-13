@@ -171,11 +171,51 @@ pub fn system_prompt_for(role: Role) -> &'static str {
     }
 }
 
+/// Combine a built-in role prompt with optional custom instructions.
+///
+/// # Arguments
+/// - `builtin`: the base system prompt (e.g., `DEVELOPER_SYSTEM_PROMPT`)
+/// - `custom`: optional project-specific instructions
+/// - `mode`: how to combine them — `Some("replace")` substitutes `custom` for
+///   `builtin`; `None` or any other value appends (default)
+///
+/// # Returns
+/// - If `custom` is `None`, returns `builtin` as-is.
+/// - If `mode == Some("replace")`, returns `custom`.
+/// - Otherwise, returns `builtin` with `custom` appended (separated by two newlines).
+fn combine_prompt(builtin: &str, custom: Option<&str>, mode: Option<&str>) -> String {
+    match custom {
+        None => builtin.to_string(),
+        Some(c) => match mode {
+            Some("replace") => c.to_string(),
+            _ => format!("{builtin}\n\n{c}"), // append (default)
+        },
+    }
+}
+
+/// Return the effective system prompt for a role, combining its built-in constant
+/// with any project-specific instructions.
+///
+/// If no assignment is provided, returns the role's built-in prompt as-is.
+/// Otherwise, applies the `system_prompt_mode` semantics (default is append).
+pub fn effective_system_prompt(role: Role, assignment: Option<&RoleAssignment>) -> String {
+    let builtin = system_prompt_for(role);
+    match assignment {
+        None => builtin.to_string(),
+        Some(a) => combine_prompt(
+            builtin,
+            a.system_prompt.as_deref(),
+            a.system_prompt_mode.as_deref(),
+        ),
+    }
+}
+
 /// Build a [`SessionConfig`] for the given [`Role`], working directory, and role assignment.
 ///
-/// Sets `system_prompt` to the role-appropriate constant and carries the
-/// `mode`, `model`, and `effort` defaults from the role's assignment.
-/// The orchestrator calls this when spawning a session for a role.
+/// Sets `system_prompt` to the role-appropriate constant (optionally combined with
+/// project-specific instructions) and carries the `mode`, `model`, and `effort`
+/// defaults from the role's assignment. The orchestrator calls this when spawning
+/// a session for a role.
 ///
 /// # Example
 /// ```
@@ -187,6 +227,8 @@ pub fn system_prompt_for(role: Role) -> &'static str {
 ///     mode: None,
 ///     model: None,
 ///     effort: None,
+///     system_prompt: None,
+///     system_prompt_mode: None,
 /// };
 /// let cfg = session_config_for(Role::Reviewer, PathBuf::from("/tmp/worktree"), Some(assignment));
 /// assert_eq!(cfg.system_prompt, REVIEWER_SYSTEM_PROMPT);
@@ -197,13 +239,14 @@ pub fn session_config_for(
     working_dir: PathBuf,
     assignment: Option<RoleAssignment>,
 ) -> SessionConfig {
+    let system_prompt = effective_system_prompt(role, assignment.as_ref());
     let (mode, model, effort) = assignment
         .map(|a| (a.mode, a.model, a.effort))
         .unwrap_or((None, None, None));
 
     SessionConfig {
         working_dir,
-        system_prompt: system_prompt_for(role).to_string(),
+        system_prompt,
         mode,
         model,
         effort,
@@ -366,6 +409,78 @@ mod tests {
     use super::*;
     use crate::backend::noop::NoopBackend;
     use crate::backend::{AgentBackend, Prompt, ResponseEvent};
+
+    // ── effective_system_prompt (combine_prompt) ──────────────────────────────
+
+    #[test]
+    fn append_extends_builtin() {
+        // When system_prompt is provided and mode is not ("append" is default),
+        // effective_system_prompt should return builtin + "\n\n" + custom.
+        let assignment = RoleAssignment {
+            provider: "default".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
+            system_prompt: Some("X".to_string()),
+            system_prompt_mode: None,
+        };
+
+        let result = effective_system_prompt(Role::Developer, Some(&assignment));
+        let expected = format!("{}\n\nX", DEVELOPER_SYSTEM_PROMPT);
+        assert_eq!(
+            result, expected,
+            "append mode should combine builtin and custom with newlines"
+        );
+    }
+
+    #[test]
+    fn replace_overrides() {
+        // When system_prompt_mode is explicitly "replace", it should return
+        // exactly the custom prompt with no builtin prefix.
+        let assignment = RoleAssignment {
+            provider: "default".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
+            system_prompt: Some("X".to_string()),
+            system_prompt_mode: Some("replace".to_string()),
+        };
+
+        let result = effective_system_prompt(Role::Developer, Some(&assignment));
+        assert_eq!(
+            result, "X",
+            "replace mode should return only the custom prompt"
+        );
+    }
+
+    #[test]
+    fn absent_uses_builtin() {
+        // When system_prompt is None, effective_system_prompt should return
+        // the role's builtin prompt as-is.
+        let assignment = RoleAssignment {
+            provider: "default".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
+            system_prompt: None,
+            system_prompt_mode: None,
+        };
+
+        let result = effective_system_prompt(Role::Developer, Some(&assignment));
+        assert_eq!(
+            result,
+            DEVELOPER_SYSTEM_PROMPT.to_string(),
+            "absent custom prompt should use builtin"
+        );
+
+        // Also test with None assignment directly.
+        let result_none = effective_system_prompt(Role::Reviewer, None);
+        assert_eq!(
+            result_none,
+            REVIEWER_SYSTEM_PROMPT.to_string(),
+            "None assignment should use builtin"
+        );
+    }
 
     // ── system_prompt_for / session_config_for ────────────────────────────────
 
@@ -634,6 +749,8 @@ mod tests {
             mode: Some("code".to_string()),
             model: Some("claude-opus".to_string()),
             effort: Some("high".to_string()),
+            system_prompt: None,
+            system_prompt_mode: None,
         };
 
         let cfg = session_config_for(

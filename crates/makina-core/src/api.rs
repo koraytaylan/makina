@@ -450,6 +450,17 @@ pub enum Command {
         /// The Run whose failed tasks should be reset and re-dispatched.
         run: RunId,
     },
+
+    /// Force-re-run project discovery regardless of any existing `[discovery]` stamp.
+    ///
+    /// Re-scans the repository, replaces all `source = "discovered"` gates with
+    /// the newly discovered ones, folds the updated role constraints into the role
+    /// assignments, and re-stamps `last_run` in the project config. Emits
+    /// [`Event::ProjectDiscovered`] on completion.
+    ///
+    /// Non-fatal: if discovery fails, the error is logged and the command
+    /// returns `Ok(Acknowledged)` rather than an error — the config is not modified.
+    DiscoverProject,
 }
 
 /// The successful outcome of a [`Command`] executed via [`Api::execute`].
@@ -850,6 +861,20 @@ pub enum Event {
         /// Token usage, when the backend reported it.
         usage: Option<UsageStats>,
     },
+
+    /// Project discovery completed (auto-run on first open or forced re-run).
+    ///
+    /// Emitted on both the auto-run path (first open with no `[discovery]` stamp)
+    /// and when the user forces a re-run via `AppEvent::DiscoverProject`. The
+    /// discovery result has been applied to the config and written back.
+    /// The TUI can surface this as a transient "Discovered N gates from M files"
+    /// status message.
+    ProjectDiscovered {
+        /// Number of gates discovered.
+        gate_count: usize,
+        /// Number of files scanned.
+        scanned_files: usize,
+    },
 }
 
 /// Token usage for a single agent turn, when the backend reports it.
@@ -1091,6 +1116,10 @@ mod tests {
                     } else {
                         Err(ApiError::UnknownRun { run })
                     }
+                }
+                Command::DiscoverProject => {
+                    // Stub: acknowledge without doing real discovery.
+                    Ok(CommandOutcome::Acknowledged)
                 }
             }
         }

@@ -2381,6 +2381,18 @@ impl App {
                         },
                     );
             }
+            // Project discovery completed (plan 0025).
+            // Surface a transient status message showing the discovery outcome.
+            Event::ProjectDiscovered {
+                gate_count,
+                scanned_files,
+            } => {
+                let msg = format!(
+                    "Discovered {} gates from {} files",
+                    gate_count, scanned_files
+                );
+                self.status_message = Some(msg);
+            }
         }
 
         self.last_event = Some(event);
@@ -3861,6 +3873,8 @@ mod tests {
                 mode: None,
                 model: None,
                 effort: None,
+                system_prompt: None,
+                system_prompt_mode: None,
             }),
             ..Default::default()
         };

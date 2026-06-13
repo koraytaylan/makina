@@ -343,6 +343,13 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
                 None => (AppEvent::Tick, None),
             }
         }
+        // ── Project discovery (plan 0025) ──────────────────────────────────────
+        // Force re-run discovery regardless of the [discovery] stamp, re-scan,
+        // replace discovered gates, update last_run timestamp.
+        AppEvent::DiscoverProject => {
+            let status = discover_project(app).await;
+            (AppEvent::Tick, status)
+        }
         // Everything else passes straight through.
         other => (other, None),
     }
@@ -826,6 +833,27 @@ async fn retry_focused(app: &App) -> Option<String> {
     }
 
     Some("nothing to retry here".to_string())
+}
+
+/// Force-re-run project discovery, regardless of the [discovery] stamp.
+///
+/// Issues `Command::DiscoverProject` to the orchestrator, which re-scans the
+/// repository, replaces all `source = "discovered"` gates, folds the updated role
+/// constraints into the role assignments, and re-stamps `last_run` in the project
+/// config. The orchestrator emits `Event::ProjectDiscovered` on completion, which
+/// the TUI processes via `api.subscribe()`.
+///
+/// Non-fatal: discovery failure is logged by the orchestrator and returns
+/// `Acknowledged`; this function surfaces the outcome in the status bar.
+async fn discover_project(app: &App) -> Option<String> {
+    match app
+        .api
+        .execute(makina_core::api::Command::DiscoverProject)
+        .await
+    {
+        Ok(_) => Some("Project discovery started".to_string()),
+        Err(e) => Some(format!("Project discovery failed: {e}")),
+    }
 }
 
 /// Read `dir` and build a [`AppEvent::BrowserOpened`] event from its entries.
@@ -2185,6 +2213,8 @@ mod tests {
                 mode: Some("code".into()),
                 model: Some("grok-3".into()),
                 effort: Some("high".into()),
+                system_prompt: None,
+                system_prompt_mode: None,
             }),
             ..Default::default()
         };

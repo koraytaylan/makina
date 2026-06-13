@@ -171,6 +171,16 @@ pub struct RoleAssignment {
     /// Optional default effort (thought_level) option value to apply when opening a session.
     #[serde(default)]
     pub effort: Option<String>,
+
+    /// Project-specific instructions appended to (or, with `replace`, substituted
+    /// for) the role's built-in system prompt.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+
+    /// How `system_prompt` combines with the built-in constant:
+    /// `"append"` (default) or `"replace"`.
+    #[serde(default)]
+    pub system_prompt_mode: Option<String>,
 }
 
 /// Role-to-provider assignments and defaults.
@@ -391,7 +401,7 @@ impl GlobalConfig {
 /// name    = "lint"
 /// command = "cargo clippy --all-targets -- -D warnings"
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GateConfig {
     /// Short human-readable name for the gate (e.g. `"tests"`, `"lint"`).
     ///
@@ -408,13 +418,33 @@ pub struct GateConfig {
     /// When absent, the gate runs directly on the host.
     #[serde(default)]
     pub image: Option<String>,
+
+    /// Source of the gate configuration.
+    ///
+    /// When `Some("discovered")`, this gate was proposed by the discovery pass.
+    /// Manual gates have no source field (defaults to `None`).
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Metadata about the last project-discovery run.
+///
+/// This is written by the discovery pass and used for idempotency (first-open
+/// auto-run skips if a stamp is present). The stamp is metadata and does not
+/// affect task execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveryStamp {
+    /// RFC3339 timestamp of the last discovery run.
+    pub last_run: String,
+    /// Repo files the discovery pass actually read.
+    pub scanned_files: Vec<String>,
 }
 
 /// Optional per-field overrides of [`CapsConfig`] that a project can set.
 ///
 /// Only the fields present in `makina.toml` override the global values; `None`
 /// fields leave the global value unchanged.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct CapsOverride {
     /// Override [`CapsConfig::gate_iterations`] if `Some`.
@@ -459,6 +489,23 @@ pub struct ProjectConfig {
 
     /// Optional override of the global `concurrency` setting.
     pub concurrency: Option<usize>,
+
+    /// Metadata from the last project-discovery run.
+    ///
+    /// Used for idempotency: first open skips discovery if present.
+    /// This field is metadata only and does not affect task execution.
+    #[serde(default)]
+    pub discovery: Option<DiscoveryStamp>,
+
+    /// Per-role configuration overrides at the project level.
+    ///
+    /// Written by the discovery pass to persist per-role `system_prompt` constraints
+    /// discovered from the repository. Project-level `system_prompt` fields are
+    /// merged (appended) on top of global-level role assignments during
+    /// [`Config::resolve`]. Provider/model/effort fields in project-level role
+    /// assignments are ignored — those remain global-only.
+    #[serde(default)]
+    pub roles: RolesConfig,
 }
 
 impl ProjectConfig {
@@ -475,6 +522,49 @@ impl ProjectConfig {
             file: source_label.to_string(),
             message: e.to_string(),
         })
+    }
+}
+
+/// A serializable view of project configuration for writing back to TOML.
+///
+/// This struct mirrors `ProjectConfig` but adds `Serialize` and includes
+/// `RolesConfig` for per-role `system_prompt` updates. It is used by the
+/// discovery writer and other config-mutation paths.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectConfigWrite {
+    /// Gates that must pass for a task to be considered done.
+    pub gates: Vec<GateConfig>,
+
+    /// The base branch for worktrees and pull requests.
+    pub base_branch: String,
+
+    /// Optional per-field overrides of the global [`CapsConfig`].
+    pub caps: Option<CapsOverride>,
+
+    /// Optional override of the global `concurrency` setting.
+    pub concurrency: Option<usize>,
+
+    /// Metadata from the last project-discovery run (idempotency marker).
+    #[serde(default)]
+    pub discovery: Option<DiscoveryStamp>,
+
+    /// Roles and their per-role configuration (with optional `system_prompt`s).
+    #[serde(default)]
+    pub roles: RolesConfig,
+}
+
+impl ProjectConfigWrite {
+    /// Convert from a `ProjectConfig` (reading roles separately).
+    pub fn from_project_and_roles(project: ProjectConfig, roles: RolesConfig) -> Self {
+        Self {
+            gates: project.gates,
+            base_branch: project.base_branch,
+            caps: project.caps,
+            concurrency: project.concurrency,
+            discovery: project.discovery,
+            roles,
+        }
     }
 }
 
@@ -574,6 +664,8 @@ impl Config {
                     mode: None,
                     model: None,
                     effort: None,
+                    system_prompt: None,
+                    system_prompt_mode: None,
                 });
             }
             if roles.developer.is_none() {
@@ -582,6 +674,8 @@ impl Config {
                     mode: None,
                     model: None,
                     effort: None,
+                    system_prompt: None,
+                    system_prompt_mode: None,
                 });
             }
             if roles.reviewer.is_none() {
@@ -590,9 +684,21 @@ impl Config {
                     mode: None,
                     model: None,
                     effort: None,
+                    system_prompt: None,
+                    system_prompt_mode: None,
                 });
             }
         }
+
+        // ── Merge project-level role system_prompt overrides ──────────────────
+        //
+        // The discovery pass writes per-role `system_prompt` constraints into the
+        // project config (`.makina/config.toml`). Here we fold those constraints
+        // into the resolved roles so they survive across process restarts.
+        //
+        // Only `system_prompt` and `system_prompt_mode` are taken from the project
+        // layer; provider/model/mode/effort come from the global layer only.
+        merge_project_role_prompts(&mut roles, &project.roles);
 
         Self {
             backend: global.backend,
@@ -882,6 +988,41 @@ impl Config {
     }
 }
 
+/// Merge project-level role `system_prompt` fields into the resolved roles.
+///
+/// Only `system_prompt` and `system_prompt_mode` are taken from the project
+/// layer; provider/mode/model/effort come from the global layer only.
+///
+/// If a project-level role has a `system_prompt` set, it is used as the
+/// effective `system_prompt` for that role (replacing any global `system_prompt`).
+/// This allows the discovery pass, which writes per-role constraints to the project
+/// config, to persist them across process restarts.
+fn merge_project_role_prompts(roles: &mut RolesConfig, project_roles: &RolesConfig) {
+    merge_role_prompt(&mut roles.planner, &project_roles.planner);
+    merge_role_prompt(&mut roles.developer, &project_roles.developer);
+    merge_role_prompt(&mut roles.reviewer, &project_roles.reviewer);
+}
+
+/// Apply a project-level role's `system_prompt`/`system_prompt_mode` onto a
+/// resolved (global) role assignment.
+///
+/// If the project role has a `system_prompt`, it overrides the global value for
+/// that field. The provider/mode/model/effort fields come only from the global layer.
+fn merge_role_prompt(resolved: &mut Option<RoleAssignment>, project: &Option<RoleAssignment>) {
+    let Some(proj) = project else {
+        return; // No project-level override for this role.
+    };
+    let Some(ref proj_prompt) = proj.system_prompt else {
+        return; // Project role has no system_prompt to merge.
+    };
+
+    // Apply the project-level system_prompt onto the resolved assignment.
+    // If there's no resolved assignment yet, create a default one.
+    let resolved_assignment = resolved.get_or_insert_with(RoleAssignment::default);
+    resolved_assignment.system_prompt = Some(proj_prompt.clone());
+    resolved_assignment.system_prompt_mode = proj.system_prompt_mode.clone();
+}
+
 /// Resolve the project config path under `repo_root`, applying the precedence
 /// `.makina/config.toml` (preferred) → legacy `./makina.toml` (deprecated).
 ///
@@ -914,6 +1055,56 @@ fn resolve_project_config_path(repo_root: &Path) -> (Option<PathBuf>, bool) {
 /// global config file and uses defaults for the global layer.
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+// ── Project config writer ─────────────────────────────────────────────────────
+
+/// Write a `ProjectConfigWrite` back to `makina.toml`, merging with any
+/// existing fields to preserve unmanaged sections.
+///
+/// Reads the existing config file (if present), applies the provided edit
+/// callback to modify a mutable `ProjectConfigWrite`, serializes it, and
+/// writes it back. This pattern ensures gates, roles, and other fields
+/// survive round-tripping through the file.
+///
+/// # Errors
+///
+/// Returns an I/O error if file reading or writing fails. Parse errors on
+/// the existing file are silently ignored (starting from a default instead).
+pub async fn write_project_config<F>(repo_root: &std::path::Path, edit: F) -> std::io::Result<()>
+where
+    F: FnOnce(&mut ProjectConfigWrite),
+{
+    use crate::paths::config_file;
+
+    let config_path = config_file(repo_root);
+
+    // Read the existing config (if any) to preserve unmanaged fields.
+    // On parse failure, start from a default (non-fatal).
+    let existing: ProjectConfigWrite = if config_path.exists() {
+        match tokio::fs::read_to_string(&config_path).await {
+            Ok(s) => toml::from_str::<ProjectConfigWrite>(&s).unwrap_or_default(),
+            Err(_) => ProjectConfigWrite::default(),
+        }
+    } else {
+        ProjectConfigWrite::default()
+    };
+
+    // Apply the edit to a mutable copy.
+    let mut updated = existing;
+    edit(&mut updated);
+
+    // Serialize to TOML.
+    let toml_str = toml::to_string_pretty(&updated)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Ensure parent directory exists.
+    if let Some(parent) = config_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    // Write the file.
+    tokio::fs::write(&config_path, toml_str).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

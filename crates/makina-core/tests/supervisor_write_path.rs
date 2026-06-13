@@ -397,6 +397,7 @@ async fn persist_file_matches_snapshot_after_gate_cap_failed() {
             name: "always-fail".into(),
             command: "false".into(),
             image: None,
+            source: None,
         }],
         caps: CapsConfig {
             gate_iterations: 2, // fail after 2 gate iterations
@@ -634,6 +635,7 @@ async fn task_view_carries_failure_reason() {
             name: "always-fail".into(),
             command: "false".into(),
             image: None,
+            source: None,
         }],
         caps: CapsConfig {
             gate_iterations: 2,

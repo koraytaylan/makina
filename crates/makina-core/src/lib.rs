@@ -11,6 +11,7 @@ pub mod audit;
 pub mod backend;
 pub mod config;
 pub mod dependency;
+pub mod discovery;
 pub mod gate;
 pub mod governance;
 pub mod ingestion;

@@ -555,6 +555,15 @@ fn log_event(ev: &Event) {
                 task.0
             )
         }
+        Event::ProjectDiscovered {
+            gate_count,
+            scanned_files,
+        } => {
+            eprintln!(
+                "  · ProjectDiscovered gates={} scanned_files={}",
+                gate_count, scanned_files
+            )
+        }
     }
 }
 

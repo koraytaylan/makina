@@ -240,6 +240,9 @@ impl Api for PlaceholderApi {
                 });
                 Ok(CommandOutcome::Acknowledged)
             }
+            // Plan 0025: force-re-run project discovery. In the placeholder, just
+            // acknowledge; the real implementation is in the orchestrator.
+            Command::DiscoverProject => Ok(CommandOutcome::Acknowledged),
         }
     }
 

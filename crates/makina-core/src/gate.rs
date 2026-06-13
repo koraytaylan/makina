@@ -139,6 +139,7 @@ pub enum GateOutcome {
 ///     name: "tests".into(),
 ///     command: "cargo test --workspace".into(),
 ///     image: None,
+///     source: None,
 /// }];
 /// match runner.run_gates(&gates, Path::new("/path/to/worktree")).await? {
 ///     GateOutcome::Passed => { /* advance to review */ }
@@ -291,6 +292,7 @@ mod tests {
             name: name.to_string(),
             command: command.to_string(),
             image: None,
+            source: None,
         }
     }
 
@@ -367,6 +369,7 @@ mod tests {
             name: "sandboxed".to_string(),
             command: "true".to_string(),
             image: Some("alpine:latest".to_string()),
+            source: None,
         }];
         let result = GateRunner::new().run_gates(&gates, dir.path()).await;
         match result {

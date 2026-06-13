@@ -320,3 +320,19 @@ files" status without re-reading disk.
   wiring and 0075's writer; this plan does not add the generate path.
 - **0024** owns the duration/model metrics header and the `usage:
   Option<UsageStats>` slot; no metric work here.
+
+## Normative Specification
+
+The behaviour and config shape of the three tasks (0073, 0074, 0075) are formally
+specified in [`docs/spec/project-discovery.md`](../../spec/project-discovery.md).
+That document is the auditable record of:
+
+- The discovery inputs (manifests + docs read by the pass).
+- The `DiscoveryResult` JSON schema (gates + role constraints).
+- Gate merging (`source = "discovered"` field and preservation of manual gates).
+- The `[discovery]` stamp and idempotency guarantee.
+- The `system_prompt` + `system_prompt_mode` configuration fields and their append/replace semantics.
+- The auto-on-first-open and force-re-run triggers.
+
+Code symbol names, config field names, and examples in that spec are the source of
+truth for acceptance checking.

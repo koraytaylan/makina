@@ -533,6 +533,8 @@ async fn two_providers_two_roles() {
             mode: Some("mode-a".into()),
             model: Some("model-a".into()),
             effort: None,
+            system_prompt: None,
+            system_prompt_mode: None,
         }),
         // Assign Reviewer to provider-b with defaults: mode="mode-b", model="model-b".
         reviewer: Some(RoleAssignment {
@@ -540,6 +542,8 @@ async fn two_providers_two_roles() {
             mode: Some("mode-b".into()),
             model: Some("model-b".into()),
             effort: None,
+            system_prompt: None,
+            system_prompt_mode: None,
         }),
         ..Default::default()
     };

@@ -663,6 +663,9 @@ impl CoreApi {
     /// held**; the registry lock is taken only for the brief insert, then dropped
     /// before the broadcast.
     async fn open_run(&self, task_list_path: PathBuf) -> Result<CommandOutcome, ApiError> {
+        // 0. Run project discovery on first open (auto-run if [discovery] stamp absent).
+        self.run_discovery_if_needed().await;
+
         // 1. Derive the plan-scoped slug (no I/O — just path manipulation).
         let slug = run_slug(&task_list_path);
 
@@ -753,6 +756,185 @@ impl CoreApi {
         });
 
         Ok(CommandOutcome::RunOpened { run: id })
+    }
+
+    /// Run project discovery if the repo has not been stamped yet.
+    ///
+    /// On the first open, if the `[discovery]` stamp is absent from the project
+    /// config, spawns a single model pass to inspect the repo and propose gates +
+    /// role constraints. Applies the result to the config and writes it back.
+    /// Non-fatal: discovery failure only logs a warning; the run proceeds.
+    ///
+    /// Idempotent: if the stamp is present, skips discovery. Also skips if no
+    /// config file exists (discovery only runs when there's an explicit project config).
+    async fn run_discovery_if_needed(&self) {
+        use crate::config::{ProjectConfig, ProjectConfigWrite};
+        use crate::discovery::{apply_discovery, discover_project};
+        use crate::paths::config_file;
+        use chrono::Utc;
+
+        let repo_root = &self.state.worktree_manager.repo_root;
+        let config_path = config_file(repo_root);
+
+        // Only proceed if a config file exists. Discovery is opt-in (only runs if
+        // the user/repo explicitly has a project config).
+        if !config_path.exists() {
+            return;
+        }
+
+        // Read the current project config to check for the discovery stamp.
+        let project_config: ProjectConfig = match tokio::fs::read_to_string(&config_path).await {
+            Ok(s) => match ProjectConfig::from_toml_str(&s, "project") {
+                Ok(cfg) => cfg,
+                Err(_) => return, // Unparseable config: skip discovery
+            },
+            Err(_) => return, // Can't read config: skip discovery
+        };
+
+        // If [discovery] stamp is present, skip (already run).
+        if project_config.discovery.is_some() {
+            return;
+        }
+
+        // Stamp is absent: run discovery.
+        tracing::info!("Running first-open project discovery...");
+
+        // Run discovery with the developer backend.
+        let (result, scanned_files) =
+            match discover_project(self.state.developer_backend.as_ref(), repo_root).await {
+                Ok((result, scanned)) => (result, scanned),
+                Err(e) => {
+                    tracing::warn!("Project discovery failed (non-fatal): {e}");
+                    // Emit a discovery event to the UI so it knows discovery was attempted.
+                    let _ = self
+                        .state
+                        .event_tx
+                        .send(crate::api::Event::ProjectDiscovered {
+                            gate_count: 0,
+                            scanned_files: 0,
+                        });
+                    return;
+                }
+            };
+
+        // Build the write view and apply discovery to it.
+        let mut write_config = ProjectConfigWrite::from_project_and_roles(
+            project_config,
+            self.state.config.roles.clone(),
+        );
+        let mut roles = self.state.config.roles.clone();
+
+        let now = Utc::now().to_rfc3339();
+        apply_discovery(&mut write_config, &mut roles, &result, &now, &scanned_files);
+
+        // Write the updated config back.
+        if let Err(e) = crate::config::write_project_config(repo_root, |cfg| {
+            *cfg = write_config;
+        })
+        .await
+        {
+            tracing::warn!("Failed to write project config after discovery: {e}");
+        } else {
+            tracing::info!(
+                "Project discovery completed: {} gates, {} files",
+                result.gates.len(),
+                scanned_files.len()
+            );
+        }
+
+        // Emit a discovery event to the UI.
+        let _ = self
+            .state
+            .event_tx
+            .send(crate::api::Event::ProjectDiscovered {
+                gate_count: result.gates.len(),
+                scanned_files: scanned_files.len(),
+            });
+    }
+
+    /// Force-re-run project discovery regardless of any existing `[discovery]` stamp.
+    ///
+    /// Re-scans the repository, replaces all `source = "discovered"` gates with
+    /// the newly discovered ones, folds the updated role constraints into the role
+    /// assignments, and re-stamps `last_run` in the project config. Emits
+    /// `Event::ProjectDiscovered` on completion.
+    ///
+    /// Non-fatal: discovery failure only logs a warning; the function returns
+    /// `Ok(Acknowledged)` in all cases rather than propagating the error.
+    async fn force_discover_project(&self) -> Result<CommandOutcome, ApiError> {
+        use crate::config::{ProjectConfig, ProjectConfigWrite};
+        use crate::discovery::{apply_discovery, discover_project};
+        use crate::paths::config_file;
+        use chrono::Utc;
+
+        let repo_root = &self.state.worktree_manager.repo_root;
+        let config_path = config_file(repo_root);
+
+        // Run discovery even if no config file exists (unlike auto-run which skips in this case).
+        // If no config file, start from a default write view.
+        let project_config: ProjectConfig = if config_path.exists() {
+            match tokio::fs::read_to_string(&config_path).await {
+                Ok(s) => ProjectConfig::from_toml_str(&s, "project").unwrap_or_default(),
+                Err(_) => ProjectConfig::default(),
+            }
+        } else {
+            ProjectConfig::default()
+        };
+
+        tracing::info!("Force-re-running project discovery...");
+
+        // Run discovery with the developer backend.
+        let (result, scanned_files) =
+            match discover_project(self.state.developer_backend.as_ref(), repo_root).await {
+                Ok((result, scanned)) => (result, scanned),
+                Err(e) => {
+                    tracing::warn!("Force project discovery failed (non-fatal): {e}");
+                    let _ = self
+                        .state
+                        .event_tx
+                        .send(crate::api::Event::ProjectDiscovered {
+                            gate_count: 0,
+                            scanned_files: 0,
+                        });
+                    return Ok(CommandOutcome::Acknowledged);
+                }
+            };
+
+        // Build the write view and apply discovery to it.
+        let mut write_config = ProjectConfigWrite::from_project_and_roles(
+            project_config,
+            self.state.config.roles.clone(),
+        );
+        let mut roles = self.state.config.roles.clone();
+
+        let now = Utc::now().to_rfc3339();
+        apply_discovery(&mut write_config, &mut roles, &result, &now, &scanned_files);
+
+        // Write the updated config back.
+        if let Err(e) = crate::config::write_project_config(repo_root, |cfg| {
+            *cfg = write_config;
+        })
+        .await
+        {
+            tracing::warn!("Failed to write project config after force discovery: {e}");
+        } else {
+            tracing::info!(
+                "Force project discovery completed: {} gates, {} files",
+                result.gates.len(),
+                scanned_files.len()
+            );
+        }
+
+        // Emit a discovery event to the UI.
+        let _ = self
+            .state
+            .event_tx
+            .send(crate::api::Event::ProjectDiscovered {
+                gate_count: result.gates.len(),
+                scanned_files: scanned_files.len(),
+            });
+
+        Ok(CommandOutcome::Acknowledged)
     }
 
     /// Read + interpret the task-list file at `task_list_path` and (on success)
@@ -1432,6 +1614,7 @@ impl Api for CoreApi {
             // Retry is async: it persists the reset graph + run snapshot.
             Command::RetryTask { run, task } => self.retry_task(run, task).await,
             Command::RetryFailedTasks { run } => self.retry_failed_tasks(run).await,
+            Command::DiscoverProject => self.force_discover_project().await,
         }
     }
 

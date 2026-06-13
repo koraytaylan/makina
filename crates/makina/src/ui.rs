@@ -2263,6 +2263,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::TaskIdle { .. } => "TaskIdle",
         Event::TaskRetried { .. } => "TaskRetried",
         Event::RoleTurnMetrics { .. } => "RoleTurnMetrics",
+        Event::ProjectDiscovered { .. } => "ProjectDiscovered",
     }
 }
 

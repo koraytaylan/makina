@@ -20,8 +20,11 @@ The **canonical real-world example** is
 |----------|----------|------------|-----------|
 | `TASKS.md` (or any `*.md` task list) | Human author | Human | Reference input only |
 | `.tasks/{slug}.json` | Planner / Supervisor | Planner only | Source of truth at runtime |
+| `config.toml` (project config) | System / Human | Both (discovery writes + hand-edits) | Source of truth for gates + role prompts at runtime |
 
 The structured-text file is **read-only input** to the Planner. Once the Planner has emitted `.tasks/{slug}.json`, all orchestration (state, dependency edges, iteration counts, timestamps) lives in the JSON artifact. Edits to the markdown file do **not** automatically update a running task graph.
+
+**Note on project discovery:** The task-list grammar itself is never modified by discovery. However, the project config (`config.toml`) receives **discovered gates** and **role constraints** on first open. For details on discovery, see [project-discovery.md](./project-discovery.md).
 
 ---
 
