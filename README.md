@@ -34,7 +34,9 @@ A central **Supervisor** drives each task through its lifecycle:
 
 Tasks run concurrently up to a configured limit; gate / review / wall-clock caps
 bound runaway work. The TUI streams per-task status and the live agent
-prompt/answer exchange as it happens.
+prompt/answer exchange as it happens. For the full contract — configured and
+discovered gates, loop-back to the Developer, and the shared cap — see
+[`docs/spec/deterministic-governance.md`](docs/spec/deterministic-governance.md).
 
 ## Requirements
 
