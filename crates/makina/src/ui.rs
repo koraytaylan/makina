@@ -973,8 +973,9 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 }
             }
 
+            let content_width = inner.width;
             for entry in &log.entries {
-                lines.extend(exchange_entry_lines(entry, app));
+                lines.extend(exchange_entry_lines(entry, app, content_width));
             }
 
             // Scroll: `scroll_max` pins the bottom-most visible offset (as the
@@ -1221,7 +1222,7 @@ fn diff_overlaid_content_line(text_line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn exchange_entry_lines(entry: &ExchangeEntry, app: &App) -> Vec<Line<'static>> {
+fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Line<'static>> {
     use crate::app::ExchangeContent;
     use makina_core::api::AgentRole;
 
@@ -1266,7 +1267,7 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App) -> Vec<Line<'static>> 
             )]));
             // Response text rendered through Markdown + ANSI.
             let base_style = Style::default().fg(resp_color);
-            lines.extend(crate::markup::render_markdown(text, base_style, 80));
+            lines.extend(crate::markup::render_markdown(text, base_style, width));
 
             // Streaming cursor (if not complete).
             if !*complete {
@@ -1303,7 +1304,7 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App) -> Vec<Line<'static>> 
             )]));
             // Thought text rendered through Markdown + ANSI.
             let base_style = Style::default().fg(Color::DarkGray);
-            let mut thought_lines = crate::markup::render_markdown(text, base_style, 80);
+            let mut thought_lines = crate::markup::render_markdown(text, base_style, width);
             // Indent all thought lines by 2 spaces.
             for line in &mut thought_lines {
                 line.spans.insert(0, Span::raw("  "));
@@ -3986,7 +3987,7 @@ mod tests {
 
         let api = Arc::new(PlaceholderApi::new());
         let app = App::new(api, vec![], std::path::PathBuf::from("."));
-        let lines = exchange_entry_lines(&entry, &app);
+        let lines = exchange_entry_lines(&entry, &app, 80);
 
         // Find the span carrying the text and assert it uses the response colour.
         let mut found = false;
@@ -4047,8 +4048,8 @@ mod tests {
         let app = App::new(api, vec![], std::path::PathBuf::from("."));
         // Render both entries' lines into a small Buffer via a Paragraph.
         let mut lines: Vec<Line> = Vec::new();
-        lines.extend(exchange_entry_lines(&thought, &app));
-        lines.extend(exchange_entry_lines(&tool, &app));
+        lines.extend(exchange_entry_lines(&thought, &app, 80));
+        lines.extend(exchange_entry_lines(&tool, &app, 80));
 
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
@@ -4292,7 +4293,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let app = App::new(api, vec![], repo_root);
 
-        let lines = exchange_entry_lines(&tool, &app);
+        let lines = exchange_entry_lines(&tool, &app, 80);
 
         // Find the header line and extract its text.
         let header_text: String = lines
