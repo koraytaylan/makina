@@ -330,6 +330,7 @@ impl kameo::message::Message<Develop> for Developer {
                     title,
                     kind,
                     status,
+                    detail,
                 })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
@@ -340,15 +341,26 @@ impl kameo::message::Message<Develop> for Developer {
                             title,
                             kind,
                             status,
+                            content: detail,
                         },
                     });
                 }
-                Some(Ok(ResponseEvent::ToolCallUpdate { id, status, title })) => {
+                Some(Ok(ResponseEvent::ToolCallUpdate {
+                    id,
+                    status,
+                    title,
+                    detail,
+                })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
                         role: api::AgentRole::Developer,
-                        event: api::ExchangeEvent::ToolCallUpdate { id, status, title },
+                        event: api::ExchangeEvent::ToolCallUpdate {
+                            id,
+                            status,
+                            title,
+                            content: detail,
+                        },
                     });
                 }
                 Some(Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })) => {

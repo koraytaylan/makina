@@ -213,11 +213,13 @@ async fn thought_and_tool_events_are_delivered() {
                 title: "running tests".into(),
                 kind: Some("execute".into()),
                 status: "pending".into(),
+                detail: None,
             },
             AcpResponseChunk::ToolCallUpdate {
                 id: "rich-tc-1".into(),
                 status: Some("completed".into()),
                 title: None,
+                detail: None,
             },
             AcpResponseChunk::Text("done".into()),
         ],

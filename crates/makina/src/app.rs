@@ -253,8 +253,9 @@ impl ExchangeLog {
     /// Upsert a tool call by `id`.
     ///
     /// Updates an existing [`ExchangeContent::Tool`] entry with the same `id`
-    /// (overwriting title/kind/status, leaving accumulated `content`), or
-    /// pushes a new tool entry with empty content.
+    /// (overwriting title/kind/status, and setting `content` when
+    /// `incoming_content` is `Some(non-empty)` so a later content-less update
+    /// never blanks a captured diff), or pushes a new tool entry.
     pub fn start_tool(
         &mut self,
         role: AgentRole,
@@ -262,18 +263,26 @@ impl ExchangeLog {
         title: String,
         kind: Option<String>,
         status: String,
+        incoming_content: Option<String>,
     ) {
         if let Some(entry) = self.find_tool_mut(&id) {
             if let ExchangeContent::Tool {
                 title: t,
                 kind: k,
                 status: s,
+                content: c,
                 ..
             } = &mut entry.content
             {
                 *t = title;
                 *k = kind;
                 *s = status;
+                // Only overwrite content when the incoming value is non-empty.
+                if let Some(new_c) = incoming_content
+                    && !new_c.is_empty()
+                {
+                    *c = new_c;
+                }
             }
             return;
         }
@@ -285,21 +294,29 @@ impl ExchangeLog {
                 title,
                 kind,
                 status,
-                content: String::new(),
+                content: incoming_content.unwrap_or_default(),
             },
         });
     }
 
-    /// Apply a status/title update to an existing tool entry by `id`.
+    /// Apply a status/title/content update to an existing tool entry by `id`.
     ///
     /// Finds the [`ExchangeContent::Tool`] entry with the matching `id` and
-    /// updates `status`/`title` when present; leaves `content` untouched.  No-op
-    /// when no entry matches (live updates always follow a `start_tool`).
-    pub fn update_tool(&mut self, id: &str, status: Option<String>, title: Option<String>) {
+    /// updates `status`/`title`/`content` when present; `content` is only
+    /// overwritten when `incoming_content` is `Some(non-empty)`.  No-op when no
+    /// entry matches (live updates always follow a `start_tool`).
+    pub fn update_tool(
+        &mut self,
+        id: &str,
+        status: Option<String>,
+        title: Option<String>,
+        incoming_content: Option<String>,
+    ) {
         if let Some(entry) = self.find_tool_mut(id)
             && let ExchangeContent::Tool {
                 title: t,
                 status: s,
+                content: c,
                 ..
             } = &mut entry.content
         {
@@ -308,6 +325,11 @@ impl ExchangeLog {
             }
             if let Some(new_title) = title {
                 *t = new_title;
+            }
+            if let Some(new_c) = incoming_content
+                && !new_c.is_empty()
+            {
+                *c = new_c;
             }
         }
     }
@@ -345,6 +367,7 @@ pub fn apply_exchange_event(log: &mut ExchangeLog, role: AgentRole, event: &Exch
             title,
             kind,
             status,
+            content,
         } => {
             log.start_tool(
                 role,
@@ -352,10 +375,16 @@ pub fn apply_exchange_event(log: &mut ExchangeLog, role: AgentRole, event: &Exch
                 title.clone(),
                 kind.clone(),
                 status.clone(),
+                content.clone(),
             );
         }
-        ExchangeEvent::ToolCallUpdate { id, status, title } => {
-            log.update_tool(id, status.clone(), title.clone());
+        ExchangeEvent::ToolCallUpdate {
+            id,
+            status,
+            title,
+            content,
+        } => {
+            log.update_tool(id, status.clone(), title.clone(), content.clone());
         }
         ExchangeEvent::TurnComplete => {
             log.complete_turn();
@@ -613,6 +642,15 @@ pub enum AppEvent {
     CloseDoctor,
     /// Write starter config templates (pressed `w` in doctor).
     DoctorWriteScaffold,
+
+    // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
+    /// Toggle verbose mode on/off (`Ctrl+O`).
+    ///
+    /// In verbose mode the exchange pane additionally renders full thought text
+    /// and the captured tool/edit content; in compact mode only the headers are
+    /// shown.  Does not collide with `o`/`O` (the file-browser key) because the
+    /// Ctrl modifier is checked first in `event.rs`.
+    ToggleVerbose,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -811,6 +849,14 @@ pub struct App {
     /// Computed once at startup and cached for the doctor view. Used to render
     /// a check in the health checklist.
     pub base_branch_exists: bool,
+
+    // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
+    /// Whether verbose mode is currently on.
+    ///
+    /// When `true`, the exchange pane renders full thought text and the captured
+    /// tool/edit content in addition to the concise headers.  Toggled by
+    /// `Ctrl+O` ([`AppEvent::ToggleVerbose`]).  Defaults to `false` (compact).
+    pub verbose_mode: bool,
 }
 
 impl App {
@@ -994,6 +1040,7 @@ impl App {
                 project: None,
             },
             base_branch_exists: false,
+            verbose_mode: false,
         }
     }
 
@@ -1470,6 +1517,12 @@ impl App {
                 // The IO layer (resolve_io in event.rs) handles the actual file writes.
                 // Here we just signal that the action is requested; the IO layer
                 // will emit a StatusMessage with the outcome.
+                true
+            }
+
+            // ── Verbose mode (plan 0021) ──────────────────────────────────────
+            AppEvent::ToggleVerbose => {
+                self.verbose_mode = !self.verbose_mode;
                 true
             }
         }
@@ -3942,6 +3995,7 @@ mod tests {
             "read".into(),
             None,
             "completed".into(),
+            None,
         );
         log.append_chunk(AgentRole::Developer, "do X.".into());
         let kinds: Vec<_> = log
@@ -3982,6 +4036,7 @@ mod tests {
             "run tests".into(),
             Some("execute".into()),
             "pending".into(),
+            None,
         );
         log.complete_turn();
 
@@ -4052,6 +4107,7 @@ mod tests {
                 title: "run tests".into(),
                 kind: Some("execute".into()),
                 status: "pending".into(),
+                content: None,
             },
         );
         feed(
@@ -4060,6 +4116,7 @@ mod tests {
                 id: "tc-1".into(),
                 status: Some("in_progress".into()),
                 title: None,
+                content: None,
             },
         );
         feed(
@@ -4068,6 +4125,7 @@ mod tests {
                 id: "tc-1".into(),
                 status: Some("completed".into()),
                 title: None,
+                content: None,
             },
         );
         // Response + turn complete.
@@ -4137,16 +4195,18 @@ mod tests {
             "edit file".into(),
             Some("edit".into()),
             "pending".into(),
+            None,
         );
         assert_eq!(log.entries.len(), 1, "one tool entry after start_tool");
 
         // First update.
-        log.update_tool("tc-1", Some("in_progress".into()), None);
+        log.update_tool("tc-1", Some("in_progress".into()), None, None);
         // Second update — title change too.
         log.update_tool(
             "tc-1",
             Some("completed".into()),
             Some("edit file (done)".into()),
+            None,
         );
 
         // Still exactly ONE tool entry — updates mutated in place.
@@ -4217,6 +4277,7 @@ mod tests {
                     title: "execute".into(),
                     kind: Some("exec".into()),
                     status: "pending".into(),
+                    content: None,
                 },
             ),
             (
@@ -4231,6 +4292,7 @@ mod tests {
                     id: "tc-1".into(),
                     status: Some("completed".into()),
                     title: None,
+                    content: None,
                 },
             ),
             (
@@ -4494,6 +4556,133 @@ mod tests {
         assert!(
             app.exchange_scroll > 0,
             "exchange_scroll should advance after SelectDown"
+        );
+    }
+
+    /// `apply_exchange_event` with `ExchangeEvent::ToolCall { content: Some(…), .. }`
+    /// followed by a matching `ToolCallUpdate` populates
+    /// `ExchangeContent::Tool.content` with the provided text.
+    #[test]
+    fn tool_content_populated_from_event() {
+        use crate::app::{ExchangeContent, ExchangeLog};
+        use makina_core::api::{AgentRole, ExchangeEvent};
+
+        let mut log = ExchangeLog::default();
+
+        // ToolCall carrying content.
+        apply_exchange_event(
+            &mut log,
+            AgentRole::Developer,
+            &ExchangeEvent::ToolCall {
+                id: "tc-content".into(),
+                title: "write file".into(),
+                kind: Some("edit".into()),
+                status: "pending".into(),
+                content: Some("+added line".into()),
+            },
+        );
+
+        // ToolCallUpdate (no new content — must not blank the existing).
+        apply_exchange_event(
+            &mut log,
+            AgentRole::Developer,
+            &ExchangeEvent::ToolCallUpdate {
+                id: "tc-content".into(),
+                status: Some("completed".into()),
+                title: None,
+                content: None,
+            },
+        );
+
+        let entry = log
+            .entries
+            .iter()
+            .find(|e| matches!(&e.content, ExchangeContent::Tool { id, .. } if id == "tc-content"))
+            .expect("tool entry must exist");
+
+        match &entry.content {
+            ExchangeContent::Tool { content, .. } => {
+                assert_eq!(
+                    content, "+added line",
+                    "content from ToolCall event must survive a subsequent content-less update"
+                );
+            }
+            other => panic!("expected Tool entry, got {other:?}"),
+        }
+    }
+
+    /// A `content: None` event leaves `ExchangeContent::Tool.content` as `""`
+    /// and does not panic.
+    #[test]
+    fn content_none_leaves_tool_content_empty() {
+        use crate::app::{ExchangeContent, ExchangeLog};
+        use makina_core::api::{AgentRole, ExchangeEvent};
+
+        let mut log = ExchangeLog::default();
+
+        apply_exchange_event(
+            &mut log,
+            AgentRole::Developer,
+            &ExchangeEvent::ToolCall {
+                id: "tc-none".into(),
+                title: "read file".into(),
+                kind: None,
+                status: "pending".into(),
+                content: None,
+            },
+        );
+
+        apply_exchange_event(
+            &mut log,
+            AgentRole::Developer,
+            &ExchangeEvent::ToolCallUpdate {
+                id: "tc-none".into(),
+                status: Some("completed".into()),
+                title: None,
+                content: None,
+            },
+        );
+
+        let entry = log
+            .entries
+            .iter()
+            .find(|e| matches!(&e.content, ExchangeContent::Tool { id, .. } if id == "tc-none"))
+            .expect("tool entry must exist");
+
+        match &entry.content {
+            ExchangeContent::Tool { content, .. } => {
+                assert_eq!(
+                    content, "",
+                    "content: None events must leave content as empty string"
+                );
+            }
+            other => panic!("expected Tool entry, got {other:?}"),
+        }
+    }
+
+    // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
+
+    /// `AppEvent::ToggleVerbose` must flip `App::verbose_mode` true↔false.
+    #[test]
+    fn toggle_verbose_flips_flag() {
+        let mut app = make_app();
+
+        // Starts off (default compact mode).
+        assert!(!app.verbose_mode, "verbose_mode must default to false");
+
+        // First toggle turns it on.
+        let changed = app.update(AppEvent::ToggleVerbose);
+        assert!(changed, "ToggleVerbose must request a redraw");
+        assert!(
+            app.verbose_mode,
+            "verbose_mode must be true after first toggle"
+        );
+
+        // Second toggle turns it back off.
+        app.update(AppEvent::ToggleVerbose);
+        assert!(
+            !app.verbose_mode,
+            "verbose_mode must be false after second toggle"
         );
     }
 }

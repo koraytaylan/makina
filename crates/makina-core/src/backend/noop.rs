@@ -386,6 +386,7 @@ mod tests {
                 title: "run tests".into(),
                 kind: Some("execute".into()),
                 status: "pending".into(),
+                detail: None,
             },
             ResponseEvent::TextChunk {
                 text: "the answer".into(),
@@ -394,6 +395,7 @@ mod tests {
                 id: "tc-1".into(),
                 status: Some("completed".into()),
                 title: None,
+                detail: None,
             },
         ]);
         let mut session = backend.spawn(test_config()).await.unwrap();

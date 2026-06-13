@@ -406,10 +406,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     //
     // The status bar is built as a `Line` of `Span`s so the error-badge span
     // can carry its own colour (warn/yellow) while the rest stays White/DarkGray.
+    let verbose_state = if app.verbose_mode { "on" } else { "off" };
     let default_style = Style::default().bg(Color::DarkGray).fg(Color::White);
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            " [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [L] log  [?] doctor  [wheel] scroll  ",
+            format!(" [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] doctor  [wheel] scroll  "),
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -1288,9 +1289,11 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
         }
         // ── Thought (agent internal reasoning) ────────────────────────────
         // Observability-only side channel.  Bold, role-coloured header
-        // ("💭 Developer thought" green / "💭 Reviewer thought" yellow) then
-        // the reasoning text dimmed (DarkGray) at a 2-space indent so it reads
-        // as a quiet aside rather than part of the answer.
+        // ("💭 Developer thought" green / "💭 Reviewer thought" yellow) is
+        // ALWAYS rendered so the user can see reasoning happened.  In verbose
+        // mode the reasoning text is additionally shown dimmed (DarkGray) at
+        // a 2-space indent so it reads as a quiet aside rather than part of
+        // the answer.  In compact mode only the header line is shown.
         ExchangeContent::Thought { text } => {
             let (label, label_color) = match entry.role {
                 AgentRole::Developer => ("💭 Developer thought", Color::Green),
@@ -1302,20 +1305,23 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                     .fg(label_color)
                     .add_modifier(Modifier::BOLD),
             )]));
-            // Thought text rendered through Markdown + ANSI.
-            let base_style = Style::default().fg(Color::DarkGray);
-            let mut thought_lines = crate::markup::render_markdown(text, base_style, width);
-            // Indent all thought lines by 2 spaces.
-            for line in &mut thought_lines {
-                line.spans.insert(0, Span::raw("  "));
+            // Thought body only in verbose mode.
+            if app.verbose_mode {
+                let base_style = Style::default().fg(Color::DarkGray);
+                let mut thought_lines = crate::markup::render_markdown(text, base_style, width);
+                // Indent all thought lines by 2 spaces.
+                for line in &mut thought_lines {
+                    line.spans.insert(0, Span::raw("  "));
+                }
+                lines.extend(thought_lines);
             }
-            lines.extend(thought_lines);
         }
         // ── Tool (agent tool invocation) ──────────────────────────────────
-        // Header "⚙ <title> [<status>]" coloured by lifecycle status, then the
-        // tool's content lines rendered with the SAME parse_ansi + diff base
-        // overlay loop the Response arm uses, so an edit diff in tool output is
-        // syntax-coloured.  Empty content renders nothing extra.
+        // Header "⚙ <title> [<status>]" coloured by lifecycle status is
+        // ALWAYS rendered.  In verbose mode the captured content lines are
+        // additionally rendered via `diff_overlaid_content_line` so the user
+        // sees exactly what was added/updated; in compact mode only the header
+        // is shown.  Empty content renders nothing extra in either mode.
         ExchangeContent::Tool {
             title,
             status,
@@ -1336,10 +1342,13 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                     .fg(status_color)
                     .add_modifier(Modifier::BOLD),
             )]));
-            for text_line in content.lines() {
-                // Re-use the Response arm's ANSI + diff overlay so an edit diff
-                // in tool output is syntax-coloured the same way.
-                lines.push(diff_overlaid_content_line(text_line));
+            // Tool content only in verbose mode.
+            if app.verbose_mode {
+                for text_line in content.lines() {
+                    // Re-use the Response arm's ANSI + diff overlay so an edit
+                    // diff in tool output is syntax-coloured the same way.
+                    lines.push(diff_overlaid_content_line(text_line));
+                }
             }
         }
     }
@@ -2045,7 +2054,7 @@ mod tests {
     /// When `app.status_message` is set, it is rendered in the status bar.
     #[test]
     fn render_status_bar_shows_status_message() {
-        let mut terminal = make_terminal(180, 24);
+        let mut terminal = make_terminal(220, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
         app.update(crate::app::AppEvent::StatusMessage("Start run:1".into()));
@@ -2130,7 +2139,7 @@ mod tests {
     fn status_bar_advertises_errors_key() {
         use crate::app::{ErrorLevel, ErrorMessage};
 
-        let mut terminal = make_terminal(140, 24);
+        let mut terminal = make_terminal(170, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
@@ -2151,7 +2160,7 @@ mod tests {
         assert!(app.unseen_errors, "unseen_errors flag should be set");
 
         // With unseen errors, the status bar shows "[e] errors(count)"
-        let mut terminal = make_terminal(140, 24);
+        let mut terminal = make_terminal(170, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2165,7 +2174,7 @@ mod tests {
             !app.unseen_errors,
             "unseen_errors flag should be cleared when pane opens"
         );
-        let mut terminal = make_terminal(140, 24);
+        let mut terminal = make_terminal(170, 24);
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
@@ -2611,7 +2620,7 @@ mod tests {
 
     #[test]
     fn render_status_bar_shows_blocked_notice_when_report_blocked() {
-        let mut terminal = make_terminal(200, 30);
+        let mut terminal = make_terminal(260, 30);
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
@@ -2645,7 +2654,7 @@ mod tests {
 
     #[test]
     fn render_focus_label_changes_with_panel() {
-        let mut terminal = make_terminal(180, 24);
+        let mut terminal = make_terminal(220, 24);
         let api = Arc::new(PlaceholderApi::new());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
@@ -4045,7 +4054,9 @@ mod tests {
         };
 
         let api = Arc::new(PlaceholderApi::new());
-        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        // Enable verbose mode so both thought body and tool content are rendered.
+        app.verbose_mode = true;
         // Render both entries' lines into a small Buffer via a Paragraph.
         let mut lines: Vec<Line> = Vec::new();
         lines.extend(exchange_entry_lines(&thought, &app, 80));
@@ -4467,6 +4478,7 @@ mod tests {
                 title: format!("Read {worktree_tool_path}"),
                 kind: Some("read".into()),
                 status: "pending".into(),
+                content: None,
             },
         }));
 
@@ -4479,6 +4491,7 @@ mod tests {
                 id: "tool-1".into(),
                 status: Some("completed".into()),
                 title: None,
+                content: None,
             },
         }));
 
@@ -4952,5 +4965,150 @@ mod tests {
         // unlikely false positives: would need "Task" and "State" in a table header).
         // We simply verify the sidebar has the content (already checked above)
         // and the exchange pane has more room.
+    }
+
+    // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
+
+    /// Build a fixture with a Thought entry (non-empty body) and a Tool entry
+    /// (non-empty content) for the verbose-mode render tests.
+    fn verbose_fixture_entries() -> (crate::app::ExchangeEntry, crate::app::ExchangeEntry) {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+
+        let thought = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Thought {
+                text: "verbose thought body here".to_string(),
+            },
+        };
+        let tool = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "verbose-tool".to_string(),
+                title: "Editing lib.rs".to_string(),
+                kind: Some("edit".to_string()),
+                status: "completed".to_string(),
+                content: "+verbose tool content line".to_string(),
+            },
+        };
+        (thought, tool)
+    }
+
+    /// In compact mode (`verbose_mode = false`) the thought header and tool header
+    /// are present but the thought body text and tool content lines are ABSENT.
+    #[test]
+    fn verbose_off_hides_thought_and_tool_content() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        use std::sync::Arc;
+
+        let (thought, tool) = verbose_fixture_entries();
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        // verbose_mode defaults to false — compact.
+        assert!(!app.verbose_mode);
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.extend(exchange_entry_lines(&thought, &app, 80));
+        lines.extend(exchange_entry_lines(&tool, &app, 80));
+
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+
+        let row_text = |row: u16| -> String {
+            (0..buf.area.width)
+                .map(|col| buf[(col, row)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        let flattened: String = (0..buf.area.height).map(row_text).collect();
+
+        // Headers are always present.
+        assert!(
+            flattened.contains("Developer thought"),
+            "compact: thought header must be visible; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("Editing lib.rs"),
+            "compact: tool header must be visible; got:\n{flattened}"
+        );
+
+        // Body / content are suppressed in compact mode.
+        assert!(
+            !flattened.contains("verbose thought body here"),
+            "compact: thought body must NOT appear; got:\n{flattened}"
+        );
+        assert!(
+            !flattened.contains("verbose tool content line"),
+            "compact: tool content must NOT appear; got:\n{flattened}"
+        );
+    }
+
+    /// In verbose mode (`verbose_mode = true`) the thought body text and tool
+    /// content lines ARE present in addition to the headers.
+    #[test]
+    fn verbose_on_shows_thought_and_tool_content() {
+        use ratatui::widgets::Widget;
+        use std::sync::Arc;
+
+        let (thought, tool) = verbose_fixture_entries();
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.verbose_mode = true;
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.extend(exchange_entry_lines(&thought, &app, 80));
+        lines.extend(exchange_entry_lines(&tool, &app, 80));
+
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+
+        let row_text = |row: u16| -> String {
+            (0..buf.area.width)
+                .map(|col| buf[(col, row)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        let flattened: String = (0..buf.area.height).map(row_text).collect();
+
+        // Headers still present.
+        assert!(
+            flattened.contains("Developer thought"),
+            "verbose: thought header must be visible; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("Editing lib.rs"),
+            "verbose: tool header must be visible; got:\n{flattened}"
+        );
+
+        // Body and content now rendered.
+        assert!(
+            flattened.contains("verbose thought body here"),
+            "verbose: thought body must be visible; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("verbose tool content line"),
+            "verbose: tool content must be visible; got:\n{flattened}"
+        );
+    }
+
+    /// The status bar must advertise the `[^O] verbose` key hint at all times.
+    #[test]
+    fn status_bar_advertises_verbose_key() {
+        let mut terminal = make_terminal(160, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("[^O] verbose"),
+            "status bar must contain '[^O] verbose' hint; got:\n{screen}"
+        );
     }
 }

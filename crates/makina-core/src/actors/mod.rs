@@ -369,11 +369,13 @@ mod tests {
                 title: "run".into(),
                 kind: Some("execute".into()),
                 status: "pending".into(),
+                detail: None,
             },
             ResponseEvent::ToolCallUpdate {
                 id: "t1".into(),
                 status: Some("completed".into()),
                 title: None,
+                detail: None,
             },
             ResponseEvent::TextChunk {
                 text: "done".into(),

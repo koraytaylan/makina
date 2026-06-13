@@ -566,6 +566,12 @@ pub enum ExchangeEvent {
         kind: Option<String>,
         /// Lifecycle status (`"pending"` when the agent omits it).
         status: String,
+        /// Best-effort displayable content for this tool call (edit diffs, raw
+        /// input text, etc.) extracted from the ACP payload. `None` when the
+        /// backend does not surface any detail. The TUI stores this in
+        /// `ExchangeContent::Tool.content` for verbose rendering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
 
     /// An incremental status/content update for a previously-announced tool call.
@@ -579,6 +585,10 @@ pub enum ExchangeEvent {
         status: Option<String>,
         /// Updated title, if the update carried one.
         title: Option<String>,
+        /// Updated displayable content, if the update carried any. `None` when
+        /// the update carries no content change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
 
     /// The agent has finished its current response turn.
@@ -1315,11 +1325,13 @@ mod tests {
             title: "run tests".to_string(),
             kind: Some("execute".to_string()),
             status: "pending".to_string(),
+            content: None,
         };
         let update = ExchangeEvent::ToolCallUpdate {
             id: "call-1".to_string(),
             status: Some("completed".to_string()),
             title: None,
+            content: None,
         };
 
         for ev in [thought.clone(), call.clone(), update.clone()] {
@@ -1332,13 +1344,16 @@ mod tests {
                     title,
                     kind,
                     status,
+                    ..
                 } => {
                     assert_eq!(id, "call-1");
                     assert_eq!(title, "run tests");
                     assert_eq!(kind.as_deref(), Some("execute"));
                     assert_eq!(status, "pending");
                 }
-                ExchangeEvent::ToolCallUpdate { id, status, title } => {
+                ExchangeEvent::ToolCallUpdate {
+                    id, status, title, ..
+                } => {
                     assert_eq!(id, "call-1");
                     assert_eq!(status.as_deref(), Some("completed"));
                     assert!(title.is_none());

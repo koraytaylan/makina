@@ -149,11 +149,14 @@ async fn non_message_updates_are_mapped_to_response_events() {
                 title,
                 kind,
                 status,
+                ..
             } => {
                 assert!(!saw_complete_last, "no event may follow TurnComplete");
                 tool_calls.push((id, title, kind, status));
             }
-            ResponseEvent::ToolCallUpdate { id, status, title } => {
+            ResponseEvent::ToolCallUpdate {
+                id, status, title, ..
+            } => {
                 assert!(!saw_complete_last, "no event may follow TurnComplete");
                 tool_call_updates.push((id, status, title));
             }

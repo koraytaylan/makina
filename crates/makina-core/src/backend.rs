@@ -198,6 +198,10 @@ pub enum ResponseEvent {
         kind: Option<String>,
         /// Lifecycle status (`"pending"` when the agent omits it).
         status: String,
+        /// Best-effort displayable content for this tool call (edit diffs, raw
+        /// input text, etc.) extracted from the ACP payload. `None` when the
+        /// backend does not surface any detail.
+        detail: Option<String>,
     },
 
     /// A status/result update for a previously-announced tool call.
@@ -210,6 +214,9 @@ pub enum ResponseEvent {
         status: Option<String>,
         /// Updated title, if the update carried one.
         title: Option<String>,
+        /// Updated displayable content, if the update carried any. `None` when
+        /// the update carries no content change.
+        detail: Option<String>,
     },
 
     /// The agent autonomously changed its operating mode.
@@ -520,6 +527,7 @@ mod tests {
                 title: "run tests".to_string(),
                 kind: Some("execute".to_string()),
                 status: "pending".to_string(),
+                detail: None,
             }),
             Ok(ResponseEvent::TextChunk {
                 text: ", world!".to_string(),
@@ -528,6 +536,7 @@ mod tests {
                 id: "tc-1".to_string(),
                 status: Some("completed".to_string()),
                 title: None,
+                detail: None,
             }),
             Ok(ResponseEvent::TurnComplete),
         ];

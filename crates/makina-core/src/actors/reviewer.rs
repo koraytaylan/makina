@@ -300,6 +300,7 @@ impl kameo::message::Message<Review> for Reviewer {
                     title,
                     kind,
                     status,
+                    detail,
                 })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
@@ -310,15 +311,26 @@ impl kameo::message::Message<Review> for Reviewer {
                             title,
                             kind,
                             status,
+                            content: detail,
                         },
                     });
                 }
-                Some(Ok(ResponseEvent::ToolCallUpdate { id, status, title })) => {
+                Some(Ok(ResponseEvent::ToolCallUpdate {
+                    id,
+                    status,
+                    title,
+                    detail,
+                })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
                         role: api::AgentRole::Reviewer,
-                        event: api::ExchangeEvent::ToolCallUpdate { id, status, title },
+                        event: api::ExchangeEvent::ToolCallUpdate {
+                            id,
+                            status,
+                            title,
+                            content: detail,
+                        },
                     });
                 }
                 Some(Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })) => {

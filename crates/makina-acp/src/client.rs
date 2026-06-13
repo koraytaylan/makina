@@ -191,9 +191,11 @@ impl AcpCommand {
 /// can render thoughts and tool activity. This mirrors the shape of
 /// `makina_core::backend::ResponseEvent` so task 15's adapter is a thin mapping.
 ///
-/// Every field is a `String`/`Option<String>` so the enum stays `Clone + Eq`;
-/// richer per-tool payloads (raw input, content, …) are intentionally not
-/// carried here.
+/// Every field is a `String`/`Option<String>` so the enum stays `Clone + Eq`.
+/// The `ToolCall` and `ToolCallUpdate` variants now carry a `detail` field
+/// extracted from the tool's `extra` map (edit diffs, raw input, etc.) via
+/// [`tool_detail`] so downstream consumers can render what the tool actually
+/// changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpResponseChunk {
     /// A fragment of the agent's assistant message text (never empty).
@@ -211,6 +213,10 @@ pub enum AcpResponseChunk {
         kind: Option<String>,
         /// Lifecycle status (`"pending"` when the agent omits it).
         status: String,
+        /// Best-effort displayable content extracted from the tool's `extra` map
+        /// (edit diffs, added/updated lines, raw input text). `None` when neither
+        /// `content` blocks nor `rawInput` yield any text.
+        detail: Option<String>,
     },
     /// A status/result update for a previously-announced tool call.
     ToolCallUpdate {
@@ -220,6 +226,9 @@ pub enum AcpResponseChunk {
         status: Option<String>,
         /// Updated title, if the update carried one.
         title: Option<String>,
+        /// Best-effort displayable content extracted from the update's `extra` map.
+        /// `None` when the update carries no displayable content.
+        detail: Option<String>,
     },
     /// The agent autonomously changed its operating mode (`current_mode_update`).
     ///
@@ -787,6 +796,99 @@ async fn forward_stderr(stderr: tokio::process::ChildStderr) {
     }
 }
 
+// ── Tool detail extraction ────────────────────────────────────────────────────────
+
+/// Best-effort extraction of a tool call's displayable detail from its open
+/// `extra` map. Prefers the `content` blocks' text — including the **file-edit
+/// diff block** that `gemini --acp` actually sends (the diff / added+updated
+/// lines for edit tools); falls back to a compact `rawInput` rendering for
+/// non-edit tools. Returns `None` when neither is present or yields no text.
+///
+/// Three observed content-block shapes are handled:
+/// 1. **File-edit diff block** — the real `gemini --acp` payload:
+///    `{ "type": "diff", "path", "oldText", "newText" }`.
+///    Surfaces `newText` (ideally as an `oldText`→`newText` diff).
+/// 2. **Nested text** — `{ "type": "content", "content": { "type": "text", "text": … } }`.
+/// 3. **Bare text** — `{ "type": "text", "text": … }` (also tolerates `{ "text": … }`).
+fn tool_detail(extra: &std::collections::HashMap<String, serde_json::Value>) -> Option<String> {
+    if let Some(serde_json::Value::Array(blocks)) = extra.get("content") {
+        let mut out = String::new();
+        for b in blocks {
+            let b_type = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if b_type == "diff" {
+                // File-edit diff block: render old→new diff.
+                let old = b.get("oldText").and_then(|v| v.as_str()).unwrap_or("");
+                let new = b.get("newText").and_then(|v| v.as_str()).unwrap_or("");
+                let path = b.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                if !old.is_empty() || !new.is_empty() {
+                    if !path.is_empty() {
+                        out.push_str("--- ");
+                        out.push_str(path);
+                        out.push('\n');
+                    }
+                    for line in old.lines() {
+                        out.push('-');
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    for line in new.lines() {
+                        out.push('+');
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+            } else if b_type == "content" {
+                // Nested text shape: { "type": "content", "content": { "type": "text", "text": … } }
+                if let Some(inner) = b.get("content")
+                    && let Some(text) = inner.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            } else {
+                // Bare text: { "type": "text", "text": … } or just { "text": … }
+                if let Some(text) = b.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
+        }
+        let trimmed = out.trim_end().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+
+    // Fallback: `rawInput` rendered compactly.
+    if let Some(raw) = extra.get("rawInput") {
+        let compact = match raw {
+            serde_json::Value::Object(map) => {
+                let parts: Vec<String> = map
+                    .iter()
+                    .map(|(k, v)| {
+                        let vs = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("{k}: {vs}")
+                    })
+                    .collect();
+                parts.join("\n")
+            }
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if !compact.trim().is_empty() {
+            return Some(compact);
+        }
+    }
+
+    None
+}
+
 // ── Prompt stream ────────────────────────────────────────────────────────────────
 
 /// State machine driving a single prompt turn to completion.
@@ -850,12 +952,14 @@ impl PromptStream<'_> {
                 Self::extract_text(&chunk).map(AcpResponseChunk::Thought)
             }
             SessionUpdate::ToolCall(tc) => Some(AcpResponseChunk::ToolCall {
+                detail: tool_detail(&tc.extra),
                 id: tc.tool_call_id,
                 title: tc.title.unwrap_or_default(),
                 kind: tc.kind,
                 status: tc.status.unwrap_or_else(|| "pending".to_string()),
             }),
             SessionUpdate::ToolCallUpdate(u) => Some(AcpResponseChunk::ToolCallUpdate {
+                detail: tool_detail(&u.extra),
                 id: u.tool_call_id,
                 status: u.status,
                 title: u.title,
@@ -956,6 +1060,113 @@ mod current_mode_tests {
             Some(AcpResponseChunk::CurrentModeUpdate {
                 current_mode_id: "code".to_string(),
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_detail_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_tc(extra: HashMap<String, serde_json::Value>) -> SessionUpdate {
+        SessionUpdate::ToolCallUpdate(crate::protocol::ToolCall {
+            tool_call_id: "tc-test".to_string(),
+            status: Some("completed".to_string()),
+            title: Some("test tool".to_string()),
+            kind: None,
+            extra,
+        })
+    }
+
+    /// A `SessionUpdate::ToolCallUpdate` whose `extra["content"]` is the
+    /// wire-shaped nested-text array maps through `classify_update` to
+    /// `AcpResponseChunk::ToolCallUpdate { detail: Some(s), .. }` where `s`
+    /// contains the inner text. An update with no content and no rawInput
+    /// yields `detail == None`.
+    #[test]
+    fn tool_detail_extracts_content_blocks() {
+        // Build the wire-shaped nested-text content array:
+        // [{ "type": "content", "content": { "type": "text", "text": "hello world" } }]
+        let mut extra = HashMap::new();
+        extra.insert(
+            "content".to_string(),
+            serde_json::json!([
+                {
+                    "type": "content",
+                    "content": { "type": "text", "text": "hello world" }
+                }
+            ]),
+        );
+
+        let chunk = PromptStream::classify_update(make_tc(extra));
+        match chunk {
+            Some(AcpResponseChunk::ToolCallUpdate { detail, .. }) => {
+                let d = detail.expect("detail must be Some for a content-bearing update");
+                assert!(
+                    d.contains("hello world"),
+                    "detail should contain the inner text, got: {d:?}"
+                );
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+
+        // An update with no content and no rawInput → detail == None.
+        let empty_chunk = PromptStream::classify_update(make_tc(HashMap::new()));
+        match empty_chunk {
+            Some(AcpResponseChunk::ToolCallUpdate { detail, .. }) => {
+                assert_eq!(detail, None, "empty extra must yield detail == None");
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+    }
+
+    /// A `SessionUpdate` whose `extra["content"]` is the file-edit diff-block
+    /// array `[{ "type": "diff", "path", "oldText", "newText" }]` yields a
+    /// `detail` that is `Some` and contains the `newText`.
+    #[test]
+    fn tool_detail_extracts_edit_diff() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "content".to_string(),
+            serde_json::json!([
+                {
+                    "type": "diff",
+                    "path": "/tmp/fs-probe.txt",
+                    "oldText": "",
+                    "newText": "PROBE-FS-TEST"
+                }
+            ]),
+        );
+
+        let chunk = PromptStream::classify_update(make_tc(extra));
+        match chunk {
+            Some(AcpResponseChunk::ToolCallUpdate { detail, .. }) => {
+                let d = detail.expect("detail must be Some for a diff-bearing update");
+                assert!(
+                    d.contains("PROBE-FS-TEST"),
+                    "detail should contain the newText, got: {d:?}"
+                );
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+    }
+
+    /// rawInput fallback: when there is no `content` key but `rawInput` is an
+    /// object, the detail is a compact `key: value` rendering.
+    #[test]
+    fn tool_detail_falls_back_to_raw_input() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "rawInput".to_string(),
+            serde_json::json!({ "command": "cargo test" }),
+        );
+
+        let detail = tool_detail(&extra);
+        let d = detail.expect("rawInput object must produce Some detail");
+        assert!(
+            d.contains("command") && d.contains("cargo test"),
+            "rawInput compact rendering should include key and value, got: {d:?}"
         );
     }
 }

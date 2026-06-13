@@ -816,6 +816,11 @@ fn translate_key(
             KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
             // Open the focused task's log in $PAGER.
             KeyCode::Char('l') | KeyCode::Char('L') => AppEvent::OpenLog,
+            // Toggle verbose mode on/off (Ctrl+O — checked BEFORE the plain
+            // `o`/`O` → OpenBrowser arm so the modifier guard wins).
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                AppEvent::ToggleVerbose
+            }
             // Open the file browser to pick a task list.
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
             // Open the provider/role configuration editor.

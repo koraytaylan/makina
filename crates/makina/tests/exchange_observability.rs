@@ -96,16 +96,19 @@ fn rich_turn() -> Vec<ResponseEvent> {
             title: "Edit src/lib.rs".into(),
             kind: Some("edit".into()),
             status: "pending".into(),
+            detail: None,
         },
         ResponseEvent::ToolCallUpdate {
             id: "tc-1".into(),
             status: Some("in_progress".into()),
             title: None,
+            detail: None,
         },
         ResponseEvent::ToolCallUpdate {
             id: "tc-1".into(),
             status: Some("completed".into()),
             title: None,
+            detail: None,
         },
         ResponseEvent::TextChunk {
             text: "Done.".into(),

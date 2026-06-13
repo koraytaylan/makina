@@ -573,15 +573,25 @@ async fn run_turn(
                 title,
                 kind,
                 status,
+                detail,
             }) => Ok(ResponseEvent::ToolCall {
                 id,
                 title,
                 kind,
                 status,
+                detail,
             }),
-            Ok(AcpResponseChunk::ToolCallUpdate { id, status, title }) => {
-                Ok(ResponseEvent::ToolCallUpdate { id, status, title })
-            }
+            Ok(AcpResponseChunk::ToolCallUpdate {
+                id,
+                status,
+                title,
+                detail,
+            }) => Ok(ResponseEvent::ToolCallUpdate {
+                id,
+                status,
+                title,
+                detail,
+            }),
             Ok(AcpResponseChunk::CurrentModeUpdate { current_mode_id }) => {
                 Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })
             }
