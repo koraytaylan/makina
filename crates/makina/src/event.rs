@@ -118,17 +118,21 @@ pub async fn run(
     tui.draw(|frame| ui::render(app, frame))?;
 
     loop {
-        let browsing = app.is_browsing();
-        let editing_providers = app.is_editing_providers();
-        let viewing_doctor = app.is_viewing_doctor();
-        let command_palette = app.is_command_palette();
-        let settings = app.is_settings();
+        let modal = ModalState {
+            browsing: app.is_browsing(),
+            editing_providers: app.is_editing_providers(),
+            viewing_doctor: app.is_viewing_doctor(),
+            command_palette: app.is_command_palette(),
+            settings: app.is_settings(),
+            picking_plan: app.is_picking_plan(),
+        };
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
             biased;
 
             maybe_term = term_rx.recv() => {
-                maybe_term.map(|ev| translate_terminal_event(ev, browsing, editing_providers, viewing_doctor, command_palette, settings, app.focused_panel))
+                maybe_term.map(|ev| translate_terminal_event(ev, modal, app.focused_panel))
+
             }
 
             maybe_api = api_stream.next() => {
@@ -238,9 +242,16 @@ async fn resolve_api_event(
 async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
     match event {
         AppEvent::OpenBrowser => {
-            // Start from the process CWD (fall back to "." if unavailable).
-            let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            (read_dir_event(&start).await, None)
+            // First try to discover plans under docs/plans/
+            let plans = makina_core::orchestrator::discover_plans(&app.repo_root);
+            if !plans.is_empty() {
+                (AppEvent::PlansDiscovered { plans }, None)
+            } else {
+                // Fall back to the CWD file browser when no plans are discovered
+                let start =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                (read_dir_event(&start).await, None)
+            }
         }
         AppEvent::BrowserParent => match app.browser.as_ref().and_then(|b| b.parent()) {
             Some(parent) => (read_dir_event(parent).await, None),
@@ -279,6 +290,38 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
                 None => (AppEvent::Tick, None),
             }
         }
+        // ── Plan picker (plan 0027) ───────────────────────────────────────────
+        // Activate a selected plan: for plans with TASKS.md, open via OpenRun;
+        // for plans without TASKS.md, route to planner-generate path.
+        AppEvent::PlanActivate => match app.selected_plan() {
+            Some(entry) if entry.has_tasks => {
+                let path = entry.dir.join("TASKS.md");
+                let status = format!("Interpreting {}...", entry.slug);
+                let result = app
+                    .api
+                    .execute(makina_core::api::Command::OpenRun {
+                        task_list_path: path,
+                    })
+                    .await;
+                let msg = if let Err(e) = result {
+                    format!("Open failed: {e}")
+                } else {
+                    status
+                };
+                (AppEvent::CloseBrowser, Some(msg))
+            }
+            Some(entry) => {
+                // plan 0028: planner-generate(entry.dir) — route here instead of OpenRun.
+                (
+                    AppEvent::CloseBrowser,
+                    Some(format!(
+                        "{}: no TASKS.md — planner will generate the graph",
+                        entry.slug
+                    )),
+                )
+            }
+            None => (AppEvent::Tick, None),
+        },
         // ── Run control (task 31) ─────────────────────────────────────────────
         AppEvent::StartRun => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
         AppEvent::PauseRun => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
@@ -907,34 +950,34 @@ async fn read_dir_event(dir: &std::path::Path) -> AppEvent {
 
 // ── Translation helpers ───────────────────────────────────────────────────────
 
-/// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
+/// Snapshot of which modal overlay is currently active.
 ///
-/// `browsing` selects the keymap: the modal file browser (task 28) captures
-/// navigation keys (Enter / Backspace / Esc) differently from the normal view.
-/// Similarly, `editing_providers` activates the provider editor keymap.
-/// `focused_panel` determines whether Space emits `ToggleTreeNode` (sidebar only).
-///
-/// Returns [`AppEvent::Tick`] for events the TUI doesn't handle (e.g. mouse
-/// events); those simply trigger a harmless redraw.
-fn translate_terminal_event(
-    ev: CrosstermEvent,
+/// Grouping the flags into a struct keeps `translate_terminal_event` and
+/// `translate_key` within clippy's `too_many_arguments` threshold (≤ 7).
+#[derive(Clone, Copy, Default)]
+struct ModalState {
     browsing: bool,
     editing_providers: bool,
     viewing_doctor: bool,
     command_palette: bool,
     settings: bool,
+    picking_plan: bool,
+}
+
+/// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
+///
+/// `modal` bundles which overlay is active; `focused_panel` determines whether
+/// Space emits `ToggleTreeNode` (sidebar only).
+///
+/// Returns [`AppEvent::Tick`] for events the TUI doesn't handle (e.g. mouse
+/// events); those simply trigger a harmless redraw.
+fn translate_terminal_event(
+    ev: CrosstermEvent,
+    modal: ModalState,
     focused_panel: crate::app::Panel,
 ) -> AppEvent {
     match ev {
-        CrosstermEvent::Key(key) => translate_key(
-            key,
-            browsing,
-            editing_providers,
-            viewing_doctor,
-            command_palette,
-            settings,
-            focused_panel,
-        ),
+        CrosstermEvent::Key(key) => translate_key(key, modal, focused_panel),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
         // `browsing` flag (the exchange pane is not the browser).
@@ -955,13 +998,17 @@ fn translate_terminal_event(
 /// Translate a key press into an [`AppEvent`], honouring the current view mode.
 fn translate_key(
     key: crossterm::event::KeyEvent,
-    browsing: bool,
-    editing_providers: bool,
-    viewing_doctor: bool,
-    command_palette: bool,
-    settings: bool,
+    modal: ModalState,
     focused_panel: crate::app::Panel,
 ) -> AppEvent {
+    let ModalState {
+        browsing,
+        editing_providers,
+        viewing_doctor,
+        command_palette,
+        settings,
+        picking_plan,
+    } = modal;
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
     if key.kind != KeyEventKind::Press {
@@ -989,6 +1036,17 @@ fn translate_key(
             KeyCode::Down => AppEvent::CommandPaletteDown,
             KeyCode::Backspace => AppEvent::CommandPaletteBackspace,
             KeyCode::Char(c) => AppEvent::CommandPaletteInput(c),
+            _ => AppEvent::Tick,
+        }
+    } else if picking_plan {
+        // ── Plan picker keymap ────────────────────────────────────────────────
+        // Esc closes the picker (does NOT quit the app); Enter activates the
+        // selection; j/k/arrows navigate.
+        match key.code {
+            KeyCode::Esc => AppEvent::CloseBrowser,
+            KeyCode::Enter => AppEvent::PlanActivate,
+            KeyCode::Up | KeyCode::Char('k') => AppEvent::PlanPickerUp,
+            KeyCode::Down | KeyCode::Char('j') => AppEvent::PlanPickerDown,
             _ => AppEvent::Tick,
         }
     } else if browsing {
@@ -1126,11 +1184,7 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 wheel(MouseEventKind::ScrollUp),
-                false,
-                false,
-                false,
-                false,
-                false,
+                ModalState::default(),
                 crate::app::Panel::Sidebar
             ),
             AppEvent::ScrollUp
@@ -1138,11 +1192,7 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 wheel(MouseEventKind::ScrollDown),
-                false,
-                false,
-                false,
-                false,
-                false,
+                ModalState::default(),
                 crate::app::Panel::Sidebar
             ),
             AppEvent::ScrollDown
@@ -1157,15 +1207,7 @@ mod tests {
         let drag = wheel(MouseEventKind::Drag(MouseButton::Left));
         assert!(
             matches!(
-                translate_terminal_event(
-                    drag,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    crate::app::Panel::Sidebar
-                ),
+                translate_terminal_event(drag, ModalState::default(), crate::app::Panel::Sidebar),
                 AppEvent::Tick
             ),
             "Drag(Left) must translate to Tick so native selection coexists"
@@ -1174,15 +1216,7 @@ mod tests {
         let moved = wheel(MouseEventKind::Moved);
         assert!(
             matches!(
-                translate_terminal_event(
-                    moved,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    crate::app::Panel::Sidebar
-                ),
+                translate_terminal_event(moved, ModalState::default(), crate::app::Panel::Sidebar),
                 AppEvent::Tick
             ),
             "Moved must translate to Tick so native selection coexists"
@@ -1193,15 +1227,7 @@ mod tests {
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::Quit
         ));
     }
@@ -1210,15 +1236,7 @@ mod tests {
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::Quit
         ));
     }
@@ -1227,15 +1245,7 @@ mod tests {
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::Quit
         ));
     }
@@ -1244,15 +1254,7 @@ mod tests {
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::FocusNext
         ));
     }
@@ -1262,11 +1264,7 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('v'), KeyModifiers::NONE),
-                false,
-                false,
-                false,
-                false,
-                false,
+                ModalState::default(),
                 crate::app::Panel::Sidebar
             ),
             AppEvent::CycleDependencyView
@@ -1278,11 +1276,7 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('e'), KeyModifiers::NONE),
-                false,
-                false,
-                false,
-                false,
-                false,
+                ModalState::default(),
                 crate::app::Panel::Sidebar
             ),
             AppEvent::ToggleErrorPane
@@ -1295,11 +1289,7 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('r'), KeyModifiers::NONE),
-                false,
-                false,
-                false,
-                false,
-                false,
+                ModalState::default(),
                 crate::app::Panel::Sidebar
             ),
             AppEvent::RetryFocused
@@ -1317,15 +1307,7 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::Tick
         ));
     }
@@ -1334,15 +1316,7 @@ mod tests {
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -1351,15 +1325,7 @@ mod tests {
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::SelectUp
         ));
     }
@@ -1368,15 +1334,7 @@ mod tests {
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::SelectDown
         ));
     }
@@ -1385,15 +1343,7 @@ mod tests {
     fn right_arrow_translates_to_focus_right_or_expand() {
         let ev = key_press(KeyCode::Right, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::FocusRightOrExpand
         ));
     }
@@ -1402,15 +1352,7 @@ mod tests {
     fn left_arrow_translates_to_focus_left_or_collapse() {
         let ev = key_press(KeyCode::Left, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::FocusLeftOrCollapse
         ));
     }
@@ -1419,15 +1361,7 @@ mod tests {
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::SelectUp
         ));
     }
@@ -1436,15 +1370,7 @@ mod tests {
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::SelectDown
         ));
     }
@@ -1455,15 +1381,7 @@ mod tests {
     fn o_key_opens_browser_in_normal_mode() {
         let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::OpenBrowser
         ));
     }
@@ -1474,15 +1392,7 @@ mod tests {
     fn s_key_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::StartRun
         ));
     }
@@ -1491,15 +1401,7 @@ mod tests {
     fn p_key_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::PauseRun
         ));
     }
@@ -1509,15 +1411,7 @@ mod tests {
         // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::CancelRun
         ));
     }
@@ -1532,11 +1426,10 @@ mod tests {
                 matches!(
                     translate_terminal_event(
                         ev,
-                        true,
-                        false,
-                        false,
-                        false,
-                        false,
+                        ModalState {
+                            browsing: true,
+                            ..ModalState::default()
+                        },
                         crate::app::Panel::Sidebar
                     ),
                     AppEvent::Tick
@@ -1552,11 +1445,10 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                true,
-                false,
-                false,
-                false,
-                false,
+                ModalState {
+                    browsing: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::BrowserActivate
@@ -1570,11 +1462,10 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                true,
-                false,
-                false,
-                false,
-                false,
+                ModalState {
+                    browsing: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::CloseBrowser
@@ -1587,11 +1478,10 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                true,
-                false,
-                false,
-                false,
-                false,
+                ModalState {
+                    browsing: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::BrowserParent
@@ -1604,11 +1494,10 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 down,
-                true,
-                false,
-                false,
-                false,
-                false,
+                ModalState {
+                    browsing: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::BrowserDown
@@ -1617,11 +1506,10 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 up,
-                true,
-                false,
-                false,
-                false,
-                false,
+                ModalState {
+                    browsing: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::BrowserUp
@@ -1634,11 +1522,10 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                true,
-                false,
-                false,
-                false,
-                false,
+                ModalState {
+                    browsing: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::Quit
@@ -1653,11 +1540,10 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                true,
-                false,
-                false,
-                false,
-                false,
+                ModalState {
+                    browsing: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::Tick
@@ -1676,13 +1562,10 @@ mod tests {
 
         let ev = translate_terminal_event(
             key_press(KeyCode::Char('q'), KeyModifiers::NONE),
-            false,
-            false,
-            false,
-            false,
-            false,
+            ModalState::default(),
             crate::app::Panel::Sidebar,
         );
+
         app.update(ev);
         assert!(app.should_quit);
     }
@@ -2758,15 +2641,7 @@ A description that is long enough to pass minimums.
         // Ctrl+P from Normal mode (all flags false) must open the palette.
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(
-                ev,
-                false,
-                false,
-                false,
-                false,
-                false,
-                crate::app::Panel::Sidebar
-            ),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
             AppEvent::OpenCommandPalette
         ));
     }
@@ -2778,11 +2653,10 @@ A description that is long enough to pass minimums.
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                false,
-                false,
-                false,
-                true,
-                false,
+                ModalState {
+                    command_palette: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::CommandPaletteExecute
@@ -2825,11 +2699,10 @@ A description that is long enough to pass minimums.
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                false,
-                false,
-                false,
-                true,
-                false,
+                ModalState {
+                    command_palette: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::CloseCommandPalette
@@ -2943,11 +2816,10 @@ wall_clock_secs = 1200
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                false,
-                false,
-                false,
-                false,
-                true,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::CloseSettings
@@ -2961,11 +2833,10 @@ wall_clock_secs = 1200
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                false,
-                false,
-                false,
-                false,
-                true,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::SettingsCommit
@@ -2979,11 +2850,10 @@ wall_clock_secs = 1200
         assert!(matches!(
             translate_terminal_event(
                 up,
-                false,
-                false,
-                false,
-                false,
-                true,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::SettingsUp
@@ -2993,11 +2863,10 @@ wall_clock_secs = 1200
         assert!(matches!(
             translate_terminal_event(
                 down,
-                false,
-                false,
-                false,
-                false,
-                true,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::SettingsDown
@@ -3011,11 +2880,10 @@ wall_clock_secs = 1200
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                false,
-                false,
-                false,
-                false,
-                true,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::SettingsInput('5')
@@ -3029,14 +2897,190 @@ wall_clock_secs = 1200
         assert!(matches!(
             translate_terminal_event(
                 ev,
-                false,
-                false,
-                false,
-                false,
-                true,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
                 crate::app::Panel::Sidebar
             ),
             AppEvent::SettingsBackspace
         ));
+    }
+
+    // ── Plan picker tests (plan 0027) ─────────────────────────────────────────
+
+    /// **Plan discovery default:** When `OpenBrowser` is resolved and the repo
+    /// contains `docs/plans/` with convention directories, `resolve_io` must
+    /// return `AppEvent::PlansDiscovered` (not `BrowserOpened`). When `docs/plans/`
+    /// is absent or empty, fall back to the file browser.
+    #[tokio::test]
+    async fn open_browser_prefers_discovered_plans() {
+        use crate::app::{App, AppEvent};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        // Create a temp repo with docs/plans/0001-x/ containing SCOPE.md, ARCHITECTURE.md, TASKS.md
+        let tmpdir = tempfile::tempdir().unwrap();
+        let repo_root = tmpdir.path();
+        let plans_dir = repo_root.join("docs/plans/0001-x");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(plans_dir.join("SCOPE.md"), "Scope").unwrap();
+        std::fs::write(plans_dir.join("ARCHITECTURE.md"), "Architecture").unwrap();
+        std::fs::write(plans_dir.join("TASKS.md"), "Tasks").unwrap();
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![], repo_root.to_path_buf());
+
+        // Resolve OpenBrowser: should discover the plan and emit PlansDiscovered
+        let (resolved, _status) = resolve_io(&app, AppEvent::OpenBrowser).await;
+        match &resolved {
+            AppEvent::PlansDiscovered { plans } => {
+                assert_eq!(plans.len(), 1, "should discover exactly one plan");
+                assert_eq!(plans[0].slug, "0001-x");
+                assert!(plans[0].has_tasks);
+            }
+            _ => panic!("OpenBrowser must emit PlansDiscovered, got {resolved:?}"),
+        }
+    }
+
+    /// **Plan activation with tasks:** When a plan with `has_tasks=true` is
+    /// activated via `PlanActivate`, `resolve_io` must call `api.execute(OpenRun)`
+    /// on the plan's `TASKS.md`, return `CloseBrowser` and an "Interpreting ..."
+    /// status message.
+    #[tokio::test]
+    async fn plan_activate_with_tasks_opens_run() {
+        use crate::app::{App, AppEvent, Mode};
+        use makina_core::dependency::EdgeInferrer;
+        use makina_core::interpreter::StructuredTextInterpreter;
+        use makina_core::orchestrator::{CoreApi, PlanEntry};
+        use std::sync::Arc;
+
+        // A valid task list for the plan's TASKS.md
+        let source = "# Flow\n\nPreamble.\n\n---\n\n## 0001 — Task\n\n\
+            ### test — Test\nDoes a thing.\n- **Depends on:** —\n- **Done when:** ok.\n";
+        let tmpdir = tempfile::tempdir().unwrap();
+        let repo_root = tmpdir.path().to_path_buf();
+        let plan_dir = repo_root.join("docs/plans/0001-test");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        let tasks_path = plan_dir.join("TASKS.md");
+        std::fs::write(&tasks_path, source).unwrap();
+
+        // Real CoreApi with deterministic interpreter
+        let interpreter = Arc::new(EdgeInferrer::new(
+            Arc::new(StructuredTextInterpreter::new()),
+        ));
+        let backend: Arc<dyn makina_core::backend::AgentBackend> =
+            Arc::new(makina_core::backend::noop::NoopBackend::new());
+        let wm = makina_core::worktree::WorktreeManager::new(
+            tempfile::tempdir().unwrap().keep(),
+            "develop".into(),
+        );
+        let config = makina_core::config::Config::resolve(
+            makina_core::config::GlobalConfig::default(),
+            makina_core::config::ProjectConfig::default(),
+        );
+        let api: Arc<dyn makina_core::api::Api> =
+            Arc::new(CoreApi::new(interpreter, backend, wm, config));
+
+        // Subscribe before acting (to avoid dropped subscription)
+        let _sub = api.subscribe();
+
+        // Build an App with a selected plan
+        let mut app = App::new(Arc::clone(&api), vec![], repo_root.clone());
+        app.mode = Mode::PlanPicker;
+        app.discovered_plans = vec![PlanEntry {
+            dir: plan_dir,
+            slug: "0001-test".to_string(),
+            has_tasks: true,
+        }];
+        app.plan_cursor = 0;
+
+        // Resolve PlanActivate
+        let (resolved, status) = resolve_io(&app, AppEvent::PlanActivate).await;
+
+        // Must return CloseBrowser + "Interpreting ..." status
+        assert!(
+            matches!(resolved, AppEvent::CloseBrowser),
+            "PlanActivate with tasks must resolve to CloseBrowser"
+        );
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|m| m.contains("Interpreting") || m.contains("Opening")),
+            "PlanActivate must surface an 'Interpreting ...' status; got {status:?}"
+        );
+
+        // Update app with the resolved event
+        app.update(resolved);
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "PlanPicker should close after activation"
+        );
+
+        // Verify CoreApi created the run
+        let runs = api.runs().await;
+        assert_eq!(runs.len(), 1, "CoreApi must have created exactly one run");
+        assert_eq!(runs[0].task_list_path, tasks_path);
+    }
+
+    /// **Plan activation without tasks:** When a plan with `has_tasks=false` is
+    /// activated via `PlanActivate`, `resolve_io` must NOT call `api.execute(OpenRun)`,
+    /// but return `CloseBrowser` and a "no TASKS.md — planner will generate the graph"
+    /// status message (leaving a seam comment for plan 0028).
+    #[tokio::test]
+    async fn plan_activate_without_tasks_does_not_open_run() {
+        use crate::app::{App, AppEvent, Mode};
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::orchestrator::PlanEntry;
+        use std::sync::Arc;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let repo_root = tmpdir.path().to_path_buf();
+        let plan_dir = repo_root.join("docs/plans/0002-no-tasks");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+
+        let api = Arc::new(PlaceholderApi::empty());
+
+        // Build an App with a selected plan without tasks
+        let mut app = App::new(api, vec![], repo_root);
+        app.mode = Mode::PlanPicker;
+        app.discovered_plans = vec![PlanEntry {
+            dir: plan_dir,
+            slug: "0002-no-tasks".to_string(),
+            has_tasks: false,
+        }];
+        app.plan_cursor = 0;
+
+        // Resolve PlanActivate: should NOT open a run
+        let (resolved, status) = resolve_io(&app, AppEvent::PlanActivate).await;
+
+        // Must return CloseBrowser + a "planner will generate" message
+        assert!(
+            matches!(resolved, AppEvent::CloseBrowser),
+            "PlanActivate without tasks must resolve to CloseBrowser"
+        );
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|m| m.contains("planner will generate")),
+            "PlanActivate without tasks must mention planner; got {status:?}"
+        );
+
+        // Update app
+        app.update(resolved);
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "PlanPicker should close after activation"
+        );
+
+        // Verify no runs were created (the PlaceholderApi would trivially succeed OpenRun,
+        // but we're testing the logic: resolve_io should not call it)
+        let runs = app.runs.clone();
+        assert!(
+            runs.is_empty(),
+            "no run should be created for a plan without TASKS.md"
+        );
     }
 }

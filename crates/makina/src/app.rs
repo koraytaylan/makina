@@ -413,6 +413,8 @@ pub enum Mode {
     CommandPalette,
     /// The settings modal (task 0070).
     Settings,
+    /// The plan picker modal (plan 0027): shows discovered `docs/plans/*/` entries.
+    PlanPicker,
 }
 
 // ── Command palette ──────────────────────────────────────────────────────────
@@ -674,6 +676,25 @@ pub enum AppEvent {
     /// Close the file browser and return to the normal view (Esc, or after a
     /// file was opened).
     CloseBrowser,
+
+    // ── Plan picker (plan 0027) ───────────────────────────────────────────────
+    /// Discovery result arrived: switch to [`Mode::PlanPicker`] with this list.
+    PlansDiscovered {
+        /// The plans discovered under `docs/plans/` by
+        /// [`makina_core::orchestrator::discover_plans`].
+        plans: Vec<makina_core::orchestrator::PlanEntry>,
+    },
+    /// Move the plan-picker selection one row up.
+    PlanPickerUp,
+    /// Move the plan-picker selection one row down.
+    PlanPickerDown,
+    /// Activate the highlighted plan picker entry (Enter).
+    ///
+    /// The IO layer interprets the current selection: for a plan with `has_tasks==true`,
+    /// triggers `api.execute(OpenRun{..})` and then [`AppEvent::CloseBrowser`];
+    /// for a plan with `has_tasks==false`, routes to the planner-generate path and
+    /// emits a status message. `update` does not mutate state for this variant.
+    PlanActivate,
 
     // ── Provider configuration editor (task 0041) ──────────────────────────────
     /// User requested to open the provider configuration editor (e.g. pressed `g`).
@@ -1039,6 +1060,16 @@ pub struct App {
     /// Updated on every `Event::RoleTurnMetrics`; the content pane renders the
     /// most recent metric for each role of the focused task.
     pub role_metrics: HashMap<(RunId, TaskId), HashMap<AgentRole, RoleTurnMetric>>,
+
+    // ── Plan picker (plan 0027) ───────────────────────────────────────────────
+    /// Plans discovered under `docs/plans/` by
+    /// [`makina_core::orchestrator::discover_plans`]. Populated when
+    /// [`AppEvent::PlansDiscovered`] is processed; empty until then.
+    pub discovered_plans: Vec<makina_core::orchestrator::PlanEntry>,
+
+    /// Index into [`App::discovered_plans`] of the highlighted entry in the
+    /// plan-picker modal. Clamped to `0..discovered_plans.len()` on navigation.
+    pub plan_cursor: usize,
 }
 
 impl App {
@@ -1228,6 +1259,8 @@ impl App {
             concurrency: 3,
             verbose_mode: false,
             role_metrics: HashMap::new(),
+            discovered_plans: Vec::new(),
+            plan_cursor: 0,
         }
     }
 
@@ -1302,6 +1335,11 @@ impl App {
         self.mode == Mode::Settings
     }
 
+    /// Whether the plan picker modal is currently active.
+    pub fn is_picking_plan(&self) -> bool {
+        self.mode == Mode::PlanPicker
+    }
+
     /// Return the currently selected [`RunView`], if any.
     ///
     /// The sidebar highlights this Run; the main panel displays its details.
@@ -1336,6 +1374,14 @@ impl App {
             .and_then(|i| run.tasks.get(i))
             .map(|tv| &tv.id)?;
         self.exchange_logs.get(&(run.id, task_id.clone()))
+    }
+
+    /// Return the [`PlanEntry`] currently highlighted in the plan-picker modal.
+    ///
+    /// Returns `None` when [`App::discovered_plans`] is empty.  Used by the IO
+    /// layer to resolve [`AppEvent::PlanActivate`] (plan 0027).
+    pub fn selected_plan(&self) -> Option<&makina_core::orchestrator::PlanEntry> {
+        self.discovered_plans.get(self.plan_cursor)
     }
 
     /// Scroll the exchange pane up by one line.
@@ -1619,6 +1665,31 @@ impl App {
             AppEvent::CloseBrowser => {
                 self.mode = Mode::Normal;
                 self.browser = None;
+                true
+            }
+
+            // ── Plan picker (plan 0027) ───────────────────────────────────────
+            AppEvent::PlansDiscovered { plans } => {
+                self.discovered_plans = plans;
+                self.plan_cursor = 0;
+                self.mode = Mode::PlanPicker;
+                true
+            }
+            AppEvent::PlanPickerUp => {
+                if self.plan_cursor > 0 {
+                    self.plan_cursor -= 1;
+                }
+                true
+            }
+            AppEvent::PlanPickerDown => {
+                let len = self.discovered_plans.len();
+                if len > 0 && self.plan_cursor < len - 1 {
+                    self.plan_cursor += 1;
+                }
+                true
+            }
+            AppEvent::PlanActivate => {
+                // Handled by the IO layer (open or route to planner). No-op here.
                 true
             }
 
@@ -5875,6 +5946,102 @@ mod tests {
                 input_tokens: Some(100),
                 output_tokens: Some(50),
             })
+        );
+    }
+
+    // ── Plan picker (plan 0027) ───────────────────────────────────────────────
+
+    fn make_plan_entries() -> Vec<makina_core::orchestrator::PlanEntry> {
+        vec![
+            makina_core::orchestrator::PlanEntry {
+                dir: PathBuf::from("/tmp/docs/plans/0001-alpha"),
+                slug: "0001-alpha".to_string(),
+                has_tasks: true,
+            },
+            makina_core::orchestrator::PlanEntry {
+                dir: PathBuf::from("/tmp/docs/plans/0002-beta"),
+                slug: "0002-beta".to_string(),
+                has_tasks: false,
+            },
+        ]
+    }
+
+    /// `PlansDiscovered` must switch to `Mode::PlanPicker`, store the list, and
+    /// reset `plan_cursor` to `0`; `selected_plan()` must return the first entry.
+    #[test]
+    fn plans_discovered_enters_picker() {
+        let mut app = make_app();
+        let entries = make_plan_entries();
+        let first_slug = entries[0].slug.clone();
+
+        app.update(AppEvent::PlansDiscovered {
+            plans: entries.clone(),
+        });
+
+        assert_eq!(
+            app.mode,
+            Mode::PlanPicker,
+            "mode must be PlanPicker after PlansDiscovered"
+        );
+        assert_eq!(
+            app.discovered_plans.len(),
+            2,
+            "discovered_plans must hold both entries"
+        );
+        assert_eq!(app.plan_cursor, 0, "plan_cursor must be reset to 0");
+        let selected = app.selected_plan().expect("selected_plan must return Some");
+        assert_eq!(
+            selected.slug, first_slug,
+            "selected_plan() must be the first entry"
+        );
+    }
+
+    /// `PlanPickerDown` must advance the cursor; past the last entry it must
+    /// clamp.  `PlanPickerUp` at `0` must stay at `0`.  `selected_plan()` must
+    /// track the cursor throughout.
+    #[test]
+    fn plan_picker_cursor_clamps() {
+        let mut app = make_app();
+        let entries = make_plan_entries();
+        app.update(AppEvent::PlansDiscovered { plans: entries });
+
+        // Cursor starts at 0 → first entry.
+        assert_eq!(app.plan_cursor, 0);
+        assert_eq!(
+            app.selected_plan().map(|e| e.slug.as_str()),
+            Some("0001-alpha")
+        );
+
+        // Down once → second entry.
+        app.update(AppEvent::PlanPickerDown);
+        assert_eq!(app.plan_cursor, 1);
+        assert_eq!(
+            app.selected_plan().map(|e| e.slug.as_str()),
+            Some("0002-beta")
+        );
+
+        // Down past end → still at last entry (clamped).
+        app.update(AppEvent::PlanPickerDown);
+        assert_eq!(app.plan_cursor, 1, "cursor must clamp at len-1");
+        assert_eq!(
+            app.selected_plan().map(|e| e.slug.as_str()),
+            Some("0002-beta")
+        );
+
+        // Up once → back to first.
+        app.update(AppEvent::PlanPickerUp);
+        assert_eq!(app.plan_cursor, 0);
+        assert_eq!(
+            app.selected_plan().map(|e| e.slug.as_str()),
+            Some("0001-alpha")
+        );
+
+        // Up at 0 → stays at 0 (clamped).
+        app.update(AppEvent::PlanPickerUp);
+        assert_eq!(app.plan_cursor, 0, "cursor must clamp at 0");
+        assert_eq!(
+            app.selected_plan().map(|e| e.slug.as_str()),
+            Some("0001-alpha")
         );
     }
 }

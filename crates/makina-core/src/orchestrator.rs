@@ -176,6 +176,55 @@ pub fn plan_slug(task_list_path: &Path) -> String {
     SLUG_FALLBACK.to_string()
 }
 
+/// One plan directory discovered under `docs/plans/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanEntry {
+    /// Absolute path to the plan directory (e.g. `…/docs/plans/0027-Plan-Auto-Discovery`).
+    pub dir: PathBuf,
+    /// The plan slug `plan_slug(dir/TASKS.md)` derives (e.g. `0027-plan-auto-discovery`).
+    pub slug: String,
+    /// `true` when the dir contains a `TASKS.md` (openable via `OpenRun`);
+    /// `false` routes to the planner-generate path (plan 0028).
+    pub has_tasks: bool,
+}
+
+/// Scan `repo_root/docs/plans/*/` for plan directories following the
+/// `SCOPE.md` / `ARCHITECTURE.md` / `TASKS.md` convention.
+///
+/// A directory is a plan iff it contains **both** `SCOPE.md` and
+/// `ARCHITECTURE.md`. `TASKS.md` is optional and recorded as
+/// [`PlanEntry::has_tasks`]. Returns entries sorted by directory name
+/// (so `0001-…` precedes `0027-…`). A missing `docs/plans` yields `vec![]`.
+pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
+    let plans_root = repo_root.join("docs").join("plans");
+    let mut entries = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&plans_root) else {
+        return entries; // no docs/plans → nothing discovered
+    };
+    for ent in rd.flatten() {
+        let dir = ent.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        // Convention gate: SCOPE.md AND ARCHITECTURE.md must both exist.
+        if !dir.join("SCOPE.md").is_file() || !dir.join("ARCHITECTURE.md").is_file() {
+            continue; // non-plan dirs (assets/, etc.) are ignored
+        }
+        let tasks = dir.join("TASKS.md");
+        let has_tasks = tasks.is_file();
+        // Slug is exactly what plan_slug derives from this dir's TASKS.md path,
+        // whether or not the file exists (plan_slug keys off the parent dir name).
+        let slug = plan_slug(&tasks);
+        entries.push(PlanEntry {
+            dir,
+            slug,
+            has_tasks,
+        });
+    }
+    entries.sort_by(|a, b| a.dir.file_name().cmp(&b.dir.file_name()));
+    entries
+}
+
 /// Sanitize `input` into a valid kebab id per `runtime-artifact-schema.md`
 /// §4.1: lowercase; map every maximal run of non-`[a-z0-9]` chars to a single
 /// `-`; trim leading/trailing `-`. The caller enforces the §4.1 length minimum.
@@ -3990,5 +4039,74 @@ Description text that is long enough for parser.
             view.tasks[1].finished_at, None,
             "pending task: finished_at must be None"
         );
+    }
+
+    #[test]
+    fn discover_plans_finds_convention_dirs() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plans_dir = tmp.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
+
+        // Create a plan with all three files (SCOPE.md, ARCHITECTURE.md, TASKS.md)
+        let plan_0001 = plans_dir.join("0001-x");
+        std::fs::create_dir(&plan_0001).expect("create 0001-x");
+        std::fs::write(plan_0001.join("SCOPE.md"), "scope").expect("write SCOPE.md");
+        std::fs::write(plan_0001.join("ARCHITECTURE.md"), "architecture")
+            .expect("write ARCHITECTURE.md");
+        std::fs::write(plan_0001.join("TASKS.md"), "tasks").expect("write TASKS.md");
+
+        let entries = discover_plans(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slug, "0001-x");
+        assert!(entries[0].has_tasks);
+        assert!(entries[0].dir.ends_with("0001-x"));
+    }
+
+    #[test]
+    fn dir_without_tasks_flagged() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plans_dir = tmp.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
+
+        // Create a plan without TASKS.md
+        let plan_0002 = plans_dir.join("0002-y");
+        std::fs::create_dir(&plan_0002).expect("create 0002-y");
+        std::fs::write(plan_0002.join("SCOPE.md"), "scope").expect("write SCOPE.md");
+        std::fs::write(plan_0002.join("ARCHITECTURE.md"), "architecture")
+            .expect("write ARCHITECTURE.md");
+
+        let entries = discover_plans(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slug, "0002-y");
+        assert!(!entries[0].has_tasks);
+    }
+
+    #[test]
+    fn non_plan_dirs_ignored() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plans_dir = tmp.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
+
+        // Create a non-plan directory (missing SCOPE.md and ARCHITECTURE.md)
+        let assets = plans_dir.join("assets");
+        std::fs::create_dir(&assets).expect("create assets");
+        std::fs::write(assets.join("foo.png"), "fake image").expect("write foo.png");
+
+        // Create a valid plan to ensure non-plans are properly filtered
+        let plan_0001 = plans_dir.join("0001-x");
+        std::fs::create_dir(&plan_0001).expect("create 0001-x");
+        std::fs::write(plan_0001.join("SCOPE.md"), "scope").expect("write SCOPE.md");
+        std::fs::write(plan_0001.join("ARCHITECTURE.md"), "architecture")
+            .expect("write ARCHITECTURE.md");
+
+        let entries = discover_plans(tmp.path());
+        // Only the valid plan should be discovered, not assets/
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slug, "0001-x");
+
+        // Test with missing docs/plans
+        let empty_tmp = tempfile::TempDir::new().expect("create temp dir");
+        let entries = discover_plans(empty_tmp.path());
+        assert_eq!(entries, vec![]);
     }
 }
