@@ -751,7 +751,7 @@ impl TaskListInterpreter for ModelInterpreter {
                 | ResponseEvent::ToolCall { .. }
                 | ResponseEvent::ToolCallUpdate { .. }
                 | ResponseEvent::CurrentModeUpdate { .. } => {}
-                ResponseEvent::TurnComplete => break,
+                ResponseEvent::TurnComplete { .. } => break,
             }
         }
         // Ensure the stream is dropped before we terminate the session.

@@ -1706,7 +1706,7 @@ Do the thing in `lib.rs`.
             };
             let events: Vec<Result<ResponseEvent, BackendError>> = vec![
                 Ok(ResponseEvent::TextChunk { text }),
-                Ok(ResponseEvent::TurnComplete),
+                Ok(ResponseEvent::TurnComplete { usage: None }),
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
@@ -1864,7 +1864,7 @@ Do the thing in `lib.rs`.
             };
             let events: Vec<Result<ResponseEvent, BackendError>> = vec![
                 Ok(ResponseEvent::TextChunk { text }),
-                Ok(ResponseEvent::TurnComplete),
+                Ok(ResponseEvent::TurnComplete { usage: None }),
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }

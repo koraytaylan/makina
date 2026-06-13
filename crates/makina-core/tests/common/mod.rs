@@ -105,7 +105,7 @@ pub async fn drain_response(stream: makina_core::backend::ResponseStream) -> Str
             | ResponseEvent::ToolCall { .. }
             | ResponseEvent::ToolCallUpdate { .. }
             | ResponseEvent::CurrentModeUpdate { .. } => {}
-            ResponseEvent::TurnComplete => break,
+            ResponseEvent::TurnComplete { .. } => break,
         }
     }
     text

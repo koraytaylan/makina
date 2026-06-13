@@ -420,6 +420,25 @@ pub struct PromptParams {
 pub struct PromptResult {
     /// Why the agent stopped (`end_turn`, `max_tokens`, `cancelled`, …).
     pub stop_reason: StopReason,
+    /// Optional token usage, when the agent reports it.
+    /// Absent for agents that don't emit it (the common case).
+    #[serde(default)]
+    pub usage: Option<TurnUsage>,
+}
+
+/// Token usage reported by the agent in a `session/prompt` result.
+///
+/// Both fields are optional because a backend may report one count without
+/// the other. `#[serde(default)]` ensures missing fields parse as `None`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnUsage {
+    /// Prompt/input tokens consumed by the turn, if reported.
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// Completion/output tokens produced by the turn, if reported.
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
 }
 
 /// `session/cancel` params (client → agent notification).
@@ -1247,5 +1266,38 @@ mod tests {
         assert_eq!(v2["sessionId"], "sess-789");
         assert_eq!(v2["optionId"], "effort_opt_1");
         assert_eq!(v2["value"], 42);
+    }
+
+    /// A `PromptResult` JSON without a `usage` field must deserialize to
+    /// `usage: None` (the serde default).  This verifies that the ACP backend
+    /// never invents usage counts when the agent omits the field (no estimation).
+    #[test]
+    fn usage_is_none_when_backend_omits_it() {
+        // JSON that a real ACP agent would send when it does not report usage.
+        let json = serde_json::json!({
+            "stopReason": "end_turn"
+        });
+        let result: PromptResult =
+            serde_json::from_value(json).expect("PromptResult must deserialize without usage");
+        assert!(
+            result.usage.is_none(),
+            "usage must be None when the backend omits the field"
+        );
+
+        // Also verify that `TurnUsage` fields default to None individually.
+        let json_partial = serde_json::json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 50
+            }
+        });
+        let result2: PromptResult = serde_json::from_value(json_partial)
+            .expect("PromptResult must deserialize with partial usage");
+        let usage = result2.usage.as_ref().expect("usage must be Some");
+        assert_eq!(usage.input_tokens, Some(50));
+        assert!(
+            usage.output_tokens.is_none(),
+            "output_tokens must be None when not reported"
+        );
     }
 }

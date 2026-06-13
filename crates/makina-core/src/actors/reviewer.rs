@@ -44,7 +44,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use kameo::actor::ActorRef;
@@ -52,7 +52,7 @@ use kameo::actor::ActorRef;
 use crate::api;
 use crate::backend::{AgentBackend, Prompt, ResponseEvent};
 use crate::config::RoleAssignment;
-use crate::roles::{Role, parse_review_verdict, session_config_for};
+use crate::roles::{Role, current_model_from, parse_review_verdict, session_config_for};
 use crate::task::Task;
 
 use super::supervisor::{EventSink, Supervisor};
@@ -237,6 +237,7 @@ impl kameo::message::Message<Review> for Reviewer {
             },
         });
 
+        let turn_start = Instant::now();
         let stream = match session.prompt(Prompt::new(prompt_text)).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -341,12 +342,26 @@ impl kameo::message::Message<Review> for Reviewer {
                         current_mode_id,
                     });
                 }
-                Some(Ok(ResponseEvent::TurnComplete)) => {
+                Some(Ok(ResponseEvent::TurnComplete { usage })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
                         role: api::AgentRole::Reviewer,
                         event: api::ExchangeEvent::TurnComplete,
+                    });
+                    let model = self
+                        .assignment
+                        .as_ref()
+                        .and_then(|a| a.model.clone())
+                        .or_else(|| current_model_from(session.capabilities().as_ref()))
+                        .unwrap_or_else(|| "(default)".to_string());
+                    (msg.sink)(api::Event::RoleTurnMetrics {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Reviewer,
+                        model,
+                        duration_ms: turn_start.elapsed().as_millis() as u64,
+                        usage,
                     });
                     break;
                 }

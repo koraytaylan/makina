@@ -244,8 +244,8 @@ impl AgentSession for NoopSession {
         if let Some(script) = &self.backend.scripted_events {
             let mut events: Vec<Result<ResponseEvent, BackendError>> =
                 script.iter().cloned().map(Ok).collect();
-            if !matches!(events.last(), Some(Ok(ResponseEvent::TurnComplete))) {
-                events.push(Ok(ResponseEvent::TurnComplete));
+            if !matches!(events.last(), Some(Ok(ResponseEvent::TurnComplete { .. }))) {
+                events.push(Ok(ResponseEvent::TurnComplete { usage: None }));
             }
             return Ok(Box::pin(stream::iter(events)));
         }
@@ -266,7 +266,7 @@ impl AgentSession for NoopSession {
             .collect();
 
         // Guarantee: stream ends with TurnComplete (contract §1).
-        events.push(Ok(ResponseEvent::TurnComplete));
+        events.push(Ok(ResponseEvent::TurnComplete { usage: None }));
 
         Ok(Box::pin(stream::iter(events)))
     }
@@ -335,7 +335,7 @@ mod tests {
 
         assert!(!events.is_empty(), "stream must not be empty");
         assert!(
-            matches!(events.last().unwrap(), ResponseEvent::TurnComplete),
+            matches!(events.last().unwrap(), ResponseEvent::TurnComplete { .. }),
             "last event must be TurnComplete, got: {:?}",
             events.last()
         );
@@ -350,7 +350,7 @@ mod tests {
         let events = drain_ok(stream).await;
 
         assert!(
-            matches!(events.last().unwrap(), ResponseEvent::TurnComplete),
+            matches!(events.last().unwrap(), ResponseEvent::TurnComplete { .. }),
             "last event must be TurnComplete"
         );
     }
@@ -368,7 +368,7 @@ mod tests {
         assert!(matches!(&events[0], ResponseEvent::TextChunk { text } if text == "line one"));
         assert!(matches!(&events[1], ResponseEvent::TextChunk { text } if text == "line two"));
         assert!(matches!(&events[2], ResponseEvent::TextChunk { text } if text == "line three"));
-        assert!(matches!(&events[3], ResponseEvent::TurnComplete));
+        assert!(matches!(&events[3], ResponseEvent::TurnComplete { .. }));
     }
 
     // ── rich path: scripted() emits side-channel events ───────────────────────
@@ -408,7 +408,7 @@ mod tests {
         assert!(matches!(&events[1], ResponseEvent::ToolCall { id, .. } if id == "tc-1"));
         assert!(matches!(&events[2], ResponseEvent::TextChunk { text } if text == "the answer"));
         assert!(matches!(&events[3], ResponseEvent::ToolCallUpdate { id, .. } if id == "tc-1"));
-        assert!(matches!(&events[4], ResponseEvent::TurnComplete));
+        assert!(matches!(&events[4], ResponseEvent::TurnComplete { .. }));
 
         // The prompt was still recorded.
         assert_eq!(backend.recorded_prompts(), vec!["go"]);
@@ -584,7 +584,7 @@ mod tests {
                     | ResponseEvent::ToolCall { .. }
                     | ResponseEvent::ToolCallUpdate { .. }
                     | ResponseEvent::CurrentModeUpdate { .. } => {}
-                    ResponseEvent::TurnComplete => break,
+                    ResponseEvent::TurnComplete { .. } => break,
                 }
             }
 

@@ -145,7 +145,7 @@ impl AgentSession for CannedSession {
             Ok(ResponseEvent::TextChunk {
                 text: self.response.clone(),
             }),
-            Ok(ResponseEvent::TurnComplete),
+            Ok(ResponseEvent::TurnComplete { usage: None }),
         ];
         Ok(Box::pin(stream::iter(events)))
     }

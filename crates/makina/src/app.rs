@@ -798,6 +798,20 @@ pub enum AppEvent {
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
+/// Per-role turn metrics for a task, rendered in the exchange pane header.
+///
+/// Holds the latest model, duration, and optional token usage for a single
+/// role's completed turn.
+#[derive(Debug, Clone)]
+pub struct RoleTurnMetric {
+    /// The model that answered this role's turn.
+    pub model: String,
+    /// Wall-clock duration of the turn, in milliseconds.
+    pub duration_ms: u64,
+    /// Token usage when the backend reported it.
+    pub usage: Option<makina_core::api::UsageStats>,
+}
+
 /// All mutable TUI state.
 ///
 /// # Arc<dyn Api>
@@ -1018,6 +1032,13 @@ pub struct App {
     /// tool/edit content in addition to the concise headers.  Toggled by
     /// `Ctrl+O` ([`AppEvent::ToggleVerbose`]).  Defaults to `false` (compact).
     pub verbose_mode: bool,
+
+    // ── Per-role metrics (plan 0024) ───────────────────────────────────────────
+    /// Latest per-role turn metrics, keyed by (run, task) then role.
+    ///
+    /// Updated on every `Event::RoleTurnMetrics`; the content pane renders the
+    /// most recent metric for each role of the focused task.
+    pub role_metrics: HashMap<(RunId, TaskId), HashMap<AgentRole, RoleTurnMetric>>,
 }
 
 impl App {
@@ -1206,6 +1227,7 @@ impl App {
             caps: makina_core::config::CapsConfig::default(),
             concurrency: 3,
             verbose_mode: false,
+            role_metrics: HashMap::new(),
         }
     }
 
@@ -2336,6 +2358,28 @@ impl App {
                 self.task_step_start_tick.remove(&(*run, task.clone()));
                 self.task_last_activity_tick.remove(&(*run, task.clone()));
                 self.status_message = Some(format!("retrying {}", task.0));
+            }
+            // Per-turn metrics event (plan 0024). Consumed by task 0072's render
+            // step; accumulate the latest metrics per (run, task) and role.
+            Event::RoleTurnMetrics {
+                run,
+                task,
+                role,
+                model,
+                duration_ms,
+                usage,
+            } => {
+                self.role_metrics
+                    .entry((*run, task.clone()))
+                    .or_default()
+                    .insert(
+                        role.clone(),
+                        RoleTurnMetric {
+                            model: model.clone(),
+                            duration_ms: *duration_ms,
+                            usage: usage.clone(),
+                        },
+                    );
             }
         }
 
@@ -5763,5 +5807,60 @@ mod tests {
         // Verify it's now None.
         assert_eq!(app.caps.idle_secs, None);
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn update_records_role_metrics_per_role() {
+        let api = Arc::new(PlaceholderApi::new());
+        let run_id = RunId(42);
+        let task_id = TaskId::new("test-task");
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        // Record a Developer metric.
+        app.update(AppEvent::ApiEvent(Event::RoleTurnMetrics {
+            run: run_id,
+            task: task_id.clone(),
+            role: AgentRole::Developer,
+            model: "gpt-4o".to_string(),
+            duration_ms: 1500,
+            usage: None,
+        }));
+
+        // Record a Reviewer metric for the same (run, task).
+        app.update(AppEvent::ApiEvent(Event::RoleTurnMetrics {
+            run: run_id,
+            task: task_id.clone(),
+            role: AgentRole::Reviewer,
+            model: "gpt-4-turbo".to_string(),
+            duration_ms: 2000,
+            usage: Some(makina_core::api::UsageStats {
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+            }),
+        }));
+
+        // Verify both metrics are stored.
+        let key = (run_id, task_id);
+        let by_role = app.role_metrics.get(&key).expect("metrics not stored");
+
+        let dev_metric = by_role
+            .get(&AgentRole::Developer)
+            .expect("Developer metric not found");
+        assert_eq!(dev_metric.model, "gpt-4o");
+        assert_eq!(dev_metric.duration_ms, 1500);
+        assert_eq!(dev_metric.usage, None);
+
+        let rev_metric = by_role
+            .get(&AgentRole::Reviewer)
+            .expect("Reviewer metric not found");
+        assert_eq!(rev_metric.model, "gpt-4-turbo");
+        assert_eq!(rev_metric.duration_ms, 2000);
+        assert_eq!(
+            rev_metric.usage,
+            Some(makina_core::api::UsageStats {
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+            })
+        );
     }
 }

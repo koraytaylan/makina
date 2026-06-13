@@ -64,7 +64,7 @@ async fn drain_ok(stream: ResponseStream) -> (String, /* turn_complete_count */ 
             | ResponseEvent::ToolCallUpdate { .. } => {
                 assert!(!saw_complete_last, "no event may follow TurnComplete");
             }
-            ResponseEvent::TurnComplete => {
+            ResponseEvent::TurnComplete { .. } => {
                 completes += 1;
                 saw_complete_last = true;
             }
@@ -160,7 +160,7 @@ async fn non_message_updates_are_mapped_to_response_events() {
                 assert!(!saw_complete_last, "no event may follow TurnComplete");
                 tool_call_updates.push((id, status, title));
             }
-            ResponseEvent::TurnComplete => {
+            ResponseEvent::TurnComplete { .. } => {
                 completes += 1;
                 saw_complete_last = true;
             }
@@ -308,7 +308,7 @@ async fn mid_turn_disconnect_surfaces_transport_error_no_false_turn_complete() {
             ) => {
                 panic!("this turn injects no side-channel events");
             }
-            Ok(ResponseEvent::TurnComplete) => {
+            Ok(ResponseEvent::TurnComplete { .. }) => {
                 panic!("must NOT emit TurnComplete after a mid-turn disconnect");
             }
             Err(BackendError::Transport { .. }) => saw_transport_err = true,

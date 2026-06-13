@@ -230,7 +230,11 @@ pub enum ResponseEvent {
     /// The agent has finished generating its response for this turn.
     ///
     /// This event MUST be the last item before the stream closes.
-    TurnComplete,
+    TurnComplete {
+        /// Token usage reported by the backend for this turn, if any.
+        /// `None` when the backend did not report usage counts (the common case).
+        usage: Option<api::UsageStats>,
+    },
 }
 
 // ── Stream type alias ─────────────────────────────────────────────────────────
@@ -403,7 +407,7 @@ mod tests {
                 Ok(ResponseEvent::TextChunk {
                     text: " (done)".to_string(),
                 }),
-                Ok(ResponseEvent::TurnComplete),
+                Ok(ResponseEvent::TurnComplete { usage: None }),
             ];
             Ok(Box::pin(stream::iter(events)))
         }
@@ -465,7 +469,7 @@ mod tests {
 
         // Final event is TurnComplete.
         assert!(
-            matches!(&events[2], ResponseEvent::TurnComplete),
+            matches!(&events[2], ResponseEvent::TurnComplete { .. }),
             "last event should be TurnComplete"
         );
     }
@@ -538,7 +542,7 @@ mod tests {
                 title: None,
                 detail: None,
             }),
-            Ok(ResponseEvent::TurnComplete),
+            Ok(ResponseEvent::TurnComplete { usage: None }),
         ];
         let stream: ResponseStream = Box::pin(stream::iter(events));
 
@@ -554,7 +558,7 @@ mod tests {
                 | ResponseEvent::CurrentModeUpdate { .. } => {
                     // Side-channel events do not contribute to the answer.
                 }
-                ResponseEvent::TurnComplete => break,
+                ResponseEvent::TurnComplete { .. } => break,
             }
         }
 
@@ -569,7 +573,7 @@ mod tests {
         let chunk = ResponseEvent::TextChunk {
             text: "hello".to_string(),
         };
-        let complete = ResponseEvent::TurnComplete;
+        let complete = ResponseEvent::TurnComplete { usage: None };
 
         // Clone must compile and produce equal values.
         let chunk2 = chunk.clone();

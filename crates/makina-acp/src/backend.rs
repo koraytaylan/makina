@@ -600,7 +600,15 @@ async fn run_turn(
                 // consumer is still listening, the turn is over. The ACP
                 // `stop_reason` is intentionally dropped — `ResponseEvent::TurnComplete`
                 // carries no reason in the MVP.
-                let _ = event_tx.send(Ok(ResponseEvent::TurnComplete)).await;
+                //
+                // Usage is mapped to `None` here (MVP fallback): the ACP
+                // `PromptResult.usage` field is parsed by the protocol layer but
+                // not yet threaded through `AcpResponseChunk::TurnComplete`
+                // (would require changing `client.rs`).  Behaviour is identical —
+                // usage simply never lights up until that threading is added.
+                let _ = event_tx
+                    .send(Ok(ResponseEvent::TurnComplete { usage: None }))
+                    .await;
                 return;
             }
             // Mid-turn failure: surface a typed error item and stop. The ACP
@@ -913,7 +921,7 @@ mod tests {
                 | makina_core::backend::ResponseEvent::ToolCall { .. }
                 | makina_core::backend::ResponseEvent::ToolCallUpdate { .. }
                 | makina_core::backend::ResponseEvent::CurrentModeUpdate { .. } => {}
-                makina_core::backend::ResponseEvent::TurnComplete => completes += 1,
+                makina_core::backend::ResponseEvent::TurnComplete { .. } => completes += 1,
             }
         }
         assert_eq!(text, "unit work done");

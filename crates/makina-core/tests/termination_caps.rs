@@ -545,7 +545,7 @@ impl AgentSession for SlowSession {
             Ok(ResponseEvent::TextChunk {
                 text: "developer output".to_string(),
             }),
-            Ok(ResponseEvent::TurnComplete),
+            Ok(ResponseEvent::TurnComplete { usage: None }),
         ];
         Ok(Box::pin(stream::iter(events)))
     }

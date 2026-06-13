@@ -88,7 +88,7 @@ async fn collect_response(
                 ResponseEvent::ThoughtChunk { .. }
                 | ResponseEvent::ToolCall { .. }
                 | ResponseEvent::ToolCallUpdate { .. } => {}
-                ResponseEvent::TurnComplete => {
+                ResponseEvent::TurnComplete { .. } => {
                     eprintln!("\n[turn complete]");
                     break;
                 }

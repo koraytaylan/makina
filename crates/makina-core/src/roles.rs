@@ -59,6 +59,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::api;
 use crate::backend::SessionConfig;
 use crate::config::RoleAssignment;
 
@@ -208,6 +209,24 @@ pub fn session_config_for(
         effort,
         extra: None,
     }
+}
+
+/// Return the current model name from a session's discovered capabilities, if any.
+///
+/// Scans `caps.config_options` for the first entry with `category == "model"`
+/// and returns its `current_value` as a `String`.  Returns `None` if capabilities
+/// are absent, no model option is found, or the current value is not a string.
+///
+/// Used by the Developer and Reviewer actors to resolve the model name for the
+/// `Event::RoleTurnMetrics` emission when the role assignment did not specify one.
+pub fn current_model_from(caps: Option<&api::SessionCapabilities>) -> Option<String> {
+    let caps = caps?;
+    caps.config_options
+        .iter()
+        .find(|opt| opt.category == "model")
+        .and_then(|opt| opt.current_value.as_ref())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 // ── ReviewVerdict ─────────────────────────────────────────────────────────────
@@ -574,7 +593,7 @@ mod tests {
                 | ResponseEvent::ToolCall { .. }
                 | ResponseEvent::ToolCallUpdate { .. }
                 | ResponseEvent::CurrentModeUpdate { .. } => {}
-                ResponseEvent::TurnComplete => break,
+                ResponseEvent::TurnComplete { .. } => break,
             }
         }
         drop(stream);

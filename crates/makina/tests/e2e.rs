@@ -543,6 +543,18 @@ fn log_event(ev: &Event) {
         Event::TaskRetried { task, .. } => {
             eprintln!("  · TaskRetried {}", task.0)
         }
+        Event::RoleTurnMetrics {
+            role,
+            task,
+            model,
+            duration_ms,
+            ..
+        } => {
+            eprintln!(
+                "  · RoleTurnMetrics {role:?}[{}] model={model} duration={duration_ms}ms",
+                task.0
+            )
+        }
     }
 }
 

@@ -47,7 +47,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use kameo::actor::ActorRef;
@@ -55,7 +55,7 @@ use kameo::actor::ActorRef;
 use crate::api;
 use crate::backend::{AgentBackend, Prompt, ResponseEvent};
 use crate::config::RoleAssignment;
-use crate::roles::{Role, session_config_for};
+use crate::roles::{Role, current_model_from, session_config_for};
 use crate::task::Task;
 
 use super::supervisor::{EventSink, Supervisor};
@@ -262,6 +262,7 @@ impl kameo::message::Message<Develop> for Developer {
             },
         });
 
+        let turn_start = Instant::now();
         let stream = match session.prompt(Prompt::new(prompt_text)).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -371,12 +372,26 @@ impl kameo::message::Message<Develop> for Developer {
                         current_mode_id,
                     });
                 }
-                Some(Ok(ResponseEvent::TurnComplete)) => {
+                Some(Ok(ResponseEvent::TurnComplete { usage })) => {
                     (msg.sink)(api::Event::AgentExchange {
                         run: msg.run,
                         task: task_id.clone(),
                         role: api::AgentRole::Developer,
                         event: api::ExchangeEvent::TurnComplete,
+                    });
+                    let model = self
+                        .assignment
+                        .as_ref()
+                        .and_then(|a| a.model.clone())
+                        .or_else(|| current_model_from(session.capabilities().as_ref()))
+                        .unwrap_or_else(|| "(default)".to_string());
+                    (msg.sink)(api::Event::RoleTurnMetrics {
+                        run: msg.run,
+                        task: task_id.clone(),
+                        role: api::AgentRole::Developer,
+                        model,
+                        duration_ms: turn_start.elapsed().as_millis() as u64,
+                        usage,
                     });
                     break;
                 }
@@ -517,7 +532,7 @@ fn build_develop_prompt(task: &Task, feedback: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendError, ResponseEvent, ResponseStream};
+    use crate::backend::{AgentBackend, BackendError, ResponseEvent, ResponseStream};
     use futures::stream;
 
     // ── Drain helper (test-only mirror of the production watchdog loop) ───────
@@ -531,6 +546,10 @@ mod tests {
     /// - `Some(idle)` → each `next()` is wrapped in
     ///   `tokio::time::timeout(idle)`.  On elapse: `IdleTimeout`.
     /// - `None` → bare `next()`, identical to the pre-watchdog code (legacy path).
+    ///
+    /// On `TurnComplete`, emits both `AgentExchange::TurnComplete` and
+    /// `RoleTurnMetrics` (matching the production handler) so tests that use
+    /// this helper observe the same event sequence.
     async fn drain_stream_with_watchdog(
         mut stream: ResponseStream,
         idle_secs: Option<u64>,
@@ -562,12 +581,20 @@ mod tests {
                 Some(Ok(ResponseEvent::TextChunk { text })) => {
                     output.push_str(&text);
                 }
-                Some(Ok(ResponseEvent::TurnComplete)) => {
+                Some(Ok(ResponseEvent::TurnComplete { usage })) => {
                     sink(api::Event::AgentExchange {
                         run,
                         task: task.clone(),
                         role: api::AgentRole::Developer,
                         event: api::ExchangeEvent::TurnComplete,
+                    });
+                    sink(api::Event::RoleTurnMetrics {
+                        run,
+                        task: task.clone(),
+                        role: api::AgentRole::Developer,
+                        model: "(default)".to_string(),
+                        duration_ms: 0,
+                        usage,
                     });
                     break;
                 }
@@ -636,7 +663,7 @@ mod tests {
                 }
                 _ => {
                     // TurnComplete.
-                    Some((Ok(ResponseEvent::TurnComplete), u32::MAX))
+                    Some((Ok(ResponseEvent::TurnComplete { usage: None }), u32::MAX))
                 }
             }
         });
@@ -785,6 +812,162 @@ mod tests {
             Ok(Err(DeveloperError::Other(msg))) => {
                 panic!("unexpected other error: {msg}");
             }
+        }
+    }
+
+    // ── Acceptance test: metrics_event_carries_model_and_duration ─────────────
+
+    /// **Acceptance test** — `metrics_event_carries_model_and_duration`
+    ///
+    /// Sends a real `Develop` message through the kameo `Developer` actor (the
+    /// production `Developer::handle` code path).  Asserts that a
+    /// `Event::RoleTurnMetrics` with the assignment's model and a `duration_ms`
+    /// ≥ 0 is emitted by the real handler.
+    ///
+    /// Uses the `NoopBackend` (one chunk + `TurnComplete`) and a real git
+    /// worktree for the commit step.
+    #[tokio::test]
+    async fn metrics_event_carries_model_and_duration() {
+        use std::sync::Mutex;
+
+        use chrono::Utc;
+
+        use crate::{
+            actors::{Develop, Developer, DeveloperArgs, Supervisor, SupervisorArgs},
+            backend::noop::NoopBackend,
+            config::{Config, GlobalConfig, ProjectConfig, RoleAssignment},
+            supervision::{RestartConfig, RootSupervisor},
+            task::{Task, TaskId, TaskState},
+            worktree::WorktreeManager,
+        };
+
+        // ── Shared sink ─────────────────────────────────────────────────────
+        let events: Arc<Mutex<Vec<api::Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let sink: crate::actors::supervisor::EventSink = Arc::new(move |e: api::Event| {
+            events_clone.lock().unwrap().push(e);
+        });
+
+        // ── Backend: one text chunk then TurnComplete{usage:None} ────────────
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(NoopBackend::with_responses(vec!["hello".into()]));
+
+        // ── Role assignment with model = "test-model" ────────────────────────
+        let assignment = RoleAssignment {
+            provider: "noop".to_string(),
+            mode: None,
+            model: Some("test-model".to_string()),
+            effort: None,
+        };
+
+        // ── Spawn actors ─────────────────────────────────────────────────────
+        let root = RootSupervisor::start();
+
+        let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
+            &root,
+            SupervisorArgs {
+                worktree_manager: WorktreeManager::new(
+                    std::path::PathBuf::from("/tmp/makina-dev-metrics-test"),
+                    "develop".into(),
+                ),
+                config: Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+            },
+            RestartConfig::default(),
+        )
+        .await;
+
+        let developer_ref = RootSupervisor::spawn_child::<Developer>(
+            &root,
+            DeveloperArgs {
+                supervisor: supervisor_ref.clone(),
+                backend: Arc::clone(&backend),
+                assignment: Some(assignment),
+            },
+            RestartConfig::default(),
+        )
+        .await;
+
+        // ── Real git worktree for the commit step ────────────────────────────
+        let dev_worktree = tempfile::tempdir().expect("temp worktree dir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dev_worktree.path())
+                .args(args)
+                .status()
+                .expect("git must be available");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["commit", "--allow-empty", "-m", "init"]);
+
+        // ── Task ─────────────────────────────────────────────────────────────
+        let now = Utc::now();
+        let task = Task {
+            id: TaskId::new("metrics-test-task"),
+            title: "Metrics test".to_string(),
+            description: "Test that metrics are emitted".to_string(),
+            done_when: "RoleTurnMetrics is emitted".to_string(),
+            depends_on: vec![],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        };
+
+        // ── Send Develop message through the real actor ──────────────────────
+        developer_ref
+            .ask(Develop {
+                task,
+                worktree: dev_worktree.path().to_path_buf(),
+                feedback: None,
+                run: api::RunId(0),
+                sink,
+                idle_secs: None,
+            })
+            .send()
+            .await
+            .expect("Develop must return Ok");
+
+        // ── Assert RoleTurnMetrics was emitted ───────────────────────────────
+        let collected = events.lock().unwrap();
+        let metrics_event = collected
+            .iter()
+            .find(|e| matches!(e, api::Event::RoleTurnMetrics { .. }));
+
+        assert!(
+            metrics_event.is_some(),
+            "expected a RoleTurnMetrics event; got: {collected:?}"
+        );
+
+        if let Some(api::Event::RoleTurnMetrics {
+            model,
+            duration_ms,
+            role,
+            usage,
+            ..
+        }) = metrics_event
+        {
+            assert_eq!(
+                model, "test-model",
+                "model must be resolved from the role assignment"
+            );
+            assert!(
+                *duration_ms < u64::MAX,
+                "duration_ms must be a measured value, got {duration_ms}"
+            );
+            assert_eq!(*role, api::AgentRole::Developer, "role must be Developer");
+            assert!(
+                usage.is_none(),
+                "usage must be None when backend reports no usage"
+            );
         }
     }
 }

@@ -829,6 +829,39 @@ pub enum Event {
         /// The task that was reset for retry.
         task: TaskId,
     },
+
+    /// Metrics for one completed agent role-turn (developer or reviewer).
+    ///
+    /// Emitted once per turn on `TurnComplete` so the TUI can show which model
+    /// answered and how long it took. `usage` lights up only if the backend
+    /// reported token counts; it is `None` otherwise (no estimation).
+    RoleTurnMetrics {
+        /// The Run the turn belongs to.
+        run: RunId,
+        /// The task whose agent took the turn.
+        task: TaskId,
+        /// Which role took the turn (Developer or Reviewer).
+        role: AgentRole,
+        /// The model that answered (resolved from the role assignment, with a
+        /// capabilities fallback). Never empty.
+        model: String,
+        /// Wall-clock duration of the turn, in milliseconds.
+        duration_ms: u64,
+        /// Token usage, when the backend reported it.
+        usage: Option<UsageStats>,
+    },
+}
+
+/// Token usage for a single agent turn, when the backend reports it.
+///
+/// Both fields are `Option` because a backend may emit one count without the
+/// other. Makina never *estimates* these — an absent count stays `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageStats {
+    /// Prompt/input tokens consumed by the turn, if reported.
+    pub input_tokens: Option<u64>,
+    /// Completion/output tokens produced by the turn, if reported.
+    pub output_tokens: Option<u64>,
 }
 
 // ── Stream type alias ─────────────────────────────────────────────────────────
@@ -1399,5 +1432,61 @@ mod tests {
         api.execute(Command::CancelRun { run: id1 }).await.unwrap();
         assert_eq!(api.runs().await.len(), 1);
         assert!(api.run(id2).await.is_some(), "id2 should still be open");
+    }
+
+    /// Verify that `Event::RoleTurnMetrics` and `UsageStats` round-trip through
+    /// `serde_json` — both with `usage: None` and with `usage: Some(UsageStats)`.
+    #[test]
+    fn metrics_event_round_trips() {
+        // Case 1: usage = None
+        let event_no_usage = Event::RoleTurnMetrics {
+            run: RunId(1),
+            task: TaskId::new("t1"),
+            role: AgentRole::Developer,
+            model: "claude-opus".to_string(),
+            duration_ms: 1234,
+            usage: None,
+        };
+        let json = serde_json::to_string(&event_no_usage)
+            .expect("Event::RoleTurnMetrics with usage:None must serialize");
+        let decoded: Event = serde_json::from_str(&json)
+            .expect("Event::RoleTurnMetrics with usage:None must deserialize");
+        assert_eq!(
+            format!("{event_no_usage:?}"),
+            format!("{decoded:?}"),
+            "round-trip with usage:None must be identical"
+        );
+
+        // Case 2: usage = Some(UsageStats { ... })
+        let event_with_usage = Event::RoleTurnMetrics {
+            run: RunId(2),
+            task: TaskId::new("t2"),
+            role: AgentRole::Reviewer,
+            model: "gpt-4o".to_string(),
+            duration_ms: 5678,
+            usage: Some(UsageStats {
+                input_tokens: Some(100),
+                output_tokens: Some(40),
+            }),
+        };
+        let json2 = serde_json::to_string(&event_with_usage)
+            .expect("Event::RoleTurnMetrics with usage:Some must serialize");
+        let decoded2: Event = serde_json::from_str(&json2)
+            .expect("Event::RoleTurnMetrics with usage:Some must deserialize");
+        assert_eq!(
+            format!("{event_with_usage:?}"),
+            format!("{decoded2:?}"),
+            "round-trip with usage:Some must be identical"
+        );
+
+        // Sanity: both tokens are present in the JSON
+        assert!(
+            json2.contains("100"),
+            "serialized JSON must contain input_tokens=100"
+        );
+        assert!(
+            json2.contains("40"),
+            "serialized JSON must contain output_tokens=40"
+        );
     }
 }

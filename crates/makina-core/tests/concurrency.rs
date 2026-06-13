@@ -191,7 +191,7 @@ impl AgentSession for CountingSession {
         };
         let events: Vec<Result<ResponseEvent, BackendError>> = vec![
             Ok(ResponseEvent::TextChunk { text }),
-            Ok(ResponseEvent::TurnComplete),
+            Ok(ResponseEvent::TurnComplete { usage: None }),
         ];
 
         // ── Session no longer active (prompt complete) ─────────────────────────

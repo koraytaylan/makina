@@ -147,7 +147,7 @@ async fn real_cli_prompt_response_through_the_backend_trait() {
                 ResponseEvent::ThoughtChunk { .. }
                 | ResponseEvent::ToolCall { .. }
                 | ResponseEvent::ToolCallUpdate { .. } => {}
-                ResponseEvent::TurnComplete => {
+                ResponseEvent::TurnComplete { .. } => {
                     eprintln!("\n[turn complete]");
                     completed = true;
                     break;

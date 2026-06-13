@@ -152,7 +152,9 @@ impl AgentSession for SpySession {
             let _ = tx
                 .send(Ok(ResponseEvent::TextChunk { text: response }))
                 .await;
-            let _ = tx.send(Ok(ResponseEvent::TurnComplete)).await;
+            let _ = tx
+                .send(Ok(ResponseEvent::TurnComplete { usage: None }))
+                .await;
         });
         Ok(Box::pin(ReceiverStream::new(rx)))
     }

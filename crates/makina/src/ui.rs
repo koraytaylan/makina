@@ -764,6 +764,71 @@ fn truncate_label(s: &str, cols: u16) -> String {
     out
 }
 
+/// Per-role metric label.
+///
+/// Returns "developer" or "reviewer".
+fn role_label(role: &makina_core::api::AgentRole) -> &'static str {
+    match role {
+        makina_core::api::AgentRole::Developer => "developer",
+        makina_core::api::AgentRole::Reviewer => "reviewer",
+    }
+}
+
+/// Format a duration in milliseconds as a human-readable string.
+///
+/// Examples: "1.8s", "2m 04s"
+fn fmt_duration(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let remaining_ms = ms % 1000;
+
+    if total_secs >= 60 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{}m {:02}s", mins, secs)
+    } else {
+        let secs_f = total_secs as f64 + remaining_ms as f64 / 1000.0;
+        format!("{:.1}s", secs_f)
+    }
+}
+
+/// Per-role metric lines for the focused task's detail header.
+///
+/// Builds one line per role with the format:
+/// `{role} · {model} · {duration}` (+ ` · {in}→{out} tok` only when usage Some).
+fn role_metric_lines(app: &App, task: &makina_core::api::TaskView) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(run) = app.selected_run() else {
+        return lines;
+    };
+    let Some(by_role) = app.role_metrics.get(&(run.id, task.id.clone())) else {
+        return lines;
+    };
+
+    for role in [
+        makina_core::api::AgentRole::Developer,
+        makina_core::api::AgentRole::Reviewer,
+    ] {
+        if let Some(m) = by_role.get(&role) {
+            let mut text = format!(
+                "{} · {} · {}",
+                role_label(&role),
+                m.model,
+                fmt_duration(m.duration_ms)
+            );
+            if let Some(u) = &m.usage
+                && let (Some(i), Some(o)) = (u.input_tokens, u.output_tokens)
+            {
+                text.push_str(&format!(" · {}→{} tok", i, o));
+            }
+            lines.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines
+}
+
 /// Render the activity indicators (idle time and wall-clock countdown) for a task.
 ///
 /// Returns a vector of Spans to be added to the task detail line, showing:
@@ -901,6 +966,10 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     detail_lines.push(Line::from(activity_indicators));
                 }
 
+                // Add per-role metrics (plan 0024).
+                let metrics = role_metric_lines(app, task);
+                detail_lines.extend(metrics);
+
                 detail_lines.push(Line::from(""));
 
                 // Add failure reason if the task is failed.
@@ -953,6 +1022,10 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     detail_lines.push(Line::from(activity_indicators));
                 }
 
+                // Add per-role metrics (plan 0024).
+                let metrics = role_metric_lines(app, task);
+                detail_lines.extend(metrics);
+
                 detail_lines.push(Line::from(""));
 
                 // Add failure reason if the task is failed.
@@ -1000,6 +1073,10 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 if !activity_indicators.is_empty() {
                     lines.push(Line::from(activity_indicators));
                 }
+
+                // Add per-role metrics (plan 0024).
+                let metrics = role_metric_lines(app, task);
+                lines.extend(metrics);
 
                 lines.push(Line::from(""));
 
@@ -2185,6 +2262,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::AgentExchange { .. } => "AgentExchange",
         Event::TaskIdle { .. } => "TaskIdle",
         Event::TaskRetried { .. } => "TaskRetried",
+        Event::RoleTurnMetrics { .. } => "RoleTurnMetrics",
     }
 }
 
@@ -5486,6 +5564,152 @@ mod tests {
         assert!(
             screen.contains("—"),
             "modal must show empty idle_secs as '—'; got:\n{screen}"
+        );
+    }
+
+    // ── Per-role metrics (plan 0024) ───────────────────────────────────────────
+
+    #[test]
+    fn header_shows_model_and_duration() {
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::new());
+
+        let run_id = RunId(1);
+        let task_id = TaskId::new("test-task");
+
+        let task = TaskView {
+            id: task_id.clone(),
+            title: "Test Task".into(),
+            state: TaskState::Done,
+            gate_iterations: 1,
+            review_iterations: 0,
+            depends_on: vec![],
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        };
+
+        let run = RunView {
+            id: run_id,
+            run_uid: "test-uid".to_string(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Completed,
+            project: "test-project".to_string(),
+            tasks: vec![task],
+            report: IngestionReport::default(),
+        };
+
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+
+        // Manually add a Developer metric with no usage.
+        let key = (run_id, task_id.clone());
+        app.role_metrics.entry(key).or_default().insert(
+            makina_core::api::AgentRole::Developer,
+            crate::app::RoleTurnMetric {
+                model: "gpt-4o".to_string(),
+                duration_ms: 1800,
+                usage: None,
+            },
+        );
+
+        terminal
+            .draw(|frame| render(&app, frame))
+            .expect("draw must succeed");
+
+        let screen = screen_of(&terminal);
+
+        // Check that the header contains the model name
+        assert!(
+            screen.contains("gpt-4o"),
+            "header must show model 'gpt-4o'; got:\n{screen}"
+        );
+
+        // Check that the header contains "developer" label
+        assert!(
+            screen.contains("developer"),
+            "header must show 'developer' label; got:\n{screen}"
+        );
+
+        // Check that a duration is shown (should be "1.8s")
+        assert!(
+            screen.contains("1.8s") || screen.contains("1800"),
+            "header must show duration; got:\n{screen}"
+        );
+
+        // Check that "tok" does NOT appear when usage is None
+        assert!(
+            !screen.contains("tok"),
+            "header must NOT show 'tok' when usage is None; got:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tokens_shown_only_when_present() {
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::new());
+
+        let run_id = RunId(2);
+        let task_id = TaskId::new("test-task");
+
+        let task = TaskView {
+            id: task_id.clone(),
+            title: "Test Task".into(),
+            state: TaskState::Done,
+            gate_iterations: 1,
+            review_iterations: 0,
+            depends_on: vec![],
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        };
+
+        let run = RunView {
+            id: run_id,
+            run_uid: "test-uid".to_string(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Completed,
+            project: "test-project".to_string(),
+            tasks: vec![task],
+            report: IngestionReport::default(),
+        };
+
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+
+        // Manually add a Developer metric WITH usage.
+        let key = (run_id, task_id.clone());
+        app.role_metrics.entry(key).or_default().insert(
+            makina_core::api::AgentRole::Developer,
+            crate::app::RoleTurnMetric {
+                model: "gpt-4o".to_string(),
+                duration_ms: 2500,
+                usage: Some(makina_core::api::UsageStats {
+                    input_tokens: Some(100),
+                    output_tokens: Some(40),
+                }),
+            },
+        );
+
+        terminal
+            .draw(|frame| render(&app, frame))
+            .expect("draw must succeed");
+
+        let screen = screen_of(&terminal);
+
+        // Check that the arrow and tok appear when usage is present
+        assert!(
+            screen.contains("→"),
+            "header must show '→' when usage is present; got:\n{screen}"
+        );
+
+        assert!(
+            screen.contains("tok"),
+            "header must show 'tok' when usage is present; got:\n{screen}"
+        );
+
+        // Also check the actual token numbers appear
+        assert!(
+            screen.contains("100") || screen.contains("40"),
+            "header must show token counts when usage is present; got:\n{screen}"
         );
     }
 }

@@ -135,7 +135,7 @@ impl AgentSession for FailOneSession {
         };
         let events: Vec<Result<ResponseEvent, BackendError>> = vec![
             Ok(ResponseEvent::TextChunk { text }),
-            Ok(ResponseEvent::TurnComplete),
+            Ok(ResponseEvent::TurnComplete { usage: None }),
         ];
         Ok(Box::pin(stream::iter(events)))
     }
@@ -202,7 +202,7 @@ impl AgentSession for PanicSession {
         };
         let events: Vec<Result<ResponseEvent, BackendError>> = vec![
             Ok(ResponseEvent::TextChunk { text }),
-            Ok(ResponseEvent::TurnComplete),
+            Ok(ResponseEvent::TurnComplete { usage: None }),
         ];
         Ok(Box::pin(stream::iter(events)))
     }
