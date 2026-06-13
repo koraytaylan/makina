@@ -3618,9 +3618,11 @@ mod tests {
             "task-b exchange must NOT appear when task-a is focused"
         );
 
-        // Switch Main panel focus and navigate to task-b (index 1).
-        app.update(AppEvent::FocusNext); // focus → Main
-        app.update(AppEvent::SelectDown); // task selection → index 1
+        // Navigate to task-b (index 1) via tree in Sidebar.
+        // Tree cursor: 0 (Run) -> 1 (Task A) -> 2 (Task B)
+        // Need SelectDown twice to reach task-b.
+        app.update(AppEvent::SelectDown); // tree move to task-a node
+        app.update(AppEvent::SelectDown); // tree move to task-b node
         assert_eq!(app.selected_task, Some(1));
 
         terminal.draw(|f| render(&app, f)).unwrap();

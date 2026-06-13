@@ -835,6 +835,10 @@ fn translate_key(
             // Sidebar navigation: arrow keys and vim-style j/k.
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
+            // Right arrow: expand collapsed run or cross focus to content pane.
+            KeyCode::Right => AppEvent::FocusRightOrExpand,
+            // Left arrow: collapse expanded run or return focus to sidebar.
+            KeyCode::Left => AppEvent::FocusLeftOrCollapse,
             // Space: toggle expand/collapse the focused tree node (sidebar focus only).
             KeyCode::Char(' ') => {
                 use crate::app::Panel;
@@ -1022,6 +1026,24 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
             AppEvent::SelectDown
+        ));
+    }
+
+    #[test]
+    fn right_arrow_translates_to_focus_right_or_expand() {
+        let ev = key_press(KeyCode::Right, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            AppEvent::FocusRightOrExpand
+        ));
+    }
+
+    #[test]
+    fn left_arrow_translates_to_focus_left_or_collapse() {
+        let ev = key_press(KeyCode::Left, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, false, false, false, crate::app::Panel::Sidebar),
+            AppEvent::FocusLeftOrCollapse
         ));
     }
 

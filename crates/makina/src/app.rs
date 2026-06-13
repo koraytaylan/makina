@@ -471,6 +471,12 @@ pub enum AppEvent {
     SelectUp,
     /// Move the sidebar selection one row down (`↓` / `j`).
     SelectDown,
+    /// `→` — on a collapsed run, expand it; otherwise cross focus into
+    /// [`Panel::Main`]. See plan 0018.
+    FocusRightOrExpand,
+    /// `←` — from [`Panel::Main`], return focus to [`Panel::Sidebar`];
+    /// otherwise collapse the focused expanded run. See plan 0018.
+    FocusLeftOrCollapse,
     /// Space key — toggle expand/collapse the focused tree node's run (sidebar focus only).
     ToggleTreeNode,
     /// Scroll the focused exchange pane one line up (mouse wheel up).
@@ -1184,10 +1190,8 @@ impl App {
                         self.tree_move(-1);
                     }
                     Panel::Main => {
-                        // Main focus: navigate tasks within the selected run.
-                        if let Some(current) = self.selected_task {
-                            self.selected_task = Some(current.saturating_sub(1));
-                        }
+                        // Main focus: scroll the exchange pane up.
+                        self.scroll_up();
                     }
                 }
                 true
@@ -1199,13 +1203,41 @@ impl App {
                         self.tree_move(1);
                     }
                     Panel::Main => {
-                        // Main focus: navigate tasks within the selected run.
-                        if let Some(current) = self.selected_task {
-                            let last = self
-                                .selected_run()
-                                .map(|r| r.tasks.len().saturating_sub(1))
-                                .unwrap_or(0);
-                            self.selected_task = Some((current + 1).min(last));
+                        // Main focus: scroll the exchange pane down.
+                        self.scroll_down(self.last_scroll_max.get());
+                    }
+                }
+                true
+            }
+            AppEvent::FocusRightOrExpand => {
+                // On a *collapsed* run, the first `Right` expands it; on an already-
+                // expanded run, or a task leaf, `Right` crosses into the content pane.
+                let collapsed_run = matches!(
+                    self.focused_node(),
+                    Some(TreeNode::Run { run })
+                        if self.runs.get(run).is_some_and(|r| self.collapsed_runs.contains(&r.id)),
+                );
+                if collapsed_run {
+                    self.tree_toggle_expand(); // expand it; cursor stays on the run header
+                } else {
+                    self.focused_panel = Panel::Main;
+                }
+                true
+            }
+            AppEvent::FocusLeftOrCollapse => {
+                match self.focused_panel {
+                    // From the content pane, `Left` steps back to the sidebar (no collapse).
+                    Panel::Main => self.focused_panel = Panel::Sidebar,
+                    // In the sidebar, `Left` collapses an *expanded* run; a collapsed run
+                    // or a task leaf is a no-op.
+                    Panel::Sidebar => {
+                        let expanded_run = matches!(
+                            self.focused_node(),
+                            Some(TreeNode::Run { run })
+                                if self.runs.get(run).is_some_and(|r| !self.collapsed_runs.contains(&r.id)),
+                        );
+                        if expanded_run {
+                            self.tree_toggle_expand(); // collapse it
                         }
                     }
                 }
@@ -1985,6 +2017,98 @@ mod tests {
             app.focused_node(),
             Some(TreeNode::Run { run: 0 }),
             "After toggle, cursor should be on Run0 header"
+        );
+    }
+
+    #[test]
+    fn right_expands_then_focuses_content() {
+        let mut app = make_app_with_runs();
+
+        // Initially at Run0 (node 0), which is expanded.
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+        assert!(
+            !app.collapsed_runs.contains(&RunId(100)),
+            "run0 should start expanded"
+        );
+
+        // Collapse run0 manually.
+        app.collapsed_runs.insert(RunId(100));
+        assert!(
+            app.collapsed_runs.contains(&RunId(100)),
+            "run0 should be collapsed"
+        );
+
+        // First FocusRightOrExpand: on a collapsed run, expand it.
+        app.update(AppEvent::FocusRightOrExpand);
+        assert!(
+            !app.collapsed_runs.contains(&RunId(100)),
+            "run0 should be expanded after first Right"
+        );
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Panel should stay Sidebar"
+        );
+
+        // Second FocusRightOrExpand: on an expanded run, cross to Main.
+        app.update(AppEvent::FocusRightOrExpand);
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "Second Right on expanded run should move to Main"
+        );
+    }
+
+    #[test]
+    fn left_returns_to_sidebar() {
+        let mut app = make_app_with_runs();
+
+        // Start in Main panel.
+        app.focused_panel = Panel::Main;
+        assert_eq!(app.focused_panel, Panel::Main);
+
+        // FocusLeftOrCollapse from Main should return to Sidebar.
+        app.update(AppEvent::FocusLeftOrCollapse);
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Left from Main should return to Sidebar"
+        );
+    }
+
+    #[test]
+    fn left_collapses_expanded_run() {
+        let mut app = make_app_with_runs();
+
+        // At Run0 (node 0), which is expanded.
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+        assert!(
+            !app.collapsed_runs.contains(&RunId(100)),
+            "run0 should start expanded"
+        );
+
+        // FocusLeftOrCollapse on an expanded run should collapse it.
+        app.update(AppEvent::FocusLeftOrCollapse);
+        assert!(
+            app.collapsed_runs.contains(&RunId(100)),
+            "run0 should be collapsed after Left"
+        );
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Panel should stay Sidebar"
+        );
+
+        // Collapse manually and test that Left on a collapsed run is a no-op.
+        app.tree_cursor = Some(0);
+        let was_collapsed = app.collapsed_runs.contains(&RunId(100));
+        app.update(AppEvent::FocusLeftOrCollapse);
+        assert_eq!(
+            app.collapsed_runs.contains(&RunId(100)),
+            was_collapsed,
+            "Left on already-collapsed run should be a no-op"
         );
     }
 
@@ -3266,9 +3390,8 @@ mod tests {
         use makina_core::api::{AgentRole, Event, ExchangeEvent, RunId, TaskId};
         let mut app = make_app_with_tasks();
 
-        // Switch to Main panel so task navigation works.
-        app.update(AppEvent::FocusNext);
-        assert_eq!(app.focused_panel, Panel::Main);
+        // Stay in Sidebar panel so tree navigation works.
+        assert_eq!(app.focused_panel, Panel::Sidebar);
 
         let id_a = TaskId::new("task-a");
         let id_b = TaskId::new("task-b");
@@ -3311,8 +3434,11 @@ mod tests {
         let focused_log = app.selected_exchange_log().unwrap();
         assert_eq!(focused_log.entries[0].text(), "task-a prompt");
 
-        // Navigate to task-b.
-        app.update(AppEvent::SelectDown);
+        // Navigate down to task-b using tree navigation in the Sidebar.
+        // Tree cursor: 0 (Run) -> 1 (Task A) -> 2 (Task B)
+        // Need to call SelectDown twice to reach task-b.
+        app.update(AppEvent::SelectDown); // Move to task-a node
+        app.update(AppEvent::SelectDown); // Move to task-b node
         assert_eq!(app.selected_task, Some(1));
         assert_eq!(app.selected_task_id(), Some(&id_b));
 
@@ -3320,8 +3446,8 @@ mod tests {
         assert_eq!(focused_log_b.entries[0].text(), "task-b prompt");
     }
 
-    /// **Task selection:** Up/Down moves the focused task when Main is focused
-    /// (clamped at both ends).
+    /// **Content scrolling:** Up/Down scrolls the exchange pane when Main is focused
+    /// (does not change selected_task).
     #[test]
     fn task_selection_up_down_main_panel() {
         let mut app = make_app_with_tasks();
@@ -3329,31 +3455,28 @@ mod tests {
         // Switch to Main panel.
         app.update(AppEvent::FocusNext);
         assert_eq!(app.focused_panel, Panel::Main);
-        assert_eq!(app.selected_task, Some(0));
+        let initial_selected_task = app.selected_task;
 
-        // Down: moves to index 1.
+        // Set up scroll space.
+        app.last_scroll_max.set(10);
+
+        // Down: scrolls, does not change selected_task.
         app.update(AppEvent::SelectDown);
         assert_eq!(
-            app.selected_task,
-            Some(1),
-            "SelectDown must move task selection"
+            app.selected_task, initial_selected_task,
+            "SelectDown must NOT change task selection in Main panel"
+        );
+        assert!(
+            app.exchange_scroll > 0,
+            "ScrollDown must advance exchange_scroll"
         );
 
-        // Down again: clamps at last (index 1 with 2 tasks).
-        app.update(AppEvent::SelectDown);
-        assert_eq!(app.selected_task, Some(1), "must clamp at last task");
-
-        // Up: moves back to index 0.
+        // Up: scrolls back, does not change selected_task.
         app.update(AppEvent::SelectUp);
         assert_eq!(
-            app.selected_task,
-            Some(0),
-            "SelectUp must move task selection"
+            app.selected_task, initial_selected_task,
+            "SelectUp must NOT change task selection in Main panel"
         );
-
-        // Up again: clamps at 0.
-        app.update(AppEvent::SelectUp);
-        assert_eq!(app.selected_task, Some(0), "must clamp at first task");
     }
 
     /// Exchange-pane scroll: manual offset clamps to `[0, scroll_max]`,
@@ -4246,6 +4369,83 @@ mod tests {
         assert!(
             app.exchange_logs.contains_key(&cache_key),
             "exchange_logs must use (RunId, TaskId) as composite cache key"
+        );
+    }
+
+    #[test]
+    fn up_down_navigates_tree_when_sidebar_focused() {
+        let mut app = make_app_with_runs();
+
+        // Start at node 0 (Run0) in the Sidebar.
+        app.focused_panel = Panel::Sidebar;
+        assert_eq!(app.tree_cursor, Some(0));
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
+
+        // SelectDown should move to node 1 (Task00).
+        app.update(AppEvent::SelectDown);
+        assert_eq!(
+            app.tree_cursor,
+            Some(1),
+            "SelectDown should move cursor from node 0 to node 1"
+        );
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Task { run: 0, task: 0 }),
+            "After SelectDown, focused_node should be Task 0-0"
+        );
+
+        // SelectUp should move back to node 0 (Run0).
+        app.update(AppEvent::SelectUp);
+        assert_eq!(
+            app.tree_cursor,
+            Some(0),
+            "SelectUp should move cursor back to node 0"
+        );
+        assert_eq!(
+            app.focused_node(),
+            Some(TreeNode::Run { run: 0 }),
+            "After SelectUp, focused_node should be Run0"
+        );
+    }
+
+    #[test]
+    fn up_down_scrolls_content_when_main_focused() {
+        let mut app = make_app_with_runs();
+
+        // Move to Main panel.
+        app.focused_panel = Panel::Main;
+
+        // Set last_scroll_max to a non-zero value so scroll_down has a clamp.
+        app.last_scroll_max.set(10);
+
+        // Record initial selected_task and exchange state.
+        let initial_selected_task = app.selected_task;
+        assert_eq!(app.exchange_scroll, 0);
+        assert!(
+            app.exchange_auto_follow,
+            "Should start with auto_follow = true"
+        );
+
+        // SelectUp should scroll up and disable auto-follow, but NOT change selected_task.
+        app.update(AppEvent::SelectUp);
+        assert_eq!(
+            app.selected_task, initial_selected_task,
+            "SelectUp should NOT change selected_task when focused on Main"
+        );
+        assert!(
+            !app.exchange_auto_follow,
+            "scroll_up should disable auto_follow"
+        );
+
+        // SelectDown should scroll down and update exchange_scroll, but NOT change selected_task.
+        app.update(AppEvent::SelectDown);
+        assert_eq!(
+            app.selected_task, initial_selected_task,
+            "SelectDown should NOT change selected_task when focused on Main"
+        );
+        assert!(
+            app.exchange_scroll > 0,
+            "exchange_scroll should advance after SelectDown"
         );
     }
 }
