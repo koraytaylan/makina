@@ -176,6 +176,16 @@ pub fn plan_slug(task_list_path: &Path) -> String {
     SLUG_FALLBACK.to_string()
 }
 
+/// Return `true` when `path` is a plan-style task list (`file_name == "TASKS.md"`,
+/// case-insensitive) — the only shape that triggers auto-generation on `NotFound`.
+/// Deterministic routes (non-`TASKS.md` paths) still error with the original
+/// `ApiError::InvalidCommand`.
+fn is_plan_tasks_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("TASKS.md"))
+}
+
 /// One plan directory discovered under `docs/plans/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEntry {
@@ -1018,15 +1028,28 @@ impl CoreApi {
         repo_root: &std::path::Path,
         seed_persist: bool,
     ) -> Result<(TaskGraph, Vec<crate::ingestion::IngestionIssue>), ApiError> {
-        // Read the .md file.
-        let text = tokio::fs::read_to_string(task_list_path)
-            .await
-            .map_err(|e| ApiError::InvalidCommand {
-                reason: format!(
-                    "could not read task list `{}`: {e}",
-                    task_list_path.display()
-                ),
-            })?;
+        // Try to read the .md file. If it's missing and it's a plan-style TASKS.md,
+        // branch to generation instead of failing.
+        let text = match tokio::fs::read_to_string(task_list_path).await {
+            Ok(text) => text,
+            // Missing TASKS.md in a plan dir ⇒ generate the graph from the spec.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && is_plan_tasks_path(task_list_path) =>
+            {
+                return self
+                    .generate_and_seed(slug, task_list_path, repo_root, seed_persist)
+                    .await;
+            }
+            Err(e) => {
+                return Err(ApiError::InvalidCommand {
+                    reason: format!(
+                        "could not read task list `{}`: {e}",
+                        task_list_path.display()
+                    ),
+                });
+            }
+        };
 
         let lint_issues: Vec<crate::ingestion::IngestionIssue> =
             crate::ingestion::lint_source(&text);
@@ -1074,6 +1097,113 @@ impl CoreApi {
                 Ok((graph, issues))
             }
         }
+    }
+
+    /// Generate a task graph for a TASKS-less plan dir from its SCOPE/ARCHITECTURE,
+    /// write the drafted `TASKS.md` into the dir (the auditable record), then
+    /// seed-persist the graph — returning `(graph, issues)` exactly like
+    /// `interpret_and_seed` so `open_run` registers a Pending run uniformly.
+    ///
+    /// # Parameters
+    ///
+    /// - `slug` — The plan-scoped identifier.
+    /// - `task_list_path` — The path where `TASKS.md` would go (used to derive `dir`).
+    /// - `repo_root` — Used for seed-persist.
+    /// - `seed_persist` — When `true`, persist the generated graph; when `false`,
+    ///   skip persist (used by `reinterpret_run` with `seed_persist=false`).
+    ///
+    /// # Behavior on errors
+    ///
+    /// Interpret/generate failures surface as reviewable `Blocking` ingestion
+    /// issues (same as `interpret_and_seed`'s error arm), never as hard
+    /// `ApiError`. A missing spec (no SCOPE.md / ARCHITECTURE.md) produces a
+    /// single "no-spec-to-generate" issue so the run opens reviewable.
+    async fn generate_and_seed(
+        &self,
+        slug: &str,
+        task_list_path: &std::path::Path,
+        repo_root: &std::path::Path,
+        seed_persist: bool,
+    ) -> Result<(TaskGraph, Vec<crate::ingestion::IngestionIssue>), ApiError> {
+        let dir = task_list_path.parent().unwrap_or(task_list_path);
+
+        // 1. Collect the spec brief from SCOPE.md and/or ARCHITECTURE.md.
+        let brief = read_plan_brief(dir).await;
+
+        // If neither file exists, we have no spec to generate from.
+        if brief.is_empty() {
+            let graph = TaskGraph {
+                slug: slug.into(),
+                tasks: vec![],
+            };
+            let issues = vec![crate::ingestion::IngestionIssue {
+                task_id: None,
+                severity: crate::ingestion::IssueSeverity::Blocking,
+                source: crate::ingestion::IssueSource::Interpreter,
+                code: "no-spec-to-generate".into(),
+                message: format!(
+                    "cannot generate task graph: no SCOPE.md or ARCHITECTURE.md in `{}`",
+                    dir.display()
+                ),
+                suggestion: Some(
+                    "create SCOPE.md and/or ARCHITECTURE.md and re-open the plan".into(),
+                ),
+            }];
+            return Ok((graph, issues));
+        }
+
+        // 2. Get the planner's system_prompt override (plan 0025, if available).
+        // For now, None; when plan 0025 lands, this would resolve from
+        // the configured planner role assignment.
+        let system_prompt_override = None;
+
+        // 3. Draft the graph via the planner generate path.
+        let graph = match self
+            .state
+            .planner_interpreter
+            .generate(slug, &brief, system_prompt_override)
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => {
+                // Generate failed (offline, validation error, etc.) → return a
+                // reviewable issue, not a hard error.
+                let empty = TaskGraph {
+                    slug: slug.into(),
+                    tasks: vec![],
+                };
+                let issues = vec![crate::ingestion::IngestionIssue {
+                    task_id: None,
+                    severity: crate::ingestion::IssueSeverity::Blocking,
+                    source: crate::ingestion::IssueSource::Interpreter,
+                    code: "generator-failed".into(),
+                    message: format!("could not generate task graph for `{slug}`: {e}"),
+                    suggestion: Some("check the SCOPE.md/ARCHITECTURE.md and re-open".into()),
+                }];
+                return Ok((empty, issues));
+            }
+        };
+
+        // 4. Write TASKS.md back into the dir from the graph (best-effort;
+        //    warn-only like seed-persist — a write failure must not block the open).
+        if let Err(e) = write_tasks_md(dir, &graph).await {
+            tracing::warn!(
+                slug = %slug,
+                error = %e,
+                "failed to write generated TASKS.md; continuing without artifact",
+            );
+        }
+
+        // 5. Seed-persist the graph (best-effort).
+        if seed_persist && let Err(e) = crate::persist::persist_graph(&graph, repo_root).await {
+            tracing::warn!(
+                slug = %slug,
+                error = %e,
+                "seed-persist failed for generated run; continuing without artifact",
+            );
+        }
+
+        Ok((graph, vec![]))
     }
 
     /// Implement `StartRun`: spawn the Supervisor scheduler in the background.
@@ -1759,6 +1889,115 @@ impl Api for CoreApi {
         let stream = BroadcastStream::new(rx).filter_map(|result| result.ok());
         Box::pin(stream)
     }
+}
+
+// ── Planner generate helpers ──────────────────────────────────────────────────
+
+/// Read SCOPE.md and/or ARCHITECTURE.md from a plan directory and join them
+/// into a single brief string. Each file is optional; returns an empty string
+/// if neither exists.
+async fn read_plan_brief(plan_dir: &std::path::Path) -> String {
+    let mut parts = Vec::new();
+
+    // Try to read SCOPE.md
+    if let Ok(scope) = tokio::fs::read_to_string(plan_dir.join("SCOPE.md")).await {
+        parts.push(scope);
+    }
+
+    // Try to read ARCHITECTURE.md
+    if let Ok(arch) = tokio::fs::read_to_string(plan_dir.join("ARCHITECTURE.md")).await {
+        parts.push(arch);
+    }
+
+    // Join with a blank line separator if both exist
+    parts.join("\n\n")
+}
+
+/// Render a [`TaskGraph`] as structured-text Markdown (TASKS.md convention) and
+/// write it to `dir/TASKS.md`.
+///
+/// The output follows the convention so it can round-trip through
+/// `StructuredTextInterpreter::interpret`.
+async fn write_tasks_md(
+    dir: &std::path::Path,
+    graph: &crate::task::TaskGraph,
+) -> Result<(), std::io::Error> {
+    let markdown = render_tasks_md(graph);
+    let path = dir.join("TASKS.md");
+    tokio::fs::write(path, markdown).await
+}
+
+/// Render a [`TaskGraph`] as structured-text Markdown following the convention
+/// in `docs/spec/structured-text-convention.md`.
+fn render_tasks_md(graph: &crate::task::TaskGraph) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# Makina Plan {} — Auto-Generated Task List",
+        graph.slug
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Auto-generated from SCOPE.md and ARCHITECTURE.md.");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "See the spec in `docs/spec/structured-text-convention.md` for the notation."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "---");
+    let _ = writeln!(out);
+
+    // Group tasks by section
+    let mut sections: std::collections::BTreeMap<Option<&str>, Vec<&crate::task::Task>> =
+        std::collections::BTreeMap::new();
+    for task in &graph.tasks {
+        let section = task.section.as_deref();
+        sections.entry(section).or_default().push(task);
+    }
+
+    // Render each section
+    for (section, tasks) in sections.iter() {
+        if let Some(section_id) = section {
+            let _ = writeln!(out, "## {} — Generated Section", section_id);
+        } else {
+            // Sections without an id must still have the em-dash separator per convention
+            let _ = writeln!(out, "##  — Ungrouped");
+        }
+        let _ = writeln!(out);
+
+        for task in tasks {
+            let _ = writeln!(out, "### {} — {}", task.id, task.title);
+            let _ = writeln!(out);
+
+            // Description
+            if !task.description.is_empty() {
+                let _ = writeln!(out, "{}", task.description);
+                let _ = writeln!(out);
+            }
+
+            // Done when
+            let _ = writeln!(out, "- **Done when:** {}", task.done_when);
+
+            // Depends on (em-dash uses U+2014)
+            if task.depends_on.is_empty() {
+                let _ = writeln!(out, "- **Depends on:** —");
+            } else {
+                let deps = task
+                    .depends_on
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "- **Depends on:** {}", deps);
+            }
+
+            let _ = writeln!(out);
+        }
+    }
+
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4108,5 +4347,324 @@ Description text that is long enough for parser.
         let empty_tmp = tempfile::TempDir::new().expect("create temp dir");
         let entries = discover_plans(empty_tmp.path());
         assert_eq!(entries, vec![]);
+    }
+
+    // ── planner-generate-on-open tests ───────────────────────────────────────
+
+    /// **Acceptance: missing TASKS.md triggers planner generate.**
+    ///
+    /// A dir with SCOPE.md + ARCHITECTURE.md but no TASKS.md should not return
+    /// `ApiError::InvalidCommand` on the NotFound. Instead, the planner should
+    /// draft a graph from the spec. This test drives the internal path and asserts
+    /// the generated graph is non-empty and validates.
+    #[tokio::test]
+    async fn missing_tasks_triggers_planner_generate() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plan_dir = tmp.path().join("0999-test-plan");
+        std::fs::create_dir(&plan_dir).expect("create plan dir");
+
+        let scope_content = "# Scope\nThis is a test plan scope.\n";
+        let arch_content = "# Architecture\nBuild two simple tasks.\n";
+
+        std::fs::write(plan_dir.join("SCOPE.md"), scope_content).expect("write SCOPE.md");
+        std::fs::write(plan_dir.join("ARCHITECTURE.md"), arch_content)
+            .expect("write ARCHITECTURE.md");
+        // Deliberately omit TASKS.md
+
+        let task_list_path = plan_dir.join("TASKS.md");
+
+        // Build a CoreApi with a planner interpreter backed by a model that
+        // returns valid task-graph JSON.
+        let valid_json = r#"{
+  "slug": "0999-test-plan-tasks",
+  "tasks": [
+    {
+      "id": "task-one",
+      "title": "First task",
+      "description": "Does something.",
+      "done_when": "Task one is done.",
+      "depends_on": [],
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    },
+    {
+      "id": "task-two",
+      "title": "Second task",
+      "description": "Depends on the first.",
+      "done_when": "Task two is done.",
+      "depends_on": ["task-one"],
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }
+  ]
+}
+"#;
+
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(NoopBackend::with_responses(vec![valid_json.to_string()]));
+        let planner_interpreter = crate::interpreter::build_planner_interpreter(
+            &crate::config::PlannerMechanism::OneShotAgent,
+            Some(Arc::clone(&backend)),
+        )
+        .expect("build planner interpreter");
+
+        let config = no_gate_config();
+
+        let worktree_manager = WorktreeManager {
+            repo_root: tmp.path().to_path_buf(),
+            base_branch: "main".into(),
+        };
+
+        let api = CoreApi::with_audit_registry(
+            Arc::new(StructuredTextInterpreter::new()),
+            planner_interpreter,
+            Arc::clone(&backend),
+            Arc::clone(&backend),
+            worktree_manager,
+            config,
+            Arc::new(NoopAuditRegistry),
+        );
+
+        let slug = run_slug(&task_list_path);
+        let repo_root = tmp.path();
+
+        // Call generate_and_seed directly (the internal path that interpret_and_seed
+        // branches to on missing TASKS.md).
+        let (graph, issues) = api
+            .generate_and_seed(&slug, &task_list_path, repo_root, true)
+            .await
+            .expect("generate_and_seed should succeed");
+
+        // Assert the generated graph is non-empty and validates.
+        assert!(
+            !graph.tasks.is_empty(),
+            "generated graph should have tasks; issues: {issues:?}"
+        );
+        assert_eq!(graph.tasks.len(), 2);
+        graph.validate().expect("generated graph must validate");
+
+        // Assert no blocking issues (generation succeeded).
+        assert!(
+            issues.is_empty(),
+            "successful generation should produce no issues; got {issues:?}"
+        );
+    }
+
+    /// **Acceptance: generated graph opens a run end-to-end.**
+    ///
+    /// OpenRun on a TASKS-less dir should return `CommandOutcome::RunOpened`
+    /// with a `Pending` run. The generated TASKS.md should exist in the dir and
+    /// be re-interpretable via the deterministic path.
+    #[tokio::test]
+    async fn generated_graph_is_ingested_and_run_opens() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plan_dir = tmp.path().join("0999-test-plan");
+        std::fs::create_dir(&plan_dir).expect("create plan dir");
+
+        let scope_content = "# Scope\nTest plan.";
+        let arch_content = "# Architecture\nSimple.";
+
+        std::fs::write(plan_dir.join("SCOPE.md"), scope_content).expect("write SCOPE.md");
+        std::fs::write(plan_dir.join("ARCHITECTURE.md"), arch_content)
+            .expect("write ARCHITECTURE.md");
+        // Omit TASKS.md
+
+        let task_list_path = plan_dir.join("TASKS.md");
+
+        let valid_json = r#"{
+  "slug": "0999-test-plan-tasks",
+  "tasks": [
+    {
+      "id": "gen-task",
+      "title": "Generated task",
+      "description": "A task.",
+      "done_when": "When done.",
+      "depends_on": [],
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }
+  ]
+}
+"#;
+
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(NoopBackend::with_responses(vec![valid_json.to_string()]));
+        let planner_interpreter = crate::interpreter::build_planner_interpreter(
+            &crate::config::PlannerMechanism::OneShotAgent,
+            Some(Arc::clone(&backend)),
+        )
+        .expect("build planner interpreter");
+
+        let config = no_gate_config();
+
+        let api = CoreApi::with_audit_registry(
+            Arc::new(StructuredTextInterpreter::new()),
+            planner_interpreter,
+            Arc::clone(&backend),
+            Arc::clone(&backend),
+            WorktreeManager {
+                repo_root: tmp.path().to_path_buf(),
+                base_branch: "main".into(),
+            },
+            config,
+            Arc::new(NoopAuditRegistry),
+        );
+
+        // Execute OpenRun
+        let outcome = api
+            .execute(Command::OpenRun {
+                task_list_path: task_list_path.clone(),
+            })
+            .await
+            .expect("OpenRun should succeed");
+
+        // Assert RunOpened
+        match outcome {
+            CommandOutcome::RunOpened { .. } => {} // expected
+            other => panic!("expected RunOpened, got {other:?}"),
+        }
+
+        // Assert TASKS.md now exists
+        assert!(
+            task_list_path.is_file(),
+            "generated TASKS.md should exist in the dir"
+        );
+
+        // Assert it re-interprets cleanly via the deterministic path
+        let markdown = std::fs::read_to_string(&task_list_path).expect("read generated TASKS.md");
+        let graph = crate::interpreter::StructuredTextInterpreter::new()
+            .interpret("0999-test-plan-tasks", &markdown)
+            .await
+            .expect("generated TASKS.md should re-interpret");
+        assert!(!graph.tasks.is_empty());
+    }
+
+    /// **Acceptance: offline path opens with a "cannot generate" issue.**
+    ///
+    /// When the planner is deterministic (no model), opening a TASKS-less dir
+    /// should not hard-error. Instead, it should open with a reviewable blocking
+    /// issue "cannot generate" rather than panicking.
+    #[tokio::test]
+    async fn no_tasks_md_does_not_hard_error_offline() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plan_dir = tmp.path().join("0999-test-plan");
+        std::fs::create_dir(&plan_dir).expect("create plan dir");
+
+        std::fs::write(plan_dir.join("SCOPE.md"), "# Scope\nTest.").expect("write SCOPE.md");
+        std::fs::write(plan_dir.join("ARCHITECTURE.md"), "# Arch\nTest.")
+            .expect("write ARCHITECTURE.md");
+
+        let task_list_path = plan_dir.join("TASKS.md");
+
+        // Build a CoreApi with a DETERMINISTIC planner interpreter (no model).
+        let planner_interpreter = Arc::new(StructuredTextInterpreter::new());
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![]));
+
+        let config = no_gate_config();
+
+        let api = CoreApi::with_audit_registry(
+            Arc::new(StructuredTextInterpreter::new()),
+            planner_interpreter,
+            Arc::clone(&backend),
+            Arc::clone(&backend),
+            WorktreeManager {
+                repo_root: tmp.path().to_path_buf(),
+                base_branch: "main".into(),
+            },
+            config,
+            Arc::new(NoopAuditRegistry),
+        );
+
+        // Execute OpenRun
+        let outcome = api
+            .execute(Command::OpenRun {
+                task_list_path: task_list_path.clone(),
+            })
+            .await
+            .expect("OpenRun should return Ok (Pending with issue), not ApiError");
+
+        // Assert RunOpened (not hard error)
+        match outcome {
+            CommandOutcome::RunOpened { .. } => {} // expected
+            other => panic!("expected RunOpened, got {other:?}"),
+        }
+
+        // Get the registered run and verify it has a blocking issue
+        let runs = api.state.runs.lock().expect("runs mutex");
+        assert_eq!(runs.len(), 1, "should have registered one run");
+        let run = runs.iter().next().unwrap().1;
+        assert!(
+            run.report.is_blocked(),
+            "run should have a blocking issue since generation failed"
+        );
+    }
+
+    /// **Acceptance: non-TASKS.md missing file still errors.**
+    ///
+    /// A missing `.tasks/ghost.json` (not a plan-style TASKS.md) must still
+    /// return `ApiError::InvalidCommand` — the generate branch is correctly scoped.
+    #[tokio::test]
+    async fn non_tasks_md_missing_file_still_errors() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![]));
+        let planner_interpreter = crate::interpreter::build_planner_interpreter(
+            &crate::config::PlannerMechanism::OneShotAgent,
+            Some(Arc::clone(&backend)),
+        )
+        .expect("build planner interpreter");
+
+        let config = no_gate_config();
+
+        let api = CoreApi::with_audit_registry(
+            Arc::new(StructuredTextInterpreter::new()),
+            planner_interpreter,
+            Arc::clone(&backend),
+            Arc::clone(&backend),
+            WorktreeManager {
+                repo_root: tmp.path().to_path_buf(),
+                base_branch: "main".into(),
+            },
+            config,
+            Arc::new(NoopAuditRegistry),
+        );
+
+        // Try to open a non-TASKS.md missing file (e.g., .tasks/ghost.json)
+        let ghost_path = tmp.path().join(".tasks").join("ghost.json");
+
+        let result = api
+            .execute(Command::OpenRun {
+                task_list_path: ghost_path,
+            })
+            .await;
+
+        // Should error with ApiError::InvalidCommand (not generate)
+        assert!(
+            result.is_err(),
+            "opening a missing non-TASKS.md file should error"
+        );
+        match result {
+            Err(ApiError::InvalidCommand { reason }) => {
+                assert!(
+                    reason.contains("could not read"),
+                    "error message should indicate read failure: {reason}"
+                );
+            }
+            Err(other) => {
+                panic!("expected ApiError::InvalidCommand, got {other:?}");
+            }
+            Ok(_) => {
+                panic!("expected error, got Ok");
+            }
+        }
     }
 }

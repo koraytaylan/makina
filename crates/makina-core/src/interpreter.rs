@@ -152,6 +152,36 @@ pub trait TaskListInterpreter: Send + Sync {
     ///
     /// [`SetTaskGraph`]: crate::actors::supervisor::SetTaskGraph
     async fn interpret(&self, slug: &str, source_text: &str) -> Result<TaskGraph, InterpretError>;
+
+    /// Generate a fresh [`TaskGraph`] for `slug` from a SCOPE/ARCHITECTURE brief
+    /// (no existing task list). Only `ModelInterpreter` implements this; the
+    /// deterministic `StructuredTextInterpreter` returns
+    /// [`InterpretError::MechanismNotSupported`].
+    ///
+    /// # Parameters
+    ///
+    /// - `slug` — The plan-scoped identifier for the generated graph.
+    /// - `brief` — The concatenated SCOPE.md / ARCHITECTURE.md brief.
+    /// - `system_prompt_override` — The planner role's custom system prompt
+    ///   (plan 0025), if provided; appended to the generate prompt when present.
+    ///
+    /// # Default behavior
+    ///
+    /// Returns [`InterpretError::MechanismNotSupported`] for deterministic
+    /// interpreters (e.g. `StructuredTextInterpreter`), allowing offline opens to
+    /// degrade to a "cannot generate" issue rather than panicking. The
+    /// `ModelInterpreter` overrides this to perform actual generation.
+    async fn generate(
+        &self,
+        slug: &str,
+        brief: &str,
+        system_prompt_override: Option<&str>,
+    ) -> Result<TaskGraph, InterpretError> {
+        let _ = (slug, brief, system_prompt_override);
+        Err(InterpretError::MechanismNotSupported {
+            mechanism: "generate".into(),
+        })
+    }
 }
 
 // ── Reference implementation ──────────────────────────────────────────────────
@@ -638,6 +668,54 @@ Rules:
 - The slug must match the file-stem identifier supplied in the user prompt.
 - Output ONLY the JSON object. No markdown code fences. No surrounding text.";
 
+/// System prompt for the planner's GENERATE path: draft a Makina-convention
+/// task graph from a plan dir's SCOPE/ARCHITECTURE brief (no existing TASKS.md).
+///
+/// Unlike [`PLANNER_SYSTEM_PROMPT`] (which transcribes an existing task list),
+/// this instructs the model to DECOMPOSE the brief into tasks. The output schema
+/// is identical, so [`parse_model_response`] validates it unchanged.
+///
+/// The planner role's system prompt override (plan 0025) is appended to this via
+/// [`generate_system_prompt`] when provided.
+pub const PLANNER_GENERATE_SYSTEM_PROMPT: &str = "\
+You are the Planner component of Makina, a multi-agent software-factory \
+orchestrator. Your sole function is to DECOMPOSE a project SCOPE and ARCHITECTURE \
+brief (Markdown) into a dependency-ordered task graph that conforms to the Makina \
+runtime-artifact schema.
+
+Output ONLY the JSON object — no prose, no markdown fences, no explanation. \
+The schema is:
+
+{
+  \"slug\": \"<string>\",
+  \"tasks\": [
+    {
+      \"id\": \"<kebab-case string>\",
+      \"title\": \"<string>\",
+      \"description\": \"<string>\",
+      \"done_when\": \"<string>\",
+      \"depends_on\": [\"<task-id>\", ...],
+      \"section\": \"<optional 4-digit string — omit if absent>\",
+      \"state\": \"new\",
+      \"gate_iterations\": 0,
+      \"review_iterations\": 0,
+      \"created_at\": \"<RFC3339 UTC timestamp>\",
+      \"updated_at\": \"<RFC3339 UTC timestamp>\"
+    }
+  ]
+}
+
+Rules:
+- Every task's id must be kebab-case and unique.
+- Every task's done_when MUST be a verifiable acceptance check.
+- Every new task starts with state \"new\", gate_iterations 0, review_iterations 0.
+- Do NOT include started_at or finished_at fields.
+- Do NOT include null values for any optional fields — omit them entirely.
+- created_at and updated_at must be the current UTC time in RFC3339 format.
+- The slug must match the file-stem identifier supplied in the user prompt.
+- Order tasks in dependency order (dependencies before dependents).
+- Output ONLY the JSON object. No markdown code fences. No surrounding text.";
+
 /// Model-backed implementation of [`TaskListInterpreter`].
 ///
 /// Sends the task-list source text to a language-model agent via an injected
@@ -677,6 +755,18 @@ pub struct ModelInterpreter {
     system_prompt: String,
     /// Working directory supplied to [`SessionConfig`].  Defaults to `/tmp`.
     working_dir: std::path::PathBuf,
+}
+
+// ── System prompt helpers ─────────────────────────────────────────────────────
+
+/// Compose the generate session's system prompt: the base
+/// `PLANNER_GENERATE_SYSTEM_PROMPT`, with the planner role override (plan 0025)
+/// appended `\n\n`-joined when present. Pure ⇒ directly unit-testable.
+fn generate_system_prompt(override_: Option<&str>) -> String {
+    match override_ {
+        Some(extra) => format!("{PLANNER_GENERATE_SYSTEM_PROMPT}\n\n{extra}"),
+        None => PLANNER_GENERATE_SYSTEM_PROMPT.to_string(),
+    }
 }
 
 impl ModelInterpreter {
@@ -761,6 +851,101 @@ impl TaskListInterpreter for ModelInterpreter {
 
         // 4–6. Extract, deserialize, validate.
         parse_model_response(&raw_response)
+    }
+
+    /// Generate a fresh task graph from a SCOPE/ARCHITECTURE brief.
+    ///
+    /// This is the trait method that makes `ModelInterpreter::generate` available
+    /// through the `TaskListInterpreter` trait, enabling the generate path in
+    /// `CoreApi::generate_and_seed` to work polymorphically.
+    async fn generate(
+        &self,
+        slug: &str,
+        brief: &str,
+        system_prompt_override: Option<&str>,
+    ) -> Result<TaskGraph, InterpretError> {
+        // Delegate to the inherent method (same signature).
+        ModelInterpreter::generate(self, slug, brief, system_prompt_override).await
+    }
+}
+
+impl ModelInterpreter {
+    /// Draft a fresh [`TaskGraph`] for `slug` from a SCOPE/ARCHITECTURE `brief`
+    /// (no existing task list). Spawns one session with the GENERATE prompt,
+    /// collects TextChunks until TurnComplete, then runs `parse_model_response`.
+    ///
+    /// # Parameters
+    ///
+    /// - `slug` — The file-stem identifier that will become `TaskGraph::slug`
+    ///   (e.g. `"my-plan"` from the plan directory name).
+    /// - `brief` — The plan specification text (typically SCOPE.md + ARCHITECTURE.md
+    ///   joined together).
+    /// - `system_prompt_override` — When `Some`, appended to the generate prompt
+    ///   (e.g. a planner role's custom system prompt from plan 0025). When `None`,
+    ///   the bare [`PLANNER_GENERATE_SYSTEM_PROMPT`] is used.
+    ///
+    /// # Steps
+    ///
+    /// 1. Spawn a session via the backend with [`PLANNER_GENERATE_SYSTEM_PROMPT`]
+    ///    (plus override if provided).
+    /// 2. Send one prompt: "Draft the Makina task graph for the following plan …"
+    ///    followed by the brief.
+    /// 3. Collect all [`ResponseEvent::TextChunk`] events until
+    ///    [`ResponseEvent::TurnComplete`].
+    /// 4. Extract the outermost JSON `{ … }` object (strips fences and prose).
+    /// 5. Deserialize into [`TaskGraph`] via `serde_json`.
+    /// 6. Run [`TaskGraph::validate()`]; return errors as
+    ///    [`InterpretError::ValidationFailed`].
+    /// 7. Terminate the session.
+    pub async fn generate(
+        &self,
+        slug: &str,
+        brief: &str,
+        system_prompt_override: Option<&str>,
+    ) -> Result<TaskGraph, InterpretError> {
+        // Pure, directly unit-testable helper (NoopBackend records only prompts,
+        // not the spawned SessionConfig, so the override is asserted on this output).
+        let system_prompt = generate_system_prompt(system_prompt_override);
+
+        // 1. Spawn a session.
+        let config = SessionConfig {
+            working_dir: self.working_dir.clone(),
+            system_prompt,
+            mode: None,
+            model: None,
+            effort: None,
+            extra: None,
+        };
+        let mut session = self.backend.spawn(config).await?;
+
+        // 2. Build and send the prompt.
+        let prompt_text = format!(
+            "Draft the Makina task graph (slug `{slug}`) for the following plan. \
+             Output ONLY the JSON task-graph object:\n\n{brief}"
+        );
+        let mut stream = session.prompt(Prompt::new(prompt_text)).await?;
+
+        // 3. Collect all TextChunk events.
+        let mut raw = String::new();
+        while let Some(item) = stream.next().await {
+            match item? {
+                ResponseEvent::TextChunk { text } => raw.push_str(&text),
+                // Side-channel events do not contribute to the model's textual
+                // response; the generator only cares about the answer text.
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. }
+                | ResponseEvent::CurrentModeUpdate { .. } => {}
+                ResponseEvent::TurnComplete { .. } => break,
+            }
+        }
+        // Ensure the stream is dropped before we terminate the session.
+        drop(stream);
+        // 7. Terminate the session (best-effort; ignore terminate errors).
+        let _ = session.terminate().await;
+
+        // 4–6. Extract, deserialize, validate (same funnel as interpret).
+        parse_model_response(&raw)
     }
 }
 
@@ -1351,6 +1536,101 @@ Description of third.
 
         let err = interpreter
             .interpret("test", "# source")
+            .await
+            .expect_err("dangling dep must cause validation failure");
+
+        assert!(
+            matches!(err, InterpretError::ValidationFailed(_)),
+            "expected ValidationFailed, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("ghost-task"),
+            "error message should mention the missing id: {err}"
+        );
+    }
+
+    // ── ModelInterpreter::generate tests ─────────────────────────────────────
+
+    /// **Acceptance: ModelInterpreter::generate drafts a graph from a brief.**
+    ///
+    /// Uses `NoopBackend::with_responses` to supply a valid task-graph JSON as
+    /// the canned response. Calls `generate` with a brief (SCOPE/ARCHITECTURE text)
+    /// and no override. Asserts that `generate` returns the correct graph, the
+    /// tasks are non-empty, and `validate()` passes.
+    #[tokio::test]
+    async fn generate_drafts_graph_from_brief() {
+        let json = valid_task_graph_json("my-plan");
+        let backend = Arc::new(NoopBackend::with_responses(vec![json]));
+        let interpreter = ModelInterpreter::new(backend);
+
+        let brief = "# SCOPE\n\nBuild a feature.\n\n# ARCHITECTURE\n\nUse module X.";
+        let graph = interpreter
+            .generate("my-plan", brief, None)
+            .await
+            .expect("must generate successfully");
+
+        assert_eq!(graph.slug, "my-plan");
+        assert!(!graph.tasks.is_empty(), "generated graph must have tasks");
+        graph.validate().expect("graph must pass validate()");
+    }
+
+    /// **Acceptance: generate_system_prompt appends override correctly.**
+    ///
+    /// A pure test on the `generate_system_prompt` helper (no backend involved).
+    /// Asserts that with `Some("EXTRA RULES")`, the result starts with
+    /// `PLANNER_GENERATE_SYSTEM_PROMPT`, contains `"\n\n"`, and ends with the
+    /// override text. With `None`, returns the bare constant.
+    #[test]
+    fn generate_system_prompt_appends_override() {
+        // Test with None: bare constant
+        let prompt_none = generate_system_prompt(None);
+        assert_eq!(prompt_none, PLANNER_GENERATE_SYSTEM_PROMPT);
+
+        // Test with Some: appends with \n\n
+        let override_text = "EXTRA RULES";
+        let prompt_some = generate_system_prompt(Some(override_text));
+
+        assert!(
+            prompt_some.starts_with(PLANNER_GENERATE_SYSTEM_PROMPT),
+            "prompt should start with PLANNER_GENERATE_SYSTEM_PROMPT"
+        );
+        assert!(
+            prompt_some.contains("\n\nEXTRA RULES"),
+            "prompt should contain the override appended with \\n\\n: {prompt_some}"
+        );
+    }
+
+    /// **Acceptance: generate validates output via parse_model_response.**
+    ///
+    /// When the model returns JSON with a dangling `depends_on` reference,
+    /// `generate` must return `InterpretError::ValidationFailed` — proving that
+    /// the shared `parse_model_response` funnel applies to both `interpret` and
+    /// `generate`.
+    #[tokio::test]
+    async fn generate_validates_output() {
+        let bad_json = r#"{
+  "slug": "test-plan",
+  "tasks": [
+    {
+      "id": "task-only",
+      "title": "Only task",
+      "description": "Does something.",
+      "done_when": "done.",
+      "depends_on": ["ghost-task"],
+      "state": "new",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "created_at": "2026-05-28T10:00:00Z",
+      "updated_at": "2026-05-28T10:00:00Z"
+    }
+  ]
+}"#;
+        let backend = Arc::new(NoopBackend::with_responses(vec![bad_json.to_string()]));
+        let interpreter = ModelInterpreter::new(backend);
+
+        let brief = "# SCOPE\n\nBuild a feature.";
+        let err = interpreter
+            .generate("test-plan", brief, None)
             .await
             .expect_err("dangling dep must cause validation failure");
 

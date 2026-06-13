@@ -26,6 +26,26 @@ The structured-text file is **read-only input** to the Planner. Once the Planner
 
 **Note on project discovery:** The task-list grammar itself is never modified by discovery. However, the project config (`config.toml`) receives **discovered gates** and **role constraints** on first open. For details on discovery, see [project-discovery.md](./project-discovery.md).
 
+### 2.1 Auto-generation fallback for TASKS-less plan directories
+
+When a plan directory contains `SCOPE.md` and/or `ARCHITECTURE.md` but **no `TASKS.md`**, Makina's planner automatically generates a task graph from that brief, without requiring manual review. The generated process is as follows:
+
+1. **Generation trigger:** Opening a plan directory that has no `TASKS.md` invokes the planner's generative mode (routed by `CoreApi::interpret_and_seed` when a `NotFound` error is encountered on a plan-style `TASKS.md` path).
+
+2. **Input:** The planner reads the available `SCOPE.md` and `ARCHITECTURE.md` files from the directory and combines them into a brief for the language model.
+
+3. **System prompt:** The planner uses a dedicated system prompt (`PLANNER_GENERATE_SYSTEM_PROMPT`; see [plan 0028](../plans/0028-Planner-Generated-Tasks/ARCHITECTURE.md)) that instructs the model to **decompose** the plan's scope and architecture into a dependency-ordered task graph conforming to this same convention.
+
+4. **Output schema:** The model output is validated against the same JSON schema as the **Interpret** path (`slug`, `tasks[]` with `id`, `title`, `description`, `done_when`, `depends_on`, `section`, and metadata fields; no `started_at`/`finished_at`). The generated graph is deserialized and validated identically to hand-written task lists.
+
+5. **Write-back:** Once validated, the generated task graph is **serialized back to `TASKS.md`** in the directory as the **auditable record**. This file becomes the source of truth for the plan and may be edited by hand thereafter.
+
+6. **No review gate:** The generation happens automatically when the directory is opened; there is no manual-review checkpoint. The resulting run registers as `Pending` and is immediately available for work.
+
+7. **Re-interpretability:** The written `TASKS.md` conforms fully to this convention and may be re-interpreted through the normal structured-text parsing path if edited.
+
+**Implementation details:** The `ModelInterpreter::generate` method in [crates/makina-core/src/interpreter.rs](../../crates/makina-core/src/interpreter.rs) drives the generative session; the missing-`TASKS.md` fallback is implemented in `CoreApi::interpret_and_seed` and `CoreApi::generate_and_seed` in [crates/makina-core/src/orchestrator.rs](../../crates/makina-core/src/orchestrator.rs). If no planner interpreter is configured (offline mode), the fallback gracefully degrades to a reviewable blocking issue rather than a hard error.
+
 ---
 
 ## 3. Document Structure
