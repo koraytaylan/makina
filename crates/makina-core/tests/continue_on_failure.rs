@@ -50,26 +50,29 @@ use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
 };
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
+use makina_core::paths;
 use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::worktree::WorktreeManager;
 
-// ── Task-id extraction ─────────────────────────────────────────────────────────
+// ── Task matching ───────────────────────────────────────────────────────────────
 
-/// Recover the task id a session belongs to from its `working_dir`.
+/// Decide whether a spawned session belongs to `(plan_slug, task_id)`.
 ///
-/// The worktree path is `.makina/worktrees/{plan_slug}--{task_id}`, so the final
-/// path component is `{plan_slug}--{task_id}`. `--` is the plan/task delimiter
-/// (and never appears inside a kebab part), so the task id is everything after
-/// the last `--`. This lets a per-task-keyed backend decide how to respond
-/// without the backend trait carrying the task id explicitly.
-fn task_id_of(config: &SessionConfig) -> String {
+/// The worktree directory name is [`makina_core::paths::short_worktree_name`] — a
+/// bounded, hashed form (`{plan#}-{task-trunc}-{hash4}`) that, unlike the old
+/// `{plan_slug}--{task_id}` scheme, is **not reversible** to the task id. So a
+/// per-task-keyed backend identifies its task by recomputing the expected
+/// worktree name with the same production helper and comparing it to the
+/// session's `working_dir` final component — no string-splitting, no coupling to
+/// the name's internal shape.
+fn is_task(config: &SessionConfig, plan_slug: &str, task_id: &str) -> bool {
     config
         .working_dir
         .file_name()
         .and_then(|s| s.to_str())
-        .map(|s| s.rsplit("--").next().unwrap_or(s).to_string())
-        .unwrap_or_default()
+        .map(|name| name == paths::short_worktree_name(plan_slug, task_id))
+        .unwrap_or(false)
 }
 
 // ── FailOneBackend: hard-error for one task, approve for the rest ───────────────
@@ -80,13 +83,19 @@ fn task_id_of(config: &SessionConfig) -> String {
 /// so the other independents reach `Done`.
 #[derive(Clone)]
 struct FailOneBackend {
+    plan_slug: String,
     fail_id: String,
     verdict: String,
 }
 
 impl FailOneBackend {
-    fn new(fail_id: impl Into<String>, verdict: impl Into<String>) -> Self {
+    fn new(
+        plan_slug: impl Into<String>,
+        fail_id: impl Into<String>,
+        verdict: impl Into<String>,
+    ) -> Self {
         Self {
+            plan_slug: plan_slug.into(),
             fail_id: fail_id.into(),
             verdict: verdict.into(),
         }
@@ -99,7 +108,7 @@ impl AgentBackend for FailOneBackend {
         let is_reviewer = config.system_prompt.to_lowercase().contains("review");
         Ok(Box::new(FailOneSession {
             terminated: false,
-            should_fail: task_id_of(&config) == self.fail_id,
+            should_fail: is_task(&config, &self.plan_slug, &self.fail_id),
             is_reviewer,
             verdict: self.verdict.clone(),
         }))
@@ -153,13 +162,19 @@ impl AgentSession for FailOneSession {
 /// fatal); every other task gets the usual success/approve response.
 #[derive(Clone)]
 struct PanicBackend {
+    plan_slug: String,
     panic_id: String,
     verdict: String,
 }
 
 impl PanicBackend {
-    fn new(panic_id: impl Into<String>, verdict: impl Into<String>) -> Self {
+    fn new(
+        plan_slug: impl Into<String>,
+        panic_id: impl Into<String>,
+        verdict: impl Into<String>,
+    ) -> Self {
         Self {
+            plan_slug: plan_slug.into(),
             panic_id: panic_id.into(),
             verdict: verdict.into(),
         }
@@ -172,7 +187,7 @@ impl AgentBackend for PanicBackend {
         let is_reviewer = config.system_prompt.to_lowercase().contains("review");
         Ok(Box::new(PanicSession {
             terminated: false,
-            should_panic: task_id_of(&config) == self.panic_id,
+            should_panic: is_task(&config, &self.plan_slug, &self.panic_id),
             is_reviewer,
             verdict: self.verdict.clone(),
         }))
@@ -367,8 +382,10 @@ async fn run_continues_after_one_independent_fails() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    // `b` fails; `a` and `c` succeed + approve.
-    let backend = FailOneBackend::new("b", r#"{"verdict":"approve"}"#);
+    // `b` fails; `a` and `c` succeed + approve.  The `RunReadyTasks` path scopes
+    // worktrees with an EMPTY plan slug (see `DriverContext::plan_slug`), so the
+    // backend keys on `short_worktree_name("", "b")`.
+    let backend = FailOneBackend::new("", "b", r#"{"verdict":"approve"}"#);
 
     let (root, supervisor_ref) = build_actor_tree(
         repo_root.clone(),
@@ -463,7 +480,8 @@ async fn failed_task_reason_recorded_while_dependent_is_skipped() {
 
     // `b` fails; `a` succeeds + approves.  `d` depends on the failing `b`, so it
     // must be transitively Skipped.
-    let backend = FailOneBackend::new("b", r#"{"verdict":"approve"}"#);
+    // Empty plan slug: the `RunReadyTasks` path scopes worktrees unprefixed.
+    let backend = FailOneBackend::new("", "b", r#"{"verdict":"approve"}"#);
 
     let (root, supervisor_ref) = build_actor_tree(
         repo_root.clone(),
@@ -576,8 +594,8 @@ async fn backend_prompt_panic_is_contained_and_run_continues() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    // `b` panics; `a` and `c` succeed + approve.
-    let backend = PanicBackend::new("b", r#"{"verdict":"approve"}"#);
+    // `b` panics; `a` and `c` succeed + approve.  Empty plan slug (RunReadyTasks).
+    let backend = PanicBackend::new("", "b", r#"{"verdict":"approve"}"#);
 
     let (root, supervisor_ref) = build_actor_tree(
         repo_root.clone(),

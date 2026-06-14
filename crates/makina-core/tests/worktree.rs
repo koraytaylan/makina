@@ -131,15 +131,15 @@ fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
 
 /// **Acceptance criterion** — create makes the worktree + branch; remove tears them down.
 ///
-/// Sequence (with plan-scoped naming `{plan_slug}--{task_id}`):
+/// Sequence (worktree dir + branch use the bounded `short_worktree_name`):
 /// 1. `WorktreeManager::new(temp_repo, "develop").create(plan_slug, "sample-task")`
-///    - `.makina/worktrees/{plan_slug}--sample-task/` must exist and contain a
+///    - `state_root/worktrees/{short_worktree_name}/` must exist and contain a
 ///      valid git checkout.
-///    - Branch `task/{plan_slug}--sample-task` must exist.
+///    - Branch `task/{short_worktree_name}` must exist.
 ///    - Handle fields must match expectations.
 /// 2. `.remove(plan_slug, "sample-task")`
-///    - `.makina/worktrees/{plan_slug}--sample-task/` must be gone.
-///    - Branch `task/{plan_slug}--sample-task` must be gone.
+///    - the worktree dir must be gone.
+///    - Branch `task/{short_worktree_name}` must be gone.
 #[tokio::test]
 async fn create_makes_worktree_and_branch_remove_tears_them_down() {
     // Hold HOME_LOCK for the entire test so HOME is not changed by concurrent tests.
@@ -154,8 +154,14 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
     let plan_slug = "0003-runtime-and-tui-hardening";
     let mgr = WorktreeManager::new(repo_root.clone(), "develop".into());
 
-    // Pre-compute the expected path NOW (while HOME is still set to tmp_home).
+    // Pre-compute the expected path + branch NOW (while HOME is still set to
+    // tmp_home).  Both use the bounded, hashed `short_worktree_name`, not the old
+    // `{plan_slug}--{task_id}` form.
     let expected_path = paths::worktree(&repo_root, plan_slug, "sample-task");
+    let expected_branch = format!(
+        "task/{}",
+        paths::short_worktree_name(plan_slug, "sample-task")
+    );
 
     // ── create ────────────────────────────────────────────────────────────────
 
@@ -166,11 +172,8 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
 
     // Check handle fields.
     assert_eq!(handle.task_id, "sample-task");
-    assert_eq!(
-        handle.branch,
-        "task/0003-runtime-and-tui-hardening--sample-task"
-    );
-    // Worktree now lives under state_root(repo_root)/worktrees/{plan_slug}--{task_id}.
+    assert_eq!(handle.branch, expected_branch);
+    // Worktree now lives under state_root(repo_root)/worktrees/{short_worktree_name}.
     assert_eq!(handle.path, expected_path);
 
     // Worktree directory must exist and be a git checkout.
@@ -191,11 +194,8 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
 
     // Branch must exist in the repo.
     assert!(
-        branch_exists(
-            &repo_root,
-            "task/0003-runtime-and-tui-hardening--sample-task"
-        ),
-        "branch task/0003-runtime-and-tui-hardening--sample-task must exist after create"
+        branch_exists(&repo_root, &expected_branch),
+        "branch {expected_branch} must exist after create"
     );
 
     // ── remove ────────────────────────────────────────────────────────────────
@@ -213,11 +213,8 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
 
     // Branch must be gone.
     assert!(
-        !branch_exists(
-            &repo_root,
-            "task/0003-runtime-and-tui-hardening--sample-task"
-        ),
-        "branch task/0003-runtime-and-tui-hardening--sample-task must be gone after remove"
+        !branch_exists(&repo_root, &expected_branch),
+        "branch {expected_branch} must be gone after remove"
     );
 }
 
@@ -247,6 +244,7 @@ async fn create_reclaims_a_stale_slot() {
     let plan_slug = "sample-plan";
     let task_id = "stale-slot";
     let mgr = WorktreeManager::new(repo_root.clone(), "develop".into());
+    let expected_branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
 
     // ── First create: leaves a real worktree + branch behind. ──────────────────
     let first = mgr
@@ -272,8 +270,7 @@ async fn create_reclaims_a_stale_slot() {
         "reclaimed worktree must live at the same path"
     );
     assert_eq!(
-        second.branch,
-        format!("task/{plan_slug}--{task_id}"),
+        second.branch, expected_branch,
         "reclaimed worktree must use the same branch name"
     );
 
@@ -291,14 +288,11 @@ async fn create_reclaims_a_stale_slot() {
 
     // The branch must exist and point at base_branch (no commits of its own yet).
     assert!(
-        branch_exists(&repo_root, &format!("task/{plan_slug}--{task_id}")),
-        "branch task/{plan_slug}--{task_id} must exist after reclaim"
+        branch_exists(&repo_root, &expected_branch),
+        "branch {expected_branch} must exist after reclaim"
     );
     let base_head = git_stdout(&repo_root, &["rev-parse", "develop"]);
-    let branch_head = git_stdout(
-        &repo_root,
-        &["rev-parse", &format!("task/{plan_slug}--{task_id}")],
-    );
+    let branch_head = git_stdout(&repo_root, &["rev-parse", &expected_branch]);
     assert_eq!(
         branch_head, base_head,
         "reclaimed branch must be cut fresh from base_branch (develop)"
@@ -457,6 +451,14 @@ async fn two_distinct_task_ids_yield_independent_worktrees() {
     let mgr = WorktreeManager::new(repo_root.clone(), "develop".into());
 
     let plan_slug = "sample-plan";
+    let branch_alpha = format!(
+        "task/{}",
+        paths::short_worktree_name(plan_slug, "task-alpha")
+    );
+    let branch_beta = format!(
+        "task/{}",
+        paths::short_worktree_name(plan_slug, "task-beta")
+    );
     let h1 = mgr
         .create(plan_slug, "task-alpha")
         .await
@@ -472,8 +474,8 @@ async fn two_distinct_task_ids_yield_independent_worktrees() {
     assert!(h2.path.exists(), "task-beta worktree must exist");
 
     // Both branches must exist.
-    assert!(branch_exists(&repo_root, "task/sample-plan--task-alpha"));
-    assert!(branch_exists(&repo_root, "task/sample-plan--task-beta"));
+    assert!(branch_exists(&repo_root, &branch_alpha));
+    assert!(branch_exists(&repo_root, &branch_beta));
 
     // Remove both.
     mgr.remove(plan_slug, "task-alpha")
@@ -486,6 +488,6 @@ async fn two_distinct_task_ids_yield_independent_worktrees() {
     // Both gone.
     assert!(!h1.path.exists(), "task-alpha worktree must be gone");
     assert!(!h2.path.exists(), "task-beta worktree must be gone");
-    assert!(!branch_exists(&repo_root, "task/sample-plan--task-alpha"));
-    assert!(!branch_exists(&repo_root, "task/sample-plan--task-beta"));
+    assert!(!branch_exists(&repo_root, &branch_alpha));
+    assert!(!branch_exists(&repo_root, &branch_beta));
 }

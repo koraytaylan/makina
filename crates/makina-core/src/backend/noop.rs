@@ -54,6 +54,7 @@
 //!     model: None,
 //!     effort: None,
 //!     extra: None,
+//!     task_id: None,
 //! };
 //!
 //! let mut session = backend.spawn(config).await.unwrap();

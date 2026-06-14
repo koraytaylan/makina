@@ -417,6 +417,15 @@ mod tests {
     /// still inside the `run_uid` span) falls back to the per-run `run.log`.
     #[test]
     fn per_task_routing() {
+        // Run-log paths resolve under $HOME (state now lives at
+        // ~/.makina/projects/{ns}/runs/…), so pin $HOME to a private temp dir and
+        // hold HOME_ENV_LOCK so this does not race with other tests (e.g. ui.rs)
+        // that mutate HOME concurrently.
+        let _home_guard = makina_core::HOME_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().expect("create temp home");
+        // SAFETY: serialised by HOME_ENV_LOCK (held for the whole test).
+        unsafe { std::env::set_var("HOME", home.path()) };
+
         let tmp = tempfile::tempdir().expect("create temp dir");
         let repo_root = tmp.path().to_path_buf();
         let run_uid = "01HXSAMPLE0000000000000001";
@@ -491,6 +500,15 @@ mod tests {
     /// distinct `{task_slug}.log` forever.
     #[test]
     fn writer_cache_is_bounded() {
+        // Run-log paths resolve under $HOME (state now lives at
+        // ~/.makina/projects/{ns}/runs/…), so pin $HOME to a private temp dir and
+        // hold HOME_ENV_LOCK so this does not race with other tests (e.g. ui.rs)
+        // that mutate HOME concurrently.
+        let _home_guard = makina_core::HOME_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().expect("create temp home");
+        // SAFETY: serialised by HOME_ENV_LOCK (held for the whole test).
+        unsafe { std::env::set_var("HOME", home.path()) };
+
         let tmp = tempfile::tempdir().expect("create temp dir");
         let repo_root = tmp.path().to_path_buf();
         let run_uid = "01HXSAMPLE0000000000000002";
