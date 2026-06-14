@@ -25,6 +25,7 @@ use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::dependency::EdgeInferrer;
 use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::orchestrator::{CoreApi, run_slug};
+use makina_core::paths;
 use makina_core::run_metadata::RunMetadata;
 use makina_core::worktree::WorktreeManager;
 
@@ -111,6 +112,11 @@ Do the thing in `lib.rs`.
 /// terminal one, and whose `started_at <= ended_at`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_metadata_terminal() {
+    // Set HOME to a temp dir so state_root resolves under it (off-repo).
+    // SAFETY: this is the only test in this file; no parallel HOME mutation.
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo = setup_temp_repo();
     let repo_root = repo.path().to_path_buf();
     let api = Arc::new(build_api(repo_root.clone()));
@@ -171,11 +177,8 @@ async fn run_metadata_terminal() {
 
     // finalize_run_status (which writes run.json) runs after the terminal status
     // is broadcast; poll the file into existence under a bounded deadline.
-    let run_json = repo_root
-        .join(".makina")
-        .join("runs")
-        .join(&run_uid)
-        .join("run.json");
+    // The file now lives under state_root(repo_root)/runs/{run_uid}/run.json.
+    let run_json = paths::run_dir(&repo_root, &run_uid).join("run.json");
     let appeared = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if run_json.exists() {

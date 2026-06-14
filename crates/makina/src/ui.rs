@@ -2354,6 +2354,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    // Use the process-global HOME_ENV_LOCK from makina_core so tests that
+    // mutate HOME are serialised against all other HOME-mutating tests in the
+    // process (including those in makina-core).
+    use makina_core::HOME_ENV_LOCK;
+
     fn make_terminal(width: u16, height: u16) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         Terminal::new(backend).unwrap()
@@ -4705,10 +4710,24 @@ mod tests {
         use makina_core::api::AgentRole;
         use std::sync::Arc;
 
-        // Create a tool entry with a title that includes a worktree-absolute path.
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+
+        // Set HOME to a temp dir so state_root resolves predictably.
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", temp_home.path()) };
+
+        // Build the worktree path via the NEW relocated short-name layout.
         let repo_root = std::path::PathBuf::from("/home/user/workspace/myproject");
-        let worktree_path =
-            "/home/user/workspace/myproject/.makina/worktrees/plan-0009--task1/src/main.rs";
+        let state_root = makina_core::paths::state_root(&repo_root);
+        let short_name = makina_core::paths::short_worktree_name("0009-sidebar-tree", "task1");
+        let worktree_path = format!(
+            "{}/worktrees/{}/src/main.rs",
+            state_root.display(),
+            short_name
+        );
+
         let tool = ExchangeEntry {
             role: AgentRole::Developer,
             content: ExchangeContent::Tool {
@@ -4742,10 +4761,10 @@ mod tests {
             "tool title must contain 'src/main.rs' (the compacted path)"
         );
 
-        // Assert that the full worktree prefix is NOT in the header.
+        // Assert that the full worktree prefix (short-name form) is NOT in the header.
         assert!(
-            !header_text.contains(".makina/worktrees/plan-0009--task1/"),
-            "tool title must NOT contain the full worktree prefix"
+            !header_text.contains(&short_name),
+            "tool title must NOT contain the full worktree short name prefix"
         );
 
         // Assert that the tool status is still shown.
@@ -4753,6 +4772,13 @@ mod tests {
             header_text.contains("completed"),
             "tool title must still contain the status '[completed]'"
         );
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
     }
 
     /// **Spinner frame advances on tick:** The spinner_frame function must
@@ -4826,6 +4852,14 @@ mod tests {
             AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
         };
 
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+
+        // Set HOME to a temp dir so state_root resolves predictably.
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", temp_home.path()) };
+
         let mut terminal = make_terminal(120, 40);
 
         // Set up a repo root and task in the worktree.
@@ -4885,12 +4919,16 @@ mod tests {
 
         // Step 4: Start a tool.
         // Use a *worktree-absolute* path so compact_paths must strip the
-        // ".makina/worktrees/<slug>/" prefix. Without the compact_paths
-        // implementation the full worktree prefix would survive in the
-        // rendered output and assertion 5 would fail.
+        // relocated state_root/worktrees/<short-name>/ prefix. Without the
+        // compact_paths implementation the full worktree prefix would survive
+        // in the rendered output and assertion 5 would fail.
+        let state_root = makina_core::paths::state_root(&repo_root);
+        let short_name =
+            makina_core::paths::short_worktree_name("0009-exchange-pane-fidelity", "pane-fidelity");
         let worktree_tool_path = format!(
-            "{}/.makina/worktrees/plan--pane-fidelity/src/main.rs",
-            repo_root.display()
+            "{}/worktrees/{}/src/main.rs",
+            state_root.display(),
+            short_name
         );
         app.update(AppEvent::ApiEvent(Event::AgentExchange {
             run: RunId(1),
@@ -5003,21 +5041,21 @@ mod tests {
         // Assertion 5: Tool title with worktree-absolute path renders repo-relative.
         //
         // The tool title was set to:
-        //   "Read /home/user/workspace/makina/.makina/worktrees/plan--pane-fidelity/src/main.rs"
+        //   "Read {state_root}/worktrees/{short_name}/src/main.rs"
         //
-        // After compact_paths() the worktree prefix
-        //   "/home/user/workspace/makina/.makina/worktrees/plan--pane-fidelity/"
+        // After compact_paths() the relocated worktree prefix
+        //   "{state_root}/worktrees/{short_name}/"
         // is stripped and only "src/main.rs" remains. Without compact_paths this
-        // assertion would fail because ".makina/worktrees/plan--pane-fidelity/"
-        // would still appear in the rendered buffer.
+        // assertion would fail because "worktrees/{short_name}/" would still
+        // appear in the rendered buffer.
         // ──────────────────────────────────────────────────────────────────────
         assert!(
             flattened.contains("src/main.rs"),
             "tool title must contain 'src/main.rs' (the compacted, worktree-stripped path)"
         );
         assert!(
-            !flattened.contains(".makina/worktrees/plan--pane-fidelity/"),
-            "tool title must NOT contain the worktree slug prefix after compact_paths()"
+            !flattened.contains(&format!("worktrees/{short_name}")),
+            "tool title must NOT contain the worktree short-name prefix after compact_paths()"
         );
 
         // ──────────────────────────────────────────────────────────────────────
@@ -5027,6 +5065,15 @@ mod tests {
             log.entries.iter().all(|e| e.complete()),
             "after TurnComplete, all entries must be marked complete"
         );
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     /// **Live activity header shows idle and wall-clock:** When a task is

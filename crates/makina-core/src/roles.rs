@@ -251,6 +251,7 @@ pub fn session_config_for(
         model,
         effort,
         extra: None,
+        task_id: None,
     }
 }
 

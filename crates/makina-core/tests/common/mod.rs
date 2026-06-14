@@ -85,6 +85,7 @@ pub fn test_session_config() -> SessionConfig {
         model: None,
         effort: None,
         extra: None,
+        task_id: None,
     }
 }
 

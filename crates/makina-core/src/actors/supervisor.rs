@@ -154,6 +154,7 @@ use crate::config::Config;
 use crate::gate::{GateOutcome, GateRunner};
 use crate::interpreter::TaskListInterpreter;
 use crate::merge::{MergeOutcome, SquashMerger};
+use crate::paths;
 use crate::persist::persist_graph;
 use crate::state_machine::{TaskEvent, transition};
 use crate::supervision::{RestartConfig, RootSupervisor};
@@ -1757,7 +1758,10 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 // We do NOT hold the graph lock while awaiting the merge lock (the
                 // review_task clone above already released the graph guard), so
                 // there is no lock-ordering cycle.
-                let branch = format!("task/{}--{task_id}", ctx.plan_slug);
+                let branch = format!(
+                    "task/{}",
+                    paths::short_worktree_name(&ctx.plan_slug, &task_id.0)
+                );
                 let message = {
                     let graph = ctx.graph.lock().await;
                     squash_commit_message_locked(&graph, task_id)?

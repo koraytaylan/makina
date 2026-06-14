@@ -336,6 +336,7 @@ async fn acp_backend_spawn_of_missing_binary_is_spawn_not_auth_error() {
         model: None,
         effort: None,
         extra: None,
+        task_id: None,
     };
     match backend.spawn(config).await {
         Err(BackendError::Spawn { .. }) => {

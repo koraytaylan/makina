@@ -482,6 +482,10 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
 
+    // Use the process-global HOME_ENV_LOCK from lib.rs so all test modules
+    // serialize HOME mutations across crate boundaries.
+    use crate::HOME_ENV_LOCK;
+
     fn sample_entry(working_dir: PathBuf) -> AuditEntry {
         AuditEntry {
             timestamp: Utc::now(),
@@ -517,8 +521,13 @@ mod tests {
     ///    decision and policy reason preserved).
     #[tokio::test]
     async fn jsonl_audit_sink_enriches_and_appends() {
+        let _guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
         let repo_dir = tempfile::tempdir().expect("create temp dir");
         let repo_root = repo_dir.path().to_path_buf();
+
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
         // The worktree lives under repo_root/.worktrees/<task-id>.
         let working_dir = repo_root.join(".worktrees").join("task-a");
@@ -545,11 +554,8 @@ mod tests {
         sink.flush().await;
 
         // Assert the JSONL file exists and has exactly two lines (append).
-        let audit_path = repo_root
-            .join(".makina")
-            .join("runs")
-            .join("run-uid-1")
-            .join("audit.jsonl");
+        // The audit log now lives under state_root(repo_root) instead of repo_root/.makina.
+        let audit_path = crate::paths::audit_log(&repo_root, "run-uid-1");
         assert!(
             audit_path.exists(),
             "audit.jsonl must be created after record + flush"
@@ -711,10 +717,16 @@ mod tests {
     /// sequence number, so order is checkable).
     #[tokio::test]
     async fn record_enqueues_without_blocking_and_writer_flushes_in_order() {
+        let _guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
         const N: usize = 1000;
 
         let repo_dir = tempfile::tempdir().expect("create temp dir");
         let repo_root = repo_dir.path().to_path_buf();
+
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         let working_dir = repo_root.join(".worktrees").join("task-a");
 
         let sink = JsonlAuditSink::new(repo_root.clone());
@@ -747,11 +759,8 @@ mod tests {
         sink.flush().await;
 
         // Assert the file has exactly N lines, in enqueue order.
-        let audit_path = repo_root
-            .join(".makina")
-            .join("runs")
-            .join("run-uid-1")
-            .join("audit.jsonl");
+        // The audit log now lives under state_root(repo_root)/runs/{run_uid}/audit.jsonl.
+        let audit_path = crate::paths::audit_log(&repo_root, "run-uid-1");
         let contents = std::fs::read_to_string(&audit_path).expect("read audit.jsonl");
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(

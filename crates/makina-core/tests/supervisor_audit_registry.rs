@@ -32,6 +32,7 @@ use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::paths;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::worktree::WorktreeManager;
 
@@ -173,6 +174,11 @@ fn task(id: &str) -> Task {
 ///    - `task_id == "audit-task"`
 #[tokio::test]
 async fn run_graph_calls_audit_registry_register_on_dispatch() {
+    // Set HOME to a temp dir so state_root resolves under it (off-repo).
+    // SAFETY: this is the only test in this file; no parallel HOME mutation.
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
@@ -244,13 +250,11 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
 
     let call = &calls[0];
 
-    let expected_working_dir = repo_root
-        .join(".makina")
-        .join("worktrees")
-        .join(format!("{plan_slug}--{task_id_str}"));
+    // Worktree now lives under state_root(repo_root)/worktrees/{plan_slug}--{task_id}.
+    let expected_working_dir = paths::worktree(&repo_root, plan_slug, task_id_str);
     assert_eq!(
         call.working_dir, expected_working_dir,
-        "register: working_dir must be repo_root/.makina/worktrees/{plan_slug}--{task_id_str}"
+        "register: working_dir must be state_root/worktrees/{plan_slug}--{task_id_str}"
     );
 
     assert_eq!(

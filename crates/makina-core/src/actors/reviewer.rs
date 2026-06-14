@@ -199,11 +199,15 @@ impl kameo::message::Message<Review> for Reviewer {
     ) -> Self::Reply {
         // 1. Build a reviewer session config rooted at the task's worktree,
         //    carrying the role assignment (mode/model/effort) from `self.assignment`.
-        let config = session_config_for(
-            Role::Reviewer,
-            msg.worktree.clone(),
-            self.assignment.clone(),
-        );
+        let config = {
+            let mut c = session_config_for(
+                Role::Reviewer,
+                msg.worktree.clone(),
+                self.assignment.clone(),
+            );
+            c.task_id = Some(msg.task.id.0.clone());
+            c
+        };
 
         // 2. Spawn a session on the injected backend.
         let mut session = self

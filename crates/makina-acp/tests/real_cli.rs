@@ -121,6 +121,7 @@ async fn real_cli_prompt_response_through_the_backend_trait() {
         model: None,
         effort: None,
         extra: None,
+        task_id: None,
     };
 
     let mut session = backend

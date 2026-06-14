@@ -2,9 +2,11 @@
 //!
 //! The [`WorktreeManager`] creates and tears down git worktrees and their
 //! associated branches on behalf of the Supervisor.  Each task gets an
-//! isolated checkout at `.makina/worktrees/{plan_slug}--{task_id}/` on branch
-//! `task/{plan_slug}--{task_id}`, branched off the configured base branch
-//! (typically `develop`).
+//! isolated checkout at `~/.makina/projects/{project_ns}/worktrees/{short_worktree_name}/`
+//! on branch `task/{short_worktree_name}`, branched off the configured base
+//! branch (typically `develop`).  The `short_worktree_name` is a bounded,
+//! deterministic `{plan#}-{task-trunc}-{hash4}` form (see
+//! [`crate::paths::short_worktree_name`]).
 //!
 //! # Design
 //!
@@ -24,9 +26,10 @@
 //!
 //! # Transient storage
 //!
-//! `.makina/worktrees/` is **not** committed — it is listed in the repo
-//! `.gitignore`.  `.makina/tasks/` (the task artifact directory) IS committed
-//! and is NOT ignored.
+//! Worktrees live under `~/.makina/projects/{project_ns}/worktrees/` (off-repo)
+//! so they are never committed and never need a gitignore rule in the project.
+//! `.makina/tasks/` (the task artifact directory) IS committed and is NOT
+//! ignored.
 //!
 //! # Concurrency
 //!
@@ -105,7 +108,7 @@ pub struct WorktreeHandle {
     pub task_id: String,
 
     /// The git branch checked out in this worktree, of the form
-    /// `task/{plan_slug}--{task_id}`.
+    /// `task/{short_worktree_name}`.
     pub branch: String,
 
     /// Absolute path to the worktree directory on the filesystem.
@@ -158,9 +161,10 @@ impl WorktreeManager {
 
     /// Create a worktree and branch for `task_id` within `plan_slug`.
     ///
-    /// The worktree directory and branch are plan-scoped as
-    /// `{plan_slug}--{task_id}` / `task/{plan_slug}--{task_id}` so that different
-    /// plans never collide even when they share a task id.
+    /// The worktree directory and branch are plan-scoped using a bounded,
+    /// deterministic short name `{plan#}-{task-trunc}-{hash4}` (see
+    /// [`crate::paths::short_worktree_name`]) so that different plans never
+    /// collide even when they share a task id.
     ///
     /// # What this does
     ///
@@ -169,13 +173,13 @@ impl WorktreeManager {
     ///    previous runs.
     /// 3. **Reclaim-on-conflict:** if the worktree path or the branch already
     ///    exist — a stale slot left by a prior interrupted run — this does *not*
-    ///    error. The `{plan_slug}--{task_id}` namespace is unambiguously
-    ///    Makina-owned transient state, so the stale slot is reclaimed: it warns,
-    ///    calls [`remove`](Self::remove) (idempotent), and falls through to
-    ///    recreate the slot **fresh off `base_branch`** (Option A — reset, not
-    ///    resume: the prior attempt was never merged, so its work is throwaway).
+    ///    error. The short-name namespace is unambiguously Makina-owned transient
+    ///    state, so the stale slot is reclaimed: it warns, calls
+    ///    [`remove`](Self::remove) (idempotent), and falls through to recreate
+    ///    the slot **fresh off `base_branch`** (Option A — reset, not resume:
+    ///    the prior attempt was never merged, so its work is throwaway).
     /// 4. Runs `git -C {repo_root} worktree add {worktree_path} -b
-    ///    task/{plan_slug}--{task_id} {base_branch}` to create the branch off
+    ///    task/{short_worktree_name} {base_branch}` to create the branch off
     ///    `base_branch` and check it out in the new worktree.
     ///
     /// # Returns
@@ -195,7 +199,7 @@ impl WorktreeManager {
         validate_task_id(task_id)?;
 
         let worktree_path = self.worktree_path(plan_slug, task_id);
-        let branch = format!("task/{plan_slug}--{task_id}");
+        let branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
 
         // Prune stale registrations first so git doesn't complain about
         // already-registered-but-gone paths from previous crashed runs.
@@ -203,9 +207,9 @@ impl WorktreeManager {
 
         // Reclaim-on-conflict: a leftover worktree path or branch is a stale slot
         // from a prior interrupted run, not a collision with someone else's work.
-        // The `{plan_slug}--{task_id}` namespace is unambiguously Makina-owned
-        // transient state, so reset the slot fresh off `base_branch` (Option A —
-        // the prior attempt was never merged, so its work is throwaway).
+        // The short-name namespace is unambiguously Makina-owned transient state,
+        // so reset the slot fresh off `base_branch` (Option A — the prior attempt
+        // was never merged, so its work is throwaway).
         if worktree_path.exists() || self.branch_exists(&branch).await? {
             tracing::warn!(
                 plan_slug,
@@ -248,7 +252,7 @@ impl WorktreeManager {
     /// 1. Validates `task_id`.
     /// 2. Runs `git -C {repo_root} worktree remove --force {worktree_path}`.
     ///    "Not found" / "not a worktree" outcomes are treated as success.
-    /// 3. Runs `git -C {repo_root} branch -D task/{plan_slug}--{task_id}`.
+    /// 3. Runs `git -C {repo_root} branch -D task/{short_worktree_name}`.
     ///    "Branch not found" outcomes are treated as success.
     /// 4. Runs `git worktree prune` to keep the git index tidy.
     ///
@@ -268,7 +272,7 @@ impl WorktreeManager {
         validate_task_id(task_id)?;
 
         let worktree_path = self.worktree_path(plan_slug, task_id);
-        let branch = format!("task/{plan_slug}--{task_id}");
+        let branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
 
         // Remove the worktree (--force handles dirty checkouts; ignore
         // "not a worktree" / "not found" so the call is idempotent).
@@ -435,6 +439,10 @@ fn is_not_found_stderr(stderr: &str) -> bool {
 mod tests {
     use super::*;
 
+    // Use the process-global HOME_ENV_LOCK from lib.rs so all test modules
+    // serialize HOME mutations across crate boundaries.
+    use crate::HOME_ENV_LOCK;
+
     // ── validate_task_id ──────────────────────────────────────────────────────
 
     #[test]
@@ -499,23 +507,57 @@ mod tests {
 
     // ── WorktreeManager::worktree_path ────────────────────────────────────────
 
+    /// The worktree path leaf must use the short name format
+    /// `{plan#}-{task-trunc}-{hash4}` and resolve under `state_root`, not
+    /// under `repo_root/.makina`.
     #[test]
-    fn worktree_path_is_under_repo_root() {
-        let mgr = WorktreeManager::new(PathBuf::from("/repo"), "develop".into());
+    fn worktree_path_uses_short_name() {
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let tmp_repo = tempfile::tempdir().expect("create temp repo");
+        let repo_root = tmp_repo.path().to_path_buf();
+
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let mgr = WorktreeManager::new(repo_root.clone(), "develop".into());
         let path = mgr.worktree_path("0003-runtime-and-tui-hardening", "sample-task");
-        assert_eq!(
-            path,
-            PathBuf::from("/repo/.makina/worktrees/0003-runtime-and-tui-hardening--sample-task")
+
+        // Must be under state_root, not repo_root/.makina.
+        let state_root = crate::paths::state_root(&repo_root);
+        assert!(
+            path.starts_with(&state_root),
+            "worktree_path must be under state_root ({}), got {}",
+            state_root.display(),
+            path.display()
+        );
+        assert!(
+            !path.starts_with(repo_root.join(".makina")),
+            "worktree_path must NOT be under repo_root/.makina"
+        );
+
+        // Leaf must be the short name (not the old plan--task form).
+        let short =
+            crate::paths::short_worktree_name("0003-runtime-and-tui-hardening", "sample-task");
+        assert!(
+            path.ends_with(&short),
+            "worktree leaf must be short_worktree_name '{short}', got {}",
+            path.display()
+        );
+        assert!(
+            !path
+                .to_string_lossy()
+                .ends_with("0003-runtime-and-tui-hardening--sample-task"),
+            "worktree path must not use the old plan--task format"
         );
     }
 
     // ── module doc-comment layout invariant ───────────────────────────────────
 
-    /// Regression guard for the `docs-plan-scoped-layout` fix: the module-level
-    /// doc-comments must describe the shipped `.makina/` layout with plan-scoped
-    /// `{plan_slug}--{task_id}` naming, never the pre-relocation top-level
-    /// `.worktrees/` / `.tasks/` paths. Doc-comments aren't introspectable at
-    /// runtime, so we assert against the module-doc region of the source file.
+    /// Regression guard: the module-level doc-comments must describe the
+    /// shipped `~/.makina/projects/{project_ns}/worktrees/{short_worktree_name}`
+    /// layout with the new short-name scheme, never the old
+    /// `.makina/worktrees/{plan_slug}--{task_id}/` in-repo paths.
     #[test]
     fn module_doc_describes_makina_plan_scoped_layout() {
         let src = include_str!("worktree.rs");
@@ -529,28 +571,20 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Shipped layout must be present.
+        // Relocated layout must be present with the new short-name form.
         assert!(
-            module_doc.contains(".makina/worktrees/{plan_slug}--{task_id}/"),
-            "module doc must reference the plan-scoped `.makina/worktrees/` checkout path"
+            module_doc.contains("~/.makina/projects/{project_ns}/worktrees/"),
+            "module doc must reference the relocated `~/.makina/projects/` layout"
         );
         assert!(
-            module_doc.contains("`.makina/worktrees/`"),
-            "module doc must state `.makina/worktrees/` is gitignored"
-        );
-        assert!(
-            module_doc.contains("`.makina/tasks/`"),
-            "module doc must state `.makina/tasks/` is the committed artifact dir"
+            module_doc.contains("short_worktree_name"),
+            "module doc must reference short_worktree_name"
         );
 
-        // Pre-relocation top-level paths must NOT reappear in the module doc.
+        // Old in-repo plan--task format must NOT appear in the module doc.
         assert!(
-            !module_doc.contains("`.worktrees/`"),
-            "module doc must not reference pre-relocation top-level `.worktrees/`"
-        );
-        assert!(
-            !module_doc.contains("`.tasks/`"),
-            "module doc must not reference pre-relocation top-level `.tasks/`"
+            !module_doc.contains(".makina/worktrees/{plan_slug}--{task_id}"),
+            "module doc must not reference the old plan-slug--task_id format"
         );
     }
 }

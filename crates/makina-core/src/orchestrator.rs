@@ -2016,6 +2016,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    // Use the process-global HOME_ENV_LOCK from lib.rs so all test modules
+    // serialize HOME mutations across crate boundaries.
+    use crate::HOME_ENV_LOCK;
+
     /// A small, valid structured-text task list used by the OpenRun tests.
     ///
     /// Two tasks under one section; `task-two` explicitly depends on `task-one`.
@@ -2249,10 +2253,17 @@ Do the thing in `lib.rs`.
         (api, repo_dir)
     }
 
-    /// Derive a task id from the per-task worktree dir (final path component is
-    /// `{plan_slug}--{task_id}`; `--` is the delimiter). Mirrors
-    /// `continue_on_failure.rs::task_id_of`.
+    /// Derive a task id from the [`SessionConfig`].
+    ///
+    /// Uses `config.task_id` when set (the orchestrator always sets it for
+    /// Developer/Reviewer sessions since plan 0029).  Falls back to parsing the
+    /// working-dir last component for backwards-compatibility with test backends
+    /// that do not supply the new field.
     fn backend_task_id(config: &crate::backend::SessionConfig) -> String {
+        if let Some(id) = &config.task_id {
+            return id.clone();
+        }
+        // Legacy fallback: old worktree names used `{plan_slug}--{task_id}`.
         config
             .working_dir
             .file_name()
@@ -3264,6 +3275,12 @@ This description is long enough to pass the thin-description threshold.
     /// no worktree/branch leaks (bounded poll for the async teardown).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancel_run_stops_execution_and_cleans_up() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         let interpreter = Arc::new(EdgeInferrer::new(
             Arc::new(StructuredTextInterpreter::new()),
         ));
@@ -3286,14 +3303,15 @@ This description is long enough to pass the thin-description threshold.
         let file_path = dir.path().join("cancel-feature.md");
         std::fs::write(&file_path, source).unwrap();
 
-        // Worktree dirs + branches are plan-scoped as `{plan_slug}--{task_id}`;
-        // derive the same plan_slug the orchestrator does so this test stays
+        // Worktree dirs + branches now use the bounded short name
+        // `{plan#}-{task-trunc}-{hash4}` (plan-0029).
+        // Derive the same plan_slug the orchestrator does so this test stays
         // location-agnostic (the tempdir parent name varies per run).
         let plan_slug = plan_slug(&file_path);
-        let wt_name_a = format!("{plan_slug}--task-a");
-        let wt_name_b = format!("{plan_slug}--task-b");
-        let branch_a = format!("task/{plan_slug}--task-a");
-        let branch_b = format!("task/{plan_slug}--task-b");
+        let wt_name_a = paths::short_worktree_name(&plan_slug, "task-a");
+        let wt_name_b = paths::short_worktree_name(&plan_slug, "task-b");
+        let branch_a = format!("task/{wt_name_a}");
+        let branch_b = format!("task/{wt_name_b}");
 
         let run = match api
             .execute(Command::OpenRun {
@@ -3311,7 +3329,8 @@ This description is long enough to pass the thin-description threshold.
 
         // 2. Wait until task-a is InProgress AND its worktree exists (the driver
         //    has launched + created the worktree before the held developer turn).
-        let worktrees_dir = repo_root.join(".makina").join("worktrees");
+        // Worktrees now live under state_root(repo_root)/worktrees/ (off-repo).
+        let worktrees_dir = paths::state_root(&repo_root).join("worktrees");
         let api_poll = Arc::clone(&api);
         let wt_a = worktrees_dir.join(&wt_name_a);
         poll_until(
@@ -3392,6 +3411,15 @@ This description is long enough to pass the thin-description threshold.
             "all worktrees + task branches to be cleaned up after cancel",
         )
         .await;
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     /// Cancel of an unknown run id is rejected.
@@ -3414,6 +3442,12 @@ This description is long enough to pass the thin-description threshold.
     /// proving pause is a *cooperative stop-launching* flag, not a teardown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pause_run_sets_paused_and_does_not_complete_then_resume_completes() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         let (api, _repo) = execution_core_api();
         let api = Arc::new(api);
         let (_dir, path) = write_task_list(ONE_TASK_LIST);
@@ -3485,6 +3519,15 @@ This description is long enough to pass the thin-description threshold.
         assert_eq!(view.status, RunStatus::Completed);
         assert!(view.tasks.iter().all(|t| t.state == TaskState::Done));
         collector.abort();
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     /// **Pause stops launching the SECOND task — deterministically.**
@@ -3995,6 +4038,12 @@ Description text that is long enough for parser.
     /// its revived `Skipped` dependent reaches `Done` too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn retried_task_runs_to_terminal_again() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
 
         api.execute(Command::RetryTask {
@@ -4039,12 +4088,27 @@ Description text that is long enough for parser.
                 .unwrap_or(false),
             "the revived dependent task-two must reach Done"
         );
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     /// `RetryFailedTasks` flips the run `Failed → Running` (observed on the
     /// stream) and then re-aggregates to `Completed`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn retry_flips_run_status_running_then_completed() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
 
         // Subscribe BEFORE issuing retry so we capture the Running flip.
@@ -4120,12 +4184,27 @@ Description text that is long enough for parser.
             )),
             "retry must emit TaskRetried for task-one; got {evs:?}"
         );
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     /// A retry targeting a run while it is still actively `Running` is rejected
     /// with `InvalidCommand` (only Failed/Paused/Completed runs are retryable).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn retry_rejected_while_run_active() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         // A backend that blocks the first developer prompt so the run is provably
         // still Running when we issue the retry.
         let (backend, release) = GatedBackend::new();
@@ -4184,6 +4263,15 @@ Description text that is long enough for parser.
             "gated run to drain to Completed",
         )
         .await;
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     /// A `Task` with `started_at = Some(t0)` and `finished_at = Some(t1)` is

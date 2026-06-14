@@ -2285,9 +2285,18 @@ A description that is long enough to pass minimums.
     #[test]
     fn open_log_resolves_expected_path() {
         use crate::placeholder::PlaceholderApi;
+        use makina_core::HOME_ENV_LOCK;
         use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
         use std::path::PathBuf;
         use std::sync::Arc;
+
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+
+        // Set HOME to a temp dir so state_root resolves deterministically.
+        let temp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", temp_home.path()) };
 
         // Create a minimal app with a run and task.
         let api = Arc::new(PlaceholderApi::empty());
@@ -2330,10 +2339,13 @@ A description that is long enough to pass minimums.
                     actual, expected,
                     "derived path must match paths::task_log output"
                 );
-                // Verify the path has the expected format: .makina/runs/{run_id}/logs/{task}.log
+                // After plan-0029, task_log lives under state_root (HOME-based), not repo_root.
+                let state_root = makina_core::paths::state_root(&repo_root);
                 assert!(
-                    expected.to_string_lossy().contains(".makina/runs/"),
-                    "path should contain .makina/runs directory"
+                    expected.starts_with(&state_root),
+                    "path should be under state_root ({}), got {}",
+                    state_root.display(),
+                    expected.display()
                 );
                 assert!(
                     expected.to_string_lossy().ends_with("my-task.log"),
@@ -2344,6 +2356,15 @@ A description that is long enough to pass minimums.
             }
         } else {
             panic!("no run selected");
+        }
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
         }
     }
 

@@ -311,6 +311,7 @@ mod tests {
             model: None,
             effort: None,
             extra: None,
+            task_id: None,
         }
     }
 
@@ -554,6 +555,7 @@ mod tests {
                 model: None,
                 effort: None,
                 extra: None,
+                task_id: None,
             };
             let mut session = self
                 .backend

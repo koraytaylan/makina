@@ -115,6 +115,15 @@ pub struct SessionConfig {
     /// configuration.  A value of `None` means "use backend defaults".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<toml::Value>,
+
+    /// The logical task id this session is processing.
+    ///
+    /// Set by the orchestrator when spawning a Developer or Reviewer session for a
+    /// known task.  Backends may use it for logging or routing; they MUST ignore it
+    /// if absent (`None` means "no task context" — e.g. planner or discovery
+    /// sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// A single turn prompt sent to an [`AgentSession`].
@@ -430,6 +439,7 @@ mod tests {
             model: None,
             effort: None,
             extra: None,
+            task_id: None,
         };
         let mut session: Box<dyn AgentSession> = backend.spawn(config).await.unwrap();
 
@@ -484,6 +494,7 @@ mod tests {
             model: None,
             effort: None,
             extra: None,
+            task_id: None,
         };
         let mut session = backend.spawn(config).await.unwrap();
         session.terminate().await.unwrap();
@@ -505,6 +516,7 @@ mod tests {
             model: None,
             effort: None,
             extra: None,
+            task_id: None,
         };
         let serialised = toml::to_string(&config).expect("serialise config to TOML");
         let deserialised: SessionConfig =

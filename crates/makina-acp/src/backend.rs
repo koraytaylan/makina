@@ -704,6 +704,7 @@ mod tests {
             model: None,
             effort: None,
             extra: None,
+            task_id: None,
         };
         // The Ok variant (`Box<dyn AgentSession>`) is not Debug, so match rather
         // than `unwrap_err()`.

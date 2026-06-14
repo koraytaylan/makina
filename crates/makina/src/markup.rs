@@ -291,17 +291,40 @@ pub fn render_ansi(text: &str) -> Vec<Line<'static>> {
 
 /// Rewrite absolute paths under the repo root (incl. the worktrees dir) to a
 /// compact repo-relative form. Non-matching text is returned unchanged.
+///
+/// After plan 0029 the worktrees live **off-repo** at
+/// `~/.makina/projects/{ns}/worktrees/{short-name}/`, so we strip:
+/// 1. The relocated `state_root(repo_root)/worktrees/<short-name>/` prefix.
+/// 2. The legacy in-repo `<root>/.makina/worktrees/<slug>--<id>/` prefix
+///    (for backward compatibility with transcripts written before the move).
+/// 3. Any remaining `<root>/` prefix for non-worktree repo-relative paths.
 pub fn compact_paths(s: &str, repo_root: &Path) -> String {
     let root = repo_root.to_string_lossy();
-    let wt = format!("{root}/.makina/worktrees/");
     let mut out = s.to_string();
-    // Strip "<root>/.makina/worktrees/<slug>--<id>/" → "" (worktree-relative).
-    if let Some(i) = out.find(&*wt)
-        && let Some(rel_start) = out[i + wt.len()..].find('/')
+
+    // 1. Strip relocated worktree prefix: state_root/worktrees/<name>/ → ""
+    let state_root = makina_core::paths::state_root(repo_root);
+    let relocated_wt = format!("{}/worktrees/", state_root.display());
+    if let Some(i) = out.find(&*relocated_wt)
+        && let Some(rel_start) = out[i + relocated_wt.len()..].find('/')
     {
-        let cut = i + wt.len() + rel_start + 1;
+        let cut = i + relocated_wt.len() + rel_start + 1;
         out.replace_range(i..cut, "");
+        // No further stripping needed — the relocated path is outside repo_root.
+        return out;
     }
+
+    // 2. Strip legacy in-repo worktree prefix: <root>/.makina/worktrees/<name>/ → ""
+    let legacy_wt = format!("{root}/.makina/worktrees/");
+    if let Some(i) = out.find(&*legacy_wt)
+        && let Some(rel_start) = out[i + legacy_wt.len()..].find('/')
+    {
+        let cut = i + legacy_wt.len() + rel_start + 1;
+        out.replace_range(i..cut, "");
+        return out;
+    }
+
+    // 3. Strip general repo-relative prefix: <root>/ → ""
     out.replace(&format!("{root}/"), "")
 }
 

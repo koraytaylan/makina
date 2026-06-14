@@ -22,7 +22,14 @@
 
 use std::process::Command;
 
+use makina_core::paths;
 use makina_core::worktree::{WorktreeError, WorktreeManager};
+
+/// Process-global lock for tests in this binary that set HOME.
+/// Tests that create/remove worktrees must hold this lock for the entire test
+/// so they don't race on the HOME env var (which determines state_root).
+/// Uses `tokio::sync::Mutex` so async tests can hold it across `.await`.
+static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── Temp-repo helper ──────────────────────────────────────────────────────────
 
@@ -135,11 +142,20 @@ fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
 ///    - Branch `task/{plan_slug}--sample-task` must be gone.
 #[tokio::test]
 async fn create_makes_worktree_and_branch_remove_tears_them_down() {
+    // Hold HOME_LOCK for the entire test so HOME is not changed by concurrent tests.
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
     let plan_slug = "0003-runtime-and-tui-hardening";
     let mgr = WorktreeManager::new(repo_root.clone(), "develop".into());
+
+    // Pre-compute the expected path NOW (while HOME is still set to tmp_home).
+    let expected_path = paths::worktree(&repo_root, plan_slug, "sample-task");
 
     // ── create ────────────────────────────────────────────────────────────────
 
@@ -154,13 +170,8 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
         handle.branch,
         "task/0003-runtime-and-tui-hardening--sample-task"
     );
-    assert_eq!(
-        handle.path,
-        repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("0003-runtime-and-tui-hardening--sample-task")
-    );
+    // Worktree now lives under state_root(repo_root)/worktrees/{plan_slug}--{task_id}.
+    assert_eq!(handle.path, expected_path);
 
     // Worktree directory must exist and be a git checkout.
     assert!(
@@ -225,6 +236,11 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
 /// a [`WorktreeError::GitCommandFailed`].
 #[tokio::test]
 async fn create_reclaims_a_stale_slot() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
@@ -297,6 +313,11 @@ async fn create_reclaims_a_stale_slot() {
 /// should return `Ok(())`.
 #[tokio::test]
 async fn remove_nonexistent_worktree_is_idempotent() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
@@ -311,6 +332,11 @@ async fn remove_nonexistent_worktree_is_idempotent() {
 /// Calling `remove` twice on the same task ID must succeed on both calls.
 #[tokio::test]
 async fn double_remove_is_idempotent() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
@@ -333,6 +359,11 @@ async fn double_remove_is_idempotent() {
 /// `create` with an empty task ID returns `WorktreeError::InvalidTaskId`.
 #[tokio::test]
 async fn create_with_empty_task_id_errors() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let mgr = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
 
@@ -349,6 +380,11 @@ async fn create_with_empty_task_id_errors() {
 /// `create` with a path-traversal task ID returns `WorktreeError::InvalidTaskId`.
 #[tokio::test]
 async fn create_with_path_traversal_task_id_errors() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let mgr = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
 
@@ -365,6 +401,11 @@ async fn create_with_path_traversal_task_id_errors() {
 /// `create` with a task ID containing a forward slash returns `InvalidTaskId`.
 #[tokio::test]
 async fn create_with_slash_in_task_id_errors() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let mgr = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
 
@@ -381,6 +422,11 @@ async fn create_with_slash_in_task_id_errors() {
 /// `create` with an uppercase task ID returns `InvalidTaskId`.
 #[tokio::test]
 async fn create_with_uppercase_task_id_errors() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let mgr = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
 
@@ -400,6 +446,11 @@ async fn create_with_uppercase_task_id_errors() {
 /// worktrees, each with their own branch.
 #[tokio::test]
 async fn two_distinct_task_ids_yield_independent_worktrees() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialised by HOME_LOCK (tokio async mutex held for entire test)
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 

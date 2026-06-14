@@ -270,7 +270,7 @@ pub fn load_disk_run_views(
     live_run_uids: &HashSet<String>,
     next_id: &mut u64,
 ) -> Vec<RunView> {
-    let runs_dir = repo_root.join(".makina").join("runs");
+    let runs_dir = crate::paths::state_root(repo_root).join("runs");
     let dir_iter = match std::fs::read_dir(&runs_dir) {
         Ok(iter) => iter,
         Err(_) => return Vec::new(), // directory absent or unreadable — nothing to load
@@ -311,6 +311,10 @@ mod tests {
 
     use chrono::TimeZone;
 
+    // Use the process-global HOME_ENV_LOCK from lib.rs so all test modules
+    // serialize HOME mutations across crate boundaries.
+    use crate::HOME_ENV_LOCK;
+
     fn fixed_ts(year: i32, month: u32, day: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, 10, 0, 0)
             .single()
@@ -320,11 +324,16 @@ mod tests {
     /// A [`RunMetadata`] written by [`write_run_metadata`] and read back via
     /// `serde_json::from_str` must preserve `run_uid`, `run_slug`, `status`, and
     /// both timestamps, and the file must land at
-    /// `.makina/runs/{run_uid}/run.json`.
+    /// `state_root(root)/runs/{run_uid}/run.json`.
     #[tokio::test]
     async fn round_trip_through_write_run_metadata() {
+        let _guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
         let dir = tempfile::tempdir().expect("create temp dir");
         let root = dir.path();
+
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
         let started = fixed_ts(2026, 5, 1);
         let ended = fixed_ts(2026, 5, 2);
@@ -340,14 +349,12 @@ mod tests {
             .await
             .expect("write_run_metadata must succeed");
 
-        let expected_path = root
-            .join(".makina")
-            .join("runs")
-            .join(&meta.run_uid)
-            .join("run.json");
+        // The file must land at state_root(root)/runs/{run_uid}/run.json
+        let expected_path = crate::paths::run_dir(root, &meta.run_uid).join("run.json");
         assert!(
             expected_path.exists(),
-            "run.json must land at .makina/runs/{{run_uid}}/run.json"
+            "run.json must land at state_root/runs/{{run_uid}}/run.json, checked {}",
+            expected_path.display()
         );
 
         let contents = std::fs::read_to_string(&expected_path).expect("read run.json");
@@ -366,9 +373,14 @@ mod tests {
     /// when the process restarts.
     #[test]
     fn old_run_json_without_snapshot_still_loads() {
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+        let tmp_home = tempfile::tempdir().expect("create temp home");
         let dir = tempfile::tempdir().expect("create temp dir");
         let root = dir.path();
         let run_uid = "01ABCDEF0123456789ABCDEFGH";
+
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio blocking_lock held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
         // Create a minimal run.json without the `tasks` field (simulating an old file).
         let old_json = r#"{
@@ -380,9 +392,10 @@ mod tests {
 }
 "#;
 
-        let run_dir = root.join(".makina").join("runs").join(run_uid);
-        std::fs::create_dir_all(&run_dir).expect("create run dir");
-        std::fs::write(run_dir.join("run.json"), old_json).expect("write old run.json");
+        // Create the run directory under state_root so load_disk_run_views finds it.
+        let run_dir_path = crate::paths::run_dir(root, run_uid);
+        std::fs::create_dir_all(&run_dir_path).expect("create run dir");
+        std::fs::write(run_dir_path.join("run.json"), old_json).expect("write old run.json");
 
         // load_disk_run_views (the disk half of runs()) must surface this run as a
         // RunView even though it has no tasks field.
@@ -406,8 +419,13 @@ mod tests {
     /// correct task states and iteration counts.
     #[tokio::test]
     async fn open_finished_run_reconstructs_view() {
+        let _guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
         let dir = tempfile::tempdir().expect("create temp dir");
         let root = dir.path();
+
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
         let started = fixed_ts(2026, 5, 1);
         let ended = fixed_ts(2026, 5, 2);

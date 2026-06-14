@@ -5090,23 +5090,31 @@ mod tests {
     /// replay loader in isolation.
     #[test]
     fn open_finished_run_populates_exchange() {
+        use makina_core::HOME_ENV_LOCK;
         use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
-        use std::fs::{self, File};
+        use std::fs::File;
         use std::io::Write;
         use tempfile::TempDir;
 
-        // Create a temporary repo root with the expected directory layout:
-        // {repo_root}/.makina/runs/{run_uid}/logs/{task_id}_transcript.jsonl
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+
+        // Set HOME to a temp dir so state_root (and thus run_logs_dir) resolves
+        // to a predictable, writable location.
+        let temp_home = TempDir::new().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", temp_home.path()) };
+
+        // Create a temporary repo root.
         let temp_dir = TempDir::new().expect("create temp dir");
         let repo_root = temp_dir.path().to_path_buf();
         let run_uid = "01TESTREPLAYUID";
         let task_id = "test-task";
-        let logs_dir = repo_root
-            .join(".makina")
-            .join("runs")
-            .join(run_uid)
-            .join("logs");
-        fs::create_dir_all(&logs_dir).expect("create logs dir");
+
+        // After plan-0029, transcripts live under state_root/runs/{run_uid}/logs/
+        // Use run_logs_dir to get (and create) the canonical path.
+        let logs_dir = makina_core::paths::run_logs_dir(&repo_root, run_uid)
+            .expect("run_logs_dir must succeed");
         let transcript_path = logs_dir.join(format!("{task_id}_transcript.jsonl"));
 
         // Write a transcript with multiple event types.
@@ -5237,6 +5245,15 @@ mod tests {
             app.exchange_logs.contains_key(&cache_key),
             "exchange_logs must use (RunId, TaskId) as composite cache key"
         );
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]
