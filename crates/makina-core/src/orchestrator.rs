@@ -1347,7 +1347,7 @@ impl CoreApi {
         // later `run()`/`runs()` snapshot reflects Completed/Failed.  The
         // JoinHandle is detached: the run drives itself to terminal + cleans up.
         tokio::spawn(async move {
-            let _ = run_graph(
+            match run_graph(
                 graph,
                 worktree_manager,
                 config,
@@ -1360,7 +1360,18 @@ impl CoreApi {
                 plan_slug,
                 planner_interpreter,
             )
-            .await;
+            .await
+            {
+                Ok(report) => {
+                    // Best-effort: log the plan_branch_left if the branch was left unmerged.
+                    if let Some(branch) = &report.plan_branch_left {
+                        tracing::info!(branch = %branch, "plan branch left unmerged after run");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "run_graph failed");
+                }
+            }
             state.finalize_run_status(run).await;
         });
     }
@@ -4507,6 +4518,7 @@ Description text that is long enough for parser.
         let worktree_manager = WorktreeManager {
             repo_root: tmp.path().to_path_buf(),
             base_branch: "main".into(),
+            fork_branch: None,
         };
 
         let api = CoreApi::with_audit_registry(
@@ -4602,6 +4614,7 @@ Description text that is long enough for parser.
             WorktreeManager {
                 repo_root: tmp.path().to_path_buf(),
                 base_branch: "main".into(),
+                fork_branch: None,
             },
             config,
             Arc::new(NoopAuditRegistry),
@@ -4667,6 +4680,7 @@ Description text that is long enough for parser.
             WorktreeManager {
                 repo_root: tmp.path().to_path_buf(),
                 base_branch: "main".into(),
+                fork_branch: None,
             },
             config,
             Arc::new(NoopAuditRegistry),
@@ -4721,6 +4735,7 @@ Description text that is long enough for parser.
             WorktreeManager {
                 repo_root: tmp.path().to_path_buf(),
                 base_branch: "main".into(),
+                fork_branch: None,
             },
             config,
             Arc::new(NoopAuditRegistry),

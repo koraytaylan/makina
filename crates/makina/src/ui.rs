@@ -2271,6 +2271,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::TaskRetried { .. } => "TaskRetried",
         Event::RoleTurnMetrics { .. } => "RoleTurnMetrics",
         Event::ProjectDiscovered { .. } => "ProjectDiscovered",
+        Event::RunIntegrationBranchLeft { .. } => "RunIntegrationBranchLeft",
     }
 }
 

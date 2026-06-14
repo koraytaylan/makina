@@ -141,6 +141,10 @@ pub struct WorktreeManager {
 
     /// The branch that new task branches are created off (e.g. `"develop"`).
     pub base_branch: String,
+
+    /// Branch new task branches fork from. `None` ⇒ fork from `base_branch`
+    /// (legacy ask-path). The run sets this to `plan/{plan_slug}`.
+    pub fork_branch: Option<String>,
 }
 
 impl WorktreeManager {
@@ -154,7 +158,17 @@ impl WorktreeManager {
         Self {
             repo_root,
             base_branch,
+            fork_branch: None,
         }
+    }
+
+    /// Builder method to set the fork point branch for task worktrees.
+    ///
+    /// When set, task worktrees fork from this branch instead of `base_branch`.
+    /// Used by the run to fork from `plan/{plan_slug}` during the run.
+    pub fn with_fork_branch(mut self, branch: String) -> Self {
+        self.fork_branch = Some(branch);
+        self
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -176,11 +190,12 @@ impl WorktreeManager {
     ///    error. The short-name namespace is unambiguously Makina-owned transient
     ///    state, so the stale slot is reclaimed: it warns, calls
     ///    [`remove`](Self::remove) (idempotent), and falls through to recreate
-    ///    the slot **fresh off `base_branch`** (Option A — reset, not resume:
-    ///    the prior attempt was never merged, so its work is throwaway).
+    ///    the slot **fresh off the fork point** (`fork_branch` when set, else
+    ///    `base_branch`; Option A — reset, not resume: the prior attempt was
+    ///    never merged, so its work is throwaway).
     /// 4. Runs `git -C {repo_root} worktree add {worktree_path} -b
-    ///    task/{short_worktree_name} {base_branch}` to create the branch off
-    ///    `base_branch` and check it out in the new worktree.
+    ///    task/{short_worktree_name} {fork_point}` to create the branch off the
+    ///    fork point and check it out in the new worktree.
     ///
     /// # Returns
     ///
@@ -208,7 +223,7 @@ impl WorktreeManager {
         // Reclaim-on-conflict: a leftover worktree path or branch is a stale slot
         // from a prior interrupted run, not a collision with someone else's work.
         // The short-name namespace is unambiguously Makina-owned transient state,
-        // so reset the slot fresh off `base_branch` (Option A — the prior attempt
+        // so reset the slot fresh off the fork point (Option A — the prior attempt
         // was never merged, so its work is throwaway).
         if worktree_path.exists() || self.branch_exists(&branch).await? {
             tracing::warn!(
@@ -221,19 +236,12 @@ impl WorktreeManager {
 
         // Create the worktree + branch in one atomic git command.
         let wt_path_str = worktree_path.to_string_lossy();
+        let fork_point = self.fork_branch.as_deref().unwrap_or(&self.base_branch);
         self.run_git(
-            &[
-                "worktree",
-                "add",
-                &wt_path_str,
-                "-b",
-                &branch,
-                &self.base_branch,
-            ],
+            &["worktree", "add", &wt_path_str, "-b", &branch, fork_point],
             &format!(
-                "git -C {} worktree add {wt_path_str} -b {branch} {}",
+                "git -C {} worktree add {wt_path_str} -b {branch} {fork_point}",
                 self.repo_root.display(),
-                self.base_branch
             ),
         )
         .await?;
@@ -321,6 +329,41 @@ impl WorktreeManager {
         let _ = self.git_worktree_prune().await;
 
         Ok(())
+    }
+
+    /// Create `plan/{plan_slug}` off `base_branch` and check it out in
+    /// `repo_root`. Idempotent-on-restart: if the branch already exists, just
+    /// check it out (a reclaimed run resumes on the same integration branch).
+    pub async fn create_plan_branch(&self, plan_slug: &str) -> Result<String, WorktreeError> {
+        let branch = format!("plan/{plan_slug}");
+        if self.branch_exists(&branch).await? {
+            self.run_git(
+                &["checkout", &branch],
+                &format!("git -C {} checkout {branch}", self.repo_root.display(),),
+            )
+            .await?;
+        } else {
+            self.run_git(
+                &["checkout", "-b", &branch, &self.base_branch],
+                &format!(
+                    "git -C {} checkout -b {branch} {}",
+                    self.repo_root.display(),
+                    self.base_branch
+                ),
+            )
+            .await?;
+        }
+        Ok(branch)
+    }
+
+    /// Check out `branch` in `repo_root` (used to restore `base_branch` at run end).
+    pub async fn checkout(&self, branch: &str) -> Result<(), WorktreeError> {
+        self.run_git(
+            &["checkout", branch],
+            &format!("git -C {} checkout {branch}", self.repo_root.display(),),
+        )
+        .await
+        .map(|_| ())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

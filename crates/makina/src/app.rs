@@ -2464,6 +2464,11 @@ impl App {
                 );
                 self.status_message = Some(msg);
             }
+            // Run's integration branch was left unmerged (plan 0030).
+            // Surface a status message with the branch name.
+            Event::RunIntegrationBranchLeft { run: _, branch } => {
+                self.status_message = Some(format!("Plan branch left unmerged: {}", branch));
+            }
         }
 
         self.last_event = Some(event);

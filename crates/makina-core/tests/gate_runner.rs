@@ -96,7 +96,7 @@ fn run_git(path: &std::path::Path, args: &[&str]) {
 /// so it is never actually spawned) and `base_branch` is `develop` to match the
 /// temp repo.
 fn config_with_gates(gates: Vec<GateConfig>, gate_iterations: u32) -> Config {
-    use makina_core::config::{ProviderConfig, RolesConfig};
+    use makina_core::config::{MergeConfig, ProviderConfig, RolesConfig};
 
     Config {
         backend: BackendConfig {
@@ -120,6 +120,7 @@ fn config_with_gates(gates: Vec<GateConfig>, gate_iterations: u32) -> Config {
         concurrency: 1,
         gates,
         base_branch: "develop".into(),
+        merge: MergeConfig::default(),
     }
 }
 

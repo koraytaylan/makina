@@ -150,7 +150,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api;
 use crate::audit::{AuditRegistry, NoopAuditRegistry};
 use crate::backend::AgentBackend;
-use crate::config::Config;
+use crate::config::{Config, FinalMerge};
 use crate::gate::{GateOutcome, GateRunner};
 use crate::interpreter::TaskListInterpreter;
 use crate::merge::{MergeOutcome, SquashMerger};
@@ -376,6 +376,11 @@ pub struct RunReport {
     /// The `String` is a short failure reason (a driver hard-error message, or a
     /// synthesized cap literal such as `"wall-clock-cap-reached"`).
     pub failed_tasks: Vec<(TaskId, String)>,
+
+    /// `Some(plan_branch)` when the run left its integration branch unmerged
+    /// (Manual mode, a failed run, or a final-merge conflict); `None` when it was
+    /// squashed/merge-committed into base_branch.
+    pub plan_branch_left: Option<String>,
 }
 
 // ── DevelopGateOutcome ──────────────────────────────────────────────────────────
@@ -886,6 +891,21 @@ async fn run_graph_inner(
         status: api::RunStatus::Running,
     });
 
+    // 1. Create + check out the per-plan integration branch off base_branch.
+    // (Skip for ask path with empty plan_slug — keep legacy behavior with fork_branch: None.)
+    let (plan_branch, worktree_manager) = if !plan_slug.is_empty() {
+        let branch = worktree_manager
+            .create_plan_branch(&plan_slug)
+            .await
+            .map_err(|e| format!("failed to create plan branch: {e}"))?;
+        // 2. Task worktrees fork from the plan branch.
+        let mgr = worktree_manager.with_fork_branch(branch.clone());
+        (branch, mgr)
+    } else {
+        // Ask path: no plan branch, keep fork_branch: None (merges into base_branch).
+        (worktree_manager.base_branch.clone(), worktree_manager)
+    };
+
     // Build the actor tree: fault-tolerance root + domain hub, then wire the
     // per-task-spawn deps into the hub (the same shape as the test harness).
     let root = RootSupervisor::start();
@@ -925,14 +945,16 @@ async fn run_graph_inner(
 
     // Build the driver context directly (we drive the `scheduler` ourselves so
     // we keep ownership of the shared graph for the final status derivation).
-    let squash_merger = SquashMerger::new(
-        worktree_manager.repo_root.clone(),
-        worktree_manager.base_branch.clone(),
-    );
+    // 3. The per-task merger targets the plan branch (now checked out in repo_root).
+    let squash_merger = SquashMerger::new(worktree_manager.repo_root.clone(), plan_branch.clone());
+
+    // Track whether this is a real plan-branch run (not the ask path).
+    let has_plan_branch = !plan_slug.is_empty();
+
     let ctx = DriverContext {
         graph: Arc::clone(&graph),
         merge_lock: Arc::new(Mutex::new(())),
-        worktree_manager,
+        worktree_manager: worktree_manager.clone(),
         gate_runner: GateRunner::new(),
         squash_merger,
         config: config.clone(),
@@ -947,10 +969,99 @@ async fn run_graph_inner(
         plan_slug,
     };
 
-    let result = scheduler(ctx, config.concurrency).await;
+    let mut result = scheduler(ctx, config.concurrency).await;
 
     // Tear down the actor tree (kills the hub + any lingering supervised spokes).
     root.kill();
+
+    // Final merge: decide whether to land plan/{slug} into base_branch (if all tasks Done).
+    // This happens BEFORE restoring base_branch, so the plan branch is still checked out.
+    // Skip final merge for the ask path (empty plan_slug → no plan branch, tasks merged directly into base_branch).
+    if result.is_ok() && has_plan_branch {
+        // Only proceed to final merge if the scheduler returned successfully AND we have a real plan branch.
+        let all_done = {
+            let g = graph.lock().await;
+            aggregate_run_status(&g) == api::RunStatus::Completed
+        };
+
+        let plan_branch_left = if all_done {
+            // All tasks Done: proceed with final merge per config.
+            let final_merger = SquashMerger::new(
+                worktree_manager.repo_root.clone(),
+                worktree_manager.base_branch.clone(),
+            );
+
+            // Construct a suitable final-merge commit message using the plan branch name.
+            let merge_message = format!("{}: integration branch", &plan_branch);
+
+            match config.merge.final_ {
+                FinalMerge::Squash => {
+                    match final_merger
+                        .final_squash(&plan_branch, &merge_message)
+                        .await
+                    {
+                        Ok(MergeOutcome::Merged) => None,
+                        Ok(MergeOutcome::Conflict { .. }) => Some(plan_branch.clone()),
+                        Err(e) => {
+                            // Hard error during final merge: treat like a conflict
+                            // (leave the branch, do not corrupt base_branch).
+                            tracing::warn!(
+                                error = %e,
+                                "final squash merge failed; leaving plan branch unmerged"
+                            );
+                            Some(plan_branch.clone())
+                        }
+                    }
+                }
+                FinalMerge::MergeCommit => {
+                    match final_merger
+                        .final_merge_commit(&plan_branch, &merge_message)
+                        .await
+                    {
+                        Ok(MergeOutcome::Merged) => None,
+                        Ok(MergeOutcome::Conflict { .. }) => Some(plan_branch.clone()),
+                        Err(e) => {
+                            // Hard error during final merge: treat like a conflict
+                            // (leave the branch, do not corrupt base_branch).
+                            tracing::warn!(
+                                error = %e,
+                                "final merge-commit failed; leaving plan branch unmerged"
+                            );
+                            Some(plan_branch.clone())
+                        }
+                    }
+                }
+                FinalMerge::Manual => {
+                    // Manual mode: always leave the branch for human merge.
+                    Some(plan_branch.clone())
+                }
+            }
+        } else {
+            // Any failed task: leave the plan branch unmerged.
+            Some(plan_branch.clone())
+        };
+
+        // Update the report with plan_branch_left status.
+        if let Ok(ref mut report) = result {
+            report.plan_branch_left = plan_branch_left.clone();
+
+            // Emit the plan-branch-left event if the branch was left.
+            if let Some(ref branch) = plan_branch_left {
+                control.emit(api::Event::RunIntegrationBranchLeft {
+                    run: control.run,
+                    branch: branch.clone(),
+                });
+            }
+        }
+    }
+
+    // Run end: restore repo_root back to base_branch (best-effort; warn on failure).
+    if let Err(e) = worktree_manager
+        .checkout(&worktree_manager.base_branch)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to restore base branch in repo_root");
+    }
 
     // Derive + emit the aggregate terminal status — but NOT when cancelled: a
     // cancelled run's status is owned by the caller (Cancel sets it explicitly),
@@ -1376,6 +1487,7 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
         None => Ok(RunReport {
             outcomes,
             failed_tasks,
+            plan_branch_left: None,
         }),
     }
 }

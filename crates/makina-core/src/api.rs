@@ -875,6 +875,19 @@ pub enum Event {
         /// Number of files scanned.
         scanned_files: usize,
     },
+
+    /// The run's integration branch was left unmerged (Manual mode, failed run, or merge conflict).
+    ///
+    /// Emitted when a completed run's `plan/{slug}` branch was not merged into
+    /// `base_branch` (either by configuration — Manual mode — or due to failure
+    /// or a merge conflict). The TUI can surface the branch name for manual
+    /// inspection or merge.
+    RunIntegrationBranchLeft {
+        /// The Run that left an unmerged branch.
+        run: RunId,
+        /// The integration branch name (e.g. `"plan/0030-demo"`).
+        branch: String,
+    },
 }
 
 /// Token usage for a single agent turn, when the backend reports it.

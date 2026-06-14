@@ -2226,6 +2226,7 @@ mod tests {
             caps: makina_core::config::CapsConfig::default(),
             concurrency: 1,
             base_branch: "develop".into(),
+            merge: makina_core::config::MergeConfig::default(),
         };
 
         let api = Arc::new(makina_core::orchestrator::CoreApi::new(

@@ -304,6 +304,38 @@ impl Default for CapsConfig {
     }
 }
 
+// ── Merge config ──────────────────────────────────────────────────────────────
+
+/// How a completed run lands its `plan/{plan_slug}` branch into `base_branch`.
+///
+/// Determines the final merge behavior when all tasks in a run complete
+/// successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalMerge {
+    /// One squash commit of the plan branch onto base_branch (the legacy shape).
+    #[default]
+    Squash,
+    /// `git merge --no-ff plan/{slug}` — a true merge commit on base_branch.
+    MergeCommit,
+    /// Leave plan/{slug}; surface its name for a human to merge.
+    Manual,
+}
+
+/// Configuration for final merge behavior.
+///
+/// Specifies how the completed run's integration branch lands into the base branch.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MergeConfig {
+    /// How the completed run's integration branch lands into base_branch.
+    ///
+    /// `final` is a Rust keyword, so the field is named `final_` with
+    /// `#[serde(rename = "final")]` to deserialize from the TOML key `final`.
+    #[serde(rename = "final")]
+    pub final_: FinalMerge,
+}
+
 // ── GlobalConfig ──────────────────────────────────────────────────────────────
 
 /// Returns the default concurrency (3) for serde field-level default.
@@ -350,6 +382,13 @@ pub struct GlobalConfig {
     /// Defaults to `3`.  Must be ≥ 1 after merging.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+
+    /// Final merge configuration for completed runs.
+    ///
+    /// Specifies how the plan branch lands into the base branch when a run
+    /// completes. Defaults to squash merge if not specified.
+    #[serde(default)]
+    pub merge: MergeConfig,
 }
 
 impl Default for GlobalConfig {
@@ -361,6 +400,7 @@ impl Default for GlobalConfig {
             planner: PlannerConfig::default(),
             caps: CapsConfig::default(),
             concurrency: 3,
+            merge: MergeConfig::default(),
         }
     }
 }
@@ -506,6 +546,13 @@ pub struct ProjectConfig {
     /// assignments are ignored — those remain global-only.
     #[serde(default)]
     pub roles: RolesConfig,
+
+    /// Optional override of the global final merge configuration.
+    ///
+    /// When set, this overrides the global `[merge]` configuration for this
+    /// specific project.
+    #[serde(default)]
+    pub merge: Option<MergeConfig>,
 }
 
 impl ProjectConfig {
@@ -601,6 +648,9 @@ pub struct Config {
 
     /// Base branch for worktrees and pull requests.  From the project layer.
     pub base_branch: String,
+
+    /// Final merge configuration (project overrides global).
+    pub merge: MergeConfig,
 }
 
 impl Config {
@@ -700,6 +750,9 @@ impl Config {
         // layer; provider/model/mode/effort come from the global layer only.
         merge_project_role_prompts(&mut roles, &project.roles);
 
+        // Merge configuration: project overrides global.
+        let merge = project.merge.unwrap_or(global.merge);
+
         Self {
             backend: global.backend,
             providers,
@@ -709,6 +762,7 @@ impl Config {
             concurrency,
             gates: project.gates,
             base_branch,
+            merge,
         }
     }
 
@@ -727,6 +781,7 @@ impl Config {
     /// - Each gate has a non-empty `name`.
     /// - Each gate has a non-empty `command`.
     /// - `base_branch` is non-empty.
+    /// - `[merge] final` is one of `"squash"`, `"merge-commit"`, or `"manual"` (unknown values rejected at parse time).
     ///
     /// # Errors
     ///
@@ -1801,6 +1856,137 @@ mod tests {
         assert!(
             error_msg.contains("global (~/.makina/config.toml)"),
             "error should contain the global-specific label, got: {error_msg}"
+        );
+    }
+
+    // ── Final merge config tests ──────────────────────────────────────────────
+
+    /// **Acceptance criterion — final merge defaults to squash**
+    ///
+    /// When global and project configs have no `[merge]` section, the resolved
+    /// `config.merge.final_` should be `FinalMerge::Squash`.
+    #[test]
+    fn final_merge_defaults_to_squash() {
+        let global = GlobalConfig::default();
+        let project = ProjectConfig::default();
+
+        let config = Config::resolve(global, project);
+
+        assert_eq!(
+            config.merge.final_,
+            FinalMerge::Squash,
+            "absent [merge] should default to Squash"
+        );
+    }
+
+    /// **Acceptance criterion — final merge parses each mode**
+    ///
+    /// The `[merge] final` field should parse from TOML strings:
+    /// - `"squash"` → `FinalMerge::Squash`
+    /// - `"merge-commit"` → `FinalMerge::MergeCommit`
+    /// - `"manual"` → `FinalMerge::Manual`
+    #[test]
+    fn final_merge_parses_each_mode() {
+        // Test squash mode
+        let global_squash = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+
+            [merge]
+            final = "squash"
+            "#,
+            "global",
+        )
+        .expect("TOML with final='squash' is valid");
+        assert_eq!(global_squash.merge.final_, FinalMerge::Squash);
+
+        // Test merge-commit mode
+        let global_merge_commit = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+
+            [merge]
+            final = "merge-commit"
+            "#,
+            "global",
+        )
+        .expect("TOML with final='merge-commit' is valid");
+        assert_eq!(global_merge_commit.merge.final_, FinalMerge::MergeCommit);
+
+        // Test manual mode
+        let global_manual = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+
+            [merge]
+            final = "manual"
+            "#,
+            "global",
+        )
+        .expect("TOML with final='manual' is valid");
+        assert_eq!(global_manual.merge.final_, FinalMerge::Manual);
+    }
+
+    /// **Acceptance criterion — final merge rejects unknown values**
+    ///
+    /// When the TOML has `[merge] final = "rebase"` (or any unknown value),
+    /// parsing should fail with a `ConfigError::Parse`.
+    #[test]
+    fn final_merge_rejects_unknown() {
+        let bad_toml = r#"
+        [backend]
+        command = "acp-cli"
+
+        [merge]
+        final = "rebase"
+        "#;
+
+        let err = GlobalConfig::from_toml_str(bad_toml, "global")
+            .expect_err("unknown final merge mode should fail parsing");
+
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "error should be ConfigError::Parse, got: {err:?}"
+        );
+    }
+
+    /// **Acceptance criterion — project merge overrides global**
+    ///
+    /// When global config has `[merge] final = "manual"` and project config
+    /// has `[merge] final = "squash"`, the resolved `config.merge.final_`
+    /// should be `FinalMerge::Squash`.
+    #[test]
+    fn project_merge_overrides_global() {
+        let global = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+
+            [merge]
+            final = "manual"
+            "#,
+            "global",
+        )
+        .expect("global TOML is valid");
+
+        let project = ProjectConfig::from_toml_str(
+            r#"
+            [merge]
+            final = "squash"
+            "#,
+            "project",
+        )
+        .expect("project TOML is valid");
+
+        let config = Config::resolve(global, project);
+
+        assert_eq!(
+            config.merge.final_,
+            FinalMerge::Squash,
+            "project [merge] should override global"
         );
     }
 }

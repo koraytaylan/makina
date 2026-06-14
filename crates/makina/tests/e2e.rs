@@ -564,6 +564,9 @@ fn log_event(ev: &Event) {
                 gate_count, scanned_files
             )
         }
+        Event::RunIntegrationBranchLeft { run, branch } => {
+            eprintln!("  · RunIntegrationBranchLeft {run} → {branch}")
+        }
     }
 }
 

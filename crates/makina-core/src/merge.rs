@@ -180,10 +180,12 @@ pub struct SquashMerger {
     /// process's CWD.  This checkout has `base_branch` checked out.
     pub repo_root: PathBuf,
 
-    /// The branch task branches are merged **into** (e.g. `"develop"`).  Used in
-    /// messages and (conceptually) the branch the restore returns to; the actual
-    /// restore is `reset --hard HEAD`, which targets whatever `repo_root` has
-    /// checked out (expected to be `base_branch`).
+    /// The **target** branch the merger lands task branches onto — `"develop"`
+    /// on the ask path, but `"plan/{slug}"` when constructed by `run_graph_inner`
+    /// for a run with a real `plan_slug`.  Used in messages and (conceptually)
+    /// the branch the restore returns to; the actual restore is
+    /// `reset --hard HEAD`, which targets whatever `repo_root` has checked out
+    /// (expected to be `base_branch`).
     pub base_branch: String,
 }
 
@@ -271,6 +273,123 @@ impl SquashMerger {
                 ),
                 stderr,
             });
+        }
+
+        Ok(MergeOutcome::Merged)
+    }
+
+    /// Squash-land `plan_branch` onto `base_branch` as ONE commit.
+    ///
+    /// This is the final merge variant of [`squash_merge`]: it first checks out
+    /// `base_branch` (whereas `squash_merge` operates on an already-checked-out
+    /// `plan_branch`), then performs the squash merge into the **true**
+    /// `base_branch`. On success, `base_branch` gains exactly ONE new commit
+    /// (message == `message`); on conflict, `base_branch` is restored to a clean
+    /// state and [`MergeOutcome::Conflict`] is returned.
+    ///
+    /// # Returns
+    ///
+    /// - [`MergeOutcome::Merged`] — the squashed commit landed on `base_branch`.
+    /// - [`MergeOutcome::Conflict`] — a conflict occurred; `base_branch` is clean
+    ///   and unchanged (`details` carries git's conflict output).
+    ///
+    /// # Errors
+    ///
+    /// [`MergeError`] on a true infrastructure failure.  On the conflict path the
+    /// restore runs before returning, so `base_branch` is left clean.
+    pub async fn final_squash(
+        &self,
+        plan_branch: &str,
+        message: &str,
+    ) -> Result<MergeOutcome, MergeError> {
+        // Check out base_branch first (we are currently on plan/{slug}).
+        self.run_git_checked(
+            &["checkout", &self.base_branch],
+            &format!(
+                "git -C {} checkout {}",
+                self.repo_root.display(),
+                &self.base_branch
+            ),
+        )
+        .await?;
+
+        // Perform the squash merge from plan_branch.
+        let squash = self
+            .run_git_raw(&["merge", "--squash", plan_branch])
+            .await?;
+
+        if !squash.status.success() {
+            // Conflict. Capture detail and restore base_branch before returning.
+            let details = combine_output(&squash.stdout, &squash.stderr);
+            self.restore_base_branch().await?;
+            return Ok(MergeOutcome::Conflict { details });
+        }
+
+        // Commit the squashed change.
+        let commit = self
+            .run_git_raw(&["commit", "--allow-empty", "-m", message])
+            .await?;
+
+        if !commit.status.success() {
+            // Commit failed. Restore base_branch before surfacing the error.
+            let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
+            self.restore_base_branch().await?;
+            return Err(MergeError::GitCommandFailed {
+                command: format!(
+                    "git -C {} commit --allow-empty -m {message:?}",
+                    self.repo_root.display()
+                ),
+                stderr,
+            });
+        }
+
+        Ok(MergeOutcome::Merged)
+    }
+
+    /// `git merge --no-ff {plan_branch}` onto `base_branch` (a real merge commit).
+    ///
+    /// Checks out `base_branch` first, then performs a non-fast-forward merge so
+    /// that the plan branch is recorded as a parent (creating a true merge commit
+    /// with two parents on `base_branch`).  On success, `base_branch` gains a
+    /// merge commit; on conflict, `base_branch` is restored to a clean state and
+    /// [`MergeOutcome::Conflict`] is returned.
+    ///
+    /// # Returns
+    ///
+    /// - [`MergeOutcome::Merged`] — the merge commit landed on `base_branch`.
+    /// - [`MergeOutcome::Conflict`] — a conflict occurred; `base_branch` is clean
+    ///   and unchanged (`details` carries git's conflict output).
+    ///
+    /// # Errors
+    ///
+    /// [`MergeError`] on a true infrastructure failure.  On the conflict path the
+    /// restore runs before returning, so `base_branch` is left clean.
+    pub async fn final_merge_commit(
+        &self,
+        plan_branch: &str,
+        message: &str,
+    ) -> Result<MergeOutcome, MergeError> {
+        // Check out base_branch first.
+        self.run_git_checked(
+            &["checkout", &self.base_branch],
+            &format!(
+                "git -C {} checkout {}",
+                self.repo_root.display(),
+                &self.base_branch
+            ),
+        )
+        .await?;
+
+        // Perform the non-fast-forward merge from plan_branch.
+        let merge = self
+            .run_git_raw(&["merge", "--no-ff", "-m", message, plan_branch])
+            .await?;
+
+        if !merge.status.success() {
+            // Conflict. Capture detail and restore base_branch before returning.
+            let details = combine_output(&merge.stdout, &merge.stderr);
+            self.restore_base_branch().await?;
+            return Ok(MergeOutcome::Conflict { details });
         }
 
         Ok(MergeOutcome::Merged)

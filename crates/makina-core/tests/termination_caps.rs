@@ -119,7 +119,7 @@ fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
 /// backends, so it is never spawned) and `base_branch` is `develop` to match the
 /// temp repo.
 fn config(gates: Vec<GateConfig>, caps: CapsConfig) -> Config {
-    use makina_core::config::{ProviderConfig, RolesConfig};
+    use makina_core::config::{MergeConfig, ProviderConfig, RolesConfig};
 
     Config {
         backend: BackendConfig {
@@ -138,6 +138,7 @@ fn config(gates: Vec<GateConfig>, caps: CapsConfig) -> Config {
         concurrency: 1,
         gates,
         base_branch: "develop".into(),
+        merge: MergeConfig::default(),
     }
 }
 
