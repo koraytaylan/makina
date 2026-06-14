@@ -3004,6 +3004,16 @@ Create beta.
     // starvation between the poll loop and the background execution).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn start_run_executes_run_and_emits_live_events() {
+        // Pin $HOME under HOME_ENV_LOCK: the run writes state (worktrees, run
+        // logs, per-task transcripts) under state_root = $HOME/.makina/projects/{ns},
+        // so a concurrent test mutating HOME mid-run would scatter those paths and
+        // the transcript assertion below would flake. Held for the whole test.
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         let (api, repo) = execution_core_api();
         let api = Arc::new(api);
         let (_dir, path) = write_task_list(ONE_TASK_LIST);
@@ -3181,6 +3191,15 @@ Create beta.
         for line in lines {
             let _: ExchangeEvent =
                 serde_json::from_str(line).expect("each transcript line must be valid JSON");
+        }
+
+        // Restore HOME.
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
         }
     }
 
