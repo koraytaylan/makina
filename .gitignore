@@ -1,3 +1,6 @@
 .DS_Store
 
 /target
+
+# Throwaway dummy projects for test-driving Makina (each its own git repo)
+/sandbox/
