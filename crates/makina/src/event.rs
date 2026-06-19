@@ -111,6 +111,11 @@ pub async fn run(
         }
     });
 
+    // Background UI jobs send their resolved AppEvents here. This keeps
+    // expensive open/discovery work off the render loop while preserving the
+    // single App::update path for state changes.
+    let (background_tx, mut background_rx) = mpsc::channel::<AppEvent>(64);
+
     // Periodic tick timer.
     let mut ticker = time::interval(TICK_INTERVAL);
 
@@ -133,6 +138,10 @@ pub async fn run(
             maybe_term = term_rx.recv() => {
                 maybe_term.map(|ev| translate_terminal_event(ev, modal, app.focused_panel))
 
+            }
+
+            maybe_background = background_rx.recv() => {
+                maybe_background
             }
 
             maybe_api = api_stream.next() => {
@@ -175,7 +184,7 @@ pub async fn run(
             // `update` consumes — plus an OPTIONAL transient status message to
             // surface the command outcome/error (task 31).  Keeping the async
             // work here keeps `App::update` pure.
-            let (event, status) = resolve_io(app, event).await;
+            let (event, status) = resolve_io(app, event, &background_tx).await;
 
             let mut needs_redraw = app.update(event);
             if let Some(msg) = status {
@@ -230,61 +239,59 @@ async fn resolve_api_event(
 ///
 /// This is the single place where the TUI touches the filesystem and the api;
 /// [`App::update`] never does.  Handles:
-/// - **File browser** (task 28): `OpenBrowser` → read CWD; `BrowserActivate` on
-///   a dir → read it, on a file → compute transient "Interpreting …" status,
-///   `execute(OpenRun)` (now fast) → `CloseBrowser` (a transient "Interpreting …"
-///   status is surfaced for files); `BrowserParent` → read parent dir.
+/// - **File browser** (task 28): `OpenBrowser` → spawn plan discovery / CWD read;
+///   `BrowserActivate` on a dir → spawn the read; on a file → compute transient
+///   "Interpreting …" status, spawn `execute(OpenRun)`, and close the browser
+///   immediately; `BrowserParent` → spawn parent read.
 /// - **Run control** (task 31): `StartRun`/`PauseRun`/`CancelRun` →
 ///   `execute(...)` for `app.selected_run()` (outcome/error → status message);
 ///   the run-state changes themselves flow back via `api.subscribe()`.
 ///
 /// Non-IO events pass straight through with no status message.
-async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
+async fn resolve_io(
+    app: &App,
+    event: AppEvent,
+    background_tx: &mpsc::Sender<AppEvent>,
+) -> (AppEvent, Option<String>) {
     match event {
         AppEvent::OpenBrowser => {
-            // First try to discover plans under docs/plans/
-            let plans = makina_core::orchestrator::discover_plans(&app.repo_root);
-            if !plans.is_empty() {
-                (AppEvent::PlansDiscovered { plans }, None)
-            } else {
-                // Fall back to the CWD file browser when no plans are discovered
-                let start =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                (read_dir_event(&start).await, None)
-            }
+            spawn_open_browser(app.repo_root.clone(), background_tx.clone());
+            (
+                AppEvent::OpenBrowser,
+                Some("Discovering plans...".to_string()),
+            )
         }
         AppEvent::BrowserParent => match app.browser.as_ref().and_then(|b| b.parent()) {
-            Some(parent) => (read_dir_event(parent).await, None),
+            Some(parent) => {
+                spawn_read_dir(parent.to_path_buf(), background_tx.clone());
+                (AppEvent::Tick, None)
+            }
             // Already at the root — nothing to do; just redraw.
             None => (AppEvent::Tick, None),
         },
         AppEvent::BrowserActivate => {
             match app.browser.as_ref().and_then(|b| b.selected_entry()) {
-                Some(entry) if entry.is_dir => (read_dir_event(&entry.path).await, None),
+                Some(entry) if entry.is_dir => {
+                    spawn_read_dir(entry.path.clone(), background_tx.clone());
+                    (AppEvent::Tick, None)
+                }
                 Some(entry) => {
                     // It's a file: compute a transient "Interpreting …" status
-                    // (for immediate user feedback), perform the (now fast)
-                    // execute(OpenRun) to register the run + broadcast, then
-                    // close the browser.  The "Opened {run}" (or error only on
-                    // failure) can follow from the RunLoaded path.
+                    // (for immediate user feedback), then let a background task
+                    // perform execute(OpenRun). The RunLoaded event will populate
+                    // the panes when the core open completes.
                     let stem = entry
                         .path
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("task list");
                     let status = format!("Interpreting {}...", stem);
-                    let result = app
-                        .api
-                        .execute(makina_core::api::Command::OpenRun {
-                            task_list_path: entry.path.clone(),
-                        })
-                        .await;
-                    let msg = if let Err(e) = result {
-                        format!("Open failed: {e}")
-                    } else {
-                        status
-                    };
-                    (AppEvent::CloseBrowser, Some(msg))
+                    spawn_open_run(
+                        std::sync::Arc::clone(&app.api),
+                        entry.path.clone(),
+                        background_tx.clone(),
+                    );
+                    (AppEvent::CloseBrowser, Some(status))
                 }
                 // No selection (empty dir) — ignore.
                 None => (AppEvent::Tick, None),
@@ -297,18 +304,8 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
             Some(entry) if entry.has_tasks => {
                 let path = entry.dir.join("TASKS.md");
                 let status = format!("Interpreting {}...", entry.slug);
-                let result = app
-                    .api
-                    .execute(makina_core::api::Command::OpenRun {
-                        task_list_path: path,
-                    })
-                    .await;
-                let msg = if let Err(e) = result {
-                    format!("Open failed: {e}")
-                } else {
-                    status
-                };
-                (AppEvent::CloseBrowser, Some(msg))
+                spawn_open_run(std::sync::Arc::clone(&app.api), path, background_tx.clone());
+                (AppEvent::CloseBrowser, Some(status))
             }
             Some(entry) => {
                 // plan 0028: planner-generate(entry.dir) — route here instead of OpenRun.
@@ -396,6 +393,49 @@ async fn resolve_io(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
         // Everything else passes straight through.
         other => (other, None),
     }
+}
+
+fn spawn_open_browser(repo_root: std::path::PathBuf, background_tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let discovery_root = repo_root.clone();
+        let plans = tokio::task::spawn_blocking(move || {
+            makina_core::orchestrator::discover_plans(&discovery_root)
+        })
+        .await
+        .unwrap_or_default();
+
+        let event = if plans.is_empty() {
+            let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            read_dir_event(&start).await
+        } else {
+            AppEvent::PlansDiscovered { plans }
+        };
+        let _ = background_tx.send(event).await;
+    });
+}
+
+fn spawn_read_dir(dir: std::path::PathBuf, background_tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let event = read_dir_event(&dir).await;
+        let _ = background_tx.send(event).await;
+    });
+}
+
+fn spawn_open_run(
+    api: std::sync::Arc<dyn makina_core::api::Api>,
+    task_list_path: std::path::PathBuf,
+    background_tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = api
+            .execute(makina_core::api::Command::OpenRun { task_list_path })
+            .await;
+        if let Err(e) = result {
+            let _ = background_tx
+                .send(AppEvent::StatusMessage(format!("Open failed: {e}")))
+                .await;
+        }
+    });
 }
 
 /// Write the provider/role configuration from the editor back to
@@ -1166,6 +1206,15 @@ mod tests {
         })
     }
 
+    fn background_events() -> (mpsc::Sender<AppEvent>, mpsc::Receiver<AppEvent>) {
+        mpsc::channel(64)
+    }
+
+    async fn resolve_io_for_test(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
+        let (tx, _rx) = background_events();
+        resolve_io(app, event, &tx).await
+    }
+
     /// Build a crossterm mouse-wheel event of the given `kind`
     /// (task `tui-mouse-scroll`).
     fn wheel(kind: MouseEventKind) -> CrosstermEvent {
@@ -1653,7 +1702,7 @@ mod tests {
         assert_eq!(app.selected_run().unwrap().id, RunId(7));
 
         // Start.
-        let (ev, status) = resolve_io(&app, AppEvent::StartRun).await;
+        let (ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
         assert!(
             matches!(ev, AppEvent::Tick),
             "control resolves to a no-op event"
@@ -1667,11 +1716,11 @@ mod tests {
         assert_eq!(app.status_message.as_deref(), Some(msg.as_str()));
 
         // Pause.
-        let (_ev, status) = resolve_io(&app, AppEvent::PauseRun).await;
+        let (_ev, status) = resolve_io_for_test(&app, AppEvent::PauseRun).await;
         assert!(status.unwrap().contains("Pause"));
 
         // Cancel.
-        let (_ev, status) = resolve_io(&app, AppEvent::CancelRun).await;
+        let (_ev, status) = resolve_io_for_test(&app, AppEvent::CancelRun).await;
         assert!(status.unwrap().contains("Cancel"));
 
         // The exact commands were issued against the api, all targeting run 7.
@@ -1697,7 +1746,7 @@ mod tests {
         let app = App::new(api, vec![], std::path::PathBuf::from("."));
         assert!(app.selected_run().is_none());
 
-        let (ev, status) = resolve_io(&app, AppEvent::StartRun).await;
+        let (ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
         assert!(matches!(ev, AppEvent::Tick));
         assert_eq!(status.as_deref(), Some("No run selected"));
     }
@@ -1724,7 +1773,7 @@ mod tests {
         };
         let app = App::new(api, vec![run], std::path::PathBuf::from("."));
 
-        let (_ev, status) = resolve_io(&app, AppEvent::StartRun).await;
+        let (_ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
         let msg = status.expect("an error must still produce a status message");
         assert!(
             msg.contains("failed"),
@@ -1743,12 +1792,22 @@ mod tests {
         use crate::placeholder::PlaceholderApi;
         use std::sync::Arc;
 
+        let tmpdir = tempfile::tempdir().unwrap();
         let api = Arc::new(PlaceholderApi::empty());
-        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let app = App::new(api, vec![], tmpdir.path().to_path_buf());
+        let (tx, mut rx) = background_events();
 
-        let (resolved, status) = resolve_io(&app, AppEvent::OpenBrowser).await;
-        assert!(status.is_none(), "OpenBrowser has no status message");
-        match resolved {
+        let (resolved, status) = resolve_io(&app, AppEvent::OpenBrowser, &tx).await;
+        assert!(
+            matches!(resolved, AppEvent::OpenBrowser),
+            "OpenBrowser must return immediately"
+        );
+        assert_eq!(status.as_deref(), Some("Discovering plans..."));
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for BrowserOpened")
+            .expect("background channel closed");
+        match opened {
             AppEvent::BrowserOpened { entries, .. } => {
                 assert!(
                     !entries.is_empty(),
@@ -1783,7 +1842,7 @@ mod tests {
             }],
         ));
 
-        let (resolved, status) = resolve_io(&app, AppEvent::BrowserActivate).await;
+        let (resolved, status) = resolve_io_for_test(&app, AppEvent::BrowserActivate).await;
         assert!(
             matches!(resolved, AppEvent::CloseBrowser),
             "file activate must resolve to CloseBrowser"
@@ -1803,10 +1862,9 @@ mod tests {
     ///
     /// Drive the exact event-loop step that opens a file against the REAL
     /// `CoreApi`: set up a browser whose selection is a sample task-list file,
-    /// call `resolve_io(BrowserActivate)` (which performs
-    /// `api.execute(OpenRun)`), then drain `api.subscribe()` and feed the
-    /// resulting `RunOpened` into `App::update` — asserting the Run appears in
-    /// `app.runs`.
+    /// call `resolve_io(BrowserActivate)` (which spawns `api.execute(OpenRun)`),
+    /// then drain `api.subscribe()` and feed the resulting `RunOpened` into
+    /// `App::update` — asserting the Run appears in `app.runs`.
     #[tokio::test]
     async fn browser_activate_file_opens_run_via_core_api_and_appears_in_app() {
         use crate::app::{App, AppEvent, Mode};
@@ -1863,7 +1921,8 @@ mod tests {
         // The event-loop step: activating a file selection performs the async
         // OpenRun against CoreApi and returns CloseBrowser + a status message
         // (now the transient "Interpreting …" one).
-        let (resolved, status) = resolve_io(&app, AppEvent::BrowserActivate).await;
+        let (tx, _rx) = background_events();
+        let (resolved, status) = resolve_io(&app, AppEvent::BrowserActivate, &tx).await;
         assert!(
             matches!(resolved, AppEvent::CloseBrowser),
             "selecting a file must resolve to CloseBrowser"
@@ -1880,12 +1939,6 @@ mod tests {
         }
         assert_eq!(app.mode, Mode::Normal, "browser should close after opening");
 
-        // The CoreApi created the Run (direct query proves OpenRun happened).
-        let runs = api.runs().await;
-        assert_eq!(runs.len(), 1, "CoreApi must have created exactly one run");
-        assert_eq!(runs[0].task_list_path, file_path);
-        assert_eq!(runs[0].tasks.len(), 1, "the task must be interpreted");
-
         // The RunOpened event flows back through subscribe(); feeding it into
         // App::update makes the Run appear in app.runs (the sidebar source).
         let ev = tokio::time::timeout(std::time::Duration::from_secs(1), sub.next())
@@ -1894,6 +1947,12 @@ mod tests {
             .expect("stream ended unexpectedly");
         assert!(matches!(ev, makina_core::api::Event::RunOpened { .. }));
         app.update(AppEvent::ApiEvent(ev));
+
+        // The CoreApi created the Run (direct query proves OpenRun happened).
+        let runs = api.runs().await;
+        assert_eq!(runs.len(), 1, "CoreApi must have created exactly one run");
+        assert_eq!(runs[0].task_list_path, file_path);
+        assert_eq!(runs[0].tasks.len(), 1, "the task must be interpreted");
 
         assert_eq!(
             app.runs.len(),
@@ -2120,7 +2179,8 @@ mod tests {
         app.mode = Mode::ProviderConfig;
 
         // Run the IO layer commit.
-        let (resolved_event, status) = resolve_io(&app, AppEvent::ProviderEditorCommit).await;
+        let (resolved_event, status) =
+            resolve_io_for_test(&app, AppEvent::ProviderEditorCommit).await;
         assert!(
             matches!(resolved_event, AppEvent::ProviderEditorCommit),
             "commit must return ProviderEditorCommit for App::update to close the editor"
@@ -2552,7 +2612,7 @@ A description that is long enough to pass minimums.
             "the focused node must be the failed task"
         );
 
-        let (_ev, status) = resolve_io(&app, AppEvent::RetryFocused).await;
+        let (_ev, status) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
         assert!(status.is_some(), "retry must surface a status message");
 
         let cmds = api.commands.lock().unwrap().clone();
@@ -2585,7 +2645,7 @@ A description that is long enough to pass minimums.
             "the focused node must be the run header"
         );
 
-        let (_ev, status) = resolve_io(&app, AppEvent::RetryFocused).await;
+        let (_ev, status) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
         assert!(status.is_some());
 
         let cmds = api.commands.lock().unwrap().clone();
@@ -2609,7 +2669,7 @@ A description that is long enough to pass minimums.
             Some(TreeNode::Task { task: 0, .. })
         ));
 
-        let (_ev, status) = resolve_io(&app, AppEvent::RetryFocused).await;
+        let (_ev, status) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
         assert_eq!(
             status.as_deref(),
             Some("nothing to retry here"),
@@ -2705,7 +2765,7 @@ A description that is long enough to pass minimums.
         }
 
         // Resolve CommandPaletteExecute; it should extract the Settings event.
-        let (resolved_event, _) = resolve_io(&app, AppEvent::CommandPaletteExecute).await;
+        let (resolved_event, _) = resolve_io_for_test(&app, AppEvent::CommandPaletteExecute).await;
 
         // The resolved event should be OpenSettings.
         assert!(
@@ -2789,7 +2849,7 @@ wall_clock_secs = 1200
         app.update(AppEvent::SettingsInput('8'));
 
         // Commit settings via resolve_io.
-        let (_resolved_event, status) = resolve_io(&app, AppEvent::SettingsCommit).await;
+        let (_resolved_event, status) = resolve_io_for_test(&app, AppEvent::SettingsCommit).await;
 
         // Status should be "Settings saved".
         assert_eq!(status, Some("Settings saved".to_string()));
@@ -2933,8 +2993,9 @@ wall_clock_secs = 1200
 
     /// **Plan discovery default:** When `OpenBrowser` is resolved and the repo
     /// contains `docs/plans/` with convention directories, `resolve_io` must
-    /// return `AppEvent::PlansDiscovered` (not `BrowserOpened`). When `docs/plans/`
-    /// is absent or empty, fall back to the file browser.
+    /// return immediately and emit `AppEvent::PlansDiscovered` on the background
+    /// channel. When `docs/plans/` is absent or empty, it falls back to the file
+    /// browser on that same channel.
     #[tokio::test]
     async fn open_browser_prefers_discovered_plans() {
         use crate::app::{App, AppEvent};
@@ -2953,22 +3014,33 @@ wall_clock_secs = 1200
         let api = Arc::new(PlaceholderApi::empty());
         let app = App::new(api, vec![], repo_root.to_path_buf());
 
-        // Resolve OpenBrowser: should discover the plan and emit PlansDiscovered
-        let (resolved, _status) = resolve_io(&app, AppEvent::OpenBrowser).await;
-        match &resolved {
+        // Resolve OpenBrowser: should return immediately, then discover the plan
+        // on the background channel.
+        let (tx, mut rx) = background_events();
+        let (resolved, status) = resolve_io(&app, AppEvent::OpenBrowser, &tx).await;
+        assert!(
+            matches!(resolved, AppEvent::OpenBrowser),
+            "OpenBrowser must return immediately"
+        );
+        assert_eq!(status.as_deref(), Some("Discovering plans..."));
+        let discovered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for PlansDiscovered")
+            .expect("background channel closed");
+        match &discovered {
             AppEvent::PlansDiscovered { plans } => {
                 assert_eq!(plans.len(), 1, "should discover exactly one plan");
                 assert_eq!(plans[0].slug, "0001-x");
                 assert!(plans[0].has_tasks);
             }
-            _ => panic!("OpenBrowser must emit PlansDiscovered, got {resolved:?}"),
+            _ => panic!("OpenBrowser must emit PlansDiscovered, got {discovered:?}"),
         }
     }
 
     /// **Plan activation with tasks:** When a plan with `has_tasks=true` is
-    /// activated via `PlanActivate`, `resolve_io` must call `api.execute(OpenRun)`
-    /// on the plan's `TASKS.md`, return `CloseBrowser` and an "Interpreting ..."
-    /// status message.
+    /// activated via `PlanActivate`, `resolve_io` must spawn
+    /// `api.execute(OpenRun)` for the plan's `TASKS.md`, return `CloseBrowser`,
+    /// and surface an "Interpreting ..." status message immediately.
     #[tokio::test]
     async fn plan_activate_with_tasks_opens_run() {
         use crate::app::{App, AppEvent, Mode};
@@ -3005,7 +3077,7 @@ wall_clock_secs = 1200
             Arc::new(CoreApi::new(interpreter, backend, wm, config));
 
         // Subscribe before acting (to avoid dropped subscription)
-        let _sub = api.subscribe();
+        let mut sub = api.subscribe();
 
         // Build an App with a selected plan
         let mut app = App::new(Arc::clone(&api), vec![], repo_root.clone());
@@ -3018,7 +3090,8 @@ wall_clock_secs = 1200
         app.plan_cursor = 0;
 
         // Resolve PlanActivate
-        let (resolved, status) = resolve_io(&app, AppEvent::PlanActivate).await;
+        let (tx, _rx) = background_events();
+        let (resolved, status) = resolve_io(&app, AppEvent::PlanActivate, &tx).await;
 
         // Must return CloseBrowser + "Interpreting ..." status
         assert!(
@@ -3040,7 +3113,13 @@ wall_clock_secs = 1200
             "PlanPicker should close after activation"
         );
 
-        // Verify CoreApi created the run
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), sub.next())
+            .await
+            .expect("timed out waiting for RunOpened")
+            .expect("stream ended unexpectedly");
+        assert!(matches!(ev, makina_core::api::Event::RunOpened { .. }));
+
+        // Verify CoreApi created the run.
         let runs = api.runs().await;
         assert_eq!(runs.len(), 1, "CoreApi must have created exactly one run");
         assert_eq!(runs[0].task_list_path, tasks_path);
@@ -3075,7 +3154,7 @@ wall_clock_secs = 1200
         app.plan_cursor = 0;
 
         // Resolve PlanActivate: should NOT open a run
-        let (resolved, status) = resolve_io(&app, AppEvent::PlanActivate).await;
+        let (resolved, status) = resolve_io_for_test(&app, AppEvent::PlanActivate).await;
 
         // Must return CloseBrowser + a "planner will generate" message
         assert!(

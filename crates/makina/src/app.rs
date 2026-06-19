@@ -664,9 +664,10 @@ pub enum AppEvent {
     /// Activate the highlighted browser entry (Enter).
     ///
     /// The IO layer interprets the current selection: entering a directory
-    /// triggers a fresh read (→ [`AppEvent::BrowserOpened`]); choosing a file
-    /// triggers `api.execute(OpenRun{..})` and then [`AppEvent::CloseBrowser`].
-    /// `update` does not mutate state for this variant.
+    /// starts a background read (→ [`AppEvent::BrowserOpened`]); choosing a file
+    /// starts `api.execute(OpenRun{..})` in the background and returns
+    /// [`AppEvent::CloseBrowser`] immediately. `update` does not mutate state
+    /// for this variant.
     BrowserActivate,
     /// Go up to the parent directory (Backspace).
     ///
@@ -690,10 +691,11 @@ pub enum AppEvent {
     PlanPickerDown,
     /// Activate the highlighted plan picker entry (Enter).
     ///
-    /// The IO layer interprets the current selection: for a plan with `has_tasks==true`,
-    /// triggers `api.execute(OpenRun{..})` and then [`AppEvent::CloseBrowser`];
-    /// for a plan with `has_tasks==false`, routes to the planner-generate path and
-    /// emits a status message. `update` does not mutate state for this variant.
+    /// The IO layer interprets the current selection: for a plan with
+    /// `has_tasks==true`, starts `api.execute(OpenRun{..})` in the background
+    /// and returns [`AppEvent::CloseBrowser`] immediately; for a plan with
+    /// `has_tasks==false`, routes to the planner-generate path and emits a
+    /// status message. `update` does not mutate state for this variant.
     PlanActivate,
 
     // ── Provider configuration editor (task 0041) ──────────────────────────────
@@ -1640,6 +1642,7 @@ impl App {
                 // A directory listing arrived: enter (or refresh) the browser.
                 self.mode = Mode::FileBrowser;
                 self.browser = Some(FileBrowser::new(dir, entries));
+                self.status_message = None;
                 true
             }
             AppEvent::BrowserUp => {
@@ -1673,6 +1676,7 @@ impl App {
                 self.discovered_plans = plans;
                 self.plan_cursor = 0;
                 self.mode = Mode::PlanPicker;
+                self.status_message = None;
                 true
             }
             AppEvent::PlanPickerUp => {
