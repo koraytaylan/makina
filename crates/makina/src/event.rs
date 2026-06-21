@@ -34,7 +34,7 @@
 use std::time::Duration;
 
 use crossterm::event::{
-    Event as CrosstermEvent, EventStream, KeyCode, KeyModifiers, MouseEventKind,
+    Event as CrosstermEvent, EventStream, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 use makina_core::log_record::LogRecord;
@@ -164,6 +164,30 @@ pub async fn run(
         };
 
         if let Some(event) = app_event {
+            // A finalised mouse selection copies the highlighted screen text to
+            // the system clipboard. Handled here because it needs the rendered
+            // buffer, which lives in `tui` (and which `App::update` cannot see).
+            if matches!(event, AppEvent::SelectionEnd(_, _)) {
+                app.update(event); // finalise selection (clears on a plain click)
+                // Render the finalised frame (with highlight) and read its
+                // buffer. The block scopes the `&tui` borrow so the clipboard
+                // write below can take `&mut tui`.
+                let copied = {
+                    let frame = tui.draw(|frame| ui::render(app, frame))?;
+                    app.selection.and_then(|sel| sel.extract(frame.buffer))
+                };
+                if let Some(text) = copied {
+                    let n = text.chars().count();
+                    tui.copy_to_clipboard(&text)?;
+                    app.update(AppEvent::StatusMessage(format!(
+                        "Copied {n} char{} to clipboard",
+                        if n == 1 { "" } else { "s" }
+                    )));
+                    tui.draw(|frame| ui::render(app, frame))?;
+                }
+                continue;
+            }
+
             // OpenLog requires tui for terminal teardown/restore, so it is
             // handled here (in the loop body, where `tui` is accessible) rather
             // than in `resolve_io` (which does not receive `tui`).
@@ -1021,14 +1045,18 @@ fn translate_terminal_event(
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
         // `browsing` flag (the exchange pane is not the browser).
-        // Down/Up/Drag/Moved → no-op so native modifier-drag selection works:
-        // the terminal's bypass modifier (Shift on most terminals; Option/Alt
-        // in iTerm2) lets the user select & copy text even with capture on,
-        // because the app never consumes those event kinds.
+        //
+        // Left button down/drag/up drive an in-app text selection: capture is on
+        // for the wheel, so the terminal won't do its own click-drag selection
+        // and we reimplement it (highlight + OSC 52 copy). See `crate::selection`.
+        // Other kinds (move, other buttons) stay no-ops.
         CrosstermEvent::Mouse(m) => match m.kind {
             MouseEventKind::ScrollUp => AppEvent::ScrollUp,
             MouseEventKind::ScrollDown => AppEvent::ScrollDown,
-            _ => AppEvent::Tick, // Down/Up/Drag/Moved → no-op so native selection works
+            MouseEventKind::Down(MouseButton::Left) => AppEvent::SelectionStart(m.column, m.row),
+            MouseEventKind::Drag(MouseButton::Left) => AppEvent::SelectionExtend(m.column, m.row),
+            MouseEventKind::Up(MouseButton::Left) => AppEvent::SelectionEnd(m.column, m.row),
+            _ => AppEvent::Tick,
         },
         // Paste, focus, etc. — ignored for now.
         _ => AppEvent::Tick,
@@ -1248,27 +1276,61 @@ mod tests {
         ));
     }
 
-    /// Drag and move events must map to `AppEvent::Tick` (no-op) so the
-    /// terminal's modifier-bypass selection (Shift-drag; Option-drag in iTerm2)
-    /// continues to work even when mouse capture is enabled.
-    #[test]
-    fn mouse_drag_is_noop() {
-        let drag = wheel(MouseEventKind::Drag(MouseButton::Left));
-        assert!(
-            matches!(
-                translate_terminal_event(drag, ModalState::default(), crate::app::Panel::Sidebar),
-                AppEvent::Tick
-            ),
-            "Drag(Left) must translate to Tick so native selection coexists"
-        );
+    /// Build a crossterm mouse event of `kind` at cell `(column, row)`.
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> CrosstermEvent {
+        CrosstermEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
 
-        let moved = wheel(MouseEventKind::Moved);
+    /// Left button down/drag/up drive the in-app text selection, carrying the
+    /// pointer's cell coordinates through to the corresponding `AppEvent`.
+    #[test]
+    fn left_button_drag_drives_selection() {
+        let down = translate_terminal_event(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 7),
+            ModalState::default(),
+            crate::app::Panel::Sidebar,
+        );
+        assert!(matches!(down, AppEvent::SelectionStart(3, 7)));
+
+        let drag = translate_terminal_event(
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 10, 9),
+            ModalState::default(),
+            crate::app::Panel::Sidebar,
+        );
+        assert!(matches!(drag, AppEvent::SelectionExtend(10, 9)));
+
+        let up = translate_terminal_event(
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 10, 9),
+            ModalState::default(),
+            crate::app::Panel::Sidebar,
+        );
+        assert!(matches!(up, AppEvent::SelectionEnd(10, 9)));
+    }
+
+    /// Plain pointer motion (no button) and non-left buttons stay no-ops so they
+    /// don't disturb selection or scroll state.
+    #[test]
+    fn moved_and_other_buttons_are_noops() {
+        let moved = translate_terminal_event(
+            mouse_at(MouseEventKind::Moved, 1, 1),
+            ModalState::default(),
+            crate::app::Panel::Sidebar,
+        );
+        assert!(matches!(moved, AppEvent::Tick), "Moved must be a no-op");
+
+        let right = translate_terminal_event(
+            mouse_at(MouseEventKind::Down(MouseButton::Right), 1, 1),
+            ModalState::default(),
+            crate::app::Panel::Sidebar,
+        );
         assert!(
-            matches!(
-                translate_terminal_event(moved, ModalState::default(), crate::app::Panel::Sidebar),
-                AppEvent::Tick
-            ),
-            "Moved must translate to Tick so native selection coexists"
+            matches!(right, AppEvent::Tick),
+            "non-left buttons must be no-ops"
         );
     }
 

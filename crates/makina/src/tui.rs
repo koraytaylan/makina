@@ -20,7 +20,7 @@
 //! terminal type for crossterm.  It is the single owner of the terminal handle,
 //! preventing accidental double-initialisation.
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::panic;
 
 use ratatui::Terminal;
@@ -121,6 +121,58 @@ impl Tui {
     {
         self.terminal.draw(render_fn)
     }
+
+    /// Copy `text` to the system clipboard using the OSC 52 escape sequence.
+    ///
+    /// OSC 52 (`ESC ] 52 ; c ; <base64> BEL`) asks the terminal emulator to set
+    /// the clipboard, so it works locally *and* over SSH without a platform
+    /// clipboard dependency. The sequence is written straight to the backend's
+    /// writer so it reaches the terminal even while the alternate screen is
+    /// active. The terminal must allow clipboard writes (iTerm2, kitty, WezTerm,
+    /// Alacritty, Ghostty, tmux with `set-clipboard on`, …) — when it doesn't,
+    /// this is a silent no-op from the user's perspective.
+    ///
+    /// Used by the event loop to copy a finalised mouse text selection
+    /// ([`crate::selection::Selection`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if writing the escape sequence to the terminal
+    /// fails.
+    pub fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+        let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+        let backend = self.terminal.backend_mut();
+        backend.write_all(seq.as_bytes())?;
+        backend.flush()
+    }
+}
+
+/// Encode `input` as standard (RFC 4648) base64 with `=` padding.
+///
+/// A tiny self-contained encoder so OSC 52 clipboard writes
+/// ([`Tui::copy_to_clipboard`]) need no external base64 dependency.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 impl Drop for Tui {
@@ -234,6 +286,19 @@ mod tests {
     /// callable. The point is that the capture state rides on init/reinit entry
     /// and restore/restore_terminal exit, so a `$PAGER` round-trip
     /// (restore → reinit) leaves the wheel working on resume.
+    /// `base64_encode` matches the RFC 4648 test vectors, including padding —
+    /// the OSC 52 clipboard payload depends on this being correct.
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
     #[test]
     fn init_enables_mouse_capture() {
         match Tui::init() {

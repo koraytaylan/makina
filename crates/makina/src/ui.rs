@@ -229,6 +229,35 @@ pub fn render(app: &App, frame: &mut Frame) {
     let main_focused = app.focused_panel == Panel::Main;
     let main_block = panel_block("Detail", main_focused);
 
+    // ── Record selectable panes for mouse text selection ───────────────────────
+    // `hit` is the full pane column (so a drag may begin on a border/padding
+    // cell); `clip` is the inner content rect (so the selection excludes borders
+    // and never crosses into the other pane). When a modal overlay is up, treat
+    // the whole screen as one pane so selection spans it without column clipping.
+    // See `crate::selection`.
+    let overlay_active = app.is_browsing()
+        || app.is_editing_providers()
+        || app.is_viewing_doctor()
+        || app.is_command_palette()
+        || app.is_settings();
+    app.set_selection_panes(if overlay_active {
+        vec![crate::app::SelectionPane {
+            hit: area,
+            clip: area,
+        }]
+    } else {
+        vec![
+            crate::app::SelectionPane {
+                hit: sidebar_area,
+                clip: panel_block("Runs & Tasks", sidebar_focused).inner(sidebar_area),
+            },
+            crate::app::SelectionPane {
+                hit: main_area,
+                clip: main_block.inner(main_area),
+            },
+        ]
+    });
+
     match app.selected_run() {
         None => {
             // No run selected: show a hint paragraph.
@@ -467,6 +496,13 @@ pub fn render(app: &App, frame: &mut Frame) {
         && let Some(s) = app.settings.as_ref()
     {
         render_settings(s, frame, area);
+    }
+
+    // ── Mouse text-selection highlight ─────────────────────────────────────────
+    // Applied last so it reverses whatever pane or overlay drew beneath the
+    // dragged region. See `crate::selection` for why selection lives in-app.
+    if let Some(sel) = app.selection {
+        sel.highlight(frame.buffer_mut());
     }
 }
 

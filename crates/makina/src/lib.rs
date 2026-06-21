@@ -33,5 +33,6 @@ pub mod markup;
 #[cfg(test)]
 pub mod placeholder;
 pub mod replay;
+pub mod selection;
 pub mod tui;
 pub mod ui;

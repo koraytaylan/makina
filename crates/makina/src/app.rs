@@ -619,6 +619,15 @@ pub enum AppEvent {
     ScrollUp,
     /// Scroll the focused exchange pane one line down (mouse wheel down).
     ScrollDown,
+    /// Left mouse button pressed at `(column, row)` — begin a text selection.
+    SelectionStart(u16, u16),
+    /// Mouse dragged to `(column, row)` with the left button held — extend the
+    /// current text selection.
+    SelectionExtend(u16, u16),
+    /// Left mouse button released at `(column, row)` — finalise the text
+    /// selection. The event loop then copies the highlighted text to the
+    /// system clipboard (it reads the rendered buffer, which `update` cannot).
+    SelectionEnd(u16, u16),
     /// An event arrived from `api.subscribe()`.
     ApiEvent(Event),
     /// Periodic tick — triggers a redraw without other state changes.
@@ -833,6 +842,21 @@ pub struct RoleTurnMetric {
     pub duration_ms: u64,
     /// Token usage when the backend reported it.
     pub usage: Option<makina_core::api::UsageStats>,
+}
+
+/// A pane a mouse text selection can target.
+///
+/// `hit` is the region a drag may *begin* in (the full pane column, so starting
+/// on a border or padding cell still works); `clip` is the inner rectangle the
+/// resulting selection is confined to (so the highlight and copied text exclude
+/// the border, padding, and any neighbouring pane). Recorded each frame by the
+/// render pass via [`App::set_selection_panes`]. See [`crate::selection`].
+#[derive(Debug, Clone, Copy)]
+pub struct SelectionPane {
+    /// Where a drag may start (the full pane column).
+    pub hit: ratatui::layout::Rect,
+    /// The rectangle the selection is confined to (inner content).
+    pub clip: ratatui::layout::Rect,
 }
 
 /// All mutable TUI state.
@@ -1072,6 +1096,23 @@ pub struct App {
     /// Index into [`App::discovered_plans`] of the highlighted entry in the
     /// plan-picker modal. Clamped to `0..discovered_plans.len()` on navigation.
     pub plan_cursor: usize,
+
+    // ── Mouse text selection ──────────────────────────────────────────────────
+    /// The active mouse-driven text selection over the rendered screen, if any.
+    ///
+    /// Begun on left-button down, extended on drag, finalised on button up.
+    /// `None` when nothing is selected. Drives the on-screen highlight
+    /// ([`crate::selection::Selection::highlight`], applied in [`crate::ui::render`])
+    /// and, once released, the clipboard copy the event loop performs by reading
+    /// the rendered buffer. See [`crate::selection`] for why selection lives in
+    /// the app rather than the terminal.
+    pub selection: Option<crate::selection::Selection>,
+
+    /// Selectable pane rectangles for the current frame, recorded by the render
+    /// pass via [`App::set_selection_panes`] (interior mutability, like
+    /// [`App::last_scroll_max`]). The event layer reads them on a left-button
+    /// down to confine the new selection to the single pane the drag began in.
+    pub selection_panes: std::cell::RefCell<Vec<SelectionPane>>,
 }
 
 impl App {
@@ -1263,6 +1304,8 @@ impl App {
             role_metrics: HashMap::new(),
             discovered_plans: Vec::new(),
             plan_cursor: 0,
+            selection: None,
+            selection_panes: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1432,6 +1475,29 @@ impl App {
         }
     }
 
+    /// Record the selectable pane rectangles for the current frame.
+    ///
+    /// Called by the render pass (which alone knows the layout) via interior
+    /// mutability, mirroring [`App::last_scroll_max`]. Replaces any previously
+    /// recorded set. Read by [`App::selection_pane_at`] when a drag begins.
+    pub fn set_selection_panes(&self, panes: Vec<SelectionPane>) {
+        *self.selection_panes.borrow_mut() = panes;
+    }
+
+    /// The clip rectangle of the recorded pane whose `hit` region contains the
+    /// screen cell `(x, y)`, if any. Used to confine a new mouse selection to a
+    /// single pane. Returns `None` when the drag began outside every pane
+    /// (e.g. the title or status bar).
+    pub fn selection_pane_at(&self, x: u16, y: u16) -> Option<ratatui::layout::Rect> {
+        self.selection_panes
+            .borrow()
+            .iter()
+            .find(|p| {
+                x >= p.hit.left() && x < p.hit.right() && y >= p.hit.top() && y < p.hit.bottom()
+            })
+            .map(|p| p.clip)
+    }
+
     /// Apply one [`AppEvent`] to the App state.
     ///
     /// This function is **pure** (no async, no IO) so it can be called from unit
@@ -1556,6 +1622,44 @@ impl App {
                 // in `scroll_down`; otherwise `exchange_scroll == scroll_max`
                 // could never hold and auto-follow would never re-engage.
                 self.scroll_down(self.last_scroll_max.get());
+                true
+            }
+            // ── Mouse text selection ──────────────────────────────────────────
+            // Down/Drag/Up drive an in-app selection (the terminal can't do its
+            // own while mouse capture is on). The copy-to-clipboard on release
+            // happens in the event loop, which has the rendered buffer.
+            AppEvent::SelectionStart(x, y) => {
+                // Confine the selection to the pane the drag began in so a wide
+                // drag never bleeds into a neighbouring pane (e.g. content →
+                // sidebar). A drag that starts outside every pane selects
+                // nothing.
+                let had = self.selection.is_some();
+                self.selection = self
+                    .selection_pane_at(x, y)
+                    .map(|bounds| crate::selection::Selection::start(x, y, bounds));
+                // Redraw if a selection started, or to clear a prior highlight.
+                had || self.selection.is_some()
+            }
+            AppEvent::SelectionExtend(x, y) => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.extend(x, y);
+                    true
+                } else {
+                    // A drag with no anchor (e.g. capture toggled mid-gesture):
+                    // nothing to redraw.
+                    false
+                }
+            }
+            AppEvent::SelectionEnd(x, y) => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.extend(x, y);
+                    sel.active = false;
+                    // A plain click (no drag) clears the selection rather than
+                    // leaving a stray one-cell highlight behind.
+                    if sel.is_empty() {
+                        self.selection = None;
+                    }
+                }
                 true
             }
             AppEvent::ToggleTreeNode => {
@@ -4422,6 +4526,84 @@ mod tests {
             app.selected_task, selected_before,
             "ScrollUp must NOT change selected_task"
         );
+    }
+
+    // ── Mouse text selection ──────────────────────────────────────────────────
+
+    /// Record one full-screen selectable pane (what a normal frame would do).
+    fn record_full_pane(app: &App) {
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.set_selection_panes(vec![crate::app::SelectionPane {
+            hit: area,
+            clip: area,
+        }]);
+    }
+
+    /// A drag (down → extend → up) leaves a finalised, non-empty selection that
+    /// the event loop can copy; `SelectionExtend` tracks the moving end.
+    #[test]
+    fn drag_builds_and_finalises_selection() {
+        let mut app = make_app();
+        record_full_pane(&app);
+        assert!(app.selection.is_none());
+
+        assert!(app.update(AppEvent::SelectionStart(2, 1)));
+        let sel = app.selection.expect("down starts a selection");
+        assert_eq!(sel.anchor, (2, 1));
+        assert!(sel.active);
+
+        assert!(app.update(AppEvent::SelectionExtend(8, 3)));
+        assert_eq!(app.selection.unwrap().cursor, (8, 3));
+
+        assert!(app.update(AppEvent::SelectionEnd(8, 3)));
+        let sel = app.selection.expect("a real drag keeps its selection");
+        assert!(!sel.active, "release clears the active flag");
+        assert!(!sel.is_empty());
+    }
+
+    /// A plain click (down then up on the same cell, no drag) clears the
+    /// selection instead of leaving a stray one-cell highlight.
+    #[test]
+    fn plain_click_clears_selection() {
+        let mut app = make_app();
+        record_full_pane(&app);
+        app.update(AppEvent::SelectionStart(4, 2));
+        app.update(AppEvent::SelectionEnd(4, 2));
+        assert!(
+            app.selection.is_none(),
+            "a click with no drag must leave nothing selected"
+        );
+    }
+
+    /// A drag that starts outside every recorded pane (e.g. the title bar)
+    /// selects nothing.
+    #[test]
+    fn selection_outside_panes_is_ignored() {
+        let mut app = make_app();
+        // One pane covering rows 2..24; row 0 is outside it.
+        app.set_selection_panes(vec![crate::app::SelectionPane {
+            hit: ratatui::layout::Rect::new(0, 2, 80, 22),
+            clip: ratatui::layout::Rect::new(0, 2, 80, 22),
+        }]);
+        app.update(AppEvent::SelectionStart(5, 0));
+        assert!(
+            app.selection.is_none(),
+            "a drag beginning outside every pane must not start a selection"
+        );
+    }
+
+    /// A new selection is confined to the `clip` rect of the pane the drag
+    /// begins in — the recorded pane's bounds ride along on the `Selection`.
+    #[test]
+    fn selection_adopts_starting_pane_bounds() {
+        let mut app = make_app();
+        let right = ratatui::layout::Rect::new(30, 1, 50, 20);
+        app.set_selection_panes(vec![crate::app::SelectionPane {
+            hit: right,
+            clip: right,
+        }]);
+        app.update(AppEvent::SelectionStart(35, 4));
+        assert_eq!(app.selection.expect("selection started").bounds, right);
     }
 
     /// Regression (fix `tui-scroll-and-restore` #1): the FIRST wheel-up from
