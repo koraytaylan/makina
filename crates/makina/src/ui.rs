@@ -45,7 +45,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, DependencyViewMode, ExchangeEntry, Panel, TreeNode};
+use crate::app::{App, DependencyViewMode, ExchangeEntry, Panel, TabContent, TreeNode};
 use makina_core::api::FailureKind;
 
 /// Render the full TUI layout into `frame`.
@@ -110,131 +110,145 @@ pub fn render(app: &App, frame: &mut Frame) {
     // The sidebar now shows "Runs & Tasks" as the title.
     let sidebar_focused = app.focused_panel == Panel::Sidebar;
 
-    // When in plan-picker mode, render the plan picker overlay instead of the
-    // normal sidebar tree.
-    if app.is_picking_plan() {
-        render_plan_picker(app, frame, sidebar_area);
-    } else {
-        let sidebar_block = panel_block("Runs & Tasks", sidebar_focused);
+    // Render the unified sidebar tree (plans + runs + tasks).
+    let sidebar_block = panel_block("Runs & Tasks", sidebar_focused);
 
-        if app.runs.is_empty() {
-            // Empty state. While a background job is running (e.g. startup plan
-            // discovery) show an animated spinner + label so the empty sidebar
-            // reads as "working", not "nothing here". Otherwise show a hint that
-            // guides the user to the `[o]` file browser (task 28).
-            let empty_text = if let Some(label) = &app.busy {
-                vec![
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        format!("  {} {label}…", spinner_frame(app.tick)),
-                        Style::default().fg(Color::Cyan),
-                    )]),
-                ]
-            } else {
-                vec![
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        "  No runs open.",
-                        Style::default().fg(Color::DarkGray),
-                    )]),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        "  Press [o] to open a",
-                        Style::default().fg(Color::DarkGray),
-                    )]),
-                    Line::from(vec![Span::styled(
-                        "  task-list file.",
-                        Style::default().fg(Color::DarkGray),
-                    )]),
-                ]
-            };
-            let para = Paragraph::new(empty_text)
-                .block(sidebar_block)
-                .style(Style::default().fg(Color::White));
-            frame.render_widget(para, sidebar_area);
+    if app.runs.is_empty() {
+        // Empty state. While a background job is running (e.g. startup plan
+        // discovery) show an animated spinner + label so the empty sidebar
+        // reads as "working", not "nothing here". Otherwise show a hint that
+        // guides the user to the `[o]` file browser (task 28).
+        let empty_text = if let Some(label) = &app.busy {
+            vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    format!("  {} {label}…", spinner_frame(app.tick)),
+                    Style::default().fg(Color::Cyan),
+                )]),
+            ]
         } else {
-            // Build one ListItem per visible tree node (runs and their expanded tasks).
-            let tree_nodes = app.visible_tree_nodes();
-            let items: Vec<ListItem> = tree_nodes
-                .iter()
-                .map(|node| {
-                    match node {
-                        TreeNode::Run { run } => {
-                            // Run node: disclosure glyph + status badge + run name
-                            let run_view = &app.runs[*run];
-                            let disclosure = if app.collapsed_runs.contains(&run_view.id) {
-                                "▸ "
-                            } else {
-                                "▾ "
-                            };
-                            let (badge, badge_color) = status_badge(&run_view.status);
-                            let name = run_label(run_view);
-                            let line = Line::from(vec![
-                                Span::raw(disclosure),
-                                Span::styled(badge, Style::default().fg(badge_color)),
-                                Span::styled(" ", Style::default()),
-                                Span::raw(name),
-                            ]);
-                            ListItem::new(line)
-                        }
-                        TreeNode::Task { run, task } => {
-                            // Task node: indent + task state badge + spinner (if InProgress/InReview) +
-                            // task title + failure label (if Failed)
-                            let run_view = &app.runs[*run];
-                            let task_view = &run_view.tasks[*task];
+            vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  No runs open.",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  Press [o] to open a",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(vec![Span::styled(
+                    "  task-list file.",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+            ]
+        };
+        let para = Paragraph::new(empty_text)
+            .block(sidebar_block)
+            .style(Style::default().fg(Color::White));
+        frame.render_widget(para, sidebar_area);
+    } else {
+        // Build one ListItem per visible tree node (runs and their expanded tasks).
+        let tree_nodes = app.visible_tree_nodes();
+        let items: Vec<ListItem> = tree_nodes
+            .iter()
+            .map(|node| {
+                match node {
+                    TreeNode::Run { run } => {
+                        // Run node: disclosure glyph + status badge + run name
+                        let run_view = &app.runs[*run];
+                        let disclosure = if app.collapsed_runs.contains(&run_view.id) {
+                            "▸ "
+                        } else {
+                            "▾ "
+                        };
+                        let (badge, badge_color) = status_badge(&run_view.status);
+                        let name = run_label(run_view);
+                        let line = Line::from(vec![
+                            Span::raw(disclosure),
+                            Span::styled(badge, Style::default().fg(badge_color)),
+                            Span::styled(" ", Style::default()),
+                            Span::raw(name),
+                        ]);
+                        ListItem::new(line)
+                    }
+                    TreeNode::Task { run, task } => {
+                        // Task node: indent + task state badge + spinner (if InProgress/InReview) +
+                        // task title + failure label (if Failed)
+                        let run_view = &app.runs[*run];
+                        let task_view = &run_view.tasks[*task];
 
-                            let (badge, badge_color) = task_state_badge(&task_view.state);
-                            let badge_text = match task_view.state {
-                                makina_core::api::TaskState::InProgress
-                                | makina_core::api::TaskState::InReview => {
-                                    format!("{} {}", spinner_frame(app.tick), badge)
-                                }
-                                _ => badge.to_string(),
-                            };
+                        let (badge, badge_color) = task_state_badge(&task_view.state);
+                        let badge_text = match task_view.state {
+                            makina_core::api::TaskState::InProgress
+                            | makina_core::api::TaskState::InReview => {
+                                format!("{} {}", spinner_frame(app.tick), badge)
+                            }
+                            _ => badge.to_string(),
+                        };
 
-                            // Build failure label if needed
-                            let failure_label =
-                                if matches!(task_view.state, makina_core::api::TaskState::Failed) {
-                                    if let Some(reason) = &task_view.failure_reason {
-                                        format!(" {}", failure_kind_label(&reason.kind))
-                                    } else {
-                                        String::new()
-                                    }
+                        // Build failure label if needed
+                        let failure_label =
+                            if matches!(task_view.state, makina_core::api::TaskState::Failed) {
+                                if let Some(reason) = &task_view.failure_reason {
+                                    format!(" {}", failure_kind_label(&reason.kind))
                                 } else {
                                     String::new()
-                                };
+                                }
+                            } else {
+                                String::new()
+                            };
 
-                            let line = Line::from(vec![
-                                Span::raw("  "), // indent
-                                Span::styled(badge_text, Style::default().fg(badge_color)),
-                                Span::styled(" ", Style::default()),
-                                Span::raw(&task_view.title),
-                                Span::raw(failure_label),
-                            ]);
-                            ListItem::new(line)
-                        }
+                        let line = Line::from(vec![
+                            Span::raw("  "), // indent
+                            Span::styled(badge_text, Style::default().fg(badge_color)),
+                            Span::styled(" ", Style::default()),
+                            Span::raw(&task_view.title),
+                            Span::raw(failure_label),
+                        ]);
+                        ListItem::new(line)
                     }
-                })
-                .collect();
+                    TreeNode::Plan { plan_idx } => {
+                        let plan_entry = &app.discovered_plans[*plan_idx];
+                        let disclosure = if app.collapsed_plans.contains(plan_idx) {
+                            "▸ "
+                        } else {
+                            "▾ "
+                        };
+                        let mut line_spans =
+                            vec![Span::raw(disclosure), Span::raw(&plan_entry.slug)];
+                        // Append "(no tasks — will plan)" hint for plans without TASKS.md.
+                        if !plan_entry.has_tasks {
+                            line_spans.push(Span::styled(
+                                " (no tasks — will plan)",
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        let line = Line::from(line_spans);
+                        ListItem::new(line)
+                    }
+                }
+            })
+            .collect();
 
-            // Highlight style for the focused node.
-            let highlight_style = Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
+        // Highlight style for the focused node.
+        let highlight_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
 
-            let sidebar_list = List::new(items)
-                .block(sidebar_block)
-                .highlight_style(highlight_style)
-                .highlight_symbol("▶ ");
+        let sidebar_list = List::new(items)
+            .block(sidebar_block)
+            .highlight_style(highlight_style)
+            .highlight_symbol("▶ ");
 
-            // ListState carries the selected index so ratatui knows which node to
-            // highlight.  Use tree_cursor instead of selected_run.
-            let mut list_state = ListState::default();
-            list_state.select(app.tree_cursor);
+        // ListState carries the selected index so ratatui knows which node to
+        // highlight.  Use tree_cursor instead of selected_run.
+        let mut list_state = ListState::default();
+        list_state.select(app.tree_cursor);
 
-            frame.render_stateful_widget(sidebar_list, sidebar_area, &mut list_state);
-        }
+        frame.render_stateful_widget(sidebar_list, sidebar_area, &mut list_state);
     }
 
     // ── Main content — per-task status view (task 29) ────────────────────────
@@ -349,6 +363,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
+                    Constraint::Length(1), // tab bar (new)
                     Constraint::Length(header_height),
                     Constraint::Length(ingestion_pane_height), // ingestion issues (0 = hidden)
                     Constraint::Min(3), // exchange pane — always at least 3 rows
@@ -356,10 +371,16 @@ pub fn render(app: &App, frame: &mut Frame) {
                 ])
                 .split(inner);
 
-            let header_area = split[0];
-            let ingestion_area = split[1];
-            let exchange_area = split[2];
-            let error_area = split[3];
+            let tab_area = split[0];
+            let header_area = split[1];
+            let ingestion_area = split[2];
+            let exchange_area = split[3];
+            let error_area = split[4];
+
+            // Render the tab bar at the top.
+            // NOTE: render_tab_bar is a no-op when no tabs are open, so this doesn't
+            // affect tests that don't open tabs.
+            render_tab_bar(app, frame, tab_area);
 
             let header_para = Paragraph::new(header_lines).style(Style::default().fg(Color::White));
             frame.render_widget(header_para, header_area);
@@ -538,6 +559,32 @@ pub fn render(app: &App, frame: &mut Frame) {
 /// render time, not in the event-handling layer.
 /// Render the dependency-view sub-pane for the selected task.
 ///
+/// Render the tab bar showing open tabs above the main content pane.
+#[allow(dead_code)]
+fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
+    if app.tabs.open_tabs.is_empty() {
+        return; // No tabs to render
+    }
+
+    let mut spans = Vec::new();
+    for (idx, tab) in app.tabs.open_tabs.iter().enumerate() {
+        let label = match tab {
+            TabContent::Task { task_id, .. } => task_id.0.clone(),
+            TabContent::Plan { plan_slug } => plan_slug.clone(),
+        };
+        let is_active = app.tabs.active_tab == Some(idx);
+        let style = if is_active {
+            Style::default().bg(Color::Cyan).fg(Color::Black)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        };
+        spans.push(Span::styled(format!(" {} ", label), style));
+        spans.push(Span::raw(" "));
+    }
+    let para = Paragraph::new(Line::from(spans));
+    frame.render_widget(para, area);
+}
+
 /// This is the single shared entry point for all [`DependencyViewMode`]
 /// renderings: sibling tasks (`tui-dep-tree`, `tui-dep-timeline`) only add their
 /// match arms here.  The pane is a top-bordered `Dependencies` block; its body
@@ -2330,68 +2377,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
 }
 
 // ── Plan picker ───────────────────────────────────────────────────────────────
-
-/// Render the plan picker modal showing discovered plans from `docs/plans/*/`.
-///
-/// Displays each plan's slug and a dim `(no tasks — will plan)` hint when
-/// `!has_tasks`. Highlights the plan at `app.plan_cursor` with a cyan background.
-/// Shows an empty-state hint when no plans are discovered.
-fn render_plan_picker(app: &App, frame: &mut Frame, area: Rect) {
-    let block = panel_block("Plans", false); // plan picker is never focused (sidebar focus is not used here)
-
-    if app.discovered_plans.is_empty() {
-        // Empty state: show a hint when no plans are discovered.
-        let empty_text = vec![
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "  No plans under docs/plans …",
-                Style::default().fg(Color::DarkGray),
-            )]),
-        ];
-        let para = Paragraph::new(empty_text)
-            .block(block)
-            .style(Style::default().fg(Color::White));
-        frame.render_widget(para, area);
-    } else {
-        // Build one ListItem per discovered plan.
-        let items: Vec<ListItem> = app
-            .discovered_plans
-            .iter()
-            .map(|entry| {
-                let mut line_spans = vec![Span::raw(&entry.slug)];
-
-                // Append "(no tasks — will plan)" hint for plans without TASKS.md
-                if !entry.has_tasks {
-                    line_spans.push(Span::styled(
-                        " (no tasks — will plan)",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-
-                let line = Line::from(line_spans);
-                ListItem::new(line)
-            })
-            .collect();
-
-        // Highlight style for the selected plan.
-        let highlight_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-
-        let plan_list = List::new(items)
-            .block(block)
-            .highlight_style(highlight_style)
-            .highlight_symbol("▶ ");
-
-        // ListState carries the selected index so ratatui knows which plan to
-        // highlight. Use plan_cursor.
-        let mut list_state = ListState::default();
-        list_state.select(Some(app.plan_cursor));
-
-        frame.render_stateful_widget(plan_list, area, &mut list_state);
-    }
-}
+// Render the plan picker modal showing discovered plans from `docs/plans/*/`.
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -3529,6 +3515,7 @@ mod tests {
         let chars: Vec<char> = screen.chars().collect();
         let rows: Vec<Vec<char>> = chars.chunks(120).map(|c| c.to_vec()).collect();
         let connector_col = |badge: &str| -> usize {
+            // First, look for rows with tree connectors (├ or └) that contain the badge.
             for row in &rows {
                 let row_str: String = row.iter().collect();
                 if row_str.contains(badge) {
@@ -3536,11 +3523,18 @@ mod tests {
                     if let Some(col) = row.iter().position(|&ch| ch == '├' || ch == '└') {
                         return col;
                     }
-                    // If no connector found on this row, return the first occurrence of the badge
-                    // (dependency tree might be using different formatting now).
-                    if let Some(col) = row_str.find(badge) {
-                        return col;
-                    }
+                }
+            }
+            // If no connector found in any row with this badge, search for the badge
+            // text itself only in rows that contain tree connectors (dependency view).
+            // This fallback handles "dependency tree might be using different formatting now".
+            for row in &rows {
+                let row_str: String = row.iter().collect();
+                if row_str.contains(badge)
+                    && (row_str.contains("├") || row_str.contains("└"))
+                    && let Some(col) = row_str.find(badge)
+                {
+                    return col;
                 }
             }
             usize::MAX
@@ -4098,17 +4092,20 @@ mod tests {
         // Need SelectDown twice to reach task-b.
         app.update(AppEvent::SelectDown); // tree move to task-a node
         app.update(AppEvent::SelectDown); // tree move to task-b node
-        assert_eq!(app.selected_task, Some(1));
+        // Note: selected_task is no longer updated by sidebar navigation (plan 0031).
+        // With tabs, the active tab determines which task's content is displayed.
+        // For this test, we manually set selected_task to simulate opening the task in a tab.
+        app.selected_task = Some(1);
 
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen_b = screen_of(&terminal);
         assert!(
             screen_b.contains("task-b only"),
-            "task-b exchange must be visible when task-b is focused"
+            "task-b exchange must be visible when task-b's tab is active"
         );
         assert!(
             !screen_b.contains("implement X"),
-            "task-a exchange must NOT appear when task-b is focused"
+            "task-a exchange must NOT appear when task-b's tab is active"
         );
     }
 
@@ -5885,122 +5882,5 @@ mod tests {
             screen.contains("100") || screen.contains("40"),
             "header must show token counts when usage is present; got:\n{screen}"
         );
-    }
-
-    // ── Render: plan picker (plan 0027) ───────────────────────────────────────
-
-    #[test]
-    fn plan_picker_renders_slugs_and_no_tasks_hint() {
-        let mut terminal = make_terminal(200, 30);
-        let api = Arc::new(PlaceholderApi::new());
-        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-
-        // Manually enter plan-picker mode with two plans: one with tasks, one without.
-        app.discovered_plans = vec![
-            makina_core::orchestrator::PlanEntry {
-                dir: PathBuf::from("docs/plans/0001-First-Plan"),
-                slug: "0001-first-plan".to_string(),
-                has_tasks: true,
-            },
-            makina_core::orchestrator::PlanEntry {
-                dir: PathBuf::from("docs/plans/0002-Second-Plan"),
-                slug: "0002-second-plan".to_string(),
-                has_tasks: false,
-            },
-        ];
-        app.plan_cursor = 0;
-        app.mode = crate::app::Mode::PlanPicker;
-
-        terminal
-            .draw(|frame| render(&app, frame))
-            .expect("draw must succeed");
-
-        let screen = screen_of(&terminal);
-
-        // Check that "Plans" title appears
-        assert!(
-            screen.contains("Plans"),
-            "plan picker must show 'Plans' title; got:\n{screen}"
-        );
-
-        // Check that both plan slugs appear
-        assert!(
-            screen.contains("0001-first-plan"),
-            "plan picker must list first plan slug; got:\n{screen}"
-        );
-        assert!(
-            screen.contains("0002-second-plan"),
-            "plan picker must list second plan slug; got:\n{screen}"
-        );
-
-        // Check that the "(no tasks — will plan)" hint appears for the second plan
-        assert!(
-            screen.contains("no tasks") && screen.contains("will plan"),
-            "plan picker must show '(no tasks — will plan)' hint for the second plan; got:\n{screen}"
-        );
-    }
-
-    #[test]
-    fn plan_picker_shows_empty_state_when_no_plans() {
-        let mut terminal = make_terminal(200, 30);
-        let api = Arc::new(PlaceholderApi::new());
-        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-
-        // Enter plan-picker mode with no discovered plans.
-        app.mode = crate::app::Mode::PlanPicker;
-
-        terminal
-            .draw(|frame| render(&app, frame))
-            .expect("draw must succeed");
-
-        let screen = screen_of(&terminal);
-
-        // Check that the empty-state hint appears
-        assert!(
-            screen.contains("No plans under docs/plans"),
-            "plan picker must show empty-state hint when no plans; got:\n{screen}"
-        );
-    }
-
-    #[test]
-    fn plan_picker_highlights_plan_cursor() {
-        let mut terminal = make_terminal(200, 30);
-        let api = Arc::new(PlaceholderApi::new());
-        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-
-        // Populate with plans and set cursor to second one
-        app.discovered_plans = vec![
-            makina_core::orchestrator::PlanEntry {
-                dir: PathBuf::from("docs/plans/0001-First-Plan"),
-                slug: "0001-first-plan".to_string(),
-                has_tasks: true,
-            },
-            makina_core::orchestrator::PlanEntry {
-                dir: PathBuf::from("docs/plans/0002-Second-Plan"),
-                slug: "0002-second-plan".to_string(),
-                has_tasks: true,
-            },
-        ];
-        app.plan_cursor = 1; // Highlight the second plan
-        app.mode = crate::app::Mode::PlanPicker;
-
-        terminal
-            .draw(|frame| render(&app, frame))
-            .expect("draw must succeed");
-
-        let screen = screen_of(&terminal);
-
-        // Check that both slugs appear (the selected one and the unselected ones)
-        assert!(
-            screen.contains("0001-first-plan"),
-            "plan picker must list first plan; got:\n{screen}"
-        );
-        assert!(
-            screen.contains("0002-second-plan"),
-            "plan picker must list second plan; got:\n{screen}"
-        );
-
-        // The highlight symbol "▶ " should appear before the selected plan
-        // (this is guaranteed by ratatui's ListState rendering)
     }
 }

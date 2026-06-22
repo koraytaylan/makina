@@ -186,6 +186,12 @@ fn is_plan_tasks_path(path: &std::path::Path) -> bool {
         .is_some_and(|n| n.eq_ignore_ascii_case("TASKS.md"))
 }
 
+/// Check if `dir` follows the plan convention (both SCOPE.md and ARCHITECTURE.md exist).
+#[allow(dead_code)]
+fn is_plan_convention_dir(dir: &Path) -> bool {
+    dir.join("SCOPE.md").is_file() && dir.join("ARCHITECTURE.md").is_file()
+}
+
 /// One plan directory discovered under `docs/plans/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEntry {
@@ -621,6 +627,9 @@ impl CoreState {
 pub struct CoreApi {
     /// Shared mutable state (also cloned into background execution tasks).
     state: Arc<CoreState>,
+    /// The model-driven TASKS.md normalizer for repairing malformed or missing
+    /// task lists in plan-convention directories.
+    pub normalizer: Arc<crate::normalizer::ModelNormalizer>,
 }
 
 impl CoreApi {
@@ -681,6 +690,10 @@ impl CoreApi {
         audit_registry: Arc<dyn AuditRegistry>,
     ) -> Self {
         let (event_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        // Create the normalizer with the developer backend (same as the planner).
+        let normalizer = Arc::new(crate::normalizer::ModelNormalizer::new(Arc::clone(
+            &developer_backend,
+        )));
         Self {
             state: Arc::new(CoreState {
                 interpreter,
@@ -694,6 +707,7 @@ impl CoreApi {
                 event_tx,
                 audit_registry,
             }),
+            normalizer,
         }
     }
 
@@ -1072,6 +1086,102 @@ impl CoreApi {
                 Ok((graph, vec![]))
             }
             Err(e) => {
+                // On parse error for a plan-convention dir, attempt normalization.
+                if let crate::interpreter::InterpretError::ParseError { location, context } = &e {
+                    let plan_dir = task_list_path.parent().unwrap_or(task_list_path);
+                    if is_plan_convention_dir(plan_dir) {
+                        tracing::info!(
+                            "Normalizing malformed TASKS.md at line {}: {}",
+                            location,
+                            context
+                        );
+                        match self.normalizer.normalize(plan_dir, slug).await {
+                            Ok(normalized) => {
+                                // Write the normalized TASKS.md back to disk.
+                                if let Err(write_err) =
+                                    tokio::fs::write(task_list_path, &normalized).await
+                                {
+                                    tracing::warn!(
+                                        slug = %slug,
+                                        error = %write_err,
+                                        "failed to write normalized TASKS.md; falling back to original error",
+                                    );
+                                    // Fall back to original error if write fails
+                                    let graph = TaskGraph {
+                                        slug: slug.into(),
+                                        tasks: vec![],
+                                    };
+                                    let issues = vec![crate::ingestion::IngestionIssue {
+                                        task_id: None,
+                                        severity: crate::ingestion::IssueSeverity::Blocking,
+                                        source: crate::ingestion::IssueSource::Interpreter,
+                                        code: "parse-error".into(),
+                                        message: format!(
+                                            "could not interpret task list `{slug}`: {e}"
+                                        ),
+                                        suggestion: Some(
+                                            "fix the task list and re-interpret".into(),
+                                        ),
+                                    }];
+                                    return Ok((graph, issues));
+                                }
+                                // Re-interpret the normalized text.
+                                match self.state.interpreter.interpret(slug, &normalized).await {
+                                    Ok(graph) => {
+                                        // Seed-persist the normalized graph.
+                                        if seed_persist
+                                            && let Err(e) =
+                                                crate::persist::persist_graph(&graph, repo_root)
+                                                    .await
+                                        {
+                                            tracing::warn!(
+                                                slug = %slug,
+                                                error = %e,
+                                                "seed-persist failed for normalized run; continuing without artifact",
+                                            );
+                                        }
+                                        return Ok((graph, vec![]));
+                                    }
+                                    Err(reinterpret_err) => {
+                                        tracing::warn!(
+                                            slug = %slug,
+                                            error = %reinterpret_err,
+                                            "re-interpretation of normalized TASKS.md failed; falling back to original error",
+                                        );
+                                        // Fall back to original error if re-interpretation fails
+                                        let graph = TaskGraph {
+                                            slug: slug.into(),
+                                            tasks: vec![],
+                                        };
+                                        let issues = vec![crate::ingestion::IngestionIssue {
+                                            task_id: None,
+                                            severity: crate::ingestion::IssueSeverity::Blocking,
+                                            source: crate::ingestion::IssueSource::Interpreter,
+                                            code: "parse-error".into(),
+                                            message: format!(
+                                                "could not interpret task list `{slug}`: {e}"
+                                            ),
+                                            suggestion: Some(
+                                                "fix the task list and re-interpret".into(),
+                                            ),
+                                        }];
+                                        return Ok((graph, issues));
+                                    }
+                                }
+                            }
+                            Err(norm_err) => {
+                                tracing::warn!(
+                                    slug = %slug,
+                                    error = %norm_err,
+                                    "normalization failed; falling back to original error",
+                                );
+                                // Fall back to original error if normalization fails
+                            }
+                        }
+                    }
+                }
+
+                // No normalization attempted, or it failed — return the original error.
                 let graph = TaskGraph {
                     slug: slug.into(),
                     tasks: vec![],

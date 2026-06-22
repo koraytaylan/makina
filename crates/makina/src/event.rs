@@ -137,7 +137,6 @@ pub async fn run(
             viewing_doctor: app.is_viewing_doctor(),
             command_palette: app.is_command_palette(),
             settings: app.is_settings(),
-            picking_plan: app.is_picking_plan(),
         };
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
@@ -329,28 +328,6 @@ async fn resolve_io(
                 None => (AppEvent::Tick, None),
             }
         }
-        // ── Plan picker (plan 0027) ───────────────────────────────────────────
-        // Activate a selected plan: for plans with TASKS.md, open via OpenRun;
-        // for plans without TASKS.md, route to planner-generate path.
-        AppEvent::PlanActivate => match app.selected_plan() {
-            Some(entry) if entry.has_tasks => {
-                let path = entry.dir.join("TASKS.md");
-                let status = format!("Interpreting {}...", entry.slug);
-                spawn_open_run(std::sync::Arc::clone(&app.api), path, background_tx.clone());
-                (AppEvent::CloseBrowser, Some(status))
-            }
-            Some(entry) => {
-                // plan 0028: planner-generate(entry.dir) — route here instead of OpenRun.
-                (
-                    AppEvent::CloseBrowser,
-                    Some(format!(
-                        "{}: no TASKS.md — planner will generate the graph",
-                        entry.slug
-                    )),
-                )
-            }
-            None => (AppEvent::Tick, None),
-        },
         // ── Run control (task 31) ─────────────────────────────────────────────
         AppEvent::StartRun => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
         AppEvent::PauseRun => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
@@ -421,6 +398,44 @@ async fn resolve_io(
         AppEvent::DiscoverProject => {
             let status = discover_project(app).await;
             (AppEvent::Tick, status)
+        }
+        // ── Open focused node (plan 0031) ────────────────────────────────────────
+        // User pressed Enter on a focused node in the sidebar. Plans open their
+        // TASKS.md via api.execute(OpenRun). Tasks open a new tab.
+        AppEvent::OpenFocusedNode => {
+            use crate::app::{TabContent, TreeNode};
+            match app.focused_node() {
+                Some(TreeNode::Plan { plan_idx }) => match app.discovered_plans.get(plan_idx) {
+                    Some(plan) => {
+                        let task_list_path = plan.dir.join("TASKS.md");
+                        let status = format!("Interpreting {}...", plan.slug);
+                        spawn_open_run(
+                            std::sync::Arc::clone(&app.api),
+                            task_list_path,
+                            background_tx.clone(),
+                        );
+                        (AppEvent::Tick, Some(status))
+                    }
+                    None => (AppEvent::Tick, Some("Plan not found".to_string())),
+                },
+                Some(TreeNode::Task { run, task }) => {
+                    // When Enter is pressed on a task node, open a new tab for that task.
+                    if let Some(run_view) = app.runs.get(run)
+                        && let Some(task_view) = run_view.tasks.get(task)
+                    {
+                        let plan_slug =
+                            makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+                        let tab_content = TabContent::Task {
+                            plan_slug,
+                            task_id: task_view.id.clone(),
+                        };
+                        return (AppEvent::OpenTab(tab_content), None);
+                    }
+                    (AppEvent::Tick, Some("Task not found".to_string()))
+                }
+                // Run nodes and plan nodes (from other branches) don't respond to Enter.
+                _ => (AppEvent::Tick, None),
+            }
         }
         // Everything else passes straight through.
         other => (other, None),
@@ -939,6 +954,7 @@ async fn retry_focused(app: &App) -> Option<String> {
                 None
             }
         }
+        Some(TreeNode::Plan { .. }) => None,
         None => None,
     };
 
@@ -956,6 +972,7 @@ async fn retry_focused(app: &App) -> Option<String> {
         .focused_node()
         .and_then(|node| match node {
             TreeNode::Run { run } | TreeNode::Task { run, .. } => app.runs.get(run),
+            TreeNode::Plan { .. } => None,
         })
         .map(|rv| rv.status == RunStatus::Pending)
         .unwrap_or(false)
@@ -1049,7 +1066,6 @@ struct ModalState {
     viewing_doctor: bool,
     command_palette: bool,
     settings: bool,
-    picking_plan: bool,
 }
 
 /// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
@@ -1099,7 +1115,6 @@ fn translate_key(
         viewing_doctor,
         command_palette,
         settings,
-        picking_plan,
     } = modal;
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
@@ -1128,17 +1143,6 @@ fn translate_key(
             KeyCode::Down => AppEvent::CommandPaletteDown,
             KeyCode::Backspace => AppEvent::CommandPaletteBackspace,
             KeyCode::Char(c) => AppEvent::CommandPaletteInput(c),
-            _ => AppEvent::Tick,
-        }
-    } else if picking_plan {
-        // ── Plan picker keymap ────────────────────────────────────────────────
-        // Esc closes the picker (does NOT quit the app); Enter activates the
-        // selection; j/k/arrows navigate.
-        match key.code {
-            KeyCode::Esc => AppEvent::CloseBrowser,
-            KeyCode::Enter => AppEvent::PlanActivate,
-            KeyCode::Up | KeyCode::Char('k') => AppEvent::PlanPickerUp,
-            KeyCode::Down | KeyCode::Char('j') => AppEvent::PlanPickerDown,
             _ => AppEvent::Tick,
         }
     } else if browsing {
@@ -1232,6 +1236,14 @@ fn translate_key(
                 use crate::app::Panel;
                 match focused_panel {
                     Panel::Sidebar => AppEvent::ToggleTreeNode,
+                    Panel::Main => AppEvent::Tick,
+                }
+            }
+            // Enter: open the focused node in the sidebar.
+            KeyCode::Enter => {
+                use crate::app::Panel;
+                match focused_panel {
+                    Panel::Sidebar => AppEvent::OpenFocusedNode,
                     Panel::Main => AppEvent::Tick,
                 }
             }
@@ -3127,151 +3139,70 @@ wall_clock_secs = 1200
         }
     }
 
-    /// **Plan activation with tasks:** When a plan with `has_tasks=true` is
-    /// activated via `PlanActivate`, `resolve_io` must spawn
-    /// `api.execute(OpenRun)` for the plan's `TASKS.md`, return `CloseBrowser`,
-    /// and surface an "Interpreting ..." status message immediately.
     #[tokio::test]
-    async fn plan_activate_with_tasks_opens_run() {
-        use crate::app::{App, AppEvent, Mode};
-        use makina_core::dependency::EdgeInferrer;
-        use makina_core::interpreter::StructuredTextInterpreter;
-        use makina_core::orchestrator::{CoreApi, PlanEntry};
-        use std::sync::Arc;
-
-        // A valid task list for the plan's TASKS.md
-        let source = "# Flow\n\nPreamble.\n\n---\n\n## 0001 — Task\n\n\
-            ### test — Test\nDoes a thing.\n- **Depends on:** —\n- **Done when:** ok.\n";
-        let tmpdir = tempfile::tempdir().unwrap();
-        let repo_root = tmpdir.path().to_path_buf();
-        let plan_dir = repo_root.join("docs/plans/0001-test");
-        std::fs::create_dir_all(&plan_dir).unwrap();
-        let tasks_path = plan_dir.join("TASKS.md");
-        std::fs::write(&tasks_path, source).unwrap();
-
-        // Real CoreApi with deterministic interpreter
-        let interpreter = Arc::new(EdgeInferrer::new(
-            Arc::new(StructuredTextInterpreter::new()),
-        ));
-        let backend: Arc<dyn makina_core::backend::AgentBackend> =
-            Arc::new(makina_core::backend::noop::NoopBackend::new());
-        let wm = makina_core::worktree::WorktreeManager::new(
-            tempfile::tempdir().unwrap().keep(),
-            "develop".into(),
-        );
-        let config = makina_core::config::Config::resolve(
-            makina_core::config::GlobalConfig::default(),
-            makina_core::config::ProjectConfig::default(),
-        );
-        let api: Arc<dyn makina_core::api::Api> =
-            Arc::new(CoreApi::new(interpreter, backend, wm, config));
-
-        // Subscribe before acting (to avoid dropped subscription)
-        let mut sub = api.subscribe();
-
-        // Build an App with a selected plan
-        let mut app = App::new(Arc::clone(&api), vec![], repo_root.clone());
-        app.mode = Mode::PlanPicker;
-        app.discovered_plans = vec![PlanEntry {
-            dir: plan_dir,
-            slug: "0001-test".to_string(),
-            has_tasks: true,
-        }];
-        app.plan_cursor = 0;
-
-        // Resolve PlanActivate
-        let (tx, _rx) = background_events();
-        let (resolved, status) = resolve_io(&app, AppEvent::PlanActivate, &tx).await;
-
-        // Must return CloseBrowser + "Interpreting ..." status
-        assert!(
-            matches!(resolved, AppEvent::CloseBrowser),
-            "PlanActivate with tasks must resolve to CloseBrowser"
-        );
-        assert!(
-            status
-                .as_deref()
-                .is_some_and(|m| m.contains("Interpreting") || m.contains("Opening")),
-            "PlanActivate must surface an 'Interpreting ...' status; got {status:?}"
-        );
-
-        // Update app with the resolved event
-        app.update(resolved);
-        assert_eq!(
-            app.mode,
-            Mode::Normal,
-            "PlanPicker should close after activation"
-        );
-
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), sub.next())
-            .await
-            .expect("timed out waiting for RunOpened")
-            .expect("stream ended unexpectedly");
-        assert!(matches!(ev, makina_core::api::Event::RunOpened { .. }));
-
-        // Verify CoreApi created the run.
-        let runs = api.runs().await;
-        assert_eq!(runs.len(), 1, "CoreApi must have created exactly one run");
-        assert_eq!(runs[0].task_list_path, tasks_path);
-    }
-
-    /// **Plan activation without tasks:** When a plan with `has_tasks=false` is
-    /// activated via `PlanActivate`, `resolve_io` must NOT call `api.execute(OpenRun)`,
-    /// but return `CloseBrowser` and a "no TASKS.md — planner will generate the graph"
-    /// status message (leaving a seam comment for plan 0028).
-    #[tokio::test]
-    async fn plan_activate_without_tasks_does_not_open_run() {
-        use crate::app::{App, AppEvent, Mode};
+    async fn enter_key_on_plan_node_opens_plan() {
+        use crate::app::{App, AppEvent, TreeNode};
         use crate::placeholder::PlaceholderApi;
         use makina_core::orchestrator::PlanEntry;
         use std::sync::Arc;
 
+        // Create a temp repo with a plan directory
         let tmpdir = tempfile::tempdir().unwrap();
-        let repo_root = tmpdir.path().to_path_buf();
-        let plan_dir = repo_root.join("docs/plans/0002-no-tasks");
+        let repo_root = tmpdir.path();
+        let plan_dir = repo_root.join("docs/plans/0001-test");
         std::fs::create_dir_all(&plan_dir).unwrap();
+        std::fs::write(plan_dir.join("SCOPE.md"), "Scope").unwrap();
+        std::fs::write(plan_dir.join("ARCHITECTURE.md"), "Architecture").unwrap();
+        std::fs::write(
+            plan_dir.join("TASKS.md"),
+            "## 0001\n\n### task-1\n\n- Done when: test",
+        )
+        .unwrap();
 
         let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], repo_root.to_path_buf());
 
-        // Build an App with a selected plan without tasks
-        let mut app = App::new(api, vec![], repo_root);
-        app.mode = Mode::PlanPicker;
+        // Manually add discovered plan (simulating PlansDiscovered)
         app.discovered_plans = vec![PlanEntry {
-            dir: plan_dir,
-            slug: "0002-no-tasks".to_string(),
-            has_tasks: false,
+            dir: plan_dir.clone(),
+            slug: "0001-test".to_string(),
+            has_tasks: true,
         }];
-        app.plan_cursor = 0;
 
-        // Resolve PlanActivate: should NOT open a run
-        let (resolved, status) = resolve_io_for_test(&app, AppEvent::PlanActivate).await;
+        // Move cursor to the plan node (index 0 in the tree)
+        app.tree_cursor = Some(0);
 
-        // Must return CloseBrowser + a "planner will generate" message
-        assert!(
-            matches!(resolved, AppEvent::CloseBrowser),
-            "PlanActivate without tasks must resolve to CloseBrowser"
-        );
-        assert!(
-            status
-                .as_deref()
-                .is_some_and(|m| m.contains("planner will generate")),
-            "PlanActivate without tasks must mention planner; got {status:?}"
-        );
+        // Verify we're focused on a plan node
+        assert!(matches!(
+            app.focused_node(),
+            Some(TreeNode::Plan { plan_idx: 0 })
+        ));
 
-        // Update app
-        app.update(resolved);
-        assert_eq!(
-            app.mode,
-            Mode::Normal,
-            "PlanPicker should close after activation"
-        );
+        // Resolve OpenFocusedNode: should spawn an OpenRun command and return a status
+        let (tx, _rx) = background_events();
+        let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
 
-        // Verify no runs were created (the PlaceholderApi would trivially succeed OpenRun,
-        // but we're testing the logic: resolve_io should not call it)
-        let runs = app.runs.clone();
-        assert!(
-            runs.is_empty(),
-            "no run should be created for a plan without TASKS.md"
-        );
+        // The resolved event should be Tick (the actual command runs in background)
+        assert!(matches!(resolved, AppEvent::Tick));
+        // Should have a status message about interpreting the plan
+        assert_eq!(status, Some("Interpreting 0001-test...".to_string()));
+    }
+
+    #[test]
+    fn enter_key_in_sidebar_translates_to_open_focused_node() {
+        let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            AppEvent::OpenFocusedNode
+        ));
+    }
+
+    #[test]
+    fn enter_key_in_main_pane_is_tick() {
+        let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main),
+            AppEvent::Tick
+        ));
     }
 }

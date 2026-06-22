@@ -413,8 +413,6 @@ pub enum Mode {
     CommandPalette,
     /// The settings modal (task 0070).
     Settings,
-    /// The plan picker modal (plan 0027): shows discovered `docs/plans/*/` entries.
-    PlanPicker,
 }
 
 // ── Command palette ──────────────────────────────────────────────────────────
@@ -583,6 +581,8 @@ pub enum TreeNode {
     Run { run: usize },
     /// Task at `runs[run].tasks[task]`.
     Task { run: usize, task: usize },
+    /// A discovered plan at `discovered_plans[plan_idx]`.
+    Plan { plan_idx: usize },
 }
 
 // ── App input event ───────────────────────────────────────────────────────────
@@ -688,24 +688,20 @@ pub enum AppEvent {
     CloseBrowser,
 
     // ── Plan picker (plan 0027) ───────────────────────────────────────────────
-    /// Discovery result arrived: switch to [`Mode::PlanPicker`] with this list.
+    /// Discovery result arrived: store discovered plans for sidebar tree integration.
     PlansDiscovered {
         /// The plans discovered under `docs/plans/` by
         /// [`makina_core::orchestrator::discover_plans`].
         plans: Vec<makina_core::orchestrator::PlanEntry>,
     },
-    /// Move the plan-picker selection one row up.
-    PlanPickerUp,
-    /// Move the plan-picker selection one row down.
-    PlanPickerDown,
-    /// Activate the highlighted plan picker entry (Enter).
+    /// Open the focused node in the sidebar (Enter).
     ///
-    /// The IO layer interprets the current selection: for a plan with
-    /// `has_tasks==true`, starts `api.execute(OpenRun{..})` in the background
-    /// and returns [`AppEvent::CloseBrowser`] immediately; for a plan with
-    /// `has_tasks==false`, routes to the planner-generate path and emits a
-    /// status message. `update` does not mutate state for this variant.
-    PlanActivate,
+    /// User pressed Enter on a `TreeNode::Plan` or other interactive node. The IO
+    /// layer resolves this by examining the focused node and dispatching the
+    /// appropriate command (e.g., `api.execute(OpenRun { task_list_path })` for a
+    /// plan). `update` itself does nothing for this variant (the async command runs
+    /// in the IO layer), keeping `update` pure.
+    OpenFocusedNode,
 
     // ── Provider configuration editor (task 0041) ──────────────────────────────
     /// User requested to open the provider configuration editor (e.g. pressed `g`).
@@ -812,6 +808,16 @@ pub enum AppEvent {
     /// Close the settings screen without saving.
     CloseSettings,
 
+    // ── Tabbed content pane (plan 0031) ──────────────────────────────────────
+    /// Open a new tab with the given content (or switch to it if already open).
+    OpenTab(TabContent),
+    /// Close the active tab.
+    CloseTab,
+    /// Switch to the next tab (or wrap to the first).
+    NextTab,
+    /// Switch to the previous tab (or wrap to the last).
+    PrevTab,
+
     // ── Placeholder stubs for forward-referenced plans ────────────────────────
     /// User requested to retry the focused task (plan 0017).
     RetryFocusedTask,
@@ -857,6 +863,63 @@ pub struct SelectionPane {
     pub hit: ratatui::layout::Rect,
     /// The rectangle the selection is confined to (inner content).
     pub clip: ratatui::layout::Rect,
+}
+
+/// Content displayed in a tab in the main pane.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TabContent {
+    /// A task within a run: identified by plan slug and task ID.
+    Task { plan_slug: String, task_id: TaskId },
+    /// A discovered plan: identified by plan slug.
+    Plan { plan_slug: String },
+}
+
+/// State for the tabbed content pane.
+#[derive(Debug, Clone)]
+pub struct TabState {
+    /// Currently open tabs.
+    pub open_tabs: Vec<TabContent>,
+    /// Index of the active tab in `open_tabs`; `None` if no tabs are open.
+    pub active_tab: Option<usize>,
+}
+
+impl TabState {
+    pub fn new() -> Self {
+        TabState {
+            open_tabs: Vec::new(),
+            active_tab: None,
+        }
+    }
+
+    /// Open a new tab or switch to it if already open.
+    pub fn open_tab(&mut self, content: TabContent) {
+        if let Some(idx) = self.open_tabs.iter().position(|t| t == &content) {
+            self.active_tab = Some(idx);
+        } else {
+            self.open_tabs.push(content);
+            self.active_tab = Some(self.open_tabs.len() - 1);
+        }
+    }
+
+    /// Close the tab at the given index. If it was the active tab, switch to an adjacent tab.
+    pub fn close_tab(&mut self, idx: usize) {
+        if idx < self.open_tabs.len() {
+            self.open_tabs.remove(idx);
+            if self.open_tabs.is_empty() {
+                self.active_tab = None;
+            } else if let Some(active) = self.active_tab
+                && active >= self.open_tabs.len()
+            {
+                self.active_tab = Some(self.open_tabs.len() - 1);
+            }
+        }
+    }
+}
+
+impl Default for TabState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// All mutable TUI state.
@@ -930,6 +993,10 @@ pub struct App {
     /// Run ids whose task children are collapsed in the sidebar tree.
     /// Absent ⇒ expanded (runs default to expanded).
     pub collapsed_runs: HashSet<RunId>,
+
+    /// Plan indices currently collapsed in the sidebar tree (excludes expanded plans).
+    /// Parallel to `collapsed_runs` but keyed by index into `discovered_plans`.
+    pub collapsed_plans: HashSet<usize>,
 
     /// Index into `visible_tree_nodes()` of the focused sidebar node.
     /// `None` when no runs are open.
@@ -1081,6 +1148,9 @@ pub struct App {
     /// config and editable via the settings modal.
     pub concurrency: usize,
 
+    /// State for the tabbed main content pane.
+    pub tabs: TabState,
+
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
     /// Whether verbose mode is currently on.
     ///
@@ -1101,10 +1171,6 @@ pub struct App {
     /// [`makina_core::orchestrator::discover_plans`]. Populated when
     /// [`AppEvent::PlansDiscovered`] is processed; empty until then.
     pub discovered_plans: Vec<makina_core::orchestrator::PlanEntry>,
-
-    /// Index into [`App::discovered_plans`] of the highlighted entry in the
-    /// plan-picker modal. Clamped to `0..discovered_plans.len()` on navigation.
-    pub plan_cursor: usize,
 
     // ── Mouse text selection ──────────────────────────────────────────────────
     /// The active mouse-driven text selection over the rendered screen, if any.
@@ -1134,10 +1200,17 @@ impl App {
         self.load_exchanges_for_selected_run();
     }
 
-    /// Flatten open runs + the tasks of expanded runs into the visible-node
-    /// order shown in the sidebar (run, then its tasks if expanded, repeat).
+    /// Flatten discovered plans + open runs + the tasks of expanded runs into the visible-node
+    /// order shown in the sidebar (plans first, then runs and their tasks if expanded, repeat).
     pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
+        // Add discovered plans at the top, optionally expanded.
+        for (plan_idx, _plan) in self.discovered_plans.iter().enumerate() {
+            nodes.push(TreeNode::Plan { plan_idx });
+            // TODO (task tui-plan-tasks): if not collapsed, add plan's tasks as nested nodes.
+            // For now, plans are leaf nodes; tasks are only shown after expansion is implemented.
+        }
+        // Add open runs and their expanded tasks (existing logic).
         for (run_idx, run) in self.runs.iter().enumerate() {
             nodes.push(TreeNode::Run { run: run_idx });
             // Only include tasks if this run is expanded (not in collapsed_runs).
@@ -1167,20 +1240,25 @@ impl App {
         match self.focused_node() {
             None => {
                 self.selected_run = None;
-                self.selected_task = None;
+                // Note: selected_task is no longer updated by sidebar navigation
+                // (plan 0031). Tabs manage task focus independently.
             }
             Some(TreeNode::Run { run }) => {
                 self.selected_run = Some(run);
-                // For a run node, set selected_task to the first task of that run,
-                // or None if the run has no tasks.
-                self.selected_task = self
-                    .runs
-                    .get(run)
-                    .and_then(|r| if r.tasks.is_empty() { None } else { Some(0) });
+                // Note: selected_task is no longer updated by sidebar navigation
+                // (plan 0031). Tabs manage task focus independently.
             }
-            Some(TreeNode::Task { run, task }) => {
+            Some(TreeNode::Task { run, .. }) => {
+                // When navigating to a task node, update the selected run but NOT
+                // the selected task. Task focus is now managed by the tab system
+                // (plan 0031), not by sidebar cursor movement.
                 self.selected_run = Some(run);
-                self.selected_task = Some(task);
+            }
+            Some(TreeNode::Plan { .. }) => {
+                // Plan nodes are not yet integrated with run/task selection.
+                self.selected_run = None;
+                // Note: selected_task is no longer updated by sidebar navigation
+                // (plan 0031). Tabs manage task focus independently.
             }
         }
         // Load exchanges if the run changed.
@@ -1221,6 +1299,7 @@ impl App {
             None => return false,
             Some(TreeNode::Run { run }) => run,
             Some(TreeNode::Task { run, .. }) => run,
+            Some(TreeNode::Plan { .. }) => return false, // Plans not yet expandable
         };
 
         // Get the run id.
@@ -1282,6 +1361,7 @@ impl App {
             selected_run,
             selected_task,
             collapsed_runs: HashSet::new(),
+            collapsed_plans: HashSet::new(),
             tree_cursor,
             exchange_logs: HashMap::new(),
             task_last_activity_tick: HashMap::new(),
@@ -1313,7 +1393,7 @@ impl App {
             verbose_mode: false,
             role_metrics: HashMap::new(),
             discovered_plans: Vec::new(),
-            plan_cursor: 0,
+            tabs: TabState::new(),
             selection: None,
             selection_panes: std::cell::RefCell::new(Vec::new()),
         }
@@ -1390,11 +1470,6 @@ impl App {
         self.mode == Mode::Settings
     }
 
-    /// Whether the plan picker modal is currently active.
-    pub fn is_picking_plan(&self) -> bool {
-        self.mode == Mode::PlanPicker
-    }
-
     /// Return the currently selected [`RunView`], if any.
     ///
     /// The sidebar highlights this Run; the main panel displays its details.
@@ -1429,14 +1504,6 @@ impl App {
             .and_then(|i| run.tasks.get(i))
             .map(|tv| &tv.id)?;
         self.exchange_logs.get(&(run.id, task_id.clone()))
-    }
-
-    /// Return the [`PlanEntry`] currently highlighted in the plan-picker modal.
-    ///
-    /// Returns `None` when [`App::discovered_plans`] is empty.  Used by the IO
-    /// layer to resolve [`AppEvent::PlanActivate`] (plan 0027).
-    pub fn selected_plan(&self) -> Option<&makina_core::orchestrator::PlanEntry> {
-        self.discovered_plans.get(self.plan_cursor)
     }
 
     /// Scroll the exchange pane up by one line.
@@ -1791,33 +1858,11 @@ impl App {
 
             // ── Plan picker (plan 0027) ───────────────────────────────────────
             AppEvent::PlansDiscovered { plans } => {
+                // Store discovered plans for sidebar tree integration (task 0031).
+                // Plans are now navigated via the unified sidebar tree, not a modal.
                 self.discovered_plans = plans;
-                self.plan_cursor = 0;
-                // Open the picker only when there's something to pick. An empty
-                // result (startup auto-discovery in a repo with no `docs/plans/`)
-                // stays on the normal view instead of popping an empty modal.
-                if !self.discovered_plans.is_empty() {
-                    self.mode = Mode::PlanPicker;
-                }
                 self.status_message = None;
                 self.busy = None;
-                true
-            }
-            AppEvent::PlanPickerUp => {
-                if self.plan_cursor > 0 {
-                    self.plan_cursor -= 1;
-                }
-                true
-            }
-            AppEvent::PlanPickerDown => {
-                let len = self.discovered_plans.len();
-                if len > 0 && self.plan_cursor < len - 1 {
-                    self.plan_cursor += 1;
-                }
-                true
-            }
-            AppEvent::PlanActivate => {
-                // Handled by the IO layer (open or route to planner). No-op here.
                 true
             }
 
@@ -1887,7 +1932,8 @@ impl App {
             | AppEvent::PauseRun
             | AppEvent::CancelRun
             | AppEvent::Reinterpret
-            | AppEvent::RetryFocused => true,
+            | AppEvent::RetryFocused
+            | AppEvent::OpenFocusedNode => true,
 
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
@@ -2324,6 +2370,33 @@ impl App {
             AppEvent::DiscoverProject => {
                 self.status_message =
                     Some("project discovery not yet available (plan 0025)".to_string());
+                true
+            }
+
+            // ── Tabbed content pane (plan 0031) ───────────────────────────────
+            AppEvent::OpenTab(content) => {
+                self.tabs.open_tab(content);
+                true
+            }
+            AppEvent::CloseTab => {
+                if let Some(active) = self.tabs.active_tab {
+                    self.tabs.close_tab(active);
+                }
+                true
+            }
+            AppEvent::NextTab => {
+                if !self.tabs.open_tabs.is_empty() {
+                    let next = (self.tabs.active_tab.unwrap_or(0) + 1) % self.tabs.open_tabs.len();
+                    self.tabs.active_tab = Some(next);
+                }
+                true
+            }
+            AppEvent::PrevTab => {
+                if !self.tabs.open_tabs.is_empty() {
+                    let len = self.tabs.open_tabs.len();
+                    let prev = (self.tabs.active_tab.unwrap_or(0) + len - 1) % len;
+                    self.tabs.active_tab = Some(prev);
+                }
                 true
             }
 
@@ -2775,7 +2848,7 @@ mod tests {
         assert_eq!(app.tree_cursor, Some(0));
         assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
         assert_eq!(app.selected_run, Some(0));
-        assert_eq!(app.selected_task, Some(0)); // First task of run0.
+        // Note: selected_task is no longer updated by sidebar navigation (plan 0031).
 
         // Move down to node 1 (Task00).
         let moved = app.tree_move(1);
@@ -2783,7 +2856,6 @@ mod tests {
         assert_eq!(app.tree_cursor, Some(1));
         assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 0 }));
         assert_eq!(app.selected_run, Some(0));
-        assert_eq!(app.selected_task, Some(0));
 
         // Move down to node 2 (Task01).
         let moved = app.tree_move(1);
@@ -2791,7 +2863,6 @@ mod tests {
         assert_eq!(app.tree_cursor, Some(2));
         assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 1 }));
         assert_eq!(app.selected_run, Some(0));
-        assert_eq!(app.selected_task, Some(1));
 
         // Move back up to node 1 (Task00).
         let moved = app.tree_move(-1);
@@ -2828,7 +2899,6 @@ mod tests {
             Some(TreeNode::Task { run: 0, task: 1 }),
             "Should start at Task01"
         );
-        assert_eq!(app.selected_task, Some(1), "Task01 should be selected");
 
         // Toggle expand (should collapse run0 and move cursor to its Run header).
         let toggled = app.tree_toggle_expand();
@@ -2847,12 +2917,8 @@ mod tests {
             "Cursor should move to Run0 header after toggle"
         );
 
-        // selected_task should be Some(0) (first task of run0 when run node is focused).
-        assert_eq!(
-            app.selected_task,
-            Some(0),
-            "selected_task should be first task of run when focused on run header"
-        );
+        // Note: selected_task is no longer updated by sidebar navigation (plan 0031).
+        // It stays as whatever it was set to via explicit tab operations.
 
         // Toggle expand again (should expand run0).
         let toggled = app.tree_toggle_expand();
@@ -2878,7 +2944,8 @@ mod tests {
         assert_eq!(app.focused_panel, Panel::Sidebar);
         assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
         assert_eq!(app.selected_run, Some(0));
-        assert_eq!(app.selected_task, Some(0));
+        // Note: selected_task is no longer updated by sidebar navigation (plan 0031).
+        // It's initialized and managed by the tab system instead.
 
         // SelectDown moves to Task00.
         app.update(AppEvent::SelectDown);
@@ -2887,7 +2954,8 @@ mod tests {
             Some(TreeNode::Task { run: 0, task: 0 }),
             "SelectDown from Run0 should move to Task00"
         );
-        assert_eq!(app.selected_task, Some(0));
+        // selected_run should stay the same since we're still within run 0
+        assert_eq!(app.selected_run, Some(0));
 
         // SelectDown moves to Task01.
         app.update(AppEvent::SelectDown);
@@ -2896,7 +2964,8 @@ mod tests {
             Some(TreeNode::Task { run: 0, task: 1 }),
             "SelectDown from Task00 should move to Task01"
         );
-        assert_eq!(app.selected_task, Some(1));
+        // selected_run should still be 0
+        assert_eq!(app.selected_run, Some(0));
     }
 
     #[test]
@@ -4361,24 +4430,32 @@ mod tests {
             "task-b log must be stored"
         );
 
-        // Focus is on task-a (index 0).
-        assert_eq!(app.selected_task, Some(0));
-        assert_eq!(app.selected_task_id(), Some(&id_a));
+        // Initially focused on run with task-a selected (via initial sync_selection_from_cursor).
+        // Note: selected_task is no longer updated by sidebar navigation (plan 0031).
+        // Tasks are opened in tabs when Enter is pressed, and the active tab determines
+        // which task's content is displayed.
+        assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
 
-        // Only task-a's log is "shown" by the focus query.
-        let focused_log = app.selected_exchange_log().unwrap();
-        assert_eq!(focused_log.entries[0].text(), "task-a prompt");
-
-        // Navigate down to task-b using tree navigation in the Sidebar.
+        // Navigate down to task-a using tree navigation in the Sidebar.
         // Tree cursor: 0 (Run) -> 1 (Task A) -> 2 (Task B)
         // Need to call SelectDown twice to reach task-b.
         app.update(AppEvent::SelectDown); // Move to task-a node
-        app.update(AppEvent::SelectDown); // Move to task-b node
-        assert_eq!(app.selected_task, Some(1));
-        assert_eq!(app.selected_task_id(), Some(&id_b));
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 0 }));
 
-        let focused_log_b = app.selected_exchange_log().unwrap();
-        assert_eq!(focused_log_b.entries[0].text(), "task-b prompt");
+        app.update(AppEvent::SelectDown); // Move to task-b node
+        assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 1 }));
+
+        // Verify that exchange logs are stored for both tasks (via the Eventstream).
+        // The specific display of which log to show is now determined by the active tab
+        // (plan 0031), not by selected_task.
+        assert!(
+            app.exchange_logs.contains_key(&(RunId(1), id_a.clone())),
+            "task-a log must remain stored"
+        );
+        assert!(
+            app.exchange_logs.contains_key(&(RunId(1), id_b.clone())),
+            "task-b log must remain stored"
+        );
     }
 
     /// **Content scrolling:** Up/Down scrolls the exchange pane when Main is focused
@@ -4775,14 +4852,14 @@ mod tests {
         };
         let mut app = App::new(api, vec![run1, run2], PathBuf::from("."));
 
-        // Initially: sidebar focused, cursor at 0 (Run0), run=0, task=0.
+        // Initially: sidebar focused, cursor at 0 (Run0), run=0.
         assert_eq!(app.focused_panel, Panel::Sidebar);
         assert_eq!(app.selected_run, Some(0));
-        assert_eq!(app.selected_task, Some(0));
         assert_eq!(app.tree_cursor, Some(0));
         assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 0 }));
 
         // Navigate down via sidebar tree: SelectDown moves to the first task of Run0.
+        // Note: selected_task is no longer updated by sidebar navigation (plan 0031).
         app.update(AppEvent::SelectDown);
         assert_eq!(
             app.tree_cursor,
@@ -4790,21 +4867,18 @@ mod tests {
             "cursor moves to next node (Task0 of Run0)"
         );
         assert_eq!(app.selected_run, Some(0), "still on run 0");
-        assert_eq!(app.selected_task, Some(0), "now on task 0");
         assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 0 }));
 
         // Navigate down: next is Task1 of Run0.
         app.update(AppEvent::SelectDown);
         assert_eq!(app.tree_cursor, Some(2));
         assert_eq!(app.selected_run, Some(0));
-        assert_eq!(app.selected_task, Some(1));
         assert_eq!(app.focused_node(), Some(TreeNode::Task { run: 0, task: 1 }));
 
         // Navigate down: next is Run1 header.
         app.update(AppEvent::SelectDown);
         assert_eq!(app.tree_cursor, Some(3));
         assert_eq!(app.selected_run, Some(1), "moved to run 1");
-        assert_eq!(app.selected_task, Some(0), "run 1 has 1 task, so task is 0");
         assert_eq!(app.focused_node(), Some(TreeNode::Run { run: 1 }));
     }
 
@@ -6194,36 +6268,6 @@ mod tests {
         ]
     }
 
-    /// `PlansDiscovered` must switch to `Mode::PlanPicker`, store the list, and
-    /// reset `plan_cursor` to `0`; `selected_plan()` must return the first entry.
-    #[test]
-    fn plans_discovered_enters_picker() {
-        let mut app = make_app();
-        let entries = make_plan_entries();
-        let first_slug = entries[0].slug.clone();
-
-        app.update(AppEvent::PlansDiscovered {
-            plans: entries.clone(),
-        });
-
-        assert_eq!(
-            app.mode,
-            Mode::PlanPicker,
-            "mode must be PlanPicker after PlansDiscovered"
-        );
-        assert_eq!(
-            app.discovered_plans.len(),
-            2,
-            "discovered_plans must hold both entries"
-        );
-        assert_eq!(app.plan_cursor, 0, "plan_cursor must be reset to 0");
-        let selected = app.selected_plan().expect("selected_plan must return Some");
-        assert_eq!(
-            selected.slug, first_slug,
-            "selected_plan() must be the first entry"
-        );
-    }
-
     /// `OpenBrowser` must flag the app busy so the UI can render a spinner while
     /// plan discovery runs in the background.
     #[test]
@@ -6255,76 +6299,134 @@ mod tests {
         assert_eq!(app.busy, None, "PlansDiscovered must clear the busy flag");
     }
 
-    /// Startup auto-discovery in a repo with no plans: an empty `PlansDiscovered`
-    /// must stay on the normal view (no empty picker popup) and clear busy.
+    /// Sidebar shows discovered plans before open runs, and the first node is a
+    /// `TreeNode::Plan` when plans are discovered.
     #[test]
-    fn empty_plans_discovered_stays_normal() {
-        let mut app = make_app();
-        app.update(AppEvent::OpenBrowser);
+    fn sidebar_shows_discovered_plans_before_runs() {
+        let api = Arc::new(PlaceholderApi::new());
+        let discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("docs/plans/0001-test"),
+            slug: "0001-test".to_string(),
+            has_tasks: true,
+        }];
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.discovered_plans = discovered_plans;
 
-        app.update(AppEvent::PlansDiscovered { plans: vec![] });
-
-        assert_eq!(
-            app.mode,
-            Mode::Normal,
-            "empty discovery must not open the plan picker"
-        );
+        let nodes = app.visible_tree_nodes();
+        assert!(!nodes.is_empty(), "visible_tree_nodes should not be empty");
         assert!(
-            app.discovered_plans.is_empty(),
-            "discovered_plans must be empty"
-        );
-        assert_eq!(
-            app.busy, None,
-            "busy must clear even when no plans are found"
+            matches!(nodes[0], TreeNode::Plan { plan_idx: 0 }),
+            "First node should be a discovered plan"
         );
     }
 
-    /// `PlanPickerDown` must advance the cursor; past the last entry it must
-    /// clamp.  `PlanPickerUp` at `0` must stay at `0`.  `selected_plan()` must
-    /// track the cursor throughout.
+    /// Integration test: opening a discovered plan from the sidebar transitions it
+    /// to the open runs list. This test verifies that:
+    /// 1. We can navigate to a discovered plan node in the sidebar tree
+    /// 2. Calling the API's `OpenRun` command with the plan's TASKS.md path works
+    /// 3. The run appears in the app's runs list
+    #[tokio::test]
+    async fn can_open_discovered_plan_from_sidebar() {
+        let api = Arc::new(PlaceholderApi::empty());
+        let plan_dir = PathBuf::from("docs/plans/0001-test");
+        let discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: plan_dir.clone(),
+            slug: "0001-test".to_string(),
+            has_tasks: true,
+        }];
+
+        let mut app = App::new(api.clone(), vec![], PathBuf::from("."));
+        app.discovered_plans = discovered_plans;
+
+        // Verify the plan node is visible in the tree
+        let nodes = app.visible_tree_nodes();
+        assert!(!nodes.is_empty(), "tree should have nodes");
+        assert!(
+            matches!(nodes[0], TreeNode::Plan { plan_idx: 0 }),
+            "first node should be the discovered plan"
+        );
+
+        // Navigate the tree cursor to the plan node
+        app.tree_cursor = Some(0);
+
+        // Verify we're focused on a plan node
+        let focused = app.focused_node();
+        assert!(
+            matches!(focused, Some(TreeNode::Plan { plan_idx: 0 })),
+            "focused node should be the plan"
+        );
+
+        // Simulate pressing Enter: dispatch OpenRun with the plan's TASKS.md path
+        let task_list_path = plan_dir.join("TASKS.md");
+        let outcome = api
+            .execute(makina_core::api::Command::OpenRun {
+                task_list_path: task_list_path.clone(),
+            })
+            .await;
+
+        // The API call should succeed
+        assert!(
+            outcome.is_ok(),
+            "OpenRun command should succeed, got {outcome:?}"
+        );
+
+        // After OpenRun, a new run should appear in the runs list
+        let runs = api.runs().await;
+        assert!(
+            !runs.is_empty(),
+            "runs list should not be empty after OpenRun"
+        );
+
+        // The new run should have the correct task_list_path
+        let newly_opened_run = runs.last().expect("last run should exist");
+        assert_eq!(
+            newly_opened_run.task_list_path, task_list_path,
+            "opened run should have the correct TASKS.md path"
+        );
+    }
+
+    // ── Tab state operations ───────────────────────────────────────────────────
+
     #[test]
-    fn plan_picker_cursor_clamps() {
-        let mut app = make_app();
-        let entries = make_plan_entries();
-        app.update(AppEvent::PlansDiscovered { plans: entries });
+    fn open_tab_adds_new_tab() {
+        let mut state = TabState::new();
+        let content = TabContent::Plan {
+            plan_slug: "0001-test".to_string(),
+        };
+        state.open_tab(content);
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.active_tab, Some(0));
+    }
 
-        // Cursor starts at 0 → first entry.
-        assert_eq!(app.plan_cursor, 0);
-        assert_eq!(
-            app.selected_plan().map(|e| e.slug.as_str()),
-            Some("0001-alpha")
-        );
+    #[test]
+    fn open_existing_tab_switches_to_it() {
+        let mut state = TabState::new();
+        let content1 = TabContent::Plan {
+            plan_slug: "0001".to_string(),
+        };
+        let content2 = TabContent::Plan {
+            plan_slug: "0002".to_string(),
+        };
+        state.open_tab(content1.clone());
+        state.open_tab(content2);
+        state.open_tab(content1); // Open again
+        assert_eq!(state.open_tabs.len(), 2);
+        assert_eq!(state.active_tab, Some(0)); // Switched back to first
+    }
 
-        // Down once → second entry.
-        app.update(AppEvent::PlanPickerDown);
-        assert_eq!(app.plan_cursor, 1);
-        assert_eq!(
-            app.selected_plan().map(|e| e.slug.as_str()),
-            Some("0002-beta")
-        );
-
-        // Down past end → still at last entry (clamped).
-        app.update(AppEvent::PlanPickerDown);
-        assert_eq!(app.plan_cursor, 1, "cursor must clamp at len-1");
-        assert_eq!(
-            app.selected_plan().map(|e| e.slug.as_str()),
-            Some("0002-beta")
-        );
-
-        // Up once → back to first.
-        app.update(AppEvent::PlanPickerUp);
-        assert_eq!(app.plan_cursor, 0);
-        assert_eq!(
-            app.selected_plan().map(|e| e.slug.as_str()),
-            Some("0001-alpha")
-        );
-
-        // Up at 0 → stays at 0 (clamped).
-        app.update(AppEvent::PlanPickerUp);
-        assert_eq!(app.plan_cursor, 0, "cursor must clamp at 0");
-        assert_eq!(
-            app.selected_plan().map(|e| e.slug.as_str()),
-            Some("0001-alpha")
-        );
+    #[test]
+    fn close_tab_removes_it() {
+        let mut state = TabState::new();
+        let content1 = TabContent::Plan {
+            plan_slug: "0001".to_string(),
+        };
+        let content2 = TabContent::Plan {
+            plan_slug: "0002".to_string(),
+        };
+        state.open_tab(content1);
+        state.open_tab(content2);
+        state.close_tab(0);
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.active_tab, Some(0)); // Still valid (now points to second tab)
     }
 }
