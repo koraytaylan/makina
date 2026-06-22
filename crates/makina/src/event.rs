@@ -119,6 +119,14 @@ pub async fn run(
     // Periodic tick timer.
     let mut ticker = time::interval(TICK_INTERVAL);
 
+    // Auto-discover plans under the repo on startup so the plan picker populates
+    // without the user pressing `[o]`. The scan runs in the background; the
+    // OpenBrowser arm sets `app.busy`, which renders a spinner until
+    // PlansDiscovered arrives. `fallback_to_browser = false` keeps startup
+    // unobtrusive: a repo with no `docs/plans/` just stays on the normal view.
+    app.update(AppEvent::OpenBrowser);
+    spawn_discover_plans(app.repo_root.clone(), background_tx.clone(), false);
+
     // Initial render.
     tui.draw(|frame| ui::render(app, frame))?;
 
@@ -279,11 +287,11 @@ async fn resolve_io(
 ) -> (AppEvent, Option<String>) {
     match event {
         AppEvent::OpenBrowser => {
-            spawn_open_browser(app.repo_root.clone(), background_tx.clone());
-            (
-                AppEvent::OpenBrowser,
-                Some("Discovering plans...".to_string()),
-            )
+            // Manual `[o]`: discover plans, falling back to the file browser when
+            // none are found. The OpenBrowser update arm sets the busy spinner;
+            // no separate status message is needed.
+            spawn_discover_plans(app.repo_root.clone(), background_tx.clone(), true);
+            (AppEvent::OpenBrowser, None)
         }
         AppEvent::BrowserParent => match app.browser.as_ref().and_then(|b| b.parent()) {
             Some(parent) => {
@@ -419,7 +427,23 @@ async fn resolve_io(
     }
 }
 
-fn spawn_open_browser(repo_root: std::path::PathBuf, background_tx: mpsc::Sender<AppEvent>) {
+/// Scan `repo_root` for plans off the render loop and feed the result back as
+/// an [`AppEvent`].
+///
+/// The blocking directory walk runs on `spawn_blocking` so the UI stays
+/// responsive (and a spinner can animate) while it runs. When plans are found
+/// the result is an [`AppEvent::PlansDiscovered`] that opens the picker.
+///
+/// `fallback_to_browser` controls the *no plans found* case:
+/// - `true` (the `[o]` keypress): fall back to the CWD file browser so the user
+///   can still navigate to an arbitrary task-list file.
+/// - `false` (startup auto-discovery): emit an empty `PlansDiscovered` so the
+///   busy state clears and the app stays on the normal view — no popup.
+fn spawn_discover_plans(
+    repo_root: std::path::PathBuf,
+    background_tx: mpsc::Sender<AppEvent>,
+    fallback_to_browser: bool,
+) {
     tokio::spawn(async move {
         let discovery_root = repo_root.clone();
         let plans = tokio::task::spawn_blocking(move || {
@@ -428,7 +452,7 @@ fn spawn_open_browser(repo_root: std::path::PathBuf, background_tx: mpsc::Sender
         .await
         .unwrap_or_default();
 
-        let event = if plans.is_empty() {
+        let event = if plans.is_empty() && fallback_to_browser {
             let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             read_dir_event(&start).await
         } else {
@@ -1864,7 +1888,9 @@ mod tests {
             matches!(resolved, AppEvent::OpenBrowser),
             "OpenBrowser must return immediately"
         );
-        assert_eq!(status.as_deref(), Some("Discovering plans..."));
+        // The busy spinner (set by the OpenBrowser update arm) replaces the old
+        // static status message, so resolve_io returns no status here.
+        assert_eq!(status, None);
         let opened = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("timed out waiting for BrowserOpened")
@@ -3084,7 +3110,9 @@ wall_clock_secs = 1200
             matches!(resolved, AppEvent::OpenBrowser),
             "OpenBrowser must return immediately"
         );
-        assert_eq!(status.as_deref(), Some("Discovering plans..."));
+        // Busy state is set by the OpenBrowser update arm, not via a status
+        // message, so resolve_io returns no status here.
+        assert_eq!(status, None);
         let discovered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("timed out waiting for PlansDiscovered")

@@ -1010,6 +1010,15 @@ pub struct App {
     /// bar.  `None` until the first command is issued.
     pub status_message: Option<String>,
 
+    /// Label for an in-flight background job, e.g. `Some("Discovering plans")`.
+    ///
+    /// Set when async work begins (plan discovery on startup / `[o]`) and
+    /// cleared when it resolves ([`AppEvent::PlansDiscovered`] /
+    /// [`AppEvent::BrowserOpened`]). While `Some`, the UI renders an animated
+    /// spinner + this label so the user can tell the app is busy. `None` when
+    /// idle.
+    pub busy: Option<String>,
+
     /// Whether the error pane is currently visible.
     pub error_pane_open: bool,
 
@@ -1282,6 +1291,7 @@ impl App {
             last_scroll_max: std::cell::Cell::new(0),
             last_event: None,
             status_message: None,
+            busy: None,
             error_pane_open: false,
             error_messages: Vec::new(),
             unseen_errors: false,
@@ -1738,8 +1748,11 @@ impl App {
             // handled by the IO layer (it does the directory read / OpenRun call
             // and feeds back BrowserOpened / CloseBrowser).  `update` stays pure.
             AppEvent::OpenBrowser => {
-                // No state change here; the IO layer reads the start dir and
-                // emits BrowserOpened.  Returning true is harmless (redraw).
+                // No state change here beyond the busy flag; the IO layer scans
+                // for plans (→ PlansDiscovered) or reads the start dir (→
+                // BrowserOpened). Mark the app busy so the UI shows a spinner
+                // while that background work is in flight.
+                self.busy = Some("Discovering plans".to_string());
                 true
             }
             AppEvent::BrowserOpened { dir, entries } => {
@@ -1747,6 +1760,7 @@ impl App {
                 self.mode = Mode::FileBrowser;
                 self.browser = Some(FileBrowser::new(dir, entries));
                 self.status_message = None;
+                self.busy = None;
                 true
             }
             AppEvent::BrowserUp => {
@@ -1779,8 +1793,14 @@ impl App {
             AppEvent::PlansDiscovered { plans } => {
                 self.discovered_plans = plans;
                 self.plan_cursor = 0;
-                self.mode = Mode::PlanPicker;
+                // Open the picker only when there's something to pick. An empty
+                // result (startup auto-discovery in a repo with no `docs/plans/`)
+                // stays on the normal view instead of popping an empty modal.
+                if !self.discovered_plans.is_empty() {
+                    self.mode = Mode::PlanPicker;
+                }
                 self.status_message = None;
+                self.busy = None;
                 true
             }
             AppEvent::PlanPickerUp => {
@@ -6201,6 +6221,61 @@ mod tests {
         assert_eq!(
             selected.slug, first_slug,
             "selected_plan() must be the first entry"
+        );
+    }
+
+    /// `OpenBrowser` must flag the app busy so the UI can render a spinner while
+    /// plan discovery runs in the background.
+    #[test]
+    fn open_browser_sets_busy() {
+        let mut app = make_app();
+        assert_eq!(app.busy, None, "app starts idle");
+
+        app.update(AppEvent::OpenBrowser);
+
+        assert_eq!(
+            app.busy.as_deref(),
+            Some("Discovering plans"),
+            "OpenBrowser must mark the app busy"
+        );
+    }
+
+    /// `PlansDiscovered` must clear the busy flag when discovery resolves —
+    /// whether or not any plans were found.
+    #[test]
+    fn plans_discovered_clears_busy() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenBrowser);
+        assert!(app.busy.is_some());
+
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+
+        assert_eq!(app.busy, None, "PlansDiscovered must clear the busy flag");
+    }
+
+    /// Startup auto-discovery in a repo with no plans: an empty `PlansDiscovered`
+    /// must stay on the normal view (no empty picker popup) and clear busy.
+    #[test]
+    fn empty_plans_discovered_stays_normal() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenBrowser);
+
+        app.update(AppEvent::PlansDiscovered { plans: vec![] });
+
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "empty discovery must not open the plan picker"
+        );
+        assert!(
+            app.discovered_plans.is_empty(),
+            "discovered_plans must be empty"
+        );
+        assert_eq!(
+            app.busy, None,
+            "busy must clear even when no plans are found"
         );
     }
 

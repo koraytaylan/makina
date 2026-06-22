@@ -118,24 +118,36 @@ pub fn render(app: &App, frame: &mut Frame) {
         let sidebar_block = panel_block("Runs & Tasks", sidebar_focused);
 
         if app.runs.is_empty() {
-            // Empty state: show a hint instead of an empty list.  The `[o]` file
-            // browser exists (task 28); guide the user to it.
-            let empty_text = vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  No runs open.",
-                    Style::default().fg(Color::DarkGray),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  Press [o] to open a",
-                    Style::default().fg(Color::DarkGray),
-                )]),
-                Line::from(vec![Span::styled(
-                    "  task-list file.",
-                    Style::default().fg(Color::DarkGray),
-                )]),
-            ];
+            // Empty state. While a background job is running (e.g. startup plan
+            // discovery) show an animated spinner + label so the empty sidebar
+            // reads as "working", not "nothing here". Otherwise show a hint that
+            // guides the user to the `[o]` file browser (task 28).
+            let empty_text = if let Some(label) = &app.busy {
+                vec![
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        format!("  {} {label}…", spinner_frame(app.tick)),
+                        Style::default().fg(Color::Cyan),
+                    )]),
+                ]
+            } else {
+                vec![
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "  No runs open.",
+                        Style::default().fg(Color::DarkGray),
+                    )]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "  Press [o] to open a",
+                        Style::default().fg(Color::DarkGray),
+                    )]),
+                    Line::from(vec![Span::styled(
+                        "  task-list file.",
+                        Style::default().fg(Color::DarkGray),
+                    )]),
+                ]
+            };
             let para = Paragraph::new(empty_text)
                 .block(sidebar_block)
                 .style(Style::default().fg(Color::White));
@@ -389,14 +401,20 @@ pub fn render(app: &App, frame: &mut Frame) {
         Panel::Sidebar => "focus: sidebar",
         Panel::Main => "focus: main",
     };
-    let trailer = match &app.status_message {
-        Some(msg) => format!("  │  {msg}"),
-        None => {
-            let event_hint = match &app.last_event {
-                None => String::new(),
-                Some(ev) => format!("  │  last: {}", event_short_name(ev)),
-            };
-            format!("  {focus_label}{event_hint}")
+    let trailer = if let Some(label) = &app.busy {
+        // An in-flight background job (e.g. plan discovery): show an animated
+        // spinner + label so the user can tell the app is working.
+        format!("  │  {} {label}…", spinner_frame(app.tick))
+    } else {
+        match &app.status_message {
+            Some(msg) => format!("  │  {msg}"),
+            None => {
+                let event_hint = match &app.last_event {
+                    None => String::new(),
+                    Some(ev) => format!("  │  last: {}", event_short_name(ev)),
+                };
+                format!("  {focus_label}{event_hint}")
+            }
         }
     };
     // Blocked-start notice (mirrors gr-legend append): only when the selected
