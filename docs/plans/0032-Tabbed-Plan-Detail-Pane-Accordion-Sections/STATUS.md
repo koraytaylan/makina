@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete.
 
 _Last updated: 2026-06-23, against develop._
 
@@ -12,7 +12,7 @@ _Last updated: 2026-06-23, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Tab-Based Plan Rendering | `remove-plan-detail-singleton`, `integrate-tab-bar-into-plan-pane` | 📋 Planned |
-| 0002 | Accordion-Section Layout for Plan Metadata | `extend-plan-entry-with-spec-content`, `add-accordion-state-to-app`, `add-toggle-accordion-event`, `handle-accordion-toggle-in-update`, `create-accordion-renderer` | 📋 Planned |
-| 0003 | Tab Navigation and Keybindings | `wire-accordion-keybindings` | 📋 Planned |
-| 0004 | Integration and Polish | `clamp-plan-tabs-on-discovery`, `test-accordion-section-state`, `integration-plan-tabs-rendering`, `verification-plan-tab-workflow` | 📋 Planned |
+| 0001 | Tab-Based Plan Rendering | `remove-plan-detail-singleton` ✅, `integrate-tab-bar-into-plan-pane` ✅ | ✅ Done |
+| 0002 | Accordion-Section Layout for Plan Metadata | `extend-plan-entry-with-spec-content` ✅, `add-accordion-state-to-app` ✅, `add-toggle-accordion-event` ✅, `handle-accordion-toggle-in-update` ✅, `create-accordion-renderer` ✅ | ✅ Done |
+| 0003 | Tab Navigation and Keybindings | `wire-accordion-keybindings` ✅ | ✅ Done |
+| 0004 | Integration and Polish | `clamp-plan-tabs-on-discovery` ✅, `test-accordion-section-state` ✅, `integration-plan-tabs-rendering` ✅, `verification-plan-tab-workflow` ✅ | ✅ Done |
