@@ -44,8 +44,11 @@ use ratatui::{
         Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
     },
 };
+use std::collections::HashSet;
 
-use crate::app::{App, DependencyViewMode, ExchangeEntry, Panel, TabContent, TreeNode};
+use crate::app::{
+    AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, TabContent, TreeNode,
+};
 use makina_core::api::FailureKind;
 
 /// Render the full TUI layout into `frame`.
@@ -343,12 +346,35 @@ pub fn render(app: &App, frame: &mut Frame) {
     let content_area = main_split[0];
     let error_area = main_split[1];
 
-    // Content precedence: an explicitly opened plan detail (Enter on a plan)
-    // wins; otherwise the selected run's view; otherwise a hint.
-    let plan_detail_idx = app.plan_detail.filter(|i| *i < app.discovered_plans.len());
-    match (plan_detail_idx, app.selected_run()) {
-        (Some(plan_idx), _) => {
-            render_plan_detail(app, plan_idx, frame, content_area, main_focused);
+    // Content precedence: an active plan tab (opened via the tab system in plan 0032)
+    // is rendered via render_plan_accordion_pane; otherwise the selected run's view;
+    // otherwise a hint.
+    let active_plan_tab = app.tabs.active_tab.and_then(|idx| {
+        app.tabs.open_tabs.get(idx).and_then(|tab_content| {
+            if let crate::app::TabContent::Plan { plan_slug } = tab_content {
+                app.discovered_plans.iter().find(|p| p.slug == *plan_slug)
+            } else {
+                None
+            }
+        })
+    });
+
+    match (active_plan_tab, app.selected_run()) {
+        (Some(plan), _) => {
+            // Split content area to reserve 1 row for tab bar at the top
+            let plan_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(3)])
+                .split(content_area);
+
+            let tab_area = plan_split[0];
+            let plan_area = plan_split[1];
+
+            // Render the tab bar
+            render_tab_bar(app, frame, tab_area);
+
+            // Render the plan accordion pane below the tab bar
+            render_plan_accordion_pane(app, plan, frame, plan_area);
         }
         (None, None) => {
             // No run selected: show a hint paragraph.
@@ -1285,95 +1311,181 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 
 // ── Plan detail pane ──────────────────────────────────────────────────────────
 
-/// Render the read-only detail pane for a discovered plan (Enter on a plan
-/// node): its slug, directory, and full task list parsed from `TASKS.md` — id,
-/// title, `GATED` marker, and direct dependencies — with a footer of key hints.
-/// Drawn into the main content area; the surrounding "Detail" border is already
-/// painted by the caller, so this adds no border of its own.
-fn render_plan_detail(app: &App, plan_idx: usize, frame: &mut Frame, area: Rect, _focused: bool) {
+/// Render a plan tab's accordion pane with SCOPE, ARCHITECTURE, TASKS, and STATUS sections.
+///
+/// Displays the plan with four independently expandable accordion sections.
+/// Each section shows a `[+]` (collapsed) or `[-]` (expanded) marker followed by the section title.
+/// When expanded, content is displayed below the header, indented by two spaces.
+/// Missing files render as `(no SCOPE.md)`, etc.
+///
+/// # Note
+///
+/// This function is not yet wired to the main render path; it will be called from
+/// the active-tab dispatch in `render` once the `remove-plan-detail-singleton` task
+/// lands.  The `allow(dead_code)` below suppresses the lint until that task is done.
+#[allow(dead_code)]
+pub(crate) fn render_plan_accordion_pane(
+    app: &App,
+    plan: &makina_core::orchestrator::PlanEntry,
+    frame: &mut Frame,
+    area: Rect,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let Some(plan) = app.discovered_plans.get(plan_idx) else {
-        return;
-    };
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                &plan.slug,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Dir:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                plan.dir.display().to_string(),
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-        Line::from(""),
-    ];
+    let mut lines = Vec::new();
 
-    if plan.tasks.is_empty() {
-        let msg = if plan.has_tasks {
-            "TASKS.md is present but parsed no tasks."
-        } else {
-            "No TASKS.md yet — this plan still needs a task list."
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {msg}"),
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        let gated = plan.tasks.iter().filter(|t| t.gated).count();
-        let mut summary = format!("Tasks ({})", plan.tasks.len());
-        if gated > 0 {
-            summary.push_str(&format!("  ·  {gated} gated"));
-        }
-        lines.push(Line::from(Span::styled(
-            summary,
-            Style::default().fg(Color::White),
-        )));
-        lines.push(Line::from(""));
-        for (i, t) in plan.tasks.iter().enumerate() {
-            let mut spans = vec![
-                Span::styled(
-                    format!("{:>2}. ", i + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(&t.id, Style::default().fg(Color::Cyan)),
-                Span::styled(format!(" — {}", t.title), Style::default().fg(Color::White)),
-            ];
-            if t.gated {
-                spans.push(Span::styled("  GATED", Style::default().fg(Color::Yellow)));
-            }
-            lines.push(Line::from(spans));
-            if !t.depends_on.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("      depends on: {}", t.depends_on.join(", ")),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-        }
-    }
-
+    // Header: plan name and directory
+    lines.push(Line::from(vec![
+        Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            &plan.slug,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Dir:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            plan.dir.display().to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
     lines.push(Line::from(""));
+
+    // Get accordion state for this plan
+    let expanded = app
+        .accordion_state
+        .get(&plan.slug)
+        .cloned()
+        .unwrap_or_default();
+
+    // SCOPE section
+    lines.extend(render_accordion_section(
+        "SCOPE",
+        AccordionSection::Scope,
+        &expanded,
+        plan.scope_text.as_deref().unwrap_or("(no SCOPE.md)"),
+    ));
+    lines.push(Line::from(""));
+
+    // ARCHITECTURE section
+    lines.extend(render_accordion_section(
+        "ARCHITECTURE",
+        AccordionSection::Architecture,
+        &expanded,
+        plan.architecture_text
+            .as_deref()
+            .unwrap_or("(no ARCHITECTURE.md)"),
+    ));
+    lines.push(Line::from(""));
+
+    // TASKS section
+    let tasks_text = format_tasks_section(&plan.tasks);
+    lines.extend(render_accordion_section(
+        "TASKS",
+        AccordionSection::Tasks,
+        &expanded,
+        &tasks_text,
+    ));
+    lines.push(Line::from(""));
+
+    // STATUS section
+    lines.extend(render_accordion_section(
+        "STATUS",
+        AccordionSection::Status,
+        &expanded,
+        plan.status_text.as_deref().unwrap_or("(no STATUS.md)"),
+    ));
+    lines.push(Line::from(""));
+
+    // Footer help text
     lines.push(Line::from(Span::styled(
-        "  [Enter] close   [→] expand in tree   [o] open a task-list to run",
+        "  [s] scope  [a] arch  [t] tasks  [z] status  [◄] [►] tabs  [Ctrl+W] close",
         Style::default().fg(Color::DarkGray),
     )));
 
-    // Clamp scroll so the footer stays visible when a long plan overflows.
+    // Clamp scroll so the footer stays visible
     let total = lines.len() as u16;
     let scroll = total.saturating_sub(area.height);
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(para, area);
+}
+
+/// Render a single accordion section (SCOPE, ARCHITECTURE, TASKS, or STATUS).
+///
+/// Returns a Vec<Line> containing the header (expanded/collapsed marker) and,
+/// if expanded, the content lines with proper indentation.
+#[allow(dead_code)]
+fn render_accordion_section(
+    title: &str,
+    section: AccordionSection,
+    expanded_set: &HashSet<AccordionSection>,
+    content: &str,
+) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    let is_expanded = expanded_set.contains(&section);
+    let marker = if is_expanded { "[-]" } else { "[+]" };
+
+    // Section header
+    result.push(Line::from(vec![
+        Span::styled(
+            marker,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Content (if expanded)
+    if is_expanded {
+        result.push(Line::from(""));
+        for line in content.lines() {
+            result.push(Line::from(format!("  {line}")));
+        }
+    }
+
+    result
+}
+
+/// Format the tasks section content: task list with GATED markers and dependencies.
+#[allow(dead_code)]
+fn format_tasks_section(tasks: &[makina_core::orchestrator::PlanTaskPreview]) -> String {
+    if tasks.is_empty() {
+        return "(no tasks)".to_string();
+    }
+    let mut text = format!("Tasks ({})", tasks.len());
+    let gated = tasks.iter().filter(|t| t.gated).count();
+    if gated > 0 {
+        text.push_str(&format!("  · {} gated", gated));
+    }
+    text.push('\n');
+    text.push('\n');
+    for (i, t) in tasks.iter().enumerate() {
+        text.push_str(&format!("  {}. ", i + 1));
+        text.push_str(&t.id);
+        text.push_str(&format!(" — {}", t.title));
+        if t.gated {
+            text.push_str("  GATED");
+        }
+        text.push('\n');
+        if !t.depends_on.is_empty() {
+            text.push_str(&format!("     depends on: {}", t.depends_on.join(", ")));
+            text.push('\n');
+        }
+    }
+    text
 }
 
 // ── Error pane (collapsible) ──────────────────────────────────────────────────
@@ -2626,6 +2738,9 @@ mod tests {
                 gated: false,
                 depends_on: Vec::new(),
             }],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
         }];
 
         terminal.draw(|f| render(&app, f)).unwrap();
@@ -2661,6 +2776,9 @@ mod tests {
                     depends_on: vec!["cargo-scaffold".to_string()],
                 },
             ],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
         }];
         app.tree_cursor = Some(0);
         app.collapsed_plans.insert(0); // PlansDiscovered seeds this in the real flow
@@ -2681,9 +2799,9 @@ mod tests {
         );
     }
 
-    /// Enter on a plan opens a detail pane in the main area listing its tasks.
+    /// Enter on a plan opens a plan tab (plan 0032) that renders with accordion sections.
     #[test]
-    fn render_plan_detail_pane_lists_tasks() {
+    fn render_plan_accordion_pane_lists_tasks() {
         let mut terminal = make_terminal(100, 26);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
@@ -2697,21 +2815,36 @@ mod tests {
                 gated: true,
                 depends_on: vec!["task-model".to_string()],
             }],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
         }];
         app.tree_cursor = Some(0);
-        app.update(crate::app::AppEvent::OpenPlanDetail { plan_idx: 0 });
+        // Open a plan tab for this plan (plan 0032).
+        app.update(crate::app::AppEvent::OpenTab(
+            crate::app::TabContent::Plan {
+                plan_slug: "0001-initial".to_string(),
+            },
+        ));
 
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
+        assert!(screen.contains("Plan: 0001-initial"), "plan header missing");
+        // Sections are collapsed by default, so we expand TASKS to see the task list
+        app.accordion_state
+            .entry("0001-initial".to_string())
+            .or_default()
+            .insert(crate::app::AccordionSection::Tasks);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
         assert!(
-            screen.contains("Plan: 0001-initial"),
-            "detail header missing"
+            screen.contains("json-store"),
+            "expanded TASKS section must list the task"
         );
-        assert!(screen.contains("json-store"), "detail must list the task");
         assert!(screen.contains("GATED"), "gated marker must show");
         assert!(
             screen.contains("depends on: task-model"),
-            "detail must show dependencies; screen:\n{screen}"
+            "plan must show dependencies; screen:\n{screen}"
         );
     }
 
@@ -6166,6 +6299,191 @@ mod tests {
         assert!(
             screen.contains("100") || screen.contains("40"),
             "header must show token counts when usage is present; got:\n{screen}"
+        );
+    }
+
+    // ── Render: accordion pane ────────────────────────────────────────────────
+
+    /// Calling `render_plan_accordion_pane` with a `PlanEntry` whose sections
+    /// contain many lines of text (more than the terminal height) must not panic,
+    /// the scroll clamp must keep the offset within `[0, total_lines - height]`,
+    /// and the expanded-section markers (`[-] SCOPE`, `[-] TASKS`, etc.) must
+    /// appear in the rendered output.
+    #[test]
+    fn render_plan_accordion_pane_long_content_no_panic_and_scroll_clamps() {
+        // Use a small terminal so the content overflows and scroll clamping fires.
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        // Build a PlanEntry with long scope content (30 lines — more than the 10-row terminal).
+        let long_scope: String = (1..=30)
+            .map(|i| format!("Scope line {i}: some content about the plan scope.\n"))
+            .collect();
+        let plan = makina_core::orchestrator::PlanEntry {
+            slug: "0032-test".to_string(),
+            dir: PathBuf::from("docs/plans/0032-test"),
+            has_tasks: true,
+            tasks: vec![
+                makina_core::orchestrator::PlanTaskPreview {
+                    id: "task-alpha".to_string(),
+                    title: "Alpha task".to_string(),
+                    gated: false,
+                    depends_on: vec![],
+                },
+                makina_core::orchestrator::PlanTaskPreview {
+                    id: "task-beta".to_string(),
+                    title: "Beta task (GATED)".to_string(),
+                    gated: true,
+                    depends_on: vec!["task-alpha".to_string()],
+                },
+            ],
+            scope_text: Some(long_scope),
+            architecture_text: Some("Architecture overview.".to_string()),
+            status_text: Some("In progress.".to_string()),
+        };
+
+        // Expand all four sections so every render path is exercised.
+        {
+            let sections = app
+                .accordion_state
+                .entry("0032-test".to_string())
+                .or_default();
+            sections.insert(AccordionSection::Scope);
+            sections.insert(AccordionSection::Architecture);
+            sections.insert(AccordionSection::Tasks);
+            sections.insert(AccordionSection::Status);
+        }
+
+        // Draw directly using the accordion renderer — must not panic.
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_plan_accordion_pane(&app, &plan, frame, area);
+            })
+            .expect("render_plan_accordion_pane must not panic with long content");
+
+        let screen = screen_of(&terminal);
+
+        // Expanded-section markers must appear in the rendered output.
+        assert!(
+            screen.contains("[-]"),
+            "at least one expanded section marker '[-]' must appear; screen:\n{screen}"
+        );
+
+        // Now test with an even smaller terminal (height = 3) — scroll clamping
+        // must still not panic (the content vastly overflows the area).
+        let mut tiny_terminal = make_terminal(80, 3);
+        tiny_terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_plan_accordion_pane(&app, &plan, frame, area);
+            })
+            .expect("render_plan_accordion_pane must not panic on very small terminal");
+    }
+
+    /// Calling `render_plan_accordion_pane` with all sections collapsed
+    /// (no entries in `accordion_state`) renders collapsed `[+]` markers
+    /// and no section content.  When a section is then expanded and the
+    /// content is `None`, the placeholder `(no ARCHITECTURE.md)` appears.
+    #[test]
+    fn render_plan_accordion_pane_collapsed_shows_plus_markers() {
+        let mut terminal = make_terminal(80, 20);
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan = makina_core::orchestrator::PlanEntry {
+            slug: "0032-collapsed".to_string(),
+            dir: PathBuf::from("docs/plans/0032-collapsed"),
+            has_tasks: false,
+            tasks: vec![],
+            scope_text: Some("Some scope content.".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+
+        // No accordion_state entry — all sections default to collapsed.
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_plan_accordion_pane(&app, &plan, frame, area);
+            })
+            .expect("render_plan_accordion_pane must not panic when all sections are collapsed");
+
+        let screen = screen_of(&terminal);
+
+        // Collapsed markers appear; content lines do not.
+        assert!(
+            screen.contains("[+]"),
+            "collapsed sections must show '[+]' markers; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Some scope content"),
+            "collapsed SCOPE section must not render its content; screen:\n{screen}"
+        );
+    }
+
+    /// When ARCHITECTURE is expanded but its content is `None`, the placeholder
+    /// `(no ARCHITECTURE.md)` must appear in the rendered output.
+    #[test]
+    fn render_plan_accordion_pane_missing_content_shows_placeholder() {
+        let mut terminal = make_terminal(80, 20);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan = makina_core::orchestrator::PlanEntry {
+            slug: "0032-missing".to_string(),
+            dir: PathBuf::from("docs/plans/0032-missing"),
+            has_tasks: false,
+            tasks: vec![],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        };
+
+        // Expand all four sections to force placeholder rendering.
+        {
+            let sections = app
+                .accordion_state
+                .entry("0032-missing".to_string())
+                .or_default();
+            sections.insert(AccordionSection::Scope);
+            sections.insert(AccordionSection::Architecture);
+            sections.insert(AccordionSection::Tasks);
+            sections.insert(AccordionSection::Status);
+        }
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_plan_accordion_pane(&app, &plan, frame, area);
+            })
+            .expect("render_plan_accordion_pane must not panic with missing content");
+
+        let screen = screen_of(&terminal);
+
+        // Expanded markers appear.
+        assert!(
+            screen.contains("[-]"),
+            "expanded sections must show '[-]' markers; screen:\n{screen}"
+        );
+        // Placeholders for missing content appear when sections are expanded.
+        assert!(
+            screen.contains("(no SCOPE.md)"),
+            "missing SCOPE must show placeholder when expanded; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("(no ARCHITECTURE.md)"),
+            "missing ARCHITECTURE must show placeholder when expanded; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("(no STATUS.md)"),
+            "missing STATUS must show placeholder when expanded; screen:\n{screen}"
+        );
+        // Tasks placeholder when empty.
+        assert!(
+            screen.contains("(no tasks)"),
+            "empty tasks must show placeholder when expanded; screen:\n{screen}"
         );
     }
 }

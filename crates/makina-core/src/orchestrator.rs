@@ -221,6 +221,12 @@ pub struct PlanEntry {
     /// no `TASKS.md` or it parses to zero tasks). Read-only preview data — the
     /// authoritative task graph is still built by `OpenRun`'s interpreter.
     pub tasks: Vec<PlanTaskPreview>,
+    /// SCOPE.md content (cached at discovery time; None if unreadable or absent).
+    pub scope_text: Option<String>,
+    /// ARCHITECTURE.md content (cached at discovery time; None if unreadable or absent).
+    pub architecture_text: Option<String>,
+    /// STATUS.md content (cached at discovery time; None if unreadable or absent).
+    pub status_text: Option<String>,
 }
 
 /// Parse a plan's `TASKS.md` text into its tasks IN FILE ORDER, mirroring the
@@ -383,6 +389,11 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
         } else {
             Vec::new()
         };
+        // Read the three spec files (SCOPE.md, ARCHITECTURE.md, STATUS.md),
+        // converting read errors to None.
+        let scope_text = std::fs::read_to_string(dir.join("SCOPE.md")).ok();
+        let architecture_text = std::fs::read_to_string(dir.join("ARCHITECTURE.md")).ok();
+        let status_text = std::fs::read_to_string(dir.join("STATUS.md")).ok();
         // Slug is exactly what plan_slug derives from this dir's TASKS.md path,
         // whether or not the file exists (plan_slug keys off the parent dir name).
         let slug = plan_slug(&tasks_path);
@@ -391,6 +402,9 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
             slug,
             has_tasks,
             tasks,
+            scope_text,
+            architecture_text,
+            status_text,
         });
     }
     entries.sort_by(|a, b| a.dir.file_name().cmp(&b.dir.file_name()));
@@ -4832,6 +4846,73 @@ Description text that is long enough for parser.
         let empty_tmp = tempfile::TempDir::new().expect("create temp dir");
         let entries = discover_plans(empty_tmp.path());
         assert_eq!(entries, vec![]);
+    }
+
+    #[test]
+    fn discover_plans_caches_spec_content_when_present() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plans_dir = tmp.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
+
+        let plan_0001 = plans_dir.join("0001-x");
+        std::fs::create_dir(&plan_0001).expect("create 0001-x");
+        std::fs::write(plan_0001.join("SCOPE.md"), "Scope content here").expect("write SCOPE.md");
+        std::fs::write(
+            plan_0001.join("ARCHITECTURE.md"),
+            "Architecture content here",
+        )
+        .expect("write ARCHITECTURE.md");
+        std::fs::write(plan_0001.join("STATUS.md"), "Status: complete").expect("write STATUS.md");
+
+        let entries = discover_plans(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].scope_text,
+            Some("Scope content here".to_string()),
+            "scope_text should contain SCOPE.md content"
+        );
+        assert_eq!(
+            entries[0].architecture_text,
+            Some("Architecture content here".to_string()),
+            "architecture_text should contain ARCHITECTURE.md content"
+        );
+        assert_eq!(
+            entries[0].status_text,
+            Some("Status: complete".to_string()),
+            "status_text should contain STATUS.md content"
+        );
+    }
+
+    #[test]
+    fn discover_plans_uses_none_for_missing_spec_files() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plans_dir = tmp.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
+
+        let plan_0001 = plans_dir.join("0001-x");
+        std::fs::create_dir(&plan_0001).expect("create 0001-x");
+        // Only create SCOPE.md and ARCHITECTURE.md (required by convention gate)
+        std::fs::write(plan_0001.join("SCOPE.md"), "Scope content").expect("write SCOPE.md");
+        std::fs::write(plan_0001.join("ARCHITECTURE.md"), "Architecture content")
+            .expect("write ARCHITECTURE.md");
+        // Intentionally don't create STATUS.md
+
+        let entries = discover_plans(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].scope_text,
+            Some("Scope content".to_string()),
+            "scope_text should be populated"
+        );
+        assert_eq!(
+            entries[0].architecture_text,
+            Some("Architecture content".to_string()),
+            "architecture_text should be populated"
+        );
+        assert_eq!(
+            entries[0].status_text, None,
+            "status_text should be None when STATUS.md is missing"
+        );
     }
 
     // ── planner-generate-on-open tests ───────────────────────────────────────

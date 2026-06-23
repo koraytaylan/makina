@@ -701,13 +701,9 @@ pub enum AppEvent {
     ///
     /// User pressed Enter on a `TreeNode`. The IO layer resolves this by
     /// examining the focused node and dispatching the appropriate event: a plan
-    /// (or plan-task) node resolves to [`AppEvent::OpenPlanDetail`]; a run's task
+    /// (or plan-task) node opens a plan tab via [`AppEvent::OpenTab`]; a run's task
     /// node resolves to [`AppEvent::OpenTab`].
     OpenFocusedNode,
-
-    /// Show the read-only detail pane for `discovered_plans[plan_idx]` in the
-    /// main area (Enter on a plan node). Sets [`App::plan_detail`].
-    OpenPlanDetail { plan_idx: usize },
 
     // ── Provider configuration editor (task 0041) ──────────────────────────────
     /// User requested to open the provider configuration editor (e.g. pressed `g`).
@@ -824,6 +820,11 @@ pub enum AppEvent {
     /// Switch to the previous tab (or wrap to the last).
     PrevTab,
 
+    // ── Accordion sections (plan 0032) ───────────────────────────────────────
+    /// Toggle the accordion section for the active plan tab.
+    /// Only applies if the active tab is a plan tab; otherwise it is a no-op.
+    ToggleAccordionSection(AccordionSection),
+
     // ── Placeholder stubs for forward-referenced plans ────────────────────────
     /// User requested to retry the focused task (plan 0017).
     RetryFocusedTask,
@@ -928,6 +929,19 @@ impl Default for TabState {
     }
 }
 
+/// Accordion section identifier for plan tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccordionSection {
+    /// SCOPE.md section
+    Scope,
+    /// ARCHITECTURE.md section
+    Architecture,
+    /// TASKS.md section (with GATED/dependency markers)
+    Tasks,
+    /// STATUS.md section
+    Status,
+}
+
 /// All mutable TUI state.
 ///
 /// # Arc<dyn Api>
@@ -1005,11 +1019,6 @@ pub struct App {
     /// Plans start collapsed: every discovered index is inserted on
     /// [`AppEvent::PlansDiscovered`].
     pub collapsed_plans: HashSet<usize>,
-
-    /// The plan whose read-only detail pane is shown in the main area, keyed by
-    /// index into `discovered_plans`. Set by pressing Enter on a plan node
-    /// ([`AppEvent::OpenPlanDetail`]); cleared when a run/task node is focused.
-    pub plan_detail: Option<usize>,
 
     /// Index into `visible_tree_nodes()` of the focused sidebar node.
     /// `None` when no runs are open.
@@ -1164,6 +1173,11 @@ pub struct App {
     /// State for the tabbed main content pane.
     pub tabs: TabState,
 
+    /// Accordion expand/collapse state for plan tabs.
+    /// Keyed by plan slug; the set contains sections that are expanded.
+    /// Sections not in the set are collapsed. All sections default to collapsed.
+    pub accordion_state: HashMap<String, HashSet<AccordionSection>>,
+
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
     /// Whether verbose mode is currently on.
     ///
@@ -1262,33 +1276,54 @@ impl App {
             }
             Some(TreeNode::Run { run }) => {
                 self.selected_run = Some(run);
-                // Focusing a run leaves plan-land: drop any open plan detail so
-                // the run view takes the main pane.
-                self.plan_detail = None;
                 // Note: selected_task is no longer updated by sidebar navigation
                 // (plan 0031). Tabs manage task focus independently.
+                // Tab state is independent from sidebar navigation (plan 0031).
             }
             Some(TreeNode::Task { run, .. }) => {
                 // When navigating to a task node, update the selected run but NOT
                 // the selected task. Task focus is now managed by the tab system
                 // (plan 0031), not by sidebar cursor movement.
                 self.selected_run = Some(run);
-                self.plan_detail = None;
+                // Tab state is independent from sidebar navigation (plan 0031).
             }
-            Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
+            Some(TreeNode::Plan { plan_idx: _ }) | Some(TreeNode::PlanTask { plan_idx: _, .. }) => {
                 // Plan / plan-task nodes have no associated run.
                 self.selected_run = None;
-                // The detail pane only shows the plan the user explicitly opened
-                // (via Enter). Moving onto a *different* plan closes the stale
-                // detail; moving among the opened plan's own tasks keeps it.
-                if self.plan_detail != Some(plan_idx) {
-                    self.plan_detail = None;
-                }
+                // Tab state is independent from sidebar navigation (plan 0031).
             }
         }
         // Load exchanges if the run changed.
         if self.selected_run != prev_run {
             self.load_exchanges_for_selected_run();
+        }
+    }
+
+    /// Close plan tabs whose slug is no longer in `discovered_plans` (plan 0032).
+    /// Called when plans are re-discovered and the list changes.
+    fn close_tabs_for_missing_plans(&mut self) {
+        let valid_plans: std::collections::HashSet<_> = self
+            .discovered_plans
+            .iter()
+            .map(|p| p.slug.clone())
+            .collect();
+        let mut indices_to_close = Vec::new();
+        let mut slugs_to_remove = Vec::new();
+        for (idx, tab) in self.tabs.open_tabs.iter().enumerate() {
+            if let TabContent::Plan { plan_slug } = tab
+                && !valid_plans.contains(plan_slug)
+            {
+                indices_to_close.push(idx);
+                slugs_to_remove.push(plan_slug.clone());
+            }
+        }
+        // Close tabs in reverse order so indices don't shift.
+        for idx in indices_to_close.iter().rev() {
+            self.tabs.close_tab(*idx);
+        }
+        // Clean up accordion state for removed plans.
+        for slug in slugs_to_remove {
+            self.accordion_state.remove(&slug);
         }
     }
 
@@ -1414,7 +1449,6 @@ impl App {
             selected_task,
             collapsed_runs: HashSet::new(),
             collapsed_plans: HashSet::new(),
-            plan_detail: None,
             tree_cursor,
             exchange_logs: HashMap::new(),
             task_last_activity_tick: HashMap::new(),
@@ -1447,6 +1481,7 @@ impl App {
             role_metrics: HashMap::new(),
             discovered_plans: Vec::new(),
             tabs: TabState::new(),
+            accordion_state: HashMap::new(),
             selection: None,
             selection_panes: std::cell::RefCell::new(Vec::new()),
         }
@@ -1945,10 +1980,9 @@ impl App {
                 // so the tree opens tidy and Right/Space/Enter reveal the tasks.
                 // (This also resets any prior expand state on a re-discovery.)
                 self.collapsed_plans = (0..self.discovered_plans.len()).collect();
-                // `discover_plans` sorts by directory name, so a re-discovery can
-                // shift indices. Drop any open plan detail rather than risk showing
-                // a *different* plan at the same index.
-                self.plan_detail = None;
+                // Close plan tabs whose slug is no longer in `discovered_plans`
+                // (plan 0032: close_tabs_for_missing_plans).
+                self.close_tabs_for_missing_plans();
                 // Keep the tree cursor valid against the freshly rebuilt node list
                 // and resync the derived selection — mirrors the RunLoaded invariant
                 // (`cursor_survives_runs_update`). On the common first-discovery path
@@ -1963,17 +1997,6 @@ impl App {
                 self.sync_selection_from_cursor();
                 self.status_message = None;
                 self.busy = None;
-                true
-            }
-
-            AppEvent::OpenPlanDetail { plan_idx } => {
-                // Enter on a plan node toggles its read-only detail pane: open it,
-                // or close it if it is already the one showing.
-                if self.plan_detail == Some(plan_idx) {
-                    self.plan_detail = None;
-                } else if plan_idx < self.discovered_plans.len() {
-                    self.plan_detail = Some(plan_idx);
-                }
                 true
             }
 
@@ -2507,6 +2530,24 @@ impl App {
                     let len = self.tabs.open_tabs.len();
                     let prev = (self.tabs.active_tab.unwrap_or(0) + len - 1) % len;
                     self.tabs.active_tab = Some(prev);
+                }
+                true
+            }
+
+            // ── Accordion sections (plan 0032) ───────────────────────────────────
+            AppEvent::ToggleAccordionSection(section) => {
+                // Only toggle if the active tab is a plan tab.
+                if let Some(active_idx) = self.tabs.active_tab
+                    && let Some(TabContent::Plan { plan_slug }) =
+                        self.tabs.open_tabs.get(active_idx)
+                {
+                    let plan_slug = plan_slug.clone();
+                    let sections = self.accordion_state.entry(plan_slug).or_default();
+                    if sections.contains(&section) {
+                        sections.remove(&section);
+                    } else {
+                        sections.insert(section);
+                    }
                 }
                 true
             }
@@ -6383,12 +6424,18 @@ mod tests {
                     plan_task("scaffold", "Scaffold"),
                     plan_task("model", "Model"),
                 ],
+                scope_text: None,
+                architecture_text: None,
+                status_text: None,
             },
             makina_core::orchestrator::PlanEntry {
                 dir: PathBuf::from("/tmp/docs/plans/0002-beta"),
                 slug: "0002-beta".to_string(),
                 has_tasks: false,
                 tasks: Vec::new(),
+                scope_text: None,
+                architecture_text: None,
+                status_text: None,
             },
         ]
     }
@@ -6434,6 +6481,9 @@ mod tests {
             slug: "0001-test".to_string(),
             has_tasks: true,
             tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
         }];
         let mut app = App::new(api, vec![], PathBuf::from("."));
         app.discovered_plans = discovered_plans;
@@ -6523,43 +6573,72 @@ mod tests {
         assert_eq!(app.visible_tree_nodes().len(), 2, "back to 2 headers");
     }
 
-    /// Enter on a plan toggles its detail pane open then closed.
+    /// Opening a plan tab via OpenTab with the same plan slug focuses the existing tab
+    /// rather than creating a duplicate (plan 0032).
     #[test]
-    fn open_plan_detail_toggles() {
+    fn open_plan_tab_deduplicates_by_slug() {
         let mut app = make_app();
         app.update(AppEvent::PlansDiscovered {
             plans: make_plan_entries(),
         });
-        assert_eq!(app.plan_detail, None);
-        app.update(AppEvent::OpenPlanDetail { plan_idx: 0 });
-        assert_eq!(app.plan_detail, Some(0));
-        app.update(AppEvent::OpenPlanDetail { plan_idx: 0 });
-        assert_eq!(app.plan_detail, None, "Enter again closes the detail");
+        assert_eq!(app.tabs.open_tabs.len(), 0, "no tabs initially");
+
+        // Open a plan tab
+        app.update(AppEvent::OpenTab(TabContent::Plan {
+            plan_slug: "0001-alpha".to_string(),
+        }));
+        assert_eq!(app.tabs.open_tabs.len(), 1, "one tab opened");
+        assert_eq!(app.tabs.active_tab, Some(0), "tab is active");
+        assert!(matches!(
+            &app.tabs.open_tabs[0],
+            TabContent::Plan { plan_slug } if plan_slug == "0001-alpha"
+        ));
+
+        // Open the same plan tab again — should focus the existing tab, not create a duplicate
+        // (this is the "open if closed, focus if open" contract from plan 0031).
+        app.update(AppEvent::OpenTab(TabContent::Plan {
+            plan_slug: "0001-alpha".to_string(),
+        }));
+        assert_eq!(
+            app.tabs.open_tabs.len(),
+            1,
+            "still only one tab (not duplicated)"
+        );
+        assert_eq!(
+            app.tabs.active_tab,
+            Some(0),
+            "the existing tab is still focused"
+        );
     }
 
     /// A re-discovery (e.g. pressing `[o]` again) must not leave the cursor
-    /// pointing past the rebuilt, all-collapsed node list, and must drop a stale
-    /// `plan_detail` whose index could now resolve to a different plan.
+    /// pointing past the rebuilt, all-collapsed node list. Plan tabs are closed
+    /// if their plan slug no longer exists (plan 0032).
     #[test]
-    fn re_discovery_clamps_cursor_and_clears_plan_detail() {
+    fn re_discovery_clamps_cursor_and_closes_missing_plan_tabs() {
         let mut app = make_app();
         app.update(AppEvent::PlansDiscovered {
             plans: make_plan_entries(),
         });
         // Expand alpha (2 task children) and park the cursor on its last task, then
-        // open a plan detail — i.e. a cursor index only valid while expanded.
+        // open a plan tab for beta.
         app.update(AppEvent::FocusRightOrExpand);
         app.tree_cursor = Some(2); // alpha's second PlanTask
-        app.update(AppEvent::OpenPlanDetail { plan_idx: 1 });
-        assert_eq!(app.plan_detail, Some(1));
+        app.update(AppEvent::OpenTab(TabContent::Plan {
+            plan_slug: "0001-beta".to_string(),
+        }));
+        assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab is open");
+        assert!(matches!(
+            &app.tabs.open_tabs[0],
+            TabContent::Plan { plan_slug } if plan_slug == "0001-beta"
+        ));
 
-        // Re-discover the same plans: tree collapses to 2 header rows.
-        app.update(AppEvent::PlansDiscovered {
-            plans: make_plan_entries(),
-        });
+        // Re-discover with only the alpha plan (beta is gone).
+        let alpha_only = vec![make_plan_entries()[0].clone()];
+        app.update(AppEvent::PlansDiscovered { plans: alpha_only });
 
         let n = app.visible_tree_nodes().len();
-        assert_eq!(n, 2, "both plans collapsed again");
+        assert_eq!(n, 1, "only alpha plan visible");
         let cursor = app.tree_cursor.expect("cursor must remain set");
         assert!(cursor < n, "cursor {cursor} must be within {n} nodes");
         assert!(
@@ -6567,8 +6646,9 @@ mod tests {
             "focused_node must resolve after re-discovery"
         );
         assert_eq!(
-            app.plan_detail, None,
-            "stale plan detail must be cleared on re-discovery"
+            app.tabs.open_tabs.len(),
+            0,
+            "plan tab for missing beta is closed"
         );
     }
 
@@ -6586,6 +6666,9 @@ mod tests {
             slug: "0001-test".to_string(),
             has_tasks: true,
             tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
         }];
 
         let mut app = App::new(api.clone(), vec![], PathBuf::from("."));
@@ -6681,5 +6764,283 @@ mod tests {
         state.close_tab(0);
         assert_eq!(state.open_tabs.len(), 1);
         assert_eq!(state.active_tab, Some(0)); // Still valid (now points to second tab)
+    }
+
+    // ── Accordion state tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn accordion_toggle_inserts_when_absent() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        // Verify accordion_state is initially empty
+        assert!(app.accordion_state.is_empty());
+
+        // Open a plan tab
+        let plan_slug = "0001-test".to_string();
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+
+        // Set active tab to the plan tab we just opened
+        app.tabs.active_tab = Some(0);
+
+        // Dispatch ToggleAccordionSection event for SCOPE (should insert it)
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
+
+        // Verify the section is now expanded
+        assert!(
+            app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Scope)),
+            "SCOPE should be expanded after toggle"
+        );
+    }
+
+    #[test]
+    fn accordion_toggle_removes_when_present() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan_slug = "0001-test".to_string();
+
+        // Open a plan tab and set it as active
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Insert SCOPE into accordion_state by dispatching toggle event
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
+
+        // Verify SCOPE is expanded
+        assert!(
+            app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Scope))
+        );
+
+        // Toggle SCOPE again (should remove it)
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
+
+        // Verify SCOPE is now collapsed (not in the set)
+        assert!(
+            !app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Scope)),
+            "SCOPE should be collapsed after toggle"
+        );
+    }
+
+    #[test]
+    fn accordion_toggle_noop_when_no_plan_tab_active() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        // No tabs open, so active_tab is None
+        assert!(app.tabs.active_tab.is_none());
+
+        // Dispatch ToggleAccordionSection event
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
+
+        // Verify accordion_state remains empty (no-op)
+        assert!(app.accordion_state.is_empty());
+    }
+
+    #[test]
+    fn accordion_toggle_noop_when_task_tab_active() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        // Open a task tab
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "0001-test".to_string(),
+            task_id: TaskId::new("task-1".to_string()),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Dispatch ToggleAccordionSection event
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
+
+        // Verify accordion_state remains empty (no-op because active tab is a task, not plan)
+        assert!(app.accordion_state.is_empty());
+    }
+
+    #[test]
+    fn accordion_multiple_sections() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan_slug = "0001-test".to_string();
+
+        // Open a plan tab
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Expand multiple sections using the event handler
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Tasks));
+
+        // Verify both are expanded
+        let expanded = &app.accordion_state[&plan_slug];
+        assert!(expanded.contains(&AccordionSection::Scope));
+        assert!(expanded.contains(&AccordionSection::Tasks));
+        assert!(!expanded.contains(&AccordionSection::Architecture));
+        assert!(!expanded.contains(&AccordionSection::Status));
+    }
+
+    #[test]
+    fn accordion_sections_persist_per_tab() {
+        let api = Arc::new(PlaceholderApi::new());
+        let plan1 = makina_core::orchestrator::PlanEntry {
+            slug: "0001-test".to_string(),
+            dir: PathBuf::from("docs/plans/0001"),
+            has_tasks: true,
+            tasks: vec![],
+            scope_text: Some("Scope for plan 1.".to_string()),
+            architecture_text: Some("Architecture for plan 1.".to_string()),
+            status_text: Some("Status for plan 1.".to_string()),
+        };
+        let plan2 = makina_core::orchestrator::PlanEntry {
+            slug: "0002-test".to_string(),
+            dir: PathBuf::from("docs/plans/0002"),
+            has_tasks: true,
+            tasks: vec![],
+            scope_text: Some("Scope for plan 2.".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.discovered_plans = vec![plan1, plan2];
+
+        // Open first plan tab and expand SCOPE
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0001-test".to_string(),
+        });
+        app.accordion_state
+            .entry("0001-test".to_string())
+            .or_default()
+            .insert(AccordionSection::Scope);
+
+        // Open second plan tab and expand TASKS
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0002-test".to_string(),
+        });
+        app.accordion_state
+            .entry("0002-test".to_string())
+            .or_default()
+            .insert(AccordionSection::Tasks);
+
+        // Switch back to first tab
+        app.tabs.active_tab = Some(0);
+
+        // Verify first tab's state is preserved
+        assert!(
+            app.accordion_state
+                .get("0001-test")
+                .map(|s| s.contains(&AccordionSection::Scope))
+                .unwrap_or(false),
+            "Plan 1's SCOPE should remain expanded"
+        );
+        assert!(
+            !app.accordion_state
+                .get("0001-test")
+                .map(|s| s.contains(&AccordionSection::Tasks))
+                .unwrap_or(true),
+            "Plan 1's TASKS should remain collapsed"
+        );
+
+        // Switch to second tab and verify its state
+        app.tabs.active_tab = Some(1);
+        assert!(
+            app.accordion_state
+                .get("0002-test")
+                .map(|s| s.contains(&AccordionSection::Tasks))
+                .unwrap_or(false),
+            "Plan 2's TASKS should remain expanded"
+        );
+    }
+
+    #[test]
+    fn rediscovery_cleans_up_accordion_state_for_removed_plans() {
+        let api = Arc::new(PlaceholderApi::new());
+        let plan_alpha = makina_core::orchestrator::PlanEntry {
+            slug: "0001-alpha".to_string(),
+            dir: PathBuf::from("docs/plans/0001"),
+            has_tasks: true,
+            tasks: vec![],
+            scope_text: Some("Alpha scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        let plan_beta = makina_core::orchestrator::PlanEntry {
+            slug: "0002-beta".to_string(),
+            dir: PathBuf::from("docs/plans/0002"),
+            has_tasks: true,
+            tasks: vec![],
+            scope_text: Some("Beta scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.discovered_plans = vec![plan_alpha, plan_beta];
+
+        // Open both plan tabs and expand different sections
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0001-alpha".to_string(),
+        });
+        app.accordion_state
+            .entry("0001-alpha".to_string())
+            .or_default()
+            .insert(AccordionSection::Scope);
+
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0002-beta".to_string(),
+        });
+        app.accordion_state
+            .entry("0002-beta".to_string())
+            .or_default()
+            .insert(AccordionSection::Architecture);
+
+        // Verify both accordion states exist
+        assert!(app.accordion_state.contains_key("0001-alpha"));
+        assert!(app.accordion_state.contains_key("0002-beta"));
+        assert_eq!(app.accordion_state.len(), 2);
+
+        // Re-discover with only alpha (beta is removed)
+        let alpha_only = vec![makina_core::orchestrator::PlanEntry {
+            slug: "0001-alpha".to_string(),
+            dir: PathBuf::from("docs/plans/0001"),
+            has_tasks: true,
+            tasks: vec![],
+            scope_text: Some("Alpha scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.update(AppEvent::PlansDiscovered { plans: alpha_only });
+
+        // Verify beta's accordion state is cleaned up, but alpha's remains
+        assert!(
+            app.accordion_state.contains_key("0001-alpha"),
+            "Alpha accordion state should remain"
+        );
+        assert!(
+            !app.accordion_state.contains_key("0002-beta"),
+            "Beta accordion state should be removed"
+        );
+        assert_eq!(
+            app.accordion_state.len(),
+            1,
+            "Should have only one accordion state left"
+        );
+        assert!(
+            app.accordion_state
+                .get("0001-alpha")
+                .map(|s| s.contains(&AccordionSection::Scope))
+                .unwrap_or(false),
+            "Alpha's SCOPE should still be expanded"
+        );
     }
 }

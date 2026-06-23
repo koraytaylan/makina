@@ -143,7 +143,13 @@ pub async fn run(
             biased;
 
             maybe_term = term_rx.recv() => {
-                maybe_term.map(|ev| translate_terminal_event(ev, modal, app.focused_panel))
+                maybe_term.map(|ev| {
+                    // Check if a plan tab is currently active
+                    let plan_tab_active = app.tabs.active_tab
+                        .and_then(|idx| app.tabs.open_tabs.get(idx))
+                        .is_some_and(|content| matches!(content, crate::app::TabContent::Plan { .. }));
+                    translate_terminal_event(ev, modal, app.focused_panel, plan_tab_active)
+                })
 
             }
 
@@ -401,14 +407,15 @@ async fn resolve_io(
         }
         // ── Open focused node (plan 0031) ────────────────────────────────────────
         // User pressed Enter on a focused node in the sidebar. A plan (or one of
-        // its task previews) opens the read-only plan detail pane; a run's task
-        // node opens a new tab.
+        // its task previews) opens a plan tab via the tab infrastructure (plan 0032);
+        // a run's task node opens a new tab.
         AppEvent::OpenFocusedNode => {
             use crate::app::{TabContent, TreeNode};
             match app.focused_node() {
                 Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
                     if plan_idx < app.discovered_plans.len() {
-                        (AppEvent::OpenPlanDetail { plan_idx }, None)
+                        let plan_slug = app.discovered_plans[plan_idx].slug.clone();
+                        (AppEvent::OpenTab(TabContent::Plan { plan_slug }), None)
                     } else {
                         (AppEvent::Tick, Some("Plan not found".to_string()))
                     }
@@ -1066,7 +1073,8 @@ struct ModalState {
 /// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
 ///
 /// `modal` bundles which overlay is active; `focused_panel` determines whether
-/// Space emits `ToggleTreeNode` (sidebar only).
+/// Space emits `ToggleTreeNode` (sidebar only); `plan_tab_active` indicates
+/// whether a plan tab is currently active (used for accordion toggle keybindings).
 ///
 /// Returns [`AppEvent::Tick`] for events the TUI doesn't handle (e.g. mouse
 /// events); those simply trigger a harmless redraw.
@@ -1074,9 +1082,10 @@ fn translate_terminal_event(
     ev: CrosstermEvent,
     modal: ModalState,
     focused_panel: crate::app::Panel,
+    plan_tab_active: bool,
 ) -> AppEvent {
     match ev {
-        CrosstermEvent::Key(key) => translate_key(key, modal, focused_panel),
+        CrosstermEvent::Key(key) => translate_key(key, modal, focused_panel, plan_tab_active),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
         // `browsing` flag (the exchange pane is not the browser).
@@ -1099,10 +1108,15 @@ fn translate_terminal_event(
 }
 
 /// Translate a key press into an [`AppEvent`], honouring the current view mode.
+///
+/// `plan_tab_active` indicates whether a plan tab is currently active; when true,
+/// the 's', 'a', 't', and 'z' keys dispatch accordion toggle events instead of
+/// run-control commands (while the main pane is focused).
 fn translate_key(
     key: crossterm::event::KeyEvent,
     modal: ModalState,
     focused_panel: crate::app::Panel,
+    plan_tab_active: bool,
 ) -> AppEvent {
     let ModalState {
         browsing,
@@ -1185,6 +1199,8 @@ fn translate_key(
         }
     } else {
         // ── Normal keymap ────────────────────────────────────────────────────
+        use crate::app::Panel;
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::Quit,
             KeyCode::Esc => AppEvent::Quit,
@@ -1206,10 +1222,41 @@ fn translate_key(
             KeyCode::Char('g') | KeyCode::Char('G') => AppEvent::OpenProviderEditor,
             // Open the doctor health-check overlay.
             KeyCode::Char('?') => AppEvent::OpenDoctor,
+            // ── Accordion toggles (plan 0032) ────────────────────────────────────
+            // s/a/t/z toggle accordion sections when the main pane is focused and
+            // a plan tab is active. Otherwise, these fall back to run-control keys.
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                if focused_panel == Panel::Main && plan_tab_active {
+                    AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Scope)
+                } else {
+                    AppEvent::StartRun
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if focused_panel == Panel::Main && plan_tab_active {
+                    AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Architecture)
+                } else {
+                    AppEvent::Tick
+                }
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                if focused_panel == Panel::Main && plan_tab_active {
+                    AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Tasks)
+                } else {
+                    AppEvent::Tick
+                }
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') => {
+                if focused_panel == Panel::Main && plan_tab_active {
+                    AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Status)
+                } else {
+                    AppEvent::Tick
+                }
+            }
             // ── Run control (task 31): act on the selected Run ────────────────
-            // s = Start/resume, p = Pause, c = Cancel.  These are intents; the IO
-            // layer resolves them into the async `api.execute(...)` call.
-            KeyCode::Char('s') | KeyCode::Char('S') => AppEvent::StartRun,
+            // p = Pause, c = Cancel.  These are intents; the IO layer resolves
+            // them into the async `api.execute(...)` call.
+            // Note: 's' is handled above as it's overloaded with accordion toggle.
             KeyCode::Char('p') | KeyCode::Char('P') => AppEvent::PauseRun,
             KeyCode::Char('c') | KeyCode::Char('C') => AppEvent::CancelRun,
             // Context-sensitive retry (plan 0017): retry the focused failed task
@@ -1219,6 +1266,14 @@ fn translate_key(
             KeyCode::Char('r') | KeyCode::Char('R') => AppEvent::RetryFocused,
             // Dismiss the provider-missing warning banner (non-fatal; just hides it).
             KeyCode::Char('d') | KeyCode::Char('D') => AppEvent::DismissProviderWarning,
+            // ── Tab navigation (plan 0032) ────────────────────────────────────
+            // Alt+Left/Right to cycle between open tabs (must come before plain arrow keys).
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => AppEvent::PrevTab,
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => AppEvent::NextTab,
+            // Ctrl+W to close the active tab.
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                AppEvent::CloseTab
+            }
             // Sidebar navigation: arrow keys and vim-style j/k.
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
@@ -1227,21 +1282,15 @@ fn translate_key(
             // Left arrow: collapse expanded run or return focus to sidebar.
             KeyCode::Left => AppEvent::FocusLeftOrCollapse,
             // Space: toggle expand/collapse the focused tree node (sidebar focus only).
-            KeyCode::Char(' ') => {
-                use crate::app::Panel;
-                match focused_panel {
-                    Panel::Sidebar => AppEvent::ToggleTreeNode,
-                    Panel::Main => AppEvent::Tick,
-                }
-            }
+            KeyCode::Char(' ') => match focused_panel {
+                Panel::Sidebar => AppEvent::ToggleTreeNode,
+                Panel::Main => AppEvent::Tick,
+            },
             // Enter: open the focused node in the sidebar.
-            KeyCode::Enter => {
-                use crate::app::Panel;
-                match focused_panel {
-                    Panel::Sidebar => AppEvent::OpenFocusedNode,
-                    Panel::Main => AppEvent::Tick,
-                }
-            }
+            KeyCode::Enter => match focused_panel {
+                Panel::Sidebar => AppEvent::OpenFocusedNode,
+                Panel::Main => AppEvent::Tick,
+            },
             _ => AppEvent::Tick,
         }
     }
@@ -1293,7 +1342,8 @@ mod tests {
             translate_terminal_event(
                 wheel(MouseEventKind::ScrollUp),
                 ModalState::default(),
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::ScrollUp
         ));
@@ -1301,7 +1351,8 @@ mod tests {
             translate_terminal_event(
                 wheel(MouseEventKind::ScrollDown),
                 ModalState::default(),
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::ScrollDown
         ));
@@ -1325,6 +1376,7 @@ mod tests {
             mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 7),
             ModalState::default(),
             crate::app::Panel::Sidebar,
+            false,
         );
         assert!(matches!(down, AppEvent::SelectionStart(3, 7)));
 
@@ -1332,6 +1384,7 @@ mod tests {
             mouse_at(MouseEventKind::Drag(MouseButton::Left), 10, 9),
             ModalState::default(),
             crate::app::Panel::Sidebar,
+            false,
         );
         assert!(matches!(drag, AppEvent::SelectionExtend(10, 9)));
 
@@ -1339,6 +1392,7 @@ mod tests {
             mouse_at(MouseEventKind::Up(MouseButton::Left), 10, 9),
             ModalState::default(),
             crate::app::Panel::Sidebar,
+            false,
         );
         assert!(matches!(up, AppEvent::SelectionEnd(10, 9)));
     }
@@ -1351,6 +1405,7 @@ mod tests {
             mouse_at(MouseEventKind::Moved, 1, 1),
             ModalState::default(),
             crate::app::Panel::Sidebar,
+            false,
         );
         assert!(matches!(moved, AppEvent::Tick), "Moved must be a no-op");
 
@@ -1358,6 +1413,7 @@ mod tests {
             mouse_at(MouseEventKind::Down(MouseButton::Right), 1, 1),
             ModalState::default(),
             crate::app::Panel::Sidebar,
+            false,
         );
         assert!(
             matches!(right, AppEvent::Tick),
@@ -1369,7 +1425,7 @@ mod tests {
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::Quit
         ));
     }
@@ -1378,7 +1434,7 @@ mod tests {
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::Quit
         ));
     }
@@ -1387,7 +1443,7 @@ mod tests {
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::Quit
         ));
     }
@@ -1396,7 +1452,7 @@ mod tests {
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::FocusNext
         ));
     }
@@ -1407,7 +1463,8 @@ mod tests {
             translate_terminal_event(
                 key_press(KeyCode::Char('v'), KeyModifiers::NONE),
                 ModalState::default(),
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::CycleDependencyView
         ));
@@ -1419,7 +1476,8 @@ mod tests {
             translate_terminal_event(
                 key_press(KeyCode::Char('e'), KeyModifiers::NONE),
                 ModalState::default(),
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::ToggleErrorPane
         ));
@@ -1432,7 +1490,8 @@ mod tests {
             translate_terminal_event(
                 key_press(KeyCode::Char('r'), KeyModifiers::NONE),
                 ModalState::default(),
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::RetryFocused
         ));
@@ -1449,7 +1508,7 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::Tick
         ));
     }
@@ -1458,7 +1517,7 @@ mod tests {
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -1467,7 +1526,7 @@ mod tests {
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::SelectUp
         ));
     }
@@ -1476,7 +1535,7 @@ mod tests {
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::SelectDown
         ));
     }
@@ -1485,7 +1544,7 @@ mod tests {
     fn right_arrow_translates_to_focus_right_or_expand() {
         let ev = key_press(KeyCode::Right, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::FocusRightOrExpand
         ));
     }
@@ -1494,7 +1553,7 @@ mod tests {
     fn left_arrow_translates_to_focus_left_or_collapse() {
         let ev = key_press(KeyCode::Left, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::FocusLeftOrCollapse
         ));
     }
@@ -1503,7 +1562,7 @@ mod tests {
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::SelectUp
         ));
     }
@@ -1512,7 +1571,7 @@ mod tests {
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::SelectDown
         ));
     }
@@ -1523,7 +1582,7 @@ mod tests {
     fn o_key_opens_browser_in_normal_mode() {
         let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::OpenBrowser
         ));
     }
@@ -1534,7 +1593,7 @@ mod tests {
     fn s_key_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::StartRun
         ));
     }
@@ -1543,7 +1602,7 @@ mod tests {
     fn p_key_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::PauseRun
         ));
     }
@@ -1553,7 +1612,7 @@ mod tests {
         // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::CancelRun
         ));
     }
@@ -1572,7 +1631,8 @@ mod tests {
                             browsing: true,
                             ..ModalState::default()
                         },
-                        crate::app::Panel::Sidebar
+                        crate::app::Panel::Sidebar,
+                        false
                     ),
                     AppEvent::Tick
                 ),
@@ -1591,7 +1651,8 @@ mod tests {
                     browsing: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::BrowserActivate
         ));
@@ -1608,7 +1669,8 @@ mod tests {
                     browsing: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::CloseBrowser
         ));
@@ -1624,7 +1686,8 @@ mod tests {
                     browsing: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::BrowserParent
         ));
@@ -1640,7 +1703,8 @@ mod tests {
                     browsing: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::BrowserDown
         ));
@@ -1652,7 +1716,8 @@ mod tests {
                     browsing: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::BrowserUp
         ));
@@ -1668,7 +1733,8 @@ mod tests {
                     browsing: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::Quit
         ));
@@ -1686,7 +1752,8 @@ mod tests {
                     browsing: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::Tick
         ));
@@ -1706,6 +1773,7 @@ mod tests {
             key_press(KeyCode::Char('q'), KeyModifiers::NONE),
             ModalState::default(),
             crate::app::Panel::Sidebar,
+            false,
         );
 
         app.update(ev);
@@ -2818,7 +2886,7 @@ A description that is long enough to pass minimums.
         // Ctrl+P from Normal mode (all flags false) must open the palette.
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::OpenCommandPalette
         ));
     }
@@ -2834,7 +2902,8 @@ A description that is long enough to pass minimums.
                     command_palette: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::CommandPaletteExecute
         ));
@@ -2880,7 +2949,8 @@ A description that is long enough to pass minimums.
                     command_palette: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::CloseCommandPalette
         ));
@@ -2997,7 +3067,8 @@ wall_clock_secs = 1200
                     settings: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::CloseSettings
         ));
@@ -3014,7 +3085,8 @@ wall_clock_secs = 1200
                     settings: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::SettingsCommit
         ));
@@ -3031,7 +3103,8 @@ wall_clock_secs = 1200
                     settings: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::SettingsUp
         ));
@@ -3044,7 +3117,8 @@ wall_clock_secs = 1200
                     settings: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::SettingsDown
         ));
@@ -3061,7 +3135,8 @@ wall_clock_secs = 1200
                     settings: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::SettingsInput('5')
         ));
@@ -3078,7 +3153,8 @@ wall_clock_secs = 1200
                     settings: true,
                     ..ModalState::default()
                 },
-                crate::app::Panel::Sidebar
+                crate::app::Panel::Sidebar,
+                false
             ),
             AppEvent::SettingsBackspace
         ));
@@ -3151,6 +3227,9 @@ wall_clock_secs = 1200
             slug: "0001-test".to_string(),
             has_tasks: true,
             tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
         }];
 
         // Move cursor to the plan node (index 0 in the tree)
@@ -3163,29 +3242,31 @@ wall_clock_secs = 1200
         ));
 
         // Resolve OpenFocusedNode: Enter on a plan now opens the read-only plan
-        // detail pane (no run is interpreted/started).
+        // detail pane (no run is interpreted/started). Since plan 0032,
+        // Enter on a plan opens a tab via OpenTab.
         let (tx, _rx) = background_events();
         let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
 
         assert!(
-            matches!(resolved, AppEvent::OpenPlanDetail { plan_idx: 0 }),
-            "Enter on a plan must open its detail pane, got {resolved:?}"
+            matches!(resolved, AppEvent::OpenTab(crate::app::TabContent::Plan { ref plan_slug }) if plan_slug == "0001-test"),
+            "Enter on a plan must open a tab (plan 0032), got {resolved:?}"
         );
-        assert_eq!(
-            status, None,
-            "opening the detail pane needs no status message"
-        );
+        assert_eq!(status, None, "opening the plan tab needs no status message");
 
-        // Applying the event sets the plan-detail selection.
+        // Applying the event opens the plan tab.
         app.update(resolved);
-        assert_eq!(app.plan_detail, Some(0));
+        assert_eq!(app.tabs.open_tabs.len(), 1);
+        assert!(matches!(
+            &app.tabs.open_tabs[0],
+            crate::app::TabContent::Plan { plan_slug } if plan_slug == "0001-test"
+        ));
     }
 
     #[test]
     fn enter_key_in_sidebar_translates_to_open_focused_node() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::OpenFocusedNode
         ));
     }
@@ -3194,8 +3275,211 @@ wall_clock_secs = 1200
     fn enter_key_in_main_pane_is_tick() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main),
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
             AppEvent::Tick
         ));
+    }
+
+    // ── Accordion section toggles (plan 0032) ───────────────────────────────────
+
+    #[test]
+    fn s_key_in_main_with_plan_tab_toggles_scope() {
+        let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Scope)
+        ));
+    }
+
+    #[test]
+    fn a_key_in_main_with_plan_tab_toggles_architecture() {
+        let ev = key_press(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Architecture)
+        ));
+    }
+
+    #[test]
+    fn t_key_in_main_with_plan_tab_toggles_tasks() {
+        let ev = key_press(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Tasks)
+        ));
+    }
+
+    #[test]
+    fn z_key_in_main_with_plan_tab_toggles_status() {
+        let ev = key_press(KeyCode::Char('z'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Status)
+        ));
+    }
+
+    #[test]
+    fn s_key_in_main_without_plan_tab_is_start_run() {
+        let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            AppEvent::StartRun
+        ));
+    }
+
+    #[test]
+    fn s_key_in_sidebar_with_plan_tab_is_start_run() {
+        let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, true),
+            AppEvent::StartRun
+        ));
+    }
+
+    #[test]
+    fn a_key_in_sidebar_with_plan_tab_is_tick() {
+        let ev = key_press(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, true),
+            AppEvent::Tick
+        ));
+    }
+
+    #[test]
+    fn accordion_toggles_work_end_to_end() {
+        use crate::app::{App, TabContent};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Open a plan tab
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "test-plan".to_string(),
+        });
+        app.focused_panel = crate::app::Panel::Main;
+
+        // Simulate pressing 's' with a plan tab active
+        let ev = translate_terminal_event(
+            key_press(KeyCode::Char('s'), KeyModifiers::NONE),
+            ModalState::default(),
+            crate::app::Panel::Main,
+            true, // plan_tab_active
+        );
+
+        // Should get a ToggleAccordionSection event
+        assert!(matches!(
+            ev,
+            AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Scope)
+        ));
+
+        // Process the event through the app
+        app.update(ev);
+
+        // The accordion state should have the Scope section expanded
+        let expanded = app.accordion_state.get("test-plan").unwrap();
+        assert!(expanded.contains(&crate::app::AccordionSection::Scope));
+
+        // Toggle it again (should collapse)
+        let ev2 = translate_terminal_event(
+            key_press(KeyCode::Char('s'), KeyModifiers::NONE),
+            ModalState::default(),
+            crate::app::Panel::Main,
+            true,
+        );
+        app.update(ev2);
+
+        // Should be collapsed now
+        let expanded = app.accordion_state.get("test-plan").unwrap();
+        assert!(!expanded.contains(&crate::app::AccordionSection::Scope));
+    }
+
+    #[test]
+    fn alt_right_key_translates_to_next_tab() {
+        let ev = key_press(KeyCode::Right, KeyModifiers::ALT);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            AppEvent::NextTab
+        ));
+    }
+
+    #[test]
+    fn alt_left_key_translates_to_prev_tab() {
+        let ev = key_press(KeyCode::Left, KeyModifiers::ALT);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            AppEvent::PrevTab
+        ));
+    }
+
+    #[test]
+    fn control_w_key_translates_to_close_tab() {
+        let ev = key_press(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            AppEvent::CloseTab
+        ));
+    }
+
+    #[test]
+    fn tab_navigation_works_end_to_end() {
+        use crate::app::{App, TabContent};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Open two plan tabs
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "plan-1".to_string(),
+        });
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "plan-2".to_string(),
+        });
+
+        // plan-2 should be active (it was the last one opened)
+        assert_eq!(app.tabs.active_tab, Some(1));
+
+        // Simulate Alt+Left to go to previous tab
+        let ev = translate_terminal_event(
+            key_press(KeyCode::Left, KeyModifiers::ALT),
+            ModalState::default(),
+            crate::app::Panel::Main,
+            true,
+        );
+        assert!(matches!(ev, AppEvent::PrevTab));
+        app.update(ev);
+
+        // Should now be on plan-1
+        assert_eq!(app.tabs.active_tab, Some(0));
+
+        // Simulate Alt+Right to go to next tab
+        let ev = translate_terminal_event(
+            key_press(KeyCode::Right, KeyModifiers::ALT),
+            ModalState::default(),
+            crate::app::Panel::Main,
+            true,
+        );
+        assert!(matches!(ev, AppEvent::NextTab));
+        app.update(ev);
+
+        // Should be back on plan-2
+        assert_eq!(app.tabs.active_tab, Some(1));
+
+        // Simulate Ctrl+W to close the active tab
+        let ev = translate_terminal_event(
+            key_press(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            ModalState::default(),
+            crate::app::Panel::Main,
+            true,
+        );
+        assert!(matches!(ev, AppEvent::CloseTab));
+        app.update(ev);
+
+        // Should have one tab left
+        assert_eq!(app.tabs.open_tabs.len(), 1);
+        assert_eq!(app.tabs.active_tab, Some(0));
     }
 }

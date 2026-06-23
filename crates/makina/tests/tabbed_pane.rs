@@ -7,12 +7,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use makina::app::{App, TabContent};
+use makina::app::{AccordionSection, App, TabContent};
 use makina::ui;
 use makina_core::api::{
     Api, ApiError, Command, CommandOutcome, EventStream, RunId, RunStatus, RunView, TaskId,
     TaskState, TaskView,
 };
+use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -76,6 +77,45 @@ fn make_app_with_tasks() -> App {
         report: makina_core::api::IngestionReport::default(),
     };
     App::new(api, vec![run], PathBuf::from("."))
+}
+
+/// Build an `App` with one running run and discovered plans.
+fn make_app_with_tasks_and_plans() -> App {
+    let api: Arc<dyn Api> = Arc::new(TestApi);
+    let run = RunView {
+        id: RunId(1),
+        run_uid: "run1".to_string(),
+        task_list_path: PathBuf::from("tasks.md"),
+        status: RunStatus::Running,
+        project: "test-project".to_string(),
+        tasks: vec![TaskView {
+            id: TaskId::new("task-1"),
+            title: "First Task".into(),
+            state: TaskState::InProgress,
+            gate_iterations: 0,
+            review_iterations: 0,
+            depends_on: vec![],
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        }],
+        report: makina_core::api::IngestionReport::default(),
+    };
+    let mut app = App::new(api, vec![run], PathBuf::from("."));
+
+    // Add a discovered plan
+    let plan = PlanEntry {
+        slug: "0001-test-plan".to_string(),
+        dir: PathBuf::from("docs/plans/0001-test"),
+        has_tasks: true,
+        tasks: vec![],
+        scope_text: Some("This is a test plan.".to_string()),
+        architecture_text: Some("Architecture details.".to_string()),
+        status_text: Some("Status: complete.".to_string()),
+    };
+    app.discovered_plans.push(plan);
+
+    app
 }
 
 /// Helper to extract screen content from a terminal.
@@ -177,5 +217,141 @@ fn tabbed_pane_active_tab_is_distinguished() {
     assert!(
         found_styled_cells,
         "active tab should be styled with Cyan background"
+    );
+}
+
+#[test]
+fn render_task_and_plan_tabs_together() {
+    let mut terminal = {
+        let backend = TestBackend::new(100, 24);
+        Terminal::new(backend).unwrap()
+    };
+    let mut app = make_app_with_tasks_and_plans();
+
+    // Open a task tab
+    app.tabs.open_tab(TabContent::Task {
+        plan_slug: "0001".to_string(),
+        task_id: TaskId("task-1".to_string()),
+    });
+
+    // Open a plan tab
+    app.tabs.open_tab(TabContent::Plan {
+        plan_slug: "0001-test-plan".to_string(),
+    });
+
+    terminal.draw(|frame| ui::render(&app, frame)).unwrap();
+    let screen = screen_of(&terminal);
+
+    // Both task and plan tabs should appear in the rendered output
+    assert!(screen.contains("task-1"), "tab bar should show task tab");
+    assert!(
+        screen.contains("0001-test-plan"),
+        "tab bar should show plan tab"
+    );
+
+    // Verify that the plan tab is active (it was the last one opened)
+    assert_eq!(
+        app.tabs.active_tab,
+        Some(1),
+        "plan tab should be active after opening"
+    );
+
+    // Check that the buffer has style information showing the active tab is the plan tab
+    let buffer = terminal.backend().buffer();
+    let buffer_content = buffer.content();
+
+    // Look for cells with the active tab styling (Cyan background)
+    let mut found_styled_cells = false;
+    for cell in buffer_content.iter() {
+        if !cell.symbol().is_empty() && cell.style().bg == Some(ratatui::style::Color::Cyan) {
+            found_styled_cells = true;
+            break;
+        }
+    }
+
+    assert!(
+        found_styled_cells,
+        "active tab should be styled with Cyan background"
+    );
+}
+
+/// Integration test: Plan Tabs Render with Accordion Sections
+#[test]
+fn plan_tabs_render_accordion_sections_without_panic() {
+    let mut terminal = {
+        let backend = TestBackend::new(120, 30);
+        Terminal::new(backend).unwrap()
+    };
+
+    let api = Arc::new(TestApi);
+    let mut app = App::new(api, vec![], PathBuf::from("."));
+
+    let plan = PlanEntry {
+        slug: "0031-test".to_string(),
+        dir: PathBuf::from("docs/plans/0031"),
+        has_tasks: true,
+        tasks: vec![
+            PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "First task".to_string(),
+                gated: false,
+                depends_on: vec![],
+            },
+            PlanTaskPreview {
+                id: "task-2".to_string(),
+                title: "Second task (GATED)".to_string(),
+                gated: true,
+                depends_on: vec!["task-1".to_string()],
+            },
+        ],
+        scope_text: Some("This plan improves sidebar navigation.".to_string()),
+        architecture_text: Some("Three workstreams...".to_string()),
+        status_text: Some("✅ Complete.".to_string()),
+    };
+    app.discovered_plans.push(plan);
+
+    // Open the plan tab
+    app.tabs.open_tab(TabContent::Plan {
+        plan_slug: "0031-test".to_string(),
+    });
+
+    // Expand all sections
+    let expanded = app
+        .accordion_state
+        .entry("0031-test".to_string())
+        .or_default();
+    expanded.insert(AccordionSection::Scope);
+    expanded.insert(AccordionSection::Architecture);
+    expanded.insert(AccordionSection::Tasks);
+    expanded.insert(AccordionSection::Status);
+
+    // Render (should not panic)
+    terminal.draw(|frame| ui::render(&app, frame)).unwrap();
+
+    // Verify output contains section headers and content
+    let screen = screen_of(&terminal);
+    assert!(
+        screen.contains("[-] SCOPE"),
+        "SCOPE section should show expanded marker"
+    );
+    assert!(
+        screen.contains("[-] ARCHITECTURE"),
+        "ARCHITECTURE section should show expanded marker"
+    );
+    assert!(
+        screen.contains("[-] TASKS"),
+        "TASKS section should show expanded marker"
+    );
+    assert!(
+        screen.contains("task-1"),
+        "Task 1 should be visible in expanded TASKS"
+    );
+    assert!(
+        screen.contains("GATED"),
+        "Gated task marker should be visible"
+    );
+    assert!(
+        screen.contains("[-] STATUS"),
+        "STATUS section should show expanded marker"
     );
 }
