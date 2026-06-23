@@ -309,9 +309,9 @@ The new accordion renderer must display the four plan sections (SCOPE, ARCHITECT
 
 ## 0001 — Tab-Based Plan Rendering
 
-### remove-plan-detail-singleton — Remove plan_detail Singleton and Route to Tabs (GATED)
+### remove-plan-detail-singleton — Remove plan_detail Singleton and Route to Tabs
 
-**Gate:** This task consumes work that must already be landed: `extend-plan-entry-with-spec-content` gives `PlanEntry` its `scope_text`, `architecture_text`, and `status_text` fields, and `create-accordion-renderer` provides the `render_plan_accordion_pane` plan-tab content renderer. Both are declared earlier (workstream 0002) and must land before this task routes plan viewing through them.
+**Prerequisites:** This task consumes work that must already be landed: `extend-plan-entry-with-spec-content` gives `PlanEntry` its `scope_text`, `architecture_text`, and `status_text` fields, and `create-accordion-renderer` provides the `render_plan_accordion_pane` plan-tab content renderer. Both are declared earlier (workstream 0002) and must land before this task routes plan viewing through them — this ordering is enforced by the `Depends on:` edges below.
 
 This task removes the singleton `plan_detail: Option<usize>` model and routes plan viewing through the tab infrastructure. Pressing Enter on a discovered plan node opens (or switches to) a tab, and the active plan tab renders via the new accordion pane instead of the old `render_plan_detail`.
 
