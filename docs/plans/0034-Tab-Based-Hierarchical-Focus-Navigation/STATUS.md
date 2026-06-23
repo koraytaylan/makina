@@ -2,9 +2,9 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete.
 
-_Last updated: 2026-06-23, against develop._
+_Last updated: 2026-06-24, against develop._
 
 - **Goal:** Users can navigate the TUI entirely by keyboard: Tab moves through Sidebar, Main content pane, and nested accordion sections with a visible focus indicator; Shift+Tab reverses; focused accordion sections are expandable/collapsible via Enter. Power-users achieve mouse-free navigation of complex plans and task hierarchies.
 - **Root cause:** The Tab key currently implements a binary toggle (Sidebar ↔ Main) without any nested focus tracking for accordion sections introduced in Plan 0032. Users cannot Tab into or navigate within accordion sections; the focus model has no field to track which section is currently focused. Additionally, there is no visual indicator showing which region/section owns focus, breaking the standard desktop UI pattern where focus is always visible. This strands keyboard-only users at the Main pane boundary and forces reliance on hardcoded S/A/T/Z keys or mouse clicks to navigate the accordion.
@@ -12,7 +12,7 @@ _Last updated: 2026-06-23, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Focus Model Extension | `extend-focus-model` | 📋 Planned |
-| 0002 | Tab/Shift+Tab Navigation Logic | `move-focus-forward`, `move-focus-backward` | 📋 Planned |
-| 0003 | Visual Focus Indicator | `add-visual-focus-indicator` | 📋 Planned |
-| 0004 | Keyboard Integration & Testing | `wire-tab-shift-tab-events`, `integration-test-tab-traversal`, `verify-accordion-entry-toggle` | 📋 Planned |
+| 0001 | Focus Model Extension | `extend-focus-model` | ✅ Done |
+| 0002 | Tab/Shift+Tab Navigation Logic | `move-focus-forward`, `move-focus-backward` | ✅ Done |
+| 0003 | Visual Focus Indicator | `add-visual-focus-indicator` | ✅ Done |
+| 0004 | Keyboard Integration & Testing | `wire-tab-shift-tab-events`, `integration-test-tab-traversal`, `verify-accordion-entry-toggle` | ✅ Done |
