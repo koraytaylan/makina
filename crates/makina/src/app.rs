@@ -571,6 +571,21 @@ pub enum Panel {
     Main,
 }
 
+/// Hierarchical focus state: which nested item inside the focused panel owns focus.
+/// When `focused_panel == Panel::Main`, `focused_section` tracks which accordion
+/// section (if any) is active. When `focused_panel == Panel::Sidebar`,
+/// `focused_section` is ignored (the tree cursor owns focus).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusState {
+    /// Sidebar tree node has focus; tree_cursor identifies the node.
+    TreeNode,
+    /// Main pane has focus, but no accordion section is focused yet (e.g., on first
+    /// entry to Main when no plan tab is active).
+    MainPane,
+    /// A specific accordion section in the active plan tab has focus.
+    AccordionSection(AccordionSection),
+}
+
 /// A node in the sidebar tree: either a run header or one of its tasks.
 ///
 /// Built on-demand by [`App::visible_tree_nodes`] to flatten the run/task
@@ -601,8 +616,10 @@ pub enum AppEvent {
     /// Terminal window was resized to the given dimensions (width, height).
     #[allow(dead_code)] // dimensions stored for future use by tasks 27-31
     Resize(u16, u16),
-    /// Tab key — cycle focus between [`Panel::Sidebar`] and [`Panel::Main`].
+    /// Tab key — move focus forward through Sidebar → Main → accordion sections → Sidebar (wrap).
     FocusNext,
+    /// Shift+Tab key — move focus backward through accordion sections → Main → Sidebar (wrap).
+    FocusPrev,
     /// `v` / `V` — cycle the dependency view between
     /// [`DependencyViewMode::Off`], `List`, `Tree`, and `Timeline`.
     CycleDependencyView,
@@ -965,6 +982,11 @@ pub struct App {
 
     /// The panel that currently owns keyboard focus.
     pub focused_panel: Panel,
+
+    /// When focused_panel == Panel::Main, tracks which accordion section (if any) has focus.
+    /// Defaults to None; Tab from Sidebar enters Main with focused_section = None, then
+    /// subsequent Tab moves to the first accordion section (Scope).
+    pub focused_section: Option<AccordionSection>,
 
     /// Which top-level view is showing.  [`Mode::FileBrowser`] overlays a modal
     /// file picker; [`Mode::Normal`] shows the runs sidebar + detail panel.
@@ -1437,6 +1459,7 @@ impl App {
             should_quit: false,
             api,
             focused_panel: Panel::Sidebar,
+            focused_section: None,
             mode: Mode::Normal,
             dependency_view: DependencyViewMode::Off,
             browser: None,
@@ -1594,6 +1617,160 @@ impl App {
         self.exchange_logs.get(&(run.id, task_id.clone()))
     }
 
+    /// Return the comprehensive focus state (region + nested section if applicable).
+    pub fn focused_state(&self) -> FocusState {
+        match self.focused_panel {
+            Panel::Sidebar => FocusState::TreeNode,
+            Panel::Main => self
+                .focused_section
+                .map(FocusState::AccordionSection)
+                .unwrap_or(FocusState::MainPane),
+        }
+    }
+
+    /// Return the static accordion section cycle order (used by Tab logic).
+    #[allow(dead_code)] // Used by downstream move_focus_forward/backward tasks
+    pub(crate) fn accordion_section_order() -> &'static [AccordionSection] {
+        &[
+            AccordionSection::Scope,
+            AccordionSection::Architecture,
+            AccordionSection::Tasks,
+            AccordionSection::Status,
+        ]
+    }
+
+    /// Move focus forward (Tab key) through the hierarchy:
+    /// Sidebar → Main (no section) → Accordion sections → Sidebar (wrap).
+    /// Wrapping occurs only if a plan tab is active; otherwise Tab from Main goes to Sidebar.
+    pub fn move_focus_forward(&mut self) {
+        match self.focused_panel {
+            Panel::Sidebar => {
+                // From Sidebar, Tab always moves to Main pane.
+                self.focused_panel = Panel::Main;
+                self.focused_section = None; // Enter Main without a specific section focus.
+            }
+            Panel::Main => {
+                // From Main, check if a plan tab is active.
+                let has_active_plan_tab = self
+                    .tabs
+                    .active_tab
+                    .and_then(|idx| self.tabs.open_tabs.get(idx))
+                    .map(|tab| matches!(tab, TabContent::Plan { .. }))
+                    .unwrap_or(false);
+
+                if has_active_plan_tab {
+                    // Plan tab is active; cycle accordion sections.
+                    let sections = Self::accordion_section_order();
+                    let next = match self.focused_section {
+                        None => Some(sections[0]), // First entry: focus Scope.
+                        Some(sec) => {
+                            // Find the current section's position and move to the next.
+                            sections
+                                .iter()
+                                .position(|&s| s == sec)
+                                .map(|pos| {
+                                    if pos + 1 < sections.len() {
+                                        Some(sections[pos + 1]) // Next section.
+                                    } else {
+                                        None // Signal to wrap to Sidebar.
+                                    }
+                                })
+                                .unwrap_or(Some(sections[0])) // Fallback: reset to Scope.
+                        }
+                    };
+
+                    match next {
+                        Some(sec) => {
+                            self.focused_section = Some(sec);
+                        }
+                        None => {
+                            // Last section (Status); wrap to Sidebar.
+                            self.focused_panel = Panel::Sidebar;
+                            self.focused_section = None;
+                        }
+                    }
+                } else {
+                    // No plan tab active: wrap from Main to Sidebar.
+                    self.focused_panel = Panel::Sidebar;
+                    self.focused_section = None;
+                }
+            }
+        }
+    }
+
+    /// Move focus backward (Shift+Tab key) through the hierarchy in reverse:
+    /// Sidebar → Status (if plan tab active) → Accordion sections in reverse → Main → Sidebar (wrap).
+    pub fn move_focus_backward(&mut self) {
+        match self.focused_panel {
+            Panel::Sidebar => {
+                // From Sidebar, Shift+Tab checks if a plan tab is active.
+                let has_active_plan_tab = self
+                    .tabs
+                    .active_tab
+                    .and_then(|idx| self.tabs.open_tabs.get(idx))
+                    .map(|tab| matches!(tab, TabContent::Plan { .. }))
+                    .unwrap_or(false);
+
+                if has_active_plan_tab {
+                    // Plan tab is active; jump to the last accordion section (Status).
+                    let sections = Self::accordion_section_order();
+                    self.focused_panel = Panel::Main;
+                    self.focused_section = Some(sections[sections.len() - 1]);
+                }
+                // If no plan tab active, stay in Sidebar (no movement).
+            }
+            Panel::Main => {
+                // From Main, check if a plan tab is active.
+                let has_active_plan_tab = self
+                    .tabs
+                    .active_tab
+                    .and_then(|idx| self.tabs.open_tabs.get(idx))
+                    .map(|tab| matches!(tab, TabContent::Plan { .. }))
+                    .unwrap_or(false);
+
+                if has_active_plan_tab {
+                    // Plan tab is active; step backward through accordion sections.
+                    let sections = Self::accordion_section_order();
+                    let next = match self.focused_section {
+                        None => {
+                            // No section focused yet; jump to the last one (Status).
+                            Some(sections[sections.len() - 1])
+                        }
+                        Some(sec) => {
+                            // Find the current section's position and move to the previous.
+                            sections
+                                .iter()
+                                .position(|&s| s == sec)
+                                .map(|pos| {
+                                    if pos > 0 {
+                                        Some(sections[pos - 1]) // Previous section.
+                                    } else {
+                                        None // Signal to exit to Sidebar.
+                                    }
+                                })
+                                .unwrap_or(Some(sections[0]))
+                        }
+                    };
+
+                    match next {
+                        Some(sec) => {
+                            self.focused_section = Some(sec);
+                        }
+                        None => {
+                            // First section (Scope); exit to Sidebar.
+                            self.focused_panel = Panel::Sidebar;
+                            self.focused_section = None;
+                        }
+                    }
+                } else {
+                    // No plan tab active: exit to Sidebar.
+                    self.focused_panel = Panel::Sidebar;
+                    self.focused_section = None;
+                }
+            }
+        }
+    }
+
     /// Scroll the exchange pane up by one line.
     ///
     /// Disengages auto-follow (the user is reviewing history) and decrements the
@@ -1682,10 +1859,11 @@ impl App {
                 true
             }
             AppEvent::FocusNext => {
-                self.focused_panel = match self.focused_panel {
-                    Panel::Sidebar => Panel::Main,
-                    Panel::Main => Panel::Sidebar,
-                };
+                self.move_focus_forward();
+                true
+            }
+            AppEvent::FocusPrev => {
+                self.move_focus_backward();
                 true
             }
             AppEvent::CycleDependencyView => {
@@ -1855,11 +2033,27 @@ impl App {
                 true
             }
             AppEvent::ToggleTreeNode => {
-                // Toggle expand/collapse on the focused tree node's run.
-                // Guard on sidebar focus so that programmatic emission when the
-                // main panel is active has no effect.
-                if self.focused_panel == Panel::Sidebar {
-                    self.tree_toggle_expand();
+                match self.focused_panel {
+                    Panel::Sidebar => {
+                        // Toggle expand/collapse on the focused tree node's run.
+                        self.tree_toggle_expand();
+                    }
+                    Panel::Main => {
+                        // Toggle the focused accordion section (if one is focused).
+                        if let Some(focused_section) = self.focused_section
+                            && let Some(active_idx) = self.tabs.active_tab
+                            && let Some(TabContent::Plan { plan_slug }) =
+                                self.tabs.open_tabs.get(active_idx)
+                        {
+                            let plan_slug = plan_slug.clone();
+                            let sections = self.accordion_state.entry(plan_slug).or_default();
+                            if sections.contains(&focused_section) {
+                                sections.remove(&focused_section);
+                            } else {
+                                sections.insert(focused_section);
+                            }
+                        }
+                    }
                 }
                 true
             }
@@ -7041,6 +7235,464 @@ mod tests {
                 .map(|s| s.contains(&AccordionSection::Scope))
                 .unwrap_or(false),
             "Alpha's SCOPE should still be expanded"
+        );
+    }
+
+    // ── Tab Navigation (Focus Forward/Backward) ──────────────────────────────
+
+    /// Test move_focus_forward exercises all traversal paths:
+    /// - Sidebar → Main (without plan tab)
+    /// - Sidebar → Main → accordion sections (with plan tab)
+    /// - Scope → Architecture → Tasks → Status (with plan tab)
+    /// - Status → Sidebar (wrap around)
+    /// - Main → Sidebar (no plan tab, direct wrap)
+    #[test]
+    fn move_focus_forward_traversal_paths() {
+        let mut app = make_app();
+
+        // === Test 1: Sidebar → Main (no plan tab) ===
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+        assert_eq!(app.focused_section, None);
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "Tab from Sidebar should move to Main"
+        );
+        assert_eq!(
+            app.focused_section, None,
+            "Main focus should have no section initially"
+        );
+
+        // === Test 2: Main → Sidebar (no plan tab, wraps directly) ===
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Tab from Main without plan tab should wrap to Sidebar"
+        );
+        assert_eq!(app.focused_section, None);
+
+        // === Test 3: Sidebar → Main → Scope (with plan tab) ===
+        // Create a plan tab to enable accordion focus
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            slug: "0001-test".to_string(),
+            dir: PathBuf::from("docs/plans/0001"),
+            has_tasks: true,
+            tasks: vec![],
+            scope_text: Some("Test scope".to_string()),
+            architecture_text: Some("Test architecture".to_string()),
+            status_text: Some("Test status".to_string()),
+        };
+        app.discovered_plans = vec![plan_entry];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0001-test".to_string(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // We're in Sidebar; Tab should go to Main
+        app.move_focus_forward();
+        assert_eq!(app.focused_panel, Panel::Main);
+        assert_eq!(
+            app.focused_section, None,
+            "Enter Main without section focus"
+        );
+
+        // From Main, Tab should enter Scope (first section)
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "Should still be in Main pane"
+        );
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Scope),
+            "First Tab should focus Scope"
+        );
+
+        // === Test 4: Scope → Architecture → Tasks → Status (accordion cycle) ===
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Architecture),
+            "Tab from Scope should focus Architecture"
+        );
+
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Tasks),
+            "Tab from Architecture should focus Tasks"
+        );
+
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Status),
+            "Tab from Tasks should focus Status"
+        );
+
+        // === Test 5: Status → Sidebar (wrap around) ===
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Tab from Status should wrap to Sidebar"
+        );
+        assert_eq!(app.focused_section, None, "Sidebar has no section focus");
+
+        // === Test 6: Verify cycle continues: Sidebar → Main → Scope again ===
+        app.move_focus_forward();
+        assert_eq!(app.focused_panel, Panel::Main);
+        assert_eq!(app.focused_section, None);
+
+        app.move_focus_forward();
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Scope),
+            "Should cycle back to Scope after wrapping"
+        );
+    }
+
+    /// Test move_focus_backward exercises all reverse traversal paths:
+    /// - Sidebar → Status (with plan tab)
+    /// - Status → Tasks → Architecture → Scope (with plan tab)
+    /// - Scope → Sidebar
+    /// - Sidebar → stays-in-Sidebar (no plan tab)
+    /// - Main → Sidebar (no plan tab, direct wrap)
+    #[test]
+    fn move_focus_backward_traversal_paths() {
+        let mut app = make_app();
+
+        // === Test 1: Sidebar → stays-in-Sidebar (no plan tab) ===
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+        assert_eq!(app.focused_section, None);
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Shift+Tab from Sidebar without plan tab should stay in Sidebar"
+        );
+        assert_eq!(app.focused_section, None);
+
+        // === Test 2: Main → Sidebar (no plan tab, direct wrap) ===
+        app.focused_panel = Panel::Main;
+        app.focused_section = None;
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Shift+Tab from Main without plan tab should wrap to Sidebar"
+        );
+        assert_eq!(app.focused_section, None);
+
+        // === Test 3: Sidebar → Status (with plan tab) ===
+        // Create a plan tab to enable accordion focus
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            slug: "0001-test".to_string(),
+            dir: PathBuf::from("docs/plans/0001"),
+            has_tasks: true,
+            tasks: vec![],
+            scope_text: Some("Test scope".to_string()),
+            architecture_text: Some("Test architecture".to_string()),
+            status_text: Some("Test status".to_string()),
+        };
+        app.discovered_plans = vec![plan_entry];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0001-test".to_string(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // We're in Sidebar; Shift+Tab should jump to Status (last section)
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "Shift+Tab from Sidebar with plan tab should move to Main"
+        );
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Status),
+            "Shift+Tab from Sidebar should jump to Status (last section)"
+        );
+
+        // === Test 4: Status → Tasks → Architecture → Scope (accordion reverse cycle) ===
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Tasks),
+            "Shift+Tab from Status should focus Tasks"
+        );
+
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Architecture),
+            "Shift+Tab from Tasks should focus Architecture"
+        );
+
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Scope),
+            "Shift+Tab from Architecture should focus Scope"
+        );
+
+        // === Test 5: Scope → Sidebar (exit from first section) ===
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Shift+Tab from Scope should exit to Sidebar"
+        );
+        assert_eq!(app.focused_section, None, "Sidebar has no section focus");
+
+        // === Test 6: Verify cycle continues in reverse: Sidebar → Status again ===
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "Shift+Tab from Sidebar should move to Main"
+        );
+        assert_eq!(
+            app.focused_section,
+            Some(AccordionSection::Status),
+            "Should cycle back to Status after wrapping"
+        );
+
+        // === Test 7: From Main without section focus → Sidebar (no plan tab case) ===
+        // Remove the plan tab to test the no-plan-tab path
+        app.focused_panel = Panel::Main;
+        app.focused_section = None;
+        app.tabs.open_tabs.clear();
+        app.tabs.active_tab = None;
+
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Shift+Tab from Main without plan tab should wrap to Sidebar"
+        );
+        assert_eq!(app.focused_section, None);
+    }
+
+    #[test]
+    fn enter_toggles_focused_accordion_section() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan_slug = "0001-test".to_string();
+
+        // Open a plan tab
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Move focus to Main pane and then to a section
+        app.focused_panel = Panel::Main;
+        app.focused_section = Some(AccordionSection::Scope);
+
+        // Initially, SCOPE should not be expanded
+        assert!(
+            !app.accordion_state
+                .get(&plan_slug)
+                .map(|s| s.contains(&AccordionSection::Scope))
+                .unwrap_or(false),
+            "SCOPE should initially be collapsed"
+        );
+
+        // Press Enter to expand the focused section
+        app.update(AppEvent::ToggleTreeNode);
+
+        // SCOPE should now be expanded
+        assert!(
+            app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Scope)),
+            "SCOPE should be expanded after pressing Enter"
+        );
+
+        // Press Enter again to collapse the focused section
+        app.update(AppEvent::ToggleTreeNode);
+
+        // SCOPE should now be collapsed
+        assert!(
+            !app.accordion_state
+                .get(&plan_slug)
+                .map(|s| s.contains(&AccordionSection::Scope))
+                .unwrap_or(false),
+            "SCOPE should be collapsed after pressing Enter again"
+        );
+    }
+
+    #[test]
+    fn enter_noop_when_no_section_focused() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan_slug = "0001-test".to_string();
+
+        // Open a plan tab
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Move focus to Main pane but don't focus a specific section
+        app.focused_panel = Panel::Main;
+        app.focused_section = None;
+
+        // Press Enter (should be a no-op)
+        app.update(AppEvent::ToggleTreeNode);
+
+        // accordion_state should remain empty
+        assert!(
+            app.accordion_state.is_empty(),
+            "accordion_state should remain empty when no section is focused"
+        );
+    }
+
+    #[test]
+    fn enter_noop_when_sidebar_focused() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan_slug = "0001-test".to_string();
+
+        // Open a plan tab
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Focus a section but then switch focus back to Sidebar
+        app.focused_panel = Panel::Sidebar;
+        app.focused_section = Some(AccordionSection::Scope);
+
+        // Press Enter (should toggle the tree node, not the accordion section)
+        app.update(AppEvent::ToggleTreeNode);
+
+        // accordion_state should remain empty (Enter was handled as tree toggle, not accordion toggle)
+        assert!(
+            app.accordion_state.is_empty(),
+            "accordion_state should remain empty when Sidebar is focused"
+        );
+    }
+
+    #[test]
+    fn enter_toggles_multiple_sections_independently() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan_slug = "0001-test".to_string();
+
+        // Open a plan tab
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Move focus to Main pane and to Scope
+        app.focused_panel = Panel::Main;
+        app.focused_section = Some(AccordionSection::Scope);
+
+        // Press Enter to expand Scope
+        app.update(AppEvent::ToggleTreeNode);
+        assert!(
+            app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Scope)),
+            "SCOPE should be expanded"
+        );
+
+        // Move focus to Architecture
+        app.focused_section = Some(AccordionSection::Architecture);
+
+        // Press Enter to expand Architecture
+        app.update(AppEvent::ToggleTreeNode);
+        assert!(
+            app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Architecture)),
+            "ARCHITECTURE should be expanded"
+        );
+
+        // Verify both are expanded
+        let expanded = &app.accordion_state[&plan_slug];
+        assert!(expanded.contains(&AccordionSection::Scope));
+        assert!(expanded.contains(&AccordionSection::Architecture));
+        assert!(!expanded.contains(&AccordionSection::Tasks));
+        assert!(!expanded.contains(&AccordionSection::Status));
+
+        // Move focus back to Scope and toggle it
+        app.focused_section = Some(AccordionSection::Scope);
+        app.update(AppEvent::ToggleTreeNode);
+
+        // Scope should be collapsed, Architecture should remain expanded
+        let expanded = &app.accordion_state[&plan_slug];
+        assert!(!expanded.contains(&AccordionSection::Scope));
+        assert!(expanded.contains(&AccordionSection::Architecture));
+    }
+
+    #[test]
+    fn enter_toggle_and_s_keybinding_are_orthogonal() {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan_slug = "0001-test".to_string();
+
+        // Open a plan tab
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: plan_slug.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Move focus to Main pane and to Scope
+        app.focused_panel = Panel::Main;
+        app.focused_section = Some(AccordionSection::Scope);
+
+        // Use the S keybinding (which is ToggleAccordionSection) to expand Scope
+        app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
+        assert!(
+            app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Scope)),
+            "SCOPE should be expanded via S keybinding"
+        );
+
+        // Use Enter to collapse Scope
+        app.update(AppEvent::ToggleTreeNode);
+        assert!(
+            !app.accordion_state
+                .get(&plan_slug)
+                .map(|s| s.contains(&AccordionSection::Scope))
+                .unwrap_or(false),
+            "SCOPE should be collapsed via Enter"
+        );
+
+        // Use the A keybinding (which is ToggleAccordionSection) to expand Architecture
+        // (this demonstrates that both input methods work on the same map without conflict)
+        app.update(AppEvent::ToggleAccordionSection(
+            AccordionSection::Architecture,
+        ));
+        assert!(
+            app.accordion_state
+                .get(&plan_slug)
+                .is_some_and(|s| s.contains(&AccordionSection::Architecture)),
+            "ARCHITECTURE should be expanded via A keybinding"
+        );
+
+        // Move focus to Architecture and use Enter to collapse it
+        app.focused_section = Some(AccordionSection::Architecture);
+        app.update(AppEvent::ToggleTreeNode);
+        assert!(
+            !app.accordion_state
+                .get(&plan_slug)
+                .map(|s| s.contains(&AccordionSection::Architecture))
+                .unwrap_or(false),
+            "ARCHITECTURE should be collapsed via Enter"
         );
     }
 }

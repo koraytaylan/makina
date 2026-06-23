@@ -1363,15 +1363,18 @@ pub(crate) fn render_plan_accordion_pane(
         .unwrap_or_default();
 
     // SCOPE section
+    let scope_focused = matches!(app.focused_section, Some(AccordionSection::Scope));
     lines.extend(render_accordion_section(
         "SCOPE",
         AccordionSection::Scope,
         &expanded,
         plan.scope_text.as_deref().unwrap_or("(no SCOPE.md)"),
+        scope_focused,
     ));
     lines.push(Line::from(""));
 
     // ARCHITECTURE section
+    let arch_focused = matches!(app.focused_section, Some(AccordionSection::Architecture));
     lines.extend(render_accordion_section(
         "ARCHITECTURE",
         AccordionSection::Architecture,
@@ -1379,25 +1382,30 @@ pub(crate) fn render_plan_accordion_pane(
         plan.architecture_text
             .as_deref()
             .unwrap_or("(no ARCHITECTURE.md)"),
+        arch_focused,
     ));
     lines.push(Line::from(""));
 
     // TASKS section
     let tasks_text = format_tasks_section(&plan.tasks);
+    let tasks_focused = matches!(app.focused_section, Some(AccordionSection::Tasks));
     lines.extend(render_accordion_section(
         "TASKS",
         AccordionSection::Tasks,
         &expanded,
         &tasks_text,
+        tasks_focused,
     ));
     lines.push(Line::from(""));
 
     // STATUS section
+    let status_focused = matches!(app.focused_section, Some(AccordionSection::Status));
     lines.extend(render_accordion_section(
         "STATUS",
         AccordionSection::Status,
         &expanded,
         plan.status_text.as_deref().unwrap_or("(no STATUS.md)"),
+        status_focused,
     ));
     lines.push(Line::from(""));
 
@@ -1426,26 +1434,30 @@ fn render_accordion_section(
     section: AccordionSection,
     expanded_set: &HashSet<AccordionSection>,
     content: &str,
+    focused: bool,
 ) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let is_expanded = expanded_set.contains(&section);
     let marker = if is_expanded { "[-]" } else { "[+]" };
 
-    // Section header
+    // Section header with focus styling
+    let marker_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let mut title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    if focused {
+        // Apply a distinctive background and bold modifier when focused.
+        title_style = title_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    }
+
     result.push(Line::from(vec![
-        Span::styled(
-            marker,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(marker, marker_style),
         Span::raw(" "),
-        Span::styled(
-            title.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title.to_string(), title_style),
     ]));
 
     // Content (if expanded)

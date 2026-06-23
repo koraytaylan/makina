@@ -1204,7 +1204,13 @@ fn translate_key(
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::Quit,
             KeyCode::Esc => AppEvent::Quit,
-            KeyCode::Tab => AppEvent::FocusNext,
+            KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    AppEvent::FocusPrev
+                } else {
+                    AppEvent::FocusNext
+                }
+            }
             // Cycle the dependency view (Off → List → Tree → Timeline → Off).
             KeyCode::Char('v') | KeyCode::Char('V') => AppEvent::CycleDependencyView,
             // Toggle the error pane open/closed.
@@ -1286,10 +1292,10 @@ fn translate_key(
                 Panel::Sidebar => AppEvent::ToggleTreeNode,
                 Panel::Main => AppEvent::Tick,
             },
-            // Enter: open the focused node in the sidebar.
+            // Enter: open the focused node in the sidebar, or toggle the focused accordion section in the main pane.
             KeyCode::Enter => match focused_panel {
                 Panel::Sidebar => AppEvent::OpenFocusedNode,
-                Panel::Main => AppEvent::Tick,
+                Panel::Main => AppEvent::ToggleTreeNode,
             },
             _ => AppEvent::Tick,
         }
@@ -3272,11 +3278,11 @@ wall_clock_secs = 1200
     }
 
     #[test]
-    fn enter_key_in_main_pane_is_tick() {
+    fn enter_key_in_main_pane_toggles_accordion() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
-            AppEvent::Tick
+            AppEvent::ToggleTreeNode
         ));
     }
 
