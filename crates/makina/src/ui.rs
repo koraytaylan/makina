@@ -113,7 +113,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     // Render the unified sidebar tree (plans + runs + tasks).
     let sidebar_block = panel_block("Runs & Tasks", sidebar_focused);
 
-    if app.runs.is_empty() {
+    // The tree is empty only when there are NO discovered plans AND no open
+    // runs — gate on the flattened node list, not `runs` alone, so a freshly
+    // opened project that has plans but no runs yet still renders its plans.
+    let tree_nodes = app.visible_tree_nodes();
+    if tree_nodes.is_empty() {
         // Empty state. While a background job is running (e.g. startup plan
         // discovery) show an animated spinner + label so the empty sidebar
         // reads as "working", not "nothing here". Otherwise show a hint that
@@ -149,8 +153,8 @@ pub fn render(app: &App, frame: &mut Frame) {
             .style(Style::default().fg(Color::White));
         frame.render_widget(para, sidebar_area);
     } else {
-        // Build one ListItem per visible tree node (runs and their expanded tasks).
-        let tree_nodes = app.visible_tree_nodes();
+        // Build one ListItem per visible tree node (plans, runs, and their
+        // expanded tasks).
         let items: Vec<ListItem> = tree_nodes
             .iter()
             .map(|node| {
@@ -2454,6 +2458,30 @@ mod tests {
         assert!(
             !screen.contains("task 31"),
             "stale 'run-control (task 31)' copy must be gone"
+        );
+    }
+
+    /// A discovered plan with NO open runs must still render in the sidebar.
+    /// Regression: the empty-state guard keyed on `runs.is_empty()` hid
+    /// discovered plans whenever no run was open yet (e.g. first open of a
+    /// freshly-planned project), so the plan was scanned but never shown.
+    #[test]
+    fn render_discovered_plan_shows_in_sidebar_with_no_runs() {
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
+            slug: "0001-initial".to_string(),
+            has_tasks: true,
+        }];
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("0001-initial"),
+            "sidebar must show the discovered plan slug even with no open runs;\nscreen was:\n{screen}"
         );
     }
 
