@@ -215,22 +215,59 @@ pub fn render(app: &App, frame: &mut Frame) {
                     }
                     TreeNode::Plan { plan_idx } => {
                         let plan_entry = &app.discovered_plans[*plan_idx];
-                        let disclosure = if app.collapsed_plans.contains(plan_idx) {
+                        let n_tasks = plan_entry.tasks.len();
+                        // Disclosure glyph: a plan with tasks gets ▸/▾; a plan with
+                        // no tasks is a leaf (no triangle).
+                        let disclosure = if n_tasks == 0 {
+                            "  "
+                        } else if app.collapsed_plans.contains(plan_idx) {
                             "▸ "
                         } else {
                             "▾ "
                         };
-                        let mut line_spans =
-                            vec![Span::raw(disclosure), Span::raw(&plan_entry.slug)];
-                        // Append "(no tasks — will plan)" hint for plans without TASKS.md.
+                        let mut line_spans = vec![
+                            Span::raw(disclosure),
+                            Span::styled(
+                                &plan_entry.slug,
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                        ];
                         if !plan_entry.has_tasks {
+                            // No TASKS.md: this plan still needs a task list.
                             line_spans.push(Span::styled(
                                 " (no tasks — will plan)",
                                 Style::default().fg(Color::DarkGray),
                             ));
+                        } else {
+                            // Show the task count so the plan reads as a container.
+                            line_spans.push(Span::styled(
+                                format!(
+                                    "  · {n_tasks} task{}",
+                                    if n_tasks == 1 { "" } else { "s" }
+                                ),
+                                Style::default().fg(Color::DarkGray),
+                            ));
                         }
-                        let line = Line::from(line_spans);
-                        ListItem::new(line)
+                        ListItem::new(Line::from(line_spans))
+                    }
+                    TreeNode::PlanTask { plan_idx, task_idx } => {
+                        // Read-only task preview under an expanded plan: tree
+                        // connector + id — title, with a GATED marker.
+                        let task = &app.discovered_plans[*plan_idx].tasks[*task_idx];
+                        let last = *task_idx + 1 == app.discovered_plans[*plan_idx].tasks.len();
+                        let connector = if last { "  └ " } else { "  ├ " };
+                        let mut spans = vec![
+                            Span::styled(connector, Style::default().fg(Color::DarkGray)),
+                            Span::styled(&task.id, Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                format!(" — {}", task.title),
+                                Style::default().fg(Color::Gray),
+                            ),
+                        ];
+                        if task.gated {
+                            spans.push(Span::styled("  GATED", Style::default().fg(Color::Yellow)));
+                        }
+                        ListItem::new(Line::from(spans))
                     }
                 }
             })
@@ -288,18 +325,42 @@ pub fn render(app: &App, frame: &mut Frame) {
         ]
     });
 
-    match app.selected_run() {
-        None => {
+    // Draw the main border once, then carve a GLOBAL error pane off the bottom
+    // of its inner area. The error pane is shared by every content state (hint,
+    // plan detail, run view) so `[e]` reveals errors even when no run is
+    // selected — previously it only rendered inside the run view.
+    let inner = main_block.inner(main_area);
+    frame.render_widget(main_block, main_area);
+    let error_pane_height: u16 = if app.error_pane_open {
+        8.min(inner.height.saturating_sub(3))
+    } else {
+        0
+    };
+    let main_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(error_pane_height)])
+        .split(inner);
+    let content_area = main_split[0];
+    let error_area = main_split[1];
+
+    // Content precedence: an explicitly opened plan detail (Enter on a plan)
+    // wins; otherwise the selected run's view; otherwise a hint.
+    let plan_detail_idx = app.plan_detail.filter(|i| *i < app.discovered_plans.len());
+    match (plan_detail_idx, app.selected_run()) {
+        (Some(plan_idx), _) => {
+            render_plan_detail(app, plan_idx, frame, content_area, main_focused);
+        }
+        (None, None) => {
             // No run selected: show a hint paragraph.
             let hint_lines = vec![
                 Line::from(""),
                 Line::from(vec![Span::styled(
-                    "  Select a run from the sidebar.",
+                    "  Select a run, or press Enter on a plan to view it.",
                     Style::default().fg(Color::DarkGray),
                 )]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
-                    "  [Tab] — switch focus",
+                    "  [→] expand plan   [Enter] plan detail   [Tab] switch focus",
                     Style::default().fg(Color::DarkGray),
                 )]),
                 Line::from(vec![Span::styled(
@@ -307,17 +368,14 @@ pub fn render(app: &App, frame: &mut Frame) {
                     Style::default().fg(Color::DarkGray),
                 )]),
             ];
-            let hint_para = Paragraph::new(hint_lines)
-                .block(main_block)
-                .style(Style::default().fg(Color::White));
-            frame.render_widget(hint_para, main_area);
+            let hint_para = Paragraph::new(hint_lines).style(Style::default().fg(Color::White));
+            frame.render_widget(hint_para, content_area);
         }
-        Some(run) => {
-            // Split main_area inside the block: header lines + ingestion pane +
-            // exchange pane + error pane.  The task table has been removed;
-            // tasks are now in the sidebar tree.
-            let inner = main_block.inner(main_area);
-            frame.render_widget(main_block, main_area);
+        (None, Some(run)) => {
+            // The selected run's view fills the content area (above the global
+            // error pane). The task table has been removed; tasks are now in the
+            // sidebar tree.
+            let inner = content_area;
 
             // Header: run path and aggregate status.
             let header_lines: Vec<Line> = vec![
@@ -347,12 +405,8 @@ pub fn render(app: &App, frame: &mut Frame) {
             ];
             let header_height = header_lines.len() as u16;
 
-            // Error pane height: a few rows when open, 0 (a no-op area) when
-            // closed.  Placed AFTER the exchange pane in the vertical split.
-            let error_pane_height: u16 = if app.error_pane_open { 5 } else { 0 };
-
             // Ingestion pane height: non-zero only when the selected run has a
-            // non-empty report. Mirrors error pane allocation.
+            // non-empty report.
             let ingestion_pane_height: u16 = if let Some(r) = app.selected_run() {
                 if r.report.is_empty() {
                     0
@@ -371,7 +425,6 @@ pub fn render(app: &App, frame: &mut Frame) {
                     Constraint::Length(header_height),
                     Constraint::Length(ingestion_pane_height), // ingestion issues (0 = hidden)
                     Constraint::Min(3), // exchange pane — always at least 3 rows
-                    Constraint::Length(error_pane_height), // error pane (0 = hidden)
                 ])
                 .split(inner);
 
@@ -379,7 +432,6 @@ pub fn render(app: &App, frame: &mut Frame) {
             let header_area = split[1];
             let ingestion_area = split[2];
             let exchange_area = split[3];
-            let error_area = split[4];
 
             // Render the tab bar at the top.
             // NOTE: render_tab_bar is a no-op when no tabs are open, so this doesn't
@@ -409,12 +461,13 @@ pub fn render(app: &App, frame: &mut Frame) {
                 dep_split[1]
             };
             render_exchange_pane(app, frame, exchange_pane_area, main_focused);
-
-            // ── Error pane (collapsible) ───────────────────────────────────
-            // A 0-height `error_area` (pane closed) makes this a no-op.
-            render_error_pane(app, frame, error_area);
         }
     }
+
+    // ── Error pane (collapsible, global) ───────────────────────────────────
+    // A 0-height `error_area` (pane closed) makes this a no-op. Rendered for
+    // every content state so `[e]` always reveals the error log.
+    render_error_pane(app, frame, error_area);
 
     // ── Status bar ────────────────────────────────────────────────────────────
     // Key hints reflect the REAL keys: [o] open file browser, [s/p/c] run
@@ -1228,6 +1281,99 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
             frame.render_widget(para, inner);
         }
     }
+}
+
+// ── Plan detail pane ──────────────────────────────────────────────────────────
+
+/// Render the read-only detail pane for a discovered plan (Enter on a plan
+/// node): its slug, directory, and full task list parsed from `TASKS.md` — id,
+/// title, `GATED` marker, and direct dependencies — with a footer of key hints.
+/// Drawn into the main content area; the surrounding "Detail" border is already
+/// painted by the caller, so this adds no border of its own.
+fn render_plan_detail(app: &App, plan_idx: usize, frame: &mut Frame, area: Rect, _focused: bool) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let Some(plan) = app.discovered_plans.get(plan_idx) else {
+        return;
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                &plan.slug,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Dir:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                plan.dir.display().to_string(),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if plan.tasks.is_empty() {
+        let msg = if plan.has_tasks {
+            "TASKS.md is present but parsed no tasks."
+        } else {
+            "No TASKS.md yet — this plan still needs a task list."
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {msg}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let gated = plan.tasks.iter().filter(|t| t.gated).count();
+        let mut summary = format!("Tasks ({})", plan.tasks.len());
+        if gated > 0 {
+            summary.push_str(&format!("  ·  {gated} gated"));
+        }
+        lines.push(Line::from(Span::styled(
+            summary,
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+        for (i, t) in plan.tasks.iter().enumerate() {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:>2}. ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(&t.id, Style::default().fg(Color::Cyan)),
+                Span::styled(format!(" — {}", t.title), Style::default().fg(Color::White)),
+            ];
+            if t.gated {
+                spans.push(Span::styled("  GATED", Style::default().fg(Color::Yellow)));
+            }
+            lines.push(Line::from(spans));
+            if !t.depends_on.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("      depends on: {}", t.depends_on.join(", ")),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [Enter] close   [→] expand in tree   [o] open a task-list to run",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Clamp scroll so the footer stays visible when a long plan overflows.
+    let total = lines.len() as u16;
+    let scroll = total.saturating_sub(area.height);
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(para, area);
 }
 
 // ── Error pane (collapsible) ──────────────────────────────────────────────────
@@ -2474,6 +2620,12 @@ mod tests {
             dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
             slug: "0001-initial".to_string(),
             has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "cargo-scaffold".to_string(),
+                title: "Compiling Skeleton".to_string(),
+                gated: false,
+                depends_on: Vec::new(),
+            }],
         }];
 
         terminal.draw(|f| render(&app, f)).unwrap();
@@ -2482,6 +2634,111 @@ mod tests {
         assert!(
             screen.contains("0001-initial"),
             "sidebar must show the discovered plan slug even with no open runs;\nscreen was:\n{screen}"
+        );
+    }
+
+    /// An expanded plan must list its task previews as child rows in the sidebar.
+    #[test]
+    fn render_expanded_plan_shows_task_children() {
+        let mut terminal = make_terminal(90, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
+            slug: "0001-initial".to_string(),
+            has_tasks: true,
+            tasks: vec![
+                makina_core::orchestrator::PlanTaskPreview {
+                    id: "cargo-scaffold".to_string(),
+                    title: "Skeleton".to_string(),
+                    gated: false,
+                    depends_on: Vec::new(),
+                },
+                makina_core::orchestrator::PlanTaskPreview {
+                    id: "task-model".to_string(),
+                    title: "Domain Model".to_string(),
+                    gated: false,
+                    depends_on: vec!["cargo-scaffold".to_string()],
+                },
+            ],
+        }];
+        app.tree_cursor = Some(0);
+        app.collapsed_plans.insert(0); // PlansDiscovered seeds this in the real flow
+        // Plan starts collapsed (children hidden) until expanded.
+        terminal.draw(|f| render(&app, f)).unwrap();
+        assert!(
+            !screen_of(&terminal).contains("cargo-scaffold"),
+            "collapsed plan must not show its tasks"
+        );
+
+        // Expand it; both task ids must now appear.
+        app.update(crate::app::AppEvent::FocusRightOrExpand);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("cargo-scaffold") && screen.contains("task-model"),
+            "expanded plan must list its task ids; screen was:\n{screen}"
+        );
+    }
+
+    /// Enter on a plan opens a detail pane in the main area listing its tasks.
+    #[test]
+    fn render_plan_detail_pane_lists_tasks() {
+        let mut terminal = make_terminal(100, 26);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
+            slug: "0001-initial".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "json-store".to_string(),
+                title: "JSON Store".to_string(),
+                gated: true,
+                depends_on: vec!["task-model".to_string()],
+            }],
+        }];
+        app.tree_cursor = Some(0);
+        app.update(crate::app::AppEvent::OpenPlanDetail { plan_idx: 0 });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("Plan: 0001-initial"),
+            "detail header missing"
+        );
+        assert!(screen.contains("json-store"), "detail must list the task");
+        assert!(screen.contains("GATED"), "gated marker must show");
+        assert!(
+            screen.contains("depends on: task-model"),
+            "detail must show dependencies; screen:\n{screen}"
+        );
+    }
+
+    /// The error pane must render even when no run is selected (regression: it
+    /// used to be drawn only inside the run view, so `[e]` showed nothing).
+    #[test]
+    fn render_error_pane_shows_with_no_run_selected() {
+        let mut terminal = make_terminal(90, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.push_error(crate::app::ErrorMessage {
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            level: crate::app::ErrorLevel::Error,
+            text: "boom-happened".to_string(),
+        });
+        // Open the error pane via the real toggle event; no run is selected.
+        app.update(crate::app::AppEvent::ToggleErrorPane);
+        assert!(
+            app.selected_run().is_none(),
+            "precondition: no run selected"
+        );
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("Errors") && screen.contains("boom-happened"),
+            "error pane + message must render with no run; screen:\n{screen}"
         );
     }
 

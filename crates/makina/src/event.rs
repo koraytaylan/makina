@@ -400,24 +400,19 @@ async fn resolve_io(
             (AppEvent::Tick, status)
         }
         // ── Open focused node (plan 0031) ────────────────────────────────────────
-        // User pressed Enter on a focused node in the sidebar. Plans open their
-        // TASKS.md via api.execute(OpenRun). Tasks open a new tab.
+        // User pressed Enter on a focused node in the sidebar. A plan (or one of
+        // its task previews) opens the read-only plan detail pane; a run's task
+        // node opens a new tab.
         AppEvent::OpenFocusedNode => {
             use crate::app::{TabContent, TreeNode};
             match app.focused_node() {
-                Some(TreeNode::Plan { plan_idx }) => match app.discovered_plans.get(plan_idx) {
-                    Some(plan) => {
-                        let task_list_path = plan.dir.join("TASKS.md");
-                        let status = format!("Interpreting {}...", plan.slug);
-                        spawn_open_run(
-                            std::sync::Arc::clone(&app.api),
-                            task_list_path,
-                            background_tx.clone(),
-                        );
-                        (AppEvent::Tick, Some(status))
+                Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
+                    if plan_idx < app.discovered_plans.len() {
+                        (AppEvent::OpenPlanDetail { plan_idx }, None)
+                    } else {
+                        (AppEvent::Tick, Some("Plan not found".to_string()))
                     }
-                    None => (AppEvent::Tick, Some("Plan not found".to_string())),
-                },
+                }
                 Some(TreeNode::Task { run, task }) => {
                     // When Enter is pressed on a task node, open a new tab for that task.
                     if let Some(run_view) = app.runs.get(run)
@@ -954,7 +949,7 @@ async fn retry_focused(app: &App) -> Option<String> {
                 None
             }
         }
-        Some(TreeNode::Plan { .. }) => None,
+        Some(TreeNode::Plan { .. }) | Some(TreeNode::PlanTask { .. }) => None,
         None => None,
     };
 
@@ -972,7 +967,7 @@ async fn retry_focused(app: &App) -> Option<String> {
         .focused_node()
         .and_then(|node| match node {
             TreeNode::Run { run } | TreeNode::Task { run, .. } => app.runs.get(run),
-            TreeNode::Plan { .. } => None,
+            TreeNode::Plan { .. } | TreeNode::PlanTask { .. } => None,
         })
         .map(|rv| rv.status == RunStatus::Pending)
         .unwrap_or(false)
@@ -3140,33 +3135,22 @@ wall_clock_secs = 1200
     }
 
     #[tokio::test]
-    async fn enter_key_on_plan_node_opens_plan() {
+    async fn enter_key_on_plan_node_opens_detail_pane() {
         use crate::app::{App, AppEvent, TreeNode};
         use crate::placeholder::PlaceholderApi;
         use makina_core::orchestrator::PlanEntry;
         use std::sync::Arc;
 
-        // Create a temp repo with a plan directory
-        let tmpdir = tempfile::tempdir().unwrap();
-        let repo_root = tmpdir.path();
-        let plan_dir = repo_root.join("docs/plans/0001-test");
-        std::fs::create_dir_all(&plan_dir).unwrap();
-        std::fs::write(plan_dir.join("SCOPE.md"), "Scope").unwrap();
-        std::fs::write(plan_dir.join("ARCHITECTURE.md"), "Architecture").unwrap();
-        std::fs::write(
-            plan_dir.join("TASKS.md"),
-            "## 0001\n\n### task-1\n\n- Done when: test",
-        )
-        .unwrap();
-
+        let plan_dir = std::path::PathBuf::from("docs/plans/0001-test");
         let api = Arc::new(PlaceholderApi::empty());
-        let mut app = App::new(api, vec![], repo_root.to_path_buf());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         // Manually add discovered plan (simulating PlansDiscovered)
         app.discovered_plans = vec![PlanEntry {
             dir: plan_dir.clone(),
             slug: "0001-test".to_string(),
             has_tasks: true,
+            tasks: Vec::new(),
         }];
 
         // Move cursor to the plan node (index 0 in the tree)
@@ -3178,14 +3162,23 @@ wall_clock_secs = 1200
             Some(TreeNode::Plan { plan_idx: 0 })
         ));
 
-        // Resolve OpenFocusedNode: should spawn an OpenRun command and return a status
+        // Resolve OpenFocusedNode: Enter on a plan now opens the read-only plan
+        // detail pane (no run is interpreted/started).
         let (tx, _rx) = background_events();
         let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
 
-        // The resolved event should be Tick (the actual command runs in background)
-        assert!(matches!(resolved, AppEvent::Tick));
-        // Should have a status message about interpreting the plan
-        assert_eq!(status, Some("Interpreting 0001-test...".to_string()));
+        assert!(
+            matches!(resolved, AppEvent::OpenPlanDetail { plan_idx: 0 }),
+            "Enter on a plan must open its detail pane, got {resolved:?}"
+        );
+        assert_eq!(
+            status, None,
+            "opening the detail pane needs no status message"
+        );
+
+        // Applying the event sets the plan-detail selection.
+        app.update(resolved);
+        assert_eq!(app.plan_detail, Some(0));
     }
 
     #[test]

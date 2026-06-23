@@ -583,6 +583,9 @@ pub enum TreeNode {
     Task { run: usize, task: usize },
     /// A discovered plan at `discovered_plans[plan_idx]`.
     Plan { plan_idx: usize },
+    /// A read-only task preview under an *expanded* plan:
+    /// `discovered_plans[plan_idx].tasks[task_idx]`.
+    PlanTask { plan_idx: usize, task_idx: usize },
 }
 
 // ── App input event ───────────────────────────────────────────────────────────
@@ -696,12 +699,15 @@ pub enum AppEvent {
     },
     /// Open the focused node in the sidebar (Enter).
     ///
-    /// User pressed Enter on a `TreeNode::Plan` or other interactive node. The IO
-    /// layer resolves this by examining the focused node and dispatching the
-    /// appropriate command (e.g., `api.execute(OpenRun { task_list_path })` for a
-    /// plan). `update` itself does nothing for this variant (the async command runs
-    /// in the IO layer), keeping `update` pure.
+    /// User pressed Enter on a `TreeNode`. The IO layer resolves this by
+    /// examining the focused node and dispatching the appropriate event: a plan
+    /// (or plan-task) node resolves to [`AppEvent::OpenPlanDetail`]; a run's task
+    /// node resolves to [`AppEvent::OpenTab`].
     OpenFocusedNode,
+
+    /// Show the read-only detail pane for `discovered_plans[plan_idx]` in the
+    /// main area (Enter on a plan node). Sets [`App::plan_detail`].
+    OpenPlanDetail { plan_idx: usize },
 
     // ── Provider configuration editor (task 0041) ──────────────────────────────
     /// User requested to open the provider configuration editor (e.g. pressed `g`).
@@ -996,7 +1002,14 @@ pub struct App {
 
     /// Plan indices currently collapsed in the sidebar tree (excludes expanded plans).
     /// Parallel to `collapsed_runs` but keyed by index into `discovered_plans`.
+    /// Plans start collapsed: every discovered index is inserted on
+    /// [`AppEvent::PlansDiscovered`].
     pub collapsed_plans: HashSet<usize>,
+
+    /// The plan whose read-only detail pane is shown in the main area, keyed by
+    /// index into `discovered_plans`. Set by pressing Enter on a plan node
+    /// ([`AppEvent::OpenPlanDetail`]); cleared when a run/task node is focused.
+    pub plan_detail: Option<usize>,
 
     /// Index into `visible_tree_nodes()` of the focused sidebar node.
     /// `None` when no runs are open.
@@ -1204,11 +1217,15 @@ impl App {
     /// order shown in the sidebar (plans first, then runs and their tasks if expanded, repeat).
     pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
-        // Add discovered plans at the top, optionally expanded.
-        for (plan_idx, _plan) in self.discovered_plans.iter().enumerate() {
+        // Add discovered plans at the top. An expanded plan (not in
+        // `collapsed_plans`) contributes its parsed task previews as child nodes.
+        for (plan_idx, plan) in self.discovered_plans.iter().enumerate() {
             nodes.push(TreeNode::Plan { plan_idx });
-            // TODO (task tui-plan-tasks): if not collapsed, add plan's tasks as nested nodes.
-            // For now, plans are leaf nodes; tasks are only shown after expansion is implemented.
+            if !self.collapsed_plans.contains(&plan_idx) {
+                for task_idx in 0..plan.tasks.len() {
+                    nodes.push(TreeNode::PlanTask { plan_idx, task_idx });
+                }
+            }
         }
         // Add open runs and their expanded tasks (existing logic).
         for (run_idx, run) in self.runs.iter().enumerate() {
@@ -1245,6 +1262,9 @@ impl App {
             }
             Some(TreeNode::Run { run }) => {
                 self.selected_run = Some(run);
+                // Focusing a run leaves plan-land: drop any open plan detail so
+                // the run view takes the main pane.
+                self.plan_detail = None;
                 // Note: selected_task is no longer updated by sidebar navigation
                 // (plan 0031). Tabs manage task focus independently.
             }
@@ -1253,12 +1273,17 @@ impl App {
                 // the selected task. Task focus is now managed by the tab system
                 // (plan 0031), not by sidebar cursor movement.
                 self.selected_run = Some(run);
+                self.plan_detail = None;
             }
-            Some(TreeNode::Plan { .. }) => {
-                // Plan nodes are not yet integrated with run/task selection.
+            Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
+                // Plan / plan-task nodes have no associated run.
                 self.selected_run = None;
-                // Note: selected_task is no longer updated by sidebar navigation
-                // (plan 0031). Tabs manage task focus independently.
+                // The detail pane only shows the plan the user explicitly opened
+                // (via Enter). Moving onto a *different* plan closes the stale
+                // detail; moving among the opened plan's own tasks keeps it.
+                if self.plan_detail != Some(plan_idx) {
+                    self.plan_detail = None;
+                }
             }
         }
         // Load exchanges if the run changed.
@@ -1291,40 +1316,67 @@ impl App {
         old_cursor != Some(new_cursor)
     }
 
-    /// Toggle collapse on the focused node's run; keep the cursor on the run header;
-    /// re-sync. Returns whether the operation succeeded (i.e., there was a focused node).
+    /// Toggle collapse/expand on the focused node's parent (a run for run/task
+    /// nodes, a plan for plan/plan-task nodes); keep the cursor on that header
+    /// and re-sync. Returns whether anything toggled. A plan with no tasks is
+    /// not expandable (returns `false`).
     pub fn tree_toggle_expand(&mut self) -> bool {
-        let focused = self.focused_node();
-        let run_idx = match focused {
-            None => return false,
-            Some(TreeNode::Run { run }) => run,
-            Some(TreeNode::Task { run, .. }) => run,
-            Some(TreeNode::Plan { .. }) => return false, // Plans not yet expandable
-        };
-
-        // Get the run id.
-        if let Some(run) = self.runs.get(run_idx) {
-            let run_id = run.id;
-            // Toggle the collapse state.
-            if self.collapsed_runs.contains(&run_id) {
-                self.collapsed_runs.remove(&run_id);
-            } else {
-                self.collapsed_runs.insert(run_id);
+        match self.focused_node() {
+            None => false,
+            Some(TreeNode::Run { run }) | Some(TreeNode::Task { run, .. }) => {
+                let Some(run_view) = self.runs.get(run) else {
+                    return false;
+                };
+                let run_id = run_view.id;
+                if self.collapsed_runs.contains(&run_id) {
+                    self.collapsed_runs.remove(&run_id);
+                } else {
+                    self.collapsed_runs.insert(run_id);
+                }
+                self.move_cursor_to_run_header(run);
+                self.sync_selection_from_cursor();
+                true
             }
-
-            // Move cursor to the run's header node.
-            let nodes = self.visible_tree_nodes();
-            if let Some(idx) = nodes
-                .iter()
-                .position(|node| matches!(node, TreeNode::Run { run: r } if *r == run_idx))
-            {
-                self.tree_cursor = Some(idx);
+            Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
+                // No tasks → nothing to reveal; leave it as a leaf.
+                if self
+                    .discovered_plans
+                    .get(plan_idx)
+                    .is_none_or(|p| p.tasks.is_empty())
+                {
+                    return false;
+                }
+                if self.collapsed_plans.contains(&plan_idx) {
+                    self.collapsed_plans.remove(&plan_idx);
+                } else {
+                    self.collapsed_plans.insert(plan_idx);
+                }
+                self.move_cursor_to_plan_header(plan_idx);
+                self.sync_selection_from_cursor();
+                true
             }
+        }
+    }
 
-            self.sync_selection_from_cursor();
-            true
-        } else {
-            false
+    /// Park the tree cursor on the given run's header node.
+    fn move_cursor_to_run_header(&mut self, run_idx: usize) {
+        if let Some(idx) = self
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, TreeNode::Run { run: r } if *r == run_idx))
+        {
+            self.tree_cursor = Some(idx);
+        }
+    }
+
+    /// Park the tree cursor on the given plan's header node.
+    fn move_cursor_to_plan_header(&mut self, plan_idx: usize) {
+        if let Some(idx) = self
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, TreeNode::Plan { plan_idx: p } if *p == plan_idx))
+        {
+            self.tree_cursor = Some(idx);
         }
     }
 
@@ -1362,6 +1414,7 @@ impl App {
             selected_task,
             collapsed_runs: HashSet::new(),
             collapsed_plans: HashSet::new(),
+            plan_detail: None,
             tree_cursor,
             exchange_logs: HashMap::new(),
             task_last_activity_tick: HashMap::new(),
@@ -1649,15 +1702,25 @@ impl App {
                 true
             }
             AppEvent::FocusRightOrExpand => {
-                // On a *collapsed* run, the first `Right` expands it; on an already-
-                // expanded run, or a task leaf, `Right` crosses into the content pane.
-                let collapsed_run = matches!(
-                    self.focused_node(),
-                    Some(TreeNode::Run { run })
-                        if self.runs.get(run).is_some_and(|r| self.collapsed_runs.contains(&r.id)),
-                );
-                if collapsed_run {
-                    self.tree_toggle_expand(); // expand it; cursor stays on the run header
+                // On a *collapsed* run or plan, the first `Right` expands it; on an
+                // already-expanded node or a leaf, `Right` crosses into the content
+                // pane.
+                let collapsed_expandable = match self.focused_node() {
+                    Some(TreeNode::Run { run }) => self
+                        .runs
+                        .get(run)
+                        .is_some_and(|r| self.collapsed_runs.contains(&r.id)),
+                    Some(TreeNode::Plan { plan_idx }) => {
+                        self.collapsed_plans.contains(&plan_idx)
+                            && self
+                                .discovered_plans
+                                .get(plan_idx)
+                                .is_some_and(|p| !p.tasks.is_empty())
+                    }
+                    _ => false,
+                };
+                if collapsed_expandable {
+                    self.tree_toggle_expand(); // expand it; cursor stays on the header
                 } else {
                     self.focused_panel = Panel::Main;
                 }
@@ -1667,18 +1730,35 @@ impl App {
                 match self.focused_panel {
                     // From the content pane, `Left` steps back to the sidebar (no collapse).
                     Panel::Main => self.focused_panel = Panel::Sidebar,
-                    // In the sidebar, `Left` collapses an *expanded* run; a collapsed run
-                    // or a task leaf is a no-op.
-                    Panel::Sidebar => {
-                        let expanded_run = matches!(
-                            self.focused_node(),
-                            Some(TreeNode::Run { run })
-                                if self.runs.get(run).is_some_and(|r| !self.collapsed_runs.contains(&r.id)),
-                        );
-                        if expanded_run {
+                    // In the sidebar, `Left` collapses an *expanded* run/plan. On a
+                    // plan-task preview leaf, `Left` collapses its parent plan and
+                    // parks the cursor on it.
+                    Panel::Sidebar => match self.focused_node() {
+                        Some(TreeNode::Run { run })
+                            if self
+                                .runs
+                                .get(run)
+                                .is_some_and(|r| !self.collapsed_runs.contains(&r.id)) =>
+                        {
                             self.tree_toggle_expand(); // collapse it
                         }
-                    }
+                        Some(TreeNode::Plan { plan_idx })
+                            if !self.collapsed_plans.contains(&plan_idx)
+                                && self
+                                    .discovered_plans
+                                    .get(plan_idx)
+                                    .is_some_and(|p| !p.tasks.is_empty()) =>
+                        {
+                            self.tree_toggle_expand(); // collapse it
+                        }
+                        Some(TreeNode::PlanTask { plan_idx, .. }) => {
+                            // Collapse the parent plan and move the cursor up to it.
+                            self.collapsed_plans.insert(plan_idx);
+                            self.move_cursor_to_plan_header(plan_idx);
+                            self.sync_selection_from_cursor();
+                        }
+                        _ => {}
+                    },
                 }
                 true
             }
@@ -1861,8 +1941,39 @@ impl App {
                 // Store discovered plans for sidebar tree integration (task 0031).
                 // Plans are now navigated via the unified sidebar tree, not a modal.
                 self.discovered_plans = plans;
+                // Plans start collapsed: seed `collapsed_plans` with every index
+                // so the tree opens tidy and Right/Space/Enter reveal the tasks.
+                // (This also resets any prior expand state on a re-discovery.)
+                self.collapsed_plans = (0..self.discovered_plans.len()).collect();
+                // `discover_plans` sorts by directory name, so a re-discovery can
+                // shift indices. Drop any open plan detail rather than risk showing
+                // a *different* plan at the same index.
+                self.plan_detail = None;
+                // Keep the tree cursor valid against the freshly rebuilt node list
+                // and resync the derived selection — mirrors the RunLoaded invariant
+                // (`cursor_survives_runs_update`). On the common first-discovery path
+                // (no prior cursor) this parks it on the first plan so Right/Enter
+                // act on the plan instead of falling through to the content pane.
+                let node_count = self.visible_tree_nodes().len();
+                self.tree_cursor = match (self.tree_cursor, node_count) {
+                    (_, 0) => None,
+                    (None, _) => Some(0),
+                    (Some(c), n) => Some(c.min(n - 1)),
+                };
+                self.sync_selection_from_cursor();
                 self.status_message = None;
                 self.busy = None;
+                true
+            }
+
+            AppEvent::OpenPlanDetail { plan_idx } => {
+                // Enter on a plan node toggles its read-only detail pane: open it,
+                // or close it if it is already the one showing.
+                if self.plan_detail == Some(plan_idx) {
+                    self.plan_detail = None;
+                } else if plan_idx < self.discovered_plans.len() {
+                    self.plan_detail = Some(plan_idx);
+                }
                 true
             }
 
@@ -6253,17 +6364,31 @@ mod tests {
 
     // ── Plan picker (plan 0027) ───────────────────────────────────────────────
 
+    fn plan_task(id: &str, title: &str) -> makina_core::orchestrator::PlanTaskPreview {
+        makina_core::orchestrator::PlanTaskPreview {
+            id: id.to_string(),
+            title: title.to_string(),
+            gated: false,
+            depends_on: Vec::new(),
+        }
+    }
+
     fn make_plan_entries() -> Vec<makina_core::orchestrator::PlanEntry> {
         vec![
             makina_core::orchestrator::PlanEntry {
                 dir: PathBuf::from("/tmp/docs/plans/0001-alpha"),
                 slug: "0001-alpha".to_string(),
                 has_tasks: true,
+                tasks: vec![
+                    plan_task("scaffold", "Scaffold"),
+                    plan_task("model", "Model"),
+                ],
             },
             makina_core::orchestrator::PlanEntry {
                 dir: PathBuf::from("/tmp/docs/plans/0002-beta"),
                 slug: "0002-beta".to_string(),
                 has_tasks: false,
+                tasks: Vec::new(),
             },
         ]
     }
@@ -6308,6 +6433,7 @@ mod tests {
             dir: PathBuf::from("docs/plans/0001-test"),
             slug: "0001-test".to_string(),
             has_tasks: true,
+            tasks: Vec::new(),
         }];
         let mut app = App::new(api, vec![], PathBuf::from("."));
         app.discovered_plans = discovered_plans;
@@ -6317,6 +6443,132 @@ mod tests {
         assert!(
             matches!(nodes[0], TreeNode::Plan { plan_idx: 0 }),
             "First node should be a discovered plan"
+        );
+    }
+
+    /// `PlansDiscovered` must park the cursor on the first node (so Right/Enter
+    /// have a target) and start every plan collapsed (no task children shown).
+    #[test]
+    fn plans_discovered_places_cursor_and_collapses_plans() {
+        let mut app = make_app();
+        assert_eq!(app.tree_cursor, None, "no runs → no cursor initially");
+
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+
+        assert_eq!(
+            app.tree_cursor,
+            Some(0),
+            "cursor must land on the first plan"
+        );
+        assert!(matches!(
+            app.focused_node(),
+            Some(TreeNode::Plan { plan_idx: 0 })
+        ));
+        // Both plans collapsed → only the two headers are visible (alpha's 2
+        // tasks stay hidden until expanded).
+        assert_eq!(app.visible_tree_nodes().len(), 2);
+    }
+
+    /// First `Right` on a collapsed plan reveals its tasks; a second `Right`
+    /// (now expanded) crosses into the content pane.
+    #[test]
+    fn right_expands_collapsed_plan_then_crosses_to_main() {
+        let mut app = make_app();
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+
+        app.update(AppEvent::FocusRightOrExpand);
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "expanding keeps sidebar focus"
+        );
+        let nodes = app.visible_tree_nodes();
+        assert!(
+            matches!(
+                nodes.get(1),
+                Some(TreeNode::PlanTask {
+                    plan_idx: 0,
+                    task_idx: 0
+                })
+            ),
+            "alpha's first task must be revealed, got {nodes:?}"
+        );
+
+        app.update(AppEvent::FocusRightOrExpand);
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "second Right on an expanded plan crosses to content"
+        );
+    }
+
+    /// `Left` collapses an expanded plan back to a single header row.
+    #[test]
+    fn left_collapses_expanded_plan() {
+        let mut app = make_app();
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+        app.update(AppEvent::FocusRightOrExpand); // expand alpha
+        assert_eq!(
+            app.visible_tree_nodes().len(),
+            4,
+            "2 plan headers + alpha's 2 tasks"
+        );
+        app.update(AppEvent::FocusLeftOrCollapse); // collapse alpha
+        assert_eq!(app.visible_tree_nodes().len(), 2, "back to 2 headers");
+    }
+
+    /// Enter on a plan toggles its detail pane open then closed.
+    #[test]
+    fn open_plan_detail_toggles() {
+        let mut app = make_app();
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+        assert_eq!(app.plan_detail, None);
+        app.update(AppEvent::OpenPlanDetail { plan_idx: 0 });
+        assert_eq!(app.plan_detail, Some(0));
+        app.update(AppEvent::OpenPlanDetail { plan_idx: 0 });
+        assert_eq!(app.plan_detail, None, "Enter again closes the detail");
+    }
+
+    /// A re-discovery (e.g. pressing `[o]` again) must not leave the cursor
+    /// pointing past the rebuilt, all-collapsed node list, and must drop a stale
+    /// `plan_detail` whose index could now resolve to a different plan.
+    #[test]
+    fn re_discovery_clamps_cursor_and_clears_plan_detail() {
+        let mut app = make_app();
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+        // Expand alpha (2 task children) and park the cursor on its last task, then
+        // open a plan detail — i.e. a cursor index only valid while expanded.
+        app.update(AppEvent::FocusRightOrExpand);
+        app.tree_cursor = Some(2); // alpha's second PlanTask
+        app.update(AppEvent::OpenPlanDetail { plan_idx: 1 });
+        assert_eq!(app.plan_detail, Some(1));
+
+        // Re-discover the same plans: tree collapses to 2 header rows.
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+
+        let n = app.visible_tree_nodes().len();
+        assert_eq!(n, 2, "both plans collapsed again");
+        let cursor = app.tree_cursor.expect("cursor must remain set");
+        assert!(cursor < n, "cursor {cursor} must be within {n} nodes");
+        assert!(
+            app.focused_node().is_some(),
+            "focused_node must resolve after re-discovery"
+        );
+        assert_eq!(
+            app.plan_detail, None,
+            "stale plan detail must be cleared on re-discovery"
         );
     }
 
@@ -6333,6 +6585,7 @@ mod tests {
             dir: plan_dir.clone(),
             slug: "0001-test".to_string(),
             has_tasks: true,
+            tasks: Vec::new(),
         }];
 
         let mut app = App::new(api.clone(), vec![], PathBuf::from("."));

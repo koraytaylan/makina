@@ -192,6 +192,21 @@ fn is_plan_convention_dir(dir: &Path) -> bool {
     dir.join("SCOPE.md").is_file() && dir.join("ARCHITECTURE.md").is_file()
 }
 
+/// One task previewed from a plan's `TASKS.md`, for the read-only sidebar tree
+/// and plan-detail pane — parsed WITHOUT interpreting/opening a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTaskPreview {
+    /// The task's kebab id (the text before ` — ` in its `### {id} — {title}` heading).
+    pub id: String,
+    /// The task title (the text after ` — `, with any trailing `(GATED)` kept).
+    pub title: String,
+    /// `true` when the title ends with `(GATED)`.
+    pub gated: bool,
+    /// Direct prerequisite task ids from the task's `- **Depends on:**` bullet
+    /// (empty for `—` / `none`).
+    pub depends_on: Vec<String>,
+}
+
 /// One plan directory discovered under `docs/plans/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEntry {
@@ -202,6 +217,137 @@ pub struct PlanEntry {
     /// `true` when the dir contains a `TASKS.md` (openable via `OpenRun`);
     /// `false` routes to the planner-generate path (plan 0028).
     pub has_tasks: bool,
+    /// The plan's tasks parsed from `TASKS.md` in file order (empty when there is
+    /// no `TASKS.md` or it parses to zero tasks). Read-only preview data — the
+    /// authoritative task graph is still built by `OpenRun`'s interpreter.
+    pub tasks: Vec<PlanTaskPreview>,
+}
+
+/// Parse a plan's `TASKS.md` text into its tasks IN FILE ORDER, mirroring the
+/// ingestion heading contract (`### {id} — {title}` with the ` — ` =
+/// space+U+2014+space separator; `- **Depends on:**` lists direct prerequisites;
+/// a trailing `(GATED)` marks a gated task). This is a lightweight preview parser
+/// — it does NOT validate the graph; that remains `OpenRun`'s job.
+pub fn parse_plan_tasks(md: &str) -> Vec<PlanTaskPreview> {
+    const SEP: &str = " \u{2014} "; // space + em dash + space
+    let mut tasks: Vec<PlanTaskPreview> = Vec::new();
+    // When inside a task's `Depends on` field, accumulate soft-wrapped
+    // continuation lines into `dep_buf` until a structural boundary, matching the
+    // interpreter's multi-line field handling (interpreter::parse_structured_text,
+    // `ParseState::InDependsOn`). `dep_target` is the index of the task being filled.
+    let mut dep_buf: Option<(usize, String)> = None;
+
+    // Flush the accumulated Depends-on buffer into its task.
+    macro_rules! flush_deps {
+        () => {
+            if let Some((idx, buf)) = dep_buf.take()
+                && let Some(t) = tasks.get_mut(idx)
+            {
+                t.depends_on = parse_dep_list(&buf);
+            }
+        };
+    }
+
+    for raw in md.lines() {
+        let is_section = raw.starts_with("## ") && !raw.starts_with("### ");
+        let is_task = raw.starts_with("### ");
+
+        // While reading a multi-line Depends-on value, a blank line / new bullet
+        // field / heading / `---` ends it; anything else is a wrapped continuation.
+        if dep_buf.is_some() {
+            let trimmed = raw.trim();
+            let is_boundary = trimmed.is_empty()
+                || is_section
+                || is_task
+                || raw == "---"
+                || trimmed.starts_with("- **");
+            if is_boundary {
+                flush_deps!();
+                // fall through and process this line as a normal structural line
+            } else {
+                if let Some((_, buf)) = dep_buf.as_mut() {
+                    buf.push(' ');
+                    buf.push_str(trimmed);
+                }
+                continue;
+            }
+        }
+
+        // A workstream/other `## …` header (but not a `### …` task) ends the prior block.
+        if is_section {
+            continue;
+        }
+        // Task heading: `### {id} — {title}` (ignore deeper `#### …`).
+        if is_task && let Some(rest) = raw.strip_prefix("### ") {
+            if let Some((id, title)) = rest.split_once(SEP) {
+                let title = title.trim().to_string();
+                let gated = title.trim_end().ends_with("(GATED)");
+                tasks.push(PlanTaskPreview {
+                    id: id.trim().to_string(),
+                    title,
+                    gated,
+                    depends_on: Vec::new(),
+                });
+            }
+            continue;
+        }
+        // The `- **Depends on:**` bullet opens the (possibly multi-line) field.
+        let line = raw.trim_start();
+        if let Some(payload) = line
+            .strip_prefix("- **Depends on:**")
+            .or_else(|| line.strip_prefix("- **Depends on**:"))
+            && let Some(last) = tasks.len().checked_sub(1)
+        {
+            dep_buf = Some((last, payload.trim().to_string()));
+        }
+    }
+    flush_deps!(); // flush a Depends-on field that ran to EOF
+    tasks
+}
+
+/// Parse a `Depends on` payload into prerequisite ids: comma-separated leading
+/// kebab tokens, with `—` / `-` / `none` / empty meaning "no dependencies".
+/// Markdown backticks and parenthetical asides are stripped first.
+fn parse_dep_list(s: &str) -> Vec<String> {
+    let cleaned: String = {
+        // Drop parenthetical asides so a comma inside one doesn't fragment ids.
+        let mut out = String::with_capacity(s.len());
+        let mut depth = 0i32;
+        for ch in s.chars() {
+            match ch {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = (depth - 1).max(0),
+                '`' | '*' | '_' => {}
+                c if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    };
+    let mut deps = Vec::new();
+    for part in cleaned.split(',') {
+        let chunk = part.trim().trim_end_matches('.').trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let lower = chunk.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "—" | "–" | "-" | "none" | "n/a" | "na" | "tbd"
+        ) {
+            continue;
+        }
+        // Take only the leading kebab token (drop trailing prose like "foo and plan 0016").
+        let token: String = chunk
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        let token = token.trim_matches('-');
+        if !token.is_empty() {
+            deps.push(token.to_string());
+        }
+    }
+    deps
 }
 
 /// Scan `repo_root/docs/plans/*/` for plan directories following the
@@ -226,15 +372,25 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
         if !dir.join("SCOPE.md").is_file() || !dir.join("ARCHITECTURE.md").is_file() {
             continue; // non-plan dirs (assets/, etc.) are ignored
         }
-        let tasks = dir.join("TASKS.md");
-        let has_tasks = tasks.is_file();
+        let tasks_path = dir.join("TASKS.md");
+        let has_tasks = tasks_path.is_file();
+        // Parse the task preview (id/title/gated/deps) once, off the render
+        // thread, so the sidebar tree + plan-detail pane never touch the FS.
+        let tasks = if has_tasks {
+            std::fs::read_to_string(&tasks_path)
+                .map(|s| parse_plan_tasks(&s))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         // Slug is exactly what plan_slug derives from this dir's TASKS.md path,
         // whether or not the file exists (plan_slug keys off the parent dir name).
-        let slug = plan_slug(&tasks);
+        let slug = plan_slug(&tasks_path);
         entries.push(PlanEntry {
             dir,
             slug,
             has_tasks,
+            tasks,
         });
     }
     entries.sort_by(|a, b| a.dir.file_name().cmp(&b.dir.file_name()));
@@ -4527,6 +4683,107 @@ Description text that is long enough for parser.
         assert_eq!(entries[0].slug, "0001-x");
         assert!(entries[0].has_tasks);
         assert!(entries[0].dir.ends_with("0001-x"));
+    }
+
+    #[test]
+    fn parse_plan_tasks_extracts_id_title_gated_and_deps() {
+        let md = "\
+# Plan 0001 — Demo
+
+## 0001 — Foundation
+
+### cargo-scaffold — Compiling Skeleton
+- **Depends on:** —
+- **Done when:** it builds
+
+### task-model — Task Domain Model
+- **Depends on:** cargo-scaffold
+- **Done when:** types exist
+
+## 0002 — Hardening
+
+### audit-pass — Security Audit (GATED)
+- **Depends on:** task-model, cargo-scaffold (and plan 0002 merged)
+- **Done when:** approved
+";
+        let tasks = parse_plan_tasks(md);
+        assert_eq!(tasks.len(), 3, "three task headings, not the ## sections");
+        assert_eq!(tasks[0].id, "cargo-scaffold");
+        assert_eq!(tasks[0].title, "Compiling Skeleton");
+        assert!(!tasks[0].gated);
+        assert!(tasks[0].depends_on.is_empty(), "— means no deps");
+        assert_eq!(tasks[1].id, "task-model");
+        assert_eq!(tasks[1].depends_on, vec!["cargo-scaffold".to_string()]);
+        assert!(tasks[2].gated, "(GATED) suffix must set gated");
+        assert_eq!(
+            tasks[2].depends_on,
+            vec!["task-model".to_string(), "cargo-scaffold".to_string()],
+            "comma list parsed; parenthetical aside dropped"
+        );
+    }
+
+    #[test]
+    fn parse_plan_tasks_accumulates_wrapped_depends_on_lines() {
+        // Soft-wrapped Depends-on continuation lines (as real plans use) must be
+        // joined — matching the interpreter's multi-line field handling. A blank
+        // line ends the field.
+        let md = "\
+## 0001 — S
+
+### planner-actor — Planner Actor
+- **Depends on:** actor-traits, runtime-artifact-schema,
+  structured-text-convention
+- **Done when:** it works
+
+### loner — No Deps
+- **Depends on:** — (uses plan 0022's timestamp plumbing only as context; adds an
+  independent per-turn duration)
+- **Done when:** done
+";
+        let tasks = parse_plan_tasks(md);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            tasks[0].depends_on,
+            vec![
+                "actor-traits".to_string(),
+                "runtime-artifact-schema".to_string(),
+                "structured-text-convention".to_string(),
+            ],
+            "the third dep on the continuation line must not be dropped"
+        );
+        assert!(
+            tasks[1].depends_on.is_empty(),
+            "a `—` lead with a multi-line parenthetical aside is still no deps, got {:?}",
+            tasks[1].depends_on
+        );
+    }
+
+    #[test]
+    fn discover_plans_populates_task_previews() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let plans_dir = tmp.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
+        let plan = plans_dir.join("0001-x");
+        std::fs::create_dir(&plan).expect("create 0001-x");
+        std::fs::write(plan.join("SCOPE.md"), "scope").unwrap();
+        std::fs::write(plan.join("ARCHITECTURE.md"), "arch").unwrap();
+        std::fs::write(
+            plan.join("TASKS.md"),
+            "## 0001 — S\n\n### alpha — First\n- **Depends on:** —\n\n### beta — Second\n- **Depends on:** alpha\n",
+        )
+        .unwrap();
+
+        let entries = discover_plans(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"],
+            "discover_plans must parse the TASKS.md preview in file order"
+        );
     }
 
     #[test]

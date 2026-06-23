@@ -380,10 +380,19 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let meta = event.metadata();
+
+        // The TUI "Errors" pane is for actionable problems, not a firehose. Only
+        // WARN and ERROR are surfaced; INFO/DEBUG/TRACE (e.g. mio poll internals,
+        // routine interpreter notices) are dropped here so they neither inflate
+        // the `[e] errors(N)` badge nor bury real failures. (In `tracing`'s
+        // ordering a more-verbose level is *greater*, so `> WARN` is INFO+.)
+        if *meta.level() > tracing::Level::WARN {
+            return;
+        }
+
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
-
-        let meta = event.metadata();
         let record = LogRecord::now(
             *meta.level(),
             visitor.message.trim_end().to_owned(),
@@ -578,6 +587,36 @@ mod tests {
         assert!(
             !cache.map.contains_key(&oldest),
             "oldest writer must have been evicted"
+        );
+    }
+
+    /// The TUI log channel surfaces only WARN/ERROR — INFO/DEBUG/TRACE (mio poll
+    /// noise, routine notices) must be dropped so the "Errors" pane and its
+    /// `[e] errors(N)` badge stay meaningful.
+    #[test]
+    fn tui_layer_forwards_only_warn_and_error() {
+        let (layer, mut rx) = tui_log_channel();
+        let subscriber = registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!("noise-trace");
+            tracing::debug!("noise-debug");
+            tracing::info!("noise-info");
+            tracing::warn!("real-warn");
+            tracing::error!("real-error");
+        });
+
+        let mut got = Vec::new();
+        while let Ok(rec) = rx.try_recv() {
+            got.push((rec.level, rec.message));
+        }
+
+        assert_eq!(
+            got,
+            vec![
+                (tracing::Level::WARN, "real-warn".to_string()),
+                (tracing::Level::ERROR, "real-error".to_string()),
+            ],
+            "only WARN/ERROR may reach the TUI channel; got {got:?}"
         );
     }
 }
