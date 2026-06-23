@@ -1,12 +1,12 @@
 export const meta = {
   name: 'create-plan',
-  description: 'Author the next implementation plan(s) under docs/plans/ in the exact house style the implement-plan workflow consumes. A read-only SURVEY step scans docs/plans/ (the roll-up board + every per-plan STATUS.md), the docs/plans/README.md authoring guide, CONTRIBUTING.md, and recent git history to learn the next NNNN sequence number, the project quality-gate commands, a recent complete plan to mirror, and a ranked list of candidate next plans — derived from the user brief if one was given, otherwise auto-derived from the deferred / gated / follow-on / debt work the STATUS docs explicitly record. SELECT picks which (and how many) plans to author and fixes each plan a stable NNNN-Title-Case-Kebab folder. For each selected plan a research-backed BLUEPRINT agent reads the authoring guide, a reference plan, and the actual codebase, then returns a structured plan blueprint with real file:line anchors, workstreams, and junior-executable tasks (kebab ids, Depends-on edges, falsifiable Done-when gates). RENDER writes the full triad (SCOPE.md, ARCHITECTURE.md, TASKS.md) plus the per-plan STATUS.md from that single shared blueprint so the workstream ids stay 1:1 across all three docs and the TASKS.md parses under implement-plan exactly. VERIFY runs an adversarial critic against the README checklist and the implement-plan parse contract (grep-confirming a sample of cited anchors), looping a bounded fixer until clean. VALIDATE then runs implement-plan itself in dryRun on the freshly authored plan to prove its TASKS.md parses into an acyclic dependency DAG, folding any safety edges it surfaces back into the file. Finally a single ROLL-UP step adds a 📋 Planned row per new plan to docs/plans/STATUS.md. All files are written UNCOMMITTED for human review (or committed when commit:true). The plans are then ready to execute with implement-plan.',
+  description: 'Author the next implementation plan(s) under docs/plans/ in the exact house style the implement-plan workflow consumes. A read-only SURVEY step scans docs/plans/ (the roll-up board + every per-plan STATUS.md), the docs/plans/README.md authoring guide, CONTRIBUTING.md, and recent git history to learn the next NNNN sequence number, the project quality-gate commands, a recent complete plan to mirror, and a ranked list of candidate next plans — derived from the user brief if one was given, otherwise auto-derived from the deferred / gated / follow-on / debt work the STATUS docs explicitly record. SELECT picks which (and how many) plans to author and fixes each plan a stable NNNN-Title-Case-Kebab folder. For each selected plan a research-backed BLUEPRINT agent reads the authoring guide, a reference plan, and the actual codebase, then returns a structured plan blueprint with real file:line anchors, workstreams, and junior-executable tasks (kebab ids, Depends-on edges, falsifiable Done-when gates). RENDER writes the full triad (SCOPE.md, ARCHITECTURE.md, TASKS.md) plus the per-plan STATUS.md from that single shared blueprint so the workstream ids stay 1:1 across all three docs and the TASKS.md parses under implement-plan exactly. VERIFY first runs a DETERMINISTIC dependency-graph gate over the rendered TASKS.md — parsing its "Depends on" edges and rejecting any cycle (reporting the cycle path), any edge that points to a task declared LATER in the file (file order must be a valid topological order, since implement-plan linearizes by document order on a cycle fallback), and best-effort producer-after-consumer symbol orderings (the task that defines a struct/enum/field/const/fn must precede tasks that use it) — then runs an adversarial critic against the README checklist and the implement-plan parse contract (grep-confirming a sample of cited anchors), looping a bounded fixer until clean. VALIDATE then runs implement-plan itself in dryRun on the freshly authored plan to prove its TASKS.md parses into an acyclic dependency DAG, folding any safety edges it surfaces back into the file. Finally a single ROLL-UP step adds a 📋 Planned row per new plan to docs/plans/STATUS.md. All files are written UNCOMMITTED for human review (or committed when commit:true). The plans are then ready to execute with implement-plan.',
   phases: [
     { title: 'Survey', detail: 'read docs/plans/ (roll-up + per-plan STATUS), the README authoring guide, CONTRIBUTING, recent git; learn next NNNN, gate commands, a reference plan, and candidate next plans (from the brief or auto-derived from deferred/gated/follow-on work)' },
     { title: 'Select', detail: 'choose which and how many plans to author; assign each a stable NNNN-Title-Case-Kebab folder and fixed file paths' },
     { title: 'Blueprint', detail: 'per plan: a research agent reads the authoring guide, a reference plan, and the codebase, then returns a structured plan blueprint with real file:line anchors, workstreams, and junior-executable tasks' },
     { title: 'Render', detail: 'per plan: write SCOPE.md, ARCHITECTURE.md, TASKS.md, and the per-plan STATUS.md from the one shared blueprint so the triad stays internally consistent and TASKS.md parses under implement-plan' },
-    { title: 'Verify', detail: 'per plan: an adversarial critic checks the files against the README checklist and the implement-plan parse contract (grep-confirming cited anchors); a bounded fixer addresses blockers' },
+    { title: 'Verify', detail: 'per plan: a deterministic dependency-graph gate parses the rendered TASKS.md and rejects cycles, file-order inversions, and producer-after-consumer symbol orderings; an adversarial critic checks the files against the README checklist and the implement-plan parse contract (grep-confirming cited anchors); a bounded fixer addresses blockers' },
     { title: 'Validate', detail: 'per plan: run implement-plan in dryRun on the authored plan to prove TASKS.md parses into an acyclic DAG; fold any surfaced safety edges back into the file' },
     { title: 'Roll-up', detail: 'add a 📋 Planned row per new plan to the docs/plans/ roll-up board and bump its Last updated line (uncommitted, or committed when commit:true)' },
   ],
@@ -224,6 +224,10 @@ const VERIFY_SCHEMA = {
 
 const OK_SCHEMA = { type: 'object', additionalProperties: false, required: ['ok'], properties: { ok: { type: 'boolean' }, error: { type: 'string' } } }
 
+// The dependency-graph gate reads the rendered TASKS.md back verbatim so the (deterministic) graph
+// checks run over the file the engine actually consumes, not the in-memory blueprint.
+const TEXT_SCHEMA = { type: 'object', additionalProperties: false, required: ['ok'], properties: { ok: { type: 'boolean' }, text: { type: 'string' }, error: { type: 'string' } } }
+
 // ── Prompt builders (function declarations hoist) ─────────────────────────────
 function surveyPrompt(plansDirHint, brief) {
   let p = `You are the SURVEY step of a create-plan run: you gather the facts needed to author the project's next implementation plan(s). Do everything READ-ONLY — no edits, no commits, no branch changes.\n\n`
@@ -319,6 +323,7 @@ function verifyPlanPrompt(repoRoot, plan, readmePath) {
     + `The plan is at ${repoRoot}/${plan.planDir}/ (SCOPE.md, ARCHITECTURE.md, TASKS.md, STATUS.md). The authoring guide + its "Checklist for a new plan" is at ${repoRoot}/${readmePath}.\n\n`
     + `Check, and raise a blocker for any failure:\n`
     + `1. PARSE CONTRACT (set parseable=false on any miss): TASKS.md has "## NNNN — Name" workstream phases; each task is "### {kebab-id} — {Title}" with a "- **Depends on:**" bullet and a "- **Done when:**" bullet; task ids are unique + lower-kebab; every Depends-on id references a task id present in the file; the dependency graph is acyclic; GATED task titles end with " (GATED)".\n`
+    + `1b. DEPENDENCY-EDGE DIRECTION (set parseable=false on any miss): declaration/file order must be a valid TOPOLOGICAL order — NO task's "Depends on" may name a task declared LATER in the file (the implement-plan engine linearizes by document order when it falls back, so a later-pointing edge makes a consumer run before its producer). The task that DEFINES a symbol (a struct/enum/field/const/fn/module) must be declared BEFORE every task that uses it, so a producer task must never depend on its consumer. A deterministic graph gate runs alongside you and rejects cycles, later-pointing edges, and producer-after-consumer orderings — flag any you see so the fix addresses them too.\n`
     + `2. TRIAD CONSISTENCY: workstream ids are 1:1 across SCOPE "In scope", the ARCHITECTURE "## {id}" sections, and the TASKS phases; every numbered finding in SCOPE "Why this plan" appears in the origin→workstream table; ARCHITECTURE title ends with "(deltas)" and opens with the file-manifest blockquote ending "Line numbers are hints; locate by symbol."\n`
     + `3. ANCHOR REALITY: pick several file:line / symbol anchors cited across SCOPE and ARCHITECTURE and grep the repo to confirm the named symbol actually exists where claimed. Raise a blocker for any anchor that does not resolve.\n`
     + `4. JUNIOR-EXECUTABILITY: each task names exact files/symbols/values, pins the test verbatim, leaves no "which?/what?/how?" open, and has a Done-when a reviewer can mark pass/fail mechanically. Done-when cites the project gate commands except where a task is explicitly documentation-only. GPU-touching tests embed the GpuKernel::is_available() self-skip guard.\n`
@@ -333,7 +338,8 @@ function verifyPlanPrompt(repoRoot, plan, readmePath) {
 
 function fixPlanPrompt(repoRoot, plan, findings) {
   return `A reviewer found issues in the authored plan at ${repoRoot}/${plan.planDir}/. Fix EACH finding by editing the affected file(s) in place; preserve everything that is already correct, and keep the implement-plan TASKS.md parse contract intact. If a finding is about a wrong file:line anchor, grep the repo for the real location and correct it. Do NOT commit.\n\n`
-    + TASKS_CONTRACT + `\n\nFindings to address:\n`
+    + TASKS_CONTRACT + `\n\n`
+    + `For any dependency CYCLE, file-order INVERSION, or symbol-order INVERSION finding: do NOT simply delete the offending "Depends on" edge. Work out the correct producer→consumer direction from the task bodies (the task that DEFINES a struct/enum/field/const/fn/module must run before tasks that USE it), then make declaration order a valid topological order — REORDER whole task blocks within their workstream so every task is declared after all of its dependencies, and rewrite each "Depends on" to list only earlier-declared ids (flip any reversed edge). When you move a task, move its entire "### {id} — {Title}" heading + context + Steps + bullets together and keep the content intact. Then re-check that no remaining "Depends on" points to a later task and the graph is acyclic.\n\nFindings to address:\n`
     + findings.map(x => `- [${x.severity}] ${x.file ? x.file + ': ' : ''}${x.note}`).join('\n')
     + `\n\nEdit only files inside ${plan.planDir}. Return ok=true once every blocker is addressed, ok=false + error otherwise.`
 }
@@ -343,6 +349,12 @@ function foldEdgesPrompt(repoRoot, tasksPath, addedEdges) {
     + `For each edge "to ← from" below, add "from" to the "- **Depends on:**" bullet of task "to" (replace a "—"/"-" with the id; otherwise append ", {id}"). Change NOTHING else. Keep the parse contract intact. Do NOT commit.\n`
     + addedEdges.map(e => `- ${e.to} ← ${e.from}${e.reason ? ` (${e.reason})` : ''}`).join('\n')
     + `\n\nEdit ONLY ${tasksPath}. Return ok=true on success, ok=false + error otherwise.`
+}
+
+// Read the rendered TASKS.md back verbatim so the deterministic dependency-graph gate can parse it.
+// (Workflow scripts have no filesystem access; this thin agent `cat`s the file for the in-script checks.)
+function readTasksPrompt(repoRoot, tasksPath) {
+  return `Read ${repoRoot}/${tasksPath} and return its COMPLETE, EXACT contents in the "text" field — every line verbatim, with NO edits, reformatting, truncation, or added commentary. Run \`cat "${repoRoot}/${tasksPath}"\` and copy stdout exactly. This is READ-ONLY: modify no files, run no git commands. If the file is missing, return ok=false + error. Otherwise ok=true with the verbatim contents in text.`
 }
 
 function rollupPrompt(repoRoot, rollupPath, rows) {
@@ -372,14 +384,15 @@ function checkBlueprintGraph(bp) {
     const ws = String(t.workstream || '')
     if (!(bp.workstreams || []).some(w => w.id === ws)) issues.push(`task ${t.id} references unknown workstream "${ws}"`)
   }
-  // Cycle detection (Kahn).
-  const indeg = new Map(ids.map(id => [id, 0]))
-  const adj = new Map(ids.map(id => [id, []]))
-  for (const t of tasks) for (const dep of (t.dependsOn || [])) if (idSet.has(dep)) { adj.get(dep).push(t.id); indeg.set(t.id, indeg.get(t.id) + 1) }
-  const q = ids.filter(id => indeg.get(id) === 0)
-  let seen = 0
-  while (q.length) { const id = q.shift(); seen++; for (const n of adj.get(id)) { indeg.set(n, indeg.get(n) - 1); if (indeg.get(n) === 0) q.push(n) } }
-  if (seen !== ids.length) issues.push('dependency cycle among tasks')
+  // Dependency-order checks (shared with the rendered-file gate): cycles (reported with the offending
+  // path) and edges that point to a task declared LATER in the blueprint. The implement-plan engine
+  // linearizes by document order when it must, so declaration order has to be a valid topological order.
+  const order = analyzeDepOrder(tasks.map((t, i) => ({ id: t.id, deps: (t.dependsOn || []), index: i })))
+  if (order.cycle) issues.push(`dependency CYCLE: ${order.cycle.join(' → ')}`)
+  for (const b of order.backward) {
+    if (order.cycle && cycleHasEdge(order.cycle, b.task, b.dep)) continue   // a cycle already implies a backward edge
+    issues.push(`task ${b.task} (#${b.taskPos + 1}) depends on ${b.dep} declared later (#${b.depPos + 1}) — declaration order must be a valid topological order`)
+  }
   // Findings coverage. Match the finding NUMBER as a bounded token so "(1)" / "1" count but "10" does
   // NOT satisfy finding 1 (a plain includes() would false-positive), while still accepting the house
   // convention of descriptive origin cells like "First problem (1)".
@@ -402,6 +415,190 @@ function checkBlueprintGraph(bp) {
   }
   return issues
 }
+
+// <graph-gate> — deterministic dependency-graph validation over a RENDERED TASKS.md. These functions
+// are PURE (no workflow-runtime deps) so they run in the workflow sandbox and can be unit-tested in
+// plain Node by slicing this sentinel block. They mirror the implement-plan engine's dependency-
+// verification pass (cycle detection + "wrong edge" flags) but at AUTHORING time, so a defective graph
+// is rejected before the plan is finalized instead of surfacing during execution.
+
+// Parse a rendered TASKS.md into its tasks IN FILE ORDER. Mirrors the implement-plan discovery
+// contract: "## NNNN — Name" = a workstream phase header (NOT a task); "### {kebab-id} — Title" = a
+// task (a trailing "(GATED)" marks it gated); "- **Depends on:** a, b" lists direct prerequisites
+// ("—"/"-"/"none"/empty = none). Dashes may be em (—), en (–), figure (‒/⁓) or ASCII hyphen.
+function parseTasksGraph(md) {
+  const lines = String(md == null ? '' : md).split(/\r?\n/)
+  const taskHead = /^###\s+([A-Za-z0-9][A-Za-z0-9_-]*)\s+[‒–—―-]\s+(.*\S)\s*$/
+  const depLine = /^\s*[-*]\s+\*\*\s*Depends on\s*:?\s*\*\*\s*:?\s*(.*)$/i
+  const tasks = []
+  let cur = null
+  for (const line of lines) {
+    if (/^###\s/.test(line) && !/^####/.test(line)) {
+      const m = line.match(taskHead)
+      if (m) {
+        cur = { id: m[1], title: m[2], index: tasks.length, deps: [], depsRaw: null, gated: /\(GATED\)\s*$/.test(m[2]), bodyLines: [] }
+        tasks.push(cur)
+        continue
+      }
+      // a "### " line that is not a conforming task heading: fall through and treat as body text
+    } else if (/^##\s/.test(line)) {
+      cur = null   // workstream/other header → the prior task's body ends here
+      continue
+    }
+    if (cur) {
+      cur.bodyLines.push(line)
+      if (cur.depsRaw === null) {
+        const dm = line.match(depLine)
+        if (dm) { cur.depsRaw = dm[1].trim(); cur.deps = parseDepList(cur.depsRaw) }
+      }
+    }
+  }
+  return tasks
+}
+
+// Parse a "- **Depends on:** ..." payload into a list of prerequisite ids. A lone dash / "none" / "n/a"
+// / "tbd" / empty means no dependencies. The house style permits prose annotations on the line — e.g.
+// "retry-redispatch (and plan 0016 merged)" or "— (but requires plan 0016)" — so parenthetical/bracketed
+// asides are stripped FIRST (a comma inside such a note must not fragment into bogus ids), markdown
+// emphasis/backticks are dropped, and each comma-separated chunk contributes only its LEADING id token
+// (trailing prose like "foo and plan 0016 merged" yields just "foo"). Cross-plan refs that aren't tasks
+// in this file fall out downstream (they're filtered by the in-file id set, exactly as implement-plan
+// tolerates unknown deps) — this parser's job is to recover the real in-file edges cleanly.
+function parseDepList(s) {
+  let t = String(s == null ? '' : s)
+  t = t.replace(/\([^()]*\)/g, ' ').replace(/\[[^\][]*\]/g, ' ')   // drop (…) / […] asides (with any inner commas)
+  t = t.replace(/[`*_]/g, ' ').replace(/\.\s*$/, '').trim()        // drop markdown emphasis + a trailing period
+  if (!t) return []
+  const none = /^(?:[‒–—―-]+|none|n\/a|na|tbd)$/i
+  const out = []
+  for (const part of t.split(',')) {
+    const chunk = part.trim()
+    if (!chunk || none.test(chunk)) continue
+    const m = chunk.match(/^[a-z0-9]+(?:-[a-z0-9]+)*/i)            // leading kebab token only
+    if (m) out.push(m[0])
+  }
+  return out
+}
+
+// The fenced code (``` … ```) of a parsed task, joined — used for the best-effort symbol analysis so a
+// symbol mentioned only in prose does not count as a real reference.
+function codeOf(task) {
+  const out = []
+  let inFence = false
+  for (const line of (task.bodyLines || [])) {
+    if (/^\s*```/.test(line)) { inFence = !inFence; continue }
+    if (inFence) out.push(line)
+  }
+  return out.join('\n')
+}
+
+// DFS cycle finder over items [{id, deps}] (deps = "this depends on"). Returns the cycle as an id PATH
+// (e.g. ['a','b','a'] for a→b→a) or null. Unknown dep ids are ignored (reported separately).
+function findCycle(items) {
+  const byId = new Map(items.map(x => [x.id, x]))
+  const color = new Map(items.map(x => [x.id, 0]))   // 0 white, 1 gray, 2 black
+  const stack = []
+  let found = null
+  function dfs(id) {
+    color.set(id, 1); stack.push(id)
+    const it = byId.get(id)
+    for (const dep of ((it && it.deps) || [])) {
+      if (!byId.has(dep)) continue
+      if (color.get(dep) === 1) { found = stack.slice(stack.indexOf(dep)).concat(dep); return true }
+      if (color.get(dep) === 0 && dfs(dep)) return true
+    }
+    color.set(id, 2); stack.pop(); return false
+  }
+  for (const it of items) { if (color.get(it.id) === 0 && dfs(it.id)) break }
+  return found
+}
+
+// (a) cycle (with path) + (b) backward edges (a dep that points to a LATER-declared id) over an ordered
+// list of {id, deps, index?}. Index defaults to position. This is the shared core of both the blueprint
+// check and the rendered-file gate.
+function analyzeDepOrder(items) {
+  const idSet = new Set(items.map(x => x.id))
+  const indexOf = new Map(items.map((x, i) => [x.id, (x.index == null ? i : x.index)]))
+  const cycle = findCycle(items)
+  const backward = []
+  for (const it of items) for (const dep of (it.deps || [])) {
+    if (dep === it.id || !idSet.has(dep)) continue
+    if (indexOf.get(dep) > indexOf.get(it.id)) backward.push({ task: it.id, dep, taskPos: indexOf.get(it.id), depPos: indexOf.get(dep) })
+  }
+  return { cycle, backward }
+}
+
+// Does the cycle path contain the directed dependency edge a→dep (a depends on dep)?
+function cycleHasEdge(cycle, a, dep) {
+  if (!cycle) return false
+  for (let k = 0; k + 1 < cycle.length; k++) if (cycle[k] === a && cycle[k + 1] === dep) return true
+  return false
+}
+
+// (c) Best-effort symbol-direction inversions: a task that DEFINES an item (struct/enum/trait/type/
+// const/static/fn/mod) must be declared before tasks that USE it. We only consider definitions/uses
+// inside fenced code, require a UNIQUE producer, and skip common/short names — so this is conservative
+// (high precision, deliberately low recall; the critic agent covers the subtler field-level cases).
+function symbolInversions(tasks) {
+  const STOP = new Set(['new', 'default', 'main', 'from', 'into', 'self', 'clone', 'build', 'run', 'spawn', 'fmt', 'drop', 'next', 'poll', 'value', 'inner', 'name', 'kind', 'with', 'test', 'mock', 'this', 'item', 'node', 'data', 'iter', 'len'])
+  const DEF = /\b(?:pub\s+)?(?:async\s+)?(?:struct|enum|trait|type|const|static|fn|mod)\s+([A-Za-z_][A-Za-z0-9_]*)/g
+  const code = tasks.map(codeOf)
+  const defs = new Map()   // sym -> Set(taskIndex)
+  tasks.forEach((t, i) => {
+    DEF.lastIndex = 0
+    let m
+    while ((m = DEF.exec(code[i]))) {
+      const sym = m[1]
+      if (sym.length < 4 || STOP.has(sym)) continue
+      if (!defs.has(sym)) defs.set(sym, new Set())
+      defs.get(sym).add(i)
+    }
+  })
+  const findings = []
+  for (const [sym, idxs] of defs) {
+    if (idxs.size !== 1) continue                       // ambiguous producer → skip (stay conservative)
+    const prod = [...idxs][0]
+    const useRe = new RegExp(`\\b${sym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`)
+    for (let i = 0; i < prod; i++) {                    // only EARLIER consumers are file-order inversions
+      if (useRe.test(code[i])) {
+        findings.push({ severity: 'blocker', file: 'TASKS.md', note: `symbol-order INVERSION (best-effort): task "${tasks[i].id}" (#${i + 1}) references "${sym}" in its code, but "${sym}" is defined by task "${tasks[prod].id}" (#${prod + 1}), which is declared LATER. The task that defines a symbol must precede tasks that use it — reorder so "${tasks[prod].id}" comes first, or fix the dependency direction.` })
+        break
+      }
+    }
+  }
+  return findings
+}
+
+// The authoring-side dependency-graph gate: parse a rendered TASKS.md and return blocker findings for
+// (duplicate/self/unknown ids), (a) cycles, (b) file-order inversions, and (c) symbol inversions.
+// `findings.length === 0` ⇒ the graph is a clean, acyclic, file-order-topological DAG.
+function analyzeTaskGraph(md) {
+  const tasks = parseTasksGraph(md)
+  const findings = []
+  const seen = new Set()
+  for (const t of tasks) { if (seen.has(t.id)) findings.push({ severity: 'blocker', file: 'TASKS.md', note: `duplicate task id "${t.id}" — task ids must be unique` }); seen.add(t.id) }
+  // A task may not depend on itself. (Unknown / cross-plan dep ids are NOT flagged here: the house style
+  // permits "Depends on" caveats that reference other plans, and the implement-plan engine simply ignores
+  // an unresolved id — so the deterministic gate stays scoped to the three in-file defect classes and
+  // leaves typo'd-id judgment to the adversarial critic.)
+  for (const t of tasks) for (const dep of t.deps) {
+    if (dep === t.id) findings.push({ severity: 'blocker', file: 'TASKS.md', note: `task "${t.id}" lists itself in "Depends on"` })
+  }
+  const items = tasks.map((t, i) => ({ id: t.id, deps: t.deps, index: i }))
+  const { cycle, backward } = analyzeDepOrder(items)
+  if (cycle) findings.push({ severity: 'blocker', file: 'TASKS.md', note: `dependency CYCLE: ${cycle.join(' → ')}. The implement-plan engine detects this and falls back to a fully sequential chain, forfeiting all cross-workstream parallelism — break the cycle by removing or reversing one edge so the graph is acyclic.` })
+  for (const b of backward) {
+    if (cycle && cycleHasEdge(cycle, b.task, b.dep)) continue   // don't double-report the cycle's own edges
+    findings.push({ severity: 'blocker', file: 'TASKS.md', note: `file-order INVERSION: task "${b.task}" (declared #${b.taskPos + 1}) depends on "${b.dep}" (declared LATER, #${b.depPos + 1}). File order must be a valid topological order because the engine linearizes by document order — move "${b.dep}" above "${b.task}", or the edge is reversed (should "${b.dep}" depend on "${b.task}"?).` })
+  }
+  for (const f of symbolInversions(tasks)) findings.push(f)
+  // dedupe identical notes
+  const out = []
+  const noteSeen = new Set()
+  for (const f of findings) { if (noteSeen.has(f.note)) continue; noteSeen.add(f.note); out.push(f) }
+  return { tasks, findings: out, cycle, backward, summary: `${tasks.length} task(s) parsed; ${out.length} graph blocker(s)${cycle ? ' (incl. a cycle)' : ''}` }
+}
+// </graph-gate>
 
 // ── 1. Survey ──────────────────────────────────────────────────────────────────
 phase('Survey')
@@ -462,23 +659,56 @@ if (DRY_RUN) {
 // pipeline() has NO barrier between stages, so plan B can be researching while plan A is rendering.
 // Each plan writes only files inside its own folder, so concurrent plans never collide; the single
 // shared file (the roll-up board) is written once, after, in the Roll-up barrier.
-async function verifyAndFix(plan) {
+// Deterministic dependency-graph gate over the RENDERED TASKS.md. Reads the file back (the script has
+// no fs access) and runs the in-script graph checks: cycles, file-order inversions, and best-effort
+// symbol inversions. Returns blocker findings the verify loop must drive to zero. Never false-blocks on
+// a flaky/truncated read — it skips the check that round instead (the read is compared against the
+// blueprint's task count to detect under-parsing).
+async function gateTasksGraph(plan, bp) {
+  if (!plan.tasksPath) return { findings: [], summary: 'no TASKS.md path', cycle: null }
+  const r = await agent(readTasksPrompt(REPO, plan.tasksPath), { label: `graph-read:${plan.number}`, phase: 'Verify', model: AUTHOR_MODEL, schema: TEXT_SCHEMA })
+  const text = (r && r.ok && typeof r.text === 'string') ? r.text : ''
+  if (!text) { log(`verify ${plan.number}: dependency-graph gate could not read ${plan.tasksPath} (${(r && r.error) || 'no text'}); skipping the graph check this round.`); return { findings: [], summary: 'unread', cycle: null } }
+  const res = analyzeTaskGraph(text)
+  const expected = (bp && Array.isArray(bp.tasks)) ? bp.tasks.length : 0
+  if (res.tasks.length < 2 || (expected && res.tasks.length < Math.max(2, expected - 2))) {
+    log(`verify ${plan.number}: dependency-graph gate parsed only ${res.tasks.length} task(s)${expected ? ` of ~${expected} expected` : ''} from ${plan.tasksPath} — treating as an unreliable/truncated read and skipping the graph check this round.`)
+    return { findings: [], summary: `under-parsed (${res.tasks.length}/${expected})`, cycle: null }
+  }
+  if (res.findings.length) log(`verify ${plan.number}: dependency-graph gate parsed ${res.tasks.length} task(s); ${res.findings.length} blocker(s)${res.cycle ? ` — CYCLE ${res.cycle.join('→')}` : ''}.`)
+  return { findings: res.findings, summary: res.summary, cycle: res.cycle }
+}
+
+async function verifyAndFix(plan, bp) {
   if (!DO_VERIFY) return { approved: true, parseable: true, findings: [], skipped: true }
   let verdict = null
+  let graph = null
   for (let i = 1; i <= MAX_VERIFY_ITERS; i++) {
+    // (NEW) deterministic dependency-graph gate FIRST — catches cycles / file-order + symbol inversions
+    // the adversarial critic can miss, mirroring the implement-plan engine's verification pass but at
+    // authoring time (a defective graph is rejected before the plan is finalized).
+    graph = await gateTasksGraph(plan, bp)
     verdict = await agent(
       verifyPlanPrompt(REPO, plan, README_PATH),
       { label: `verify:${plan.number}#${i}`, phase: 'Verify', model: CRITIC_MODEL, effort: 'high', agentType: 'Explore', schema: VERIFY_SCHEMA }
     )
-    if (verdict && verdict.approved && verdict.parseable) { log(`verify ${plan.number}: clean on round ${i}.`); break }
-    const blockers = (verdict && verdict.findings || []).filter(f => f.severity === 'blocker')
+    const graphBlockers = (graph && graph.findings) || []
+    const criticBlockers = ((verdict && verdict.findings) || []).filter(f => f.severity === 'blocker')
+    const blockers = [...criticBlockers, ...graphBlockers]
+    if (!graphBlockers.length && verdict && verdict.approved && verdict.parseable) { log(`verify ${plan.number}: clean (critic + dependency-graph gate) on round ${i}.`); break }
     if (!blockers.length && verdict && verdict.parseable) { log(`verify ${plan.number}: only nits on round ${i}; accepting.`); break }
-    if (i === MAX_VERIFY_ITERS) { log(`verify ${plan.number}: still ${blockers.length} blocker(s) after ${i} round(s); left as-authored for inspection.`); break }
-    log(`verify ${plan.number}: round ${i} found ${blockers.length} blocker(s); fixing.`)
+    if (i === MAX_VERIFY_ITERS) { log(`verify ${plan.number}: still ${blockers.length} blocker(s)${graphBlockers.length ? ` (incl. ${graphBlockers.length} dependency-graph)` : ''} after ${i} round(s); left as-authored for inspection.`); break }
+    log(`verify ${plan.number}: round ${i} found ${blockers.length} blocker(s)${graphBlockers.length ? ` (incl. ${graphBlockers.length} from the graph gate)` : ''}; fixing.`)
     const fixFindings = blockers.length ? blockers : [{ severity: 'blocker', note: 'reviewer rejected but listed no findings; re-check the parse contract and triad consistency' }]
     await agent(fixPlanPrompt(REPO, plan, fixFindings), { label: `fix:${plan.number}#${i}`, phase: 'Verify', model: AUTHOR_MODEL, schema: OK_SCHEMA })
   }
-  return verdict || { approved: false, parseable: false, findings: [{ severity: 'blocker', note: 'no verdict' }] }
+  const graphBlockers = (graph && graph.findings) || []
+  return {
+    approved: !!(verdict && verdict.approved && verdict.parseable && graphBlockers.length === 0),
+    parseable: !!(verdict && verdict.parseable && graphBlockers.length === 0),
+    findings: [...((verdict && verdict.findings) || []), ...graphBlockers],
+    graph: graph ? { cycle: graph.cycle || null, blockers: graphBlockers.length, summary: graph.summary } : null,
+  }
 }
 
 async function validatePlan(plan) {
@@ -537,7 +767,7 @@ const authored = await pipeline(
     return { bp, writeOk: ok }
   },
   // Stage 3 — Verify (adversarial critic) + bounded fixer.
-  async (r, plan) => ({ ...r, verify: await verifyAndFix(plan) }),
+  async (r, plan) => ({ ...r, verify: await verifyAndFix(plan, r.bp) }),
   // Stage 4 — Validate via implement-plan dryRun (real consumer), fold any safety edges.
   async (r, plan) => {
     const validate = await validatePlan(plan)
@@ -579,6 +809,7 @@ if (DO_COMMIT) {
 
 for (const p of ok) {
   if (p.validate && p.validate.edgesFolded === false) log(`WARNING ${p.number}: implement-plan surfaced safety edges that could NOT be folded into TASKS.md automatically — add them by hand before implementing.`)
+  if (p.verify && p.verify.graph && p.verify.graph.blockers > 0) log(`WARNING ${p.number}: the dependency-graph gate left ${p.verify.graph.blockers} unresolved issue(s)${p.verify.graph.cycle ? ` (cycle ${p.verify.graph.cycle.join('→')})` : ''} in TASKS.md — fix the "Depends on" edges/ordering before implementing.`)
 }
 const summary = ok.map(p => `${p.number}-${p.slug} (${p.taskCount} tasks${p.verify && p.verify.approved ? ', verified' : p.verify && p.verify.skipped ? '' : ', verify had findings'}${p.validate && p.validate.ok ? ', parse-OK' : ''})`).join('; ')
 log(`Done: authored ${ok.length} plan(s) — ${summary}. Review the files, then run implement-plan (dryRun first), e.g. implement-plan ${ok[0].number}.`)
@@ -589,6 +820,7 @@ return {
     taskCount: p.taskCount, plannedOutcome: p.plannedOutcome,
     filesOk: p.writeOk, verified: !!(p.verify && p.verify.approved), parseOk: !!(p.validate && p.validate.ok),
     edgesFolded: !(p.validate && p.validate.edgesFolded === false),
+    graphGateClean: !(p.verify && p.verify.graph && p.verify.graph.blockers > 0),
   })),
   rollupUpdated: rollupDone, committed,
   skipped: skipped.map(c => ({ title: c.title, kind: c.kind })),
