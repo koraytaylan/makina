@@ -63,8 +63,10 @@
 //! already happened).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::paths;
 
@@ -145,6 +147,26 @@ pub struct WorktreeManager {
     /// Branch new task branches fork from. `None` ⇒ fork from `base_branch`
     /// (legacy ask-path). The run sets this to `plan/{plan_slug}`.
     pub fork_branch: Option<String>,
+
+    /// Serializes worktree-lifecycle git operations ([`create`](Self::create) /
+    /// [`remove`](Self::remove)) across concurrent drivers running against the
+    /// **same repository**.
+    ///
+    /// `git worktree prune` — run by both `create` and `remove` — deletes any
+    /// `.git/worktrees/<name>/` admin directory that looks incomplete.  Without
+    /// this lock it races a *concurrent* `git worktree add` that has already
+    /// created the admin dir but not yet written its `gitdir` file: prune deletes
+    /// the half-built dir, then `add` fails with
+    /// `could not open '.git/worktrees/<name>/gitdir' for writing: No such file
+    /// or directory`, driving the task to a spurious `Failed`.  This guard makes
+    /// `prune`/`add`/`remove` mutually exclusive on the shared repo.
+    ///
+    /// Shared across clones via the `Arc` — the manager is cloned per task (and
+    /// the per-task clones flow through [`with_fork_branch`](Self::with_fork_branch)),
+    /// so a single `new()` yields one process-wide lock for that repo.  The guard
+    /// is held only around the (fast) git metadata ops, never across the
+    /// dev/review work, so it does not serialize the tasks themselves.
+    op_lock: Arc<Mutex<()>>,
 }
 
 impl WorktreeManager {
@@ -159,6 +181,7 @@ impl WorktreeManager {
             repo_root,
             base_branch,
             fork_branch: None,
+            op_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -216,6 +239,14 @@ impl WorktreeManager {
         let worktree_path = self.worktree_path(plan_slug, task_id);
         let branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
 
+        // Serialize this whole lifecycle against any concurrent driver's
+        // `create`/`remove` on the same repo.  The `git worktree prune` below (and
+        // in `remove`) deletes incomplete `.git/worktrees/<name>/` admin dirs,
+        // which races a concurrent `git worktree add` mid-flight — see `op_lock`.
+        // Held for the entire method; the reclaim path calls `remove_inner`, which
+        // does NOT re-acquire, so the non-reentrant mutex never self-deadlocks.
+        let _op_guard = self.op_lock.lock().await;
+
         // Prune stale registrations first so git doesn't complain about
         // already-registered-but-gone paths from previous crashed runs.
         self.git_worktree_prune().await?;
@@ -231,7 +262,8 @@ impl WorktreeManager {
                 task_id,
                 "reclaiming stale worktree/branch from a prior interrupted run"
             );
-            self.remove(plan_slug, task_id).await?;
+            // Already holding `op_lock`: call the non-locking inner helper.
+            self.remove_inner(plan_slug, task_id).await?;
         }
 
         // Create the worktree + branch in one atomic git command.
@@ -276,7 +308,26 @@ impl WorktreeManager {
     /// - [`WorktreeError::InvalidTaskId`] — bad task ID.
     /// - [`WorktreeError::GitCommandFailed`] — a git command failed for a
     ///   reason other than "not found".
+    ///
+    /// # Concurrency
+    ///
+    /// Acquires `op_lock` so the teardown's `git worktree remove`/`branch -D`/
+    /// `prune` cannot run concurrently with another driver's `create`/`remove`
+    /// on the same repo (see `op_lock`).
     pub async fn remove(&self, plan_slug: &str, task_id: &str) -> Result<(), WorktreeError> {
+        // Serialize against concurrent worktree-lifecycle git ops (see `op_lock`).
+        let _op_guard = self.op_lock.lock().await;
+        self.remove_inner(plan_slug, task_id).await
+    }
+
+    /// Worktree + branch teardown **without** acquiring `op_lock`.
+    ///
+    /// The caller MUST already hold `op_lock`: this is invoked by the public
+    /// [`remove`](Self::remove) (which takes the lock) and by
+    /// [`create`](Self::create)'s reclaim path (which holds the lock for its whole
+    /// body).  Splitting the lock acquisition out of the body is what lets
+    /// `create` reclaim a stale slot without dead-locking the non-reentrant mutex.
+    async fn remove_inner(&self, plan_slug: &str, task_id: &str) -> Result<(), WorktreeError> {
         validate_task_id(task_id)?;
 
         let worktree_path = self.worktree_path(plan_slug, task_id);

@@ -4982,11 +4982,7 @@ Description text that is long enough for parser.
 
         let config = no_gate_config();
 
-        let worktree_manager = WorktreeManager {
-            repo_root: tmp.path().to_path_buf(),
-            base_branch: "main".into(),
-            fork_branch: None,
-        };
+        let worktree_manager = WorktreeManager::new(tmp.path().to_path_buf(), "main".into());
 
         let api = CoreApi::with_audit_registry(
             Arc::new(StructuredTextInterpreter::new()),
@@ -5078,11 +5074,7 @@ Description text that is long enough for parser.
             planner_interpreter,
             Arc::clone(&backend),
             Arc::clone(&backend),
-            WorktreeManager {
-                repo_root: tmp.path().to_path_buf(),
-                base_branch: "main".into(),
-                fork_branch: None,
-            },
+            WorktreeManager::new(tmp.path().to_path_buf(), "main".into()),
             config,
             Arc::new(NoopAuditRegistry),
         );
@@ -5144,11 +5136,7 @@ Description text that is long enough for parser.
             planner_interpreter,
             Arc::clone(&backend),
             Arc::clone(&backend),
-            WorktreeManager {
-                repo_root: tmp.path().to_path_buf(),
-                base_branch: "main".into(),
-                fork_branch: None,
-            },
+            WorktreeManager::new(tmp.path().to_path_buf(), "main".into()),
             config,
             Arc::new(NoopAuditRegistry),
         );
@@ -5199,11 +5187,7 @@ Description text that is long enough for parser.
             planner_interpreter,
             Arc::clone(&backend),
             Arc::clone(&backend),
-            WorktreeManager {
-                repo_root: tmp.path().to_path_buf(),
-                base_branch: "main".into(),
-                fork_branch: None,
-            },
+            WorktreeManager::new(tmp.path().to_path_buf(), "main".into()),
             config,
             Arc::new(NoopAuditRegistry),
         );

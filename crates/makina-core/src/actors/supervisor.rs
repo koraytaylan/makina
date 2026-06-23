@@ -422,7 +422,10 @@ struct DriverContext {
     /// `Mutex<()>` whose guard is held for the minimal merge span only.
     merge_lock: Arc<Mutex<()>>,
 
-    /// Worktree/branch lifecycle manager (safe for concurrent distinct IDs).
+    /// Worktree/branch lifecycle manager.  Its `create`/`remove` serialize their
+    /// git operations across concurrent drivers via an internal lock (shared by
+    /// all clones), so the `git worktree prune` they run cannot race a concurrent
+    /// `git worktree add` — see [`WorktreeManager`].
     worktree_manager: WorktreeManager,
 
     /// The gate runner (stateless; reused across tasks/iterations).
