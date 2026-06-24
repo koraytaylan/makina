@@ -1099,14 +1099,29 @@ fn translate_terminal_event(
             MouseEventKind::ScrollUp => AppEvent::ScrollUpAt(m.column, m.row),
             MouseEventKind::ScrollDown => AppEvent::ScrollDownAt(m.column, m.row),
             MouseEventKind::Down(MouseButton::Left) => {
-                // A click on a header toggles it; otherwise begin a text selection as before.
-                if let Some((section, _)) =
-                    app.accordion_header_bounds.borrow().iter().find(|(_, r)| {
-                        r.x <= m.column
-                            && m.column < r.x + r.width
-                            && r.y <= m.row
-                            && m.row < r.y + r.height
-                    })
+                // Hit-test, in priority order: a tab chip activates that tab; a
+                // sidebar row opens/focuses that node's tab (mirrors Enter); an
+                // accordion header toggles it; otherwise begin a text selection.
+                let in_bounds = |r: &ratatui::layout::Rect| {
+                    r.x <= m.column
+                        && m.column < r.x + r.width
+                        && r.y <= m.row
+                        && m.row < r.y + r.height
+                };
+                if let Some((idx, _)) = app.tab_bounds.borrow().iter().find(|(_, r)| in_bounds(r)) {
+                    AppEvent::ActivateTab(*idx)
+                } else if let Some((idx, _)) = app
+                    .sidebar_node_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(_, r)| in_bounds(r))
+                {
+                    AppEvent::OpenTreeRow(*idx)
+                } else if let Some((section, _)) = app
+                    .accordion_header_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(_, r)| in_bounds(r))
                 {
                     AppEvent::ToggleAccordionSection(*section)
                 } else {
@@ -1468,6 +1483,62 @@ mod tests {
         assert!(
             matches!(right, AppEvent::Tick),
             "non-left buttons must be no-ops"
+        );
+    }
+
+    /// A left click hit-tests, in priority order, the tab chips then the sidebar
+    /// rows (both recorded during render), falling back to a text selection when
+    /// the click lands on neither. This is what makes clicking a tab switch tabs
+    /// and clicking a sidebar row open/focus its tab.
+    #[test]
+    fn left_click_hit_tests_tabs_then_sidebar_rows() {
+        use ratatui::layout::Rect;
+
+        let app = test_app();
+        // Simulate the bounds a render would have recorded.
+        app.tab_bounds.borrow_mut().push((
+            1,
+            Rect {
+                x: 5,
+                y: 0,
+                width: 8,
+                height: 1,
+            },
+        ));
+        app.sidebar_node_bounds.borrow_mut().push((
+            2,
+            Rect {
+                x: 0,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+        ));
+
+        let click = |col, row| {
+            translate_terminal_event(
+                mouse_at(MouseEventKind::Down(MouseButton::Left), col, row),
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &app,
+            )
+        };
+
+        // Inside the tab chip → activate that tab.
+        assert!(
+            matches!(click(6, 0), AppEvent::ActivateTab(1)),
+            "click on a tab chip activates it"
+        );
+        // Inside a sidebar row → open/focus that node's tab.
+        assert!(
+            matches!(click(4, 3), AppEvent::OpenTreeRow(2)),
+            "click on a sidebar row opens that node"
+        );
+        // Outside both → fall back to text selection.
+        assert!(
+            matches!(click(50, 20), AppEvent::SelectionStart(50, 20)),
+            "click on empty space starts a selection"
         );
     }
 

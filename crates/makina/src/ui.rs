@@ -122,6 +122,13 @@ pub fn render(app: &App, frame: &mut Frame) {
     // runs — gate on the flattened node list, not `runs` alone, so a freshly
     // opened project that has plans but no runs yet still renders its plans.
     let tree_nodes = app.visible_tree_nodes();
+    // Reset per-frame click bounds up front; the sidebar branch and
+    // `render_tab_bar` refill them. Clearing unconditionally here (rather than
+    // only where they are populated) means a frame whose match arm draws no tab
+    // bar — e.g. the no-tabs hint — can't leave a previous frame's chip bounds
+    // around to absorb a stray click.
+    app.sidebar_node_bounds.borrow_mut().clear();
+    app.tab_bounds.borrow_mut().clear();
     if tree_nodes.is_empty() {
         // Empty state. While a background job is running (e.g. startup plan
         // discovery) show an animated spinner + label so the empty sidebar
@@ -308,6 +315,28 @@ pub fn render(app: &App, frame: &mut Frame) {
 
         frame.render_stateful_widget(sidebar_list, sidebar_area, &mut list_state);
 
+        // Record one clickable bound per visible row so a mouse click can
+        // open/focus that node's tab (mirrors keyboard Enter). Every tree node
+        // is exactly one row; the first visible row maps to the list's scroll
+        // offset. See the `Down(Left)` hit-test in `event::translate_terminal_event`.
+        {
+            let mut node_bounds = app.sidebar_node_bounds.borrow_mut();
+            let visible_rows =
+                sidebar_visible.min(total_items.saturating_sub(sidebar_scroll_offset));
+            for row in 0..visible_rows {
+                let node_idx = sidebar_scroll_offset + row;
+                node_bounds.push((
+                    node_idx,
+                    Rect {
+                        x: sidebar_inner.x,
+                        y: sidebar_inner.y + row as u16,
+                        width: sidebar_inner.width,
+                        height: 1,
+                    },
+                ));
+            }
+        }
+
         // Record the sidebar scroll-max this frame and render scrollbar if needed.
         app.last_scroll_maxes
             .borrow_mut()
@@ -455,19 +484,20 @@ pub fn render(app: &App, frame: &mut Frame) {
         }
         (None, Some(task_id), Some(run)) => {
             // An active task tab shows the task entry (metadata + Markdown body).
+            // Split content area to reserve 1 row for tab bar at the top.
+            let task_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(3)])
+                .split(content_area);
+
+            let tab_area = task_split[0];
+            let task_area = task_split[1];
+
+            // Render the tab bar first so it stays visible even if the task
+            // itself can't be resolved in the selected run.
+            render_tab_bar(app, frame, tab_area);
+
             if let Some(task_idx) = find_task_idx_in_run(app, &task_id) {
-                // Split content area to reserve 1 row for tab bar at the top
-                let task_split = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(3)])
-                    .split(content_area);
-
-                let tab_area = task_split[0];
-                let task_area = task_split[1];
-
-                // Render the tab bar
-                render_tab_bar(app, frame, tab_area);
-
                 // Render the task entry pane below the tab bar
                 render_task_entry_pane(app, run, task_idx, frame, task_area);
 
@@ -476,6 +506,19 @@ pub fn render(app: &App, frame: &mut Frame) {
                     panel: ScrollablePanel::TaskEntry,
                     rect: task_area,
                 });
+            } else {
+                // The active task tab points at a task that is no longer in the
+                // selected run — keep the tab bar and show a hint rather than a
+                // blank pane.
+                let hint = Paragraph::new(vec![
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "  This task is no longer available.",
+                        Style::default().fg(Color::DarkGray),
+                    )]),
+                ])
+                .style(Style::default().fg(Color::White));
+                frame.render_widget(hint, task_area);
             }
         }
         (None, _, Some(run)) => {
@@ -579,8 +622,19 @@ pub fn render(app: &App, frame: &mut Frame) {
             });
         }
         _ => {
-            // Fallback: no run selected but a task tab is somehow active (shouldn't happen).
-            // Show the same hint as the no-run case.
+            // Fallback: a tab is active but its task can't be resolved to a run
+            // (e.g. the run was closed). Keep the tab bar visible when any tab is
+            // open so the strip never silently disappears, and show a hint below.
+            let hint_area = if app.tabs.open_tabs.is_empty() {
+                content_area
+            } else {
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(3)])
+                    .split(content_area);
+                render_tab_bar(app, frame, split[0]);
+                split[1]
+            };
             let hint_lines = vec![
                 Line::from(""),
                 Line::from(vec![Span::styled(
@@ -590,7 +644,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 Line::from(""),
             ];
             let hint_para = Paragraph::new(hint_lines).style(Style::default().fg(Color::White));
-            frame.render_widget(hint_para, content_area);
+            frame.render_widget(hint_para, hint_area);
         }
     }
 
@@ -750,26 +804,63 @@ pub fn render(app: &App, frame: &mut Frame) {
 /// Render the dependency-view sub-pane for the selected task.
 ///
 /// Render the tab bar showing open tabs above the main content pane.
-#[allow(dead_code)]
+///
+/// Each tab is drawn as a `│ kind label │` chip — the active one bold on a Cyan
+/// background, inactive ones dim on DarkGray — so the row reads as a tab strip.
+/// The clickable bound of every chip is recorded in `app.tab_bounds` so the
+/// event loop can activate the tab under a mouse click (see the `Down(Left)`
+/// hit-test in `event::translate_terminal_event`).
 fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let mut bounds = app.tab_bounds.borrow_mut();
+    bounds.clear();
     if app.tabs.open_tabs.is_empty() {
         return; // No tabs to render
     }
 
     let mut spans = Vec::new();
+    // `x` tracks the column where the next chip starts so recorded bounds line
+    // up exactly with what is drawn.
+    let mut x = area.x;
+    let area_end = area.x.saturating_add(area.width);
+    // Leading divider so the first chip reads as a bordered tab.
+    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+    x = x.saturating_add(1);
+
     for (idx, tab) in app.tabs.open_tabs.iter().enumerate() {
-        let label = match tab {
-            TabContent::Task { task_id, .. } => task_id.0.clone(),
-            TabContent::Plan { plan_slug } => plan_slug.clone(),
+        let (kind, label) = match tab {
+            TabContent::Task { task_id, .. } => ("task ", task_id.0.clone()),
+            TabContent::Plan { plan_slug } => ("plan ", plan_slug.clone()),
         };
+        let chip = format!(" {kind}{label} ");
+        let chip_w = chip.chars().count() as u16;
+
+        // Record the clickable bound for this chip, clamped to the bar width.
+        if x < area_end {
+            let width = chip_w.min(area_end - x);
+            bounds.push((
+                idx,
+                Rect {
+                    x,
+                    y: area.y,
+                    width,
+                    height: 1,
+                },
+            ));
+        }
+
         let is_active = app.tabs.active_tab == Some(idx);
         let style = if is_active {
-            Style::default().bg(Color::Cyan).fg(Color::Black)
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(Color::DarkGray).fg(Color::White)
+            Style::default().bg(Color::DarkGray).fg(Color::Gray)
         };
-        spans.push(Span::styled(format!(" {} ", label), style));
-        spans.push(Span::raw(" "));
+        spans.push(Span::styled(chip, style));
+        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+        // Chip width + 1 for the trailing divider.
+        x = x.saturating_add(chip_w).saturating_add(1);
     }
     let para = Paragraph::new(Line::from(spans));
     frame.render_widget(para, area);

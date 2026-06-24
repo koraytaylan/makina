@@ -841,6 +841,13 @@ pub enum AppEvent {
     NextTab,
     /// Switch to the previous tab (or wrap to the last).
     PrevTab,
+    /// Activate (switch to) the tab at the given index — a mouse click on the
+    /// tab bar resolves to this.
+    ActivateTab(usize),
+    /// Open (or focus) the tab for the visible tree node at the given index and
+    /// move the sidebar cursor to it — a mouse click on a sidebar row resolves
+    /// to this, mirroring the keyboard Enter (`OpenFocusedNode`) behaviour.
+    OpenTreeRow(usize),
 
     // ── Accordion sections (plan 0032) ───────────────────────────────────────
     /// Toggle the accordion section for the active plan tab.
@@ -1266,6 +1273,17 @@ pub struct App {
     /// Cleared and repopulated every frame, so resizes and pane reflows self-correct.
     /// `RefCell` so the `&App` render pass can rewrite it, mirroring `selection_panes`.
     pub accordion_header_bounds: std::cell::RefCell<Vec<(AccordionSection, Rect)>>,
+
+    /// Bounding box of each tab chip in the tab bar, keyed by its index in
+    /// `tabs.open_tabs`, recorded during `render_tab_bar` so a mouse click can
+    /// activate the tab under the cursor. Cleared and repopulated every frame.
+    pub tab_bounds: std::cell::RefCell<Vec<(usize, Rect)>>,
+
+    /// Bounding box of each visible sidebar row, keyed by its index in
+    /// `visible_tree_nodes()`, recorded during the sidebar render so a mouse
+    /// click can open/focus that node's tab (mirrors keyboard Enter). Cleared
+    /// and repopulated every frame, so scrolling and resizes self-correct.
+    pub sidebar_node_bounds: std::cell::RefCell<Vec<(usize, Rect)>>,
 }
 
 impl App {
@@ -1345,6 +1363,36 @@ impl App {
             }
         }
         // Load exchanges if the run changed.
+        if self.selected_run != prev_run {
+            self.load_exchanges_for_selected_run();
+        }
+    }
+
+    /// When the active tab is a task tab, point `selected_run` at the run that
+    /// contains that task so the task-entry pane actually renders.
+    ///
+    /// The task-tab render arm scopes its task lookup to `selected_run`
+    /// (`find_task_idx_in_run`), but `selected_run` is otherwise driven only by
+    /// the sidebar cursor. Without this sync, switching to a task tab (via tab
+    /// click or Next/Prev) while the cursor sits on a plan node leaves
+    /// `selected_run = None`, so the task tab renders a blank pane. Plan tabs
+    /// need no run and are left untouched.
+    fn sync_selected_run_to_active_tab(&mut self) {
+        let Some(active) = self.tabs.active_tab else {
+            return;
+        };
+        let Some(TabContent::Task { plan_slug, task_id }) = self.tabs.open_tabs.get(active) else {
+            return;
+        };
+        let plan_slug = plan_slug.clone();
+        let task_id = task_id.clone();
+        let prev_run = self.selected_run;
+        if let Some(run_idx) = self.runs.iter().position(|run| {
+            makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
+                && run.tasks.iter().any(|t| t.id == task_id)
+        }) {
+            self.selected_run = Some(run_idx);
+        }
         if self.selected_run != prev_run {
             self.load_exchanges_for_selected_run();
         }
@@ -1538,6 +1586,8 @@ impl App {
             selection_panes: std::cell::RefCell::new(Vec::new()),
             panel_geometries: std::cell::RefCell::new(Vec::new()),
             accordion_header_bounds: std::cell::RefCell::new(Vec::new()),
+            tab_bounds: std::cell::RefCell::new(Vec::new()),
+            sidebar_node_bounds: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -2797,12 +2847,14 @@ impl App {
             // ── Tabbed content pane (plan 0031) ───────────────────────────────
             AppEvent::OpenTab(content) => {
                 self.tabs.open_tab(content);
+                self.sync_selected_run_to_active_tab();
                 true
             }
             AppEvent::CloseTab => {
                 if let Some(active) = self.tabs.active_tab {
                     self.tabs.close_tab(active);
                 }
+                self.sync_selected_run_to_active_tab();
                 true
             }
             AppEvent::NextTab => {
@@ -2810,6 +2862,7 @@ impl App {
                     let next = (self.tabs.active_tab.unwrap_or(0) + 1) % self.tabs.open_tabs.len();
                     self.tabs.active_tab = Some(next);
                 }
+                self.sync_selected_run_to_active_tab();
                 true
             }
             AppEvent::PrevTab => {
@@ -2817,6 +2870,53 @@ impl App {
                     let len = self.tabs.open_tabs.len();
                     let prev = (self.tabs.active_tab.unwrap_or(0) + len - 1) % len;
                     self.tabs.active_tab = Some(prev);
+                }
+                self.sync_selected_run_to_active_tab();
+                true
+            }
+            // Mouse click on a tab chip: activate it (mirror Next/Prev semantics).
+            AppEvent::ActivateTab(idx) => {
+                if idx < self.tabs.open_tabs.len() {
+                    self.tabs.active_tab = Some(idx);
+                    self.sync_selected_run_to_active_tab();
+                }
+                true
+            }
+            // Mouse click on a sidebar row: move the cursor there and open/focus
+            // that node's tab, mirroring the keyboard Enter (`OpenFocusedNode`)
+            // path resolved in `event::resolve_io`. Kept here (not in
+            // `resolve_io`) because moving the cursor mutates `App`, which
+            // `resolve_io` cannot do (it takes `&App`).
+            AppEvent::OpenTreeRow(idx) => {
+                let nodes = self.visible_tree_nodes();
+                let Some(node) = nodes.get(idx).copied() else {
+                    return false;
+                };
+                // Move the sidebar highlight to the clicked row and re-sync the
+                // selected run/exchanges from it.
+                self.tree_cursor = Some(idx);
+                self.sync_selection_from_cursor();
+                match node {
+                    TreeNode::Plan { plan_idx } | TreeNode::PlanTask { plan_idx, .. } => {
+                        if let Some(plan) = self.discovered_plans.get(plan_idx) {
+                            let plan_slug = plan.slug.clone();
+                            self.tabs.open_tab(TabContent::Plan { plan_slug });
+                        }
+                    }
+                    TreeNode::Task { run, task } => {
+                        if let Some(run_view) = self.runs.get(run)
+                            && let Some(task_view) = run_view.tasks.get(task)
+                        {
+                            let plan_slug =
+                                makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+                            let task_id = task_view.id.clone();
+                            self.tabs.open_tab(TabContent::Task { plan_slug, task_id });
+                            self.sync_selected_run_to_active_tab();
+                        }
+                    }
+                    // Clicking a run header just selects it (handled by the cursor
+                    // sync above); it opens no tab, matching Enter on a run node.
+                    TreeNode::Run { .. } => {}
                 }
                 true
             }
@@ -8791,5 +8891,129 @@ mod tests {
                 "active_tab index should be valid"
             );
         }
+    }
+
+    /// A mouse click on a tab chip (resolved to `ActivateTab`) switches the
+    /// active tab to that index.
+    #[test]
+    fn activate_tab_event_switches_active_tab() {
+        use crate::app::TabContent;
+
+        let mut app = make_app_with_tasks();
+        let task_a = app.runs[0].tasks[0].id.clone();
+        let task_b = app.runs[0].tasks[1].id.clone();
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "p".into(),
+            task_id: task_a,
+        });
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "p".into(),
+            task_id: task_b,
+        });
+        assert_eq!(app.tabs.active_tab, Some(1), "second tab active after open");
+
+        // Clicking the first tab chip activates it.
+        app.update(AppEvent::ActivateTab(0));
+        assert_eq!(
+            app.tabs.active_tab,
+            Some(0),
+            "ActivateTab(0) switches to it"
+        );
+
+        // Out-of-range index is a no-op (does not panic or change state).
+        app.update(AppEvent::ActivateTab(99));
+        assert_eq!(
+            app.tabs.active_tab,
+            Some(0),
+            "out-of-range ActivateTab is a no-op"
+        );
+    }
+
+    /// A mouse click on a sidebar plan row (resolved to `OpenTreeRow`) opens a
+    /// plan tab and moves the tree cursor to that row — mirroring keyboard Enter.
+    #[test]
+    fn open_tree_row_opens_plan_tab_and_moves_cursor() {
+        use crate::app::{TabContent, TreeNode};
+        use makina_core::orchestrator::PlanEntry;
+
+        let mut app = make_app_with_tasks();
+        app.discovered_plans.push(PlanEntry {
+            slug: "0099-clickable".to_string(),
+            dir: PathBuf::from("docs/plans/0099"),
+            has_tasks: false,
+            tasks: vec![],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        });
+
+        // The plan is the first visible node (plans render above runs).
+        let nodes = app.visible_tree_nodes();
+        let plan_row = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Plan { .. }))
+            .expect("a plan node should be visible");
+
+        app.update(AppEvent::OpenTreeRow(plan_row));
+
+        assert_eq!(
+            app.tree_cursor,
+            Some(plan_row),
+            "cursor moves to clicked row"
+        );
+        assert_eq!(app.tabs.open_tabs.len(), 1, "one plan tab opened");
+        assert!(
+            matches!(
+                app.tabs.open_tabs.first(),
+                Some(TabContent::Plan { plan_slug }) if plan_slug == "0099-clickable"
+            ),
+            "clicking a plan row opens that plan's tab"
+        );
+    }
+
+    /// Regression: switching to a task tab must re-point `selected_run` at the
+    /// run that owns the task, so the task pane renders even when the sidebar
+    /// cursor previously cleared the run (e.g. it sat on a plan node). Without
+    /// the sync the task tab would render a blank pane.
+    #[test]
+    fn switching_to_task_tab_syncs_selected_run() {
+        // make_app_with_tasks has one run (".tasks/x.json") with task-a / task-b.
+        let mut app = make_app_with_tasks();
+        let nodes = app.visible_tree_nodes();
+        // Node layout with no plans: [Run, Task(a), Task(b)].
+        let task_a_row = 1;
+        let task_b_row = 2;
+        assert!(
+            matches!(
+                nodes.get(task_a_row),
+                Some(crate::app::TreeNode::Task { .. })
+            ),
+            "row 1 should be a task node"
+        );
+
+        // Open both task tabs via the click path (derives plan_slug from the run).
+        app.update(AppEvent::OpenTreeRow(task_a_row));
+        app.update(AppEvent::OpenTreeRow(task_b_row));
+        assert_eq!(app.tabs.open_tabs.len(), 2, "two task tabs open");
+
+        // Simulate the cursor landing on a plan node, which clears selected_run.
+        app.selected_run = None;
+
+        // Switching tabs must re-derive selected_run from the active task tab.
+        app.update(AppEvent::PrevTab);
+        assert_eq!(
+            app.selected_run,
+            Some(0),
+            "PrevTab to a task tab re-syncs selected_run to the owning run"
+        );
+
+        // A direct tab activation does the same.
+        app.selected_run = None;
+        app.update(AppEvent::ActivateTab(1));
+        assert_eq!(
+            app.selected_run,
+            Some(0),
+            "ActivateTab to a task tab re-syncs selected_run"
+        );
     }
 }

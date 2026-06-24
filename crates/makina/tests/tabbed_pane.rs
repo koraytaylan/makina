@@ -358,3 +358,50 @@ fn plan_tabs_render_accordion_sections_without_panic() {
         "STATUS section should show expanded marker"
     );
 }
+
+/// Rendering records clickable bounds for every tab chip and every visible
+/// sidebar row, so the event loop can turn a mouse click into an `ActivateTab`
+/// / `OpenTreeRow` event.
+#[test]
+fn render_records_tab_and_sidebar_click_bounds() {
+    let mut terminal = {
+        let backend = TestBackend::new(100, 24);
+        Terminal::new(backend).unwrap()
+    };
+    let mut app = make_app_with_tasks_and_plans();
+
+    // Open a task tab and a plan tab so the tab bar has two chips.
+    app.tabs.open_tab(TabContent::Task {
+        plan_slug: "0001".to_string(),
+        task_id: TaskId("task-1".to_string()),
+    });
+    app.tabs.open_tab(TabContent::Plan {
+        plan_slug: "0001-test-plan".to_string(),
+    });
+
+    terminal.draw(|frame| ui::render(&app, frame)).unwrap();
+
+    // One clickable bound per open tab, each exactly one row tall.
+    let tab_bounds = app.tab_bounds.borrow();
+    assert_eq!(tab_bounds.len(), 2, "two tab chips recorded");
+    let mut indices: Vec<usize> = tab_bounds.iter().map(|(i, _)| *i).collect();
+    indices.sort_unstable();
+    assert_eq!(indices, vec![0, 1], "chip indices map to open-tab indices");
+    for (_, r) in tab_bounds.iter() {
+        assert_eq!(r.height, 1, "each tab chip is one row");
+        assert!(r.width > 0, "each tab chip has positive width");
+    }
+
+    // One clickable bound per visible sidebar row.
+    let node_bounds = app.sidebar_node_bounds.borrow();
+    let visible = app.visible_tree_nodes().len();
+    assert_eq!(
+        node_bounds.len(),
+        visible,
+        "one clickable bound per visible sidebar row"
+    );
+    for (idx, r) in node_bounds.iter() {
+        assert!(*idx < visible, "node index in range");
+        assert_eq!(r.height, 1, "each sidebar row is one row tall");
+    }
+}
