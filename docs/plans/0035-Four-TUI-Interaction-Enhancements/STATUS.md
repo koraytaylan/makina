@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete.
 
 _Last updated: 2026-06-24, against develop._
 
@@ -12,7 +12,7 @@ _Last updated: 2026-06-24, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Accordion Click-to-Toggle | `accordion-click-detection` | 📋 Planned |
-| 0002 | Arrow-Key Hierarchical Navigation | `arrow-key-navigation-parity` | 📋 Planned |
-| 0003 | Markdown Content Rendering | `task-entry-markdown-rendering` | 📋 Planned |
-| 0004 | Task Entry Opening in Tabs | `task-entry-tab-opening` | 📋 Planned |
+| 0001 | Accordion Click-to-Toggle | `accordion-click-detection` | ✅ Done |
+| 0002 | Arrow-Key Hierarchical Navigation | `arrow-key-navigation-parity` | ✅ Done |
+| 0003 | Markdown Content Rendering | `task-entry-markdown-rendering` | ✅ Done |
+| 0004 | Task Entry Opening in Tabs | `task-entry-tab-opening` | ✅ Done |
