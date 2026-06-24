@@ -406,19 +406,33 @@ async fn resolve_io(
             (AppEvent::Tick, status)
         }
         // ── Open focused node (plan 0031) ────────────────────────────────────────
-        // User pressed Enter on a focused node in the sidebar. A plan (or one of
-        // its task previews) opens a plan tab via the tab infrastructure (plan 0032);
-        // a run's task node opens a new tab.
+        // User pressed Enter on a focused node in the sidebar. A plan opens its
+        // plan tab; a plan's task preview opens its own task tab; a run's task
+        // node opens a run-task tab. All route through the tab infrastructure.
         AppEvent::OpenFocusedNode => {
             use crate::app::{TabContent, TreeNode};
             match app.focused_node() {
-                Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
-                    if plan_idx < app.discovered_plans.len() {
-                        let plan_slug = app.discovered_plans[plan_idx].slug.clone();
+                Some(TreeNode::Plan { plan_idx }) => {
+                    if let Some(plan) = app.discovered_plans.get(plan_idx) {
+                        let plan_slug = plan.slug.clone();
                         (AppEvent::OpenTab(TabContent::Plan { plan_slug }), None)
                     } else {
                         (AppEvent::Tick, Some("Plan not found".to_string()))
                     }
+                }
+                Some(TreeNode::PlanTask { plan_idx, task_idx }) => {
+                    // A plan's task preview opens its own task tab so each task
+                    // gets a distinct tab, matching the run-task case below.
+                    if let Some(plan) = app.discovered_plans.get(plan_idx)
+                        && let Some(preview) = plan.tasks.get(task_idx)
+                    {
+                        let tab_content = TabContent::PlanTask {
+                            plan_slug: plan.slug.clone(),
+                            task_id: preview.id.clone(),
+                        };
+                        return (AppEvent::OpenTab(tab_content), None);
+                    }
+                    (AppEvent::Tick, Some("Task not found".to_string()))
                 }
                 Some(TreeNode::Task { run, task }) => {
                     // When Enter is pressed on a task node, open a new tab for that task.
@@ -3557,6 +3571,58 @@ wall_clock_secs = 1200
         assert!(matches!(
             &app.tabs.open_tabs[0],
             crate::app::TabContent::Plan { plan_slug } if plan_slug == "0001-test"
+        ));
+    }
+
+    /// Enter on a plan's task preview opens that task's OWN tab (a `PlanTask`
+    /// tab), distinct from the plan tab — so each task the user opens gets a tab.
+    #[tokio::test]
+    async fn enter_key_on_plan_task_node_opens_task_tab() {
+        use crate::app::{App, AppEvent, TreeNode};
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.discovered_plans = vec![PlanEntry {
+            dir: std::path::PathBuf::from("docs/plans/0001-test"),
+            slug: "0001-test".to_string(),
+            has_tasks: true,
+            tasks: vec![PlanTaskPreview {
+                id: "do-thing".to_string(),
+                title: "Do the thing".to_string(),
+                gated: false,
+                depends_on: vec![],
+            }],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+
+        // Cursor on the plan-task preview (node 1: [Plan, PlanTask]).
+        app.tree_cursor = Some(1);
+        assert!(matches!(
+            app.focused_node(),
+            Some(TreeNode::PlanTask {
+                plan_idx: 0,
+                task_idx: 0
+            })
+        ));
+
+        let (tx, _rx) = background_events();
+        let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
+        assert!(
+            matches!(&resolved, AppEvent::OpenTab(crate::app::TabContent::PlanTask { plan_slug, task_id }) if plan_slug == "0001-test" && task_id == "do-thing"),
+            "Enter on a plan-task preview must open its own task tab, got {resolved:?}"
+        );
+        assert_eq!(status, None);
+
+        app.update(resolved);
+        assert_eq!(app.tabs.open_tabs.len(), 1);
+        assert!(matches!(
+            &app.tabs.open_tabs[0],
+            crate::app::TabContent::PlanTask { task_id, .. } if task_id == "do-thing"
         ));
     }
 

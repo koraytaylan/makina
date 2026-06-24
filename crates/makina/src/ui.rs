@@ -432,14 +432,39 @@ pub fn render(app: &App, frame: &mut Frame) {
         })
     });
 
+    // An active plan-task tab resolves to its plan entry and the matching task
+    // preview, rendered as a standalone task pane (distinct from the plan tab).
+    let active_plan_task_tab = app.tabs.active_tab.and_then(|idx| {
+        app.tabs.open_tabs.get(idx).and_then(|tab_content| {
+            if let crate::app::TabContent::PlanTask { plan_slug, task_id } = tab_content {
+                app.discovered_plans
+                    .iter()
+                    .find(|p| p.slug == *plan_slug)
+                    .and_then(|plan| {
+                        plan.tasks
+                            .iter()
+                            .find(|t| t.id == *task_id)
+                            .map(|preview| (plan, preview))
+                    })
+            } else {
+                None
+            }
+        })
+    });
+
     // Accumulate panel geometries for hitbox testing.
     let mut panel_geoms: Vec<PanelGeometry> = vec![PanelGeometry {
         panel: ScrollablePanel::Sidebar,
         rect: sidebar_area,
     }];
 
-    match (active_plan_tab, active_task_tab.clone(), app.selected_run()) {
-        (Some(plan), _, _) => {
+    match (
+        active_plan_tab,
+        active_plan_task_tab,
+        active_task_tab.clone(),
+        app.selected_run(),
+    ) {
+        (Some(plan), _, _, _) => {
             // Split content area to reserve 1 row for tab bar at the top
             let plan_split = Layout::default()
                 .direction(Direction::Vertical)
@@ -461,7 +486,21 @@ pub fn render(app: &App, frame: &mut Frame) {
                 rect: plan_area,
             });
         }
-        (None, None, None) => {
+        (None, Some((plan, preview)), _, _) => {
+            // An active plan-task tab shows the task preview (id, title, gated,
+            // dependencies) in its own pane, with the tab bar above.
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(3)])
+                .split(content_area);
+            render_tab_bar(app, frame, split[0]);
+            render_plan_task_pane(plan, preview, frame, split[1]);
+            panel_geoms.push(PanelGeometry {
+                panel: ScrollablePanel::PlanAccordion,
+                rect: split[1],
+            });
+        }
+        (None, None, None, None) => {
             // No run selected: show a hint paragraph.
             let hint_lines = vec![
                 Line::from(""),
@@ -482,7 +521,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             let hint_para = Paragraph::new(hint_lines).style(Style::default().fg(Color::White));
             frame.render_widget(hint_para, content_area);
         }
-        (None, Some(task_id), Some(run)) => {
+        (None, None, Some(task_id), Some(run)) => {
             // An active task tab shows the task entry (metadata + Markdown body).
             // Split content area to reserve 1 row for tab bar at the top.
             let task_split = Layout::default()
@@ -521,7 +560,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 frame.render_widget(hint, task_area);
             }
         }
-        (None, _, Some(run)) => {
+        (None, None, _, Some(run)) => {
             // The selected run's view fills the content area (above the global
             // error pane). The task table has been removed; tasks are now in the
             // sidebar tree.
@@ -829,6 +868,7 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
     for (idx, tab) in app.tabs.open_tabs.iter().enumerate() {
         let (kind, label) = match tab {
             TabContent::Task { task_id, .. } => ("task ", task_id.0.clone()),
+            TabContent::PlanTask { task_id, .. } => ("task ", task_id.clone()),
             TabContent::Plan { plan_slug } => ("plan ", plan_slug.clone()),
         };
         let chip = format!(" {kind}{label} ");
@@ -863,6 +903,64 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
         x = x.saturating_add(chip_w).saturating_add(1);
     }
     let para = Paragraph::new(Line::from(spans));
+    frame.render_widget(para, area);
+}
+
+/// Render the content pane for an active plan-task tab: the task preview's id,
+/// title, gated status, and dependency list parsed from the plan's TASKS.md.
+///
+/// A discovered plan's task is a read-only preview ([`PlanTaskPreview`]), not a
+/// running task, so this shows the parsed metadata rather than a live exchange.
+fn render_plan_task_pane(
+    plan: &makina_core::orchestrator::PlanEntry,
+    preview: &makina_core::orchestrator::PlanTaskPreview,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![Span::styled(
+            preview.id.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            preview.title.clone(),
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(plan.slug.clone(), Style::default().fg(Color::Gray)),
+        ]),
+    ];
+    if preview.gated {
+        lines.push(Line::from(vec![
+            Span::styled("Gated: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "yes — blocked until prerequisites land",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    if preview.depends_on.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Depends on: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("(none)", Style::default().fg(Color::DarkGray)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "Depends on:",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        for dep in &preview.depends_on {
+            lines.push(Line::from(vec![
+                Span::raw("  • "),
+                Span::styled(dep.clone(), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+    }
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 

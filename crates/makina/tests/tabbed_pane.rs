@@ -359,6 +359,98 @@ fn plan_tabs_render_accordion_sections_without_panic() {
     );
 }
 
+/// The real end-user flow: a discovered plan with task previews and **no runs**.
+/// Opening the plan opens its plan tab; opening each task preview opens its OWN
+/// distinct task tab (not a dedup of the plan tab), and the content pane shows
+/// that task's detail. This is the behaviour that was missing — previously a
+/// plan-task click resolved to the single plan tab, so no new tabs appeared.
+#[test]
+fn opening_plan_tasks_creates_distinct_task_tabs() {
+    use makina::app::{AppEvent, TreeNode};
+
+    let api: Arc<dyn Api> = Arc::new(TestApi);
+    let mut app = App::new(api, vec![], PathBuf::from("."));
+    app.discovered_plans.push(PlanEntry {
+        slug: "0007-demo".to_string(),
+        dir: PathBuf::from("docs/plans/0007"),
+        has_tasks: true,
+        tasks: vec![
+            PlanTaskPreview {
+                id: "wire-thing".to_string(),
+                title: "Wire the thing".to_string(),
+                gated: false,
+                depends_on: vec![],
+            },
+            PlanTaskPreview {
+                id: "gate-thing".to_string(),
+                title: "Gate the thing".to_string(),
+                gated: true,
+                depends_on: vec!["wire-thing".to_string()],
+            },
+        ],
+        scope_text: Some("scope".to_string()),
+        architecture_text: None,
+        status_text: None,
+    });
+
+    // Visible nodes: [Plan, PlanTask(wire), PlanTask(gate)] (plan expanded).
+    let nodes = app.visible_tree_nodes();
+    assert!(matches!(nodes[0], TreeNode::Plan { .. }));
+    assert!(matches!(nodes[1], TreeNode::PlanTask { .. }));
+
+    // Open the plan → exactly one plan tab.
+    app.update(AppEvent::OpenTreeRow(0));
+    assert_eq!(app.tabs.open_tabs.len(), 1);
+    assert!(matches!(app.tabs.open_tabs[0], TabContent::Plan { .. }));
+
+    // Open the first task preview → a SECOND, distinct task tab (the bug fix).
+    app.update(AppEvent::OpenTreeRow(1));
+    assert_eq!(
+        app.tabs.open_tabs.len(),
+        2,
+        "a task preview must open its own tab, not refocus the plan tab"
+    );
+    assert!(
+        matches!(&app.tabs.open_tabs[1], TabContent::PlanTask { task_id, .. } if task_id == "wire-thing")
+    );
+    assert_eq!(app.tabs.active_tab, Some(1), "the new task tab is active");
+
+    // Open the second task preview → a THIRD tab.
+    app.update(AppEvent::OpenTreeRow(2));
+    assert_eq!(app.tabs.open_tabs.len(), 3);
+    assert!(
+        matches!(&app.tabs.open_tabs[2], TabContent::PlanTask { task_id, .. } if task_id == "gate-thing")
+    );
+
+    // Re-opening an already-open task focuses it (no duplicate).
+    app.update(AppEvent::OpenTreeRow(1));
+    assert_eq!(
+        app.tabs.open_tabs.len(),
+        3,
+        "re-opening a task focuses its tab"
+    );
+    assert_eq!(app.tabs.active_tab, Some(1));
+
+    // Render: the active task tab's content pane shows the task detail, and the
+    // tab bar lists every open tab.
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| ui::render(&app, frame)).unwrap();
+    let screen = screen_of(&terminal);
+    assert!(
+        screen.contains("wire-thing"),
+        "active task tab renders its id"
+    );
+    assert!(
+        screen.contains("Wire the thing"),
+        "active task tab renders its title in the content pane"
+    );
+    assert!(
+        screen.contains("gate-thing"),
+        "tab bar shows the other task tab"
+    );
+    assert!(screen.contains("0007-demo"), "tab bar shows the plan tab");
+}
+
 /// Rendering records clickable bounds for every tab chip and every visible
 /// sidebar row, so the event loop can turn a mouse click into an `ActivateTab`
 /// / `OpenTreeRow` event.

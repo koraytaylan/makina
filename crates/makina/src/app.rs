@@ -906,6 +906,10 @@ pub struct SelectionPane {
 pub enum TabContent {
     /// A task within a run: identified by plan slug and task ID.
     Task { plan_slug: String, task_id: TaskId },
+    /// A task preview under a discovered plan (parsed from its TASKS.md):
+    /// identified by the plan slug and the task's kebab id. Distinct from
+    /// [`TabContent::Task`], which is backed by a running task.
+    PlanTask { plan_slug: String, task_id: String },
     /// A discovered plan: identified by plan slug.
     Plan { plan_slug: String },
 }
@@ -1409,7 +1413,15 @@ impl App {
         let mut indices_to_close = Vec::new();
         let mut slugs_to_remove = Vec::new();
         for (idx, tab) in self.tabs.open_tabs.iter().enumerate() {
-            if let TabContent::Plan { plan_slug } = tab
+            // Both plan tabs and a plan's task-preview tabs are keyed by plan
+            // slug; close either when its plan is gone.
+            let plan_slug = match tab {
+                TabContent::Plan { plan_slug } | TabContent::PlanTask { plan_slug, .. } => {
+                    Some(plan_slug)
+                }
+                TabContent::Task { .. } => None,
+            };
+            if let Some(plan_slug) = plan_slug
                 && !valid_plans.contains(plan_slug)
             {
                 indices_to_close.push(idx);
@@ -2897,10 +2909,23 @@ impl App {
                 self.tree_cursor = Some(idx);
                 self.sync_selection_from_cursor();
                 match node {
-                    TreeNode::Plan { plan_idx } | TreeNode::PlanTask { plan_idx, .. } => {
+                    TreeNode::Plan { plan_idx } => {
                         if let Some(plan) = self.discovered_plans.get(plan_idx) {
                             let plan_slug = plan.slug.clone();
                             self.tabs.open_tab(TabContent::Plan { plan_slug });
+                        }
+                    }
+                    TreeNode::PlanTask { plan_idx, task_idx } => {
+                        // A plan's task preview opens its own task tab (distinct
+                        // from the plan tab), so each task the user clicks gets a
+                        // tab — matching the run-task behaviour below.
+                        if let Some(plan) = self.discovered_plans.get(plan_idx)
+                            && let Some(preview) = plan.tasks.get(task_idx)
+                        {
+                            let plan_slug = plan.slug.clone();
+                            let task_id = preview.id.clone();
+                            self.tabs
+                                .open_tab(TabContent::PlanTask { plan_slug, task_id });
                         }
                     }
                     TreeNode::Task { run, task } => {
