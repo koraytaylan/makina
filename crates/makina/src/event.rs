@@ -1204,6 +1204,10 @@ fn translate_key(
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::Quit,
             KeyCode::Esc => AppEvent::Quit,
+            // Shift+Tab: most terminals deliver it as `BackTab` (no SHIFT
+            // modifier); terminals in the kitty/enhanced keyboard mode deliver
+            // it as `Tab` + SHIFT. Handle both so reverse focus always works.
+            KeyCode::BackTab => AppEvent::FocusPrev,
             KeyCode::Tab => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     AppEvent::FocusPrev
@@ -1460,6 +1464,28 @@ mod tests {
         assert!(matches!(
             translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
             AppEvent::FocusNext
+        ));
+    }
+
+    #[test]
+    fn back_tab_translates_to_focus_prev() {
+        // The standard terminal encoding of Shift+Tab: KeyCode::BackTab with no
+        // SHIFT modifier. This is what most terminals actually send.
+        let ev = key_press(KeyCode::BackTab, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            AppEvent::FocusPrev
+        ));
+    }
+
+    #[test]
+    fn shift_tab_translates_to_focus_prev() {
+        // Enhanced/kitty keyboard mode encoding of Shift+Tab: KeyCode::Tab with
+        // the SHIFT modifier set.
+        let ev = key_press(KeyCode::Tab, KeyModifiers::SHIFT);
+        assert!(matches!(
+            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            AppEvent::FocusPrev
         ));
     }
 
