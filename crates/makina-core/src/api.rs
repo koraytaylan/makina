@@ -251,6 +251,11 @@ pub struct TaskView {
     /// through to the view so the TUI can display a human-readable reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<FailureReason>,
+
+    /// Raw Markdown entry for this task (title, steps, deps, notes) from TASKS.md,
+    /// captured at parse time so rendering never touches disk.
+    #[serde(default)]
+    pub entry_text: String,
 }
 
 /// Aggregate status of a Run from the TUI's perspective.
@@ -1076,6 +1081,7 @@ mod tests {
                             started_at: None,
                             finished_at: None,
                             failure_reason: None,
+                            entry_text: String::new(),
                         }],
                         report: IngestionReport::default(),
                     };
@@ -1374,6 +1380,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            entry_text: String::new(),
         };
         let task2 = task.clone();
         let dbg = format!("{task2:?}");

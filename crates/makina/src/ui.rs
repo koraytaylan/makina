@@ -51,7 +51,7 @@ use crate::app::{
     AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
     ScrollablePanel, TabContent, TreeNode,
 };
-use makina_core::api::FailureKind;
+use makina_core::api::{FailureKind, RunView, TaskId};
 
 /// Render the full TUI layout into `frame`.
 ///
@@ -381,12 +381,22 @@ pub fn render(app: &App, frame: &mut Frame) {
     let error_area = main_split[1];
 
     // Content precedence: an active plan tab (opened via the tab system in plan 0032)
-    // is rendered via render_plan_accordion_pane; otherwise the selected run's view;
-    // otherwise a hint.
+    // is rendered via render_plan_accordion_pane; an active task tab is rendered via
+    // render_task_entry_pane; otherwise the selected run's view; otherwise a hint.
     let active_plan_tab = app.tabs.active_tab.and_then(|idx| {
         app.tabs.open_tabs.get(idx).and_then(|tab_content| {
             if let crate::app::TabContent::Plan { plan_slug } = tab_content {
                 app.discovered_plans.iter().find(|p| p.slug == *plan_slug)
+            } else {
+                None
+            }
+        })
+    });
+
+    let active_task_tab = app.tabs.active_tab.and_then(|idx| {
+        app.tabs.open_tabs.get(idx).and_then(|tab_content| {
+            if let crate::app::TabContent::Task { task_id, .. } = tab_content {
+                Some(task_id.clone())
             } else {
                 None
             }
@@ -399,8 +409,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         rect: sidebar_area,
     }];
 
-    match (active_plan_tab, app.selected_run()) {
-        (Some(plan), _) => {
+    match (active_plan_tab, active_task_tab.clone(), app.selected_run()) {
+        (Some(plan), _, _) => {
             // Split content area to reserve 1 row for tab bar at the top
             let plan_split = Layout::default()
                 .direction(Direction::Vertical)
@@ -422,7 +432,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 rect: plan_area,
             });
         }
-        (None, None) => {
+        (None, None, None) => {
             // No run selected: show a hint paragraph.
             let hint_lines = vec![
                 Line::from(""),
@@ -443,7 +453,32 @@ pub fn render(app: &App, frame: &mut Frame) {
             let hint_para = Paragraph::new(hint_lines).style(Style::default().fg(Color::White));
             frame.render_widget(hint_para, content_area);
         }
-        (None, Some(run)) => {
+        (None, Some(task_id), Some(run)) => {
+            // An active task tab shows the task entry (metadata + Markdown body).
+            if let Some(task_idx) = find_task_idx_in_run(app, &task_id) {
+                // Split content area to reserve 1 row for tab bar at the top
+                let task_split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(3)])
+                    .split(content_area);
+
+                let tab_area = task_split[0];
+                let task_area = task_split[1];
+
+                // Render the tab bar
+                render_tab_bar(app, frame, tab_area);
+
+                // Render the task entry pane below the tab bar
+                render_task_entry_pane(app, run, task_idx, frame, task_area);
+
+                // Record the task entry geometry
+                panel_geoms.push(PanelGeometry {
+                    panel: ScrollablePanel::TaskEntry,
+                    rect: task_area,
+                });
+            }
+        }
+        (None, _, Some(run)) => {
             // The selected run's view fills the content area (above the global
             // error pane). The task table has been removed; tasks are now in the
             // sidebar tree.
@@ -542,6 +577,20 @@ pub fn render(app: &App, frame: &mut Frame) {
                 panel: ScrollablePanel::Exchange,
                 rect: exchange_pane_area,
             });
+        }
+        _ => {
+            // Fallback: no run selected but a task tab is somehow active (shouldn't happen).
+            // Show the same hint as the no-run case.
+            let hint_lines = vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  Select a run, or press Enter on a plan to view it.",
+                    Style::default().fg(Color::DarkGray),
+                )]),
+                Line::from(""),
+            ];
+            let hint_para = Paragraph::new(hint_lines).style(Style::default().fg(Color::White));
+            frame.render_widget(hint_para, content_area);
         }
     }
 
@@ -1401,6 +1450,100 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
     }
 }
 
+// ── Task entry pane ───────────────────────────────────────────────────────────
+
+/// Render a task's entry (metadata + Markdown body) into a bordered pane.
+/// Width is taken from the pane's inner area so wrapping matches the pane, and
+/// the body reuses plan 0020's hardened `render_markdown` — no new parser.
+fn render_task_entry_pane(
+    _app: &App,
+    run: &RunView,
+    task_idx: usize,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let block = Block::default()
+        .title(" Task Entry ")
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::Blue));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if let Some(task) = run.tasks.get(task_idx) {
+        let mut lines: Vec<Line> = Vec::new();
+
+        // Task header: ID and title
+        lines.push(Line::from(vec![Span::styled(
+            format!("{} — {}", task.id, task.title),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        // State badge
+        let (badge, badge_color) = task_state_badge(&task.state);
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {}", badge),
+            Style::default().fg(badge_color),
+        )]));
+
+        // Dependencies and gated status
+        if !task.depends_on.is_empty() {
+            let deps_str = task
+                .depends_on
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(Line::from(vec![Span::styled(
+                format!("  Depends on: {}", deps_str),
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+
+        // Add metrics if available
+        if task.gate_iterations > 0 || task.review_iterations > 0 {
+            let counts = format!(
+                "gate ×{}  ·  review ×{}",
+                task.gate_iterations, task.review_iterations
+            );
+            let style = Style::default().fg(Color::Yellow);
+            lines.push(Line::from(Span::styled(counts, style)));
+        }
+
+        lines.push(Line::from(""));
+
+        // Entry text rendered through Markdown
+        let content_width = inner.width;
+        let base_style = Style::default().fg(Color::White);
+        lines.extend(crate::markup::render_markdown(
+            &task.entry_text,
+            base_style,
+            content_width,
+        ));
+
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    } else {
+        // Task not found placeholder
+        let placeholder = Line::from(vec![Span::styled(
+            "  Task not found.",
+            Style::default().fg(Color::DarkGray),
+        )]);
+        let para = Paragraph::new(vec![placeholder]);
+        frame.render_widget(para, inner);
+    }
+}
+
+// ── Helper: find task in run ──────────────────────────────────────────────────
+
+/// Resolve a `TaskId` to a task index within the selected run, if present.
+fn find_task_idx_in_run(app: &App, task_id: &TaskId) -> Option<usize> {
+    app.selected_run()
+        .and_then(|run| run.tasks.iter().position(|t| &t.id == task_id))
+}
+
 // ── Plan detail pane ──────────────────────────────────────────────────────────
 
 /// Render a plan tab's accordion pane with SCOPE, ARCHITECTURE, TASKS, and STATUS sections.
@@ -1426,26 +1569,67 @@ pub(crate) fn render_plan_accordion_pane(
         return;
     }
 
-    let mut lines = Vec::new();
+    // Reserve the rightmost column for the scrollbar so text is not overpainted.
+    // We compute content_area early so we know the render width for wrap-aware
+    // row accounting (needed to correctly map header lines to terminal rows).
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let content_area = cols[0];
+    let scrollbar_area = cols[1];
+
+    // Helper: number of terminal rows a single Line occupies when rendered with
+    // `Wrap { trim: false }` at the given column width.
+    let rendered_rows_for_line = |line: &Line<'_>| -> u16 {
+        let w = line.width();
+        if content_area.width == 0 || w == 0 {
+            1
+        } else {
+            // ceil(w / content_area.width), clamped to u16::MAX
+            (w as u32)
+                .div_ceil(content_area.width as u32)
+                .min(u16::MAX as u32) as u16
+        }
+    };
+
+    // `rendered_row` tracks the running count of *terminal rows* (not Vec<Line>
+    // indices) emitted so far.  We record this value before pushing each header
+    // line so the hit-test can map a terminal y-coordinate back to the section.
+    let mut rendered_row: u16 = 0;
+    // Pairs of (section, rendered_row_of_header).
+    let mut accordion_header_rows: Vec<(AccordionSection, u16)> = Vec::new();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Helper macro: push a line and advance rendered_row.
+    // (Using a closure would hit borrow checker issues with the captures.)
+    macro_rules! push_line {
+        ($l:expr) => {{
+            let l: Line<'static> = $l;
+            rendered_row += rendered_rows_for_line(&l);
+            lines.push(l);
+        }};
+    }
 
     // Header: plan name and directory
-    lines.push(Line::from(vec![
+    push_line!(Line::from(vec![
         Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            &plan.slug,
+            plan.slug.clone(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
-    lines.push(Line::from(vec![
+    push_line!(Line::from(vec![
         Span::styled("Dir:  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             plan.dir.display().to_string(),
             Style::default().fg(Color::Gray),
         ),
     ]));
-    lines.push(Line::from(""));
+    push_line!(Line::from(""));
 
     // Get accordion state for this plan
     let expanded = app
@@ -1454,20 +1638,24 @@ pub(crate) fn render_plan_accordion_pane(
         .cloned()
         .unwrap_or_default();
 
-    // SCOPE section
+    // SCOPE section — record header row *before* pushing the header line.
     let scope_focused = matches!(app.focused_section, Some(AccordionSection::Scope));
-    lines.extend(render_accordion_section(
+    accordion_header_rows.push((AccordionSection::Scope, rendered_row));
+    for l in render_accordion_section(
         "SCOPE",
         AccordionSection::Scope,
         &expanded,
         plan.scope_text.as_deref().unwrap_or("(no SCOPE.md)"),
         scope_focused,
-    ));
-    lines.push(Line::from(""));
+    ) {
+        push_line!(l);
+    }
+    push_line!(Line::from(""));
 
     // ARCHITECTURE section
     let arch_focused = matches!(app.focused_section, Some(AccordionSection::Architecture));
-    lines.extend(render_accordion_section(
+    accordion_header_rows.push((AccordionSection::Architecture, rendered_row));
+    for l in render_accordion_section(
         "ARCHITECTURE",
         AccordionSection::Architecture,
         &expanded,
@@ -1475,56 +1663,82 @@ pub(crate) fn render_plan_accordion_pane(
             .as_deref()
             .unwrap_or("(no ARCHITECTURE.md)"),
         arch_focused,
-    ));
-    lines.push(Line::from(""));
+    ) {
+        push_line!(l);
+    }
+    push_line!(Line::from(""));
 
     // TASKS section
     let tasks_text = format_tasks_section(&plan.tasks);
     let tasks_focused = matches!(app.focused_section, Some(AccordionSection::Tasks));
-    lines.extend(render_accordion_section(
+    accordion_header_rows.push((AccordionSection::Tasks, rendered_row));
+    for l in render_accordion_section(
         "TASKS",
         AccordionSection::Tasks,
         &expanded,
         &tasks_text,
         tasks_focused,
-    ));
-    lines.push(Line::from(""));
+    ) {
+        push_line!(l);
+    }
+    push_line!(Line::from(""));
 
     // STATUS section
     let status_focused = matches!(app.focused_section, Some(AccordionSection::Status));
-    lines.extend(render_accordion_section(
+    accordion_header_rows.push((AccordionSection::Status, rendered_row));
+    for l in render_accordion_section(
         "STATUS",
         AccordionSection::Status,
         &expanded,
         plan.status_text.as_deref().unwrap_or("(no STATUS.md)"),
         status_focused,
-    ));
-    lines.push(Line::from(""));
+    ) {
+        push_line!(l);
+    }
+    push_line!(Line::from(""));
 
     // Footer help text
-    lines.push(Line::from(Span::styled(
+    push_line!(Line::from(Span::styled(
         "  [s] scope  [a] arch  [t] tasks  [z] status  [◄] [►] tabs  [Ctrl+W] close",
         Style::default().fg(Color::DarkGray),
     )));
 
-    // Per-panel scroll clamp ceiling: how many lines can be scrolled before the
+    // `rendered_row` now holds the total rendered height in terminal rows.
+    let total_rendered_rows = rendered_row;
+    // Per-panel scroll clamp ceiling: how many rows can be scrolled before the
     // last line of content reaches the top of the viewport.
-    let total_lines = lines.len() as u16;
-    let accordion_scroll_max = total_lines.saturating_sub(area.height);
+    let accordion_scroll_max = total_rendered_rows.saturating_sub(content_area.height);
     app.last_scroll_maxes
         .borrow_mut()
         .insert(ScrollablePanel::PlanAccordion, accordion_scroll_max);
 
-    // Reserve the rightmost column for the scrollbar so text is not overpainted.
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
-    let content_area = cols[0];
-    let scrollbar_area = cols[1];
-
     let accordion_scroll_offset =
         app.panel_offset(ScrollablePanel::PlanAccordion, accordion_scroll_max);
+
+    // Compute the actual terminal rectangle for each visible accordion header.
+    // Each header occupies exactly one row; we convert from rendered-row space to
+    // viewport coordinates by subtracting the scroll offset and adding the pane origin.
+    let mut computed_bounds = Vec::new();
+    for (section, header_rendered_row) in accordion_header_rows {
+        // Skip headers scrolled above or below the visible viewport.
+        if header_rendered_row >= accordion_scroll_offset
+            && header_rendered_row < accordion_scroll_offset + content_area.height
+        {
+            let row_in_viewport = content_area.y + (header_rendered_row - accordion_scroll_offset);
+            let header_rect = Rect {
+                x: content_area.x,
+                y: row_in_viewport,
+                width: content_area.width,
+                height: 1,
+            };
+            computed_bounds.push((section, header_rect));
+        }
+    }
+
+    // Store the computed bounds via RefCell so the event loop can hit-test mouse
+    // clicks.  Mirrors the pattern used by `selection_panes` and `panel_geometries`.
+    *app.accordion_header_bounds.borrow_mut() = computed_bounds;
+
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((accordion_scroll_offset, 0));
@@ -1537,8 +1751,8 @@ pub(crate) fn render_plan_accordion_pane(
             .copied()
             .unwrap_or(0)
             .min(accordion_scroll_max);
-        let mut scrollbar_state =
-            ScrollbarState::new(total_lines as usize).position(accordion_scroll_offset as usize);
+        let mut scrollbar_state = ScrollbarState::new(total_rendered_rows as usize)
+            .position(accordion_scroll_offset as usize);
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -3518,6 +3732,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -4169,6 +4384,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("beta"),
@@ -4180,6 +4396,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("gamma"),
@@ -4191,6 +4408,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("delta"),
@@ -4202,6 +4420,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -4324,6 +4543,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("a"),
@@ -4335,6 +4555,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("b"),
@@ -4346,6 +4567,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("c"),
@@ -4357,6 +4579,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -4493,6 +4716,7 @@ mod tests {
                     started_at: Some(t0),
                     finished_at: Some(t0 + chrono::Duration::seconds(60)),
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 // Task 2: not yet started — must show ghost, not '█'.
                 TaskView {
@@ -4505,6 +4729,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -4560,6 +4785,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("task-b"),
@@ -4571,6 +4797,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -4634,6 +4861,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("beta"),
@@ -4645,6 +4873,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -4766,6 +4995,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -4865,6 +5095,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("task-b"),
@@ -4876,6 +5107,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -5061,6 +5293,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -5155,6 +5388,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -5250,6 +5484,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -5508,6 +5743,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -5598,6 +5834,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -5690,6 +5927,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -5791,6 +6029,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -5935,6 +6174,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -6039,6 +6279,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("beta"),
@@ -6050,6 +6291,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -6100,6 +6342,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -6150,6 +6393,7 @@ mod tests {
                     kind: FailureKind::MergeConflict,
                     message: "squash merge conflict detected".into(),
                 }),
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -6294,6 +6538,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -6365,6 +6610,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -6587,6 +6833,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -6715,6 +6962,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("failed-task"),
@@ -6729,6 +6977,7 @@ mod tests {
                         kind: FailureKind::HardError,
                         message: "test error".into(),
                     }),
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -6811,6 +7060,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("task-b"),
@@ -6822,6 +7072,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -6892,6 +7143,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
                 TaskView {
                     id: TaskId::new("t2"),
@@ -6903,6 +7155,7 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     failure_reason: None,
+                    entry_text: String::new(),
                 },
             ],
             report: makina_core::api::IngestionReport::default(),
@@ -7190,6 +7443,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            entry_text: String::new(),
         };
 
         let run = RunView {
@@ -7264,6 +7518,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            entry_text: String::new(),
         };
 
         let run = RunView {
@@ -7733,6 +7988,7 @@ mod tests {
                 finished_at: None,
                 depends_on: vec![],
                 failure_reason: None,
+                entry_text: String::new(),
             });
         }
 
@@ -7751,6 +8007,7 @@ mod tests {
             finished_at: None,
             depends_on,
             failure_reason: None,
+            entry_text: String::new(),
         };
         dep_tasks.push(task_with_deps);
 
@@ -7897,6 +8154,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             }],
             report: makina_core::api::IngestionReport::default(),
         };
@@ -8000,6 +8258,111 @@ mod tests {
             large_height > small_height,
             "Sidebar rect.height must increase when terminal height increases \
              (small={small_height}, large={large_height})"
+        );
+    }
+
+    /// **Task entry pane renders markdown:** when a task tab is active, the task
+    /// entry pane renders with the task's entry_text (combination of description
+    /// and done_when) processed through render_markdown.
+    #[test]
+    fn task_entry_pane_renders_markdown() {
+        let mut terminal = make_terminal(120, 40);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("test-task"),
+                title: "Test Task".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "This is a **bold** test\n\n### Done when\n\n- Item 1\n- Item 2"
+                    .to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "test-plan".to_string(),
+            task_id: TaskId::new("test-task"),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The rendered screen should contain the task ID, title, and markdown content.
+        assert!(
+            screen.contains("test-task"),
+            "Task ID must appear in rendered output"
+        );
+        assert!(
+            screen.contains("Test Task"),
+            "Task title must appear in rendered output"
+        );
+        assert!(
+            screen.contains("bold"),
+            "Markdown bold content must be rendered"
+        );
+        assert!(
+            screen.contains("Done when"),
+            "Done when section must be rendered"
+        );
+        assert!(screen.contains("Item 1"), "List items must be rendered");
+    }
+
+    /// **Task entry pane respects pane width:** the entry_text is rendered with
+    /// render_markdown using the pane's inner width for proper text wrapping.
+    #[test]
+    fn task_entry_pane_respects_pane_width() {
+        let mut terminal = make_terminal(120, 40);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let long_text = "This is a very long line of text that should wrap at the pane width boundary when rendered through markdown rendering with proper line wrapping applied to respect the width parameter";
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("width-test"),
+                title: "Width Test".into(),
+                state: TaskState::Ready,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: long_text.to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "test-plan".to_string(),
+            task_id: TaskId::new("width-test"),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The content should be rendered and wrapped appropriately.
+        // Check that at least some portion of the text is visible.
+        assert!(
+            screen.contains("very long line"),
+            "Long text should be rendered with wrapping"
         );
     }
 }

@@ -232,6 +232,7 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
             started_at: t.started_at,
             finished_at: t.finished_at,
             failure_reason: t.failure_reason.clone(),
+            entry_text: String::new(),
         })
         .collect();
 

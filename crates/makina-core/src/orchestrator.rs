@@ -529,16 +529,31 @@ fn build_view(
     let tasks = graph
         .tasks
         .iter()
-        .map(|task| TaskView {
-            id: (&task.id).into(),
-            title: task.title.clone(),
-            state: task.state.into(),
-            gate_iterations: task.gate_iterations,
-            review_iterations: task.review_iterations,
-            depends_on: task.depends_on.iter().map(Into::into).collect(),
-            started_at: task.started_at,
-            finished_at: task.finished_at,
-            failure_reason: task.failure_reason.clone(),
+        .map(|task| {
+            // Build entry_text from description and done_when
+            let mut entry_text = String::new();
+            if !task.description.is_empty() {
+                entry_text.push_str(&task.description);
+            }
+            if !task.done_when.is_empty() {
+                if !entry_text.is_empty() {
+                    entry_text.push_str("\n\n");
+                }
+                entry_text.push_str("### Done when\n\n");
+                entry_text.push_str(&task.done_when);
+            }
+            TaskView {
+                id: (&task.id).into(),
+                title: task.title.clone(),
+                state: task.state.into(),
+                gate_iterations: task.gate_iterations,
+                review_iterations: task.review_iterations,
+                depends_on: task.depends_on.iter().map(Into::into).collect(),
+                started_at: task.started_at,
+                finished_at: task.finished_at,
+                failure_reason: task.failure_reason.clone(),
+                entry_text,
+            }
         })
         .collect();
 

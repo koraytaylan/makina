@@ -148,7 +148,7 @@ pub async fn run(
                     let plan_tab_active = app.tabs.active_tab
                         .and_then(|idx| app.tabs.open_tabs.get(idx))
                         .is_some_and(|content| matches!(content, crate::app::TabContent::Plan { .. }));
-                    translate_terminal_event(ev, modal, app.focused_panel, plan_tab_active)
+                    translate_terminal_event(ev, modal, app.focused_panel, plan_tab_active, app)
                 })
 
             }
@@ -1083,6 +1083,7 @@ fn translate_terminal_event(
     modal: ModalState,
     focused_panel: crate::app::Panel,
     plan_tab_active: bool,
+    app: &crate::app::App,
 ) -> AppEvent {
     match ev {
         CrosstermEvent::Key(key) => translate_key(key, modal, focused_panel, plan_tab_active),
@@ -1097,7 +1098,21 @@ fn translate_terminal_event(
         CrosstermEvent::Mouse(m) => match m.kind {
             MouseEventKind::ScrollUp => AppEvent::ScrollUpAt(m.column, m.row),
             MouseEventKind::ScrollDown => AppEvent::ScrollDownAt(m.column, m.row),
-            MouseEventKind::Down(MouseButton::Left) => AppEvent::SelectionStart(m.column, m.row),
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A click on a header toggles it; otherwise begin a text selection as before.
+                if let Some((section, _)) =
+                    app.accordion_header_bounds.borrow().iter().find(|(_, r)| {
+                        r.x <= m.column
+                            && m.column < r.x + r.width
+                            && r.y <= m.row
+                            && m.row < r.y + r.height
+                    })
+                {
+                    AppEvent::ToggleAccordionSection(*section)
+                } else {
+                    AppEvent::SelectionStart(m.column, m.row)
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) => AppEvent::SelectionExtend(m.column, m.row),
             MouseEventKind::Up(MouseButton::Left) => AppEvent::SelectionEnd(m.column, m.row),
             _ => AppEvent::Tick,
@@ -1287,10 +1302,16 @@ fn translate_key(
             // Sidebar navigation: arrow keys and vim-style j/k.
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
-            // Right arrow: expand collapsed run or cross focus to content pane.
-            KeyCode::Right => AppEvent::FocusRightOrExpand,
-            // Left arrow: collapse expanded run or return focus to sidebar.
-            KeyCode::Left => AppEvent::FocusLeftOrCollapse,
+            // Right arrow: Tab-equivalent in main pane (forward focus), expand/cross in sidebar.
+            KeyCode::Right => match focused_panel {
+                Panel::Main => AppEvent::FocusNext,
+                Panel::Sidebar => AppEvent::FocusRightOrExpand,
+            },
+            // Left arrow: Shift+Tab-equivalent in main pane (backward focus), collapse/cross in sidebar.
+            KeyCode::Left => match focused_panel {
+                Panel::Main => AppEvent::FocusPrev,
+                Panel::Sidebar => AppEvent::FocusLeftOrCollapse,
+            },
             // Space: toggle expand/collapse the focused tree node (sidebar focus only).
             KeyCode::Char(' ') => match focused_panel {
                 Panel::Sidebar => AppEvent::ToggleTreeNode,
@@ -1328,6 +1349,15 @@ mod tests {
         mpsc::channel(64)
     }
 
+    fn test_app() -> App {
+        use crate::placeholder::PlaceholderApi;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        App::new(api, vec![], PathBuf::from("/"))
+    }
+
     async fn resolve_io_for_test(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
         let (tx, _rx) = background_events();
         resolve_io(app, event, &tx).await
@@ -1348,12 +1378,14 @@ mod tests {
     fn wheel_translates_to_scroll() {
         // Wheel events route to the exchange-pane scroll helpers regardless of
         // the `browsing` flag (the exchange pane is not the browser).
+        let app = test_app();
         assert!(matches!(
             translate_terminal_event(
                 wheel(MouseEventKind::ScrollUp),
                 ModalState::default(),
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::ScrollUpAt(_, _)
         ));
@@ -1362,7 +1394,8 @@ mod tests {
                 wheel(MouseEventKind::ScrollDown),
                 ModalState::default(),
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::ScrollDownAt(_, _)
         ));
@@ -1382,11 +1415,13 @@ mod tests {
     /// pointer's cell coordinates through to the corresponding `AppEvent`.
     #[test]
     fn left_button_drag_drives_selection() {
+        let app = test_app();
         let down = translate_terminal_event(
             mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 7),
             ModalState::default(),
             crate::app::Panel::Sidebar,
             false,
+            &app,
         );
         assert!(matches!(down, AppEvent::SelectionStart(3, 7)));
 
@@ -1395,6 +1430,7 @@ mod tests {
             ModalState::default(),
             crate::app::Panel::Sidebar,
             false,
+            &app,
         );
         assert!(matches!(drag, AppEvent::SelectionExtend(10, 9)));
 
@@ -1403,6 +1439,7 @@ mod tests {
             ModalState::default(),
             crate::app::Panel::Sidebar,
             false,
+            &app,
         );
         assert!(matches!(up, AppEvent::SelectionEnd(10, 9)));
     }
@@ -1411,11 +1448,13 @@ mod tests {
     /// don't disturb selection or scroll state.
     #[test]
     fn moved_and_other_buttons_are_noops() {
+        let app = test_app();
         let moved = translate_terminal_event(
             mouse_at(MouseEventKind::Moved, 1, 1),
             ModalState::default(),
             crate::app::Panel::Sidebar,
             false,
+            &app,
         );
         assert!(matches!(moved, AppEvent::Tick), "Moved must be a no-op");
 
@@ -1424,6 +1463,7 @@ mod tests {
             ModalState::default(),
             crate::app::Panel::Sidebar,
             false,
+            &app,
         );
         assert!(
             matches!(right, AppEvent::Tick),
@@ -1435,7 +1475,13 @@ mod tests {
     fn q_key_translates_to_quit() {
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::Quit
         ));
     }
@@ -1444,7 +1490,13 @@ mod tests {
     fn esc_key_translates_to_quit() {
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::Quit
         ));
     }
@@ -1453,7 +1505,13 @@ mod tests {
     fn ctrl_c_translates_to_quit() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::Quit
         ));
     }
@@ -1462,7 +1520,13 @@ mod tests {
     fn tab_translates_to_focus_next() {
         let ev = key_press(KeyCode::Tab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::FocusNext
         ));
     }
@@ -1473,7 +1537,13 @@ mod tests {
         // SHIFT modifier. This is what most terminals actually send.
         let ev = key_press(KeyCode::BackTab, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::FocusPrev
         ));
     }
@@ -1484,19 +1554,27 @@ mod tests {
         // the SHIFT modifier set.
         let ev = key_press(KeyCode::Tab, KeyModifiers::SHIFT);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::FocusPrev
         ));
     }
 
     #[test]
     fn v_translates_to_cycle_dependency_view() {
+        let app = test_app();
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('v'), KeyModifiers::NONE),
                 ModalState::default(),
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::CycleDependencyView
         ));
@@ -1504,12 +1582,14 @@ mod tests {
 
     #[test]
     fn e_key_translates_to_toggle_error_pane() {
+        let app = test_app();
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('e'), KeyModifiers::NONE),
                 ModalState::default(),
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::ToggleErrorPane
         ));
@@ -1518,12 +1598,14 @@ mod tests {
     #[test]
     fn r_key_translates_to_retry_focused() {
         // Plan 0017 repurposes `r` from Reinterpret to context-sensitive retry.
+        let app = test_app();
         assert!(matches!(
             translate_terminal_event(
                 key_press(KeyCode::Char('r'), KeyModifiers::NONE),
                 ModalState::default(),
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::RetryFocused
         ));
@@ -1540,7 +1622,13 @@ mod tests {
             state: KeyEventState::NONE,
         });
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::Tick
         ));
     }
@@ -1549,7 +1637,13 @@ mod tests {
     fn resize_translates_to_resize_event() {
         let ev = CrosstermEvent::Resize(120, 40);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::Resize(120, 40)
         ));
     }
@@ -1558,7 +1652,13 @@ mod tests {
     fn up_arrow_translates_to_select_up() {
         let ev = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::SelectUp
         ));
     }
@@ -1567,7 +1667,13 @@ mod tests {
     fn down_arrow_translates_to_select_down() {
         let ev = key_press(KeyCode::Down, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::SelectDown
         ));
     }
@@ -1576,7 +1682,13 @@ mod tests {
     fn right_arrow_translates_to_focus_right_or_expand() {
         let ev = key_press(KeyCode::Right, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::FocusRightOrExpand
         ));
     }
@@ -1585,7 +1697,13 @@ mod tests {
     fn left_arrow_translates_to_focus_left_or_collapse() {
         let ev = key_press(KeyCode::Left, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::FocusLeftOrCollapse
         ));
     }
@@ -1594,7 +1712,13 @@ mod tests {
     fn k_key_translates_to_select_up() {
         let ev = key_press(KeyCode::Char('k'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::SelectUp
         ));
     }
@@ -1603,7 +1727,13 @@ mod tests {
     fn j_key_translates_to_select_down() {
         let ev = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::SelectDown
         ));
     }
@@ -1614,7 +1744,13 @@ mod tests {
     fn o_key_opens_browser_in_normal_mode() {
         let ev = key_press(KeyCode::Char('o'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::OpenBrowser
         ));
     }
@@ -1625,7 +1761,13 @@ mod tests {
     fn s_key_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::StartRun
         ));
     }
@@ -1634,7 +1776,13 @@ mod tests {
     fn p_key_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::PauseRun
         ));
     }
@@ -1644,7 +1792,13 @@ mod tests {
         // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::CancelRun
         ));
     }
@@ -1653,6 +1807,7 @@ mod tests {
     fn control_keys_do_nothing_in_browser_mode() {
         // s/p/c are normal-mode keys; inside the browser they fall through to a
         // harmless Tick (the browser keymap owns navigation).
+        let app = test_app();
         for ch in ['s', 'p', 'c'] {
             let ev = key_press(KeyCode::Char(ch), KeyModifiers::NONE);
             assert!(
@@ -1664,7 +1819,8 @@ mod tests {
                             ..ModalState::default()
                         },
                         crate::app::Panel::Sidebar,
-                        false
+                        false,
+                        &app
                     ),
                     AppEvent::Tick
                 ),
@@ -1675,6 +1831,7 @@ mod tests {
 
     #[test]
     fn enter_in_browser_activates_selection() {
+        let app = test_app();
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -1684,7 +1841,8 @@ mod tests {
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::BrowserActivate
         ));
@@ -1692,6 +1850,7 @@ mod tests {
 
     #[test]
     fn esc_in_browser_closes_not_quits() {
+        let app = test_app();
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         // In browser mode, Esc must close the browser, NOT quit the app.
         assert!(matches!(
@@ -1702,7 +1861,8 @@ mod tests {
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::CloseBrowser
         ));
@@ -1710,6 +1870,7 @@ mod tests {
 
     #[test]
     fn backspace_in_browser_goes_to_parent() {
+        let app = test_app();
         let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -1719,7 +1880,8 @@ mod tests {
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::BrowserParent
         ));
@@ -1727,6 +1889,7 @@ mod tests {
 
     #[test]
     fn jk_in_browser_navigate_browser_not_sidebar() {
+        let app = test_app();
         let down = key_press(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -1736,7 +1899,8 @@ mod tests {
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::BrowserDown
         ));
@@ -1749,7 +1913,8 @@ mod tests {
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::BrowserUp
         ));
@@ -1757,6 +1922,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_even_in_browser_mode() {
+        let app = test_app();
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
             translate_terminal_event(
@@ -1766,7 +1932,8 @@ mod tests {
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::Quit
         ));
@@ -1776,6 +1943,7 @@ mod tests {
     fn q_in_browser_is_not_quit() {
         // `q` is a normal-mode quit key; inside the browser it must not quit
         // (it falls through to Tick so the user can keep browsing).
+        let app = test_app();
         let ev = key_press(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -1785,7 +1953,8 @@ mod tests {
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::Tick
         ));
@@ -1806,6 +1975,7 @@ mod tests {
             ModalState::default(),
             crate::app::Panel::Sidebar,
             false,
+            &app,
         );
 
         app.update(ev);
@@ -2198,6 +2368,7 @@ mod tests {
                         started_at: None,
                         finished_at: None,
                         failure_reason: None,
+                        entry_text: String::new(),
                     },
                     TaskView {
                         id: TaskId::new("second"),
@@ -2209,6 +2380,7 @@ mod tests {
                         started_at: None,
                         finished_at: None,
                         failure_reason: None,
+                        entry_text: String::new(),
                     },
                 ],
                 report: makina_core::api::IngestionReport::default(),
@@ -2568,6 +2740,7 @@ A description that is long enough to pass minimums.
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            entry_text: String::new(),
         };
         let run = RunView {
             id: RunId(123),
@@ -2766,6 +2939,7 @@ A description that is long enough to pass minimums.
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            entry_text: String::new(),
         }
     }
 
@@ -2918,7 +3092,13 @@ A description that is long enough to pass minimums.
         // Ctrl+P from Normal mode (all flags false) must open the palette.
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::OpenCommandPalette
         ));
     }
@@ -2926,6 +3106,7 @@ A description that is long enough to pass minimums.
     #[tokio::test]
     async fn palette_enter_executes_selected_action() {
         // With command_palette=true, Enter must map to CommandPaletteExecute.
+        let app = test_app();
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -2935,7 +3116,8 @@ A description that is long enough to pass minimums.
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::CommandPaletteExecute
         ));
@@ -2973,6 +3155,7 @@ A description that is long enough to pass minimums.
     #[test]
     fn palette_esc_closes() {
         // Esc from the palette must map to CloseCommandPalette.
+        let app = test_app();
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -2982,7 +3165,8 @@ A description that is long enough to pass minimums.
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::CloseCommandPalette
         ));
@@ -3091,6 +3275,7 @@ wall_clock_secs = 1200
     #[test]
     fn settings_esc_closes() {
         // Esc in settings must map to CloseSettings.
+        let app = test_app();
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -3100,7 +3285,8 @@ wall_clock_secs = 1200
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::CloseSettings
         ));
@@ -3109,6 +3295,7 @@ wall_clock_secs = 1200
     #[test]
     fn settings_enter_commits() {
         // Enter in settings must map to SettingsCommit.
+        let app = test_app();
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -3118,7 +3305,8 @@ wall_clock_secs = 1200
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::SettingsCommit
         ));
@@ -3127,6 +3315,7 @@ wall_clock_secs = 1200
     #[test]
     fn settings_arrows_navigate() {
         // Up/Down in settings must map to SettingsUp/SettingsDown.
+        let app = test_app();
         let up = key_press(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -3136,7 +3325,8 @@ wall_clock_secs = 1200
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::SettingsUp
         ));
@@ -3150,7 +3340,8 @@ wall_clock_secs = 1200
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::SettingsDown
         ));
@@ -3159,6 +3350,7 @@ wall_clock_secs = 1200
     #[test]
     fn settings_digit_input() {
         // Typing a digit in settings must map to SettingsInput.
+        let app = test_app();
         let ev = key_press(KeyCode::Char('5'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -3168,7 +3360,8 @@ wall_clock_secs = 1200
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::SettingsInput('5')
         ));
@@ -3177,6 +3370,7 @@ wall_clock_secs = 1200
     #[test]
     fn settings_backspace_deletes() {
         // Backspace in settings must map to SettingsBackspace.
+        let app = test_app();
         let ev = key_press(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -3186,7 +3380,8 @@ wall_clock_secs = 1200
                     ..ModalState::default()
                 },
                 crate::app::Panel::Sidebar,
-                false
+                false,
+                &app
             ),
             AppEvent::SettingsBackspace
         ));
@@ -3298,7 +3493,13 @@ wall_clock_secs = 1200
     fn enter_key_in_sidebar_translates_to_open_focused_node() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
             AppEvent::OpenFocusedNode
         ));
     }
@@ -3307,7 +3508,13 @@ wall_clock_secs = 1200
     fn enter_key_in_main_pane_toggles_accordion() {
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                &test_app()
+            ),
             AppEvent::ToggleTreeNode
         ));
     }
@@ -3318,7 +3525,13 @@ wall_clock_secs = 1200
     fn s_key_in_main_with_plan_tab_toggles_scope() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                true,
+                &test_app()
+            ),
             AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Scope)
         ));
     }
@@ -3327,7 +3540,13 @@ wall_clock_secs = 1200
     fn a_key_in_main_with_plan_tab_toggles_architecture() {
         let ev = key_press(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                true,
+                &test_app()
+            ),
             AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Architecture)
         ));
     }
@@ -3336,7 +3555,13 @@ wall_clock_secs = 1200
     fn t_key_in_main_with_plan_tab_toggles_tasks() {
         let ev = key_press(KeyCode::Char('t'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                true,
+                &test_app()
+            ),
             AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Tasks)
         ));
     }
@@ -3345,7 +3570,13 @@ wall_clock_secs = 1200
     fn z_key_in_main_with_plan_tab_toggles_status() {
         let ev = key_press(KeyCode::Char('z'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, true),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                true,
+                &test_app()
+            ),
             AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Status)
         ));
     }
@@ -3354,7 +3585,13 @@ wall_clock_secs = 1200
     fn s_key_in_main_without_plan_tab_is_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                &test_app()
+            ),
             AppEvent::StartRun
         ));
     }
@@ -3363,7 +3600,13 @@ wall_clock_secs = 1200
     fn s_key_in_sidebar_with_plan_tab_is_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, true),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                true,
+                &test_app()
+            ),
             AppEvent::StartRun
         ));
     }
@@ -3372,7 +3615,13 @@ wall_clock_secs = 1200
     fn a_key_in_sidebar_with_plan_tab_is_tick() {
         let ev = key_press(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Sidebar, true),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                true,
+                &test_app()
+            ),
             AppEvent::Tick
         ));
     }
@@ -3398,6 +3647,7 @@ wall_clock_secs = 1200
             ModalState::default(),
             crate::app::Panel::Main,
             true, // plan_tab_active
+            &app,
         );
 
         // Should get a ToggleAccordionSection event
@@ -3419,6 +3669,7 @@ wall_clock_secs = 1200
             ModalState::default(),
             crate::app::Panel::Main,
             true,
+            &app,
         );
         app.update(ev2);
 
@@ -3431,7 +3682,13 @@ wall_clock_secs = 1200
     fn alt_right_key_translates_to_next_tab() {
         let ev = key_press(KeyCode::Right, KeyModifiers::ALT);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                &test_app()
+            ),
             AppEvent::NextTab
         ));
     }
@@ -3440,7 +3697,13 @@ wall_clock_secs = 1200
     fn alt_left_key_translates_to_prev_tab() {
         let ev = key_press(KeyCode::Left, KeyModifiers::ALT);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                &test_app()
+            ),
             AppEvent::PrevTab
         ));
     }
@@ -3449,7 +3712,13 @@ wall_clock_secs = 1200
     fn control_w_key_translates_to_close_tab() {
         let ev = key_press(KeyCode::Char('w'), KeyModifiers::CONTROL);
         assert!(matches!(
-            translate_terminal_event(ev, ModalState::default(), crate::app::Panel::Main, false),
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                &test_app()
+            ),
             AppEvent::CloseTab
         ));
     }
@@ -3480,6 +3749,7 @@ wall_clock_secs = 1200
             ModalState::default(),
             crate::app::Panel::Main,
             true,
+            &app,
         );
         assert!(matches!(ev, AppEvent::PrevTab));
         app.update(ev);
@@ -3493,6 +3763,7 @@ wall_clock_secs = 1200
             ModalState::default(),
             crate::app::Panel::Main,
             true,
+            &app,
         );
         assert!(matches!(ev, AppEvent::NextTab));
         app.update(ev);
@@ -3506,6 +3777,7 @@ wall_clock_secs = 1200
             ModalState::default(),
             crate::app::Panel::Main,
             true,
+            &app,
         );
         assert!(matches!(ev, AppEvent::CloseTab));
         app.update(ev);
@@ -3513,5 +3785,100 @@ wall_clock_secs = 1200
         // Should have one tab left
         assert_eq!(app.tabs.open_tabs.len(), 1);
         assert_eq!(app.tabs.active_tab, Some(0));
+    }
+
+    #[test]
+    fn test_accordion_header_click_toggles_section() {
+        use ratatui::layout::Rect;
+
+        // Create an app and manually populate accordion_header_bounds with known regions
+        let app = test_app();
+
+        // Simulate a header at position (0, 5) with width 40 and height 1
+        let header_rect = Rect {
+            x: 0,
+            y: 5,
+            width: 40,
+            height: 1,
+        };
+        let app = app;
+        *app.accordion_header_bounds.borrow_mut() =
+            vec![(crate::app::AccordionSection::Scope, header_rect)];
+
+        // Create a mouse click inside the header bounds
+        let click_inside = mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 5);
+        let ev = translate_terminal_event(
+            click_inside,
+            ModalState::default(),
+            crate::app::Panel::Main,
+            true,
+            &app,
+        );
+
+        // Should dispatch ToggleAccordionSection
+        assert!(matches!(
+            ev,
+            AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Scope)
+        ));
+
+        // Create a mouse click outside the header bounds
+        let click_outside = mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 10);
+        let ev2 = translate_terminal_event(
+            click_outside,
+            ModalState::default(),
+            crate::app::Panel::Main,
+            true,
+            &app,
+        );
+
+        // Should dispatch SelectionStart instead
+        assert!(matches!(ev2, AppEvent::SelectionStart(10, 10)));
+    }
+
+    #[test]
+    fn arrow_keys_in_main_pane_emit_focus_events() {
+        // Right arrow in main pane should emit FocusNext (Tab-equivalent)
+        let right_event = key_press(KeyCode::Right, KeyModifiers::NONE);
+        let ev = translate_terminal_event(
+            right_event,
+            ModalState::default(),
+            crate::app::Panel::Main,
+            false,
+            &test_app(),
+        );
+        assert!(matches!(ev, AppEvent::FocusNext));
+
+        // Left arrow in main pane should emit FocusPrev (Shift+Tab-equivalent)
+        let left_event = key_press(KeyCode::Left, KeyModifiers::NONE);
+        let ev = translate_terminal_event(
+            left_event,
+            ModalState::default(),
+            crate::app::Panel::Main,
+            false,
+            &test_app(),
+        );
+        assert!(matches!(ev, AppEvent::FocusPrev));
+
+        // Right arrow in sidebar should still emit FocusRightOrExpand (preserve existing behavior)
+        let right_event = key_press(KeyCode::Right, KeyModifiers::NONE);
+        let ev = translate_terminal_event(
+            right_event,
+            ModalState::default(),
+            crate::app::Panel::Sidebar,
+            false,
+            &test_app(),
+        );
+        assert!(matches!(ev, AppEvent::FocusRightOrExpand));
+
+        // Left arrow in sidebar should still emit FocusLeftOrCollapse (preserve existing behavior)
+        let left_event = key_press(KeyCode::Left, KeyModifiers::NONE);
+        let ev = translate_terminal_event(
+            left_event,
+            ModalState::default(),
+            crate::app::Panel::Sidebar,
+            false,
+            &test_app(),
+        );
+        assert!(matches!(ev, AppEvent::FocusLeftOrCollapse));
     }
 }

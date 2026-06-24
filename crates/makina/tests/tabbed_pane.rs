@@ -61,6 +61,7 @@ fn make_app_with_tasks() -> App {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             },
             TaskView {
                 id: TaskId::new("task-2"),
@@ -72,6 +73,7 @@ fn make_app_with_tasks() -> App {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             },
         ],
         report: makina_core::api::IngestionReport::default(),
@@ -98,6 +100,7 @@ fn make_app_with_tasks_and_plans() -> App {
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            entry_text: String::new(),
         }],
         report: makina_core::api::IngestionReport::default(),
     };

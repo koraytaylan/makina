@@ -75,6 +75,7 @@ fn exchange_app() -> App {
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            entry_text: String::new(),
         }],
         report: makina_core::api::IngestionReport::default(),
     };

@@ -294,6 +294,7 @@ fn sample_run(id: RunId) -> RunView {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             },
             TaskView {
                 id: TaskId::new("tui-scaffold"),
@@ -305,6 +306,7 @@ fn sample_run(id: RunId) -> RunView {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             },
             TaskView {
                 id: TaskId::new("runs-sidebar"),
@@ -316,6 +318,7 @@ fn sample_run(id: RunId) -> RunView {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: String::new(),
             },
         ],
         report: makina_core::api::IngestionReport::default(),
