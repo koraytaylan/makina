@@ -1095,8 +1095,8 @@ fn translate_terminal_event(
         // and we reimplement it (highlight + OSC 52 copy). See `crate::selection`.
         // Other kinds (move, other buttons) stay no-ops.
         CrosstermEvent::Mouse(m) => match m.kind {
-            MouseEventKind::ScrollUp => AppEvent::ScrollUp,
-            MouseEventKind::ScrollDown => AppEvent::ScrollDown,
+            MouseEventKind::ScrollUp => AppEvent::ScrollUpAt(m.column, m.row),
+            MouseEventKind::ScrollDown => AppEvent::ScrollDownAt(m.column, m.row),
             MouseEventKind::Down(MouseButton::Left) => AppEvent::SelectionStart(m.column, m.row),
             MouseEventKind::Drag(MouseButton::Left) => AppEvent::SelectionExtend(m.column, m.row),
             MouseEventKind::Up(MouseButton::Left) => AppEvent::SelectionEnd(m.column, m.row),
@@ -1355,7 +1355,7 @@ mod tests {
                 crate::app::Panel::Sidebar,
                 false
             ),
-            AppEvent::ScrollUp
+            AppEvent::ScrollUpAt(_, _)
         ));
         assert!(matches!(
             translate_terminal_event(
@@ -1364,7 +1364,7 @@ mod tests {
                 crate::app::Panel::Sidebar,
                 false
             ),
-            AppEvent::ScrollDown
+            AppEvent::ScrollDownAt(_, _)
         ));
     }
 

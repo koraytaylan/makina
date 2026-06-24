@@ -41,13 +41,15 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
 use std::collections::HashSet;
 
 use crate::app::{
-    AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, TabContent, TreeNode,
+    AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
+    ScrollablePanel, TabContent, TreeNode,
 };
 use makina_core::api::FailureKind;
 
@@ -282,6 +284,12 @@ pub fn render(app: &App, frame: &mut Frame) {
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
 
+        // Capture item count and compute scroll bounds before items are moved.
+        let total_items = items.len();
+        let sidebar_inner = sidebar_block.inner(sidebar_area);
+        let sidebar_visible = sidebar_inner.height as usize;
+        let sidebar_scroll_max = total_items.saturating_sub(sidebar_visible) as u16;
+
         let sidebar_list = List::new(items)
             .block(sidebar_block)
             .highlight_style(highlight_style)
@@ -289,10 +297,36 @@ pub fn render(app: &App, frame: &mut Frame) {
 
         // ListState carries the selected index so ratatui knows which node to
         // highlight.  Use tree_cursor instead of selected_run.
-        let mut list_state = ListState::default();
-        list_state.select(app.tree_cursor);
+        let sidebar_scroll_offset = app
+            .scroll_offsets
+            .get(&ScrollablePanel::Sidebar)
+            .copied()
+            .unwrap_or(0) as usize;
+        let mut list_state = ListState::default()
+            .with_selected(app.tree_cursor)
+            .with_offset(sidebar_scroll_offset);
 
         frame.render_stateful_widget(sidebar_list, sidebar_area, &mut list_state);
+
+        // Record the sidebar scroll-max this frame and render scrollbar if needed.
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Sidebar, sidebar_scroll_max);
+
+        if total_items > sidebar_visible {
+            let sidebar_scroll_offset = app
+                .scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0);
+            let mut scrollbar_state =
+                ScrollbarState::new(total_items).position(sidebar_scroll_offset as usize);
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None);
+            frame.render_stateful_widget(scrollbar, sidebar_inner, &mut scrollbar_state);
+        }
     }
 
     // ── Main content — per-task status view (task 29) ────────────────────────
@@ -359,6 +393,12 @@ pub fn render(app: &App, frame: &mut Frame) {
         })
     });
 
+    // Accumulate panel geometries for hitbox testing.
+    let mut panel_geoms: Vec<PanelGeometry> = vec![PanelGeometry {
+        panel: ScrollablePanel::Sidebar,
+        rect: sidebar_area,
+    }];
+
     match (active_plan_tab, app.selected_run()) {
         (Some(plan), _) => {
             // Split content area to reserve 1 row for tab bar at the top
@@ -375,6 +415,12 @@ pub fn render(app: &App, frame: &mut Frame) {
 
             // Render the plan accordion pane below the tab bar
             render_plan_accordion_pane(app, plan, frame, plan_area);
+
+            // Record the plan accordion geometry
+            panel_geoms.push(PanelGeometry {
+                panel: ScrollablePanel::PlanAccordion,
+                rect: plan_area,
+            });
         }
         (None, None) => {
             // No run selected: show a hint paragraph.
@@ -483,12 +529,24 @@ pub fn render(app: &App, frame: &mut Frame) {
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(dep_height), Constraint::Min(3)])
                     .split(exchange_area);
-                render_dependency_view(app, frame, dep_split[0]);
+                let dep_area = dep_split[0];
+                render_dependency_view(app, frame, dep_area);
+                panel_geoms.push(PanelGeometry {
+                    panel: ScrollablePanel::DependencyView,
+                    rect: dep_area,
+                });
                 dep_split[1]
             };
             render_exchange_pane(app, frame, exchange_pane_area, main_focused);
+            panel_geoms.push(PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: exchange_pane_area,
+            });
         }
     }
+
+    // Record the accumulated panel geometries for hitbox testing in the event loop.
+    app.set_panel_geometries(panel_geoms);
 
     // ── Error pane (collapsible, global) ───────────────────────────────────
     // A 0-height `error_area` (pane closed) makes this a no-op. Rendered for
@@ -732,7 +790,14 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )])],
             };
-            let para = Paragraph::new(lines);
+            let dep_total = lines.len() as u16;
+            let dep_scroll_max = dep_total.saturating_sub(inner.height);
+            app.last_scroll_maxes
+                .borrow_mut()
+                .insert(ScrollablePanel::DependencyView, dep_scroll_max);
+            let dep_scroll_offset =
+                app.panel_offset(ScrollablePanel::DependencyView, dep_scroll_max);
+            let para = Paragraph::new(lines).scroll((dep_scroll_offset, 0));
             frame.render_widget(para, inner);
         }
         DependencyViewMode::Tree => {
@@ -761,7 +826,14 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )])],
             };
-            let para = Paragraph::new(lines);
+            let dep_total = lines.len() as u16;
+            let dep_scroll_max = dep_total.saturating_sub(inner.height);
+            app.last_scroll_maxes
+                .borrow_mut()
+                .insert(ScrollablePanel::DependencyView, dep_scroll_max);
+            let dep_scroll_offset =
+                app.panel_offset(ScrollablePanel::DependencyView, dep_scroll_max);
+            let para = Paragraph::new(lines).scroll((dep_scroll_offset, 0));
             frame.render_widget(para, inner);
         }
         DependencyViewMode::Timeline => {
@@ -847,7 +919,14 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )])],
             };
-            let para = Paragraph::new(lines);
+            let dep_total = lines.len() as u16;
+            let dep_scroll_max = dep_total.saturating_sub(inner.height);
+            app.last_scroll_maxes
+                .borrow_mut()
+                .insert(ScrollablePanel::DependencyView, dep_scroll_max);
+            let dep_scroll_offset =
+                app.panel_offset(ScrollablePanel::DependencyView, dep_scroll_max);
+            let para = Paragraph::new(lines).scroll((dep_scroll_offset, 0));
             frame.render_widget(para, inner);
         }
         // `Off` is handled by the caller (this fn is not invoked).
@@ -1298,13 +1377,26 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
             // Record the rendered bottom so the (geometry-free) `App::update`
             // scroll path can anchor `scroll_up` and bound `scroll_down` to the
             // real bottom (interior mutability keeps the `&App` render signature).
-            app.last_scroll_max.set(scroll_max);
+            app.last_scroll_maxes
+                .borrow_mut()
+                .insert(crate::app::ScrollablePanel::Exchange, scroll_max);
             let scroll_offset = app.effective_offset(scroll_max);
 
             let para = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((scroll_offset, 0));
             frame.render_widget(para, inner);
+
+            // Render scrollbar only when content exceeds the viewport.
+            if scroll_max > 0 {
+                let mut scrollbar_state =
+                    ScrollbarState::new(total_lines).position(scroll_offset as usize);
+                let scrollbar = Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None);
+                frame.render_stateful_widget(scrollbar, inner, &mut scrollbar_state);
+            }
         }
     }
 }
@@ -1415,13 +1507,44 @@ pub(crate) fn render_plan_accordion_pane(
         Style::default().fg(Color::DarkGray),
     )));
 
-    // Clamp scroll so the footer stays visible
-    let total = lines.len() as u16;
-    let scroll = total.saturating_sub(area.height);
+    // Per-panel scroll clamp ceiling: how many lines can be scrolled before the
+    // last line of content reaches the top of the viewport.
+    let total_lines = lines.len() as u16;
+    let accordion_scroll_max = total_lines.saturating_sub(area.height);
+    app.last_scroll_maxes
+        .borrow_mut()
+        .insert(ScrollablePanel::PlanAccordion, accordion_scroll_max);
+
+    // Reserve the rightmost column for the scrollbar so text is not overpainted.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let content_area = cols[0];
+    let scrollbar_area = cols[1];
+
+    let accordion_scroll_offset =
+        app.panel_offset(ScrollablePanel::PlanAccordion, accordion_scroll_max);
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(para, area);
+        .scroll((accordion_scroll_offset, 0));
+    frame.render_widget(para, content_area);
+
+    if accordion_scroll_max > 0 {
+        let accordion_scroll_offset = app
+            .scroll_offsets
+            .get(&ScrollablePanel::PlanAccordion)
+            .copied()
+            .unwrap_or(0)
+            .min(accordion_scroll_max);
+        let mut scrollbar_state =
+            ScrollbarState::new(total_lines as usize).position(accordion_scroll_offset as usize);
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
 }
 
 /// Render a single accordion section (SCOPE, ARCHITECTURE, TASKS, or STATUS).
@@ -2658,7 +2781,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, ScrollablePanel};
     use crate::placeholder::PlaceholderApi;
     use makina_core::api::{
         IngestionIssue, IngestionReport, IssueSeverity, IssueSource, RunId, RunStatus, RunView,
@@ -2857,6 +2980,343 @@ mod tests {
         assert!(
             screen.contains("depends on: task-model"),
             "plan must show dependencies; screen:\n{screen}"
+        );
+    }
+
+    /// **Accordion scrollbar renders when tall:** When a plan's expanded sections
+    /// exceed the pane height, a scrollbar appears in the reserved rightmost column.
+    #[test]
+    fn accordion_scrollbar_renders_when_tall() {
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Create a plan with very long content so all sections expanded will exceed pane height.
+        let long_content = "This is a test section.\n".repeat(50);
+
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
+            slug: "0001-initial".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "json-store".to_string(),
+                title: "JSON Store".to_string(),
+                gated: true,
+                depends_on: vec!["task-model".to_string()],
+            }],
+            scope_text: Some(long_content.clone()),
+            architecture_text: Some(long_content.clone()),
+            status_text: Some(long_content.clone()),
+        }];
+        app.tree_cursor = Some(0);
+
+        // Open a plan tab for this plan.
+        app.update(crate::app::AppEvent::OpenTab(
+            crate::app::TabContent::Plan {
+                plan_slug: "0001-initial".to_string(),
+            },
+        ));
+
+        // Expand all sections to make content tall.
+        app.accordion_state
+            .entry("0001-initial".to_string())
+            .or_default()
+            .insert(crate::app::AccordionSection::Scope);
+        app.accordion_state
+            .entry("0001-initial".to_string())
+            .or_default()
+            .insert(crate::app::AccordionSection::Architecture);
+        app.accordion_state
+            .entry("0001-initial".to_string())
+            .or_default()
+            .insert(crate::app::AccordionSection::Status);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // The accordion's reserved scrollbar column is the rightmost column of plan_area.
+        // For an 80-wide terminal: sidebar = 30% = 24 cols, main = 56 cols.
+        // main_block (Borders::ALL + Padding::horizontal(1)) inner: x=26, width=52.
+        // plan_area has the same x and width, so its rightmost column = 26 + 52 - 1 = 77.
+        let accordion_scrollbar_col: u16 = 77;
+        // Accordion rows start after the tab row inside main inner (y=2 for body starting at y=1).
+        let accordion_rows = 1u16..9u16;
+
+        // Assert a scrollbar glyph is present in the accordion's reserved rightmost column.
+        let has_scrollbar = col_has_scrollbar(
+            &buffer,
+            accordion_scrollbar_col,
+            accordion_rows.start,
+            accordion_rows.end,
+        );
+
+        assert!(
+            has_scrollbar,
+            "accordion pane must show scrollbar thumb (█) or track (║) in the rightmost column (x={accordion_scrollbar_col}) when content is tall"
+        );
+    }
+
+    /// **Accordion has no scrollbar when short:** When a plan's expanded sections
+    /// fit within the pane height, no scrollbar glyphs should appear in the
+    /// accordion pane's rightmost columns.
+    #[test]
+    fn accordion_no_scrollbar_when_short() {
+        let mut terminal = make_terminal(80, 25);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Create a plan with minimal content so expanded sections fit in pane height.
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
+            slug: "0001-initial".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "json-store".to_string(),
+                title: "JSON Store".to_string(),
+                gated: true,
+                depends_on: vec!["task-model".to_string()],
+            }],
+            scope_text: Some("Short scope text.\n".to_string()),
+            architecture_text: Some("Short arch text.\n".to_string()),
+            status_text: Some("Short status text.\n".to_string()),
+        }];
+        app.tree_cursor = Some(0);
+
+        // Open a plan tab for this plan.
+        app.update(crate::app::AppEvent::OpenTab(
+            crate::app::TabContent::Plan {
+                plan_slug: "0001-initial".to_string(),
+            },
+        ));
+
+        // Don't expand sections - leave them collapsed so content is short.
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // The accordion's reserved scrollbar column is the rightmost column of plan_area.
+        // For an 80-wide terminal: sidebar = 30% = 24 cols, main = 56 cols.
+        // main_block (Borders::ALL + Padding::horizontal(1)) inner: x=26, width=52.
+        // plan_area has the same x and width, so its rightmost column = 26 + 52 - 1 = 77.
+        let accordion_scrollbar_col: u16 = 77;
+        // With terminal height 25, accordion rows go from 1 to 23.
+        let accordion_rows = 1u16..23u16;
+
+        // Assert no scrollbar glyph appears in the accordion's reserved rightmost column.
+        let has_scrollbar = col_has_scrollbar(
+            &buffer,
+            accordion_scrollbar_col,
+            accordion_rows.start,
+            accordion_rows.end,
+        );
+
+        assert!(
+            !has_scrollbar,
+            "accordion pane must not show scrollbar glyphs when content fits (checked col x={accordion_scrollbar_col})"
+        );
+    }
+
+    /// **Accordion scroll offset applied to rendering:** When `scroll_offsets[PlanAccordion] = 3`
+    /// and the accordion content exceeds the pane height, the first rendered accordion content
+    /// row equals the wrapped line originally at index 3 (lines 0–2 are skipped). With an offset
+    /// greater than `accordion_scroll_max` it clamps so the first row equals the line at index
+    /// `accordion_scroll_max`.
+    ///
+    /// Proof strategy (geometry-free, mirrors exchange_scroll_offset_applied_to_rendering):
+    ///   1. Render at offset=0 into a tall-enough terminal; scan for the first row containing
+    ///      "SCOPE" (the first accordion line, index 0). That row is `first_content_y`.
+    ///   2. Capture the content of row `first_content_y + OFFSET` from the offset=0 render.
+    ///      That is exactly what lines[OFFSET] looks like.
+    ///   3. Render at offset=OFFSET and assert row `first_content_y` equals the content captured
+    ///      in step 2 — proving lines[OFFSET] has moved to the top.
+    ///   4. Read `accordion_scroll_max` from `app.last_scroll_maxes` (written by the render pass).
+    ///      Render at `accordion_scroll_max`, record the first visible row.
+    ///      Render at `accordion_scroll_max + 100` (over the ceiling); assert the first visible
+    ///      row equals the row captured at `accordion_scroll_max` (clamp proof).
+    #[test]
+    fn accordion_scroll_offset_applied_to_rendering() {
+        use crate::app::AppEvent;
+
+        // Use a tall terminal (100×30) so `first_content_y + OFFSET` is within the viewport
+        // when offset=0.  The accordion occupies roughly rows 3..28 (9 visible rows per frame
+        // after borders/tabs, but the paragraph is tall enough to overflow).
+        let term_width: usize = 100;
+        let term_height: u16 = 30;
+        const OFFSET: u16 = 3; // spec requires scroll_offsets[PlanAccordion] = 3
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Create a plan with tall content so scroll_max > 0.
+        let long_content = (0..80)
+            .map(|i| format!("Section line {}\n", i))
+            .collect::<String>();
+
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
+            slug: "0001-initial".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "test-task".to_string(),
+                title: "Test Task".to_string(),
+                gated: false,
+                depends_on: vec![],
+            }],
+            scope_text: Some(long_content.clone()),
+            architecture_text: Some(long_content.clone()),
+            status_text: Some(long_content.clone()),
+        }];
+        app.tree_cursor = Some(0);
+
+        // Open a plan tab.
+        app.update(AppEvent::OpenTab(crate::app::TabContent::Plan {
+            plan_slug: "0001-initial".to_string(),
+        }));
+
+        // Expand all sections to make content tall.
+        app.accordion_state
+            .entry("0001-initial".to_string())
+            .or_default()
+            .insert(crate::app::AccordionSection::Scope);
+        app.accordion_state
+            .entry("0001-initial".to_string())
+            .or_default()
+            .insert(crate::app::AccordionSection::Architecture);
+        app.accordion_state
+            .entry("0001-initial".to_string())
+            .or_default()
+            .insert(crate::app::AccordionSection::Status);
+
+        // ── Step 1: render at offset=0; find first_content_y and capture lines[OFFSET] ──
+        app.scroll_offsets.insert(ScrollablePanel::PlanAccordion, 0);
+        let mut terminal = make_terminal(term_width as u16, term_height);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_0 = screen_of(&terminal);
+
+        // Locate first_content_y: the first terminal row that contains "SCOPE"
+        // (the accordion header, which is lines[0] of the paragraph).
+        let first_content_y = (0..term_height as usize)
+            .find(|&y| {
+                let row: String = screen_at_0
+                    .chars()
+                    .skip(y * term_width)
+                    .take(term_width)
+                    .collect();
+                row.contains("SCOPE")
+            })
+            .expect(
+                "offset=0 render must show 'SCOPE' header in the accordion; \
+                 check that the plan tab is open and sections are expanded",
+            );
+
+        // lines[0] = "[-] SCOPE" → appears at first_content_y.
+        // lines[OFFSET=3] appears at first_content_y + OFFSET (when offset=0).
+        let target_y = first_content_y + OFFSET as usize;
+        assert!(
+            target_y < term_height as usize,
+            "first_content_y={} + OFFSET={} = {} must be within term_height={}; \
+             increase term_height",
+            first_content_y,
+            OFFSET,
+            target_y,
+            term_height
+        );
+
+        // Capture what lines[OFFSET] looks like at offset=0.
+        let row_lines_offset_at_0: String = screen_at_0
+            .chars()
+            .skip(target_y * term_width)
+            .take(term_width)
+            .collect();
+
+        // Sanity: lines[OFFSET] must not be identical to lines[0].
+        let row_lines_0_at_0: String = screen_at_0
+            .chars()
+            .skip(first_content_y * term_width)
+            .take(term_width)
+            .collect();
+        assert_ne!(
+            row_lines_offset_at_0, row_lines_0_at_0,
+            "lines[{OFFSET}] and lines[0] must be different; content structure may be wrong"
+        );
+
+        // ── Step 2: render at offset=OFFSET=3; first row must equal lines[OFFSET] ──
+        app.scroll_offsets
+            .insert(ScrollablePanel::PlanAccordion, OFFSET);
+        let mut terminal = make_terminal(term_width as u16, term_height);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_offset = screen_of(&terminal);
+
+        let first_row_at_offset: String = screen_at_offset
+            .chars()
+            .skip(first_content_y * term_width)
+            .take(term_width)
+            .collect();
+
+        assert_eq!(
+            first_row_at_offset,
+            row_lines_offset_at_0,
+            "With scroll_offsets[PlanAccordion]={OFFSET}, the first visible accordion row \
+             (terminal row y={first_content_y}) must equal lines[{OFFSET}] (which appeared at \
+             row {} when offset=0);\n  expected: '{}'\n  got:      '{}'",
+            target_y,
+            row_lines_offset_at_0.trim_end(),
+            first_row_at_offset.trim_end()
+        );
+
+        // ── Step 3: verify clamping ─────────────────────────────────────────────
+        // Read accordion_scroll_max that the render pass recorded this frame.
+        let accordion_scroll_max = app
+            .last_scroll_maxes
+            .borrow()
+            .get(&ScrollablePanel::PlanAccordion)
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            accordion_scroll_max > 0,
+            "accordion_scroll_max must be > 0 (content must overflow the pane)"
+        );
+
+        // Render at exactly scroll_max; record the first visible row.
+        app.scroll_offsets
+            .insert(ScrollablePanel::PlanAccordion, accordion_scroll_max);
+        let mut terminal = make_terminal(term_width as u16, term_height);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_max = screen_of(&terminal);
+
+        let first_row_at_max: String = screen_at_max
+            .chars()
+            .skip(first_content_y * term_width)
+            .take(term_width)
+            .collect();
+
+        // Render at offset well above scroll_max (should clamp to scroll_max).
+        let huge_offset = accordion_scroll_max.saturating_add(100);
+        app.scroll_offsets
+            .insert(ScrollablePanel::PlanAccordion, huge_offset);
+        let mut terminal = make_terminal(term_width as u16, term_height);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_huge = screen_of(&terminal);
+
+        let first_row_at_huge: String = screen_at_huge
+            .chars()
+            .skip(first_content_y * term_width)
+            .take(term_width)
+            .collect();
+
+        assert_eq!(
+            first_row_at_huge,
+            first_row_at_max,
+            "With scroll_offsets[PlanAccordion]={} (> accordion_scroll_max={}), the first \
+             visible accordion row must clamp to the row at scroll_max={};\
+             \n  expected (at scroll_max): '{}'\n  got (at huge offset):   '{}'",
+            huge_offset,
+            accordion_scroll_max,
+            accordion_scroll_max,
+            first_row_at_max.trim_end(),
+            first_row_at_huge.trim_end()
         );
     }
 
@@ -3566,6 +4026,13 @@ mod tests {
             .iter()
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
             .collect()
+    }
+
+    fn col_has_scrollbar(buf: &ratatui::buffer::Buffer, x: u16, y0: u16, y1: u16) -> bool {
+        (y0..y1).any(|y| {
+            let s = buf[(x, y)].symbol();
+            s == "█" || s == "║" || s == "▲" || s == "▼"
+        })
     }
 
     #[test]
@@ -5008,6 +5475,541 @@ mod tests {
         assert!(
             added_fg_green,
             "the `+added line` in tool content must have a Green-foreground cell (diff styling)"
+        );
+    }
+
+    // ── Scrollbar rendering tests ─────────────────────────────────────────────
+
+    /// **Exchange pane scrollbar renders when tall:** When the exchange log
+    /// exceeds the pane height, a vertical scrollbar (thumb `█` and track `║`)
+    /// must render in the right column of the pane's inner area.
+    #[test]
+    fn exchange_pane_scrollbar_renders_when_tall() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/scrollbar-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("tall-log"),
+                title: "Tall Log".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+
+        // Send a prompt.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("tall-log"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "Do something".into(),
+            },
+        }));
+
+        // Send many response chunks to exceed the pane height.
+        for i in 0..20 {
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: TaskId::new("tall-log"),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::ResponseChunk {
+                    text: format!("Response line {}\n", i),
+                },
+            }));
+        }
+
+        // Complete the response.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("tall-log"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // The exchange pane's inner area (Borders::TOP, no horizontal border) has x=26, width=52
+        // for an 80-wide terminal (main_block inner: border+padding = 2 per side → x=26, width=52).
+        // The scrollbar renders into the rightmost column of the inner area: x = 26 + 52 - 1 = 77.
+        let exchange_scrollbar_col: u16 = 77;
+        let exchange_rows = 2u16..9u16;
+
+        // Assert a scrollbar glyph is present in the exchange pane's rightmost inner column.
+        let has_scrollbar = col_has_scrollbar(
+            &buffer,
+            exchange_scrollbar_col,
+            exchange_rows.start,
+            exchange_rows.end,
+        );
+
+        assert!(
+            has_scrollbar,
+            "exchange pane must show scrollbar thumb (█) or track (║) in rightmost inner column (x={exchange_scrollbar_col}) when content is tall"
+        );
+    }
+
+    /// **Exchange pane has no scrollbar when short:** When the exchange log
+    /// fits within the pane height, no scrollbar glyphs should appear in the
+    /// right column of the pane's inner area.
+    #[test]
+    fn exchange_pane_no_scrollbar_when_short() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        // Use a tall terminal so the exchange pane inner area has many more rows than
+        // the short log (2 responses). 80×24: body=22, main inner=20, after tab(1)+header(3)=16
+        // exchange inner rows ≈ 15 > 3 content lines → scroll_max = 0 → no scrollbar.
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/scrollbar-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("short-log"),
+                title: "Short Log".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+
+        // Send a prompt.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("short-log"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "Quick task".into(),
+            },
+        }));
+
+        // Send only 2 response chunks (fits easily in the tall pane).
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("short-log"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::ResponseChunk {
+                text: "Answer part 1\n".into(),
+            },
+        }));
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("short-log"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::ResponseChunk {
+                text: "Answer part 2\n".into(),
+            },
+        }));
+
+        // Complete the response.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("short-log"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // For an 80-wide terminal: exchange pane inner rightmost column = 26 + 52 - 1 = 77.
+        let exchange_scrollbar_col: u16 = 77;
+        let exchange_rows = 2u16..23u16;
+
+        // Assert no scrollbar glyph appears in the exchange pane's rightmost inner column.
+        let has_scrollbar = col_has_scrollbar(
+            &buffer,
+            exchange_scrollbar_col,
+            exchange_rows.start,
+            exchange_rows.end,
+        );
+
+        assert!(
+            !has_scrollbar,
+            "exchange pane must not show any scrollbar glyphs when content fits (checked col x={exchange_scrollbar_col})"
+        );
+    }
+
+    /// **Exchange pane scrollbar position matches offset:** When the scroll
+    /// offset is set to a mid value (with auto-follow off), the thumb glyph
+    /// must appear in the expected row band within the pane height, not at
+    /// the top.
+    #[test]
+    fn exchange_pane_scrollbar_position_matches_offset() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        let mut terminal = make_terminal(80, 12);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/scrollbar-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("mid-offset"),
+                title: "Mid Offset".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+
+        // Send a prompt.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("mid-offset"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "Do something".into(),
+            },
+        }));
+
+        // Send many response chunks to create scroll space.
+        for i in 0..25 {
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: TaskId::new("mid-offset"),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::ResponseChunk {
+                    text: format!("Response line {}\n", i),
+                },
+            }));
+        }
+
+        // Complete the response.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("mid-offset"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        // Disable auto-follow and set scroll offset to a mid value.
+        app.exchange_auto_follow = false;
+        app.scroll_offsets.insert(ScrollablePanel::Exchange, 10);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // The exchange pane's inner area occupies rows 2 to 11 (10 rows total).
+        // With a scroll offset of 10 and pane height ~9, the thumb should be
+        // roughly in the middle-to-lower portion of the visible scrollbar area.
+        let exchange_rows = 2u16..11u16;
+
+        // Find the row with the thumb glyph in the rightmost columns.
+        let thumb_row = exchange_rows.clone().find(|row| {
+            (70u16..80u16).any(|col| {
+                let symbol = buffer[(col, *row)].symbol();
+                symbol == "█"
+            })
+        });
+
+        // The thumb should not be at the very top (row 2).
+        assert!(
+            thumb_row.is_some() && thumb_row != Some(2),
+            "exchange pane scrollbar thumb must appear at a non-top row when offset is mid; found at {:?}",
+            thumb_row
+        );
+    }
+
+    /// **Exchange pane scroll offset is applied to rendering:** When scroll_offsets
+    /// contains a manual offset N and auto-follow is disabled, the first visible
+    /// content row of the exchange pane must equal the log line originally at index N.
+    ///
+    /// Proof strategy (geometry-free):
+    ///   1. Render with offset=0 and a tall-enough terminal (80×30) so that row
+    ///      `first_inner_y` shows lines[0] and row `first_inner_y + N` shows lines[N].
+    ///   2. Record the content of row `first_inner_y + N` from that render.
+    ///   3. Render with offset=N and assert the content of row `first_inner_y` equals
+    ///      the content recorded in step 2 — proving lines[N] has moved to the top.
+    ///
+    /// The first inner row coordinate (`first_inner_y`) is located dynamically by
+    /// scanning for lines[0] = "gate … review …" so the test is layout-independent.
+    #[test]
+    fn exchange_scroll_offset_applied_to_rendering() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/scroll-offset-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("offset-test"),
+                title: "Offset Test".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+
+        // Send a prompt (lines[2] and lines[3] in the exchange paragraph).
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("offset-test"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "Test prompt".into(),
+            },
+        }));
+
+        // Send 30 response chunks.  After TurnComplete they are concatenated in one
+        // Response entry and rendered through the markdown pipeline; the label line
+        // plus the response-text lines give at least 30 content lines beyond the
+        // header, which is far more than the pane height so scroll_max > 0.
+        for i in 0..30 {
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: TaskId::new("offset-test"),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::ResponseChunk {
+                    text: format!("Response line {}\n", i),
+                },
+            }));
+        }
+
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("offset-test"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        // Use a tall terminal so row `first_inner_y + N` is within the viewport
+        // when offset=0 (we need N=10 to be visible, first_inner_y is around 7-8).
+        let term_width: usize = 80;
+        let term_height: u16 = 30;
+        const N: usize = 10; // scroll offset to test
+
+        // ── Step 1: render with offset=0, locate first_inner_y and record lines[N] ─
+        app.exchange_auto_follow = false;
+        app.scroll_offsets.insert(ScrollablePanel::Exchange, 0);
+        let mut terminal = make_terminal(term_width as u16, term_height);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_0 = screen_of(&terminal);
+
+        // Locate first_inner_y: the first row showing "gate … review …" (lines[0]).
+        let first_inner_y = (0..term_height as usize)
+            .find(|&y| {
+                let row: String = screen_at_0
+                    .chars()
+                    .skip(y * term_width)
+                    .take(term_width)
+                    .collect();
+                row.contains("gate") && row.contains("review")
+            })
+            .expect(
+                "offset=0 render must show 'gate … review …' (lines[0]) at some row; \
+                 check that the exchange pane is visible in the 80×30 terminal",
+            );
+
+        // Capture what lines[N] looks like at offset=0 (it appears at first_inner_y + N).
+        let row_n_at_offset_0: String = screen_at_0
+            .chars()
+            .skip((first_inner_y + N) * term_width)
+            .take(term_width)
+            .collect();
+
+        // Sanity: lines[N] must be within the terminal height.
+        assert!(
+            first_inner_y + N < term_height as usize,
+            "first_inner_y={} + N={} must be less than term_height={}; \
+             increase term_height or reduce N",
+            first_inner_y,
+            N,
+            term_height
+        );
+
+        // ── Step 2: render with offset=N; first content row must equal lines[N] ──
+        app.scroll_offsets
+            .insert(ScrollablePanel::Exchange, N as u16);
+        let mut terminal = make_terminal(term_width as u16, term_height);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_n = screen_of(&terminal);
+
+        let first_row_at_n: String = screen_at_n
+            .chars()
+            .skip(first_inner_y * term_width)
+            .take(term_width)
+            .collect();
+
+        assert_eq!(
+            first_row_at_n,
+            row_n_at_offset_0,
+            "With scroll_offset={N} the first visible content row of the exchange pane \
+             (buffer row y={first_inner_y}) must equal the line originally at index {N} \
+             (which appeared at row {} when offset=0); \
+             \n  expected: '{}'\n  got:      '{}'",
+            first_inner_y + N,
+            row_n_at_offset_0.trim_end(),
+            first_row_at_n.trim_end()
+        );
+
+        // Extra positive check: lines[N] must contain response text, not the header.
+        assert!(
+            first_row_at_n.contains("Response line"),
+            "lines[{N}] (at first content row with offset={N}) must be a response line, not a header; \
+             got: '{}'",
+            first_row_at_n.trim_end()
+        );
+    }
+
+    /// **Exchange pane auto-follow shows the bottom of the log:** When
+    /// `exchange_auto_follow` is true, the rendered exchange pane must contain
+    /// the last response line in the buffer.  When it is false with offset=0,
+    /// the top of the log is shown instead and the last response line is absent.
+    #[test]
+    fn exchange_auto_follow_preserved_with_rendering() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/auto-follow-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("auto-follow-test"),
+                title: "Auto Follow Test".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+
+        // Send a prompt.
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("auto-follow-test"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::PromptSent {
+                text: "Do something".into(),
+            },
+        }));
+
+        // Send 30 response chunks so total_lines (36) exceeds every reasonable
+        // pane height; the last chunk text is "Response line 29".
+        for i in 0..30 {
+            app.update(AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: TaskId::new("auto-follow-test"),
+                role: AgentRole::Developer,
+                event: ExchangeEvent::ResponseChunk {
+                    text: format!("Response line {}\n", i),
+                },
+            }));
+        }
+
+        app.update(AppEvent::ApiEvent(Event::AgentExchange {
+            run: RunId(1),
+            task: TaskId::new("auto-follow-test"),
+            role: AgentRole::Developer,
+            event: ExchangeEvent::TurnComplete,
+        }));
+
+        // ── Auto-follow ON: effective_offset = scroll_max; last line visible ────
+        // The TurnComplete event re-engages auto-follow (exchange_auto_follow=true).
+        assert!(
+            app.exchange_auto_follow,
+            "auto-follow must be true after TurnComplete drives scroll_offsets to the bottom"
+        );
+        let mut terminal = make_terminal(80, 12);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_auto = screen_of(&terminal);
+
+        // The bottom of the log ("Response line 29") must appear somewhere in
+        // the exchange pane rows of the TestBackend buffer.
+        assert!(
+            screen_auto.contains("Response line 29"),
+            "With auto-follow ON the bottom of the log ('Response line 29') must be \
+             visible in the rendered buffer; effective_offset should equal scroll_max"
+        );
+
+        // ── Auto-follow OFF + offset=0: top of log shown; last line absent ──────
+        // When the user manually pins to offset=0 with auto-follow off, the pane
+        // shows the very first lines ("gate …", "", "▶ Developer prompt", …).
+        // "Response line 29" is far beyond the pane viewport and must not appear.
+        app.exchange_auto_follow = false;
+        app.scroll_offsets.insert(ScrollablePanel::Exchange, 0);
+        let mut terminal = make_terminal(80, 12);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_top = screen_of(&terminal);
+
+        assert!(
+            !screen_top.contains("Response line 29"),
+            "With auto-follow OFF and offset=0 the last line ('Response line 29') must \
+             NOT appear in the buffer (the pane shows the top of the log)"
+        );
+
+        // The top of the log must be visible: lines[0] = "gate ×0  ·  review ×0".
+        // "gate" is reliable ASCII that only appears in the exchange pane header at offset=0.
+        assert!(
+            screen_top.contains("gate") && screen_top.contains("review"),
+            "With auto-follow OFF and offset=0 the exchange pane must show the top of \
+             the log (lines[0] = 'gate × … review ×0' must appear in the buffer)"
         );
     }
 
@@ -6496,6 +7498,508 @@ mod tests {
         assert!(
             screen.contains("(no tasks)"),
             "empty tasks must show placeholder when expanded; screen:\n{screen}"
+        );
+    }
+
+    /// **Sidebar scrollbar renders when tall:** When the sidebar item count
+    /// exceeds the pane height, a vertical scrollbar (thumb `█` and track `║`)
+    /// must appear in the sidebar's inner rightmost column.
+    #[test]
+    fn sidebar_scrollbar_renders_when_tall() {
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        // Create 50 runs to exceed the sidebar height of ~8 rows (10 total - 1 title - 1 status).
+        let runs = (0..50)
+            .map(|i| RunView {
+                id: RunId(i as u64),
+                run_uid: format!("run-{}", i),
+                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                status: RunStatus::Running,
+                project: "test-project".to_string(),
+                tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
+            })
+            .collect();
+
+        let app = App::new(api, runs, std::path::PathBuf::from("."));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // Sidebar inner area: sidebar_area = Percentage(30) of 80 = 24 cols (x=0, width=24).
+        // sidebar_block has Borders::ALL + Padding::horizontal(1): removes 2 per horizontal side.
+        // sidebar_inner: x = 0+2 = 2, width = 24-4 = 20, rightmost column = 2 + 20 - 1 = 21.
+        let sidebar_scrollbar_col: u16 = 21;
+        let sidebar_rows = 1u16..9u16; // Rows from below title bar to above status bar
+
+        // Assert a scrollbar glyph is present in the sidebar's inner rightmost column.
+        let has_scrollbar = col_has_scrollbar(
+            &buffer,
+            sidebar_scrollbar_col,
+            sidebar_rows.start,
+            sidebar_rows.end,
+        );
+
+        assert!(
+            has_scrollbar,
+            "sidebar must show scrollbar thumb (█) or track (║) in the rightmost inner column (x={sidebar_scrollbar_col}) when content is tall"
+        );
+    }
+
+    /// **Sidebar has no scrollbar when short:** When the sidebar item count
+    /// fits within the pane height, no scrollbar glyphs should appear in the
+    /// sidebar's right columns.
+    #[test]
+    fn sidebar_no_scrollbar_when_short() {
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        // Create only 5 runs, which fits in the sidebar height.
+        let runs = (0..5)
+            .map(|i| RunView {
+                id: RunId(i as u64),
+                run_uid: format!("run-{}", i),
+                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                status: RunStatus::Running,
+                project: "test-project".to_string(),
+                tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
+            })
+            .collect();
+
+        let app = App::new(api, runs, std::path::PathBuf::from("."));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // Sidebar inner rightmost column = 2 + 20 - 1 = 21 (see sidebar_scrollbar_renders_when_tall).
+        let sidebar_scrollbar_col: u16 = 21;
+        let sidebar_rows = 1u16..9u16;
+
+        // Assert no scrollbar glyph appears in the sidebar's inner rightmost column.
+        let has_scrollbar = col_has_scrollbar(
+            &buffer,
+            sidebar_scrollbar_col,
+            sidebar_rows.start,
+            sidebar_rows.end,
+        );
+
+        assert!(
+            !has_scrollbar,
+            "sidebar must not show any scrollbar glyphs when content fits (checked col x={sidebar_scrollbar_col})"
+        );
+    }
+
+    /// Extract a text string from a buffer rectangle (rows y0..y1, cols x0..x1).
+    /// Each row is concatenated with '\n' so substring checks can be row-bounded.
+    fn extract_buffer_region(
+        buf: &ratatui::buffer::Buffer,
+        x0: u16,
+        x1: u16,
+        y0: u16,
+        y1: u16,
+    ) -> String {
+        let mut out = String::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// **Sidebar scroll offset applied to rendering:**
+    ///
+    /// When `scroll_offsets[Sidebar] = 3` and `tree_cursor = None` (no selection,
+    /// so ratatui does not nudge the offset to keep a selected item visible), the
+    /// first item visible in the sidebar inner area must be the item originally at
+    /// index 3, and items at indices 0-2 must NOT appear in the sidebar.
+    ///
+    /// With `scroll_offsets[Sidebar] = 0` the item at index 0 is visible and the
+    /// item at index 6 is not (only 6 inner rows fit in a height-10 terminal).
+    ///
+    /// The test scans only the sidebar's inner buffer columns (1..23 in an 80-wide
+    /// terminal where the sidebar is 30% = 24 cols wide) to avoid false matches
+    /// from other panels.
+    #[test]
+    fn sidebar_scroll_offset_applied_to_rendering() {
+        // Terminal: 80 wide, 10 tall.
+        // Layout: row 0 = title, rows 1-8 = body (sidebar + main), row 9 = status bar.
+        // Sidebar occupies 30% of 80 = 24 columns (x: 0..24), with Borders::ALL:
+        //   inner columns: x 1..23 (22 wide), inner rows: y 2..8 (6 rows).
+        // With 12 items and 6 visible inner rows, offset=3 shows items 3-8; items 0-2 are hidden.
+        // With offset=0, items 0-5 are shown; item 6 is hidden.
+        //
+        // Item labels: file_stem of ".tasks/run-{i}.json" = "run-{i}" (no zero-padding).
+        // Uniqueness: "run-0" only appears in item 0; "run-1" only in item 1 (items 10+ don't
+        // exist since we create only 12 items, but even so "run-10" is not in the visible window
+        // at offset=3). "run-3" only appears in item 3. This makes substring checks safe.
+
+        let make_runs = || -> Vec<RunView> {
+            (0..12)
+                .map(|i| RunView {
+                    id: RunId(i as u64),
+                    run_uid: format!("run-{i}"),
+                    task_list_path: PathBuf::from(format!(".tasks/run-{i}.json")),
+                    status: RunStatus::Running,
+                    project: "test-project".to_string(),
+                    tasks: vec![],
+                    report: makina_core::api::IngestionReport::default(),
+                })
+                .collect()
+        };
+
+        // ── Test 1: offset = 3, no selection ─────────────────────────────────
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, make_runs(), std::path::PathBuf::from("."));
+        // Clear the tree cursor so ratatui does not nudge the offset to keep
+        // item 0 visible — without this, setting offset=3 with selected=Some(0)
+        // causes ratatui to reset first_visible_index back to 0.
+        app.tree_cursor = None;
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 3);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf1 = terminal.backend().buffer().clone();
+
+        // Sidebar inner area: x in 1..23, y in 2..8 (rows inside the Borders::ALL box).
+        let sidebar1 = extract_buffer_region(&buf1, 1, 23, 2, 8);
+
+        assert!(
+            sidebar1.contains("run-3"),
+            "offset=3: item at index 3 (run-3) must be visible in the sidebar; sidebar was:\n{sidebar1}"
+        );
+        assert!(
+            !sidebar1.contains("run-0"),
+            "offset=3: item at index 0 (run-0) must NOT be visible; sidebar was:\n{sidebar1}"
+        );
+        assert!(
+            !sidebar1.contains("run-1"),
+            "offset=3: item at index 1 (run-1) must NOT be visible; sidebar was:\n{sidebar1}"
+        );
+        assert!(
+            !sidebar1.contains("run-2"),
+            "offset=3: item at index 2 (run-2) must NOT be visible; sidebar was:\n{sidebar1}"
+        );
+
+        // ── Test 2: offset = 0, no selection ─────────────────────────────────
+        let mut terminal2 = make_terminal(80, 10);
+        let api2 = Arc::new(PlaceholderApi::empty());
+        let mut app2 = App::new(api2, make_runs(), std::path::PathBuf::from("."));
+        app2.tree_cursor = None;
+        app2.scroll_offsets.insert(ScrollablePanel::Sidebar, 0);
+
+        terminal2.draw(|f| render(&app2, f)).unwrap();
+        let buf2 = terminal2.backend().buffer().clone();
+
+        let sidebar2 = extract_buffer_region(&buf2, 1, 23, 2, 8);
+
+        assert!(
+            sidebar2.contains("run-0"),
+            "offset=0: item at index 0 (run-0) must be visible in the sidebar; sidebar was:\n{sidebar2}"
+        );
+        // With 6 inner rows and offset=0, items 0-5 are visible; item 6 is not.
+        assert!(
+            !sidebar2.contains("run-6"),
+            "offset=0: item at index 6 (run-6) must NOT be visible with only 6 inner rows; sidebar was:\n{sidebar2}"
+        );
+    }
+
+    /// **Dependency view scroll offset applied to List arm:** When the dependency
+    /// view's List arm is rendered with synthetic dependencies exceeding the pane
+    /// height, and a scroll offset is set, the first visible line should equal
+    /// the line at the offset index.
+    #[test]
+    fn dependency_view_scroll_offset_list_arm() {
+        use crate::app::DependencyViewMode;
+
+        let mut terminal = make_terminal(120, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        // Create many dependency tasks in the same run so they exceed pane height.
+        let mut dep_tasks = Vec::new();
+        for i in 0..12 {
+            dep_tasks.push(TaskView {
+                id: TaskId::new(format!("dep-{}", i)),
+                title: format!("Dependency {}", i),
+                state: TaskState::Done,
+                gate_iterations: 0,
+                review_iterations: 0,
+                started_at: None,
+                finished_at: None,
+                depends_on: vec![],
+                failure_reason: None,
+            });
+        }
+
+        // Create a main task that has synthetic dependencies (all the deps above).
+        let mut depends_on = Vec::new();
+        for i in 0..12 {
+            depends_on.push(TaskId::new(format!("dep-{}", i)));
+        }
+        let task_with_deps = TaskView {
+            id: TaskId::new("main-task"),
+            title: "Main task".into(),
+            state: TaskState::Done,
+            gate_iterations: 0,
+            review_iterations: 0,
+            started_at: None,
+            finished_at: None,
+            depends_on,
+            failure_reason: None,
+        };
+        dep_tasks.push(task_with_deps);
+
+        let run = RunView {
+            id: RunId(1),
+            run_uid: "test-run".to_string(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: "test-project".to_string(),
+            tasks: dep_tasks,
+            report: IngestionReport::default(),
+        };
+
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+
+        // Select the main task (the one with dependencies).
+        app.selected_task = Some(12);
+        app.dependency_view = DependencyViewMode::List;
+
+        // Test 1: offset = 2, should skip first 2 dependencies
+        app.scroll_offsets
+            .insert(ScrollablePanel::DependencyView, 2);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Dependency view is in the upper portion of the main area.
+        // Main area starts at column 30 (right of sidebar), rows roughly 5-15.
+        let dep_view = extract_buffer_region(&buffer, 30, 119, 5, 15);
+
+        // With offset=2, the first visible dependency should be dep-2.
+        // Look for "dep-2" in the extracted region.
+        assert!(
+            dep_view.contains("dep-2"),
+            "With scroll offset=2, first visible dependency must be dep-2; got:\n{dep_view}"
+        );
+
+        // dep-0 and dep-1 should NOT be visible (they are scrolled off).
+        assert!(
+            !dep_view.contains("dep-0"),
+            "With scroll offset=2, dep-0 (at index 0) must NOT be visible; got:\n{dep_view}"
+        );
+
+        // Test 2: offset = 0, should show first dependency from the start.
+        app.scroll_offsets
+            .insert(ScrollablePanel::DependencyView, 0);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dep_view = extract_buffer_region(&buffer, 30, 119, 5, 15);
+
+        assert!(
+            dep_view.contains("dep-0"),
+            "With scroll offset=0, first visible dependency must be dep-0; got:\n{dep_view}"
+        );
+    }
+
+    // ── Record-panel-geometries tests ─────────────────────────────────────────
+
+    /// Helper: compute the sidebar_area and exchange_pane_area that render()
+    /// produces for a terminal of the given size (no provider warning, no error
+    /// pane, DependencyViewMode::Off, empty ingestion report).
+    ///
+    /// Mirrors the layout logic in `render()` exactly, including the
+    /// `Padding::horizontal(1)` inside `panel_block` which shifts the inner
+    /// rect by +1 on each horizontal side.
+    fn expected_geometry(width: u16, height: u16) -> (Rect, Rect) {
+        let area = Rect::new(0, 0, width, height);
+
+        // Top-level vertical split: title(1) / warning(0) / body(Min) / status(1).
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(0),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let body_area = vertical[2];
+
+        // Body horizontal split: sidebar(30%) / main(70%).
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(body_area);
+        let sidebar_area = body[0];
+        let main_area = body[1];
+
+        // panel_block has Borders::ALL + Padding::horizontal(1).
+        // Borders::ALL removes 1 cell on each side; horizontal padding removes 1
+        // more on each side → total: x+2, y+1, width-4, height-2.
+        let main_inner = Rect::new(
+            main_area.x + 2,
+            main_area.y + 1,
+            main_area.width.saturating_sub(4),
+            main_area.height.saturating_sub(2),
+        );
+
+        // content_area = main_inner (error pane height = 0).
+        let content_area = main_inner;
+
+        // In the (None, Some(run)) arm, the header has 3 lines, ingestion = 0.
+        let header_height: u16 = 3;
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),             // tab bar
+                Constraint::Length(header_height), // header
+                Constraint::Length(0),             // ingestion (empty)
+                Constraint::Min(3),                // exchange
+            ])
+            .split(content_area);
+        // exchange_area = split[3]; with DependencyViewMode::Off → exchange_pane_area = exchange_area.
+        let exchange_pane_area = split[3];
+
+        (sidebar_area, exchange_pane_area)
+    }
+
+    /// **Record panel geometries — with selected run:**
+    /// After rendering with a run selected (no active plan tab,
+    /// DependencyViewMode::Off), `panel_geometries` must contain a Sidebar
+    /// entry whose rect matches sidebar_area and an Exchange entry whose rect
+    /// matches exchange_pane_area.
+    #[test]
+    fn record_panel_geometries_with_selected_run() {
+        let (sidebar_area, exchange_pane_area) = expected_geometry(80, 24);
+
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/geom-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("geom-task"),
+                title: "Geometry Task".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        // Select the run so we enter the (None, Some(run)) match arm.
+        app.tree_cursor = Some(0);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let geoms = app.panel_geometries.borrow();
+
+        // Sidebar entry must exist and match the expected rect.
+        let sidebar_entry = geoms.iter().find(|g| g.panel == ScrollablePanel::Sidebar);
+        assert!(
+            sidebar_entry.is_some(),
+            "panel_geometries must contain a Sidebar entry; got: {:?}",
+            &*geoms
+        );
+        assert_eq!(
+            sidebar_entry.unwrap().rect,
+            sidebar_area,
+            "Sidebar rect must equal sidebar_area"
+        );
+
+        // Exchange entry must exist and match the expected rect.
+        let exchange_entry = geoms.iter().find(|g| g.panel == ScrollablePanel::Exchange);
+        assert!(
+            exchange_entry.is_some(),
+            "panel_geometries must contain an Exchange entry when a run is selected; got: {:?}",
+            &*geoms
+        );
+        assert_eq!(
+            exchange_entry.unwrap().rect,
+            exchange_pane_area,
+            "Exchange rect must equal exchange_pane_area"
+        );
+    }
+
+    /// **Record panel geometries — no run selected:**
+    /// When no run is selected and no plan tab is active, the render enters the
+    /// (None, None) hint arm and must NOT record an Exchange geometry entry.
+    #[test]
+    fn record_panel_geometries_no_run_selected_has_no_exchange_entry() {
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        // No runs → selected_run() returns None; no plan tabs opened.
+        let app = App::new(api, vec![], PathBuf::from("."));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let geoms = app.panel_geometries.borrow();
+
+        // Sidebar must still be recorded (it's always visible).
+        assert!(
+            geoms.iter().any(|g| g.panel == ScrollablePanel::Sidebar),
+            "Sidebar entry must always be recorded; got: {:?}",
+            &*geoms
+        );
+
+        // Exchange must NOT be recorded when no run is selected.
+        assert!(
+            !geoms.iter().any(|g| g.panel == ScrollablePanel::Exchange),
+            "Exchange entry must NOT appear when no run is selected; got: {:?}",
+            &*geoms
+        );
+    }
+
+    /// **Record panel geometries — resize changes sidebar rect.height:**
+    /// Rendering at a taller terminal size must produce a sidebar entry with a
+    /// larger `rect.height` than a shorter terminal, proving that panel
+    /// geometries are recomputed from the actual frame area on each render.
+    #[test]
+    fn record_panel_geometries_sidebar_height_changes_on_resize() {
+        // First render at 80x20.
+        let mut terminal_small = make_terminal(80, 20);
+        let api_small: Arc<dyn makina_core::api::Api> = Arc::new(PlaceholderApi::empty());
+        let app_small = App::new(api_small, vec![], PathBuf::from("."));
+        terminal_small.draw(|f| render(&app_small, f)).unwrap();
+        let small_height = app_small
+            .panel_geometries
+            .borrow()
+            .iter()
+            .find(|g| g.panel == ScrollablePanel::Sidebar)
+            .map(|g| g.rect.height)
+            .expect("Sidebar entry must exist after render");
+
+        // Second render at 80x30 (10 rows taller).
+        let mut terminal_large = make_terminal(80, 30);
+        let api_large: Arc<dyn makina_core::api::Api> = Arc::new(PlaceholderApi::empty());
+        let app_large = App::new(api_large, vec![], PathBuf::from("."));
+        terminal_large.draw(|f| render(&app_large, f)).unwrap();
+        let large_height = app_large
+            .panel_geometries
+            .borrow()
+            .iter()
+            .find(|g| g.panel == ScrollablePanel::Sidebar)
+            .map(|g| g.rect.height)
+            .expect("Sidebar entry must exist after render");
+
+        assert!(
+            large_height > small_height,
+            "Sidebar rect.height must increase when terminal height increases \
+             (small={small_height}, large={large_height})"
         );
     }
 }

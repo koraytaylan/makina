@@ -639,6 +639,10 @@ pub enum AppEvent {
     ScrollUp,
     /// Scroll the focused exchange pane one line down (mouse wheel down).
     ScrollDown,
+    /// Scroll up at the given (column, row) — used for mouse-position-aware routing.
+    ScrollUpAt(u16, u16),
+    /// Scroll down at the given (column, row) — used for mouse-position-aware routing.
+    ScrollDownAt(u16, u16),
     /// Left mouse button pressed at `(column, row)` — begin a text selection.
     SelectionStart(u16, u16),
     /// Mouse dragged to `(column, row)` with the left button held — extend the
@@ -959,6 +963,28 @@ pub enum AccordionSection {
     Status,
 }
 
+/// Identifies a scrollable panel for per-panel scroll state and hitbox testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScrollablePanel {
+    /// The left sidebar listing runs and tasks.
+    Sidebar,
+    /// The exchange pane (prompts and responses).
+    Exchange,
+    /// The plan accordion pane (when a plan tab is active).
+    PlanAccordion,
+    /// The dependency-view overlay (when `DependencyViewMode` is not `Off`).
+    DependencyView,
+}
+
+/// Geometry of a single scrollable panel (used for mouse hitbox testing).
+#[derive(Debug, Clone, Copy)]
+pub struct PanelGeometry {
+    /// Which panel this rectangle belongs to.
+    pub panel: ScrollablePanel,
+    /// The rendered rectangle of the panel content area.
+    pub rect: ratatui::layout::Rect,
+}
+
 /// All mutable TUI state.
 ///
 /// # Arc<dyn Api>
@@ -1083,33 +1109,22 @@ pub struct App {
     /// the exchange header.
     pub wall_clock_secs_config: u64,
 
-    /// Manual scroll offset for the exchange pane, in lines from the top.
-    ///
-    /// `App` does not know the rendered line count or pane height, so the
-    /// clamp upper bound (`scroll_max`) is passed in by the render/event layer
-    /// (see [`App::scroll_down`] / [`App::effective_offset`]).
-    pub exchange_scroll: u16,
-
     /// Whether the exchange pane auto-follows the bottom of the log.
     ///
     /// Defaults to `true` (newest exchange always visible).  Scrolling up
     /// disengages auto-follow; scrolling back down to the bottom re-engages it.
     pub exchange_auto_follow: bool,
 
-    /// The most recent `scroll_max` (`total_lines - pane_height`) the render
-    /// pass computed for the exchange pane.
-    ///
-    /// `App` has no pane geometry, so the render path records the real bottom
-    /// offset here via interior mutability ([`std::cell::Cell`]) — letting the
-    /// `&App` render signature stay unchanged.  Two consumers read it:
-    ///
-    /// * [`App::scroll_up`] anchors the manual offset to the rendered bottom
-    ///   when auto-follow first disengages (so the first wheel-up moves up by
-    ///   exactly one line instead of jumping to the top), and
-    /// * the `AppEvent::ScrollDown` arm in [`App::update`] uses it as the
-    ///   clamp bound so reaching the real rendered bottom re-engages
-    ///   auto-follow.
-    pub last_scroll_max: std::cell::Cell<u16>,
+    /// Per-panel manual scroll offset (in lines from top). Key is the panel;
+    /// a missing key defaults to 0. Written only from `App::update`, so a plain
+    /// `HashMap` (no interior mutability needed).
+    pub scroll_offsets: std::collections::HashMap<ScrollablePanel, u16>,
+
+    /// Per-panel highest scroll offset the last render produced (the clamp
+    /// ceiling for user input). `RefCell` because the `&App` render pass writes
+    /// it each frame — this replaces the old `last_scroll_max: Cell<u16>` write
+    /// path at `ui.rs:1301`. A missing key defaults to 0 (no scroll needed).
+    pub last_scroll_maxes: std::cell::RefCell<std::collections::HashMap<ScrollablePanel, u16>>,
 
     /// Last api event received — stored for test assertions and status-bar
     /// display.  Will be used by tasks 27–31 for richer updates.
@@ -1237,6 +1252,11 @@ pub struct App {
     /// [`App::last_scroll_max`]). The event layer reads them on a left-button
     /// down to confine the new selection to the single pane the drag began in.
     pub selection_panes: std::cell::RefCell<Vec<SelectionPane>>,
+
+    /// Rendered rectangles of each scrollable panel, recorded each frame for
+    /// hitbox testing. `RefCell` so the `&App` render pass can rewrite it,
+    /// mirroring `selection_panes`.
+    pub panel_geometries: std::cell::RefCell<Vec<PanelGeometry>>,
 }
 
 impl App {
@@ -1476,9 +1496,9 @@ impl App {
             exchange_logs: HashMap::new(),
             task_last_activity_tick: HashMap::new(),
             task_step_start_tick: HashMap::new(),
-            exchange_scroll: 0,
             exchange_auto_follow: true,
-            last_scroll_max: std::cell::Cell::new(0),
+            scroll_offsets: std::collections::HashMap::new(),
+            last_scroll_maxes: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_event: None,
             status_message: None,
             busy: None,
@@ -1507,6 +1527,7 @@ impl App {
             accordion_state: HashMap::new(),
             selection: None,
             selection_panes: std::cell::RefCell::new(Vec::new()),
+            panel_geometries: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1771,49 +1792,61 @@ impl App {
         }
     }
 
-    /// Scroll the exchange pane up by one line.
-    ///
-    /// Disengages auto-follow (the user is reviewing history) and decrements the
-    /// manual offset, clamped at `0`.  `App` does not know the rendered line
-    /// count, so no upper bound is needed here.
-    ///
-    /// When auto-follow is currently engaged the manual `exchange_scroll` is
-    /// stale (`0`) while the render path pins the pane to `scroll_max`.  Anchor
-    /// the manual offset to the last rendered bottom ([`App::last_scroll_max`])
-    /// *before* decrementing, so the first wheel-up moves up by exactly one
-    /// line (`scroll_max - 1`) instead of snapping to the top.
-    pub fn scroll_up(&mut self) {
-        if self.exchange_auto_follow {
-            // Anchor to the rendered bottom so the first wheel-up is `max - 1`.
-            self.exchange_scroll = self.last_scroll_max.get();
+    /// Scroll the given panel up by one line, disengaging auto-follow if the panel is the exchange pane.
+    pub fn scroll_up(&mut self, panel: ScrollablePanel) {
+        // Only the exchange pane has auto-follow logic.
+        if panel == ScrollablePanel::Exchange && self.exchange_auto_follow {
+            self.exchange_auto_follow = false;
+            // Anchor the manual offset to the last rendered bottom.
+            let bottom = self
+                .last_scroll_maxes
+                .borrow()
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0);
+            self.scroll_offsets
+                .insert(ScrollablePanel::Exchange, bottom);
         }
-        self.exchange_auto_follow = false;
-        self.exchange_scroll = self.exchange_scroll.saturating_sub(1);
+        let current = self.scroll_offsets.entry(panel).or_insert(0);
+        *current = current.saturating_sub(1);
     }
 
-    /// Scroll the exchange pane down by one line, clamped at `scroll_max`.
-    ///
-    /// `scroll_max` is computed by the caller exactly like
-    /// [`render_exchange_pane`](crate::ui) — `total_lines.saturating_sub(pane_height)`.
-    /// Reaching the bottom re-engages auto-follow so new exchanges keep the pane
-    /// pinned to the latest line.
-    pub fn scroll_down(&mut self, scroll_max: u16) {
-        self.exchange_scroll = self.exchange_scroll.saturating_add(1).min(scroll_max);
-        if self.exchange_scroll == scroll_max {
+    /// Scroll the given panel down by one line, clamped at scroll_max.
+    pub fn scroll_down(&mut self, panel: ScrollablePanel, scroll_max: u16) {
+        let current = self.scroll_offsets.entry(panel).or_insert(0);
+        *current = current.saturating_add(1).min(scroll_max);
+        if panel == ScrollablePanel::Exchange && *current == scroll_max {
             self.exchange_auto_follow = true;
         }
     }
 
-    /// The effective scroll offset to render with, given the current
-    /// `scroll_max` (computed by the caller as in `render_exchange_pane`).
-    ///
-    /// When auto-following, returns `scroll_max` (pinned to the bottom);
-    /// otherwise returns the manual offset, clamped to `scroll_max`.
+    /// The effective scroll offset to render the exchange pane with, given the
+    /// caller-computed scroll_max. When auto-following, returns scroll_max
+    /// (pinned to the bottom); otherwise the manual offset clamped to scroll_max.
     pub fn effective_offset(&self, scroll_max: u16) -> u16 {
         if self.exchange_auto_follow {
             scroll_max
         } else {
-            self.exchange_scroll.min(scroll_max)
+            self.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0)
+                .min(scroll_max)
+        }
+    }
+
+    /// The render-time scroll offset for any panel, clamped to scroll_max.
+    /// The exchange pane delegates to `effective_offset` so auto-follow is honored;
+    /// every other panel uses its stored offset clamped to scroll_max.
+    pub fn panel_offset(&self, panel: ScrollablePanel, scroll_max: u16) -> u16 {
+        if panel == ScrollablePanel::Exchange {
+            self.effective_offset(scroll_max)
+        } else {
+            self.scroll_offsets
+                .get(&panel)
+                .copied()
+                .unwrap_or(0)
+                .min(scroll_max)
         }
     }
 
@@ -1838,6 +1871,26 @@ impl App {
                 x >= p.hit.left() && x < p.hit.right() && y >= p.hit.top() && y < p.hit.bottom()
             })
             .map(|p| p.clip)
+    }
+
+    /// Record the geometries of rendered panels for hitbox testing.
+    /// Takes `&self` (interior mutability) so the render pass can call it.
+    pub fn set_panel_geometries(&self, geoms: Vec<PanelGeometry>) {
+        *self.panel_geometries.borrow_mut() = geoms;
+    }
+
+    /// Given a mouse column and row, return the panel under it (if any).
+    pub fn panel_at(&self, col: u16, row: u16) -> Option<ScrollablePanel> {
+        self.panel_geometries
+            .borrow()
+            .iter()
+            .find(|g| {
+                col >= g.rect.x
+                    && col < (g.rect.x + g.rect.width)
+                    && row >= g.rect.y
+                    && row < (g.rect.y + g.rect.height)
+            })
+            .map(|g| g.panel)
     }
 
     /// Apply one [`AppEvent`] to the App state.
@@ -1896,7 +1949,7 @@ impl App {
                     }
                     Panel::Main => {
                         // Main focus: scroll the exchange pane up.
-                        self.scroll_up();
+                        self.scroll_up(ScrollablePanel::Exchange);
                     }
                 }
                 true
@@ -1909,7 +1962,13 @@ impl App {
                     }
                     Panel::Main => {
                         // Main focus: scroll the exchange pane down.
-                        self.scroll_down(self.last_scroll_max.get());
+                        let max = self
+                            .last_scroll_maxes
+                            .borrow()
+                            .get(&ScrollablePanel::Exchange)
+                            .copied()
+                            .unwrap_or(0);
+                        self.scroll_down(ScrollablePanel::Exchange, max);
                     }
                 }
                 true
@@ -1983,7 +2042,7 @@ impl App {
             // the render pass re-clamps the offset to the current
             // `total_lines - pane_height` via `effective_offset`.
             AppEvent::ScrollUp => {
-                self.scroll_up();
+                self.scroll_up(ScrollablePanel::Exchange);
                 true
             }
             AppEvent::ScrollDown => {
@@ -1991,7 +2050,31 @@ impl App {
                 // `u16::MAX`) so reaching the real bottom re-engages auto-follow
                 // in `scroll_down`; otherwise `exchange_scroll == scroll_max`
                 // could never hold and auto-follow would never re-engage.
-                self.scroll_down(self.last_scroll_max.get());
+                let max = self
+                    .last_scroll_maxes
+                    .borrow()
+                    .get(&ScrollablePanel::Exchange)
+                    .copied()
+                    .unwrap_or(0);
+                self.scroll_down(ScrollablePanel::Exchange, max);
+                true
+            }
+            AppEvent::ScrollUpAt(col, row) => {
+                if let Some(panel) = self.panel_at(col, row) {
+                    self.scroll_up(panel);
+                }
+                true
+            }
+            AppEvent::ScrollDownAt(col, row) => {
+                if let Some(panel) = self.panel_at(col, row) {
+                    let scroll_max = self
+                        .last_scroll_maxes
+                        .borrow()
+                        .get(&panel)
+                        .copied()
+                        .unwrap_or(0);
+                    self.scroll_down(panel, scroll_max);
+                }
                 true
             }
             // ── Mouse text selection ──────────────────────────────────────────
@@ -4816,7 +4899,9 @@ mod tests {
         let initial_selected_task = app.selected_task;
 
         // Set up scroll space.
-        app.last_scroll_max.set(10);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 10);
 
         // Down: scrolls, does not change selected_task.
         app.update(AppEvent::SelectDown);
@@ -4825,8 +4910,12 @@ mod tests {
             "SelectDown must NOT change task selection in Main panel"
         );
         assert!(
-            app.exchange_scroll > 0,
-            "ScrollDown must advance exchange_scroll"
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "ScrollDown must advance exchange scroll offset"
         );
 
         // Up: scrolls back, does not change selected_task.
@@ -4847,29 +4936,52 @@ mod tests {
 
         // Default: auto-follow engaged, offset at the top.
         assert!(app.exchange_auto_follow);
-        assert_eq!(app.exchange_scroll, 0);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
 
         // (2) scroll_up clears auto-follow.
-        app.scroll_up();
+        app.scroll_up(ScrollablePanel::Exchange);
         assert!(
             !app.exchange_auto_follow,
             "scroll_up must clear exchange_auto_follow"
         );
 
         // (1) scroll_up never goes below 0.
-        app.scroll_up();
-        app.scroll_up();
-        assert_eq!(app.exchange_scroll, 0, "scroll_up must not go below 0");
+        app.scroll_up(ScrollablePanel::Exchange);
+        app.scroll_up(ScrollablePanel::Exchange);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "scroll_up must not go below 0"
+        );
 
         // (1) scroll_down never exceeds max.
         for _ in 0..(max + 5) {
-            app.scroll_down(max);
+            app.scroll_down(ScrollablePanel::Exchange, max);
             assert!(
-                app.exchange_scroll <= max,
+                app.scroll_offsets
+                    .get(&ScrollablePanel::Exchange)
+                    .copied()
+                    .unwrap_or(0)
+                    <= max,
                 "scroll_down must never exceed scroll_max"
             );
         }
-        assert_eq!(app.exchange_scroll, max);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            max
+        );
 
         // (3) scroll_down reaching max re-sets auto-follow.
         assert!(
@@ -4888,17 +5000,27 @@ mod tests {
         // The render pass records the rendered bottom; the geometry-free update
         // path uses it as the scroll clamp bound.  Without a non-zero bound there
         // is nowhere to scroll, so simulate a multi-line pane.
-        app.last_scroll_max.set(5);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 5);
 
         // Record the task selection before scrolling.
         let selected_before = app.selected_task;
         assert_eq!(selected_before, Some(0));
 
         // ScrollDown nudges the manual offset down by one line.
-        let offset_before = app.exchange_scroll;
+        let offset_before = app
+            .scroll_offsets
+            .get(&ScrollablePanel::Exchange)
+            .copied()
+            .unwrap_or(0);
         app.update(AppEvent::ScrollDown);
         assert_ne!(
-            app.exchange_scroll, offset_before,
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            offset_before,
             "ScrollDown must change the exchange scroll offset"
         );
         assert_eq!(
@@ -4907,10 +5029,18 @@ mod tests {
         );
 
         // ScrollUp moves the offset back up and disengages auto-follow.
-        let offset_after_down = app.exchange_scroll;
+        let offset_after_down = app
+            .scroll_offsets
+            .get(&ScrollablePanel::Exchange)
+            .copied()
+            .unwrap_or(0);
         app.update(AppEvent::ScrollUp);
         assert_ne!(
-            app.exchange_scroll, offset_after_down,
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            offset_after_down,
             "ScrollUp must change the exchange scroll offset"
         );
         assert!(
@@ -4928,7 +5058,7 @@ mod tests {
     /// (task `re-enable-mouse-capture`).
     ///
     /// This test verifies that the mouse wheel events work correctly when
-    /// mouse capture is re-enabled: scrolling moves the exchange_scroll offset
+    /// mouse capture is re-enabled: scrolling moves the exchange scroll offset
     /// (and may disengage auto-follow), but leaves selected_task untouched.
     #[test]
     fn scroll_events_adjust_exchange_state() {
@@ -4936,18 +5066,28 @@ mod tests {
         let max: u16 = 5;
 
         // Simulate a multi-line pane.
-        app.last_scroll_max.set(max);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, max);
 
         // Record the task selection before scrolling.
         let selected_before = app.selected_task;
         assert_eq!(selected_before, Some(0));
 
-        // ScrollDown should move the exchange_scroll offset.
-        let offset_before = app.exchange_scroll;
+        // ScrollDown should move the exchange scroll offset.
+        let offset_before = app
+            .scroll_offsets
+            .get(&ScrollablePanel::Exchange)
+            .copied()
+            .unwrap_or(0);
         app.update(AppEvent::ScrollDown);
         assert_ne!(
-            app.exchange_scroll, offset_before,
-            "ScrollDown must adjust exchange_scroll"
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            offset_before,
+            "ScrollDown must adjust exchange scroll offset"
         );
         assert_eq!(
             app.selected_task, selected_before,
@@ -4955,11 +5095,19 @@ mod tests {
         );
 
         // ScrollUp should move the offset back and disengage auto-follow.
-        let offset_after_down = app.exchange_scroll;
+        let offset_after_down = app
+            .scroll_offsets
+            .get(&ScrollablePanel::Exchange)
+            .copied()
+            .unwrap_or(0);
         app.update(AppEvent::ScrollUp);
         assert_ne!(
-            app.exchange_scroll, offset_after_down,
-            "ScrollUp must adjust exchange_scroll"
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            offset_after_down,
+            "ScrollUp must adjust exchange scroll offset"
         );
         assert!(
             !app.exchange_auto_follow,
@@ -5053,7 +5201,7 @@ mod tests {
     /// auto-follow must move up by exactly one line (`scroll_max - 1`), NOT snap
     /// to the top (offset 0).
     ///
-    /// Before the fix, `scroll_up` left the stale `exchange_scroll == 0` and
+    /// Before the fix, `scroll_up` left the stale exchange offset at 0 and
     /// merely `saturating_sub(1)`-ed it, so `effective_offset` returned 0 (top)
     /// on the first wheel-up while auto-following.
     #[test]
@@ -5062,15 +5210,21 @@ mod tests {
         let max: u16 = 12;
 
         // Simulate what the render pass records: the bottom-most offset.
-        app.last_scroll_max.set(max);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, max);
         assert!(app.exchange_auto_follow, "default is auto-follow");
         assert_eq!(
-            app.exchange_scroll, 0,
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
             "manual offset is stale (0) while following"
         );
 
         // First wheel-up disengages auto-follow and anchors to the bottom.
-        app.scroll_up();
+        app.scroll_up(ScrollablePanel::Exchange);
 
         assert!(
             !app.exchange_auto_follow,
@@ -5082,9 +5236,12 @@ mod tests {
             "first wheel-up must be max-1 (one line up), NOT 0 (top)"
         );
         assert_eq!(
-            app.exchange_scroll,
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
             max - 1,
-            "exchange_scroll must be anchored to the rendered bottom minus one"
+            "exchange scroll offset must be anchored to the rendered bottom minus one"
         );
     }
 
@@ -5092,15 +5249,17 @@ mod tests {
     /// re-engage when scrolling back down to the real rendered bottom.
     ///
     /// Before the fix, the `ScrollDown` arm clamped at `u16::MAX`, so
-    /// `exchange_scroll == scroll_max` was unreachable and auto-follow could
-    /// never re-engage via the mouse path.  Now it clamps at `last_scroll_max`.
+    /// exchange scroll offset == scroll_max was unreachable and auto-follow could
+    /// never re-engage via the mouse path.  Now it clamps at last_scroll_maxes.
     #[test]
     fn mouse_scroll_down_to_bottom_reengages_auto_follow() {
         let mut app = make_app_with_tasks();
         let max: u16 = 4;
 
         // The render pass records the real bottom offset.
-        app.last_scroll_max.set(max);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, max);
 
         // Scroll up several times (disengages auto-follow, walks the offset up).
         for _ in 0..3 {
@@ -5117,8 +5276,12 @@ mod tests {
         }
 
         assert_eq!(
-            app.exchange_scroll, max,
-            "ScrollDown must clamp at the real rendered bottom (last_scroll_max)"
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            max,
+            "ScrollDown must clamp at the real rendered bottom (last_scroll_maxes)"
         );
         assert!(
             app.exchange_auto_follow,
@@ -5127,15 +5290,84 @@ mod tests {
     }
 
     /// Regression (fix `tui-scroll-and-restore` #3): `scroll_down` must not
-    /// overflow `exchange_scroll` when it is already at `u16::MAX` (debug panic).
+    /// overflow the exchange scroll offset when it is already at `u16::MAX` (debug panic).
     #[test]
     fn scroll_down_does_not_overflow_at_u16_max() {
         let mut app = make_app();
         app.exchange_auto_follow = false;
-        app.exchange_scroll = u16::MAX;
+        app.scroll_offsets
+            .insert(ScrollablePanel::Exchange, u16::MAX);
         // saturating_add inside scroll_down must not panic in debug builds.
-        app.scroll_down(u16::MAX);
-        assert_eq!(app.exchange_scroll, u16::MAX);
+        app.scroll_down(ScrollablePanel::Exchange, u16::MAX);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            u16::MAX
+        );
+    }
+
+    /// Per-panel scroll maps: reading a missing key returns 0 without panicking,
+    /// and inserting/round-tripping values works correctly.
+    #[test]
+    fn per_panel_scroll_maps_default_to_zero_and_roundtrip() {
+        let app = make_app();
+
+        // Reading a missing scroll_offsets key returns 0 without panicking.
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "Missing scroll_offsets key should default to 0"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "Missing scroll_offsets key should default to 0"
+        );
+
+        // Inserting into scroll_offsets works.
+        let mut app = app;
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 5);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            5,
+            "Inserted value should be retrievable"
+        );
+
+        // Reading a missing last_scroll_maxes key returns 0 without panicking.
+        assert_eq!(
+            app.last_scroll_maxes
+                .borrow()
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "Missing last_scroll_maxes key should default to 0"
+        );
+
+        // Inserting into last_scroll_maxes and round-tripping works.
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 7);
+        assert_eq!(
+            app.last_scroll_maxes
+                .borrow()
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            7,
+            "Inserted value should round-trip through RefCell"
+        );
     }
 
     /// Task selection: run navigation (Sidebar focus) must NOT change
@@ -5930,12 +6162,20 @@ mod tests {
         // Move to Main panel.
         app.focused_panel = Panel::Main;
 
-        // Set last_scroll_max to a non-zero value so scroll_down has a clamp.
-        app.last_scroll_max.set(10);
+        // Set last_scroll_maxes to a non-zero value so scroll_down has a clamp.
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 10);
 
         // Record initial selected_task and exchange state.
         let initial_selected_task = app.selected_task;
-        assert_eq!(app.exchange_scroll, 0);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
         assert!(
             app.exchange_auto_follow,
             "Should start with auto_follow = true"
@@ -5952,15 +6192,19 @@ mod tests {
             "scroll_up should disable auto_follow"
         );
 
-        // SelectDown should scroll down and update exchange_scroll, but NOT change selected_task.
+        // SelectDown should scroll down and update exchange scroll offset, but NOT change selected_task.
         app.update(AppEvent::SelectDown);
         assert_eq!(
             app.selected_task, initial_selected_task,
             "SelectDown should NOT change selected_task when focused on Main"
         );
         assert!(
-            app.exchange_scroll > 0,
-            "exchange_scroll should advance after SelectDown"
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "exchange scroll offset should advance after SelectDown"
         );
     }
 
@@ -7693,6 +7937,516 @@ mod tests {
                 .map(|s| s.contains(&AccordionSection::Architecture))
                 .unwrap_or(false),
             "ARCHITECTURE should be collapsed via Enter"
+        );
+    }
+
+    // ── Panel geometry and hitbox testing ──────────────────────────────────
+
+    #[test]
+    fn panel_at_returns_none_outside_any_rect() {
+        let app = make_app();
+
+        // Record two panel geometries: sidebar at (0,0) with width 20, height 30,
+        // and exchange at (20,0) with width 60, height 30.
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 30,
+                },
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect {
+                    x: 20,
+                    y: 0,
+                    width: 60,
+                    height: 30,
+                },
+            },
+        ]);
+
+        // Test that a coordinate outside all panels returns None
+        assert_eq!(
+            app.panel_at(100, 100),
+            None,
+            "coordinate outside all rects should return None"
+        );
+    }
+
+    #[test]
+    fn panel_at_returns_panel_inside_rect() {
+        let app = make_app();
+
+        // Record two panel geometries
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 30,
+                },
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect {
+                    x: 20,
+                    y: 0,
+                    width: 60,
+                    height: 30,
+                },
+            },
+        ]);
+
+        // Test that a coordinate strictly inside the sidebar rect returns Sidebar
+        assert_eq!(
+            app.panel_at(5, 15),
+            Some(ScrollablePanel::Sidebar),
+            "coordinate inside sidebar rect should return Some(ScrollablePanel::Sidebar)"
+        );
+
+        // Test that a coordinate strictly inside the exchange rect returns Exchange
+        assert_eq!(
+            app.panel_at(50, 15),
+            Some(ScrollablePanel::Exchange),
+            "coordinate inside exchange rect should return Some(ScrollablePanel::Exchange)"
+        );
+    }
+
+    #[test]
+    fn panel_at_returns_none_on_exclusive_right_edge() {
+        let app = make_app();
+
+        // Record one panel geometry: sidebar at (0,0) with width 20, height 30
+        app.set_panel_geometries(vec![PanelGeometry {
+            panel: ScrollablePanel::Sidebar,
+            rect: ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 30,
+            },
+        }]);
+
+        // Test that a coordinate exactly on rect.x + rect.width (the exclusive right edge) returns None
+        assert_eq!(
+            app.panel_at(20, 15),
+            None,
+            "coordinate on the exclusive right edge should return None"
+        );
+
+        // Verify that rect.x + rect.width - 1 is still inside the rect
+        assert_eq!(
+            app.panel_at(19, 15),
+            Some(ScrollablePanel::Sidebar),
+            "coordinate just left of the exclusive right edge should return the panel"
+        );
+    }
+
+    #[test]
+    fn panel_offset_sidebar_returns_stored_offset_clamped_to_max() {
+        let mut app = make_app();
+
+        // Set sidebar scroll offset to 10
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 10);
+
+        // panel_offset should clamp to scroll_max of 4
+        let result = app.panel_offset(ScrollablePanel::Sidebar, 4);
+        assert_eq!(
+            result, 4,
+            "panel_offset should clamp sidebar offset 10 to scroll_max 4"
+        );
+
+        // Verify with offset below max
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 2);
+        let result = app.panel_offset(ScrollablePanel::Sidebar, 4);
+        assert_eq!(
+            result, 2,
+            "panel_offset should return offset 2 when below scroll_max 4"
+        );
+    }
+
+    #[test]
+    fn panel_offset_exchange_returns_max_when_auto_follow_true() {
+        let mut app = make_app();
+
+        // Enable auto-follow
+        app.exchange_auto_follow = true;
+
+        // Set up the last_scroll_maxes map
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 50);
+
+        // panel_offset should return scroll_max (50) when auto-follow is true
+        let result = app.panel_offset(ScrollablePanel::Exchange, 50);
+        assert_eq!(
+            result, 50,
+            "panel_offset should return scroll_max 50 when exchange auto-follow is true"
+        );
+    }
+
+    #[test]
+    fn panels_are_independent_scroll_states() {
+        let mut app = make_app();
+
+        // Scroll only the sidebar — exchange must remain at 0
+        app.scroll_down(ScrollablePanel::Sidebar, 10);
+        app.scroll_down(ScrollablePanel::Sidebar, 10);
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "sidebar offset should be 2 after two scroll_down calls"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "exchange offset must remain 0 when only sidebar is scrolled"
+        );
+    }
+
+    // ── ScrollUpAt/ScrollDownAt event dispatch tests ─────────────────────────────
+
+    #[test]
+    fn scroll_up_at_routes_to_sidebar() {
+        let mut app = make_app();
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect::new(0, 1, 30, 59),
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+            },
+        ]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Sidebar, 10);
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 5);
+
+        app.update(AppEvent::ScrollUpAt(10, 20)); // inside sidebar
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            4,
+            "ScrollUpAt over sidebar should decrement sidebar offset"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "ScrollUpAt over sidebar should not change exchange offset"
+        );
+    }
+
+    #[test]
+    fn scroll_down_at_routes_to_exchange() {
+        let mut app = make_app();
+        app.exchange_auto_follow = false; // exercise the manual-offset path
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect::new(0, 1, 30, 59),
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+            },
+        ]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 50);
+        app.scroll_offsets.insert(ScrollablePanel::Exchange, 10);
+
+        app.update(AppEvent::ScrollDownAt(60, 30)); // inside exchange
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            11,
+            "ScrollDownAt over exchange should increment exchange offset"
+        );
+    }
+
+    #[test]
+    fn scroll_down_at_routes_to_accordion() {
+        let mut app = make_app();
+        app.set_panel_geometries(vec![PanelGeometry {
+            panel: ScrollablePanel::PlanAccordion,
+            rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+        }]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::PlanAccordion, 100);
+        app.scroll_offsets.insert(ScrollablePanel::PlanAccordion, 5);
+
+        app.update(AppEvent::ScrollDownAt(50, 30)); // inside accordion
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::PlanAccordion)
+                .copied()
+                .unwrap_or(0),
+            6,
+            "ScrollDownAt over accordion should increment accordion offset"
+        );
+    }
+
+    #[test]
+    fn scroll_down_at_routes_to_dependency_view() {
+        let mut app = make_app();
+        app.set_panel_geometries(vec![PanelGeometry {
+            panel: ScrollablePanel::DependencyView,
+            rect: ratatui::layout::Rect::new(0, 1, 100, 30),
+        }]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::DependencyView, 80);
+        app.scroll_offsets
+            .insert(ScrollablePanel::DependencyView, 3);
+
+        app.update(AppEvent::ScrollDownAt(50, 15)); // inside dependency view
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::DependencyView)
+                .copied()
+                .unwrap_or(0),
+            4,
+            "ScrollDownAt over dependency view should increment dependency view offset"
+        );
+    }
+
+    #[test]
+    fn scroll_at_coordinates_outside_panels_is_noop() {
+        let mut app = make_app();
+        app.set_panel_geometries(vec![PanelGeometry {
+            panel: ScrollablePanel::Sidebar,
+            rect: ratatui::layout::Rect::new(0, 1, 30, 59),
+        }]);
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 5);
+
+        app.update(AppEvent::ScrollUpAt(100, 100)); // outside every rect
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            5,
+            "ScrollUpAt outside panels should be a no-op"
+        );
+    }
+
+    #[test]
+    fn scroll_up_at_inside_exchange_ignores_sidebar() {
+        let mut app = make_app();
+        app.exchange_auto_follow = false; // disable auto-follow to test plain offset decrement
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect::new(0, 1, 30, 59),
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+            },
+        ]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Sidebar, 20);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 100);
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 10);
+        app.scroll_offsets.insert(ScrollablePanel::Exchange, 5);
+
+        app.update(AppEvent::ScrollUpAt(50, 30)); // inside exchange, not sidebar
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            10,
+            "ScrollUpAt over exchange should not change sidebar offset"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            4,
+            "ScrollUpAt over exchange should decrement exchange offset"
+        );
+    }
+
+    // ── Integration Tests for Scroll Routing and Scrollbars ────────────────────
+
+    /// Test 1: scrolling over sidebar moves only the sidebar offset
+    #[test]
+    fn scroll_up_at_coordinates_targets_sidebar() {
+        let mut app = make_app();
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect::new(0, 1, 30, 59),
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+            },
+        ]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Sidebar, 10);
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 5);
+
+        app.update(AppEvent::ScrollUpAt(10, 20)); // inside sidebar
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            4,
+            "ScrollUpAt over sidebar should decrement sidebar offset"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "ScrollUpAt over sidebar should not affect exchange offset"
+        );
+    }
+
+    /// Test 2: scrolling over exchange moves only the exchange offset
+    #[test]
+    fn scroll_down_at_coordinates_targets_exchange() {
+        let mut app = make_app();
+        app.exchange_auto_follow = false; // exercise the manual-offset path
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect::new(0, 1, 30, 59),
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+            },
+        ]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 50);
+        app.scroll_offsets.insert(ScrollablePanel::Exchange, 10);
+
+        app.update(AppEvent::ScrollDownAt(60, 30)); // inside exchange
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            11,
+            "ScrollDownAt over exchange should increment exchange offset"
+        );
+    }
+
+    // Note: Test 3 (scrolling outside every rect is a no-op) already exists above as
+    // `scroll_at_coordinates_outside_panels_is_noop`, so we skip it here to avoid duplication.
+
+    /// Test 4: exchange auto-follow is preserved through routing
+    #[test]
+    fn exchange_auto_follow_preserved_with_routing() {
+        let mut app = make_app();
+        app.set_panel_geometries(vec![PanelGeometry {
+            panel: ScrollablePanel::Exchange,
+            rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+        }]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 100);
+        app.exchange_auto_follow = true;
+
+        app.update(AppEvent::ScrollDownAt(60, 30)); // stays pinned
+        assert_eq!(
+            app.effective_offset(100),
+            100,
+            "auto-follow should pin to scroll_max"
+        );
+
+        app.update(AppEvent::ScrollUpAt(60, 30)); // disengages
+        assert!(
+            !app.exchange_auto_follow,
+            "scroll up should disengage auto-follow"
+        );
+    }
+
+    /// Test 5: multiple panels maintain independent scroll offsets
+    #[test]
+    fn multiple_panels_maintain_independent_scroll() {
+        let mut app = make_app();
+        app.exchange_auto_follow = false;
+        app.set_panel_geometries(vec![
+            PanelGeometry {
+                panel: ScrollablePanel::Sidebar,
+                rect: ratatui::layout::Rect::new(0, 1, 30, 59),
+            },
+            PanelGeometry {
+                panel: ScrollablePanel::Exchange,
+                rect: ratatui::layout::Rect::new(30, 1, 70, 59),
+            },
+        ]);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Sidebar, 20);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 100);
+
+        app.update(AppEvent::ScrollDownAt(10, 20));
+        app.update(AppEvent::ScrollDownAt(10, 20));
+        app.update(AppEvent::ScrollDownAt(60, 30));
+        app.update(AppEvent::ScrollDownAt(60, 30));
+        app.update(AppEvent::ScrollDownAt(60, 30));
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Sidebar)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "Sidebar should have scrolled down twice"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            3,
+            "Exchange should have scrolled down three times"
         );
     }
 }
