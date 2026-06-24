@@ -3594,6 +3594,7 @@ wall_clock_secs = 1200
                 title: "Do the thing".to_string(),
                 gated: false,
                 depends_on: vec![],
+                body: String::new(),
             }],
             scope_text: None,
             architecture_text: None,

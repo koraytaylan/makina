@@ -494,7 +494,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 .constraints([Constraint::Length(1), Constraint::Min(3)])
                 .split(content_area);
             render_tab_bar(app, frame, split[0]);
-            render_plan_task_pane(plan, preview, frame, split[1]);
+            render_plan_task_pane(app, plan, preview, frame, split[1]);
             panel_geoms.push(PanelGeometry {
                 panel: ScrollablePanel::PlanAccordion,
                 rect: split[1],
@@ -906,62 +906,117 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para, area);
 }
 
-/// Render the content pane for an active plan-task tab: the task preview's id,
-/// title, gated status, and dependency list parsed from the plan's TASKS.md.
+/// Render the content pane for an active plan-task tab: the task's id and title,
+/// then its FULL section body from the plan's TASKS.md rendered as Markdown
+/// (best effort), scrollable with a scrollbar like the plan-accordion pane.
 ///
 /// A discovered plan's task is a read-only preview ([`PlanTaskPreview`]), not a
-/// running task, so this shows the parsed metadata rather than a live exchange.
+/// running task, so the body is the parsed Markdown under the task heading, not
+/// a live exchange. Falls back to the parsed metadata when no body was captured.
 fn render_plan_task_pane(
+    app: &App,
     plan: &makina_core::orchestrator::PlanEntry,
     preview: &makina_core::orchestrator::PlanTaskPreview,
     frame: &mut Frame,
     area: Rect,
 ) {
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![Span::styled(
-            preview.id.clone(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            preview.title.clone(),
-            Style::default().fg(Color::White),
-        )]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(plan.slug.clone(), Style::default().fg(Color::Gray)),
-        ]),
-    ];
-    if preview.gated {
-        lines.push(Line::from(vec![
-            Span::styled("Gated: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "yes — blocked until prerequisites land",
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
+    if area.height == 0 || area.width == 0 {
+        return;
     }
-    if preview.depends_on.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Depends on: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("(none)", Style::default().fg(Color::DarkGray)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![Span::styled(
-            "Depends on:",
-            Style::default().fg(Color::DarkGray),
+
+    // Reserve the rightmost column for the scrollbar (mirrors the accordion pane).
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let content_area = cols[0];
+    let scrollbar_area = cols[1];
+
+    // Wrap-aware row counting so scroll bounds account for soft-wrapped lines.
+    let rendered_rows_for_line = |line: &Line<'_>| -> u16 {
+        let w = line.width();
+        if content_area.width == 0 || w == 0 {
+            1
+        } else {
+            (w as u32)
+                .div_ceil(content_area.width as u32)
+                .min(u16::MAX as u32) as u16
+        }
+    };
+
+    let mut rendered_row: u16 = 0;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    macro_rules! push_line {
+        ($l:expr) => {{
+            let l: Line<'static> = $l;
+            rendered_row += rendered_rows_for_line(&l);
+            lines.push(l);
+        }};
+    }
+
+    // Header: `id — title`, plan slug, and a gated note.
+    push_line!(Line::from(vec![Span::styled(
+        format!("{} — {}", preview.id, preview.title),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    push_line!(Line::from(vec![
+        Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(plan.slug.clone(), Style::default().fg(Color::Gray)),
+    ]));
+    if preview.gated {
+        push_line!(Line::from(vec![Span::styled(
+            "Gated — blocked until prerequisites land",
+            Style::default().fg(Color::Yellow),
         )]));
-        for dep in &preview.depends_on {
-            lines.push(Line::from(vec![
-                Span::raw("  • "),
-                Span::styled(dep.clone(), Style::default().fg(Color::Cyan)),
+    }
+    push_line!(Line::from(""));
+
+    // Body: the full task section from TASKS.md, rendered as Markdown.
+    if preview.body.trim().is_empty() {
+        if preview.depends_on.is_empty() {
+            push_line!(Line::from(Span::styled(
+                "(no further detail in TASKS.md)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            push_line!(Line::from(vec![
+                Span::styled("Depends on: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    preview.depends_on.join(", "),
+                    Style::default().fg(Color::Cyan),
+                ),
             ]));
         }
+    } else {
+        let base_style = Style::default().fg(Color::White);
+        for l in crate::markup::render_markdown(&preview.body, base_style, content_area.width) {
+            push_line!(l);
+        }
     }
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+
+    let total_rendered_rows = rendered_row;
+    let scroll_max = total_rendered_rows.saturating_sub(content_area.height);
+    app.last_scroll_maxes
+        .borrow_mut()
+        .insert(ScrollablePanel::PlanAccordion, scroll_max);
+    let scroll_offset = app.panel_offset(ScrollablePanel::PlanAccordion, scroll_max);
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0));
+    frame.render_widget(para, content_area);
+
+    if scroll_max > 0 {
+        let mut scrollbar_state =
+            ScrollbarState::new(total_rendered_rows as usize).position(scroll_offset as usize);
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
 }
 
 /// This is the single shared entry point for all [`DependencyViewMode`]
@@ -3300,6 +3355,7 @@ mod tests {
                 id: "cargo-scaffold".to_string(),
                 title: "Compiling Skeleton".to_string(),
                 gated: false,
+                body: String::new(),
                 depends_on: Vec::new(),
             }],
             scope_text: None,
@@ -3331,12 +3387,14 @@ mod tests {
                     id: "cargo-scaffold".to_string(),
                     title: "Skeleton".to_string(),
                     gated: false,
+                    body: String::new(),
                     depends_on: Vec::new(),
                 },
                 makina_core::orchestrator::PlanTaskPreview {
                     id: "task-model".to_string(),
                     title: "Domain Model".to_string(),
                     gated: false,
+                    body: String::new(),
                     depends_on: vec!["cargo-scaffold".to_string()],
                 },
             ],
@@ -3377,6 +3435,7 @@ mod tests {
                 id: "json-store".to_string(),
                 title: "JSON Store".to_string(),
                 gated: true,
+                body: String::new(),
                 depends_on: vec!["task-model".to_string()],
             }],
             scope_text: None,
@@ -3431,6 +3490,7 @@ mod tests {
                 id: "json-store".to_string(),
                 title: "JSON Store".to_string(),
                 gated: true,
+                body: String::new(),
                 depends_on: vec!["task-model".to_string()],
             }],
             scope_text: Some(long_content.clone()),
@@ -3504,6 +3564,7 @@ mod tests {
                 id: "json-store".to_string(),
                 title: "JSON Store".to_string(),
                 gated: true,
+                body: String::new(),
                 depends_on: vec!["task-model".to_string()],
             }],
             scope_text: Some("Short scope text.\n".to_string()),
@@ -3591,6 +3652,7 @@ mod tests {
                 id: "test-task".to_string(),
                 title: "Test Task".to_string(),
                 gated: false,
+                body: String::new(),
                 depends_on: vec![],
             }],
             scope_text: Some(long_content.clone()),
@@ -7813,12 +7875,14 @@ mod tests {
                     id: "task-alpha".to_string(),
                     title: "Alpha task".to_string(),
                     gated: false,
+                    body: String::new(),
                     depends_on: vec![],
                 },
                 makina_core::orchestrator::PlanTaskPreview {
                     id: "task-beta".to_string(),
                     title: "Beta task (GATED)".to_string(),
                     gated: true,
+                    body: String::new(),
                     depends_on: vec!["task-alpha".to_string()],
                 },
             ],

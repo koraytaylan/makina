@@ -205,6 +205,11 @@ pub struct PlanTaskPreview {
     /// Direct prerequisite task ids from the task's `- **Depends on:**` bullet
     /// (empty for `—` / `none`).
     pub depends_on: Vec<String>,
+    /// The raw Markdown body under the task's `### {id} — {title}` heading — every
+    /// line up to the next task (`### `) or section (`## `) heading, trimmed of
+    /// surrounding blank lines. Best-effort preview text for the plan-task detail
+    /// pane; empty when the task heading has no body.
+    pub body: String,
 }
 
 /// One plan directory discovered under `docs/plans/`.
@@ -242,6 +247,19 @@ pub fn parse_plan_tasks(md: &str) -> Vec<PlanTaskPreview> {
     // interpreter's multi-line field handling (interpreter::parse_structured_text,
     // `ParseState::InDependsOn`). `dep_target` is the index of the task being filled.
     let mut dep_buf: Option<(usize, String)> = None;
+    // Index of the task whose body lines we are currently accumulating. A `### `
+    // task heading moves it to the new task; a `## ` section heading clears it.
+    let mut current: Option<usize> = None;
+
+    // Append one raw source line to the given task's body (preserving newlines).
+    fn push_body(tasks: &mut [PlanTaskPreview], idx: Option<usize>, raw: &str) {
+        if let Some(i) = idx
+            && let Some(t) = tasks.get_mut(i)
+        {
+            t.body.push_str(raw);
+            t.body.push('\n');
+        }
+    }
 
     // Flush the accumulated Depends-on buffer into its task.
     macro_rules! flush_deps {
@@ -275,12 +293,15 @@ pub fn parse_plan_tasks(md: &str) -> Vec<PlanTaskPreview> {
                     buf.push(' ');
                     buf.push_str(trimmed);
                 }
+                // A wrapped Depends-on continuation is still part of the body.
+                push_body(&mut tasks, current, raw);
                 continue;
             }
         }
 
         // A workstream/other `## …` header (but not a `### …` task) ends the prior block.
         if is_section {
+            current = None;
             continue;
         }
         // Task heading: `### {id} — {title}` (ignore deeper `#### …`).
@@ -293,7 +314,13 @@ pub fn parse_plan_tasks(md: &str) -> Vec<PlanTaskPreview> {
                     title,
                     gated,
                     depends_on: Vec::new(),
+                    body: String::new(),
                 });
+                current = Some(tasks.len() - 1);
+            } else {
+                // A `### ` heading that doesn't match the contract still ends the
+                // previous task's body.
+                current = None;
             }
             continue;
         }
@@ -306,8 +333,16 @@ pub fn parse_plan_tasks(md: &str) -> Vec<PlanTaskPreview> {
         {
             dep_buf = Some((last, payload.trim().to_string()));
         }
+        // Everything else under the current task (description, bullets, `#### …`
+        // sub-headings, code fences) is body content.
+        push_body(&mut tasks, current, raw);
     }
     flush_deps!(); // flush a Depends-on field that ran to EOF
+    // Trim surrounding blank lines so the body starts at the first content line.
+    for t in &mut tasks {
+        let trimmed = t.body.trim().to_string();
+        t.body = trimmed;
+    }
     tasks
 }
 
@@ -4748,6 +4783,26 @@ Description text that is long enough for parser.
             tasks[2].depends_on,
             vec!["task-model".to_string(), "cargo-scaffold".to_string()],
             "comma list parsed; parenthetical aside dropped"
+        );
+
+        // Each task's body captures the full Markdown under its heading, up to the
+        // next task (`### `) or section (`## `) heading.
+        assert!(
+            tasks[0].body.contains("- **Done when:** it builds"),
+            "task body captures the Done-when bullet, got: {:?}",
+            tasks[0].body
+        );
+        assert!(
+            tasks[0].body.contains("- **Depends on:** —"),
+            "task body includes the Depends-on bullet"
+        );
+        assert!(
+            !tasks[0].body.contains("task-model"),
+            "a task's body must stop at the next task heading"
+        );
+        assert!(
+            !tasks[1].body.contains("Hardening"),
+            "a task's body must stop at the next ## section heading"
         );
     }
 

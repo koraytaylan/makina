@@ -299,12 +299,14 @@ fn plan_tabs_render_accordion_sections_without_panic() {
                 title: "First task".to_string(),
                 gated: false,
                 depends_on: vec![],
+                body: String::new(),
             },
             PlanTaskPreview {
                 id: "task-2".to_string(),
                 title: "Second task (GATED)".to_string(),
                 gated: true,
                 depends_on: vec!["task-1".to_string()],
+                body: String::new(),
             },
         ],
         scope_text: Some("This plan improves sidebar navigation.".to_string()),
@@ -380,12 +382,15 @@ fn opening_plan_tasks_creates_distinct_task_tabs() {
                 title: "Wire the thing".to_string(),
                 gated: false,
                 depends_on: vec![],
+                body: "Connect the widget to the bus.\n\n- **Done when:** the bus reports READY."
+                    .to_string(),
             },
             PlanTaskPreview {
                 id: "gate-thing".to_string(),
                 title: "Gate the thing".to_string(),
                 gated: true,
                 depends_on: vec!["wire-thing".to_string()],
+                body: String::new(),
             },
         ],
         scope_text: Some("scope".to_string()),
@@ -449,6 +454,15 @@ fn opening_plan_tasks_creates_distinct_task_tabs() {
         "tab bar shows the other task tab"
     );
     assert!(screen.contains("0007-demo"), "tab bar shows the plan tab");
+    // The FULL task body from TASKS.md is rendered (not just id/title).
+    assert!(
+        screen.contains("Connect the widget to the bus"),
+        "active task tab renders the full task body from TASKS.md"
+    );
+    assert!(
+        screen.contains("Done when"),
+        "task body includes its Done-when section"
+    );
 }
 
 /// Rendering records clickable bounds for every tab chip and every visible

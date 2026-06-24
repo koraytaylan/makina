@@ -7004,6 +7004,7 @@ mod tests {
             title: title.to_string(),
             gated: false,
             depends_on: Vec::new(),
+            body: String::new(),
         }
     }
 
