@@ -1647,6 +1647,8 @@ pub(crate) fn render_plan_accordion_pane(
         &expanded,
         plan.scope_text.as_deref().unwrap_or("(no SCOPE.md)"),
         scope_focused,
+        content_area.width,
+        true,
     ) {
         push_line!(l);
     }
@@ -1663,6 +1665,8 @@ pub(crate) fn render_plan_accordion_pane(
             .as_deref()
             .unwrap_or("(no ARCHITECTURE.md)"),
         arch_focused,
+        content_area.width,
+        true,
     ) {
         push_line!(l);
     }
@@ -1678,6 +1682,8 @@ pub(crate) fn render_plan_accordion_pane(
         &expanded,
         &tasks_text,
         tasks_focused,
+        content_area.width,
+        false,
     ) {
         push_line!(l);
     }
@@ -1692,6 +1698,8 @@ pub(crate) fn render_plan_accordion_pane(
         &expanded,
         plan.status_text.as_deref().unwrap_or("(no STATUS.md)"),
         status_focused,
+        content_area.width,
+        true,
     ) {
         push_line!(l);
     }
@@ -1772,6 +1780,8 @@ fn render_accordion_section(
     expanded_set: &HashSet<AccordionSection>,
     content: &str,
     focused: bool,
+    content_width: u16,
+    as_markdown: bool,
 ) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let is_expanded = expanded_set.contains(&section);
@@ -1800,8 +1810,24 @@ fn render_accordion_section(
     // Content (if expanded)
     if is_expanded {
         result.push(Line::from(""));
-        for line in content.lines() {
-            result.push(Line::from(format!("  {line}")));
+        if as_markdown {
+            // Render the section body through the hardened Markdown renderer
+            // (headings, bold/italic, lists, code blocks, links, rules) instead
+            // of showing raw CommonMark source. Wrap to the pane width minus the
+            // 2-space indent so the indented lines still fit the viewport, then
+            // prepend the indent so the body stays nested under its header.
+            let body_width = content_width.saturating_sub(2);
+            let base = Style::default().fg(Color::White);
+            for mut line in crate::markup::render_markdown(content, base, body_width) {
+                line.spans.insert(0, Span::raw("  "));
+                result.push(line);
+            }
+        } else {
+            // Synthesized, already-structured text (e.g. the TASKS summary):
+            // indent each raw line without Markdown processing.
+            for line in content.lines() {
+                result.push(Line::from(format!("  {line}")));
+            }
         }
     }
 
@@ -7753,6 +7779,81 @@ mod tests {
         assert!(
             screen.contains("(no tasks)"),
             "empty tasks must show placeholder when expanded; screen:\n{screen}"
+        );
+    }
+
+    /// **Accordion bodies render Markdown, not raw source:** an expanded SCOPE /
+    /// ARCHITECTURE / STATUS section whose `.md` content contains CommonMark
+    /// markup must render the *formatted* result — no literal `##` heading
+    /// prefixes, `**bold**` asterisks, or fenced-code backticks should reach the
+    /// screen. Regression guard for the plan-accordion markdown gap (the SCOPE/
+    /// ARCHITECTURE/STATUS bodies previously displayed raw source).
+    #[test]
+    fn render_plan_accordion_pane_renders_markdown_not_raw() {
+        let mut terminal = make_terminal(80, 40);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let plan = makina_core::orchestrator::PlanEntry {
+            slug: "0035-md".to_string(),
+            dir: PathBuf::from("docs/plans/0035-md"),
+            has_tasks: false,
+            tasks: vec![],
+            scope_text: Some(
+                "## Scope Heading\n\nA **bold** word and an _italic_ word.\n\n\
+                 - first bullet\n- second bullet\n\n`inline_code` here.\n"
+                    .to_string(),
+            ),
+            architecture_text: Some("### Layers\n\nText with `code`.".to_string()),
+            status_text: Some("**Status:** done.".to_string()),
+        };
+
+        // Expand SCOPE, ARCHITECTURE, and STATUS (the Markdown-rendered sections).
+        {
+            let sections = app
+                .accordion_state
+                .entry("0035-md".to_string())
+                .or_default();
+            sections.insert(AccordionSection::Scope);
+            sections.insert(AccordionSection::Architecture);
+            sections.insert(AccordionSection::Status);
+        }
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_plan_accordion_pane(&app, &plan, frame, area);
+            })
+            .expect("render_plan_accordion_pane must not panic rendering Markdown");
+
+        let screen = screen_of(&terminal);
+
+        // The human-readable text survives …
+        assert!(
+            screen.contains("Scope Heading"),
+            "heading text must render; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("bold") && screen.contains("italic"),
+            "inline-styled words must render; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("first bullet"),
+            "list items must render; screen:\n{screen}"
+        );
+
+        // … but the raw CommonMark markup must NOT appear verbatim.
+        assert!(
+            !screen.contains("##"),
+            "heading markup '##' must be rendered away, not shown raw; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("**"),
+            "bold markup '**' must be rendered away, not shown raw; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains('`'),
+            "code-span backticks must be rendered away, not shown raw; screen:\n{screen}"
         );
     }
 
