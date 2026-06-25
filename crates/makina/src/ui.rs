@@ -9055,17 +9055,17 @@ mod tests {
     /// and assert that the focused header's background color differs per theme.
     ///
     /// When `focused_section = Some(AccordionSection::Scope)`, `render_accordion_section`
-    /// applies `title_style.bg(theme.get(ThemeRole::Dim))` to the "SCOPE" header
-    /// span.  The Dim color is distinct in each Ayu variant:
-    ///   Dark   → Rgb(90,  99,  120)
-    ///   Mirage → Rgb(112, 122, 140)
-    ///   Light  → Rgb(130, 142, 159)
+    /// applies `title_style.bg(theme.get(ThemeRole::FocusBg))` to the "SCOPE" header
+    /// span.  The FocusBg color is distinct in each Ayu variant:
+    ///   Dark   → Rgb(40,  80,  120)
+    ///   Mirage → Rgb(70,  110, 160)
+    ///   Light  → Rgb(200, 215, 240)
     ///
     /// The accordion layout is:
     ///   row 0: "Plan: {slug}"
     ///   row 1: "Dir:  {dir}"
     ///   row 2: ""  (empty separator)
-    ///   row 3: "[+] SCOPE"  ← focused header with Dim bg
+    ///   row 3: "[+] SCOPE"  ← focused header with FocusBg bg
     ///
     /// "[+] " is 4 characters, so "SCOPE" starts at column 4 of row 3.
     /// In a width-80 buffer, buffer index = 3 * 80 + 4 = 244.
@@ -9102,7 +9102,7 @@ mod tests {
             let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
             app.active_theme = theme.clone();
             // Set the SCOPE section as focused so render_accordion_section applies
-            // the Dim background to the "SCOPE" title span.
+            // the FocusBg background to the "SCOPE" title span.
             app.focused_section = Some(AccordionSection::Scope);
 
             terminal
@@ -9119,11 +9119,11 @@ mod tests {
             let idx = (SCOPE_ROW as usize) * (W as usize) + (SCOPE_COL as usize);
             let cell = &cells[idx];
 
-            // The focused header must have a non-Reset background (the Dim color).
+            // The focused header must have a non-Reset background (the FocusBg color).
             assert!(
                 cell.bg != Color::Reset,
                 "Focused accordion header at row {SCOPE_ROW} col {SCOPE_COL} must have \
-                 a non-Reset background (focused Dim styling was not applied)"
+                 a non-Reset background (focused FocusBg styling was not applied)"
             );
 
             pairs.push((cell.bg, cell.fg));
@@ -9148,9 +9148,10 @@ mod tests {
     ///
     /// This end-to-end integration test verifies that colors flow from the theme
     /// through the render logic into the ratatui buffer as truecolor, not reduced
-    /// to 16-color ANSI. It scans 200+ cells from different parts of the UI
-    /// (title bar, sidebar, main pane) and asserts each non-default color is
-    /// Color::Rgb.
+    /// to 16-color ANSI. It scans the first 200 cells of the rendered buffer —
+    /// row 0 (the fully-painted title bar) plus the top of the body — asserting
+    /// every styled cell is Color::Rgb, and that at least one truecolor cell is
+    /// actually present so the check cannot pass vacuously.
     #[test]
     fn test_render_produces_truecolor_cells_not_ansi16() {
         let mut terminal = make_terminal(80, 24);
@@ -9165,9 +9166,9 @@ mod tests {
         // Collect any non-RGB colors found during the scan so we can report them.
         let mut non_rgb_findings: Vec<(usize, Color, Color)> = Vec::new();
 
-        // Scan at least 200 cells (entire buffer is 80*24 = 1920 cells).
-        // Sampling all cells ensures comprehensive coverage of title bar, sidebar,
-        // main pane, and status bar regions.
+        // Scan the first 200 cells of the 80x24 buffer — row 0 (the title bar,
+        // fully painted with truecolor) plus the top of the body. This exercises
+        // the styled title row without depending on lower-pane content.
         for (idx, cell) in cells.iter().take(200).enumerate() {
             // Foreground color: must be Color::Reset (default/inherited) or Color::Rgb.
             match cell.fg {
@@ -9201,6 +9202,19 @@ mod tests {
                 .iter()
                 .map(|(idx, fg, bg)| format!("cell[{}]: fg={:?}, bg={:?}", idx, fg, bg))
                 .collect::<Vec<_>>()
+        );
+
+        // Positive guard: at least one scanned cell must actually be truecolor.
+        // Without this, the is_empty() check above would pass vacuously if the
+        // styled rows ever stopped rendering (all-Reset cells are in the allowed
+        // set), masking exactly the kind of regression this test guards against.
+        assert!(
+            cells
+                .iter()
+                .take(200)
+                .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..))),
+            "Expected at least one truecolor (Color::Rgb) cell among the first 200 \
+             scanned cells, found none — the styled title row may not be rendering."
         );
     }
 }
