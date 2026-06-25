@@ -2,7 +2,7 @@
 
 Task-level status lives here.
 
-**Status:** 🔲 Not started — authored, awaiting implementation.
+**Status:** ✅ Complete — 10/11 tasks landed on `implement-plan/0037`; squash-merged into develop as `0ae1a2c4221cbc4278d5068aa733156c5d5b411f`.
 
 _Last updated: 2026-06-25, against develop._
 
@@ -32,19 +32,21 @@ _Last updated: 2026-06-25, against develop._
   that rendered buffer cells stay `Rgb`/`Reset` (never `Indexed`). Run a grep
   audit of `ui.rs`/`ansi.rs` and fix any surviving production literal via a gated
   task.
-- **Outcome:** _(pending implementation)_ — to be recorded here when the plan
-  lands.
+- **Outcome:** 10 of 11 tasks landed and squash-merged into develop
+  (`0ae1a2c4221cbc4278d5068aa733156c5d5b411f`). The one gated task
+  (`verify-hardcoded-colors-are-fixed`) was not run, as expected for a GATED
+  task with no dependents unblocked by the audit.
 
 | WS | Workstream | Task | State |
 |---|---|---|---|
-| 0001 | Theme-Aware Markdown Code Block Styling | `audit-markdown-code-block-calls` | 🔲 Pending |
-| 0001 | Theme-Aware Markdown Code Block Styling | `add-codblock-theme-role` | 🔲 Pending |
-| 0001 | Theme-Aware Markdown Code Block Styling | `update-render-markdown-signature` | 🔲 Pending |
-| 0001 | Theme-Aware Markdown Code Block Styling | `replace-code-block-hardcoded-modifiers` | 🔲 Pending |
-| 0001 | Theme-Aware Markdown Code Block Styling | `thread-theme-through-render-markdown-callsites` | 🔲 Pending |
-| 0002 | Selection and Focus Highlight Distinctness Audit | `add-selection-distinctness-test` | 🔲 Pending |
-| 0002 | Selection and Focus Highlight Distinctness Audit | `update-accordion-focus-styling` | 🔲 Pending |
-| 0003 | Hardcoded Color Sweep and Truecolor Verification | `hardcoded-color-grep-audit` | 🔲 Pending |
-| 0003 | Hardcoded Color Sweep and Truecolor Verification | `add-rgb-type-assertion-test` | 🔲 Pending |
-| 0003 | Hardcoded Color Sweep and Truecolor Verification | `add-buffer-truecolor-assertion` | 🔲 Pending |
-| 0003 | Hardcoded Color Sweep and Truecolor Verification | `verify-hardcoded-colors-are-fixed` (GATED) | 🔲 Pending |
+| 0001 | Theme-Aware Markdown Code Block Styling | `audit-markdown-code-block-calls` | ✅ Done |
+| 0001 | Theme-Aware Markdown Code Block Styling | `add-codblock-theme-role` | ✅ Done |
+| 0001 | Theme-Aware Markdown Code Block Styling | `update-render-markdown-signature` | ✅ Done |
+| 0001 | Theme-Aware Markdown Code Block Styling | `replace-code-block-hardcoded-modifiers` | ✅ Done |
+| 0001 | Theme-Aware Markdown Code Block Styling | `thread-theme-through-render-markdown-callsites` | ✅ Done |
+| 0002 | Selection and Focus Highlight Distinctness Audit | `add-selection-distinctness-test` | ✅ Done |
+| 0002 | Selection and Focus Highlight Distinctness Audit | `update-accordion-focus-styling` | ✅ Done |
+| 0003 | Hardcoded Color Sweep and Truecolor Verification | `hardcoded-color-grep-audit` | ✅ Done |
+| 0003 | Hardcoded Color Sweep and Truecolor Verification | `add-rgb-type-assertion-test` | ✅ Done |
+| 0003 | Hardcoded Color Sweep and Truecolor Verification | `add-buffer-truecolor-assertion` | ✅ Done |
+| 0003 | Hardcoded Color Sweep and Truecolor Verification | `verify-hardcoded-colors-are-fixed` (GATED) | 🔲 Gated (not run) |
