@@ -121,6 +121,7 @@ fn config_with_gates(gates: Vec<GateConfig>, gate_iterations: u32) -> Config {
         gates,
         base_branch: "develop".into(),
         merge: MergeConfig::default(),
+        theme_name: "Ayu Dark".into(),
     }
 }
 

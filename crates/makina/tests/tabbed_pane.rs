@@ -207,11 +207,13 @@ fn tabbed_pane_active_tab_is_distinguished() {
     let buffer = terminal.backend().buffer();
     let buffer_content = buffer.content();
 
-    // Look for cells with the active tab styling (Cyan background)
+    // Look for cells with the active tab styling (Accent background, theme-resolved)
     // The active tab should have a different style than inactive tabs
+    let th = makina::theme::ayu_dark();
+    let accent = th.get(makina::theme::ThemeRole::Accent);
     let mut found_styled_cells = false;
     for cell in buffer_content.iter() {
-        if !cell.symbol().is_empty() && cell.style().bg == Some(ratatui::style::Color::Cyan) {
+        if !cell.symbol().is_empty() && cell.style().bg == Some(accent) {
             found_styled_cells = true;
             break;
         }
@@ -219,7 +221,7 @@ fn tabbed_pane_active_tab_is_distinguished() {
 
     assert!(
         found_styled_cells,
-        "active tab should be styled with Cyan background"
+        "active tab should be styled with Accent background"
     );
 }
 
@@ -263,10 +265,12 @@ fn render_task_and_plan_tabs_together() {
     let buffer = terminal.backend().buffer();
     let buffer_content = buffer.content();
 
-    // Look for cells with the active tab styling (Cyan background)
+    // Look for cells with the active tab styling (Accent background, theme-resolved)
+    let th = makina::theme::ayu_dark();
+    let accent = th.get(makina::theme::ThemeRole::Accent);
     let mut found_styled_cells = false;
     for cell in buffer_content.iter() {
-        if !cell.symbol().is_empty() && cell.style().bg == Some(ratatui::style::Color::Cyan) {
+        if !cell.symbol().is_empty() && cell.style().bg == Some(accent) {
             found_styled_cells = true;
             break;
         }
@@ -274,7 +278,7 @@ fn render_task_and_plan_tabs_together() {
 
     assert!(
         found_styled_cells,
-        "active tab should be styled with Cyan background"
+        "active tab should be styled with Accent background"
     );
 }
 

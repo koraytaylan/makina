@@ -40,7 +40,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 
 /// An in-progress or completed text selection, in terminal cell coordinates.
 ///
@@ -126,17 +126,20 @@ impl Selection {
         Some((start, end))
     }
 
-    /// Paint the selected cells with a reversed style over `buf`.
+    /// Paint the selected cells with themed selection colors over `buf`.
     ///
-    /// A no-op for an empty (single-cell) selection so a plain click never
-    /// flashes a stray reversed cell. Applied last in the render pass so it
-    /// reverses whatever pane or overlay drew underneath — but only within
+    /// Colors each cell with the theme's `SelectionBg` background and `Foreground`
+    /// text color. A no-op for an empty (single-cell) selection so a plain click
+    /// never flashes a stray styled cell. Applied last in the render pass so it
+    /// overrides whatever pane or overlay drew underneath — but only within
     /// [`bounds`](Self::bounds).
-    pub fn highlight(&self, buf: &mut Buffer) {
+    pub fn highlight(&self, buf: &mut Buffer, theme: &crate::theme::Theme) {
         if self.is_empty() {
             return;
         }
-        let style = Style::default().add_modifier(Modifier::REVERSED);
+        let style = Style::default()
+            .bg(theme.get(crate::theme::ThemeRole::SelectionBg))
+            .fg(theme.get(crate::theme::ThemeRole::Foreground));
         for row in self.bounds.top()..self.bounds.bottom() {
             if let Some((start, end)) = self.row_range(row) {
                 for col in start..=end {
@@ -298,10 +301,11 @@ mod tests {
     }
 
     #[test]
-    fn highlight_reverses_only_cells_within_bounds() {
+    fn highlight_styles_only_cells_within_bounds() {
         // Bounds are the right pane (cols 3-5). Dragging from its right edge out
         // into the left pane selects the whole right pane but never the left:
         // the free end clamps to column 3.
+        let th = crate::theme::ayu_dark();
         let mut buf = buffer(&["LLLRRR"]);
         let sel = Selection {
             anchor: (5, 0),
@@ -309,33 +313,31 @@ mod tests {
             active: false,
             bounds: Rect::new(3, 0, 3, 1),
         };
-        sel.highlight(&mut buf);
-        let reversed = |x: u16| {
-            buf.cell(Position::new(x, 0))
-                .unwrap()
-                .modifier
-                .contains(Modifier::REVERSED)
+        sel.highlight(&mut buf, &th);
+        let has_selection_style = |x: u16| {
+            let cell = buf.cell(Position::new(x, 0)).unwrap();
+            cell.bg == th.get(crate::theme::ThemeRole::SelectionBg)
+                && cell.fg == th.get(crate::theme::ThemeRole::Foreground)
         };
         assert!(
-            !reversed(0) && !reversed(1) && !reversed(2),
+            !has_selection_style(0) && !has_selection_style(1) && !has_selection_style(2),
             "left pane untouched"
         );
         assert!(
-            reversed(3) && reversed(4) && reversed(5),
+            has_selection_style(3) && has_selection_style(4) && has_selection_style(5),
             "right pane highlighted"
         );
     }
 
     #[test]
     fn highlight_skips_empty_selection() {
+        let th = crate::theme::ayu_dark();
         let mut buf = buffer(&["abcde"]);
-        Selection::start(2, 0, buf.area).highlight(&mut buf);
+        Selection::start(2, 0, buf.area).highlight(&mut buf, &th);
         for x in 0..5 {
+            let cell = buf.cell(Position::new(x, 0)).unwrap();
             assert!(
-                !buf.cell(Position::new(x, 0))
-                    .unwrap()
-                    .modifier
-                    .contains(Modifier::REVERSED),
+                cell.bg != th.get(crate::theme::ThemeRole::SelectionBg),
                 "a plain click must not highlight any cell"
             );
         }

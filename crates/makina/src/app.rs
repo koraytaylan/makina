@@ -418,14 +418,27 @@ pub enum Mode {
 
 // ── Command palette ──────────────────────────────────────────────────────────
 
-/// A single selectable command in the palette: its display label and the
-/// `AppEvent` `Enter` re-dispatches through the normal update path.
+/// A single selectable command in the palette.
 #[derive(Debug, Clone)]
-pub struct PaletteAction {
-    /// The display label for this action.
-    pub label: &'static str,
-    /// The event to dispatch when this action is executed.
-    pub event: AppEvent,
+pub enum PaletteAction {
+    /// A regular action: its display label and the `AppEvent` `Enter` re-dispatches through the normal update path.
+    Regular {
+        label: &'static str,
+        event: AppEvent,
+    },
+    /// A nested theme selector that lists built-in themes.
+    NestedThemeSelector { label: &'static str },
+}
+
+impl PaletteAction {
+    /// Display label for this action.
+    pub fn label(&self) -> &str {
+        match self {
+            PaletteAction::Regular { label, .. } | PaletteAction::NestedThemeSelector { label } => {
+                label
+            }
+        }
+    }
 }
 
 /// State for the Ctrl+P command-palette modal.
@@ -437,6 +450,8 @@ pub struct CommandPalette {
     pub actions: Vec<PaletteAction>,
     /// Selected index *into the filtered view* (clamped on every filter change).
     pub selected: usize,
+    /// None = normal action list; Some = theme-selector mode showing theme names.
+    pub theme_selector: Option<Vec<String>>,
 }
 
 impl CommandPalette {
@@ -446,33 +461,36 @@ impl CommandPalette {
     /// carry the new stub variant.
     pub fn default_actions() -> Vec<PaletteAction> {
         vec![
-            PaletteAction {
+            PaletteAction::Regular {
                 label: "Open task list",
                 event: AppEvent::OpenBrowser,
             },
-            PaletteAction {
+            PaletteAction::Regular {
                 label: "Configure providers & roles",
                 event: AppEvent::OpenProviderEditor,
             },
-            PaletteAction {
+            PaletteAction::Regular {
                 label: "Settings",
                 event: AppEvent::OpenSettings,
             },
-            PaletteAction {
+            PaletteAction::Regular {
                 label: "Doctor",
                 event: AppEvent::OpenDoctor,
             },
-            PaletteAction {
+            PaletteAction::Regular {
                 label: "Retry failed task",
                 event: AppEvent::RetryFocusedTask,
             },
-            PaletteAction {
+            PaletteAction::Regular {
                 label: "Discover project",
                 event: AppEvent::DiscoverProject,
             },
-            PaletteAction {
+            PaletteAction::Regular {
                 label: "Quit",
                 event: AppEvent::Quit,
+            },
+            PaletteAction::NestedThemeSelector {
+                label: "Switch theme",
             },
         ]
     }
@@ -485,8 +503,27 @@ impl CommandPalette {
             let filter_lower = self.filter.to_lowercase();
             self.actions
                 .iter()
-                .filter(|action| action.label.to_lowercase().contains(&filter_lower))
+                .filter(|action| action.label().to_lowercase().contains(&filter_lower))
                 .collect()
+        }
+    }
+
+    /// Theme names from `theme_selector` that match the current `filter`.
+    /// Returns an empty vec when not in theme-selector mode.
+    pub fn filtered_theme_names(&self) -> Vec<&String> {
+        match &self.theme_selector {
+            None => vec![],
+            Some(theme_names) => {
+                if self.filter.is_empty() {
+                    theme_names.iter().collect()
+                } else {
+                    let filter_lower = self.filter.to_lowercase();
+                    theme_names
+                        .iter()
+                        .filter(|name| name.to_lowercase().contains(&filter_lower))
+                        .collect()
+                }
+            }
         }
     }
 }
@@ -815,6 +852,10 @@ pub enum AppEvent {
     CommandPaletteExecute,
     /// Close the command palette and return to normal mode.
     CloseCommandPalette,
+    /// Enter the nested theme selector mode (internal event).
+    EnterThemeSelector,
+    /// Apply the selected theme from nested selector (internal event).
+    ApplyThemeSelection,
 
     // ── Settings screen (plan 0070) ───────────────────────────────────────────
     /// User requested to open the settings screen.
@@ -1237,6 +1278,10 @@ pub struct App {
     /// `Ctrl+O` ([`AppEvent::ToggleVerbose`]).  Defaults to `false` (compact).
     pub verbose_mode: bool,
 
+    // ── Theming (plan 0036) ───────────────────────────────────────────────────
+    /// Active color theme, read during render. Defaults to Ayu Dark; restored from GlobalConfig on startup and mutated by the 'Switch theme' palette action.
+    pub active_theme: crate::theme::Theme,
+
     // ── Per-role metrics (plan 0024) ───────────────────────────────────────────
     /// Latest per-role turn metrics, keyed by (run, task) then role.
     ///
@@ -1590,6 +1635,7 @@ impl App {
             caps: makina_core::config::CapsConfig::default(),
             concurrency: 3,
             verbose_mode: false,
+            active_theme: crate::theme::ayu_dark(),
             role_metrics: HashMap::new(),
             discovered_plans: Vec::new(),
             tabs: TabState::new(),
@@ -2455,6 +2501,7 @@ impl App {
                     filter: String::new(),
                     actions: CommandPalette::default_actions(),
                     selected: 0,
+                    theme_selector: None,
                 });
                 self.mode = Mode::CommandPalette;
                 true
@@ -2462,8 +2509,12 @@ impl App {
             AppEvent::CommandPaletteInput(c) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     palette.filter.push(c);
-                    // Clamp selected to the filtered list length
-                    let filtered_len = palette.filtered().len();
+                    // Clamp selected to the filtered list length (branch on mode)
+                    let filtered_len = if palette.theme_selector.is_some() {
+                        palette.filtered_theme_names().len()
+                    } else {
+                        palette.filtered().len()
+                    };
                     palette.selected = palette.selected.min(filtered_len.saturating_sub(1));
                 }
                 true
@@ -2471,8 +2522,12 @@ impl App {
             AppEvent::CommandPaletteBackspace => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     palette.filter.pop();
-                    // Clamp selected to the filtered list length
-                    let filtered_len = palette.filtered().len();
+                    // Clamp selected to the filtered list length (branch on mode)
+                    let filtered_len = if palette.theme_selector.is_some() {
+                        palette.filtered_theme_names().len()
+                    } else {
+                        palette.filtered().len()
+                    };
                     palette.selected = palette.selected.min(filtered_len.saturating_sub(1));
                 }
                 true
@@ -2485,17 +2540,80 @@ impl App {
             }
             AppEvent::CommandPaletteDown => {
                 if let Some(palette) = self.command_palette.as_mut() {
-                    let filtered_len = palette.filtered().len();
+                    let filtered_len = if palette.theme_selector.is_some() {
+                        palette.filtered_theme_names().len()
+                    } else {
+                        palette.filtered().len()
+                    };
                     palette.selected = (palette.selected + 1).min(filtered_len.saturating_sub(1));
                 }
                 true
             }
             AppEvent::CommandPaletteExecute => {
+                // In normal execution, resolve_io handles this and returns the dispatched event.
+                // But for testing and direct calls, we handle the theme selector mode here.
+                if let Some(palette) = self.command_palette.as_mut() {
+                    if palette.theme_selector.is_some() {
+                        // In theme selector mode - apply the selection
+                        self.update(AppEvent::ApplyThemeSelection);
+                        return true;
+                    }
+                    // Check if we're selecting the NestedThemeSelector action
+                    let filtered = palette.filtered();
+                    if let Some(action) = filtered.get(palette.selected)
+                        && matches!(action, PaletteAction::NestedThemeSelector { .. })
+                    {
+                        // Enter theme selector mode
+                        self.update(AppEvent::EnterThemeSelector);
+                        return true;
+                    }
+                }
+                // Regular action execution - close the palette (the actual event is dispatched by resolve_io)
                 self.mode = Mode::Normal;
                 self.command_palette = None;
                 true
             }
+            AppEvent::EnterThemeSelector => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    let theme_names = crate::theme::Theme::builtin_themes()
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect();
+                    palette.filter = String::new();
+                    palette.selected = 0;
+                    palette.theme_selector = Some(theme_names);
+                }
+                true
+            }
+            AppEvent::ApplyThemeSelection => {
+                if let Some(palette) = self.command_palette.as_mut()
+                    && palette.theme_selector.is_some()
+                {
+                    let selected_name = palette
+                        .filtered_theme_names()
+                        .get(palette.selected)
+                        .map(|s| (*s).clone());
+                    if let Some(name) = selected_name
+                        && let Some(theme) = crate::theme::Theme::builtin_themes()
+                            .into_iter()
+                            .find(|t| t.name == name)
+                    {
+                        self.active_theme = theme;
+                        palette.theme_selector = None; // Exit theme selector mode
+                    }
+                }
+                true
+            }
             AppEvent::CloseCommandPalette => {
+                if let Some(palette) = self.command_palette.as_mut()
+                    && palette.theme_selector.is_some()
+                {
+                    // Exit theme selector mode, return to action list
+                    palette.theme_selector = None;
+                    palette.filter = String::new();
+                    palette.selected = 0;
+                    return true;
+                }
                 self.mode = Mode::Normal;
                 self.command_palette = None;
                 true
@@ -6515,9 +6633,9 @@ mod tests {
         let mut app = make_app();
         app.update(AppEvent::OpenCommandPalette);
 
-        // Palette has all 7 default actions.
+        // Palette has all 8 default actions.
         let palette = app.command_palette.as_ref().unwrap();
-        assert_eq!(palette.filtered().len(), 7, "full list must have 7 actions");
+        assert_eq!(palette.filtered().len(), 8, "full list must have 8 actions");
 
         // Type "doc" (case-insensitive).
         app.update(AppEvent::CommandPaletteInput('d'));
@@ -6532,7 +6650,8 @@ mod tests {
         let filtered = palette.filtered();
         assert_eq!(filtered.len(), 1, "filtered list must have 1 item");
         assert_eq!(
-            filtered[0].label, "Doctor",
+            filtered[0].label(),
+            "Doctor",
             "filtered item must be 'Doctor'"
         );
 
@@ -6553,7 +6672,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            7,
+            8,
             "full list restored after filter cleared"
         );
     }
@@ -6603,6 +6722,233 @@ mod tests {
         assert!(
             app.command_palette.is_none(),
             "command_palette must be None after close"
+        );
+    }
+
+    /// Entering the nested theme selector opens the theme list and keeps the palette open.
+    #[test]
+    fn nested_theme_selector_enters_mode() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenCommandPalette);
+
+        // Navigate to the "Switch theme" action (should be at index 7, the last one).
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.actions.len(), 8, "should have 8 actions");
+        assert!(
+            matches!(
+                palette.actions[7],
+                crate::app::PaletteAction::NestedThemeSelector { .. }
+            ),
+            "last action should be NestedThemeSelector"
+        );
+
+        // Select it by moving down 7 times from index 0.
+        for _ in 0..7 {
+            app.update(AppEvent::CommandPaletteDown);
+        }
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.selected, 7, "should be at index 7");
+        assert!(
+            palette.theme_selector.is_none(),
+            "theme_selector should still be None"
+        );
+
+        // Execute to enter theme selector mode.
+        app.update(AppEvent::CommandPaletteExecute);
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(
+            palette.theme_selector.is_some(),
+            "theme_selector should be Some after entering"
+        );
+        assert_eq!(
+            palette.filter, "",
+            "filter should be cleared when entering theme mode"
+        );
+        assert_eq!(palette.selected, 0, "selected should reset to 0");
+
+        // Palette should still be open.
+        assert_eq!(
+            app.mode,
+            Mode::CommandPalette,
+            "palette should still be open"
+        );
+        assert!(
+            app.command_palette.is_some(),
+            "command_palette should be Some"
+        );
+
+        let theme_names = palette.theme_selector.as_ref().unwrap();
+        assert_eq!(theme_names.len(), 3, "should have 3 built-in themes");
+        assert!(theme_names.contains(&"Ayu Dark".to_string()));
+        assert!(theme_names.contains(&"Ayu Mirage".to_string()));
+        assert!(theme_names.contains(&"Ayu Light".to_string()));
+    }
+
+    /// Selecting a theme in nested mode mutates app.active_theme and clears theme_selector.
+    #[test]
+    fn nested_theme_selector_applies_theme() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenCommandPalette);
+
+        // Navigate to and enter the theme selector.
+        for _ in 0..7 {
+            app.update(AppEvent::CommandPaletteDown);
+        }
+        app.update(AppEvent::CommandPaletteExecute);
+
+        let initial_theme = app.active_theme.name.clone();
+        assert_eq!(initial_theme, "Ayu Dark", "should start with Ayu Dark");
+
+        // Move down to the second theme (Ayu Mirage).
+        app.update(AppEvent::CommandPaletteDown);
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.selected, 1, "should be at Ayu Mirage");
+
+        // Execute to apply the theme.
+        app.update(AppEvent::CommandPaletteExecute);
+
+        // Theme should change.
+        assert_eq!(
+            app.active_theme.name, "Ayu Mirage",
+            "active_theme should be Ayu Mirage"
+        );
+
+        // Theme selector should be cleared, palette should still be open.
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(
+            palette.theme_selector.is_none(),
+            "theme_selector should be None after selection"
+        );
+        assert_eq!(
+            app.mode,
+            Mode::CommandPalette,
+            "palette should still be open"
+        );
+    }
+
+    /// Esc in nested theme selector mode returns to action list without changing theme.
+    #[test]
+    fn nested_theme_selector_esc_returns_to_actions() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenCommandPalette);
+
+        // Enter theme selector.
+        for _ in 0..7 {
+            app.update(AppEvent::CommandPaletteDown);
+        }
+        app.update(AppEvent::CommandPaletteExecute);
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(
+            palette.theme_selector.is_some(),
+            "should be in theme selector mode"
+        );
+
+        let initial_theme = app.active_theme.name.clone();
+
+        // Move down to a different theme.
+        app.update(AppEvent::CommandPaletteDown);
+        app.update(AppEvent::CommandPaletteDown);
+
+        // Press Esc to exit theme selector mode.
+        app.update(AppEvent::CloseCommandPalette);
+
+        // Theme should not have changed.
+        assert_eq!(
+            app.active_theme.name, initial_theme,
+            "theme should not change on Esc"
+        );
+
+        // Should be back to action list.
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(
+            palette.theme_selector.is_none(),
+            "theme_selector should be None after Esc"
+        );
+        assert_eq!(palette.selected, 0, "selected should reset to 0");
+        assert_eq!(palette.filter, "", "filter should be empty");
+
+        // Palette should still be open.
+        assert_eq!(
+            app.mode,
+            Mode::CommandPalette,
+            "palette should still be open"
+        );
+    }
+
+    /// Filtering works in theme selector mode.
+    #[test]
+    fn nested_theme_selector_filtering() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenCommandPalette);
+
+        // Enter theme selector.
+        for _ in 0..7 {
+            app.update(AppEvent::CommandPaletteDown);
+        }
+        app.update(AppEvent::CommandPaletteExecute);
+
+        // Navigate to "Ayu Light" (index 2) before filtering.
+        app.update(AppEvent::CommandPaletteDown);
+        app.update(AppEvent::CommandPaletteDown);
+        {
+            let palette = app.command_palette.as_ref().unwrap();
+            assert_eq!(palette.selected, 2, "should be at index 2 (Ayu Light)");
+        }
+
+        // Type 'd' to filter — only "Ayu Dark" matches (1 result).
+        // Actions matching 'd' include "Doctor" and "Discover project" (2 results),
+        // so if filtering incorrectly used palette.filtered().len() it would clamp
+        // selected to min(2, 2-1)=1 instead of the correct min(2, 1-1)=0.
+        app.update(AppEvent::CommandPaletteInput('d'));
+
+        {
+            let palette = app.command_palette.as_ref().unwrap();
+            assert_eq!(palette.filter, "d", "filter should be 'd'");
+            assert_eq!(
+                palette.selected, 0,
+                "selected must be clamped to 0 (only 1 theme matches 'd')"
+            );
+            assert!(
+                palette.theme_selector.is_some(),
+                "theme_selector should still be Some"
+            );
+            // Verify filtered_theme_names returns the correct count.
+            assert_eq!(
+                palette.filtered_theme_names().len(),
+                1,
+                "exactly 1 theme matches 'd' (Ayu Dark)"
+            );
+        }
+
+        // Type "mirage" (clearing 'd' first via backspace, then typing).
+        app.update(AppEvent::CommandPaletteBackspace);
+        app.update(AppEvent::CommandPaletteInput('m'));
+        app.update(AppEvent::CommandPaletteInput('i'));
+        app.update(AppEvent::CommandPaletteInput('r'));
+        app.update(AppEvent::CommandPaletteInput('a'));
+        app.update(AppEvent::CommandPaletteInput('g'));
+        app.update(AppEvent::CommandPaletteInput('e'));
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.filter, "mirage", "filter should be 'mirage'");
+
+        // The theme selector is still Some, and we should see only one theme.
+        assert!(
+            palette.theme_selector.is_some(),
+            "theme_selector should still be Some"
+        );
+        assert_eq!(
+            palette.filtered_theme_names().len(),
+            1,
+            "should filter to 1 theme matching 'mirage'"
+        );
+        assert_eq!(
+            palette.selected, 0,
+            "selected must be clamped within the theme-filtered count"
         );
     }
 

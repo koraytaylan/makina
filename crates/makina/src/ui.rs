@@ -98,8 +98,8 @@ pub fn render(app: &App, frame: &mut Frame) {
     let title_text = format!(" Makina v{version} — multi-agent software factory ");
     let title = Paragraph::new(title_text).style(
         Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
+            .bg(app.active_theme.get(crate::theme::ThemeRole::Info))
+            .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
             .add_modifier(Modifier::BOLD),
     );
     frame.render_widget(title, title_area);
@@ -116,7 +116,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let sidebar_focused = app.focused_panel == Panel::Sidebar;
 
     // Render the unified sidebar tree (plans + runs + tasks).
-    let sidebar_block = panel_block("Runs & Tasks", sidebar_focused);
+    let sidebar_block = panel_block(app, "Runs & Tasks", sidebar_focused);
 
     // The tree is empty only when there are NO discovered plans AND no open
     // runs — gate on the flattened node list, not `runs` alone, so a freshly
@@ -139,7 +139,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     format!("  {} {label}…", spinner_frame(app.tick)),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                 )]),
             ]
         } else {
@@ -147,22 +147,22 @@ pub fn render(app: &App, frame: &mut Frame) {
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  No runs open.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  Press [o] to open a",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
                 Line::from(vec![Span::styled(
                     "  task-list file.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
             ]
         };
         let para = Paragraph::new(empty_text)
             .block(sidebar_block)
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)));
         frame.render_widget(para, sidebar_area);
     } else {
         // Build one ListItem per visible tree node (plans, runs, and their
@@ -179,7 +179,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                         } else {
                             "▾ "
                         };
-                        let (badge, badge_color) = status_badge(&run_view.status);
+                        let (badge, badge_color) = status_badge(&run_view.status, app);
                         let name = run_label(run_view);
                         let line = Line::from(vec![
                             Span::raw(disclosure),
@@ -195,7 +195,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                         let run_view = &app.runs[*run];
                         let task_view = &run_view.tasks[*task];
 
-                        let (badge, badge_color) = task_state_badge(&task_view.state);
+                        let (badge, badge_color) = task_state_badge(&task_view.state, app);
                         let badge_text = match task_view.state {
                             makina_core::api::TaskState::InProgress
                             | makina_core::api::TaskState::InReview => {
@@ -248,7 +248,8 @@ pub fn render(app: &App, frame: &mut Frame) {
                             // No TASKS.md: this plan still needs a task list.
                             line_spans.push(Span::styled(
                                 " (no tasks — will plan)",
-                                Style::default().fg(Color::DarkGray),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ));
                         } else {
                             // Show the task count so the plan reads as a container.
@@ -257,7 +258,8 @@ pub fn render(app: &App, frame: &mut Frame) {
                                     "  · {n_tasks} task{}",
                                     if n_tasks == 1 { "" } else { "s" }
                                 ),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ));
                         }
                         ListItem::new(Line::from(line_spans))
@@ -269,15 +271,28 @@ pub fn render(app: &App, frame: &mut Frame) {
                         let last = *task_idx + 1 == app.discovered_plans[*plan_idx].tasks.len();
                         let connector = if last { "  └ " } else { "  ├ " };
                         let mut spans = vec![
-                            Span::styled(connector, Style::default().fg(Color::DarkGray)),
-                            Span::styled(&task.id, Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                connector,
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                            ),
+                            Span::styled(
+                                &task.id,
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
+                            ),
                             Span::styled(
                                 format!(" — {}", task.title),
-                                Style::default().fg(Color::Gray),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ),
                         ];
                         if task.gated {
-                            spans.push(Span::styled("  GATED", Style::default().fg(Color::Yellow)));
+                            spans.push(Span::styled(
+                                "  GATED",
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
+                            ));
                         }
                         ListItem::new(Line::from(spans))
                     }
@@ -287,8 +302,8 @@ pub fn render(app: &App, frame: &mut Frame) {
 
         // Highlight style for the focused node.
         let highlight_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
+            .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
             .add_modifier(Modifier::BOLD);
 
         // Capture item count and compute scroll bounds before items are moved.
@@ -360,7 +375,7 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // ── Main content — per-task status view (task 29) ────────────────────────
     let main_focused = app.focused_panel == Panel::Main;
-    let main_block = panel_block("Detail", main_focused);
+    let main_block = panel_block(app, "Detail", main_focused);
 
     // ── Record selectable panes for mouse text selection ───────────────────────
     // `hit` is the full pane column (so a drag may begin on a border/padding
@@ -382,7 +397,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         vec![
             crate::app::SelectionPane {
                 hit: sidebar_area,
-                clip: panel_block("Runs & Tasks", sidebar_focused).inner(sidebar_area),
+                clip: panel_block(app, "Runs & Tasks", sidebar_focused).inner(sidebar_area),
             },
             crate::app::SelectionPane {
                 hit: main_area,
@@ -506,19 +521,21 @@ pub fn render(app: &App, frame: &mut Frame) {
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  Select a run, or press Enter on a plan to view it.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  [→] expand plan   [Enter] plan detail   [Tab] switch focus",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
                 Line::from(vec![Span::styled(
                     "  [q / Esc / Ctrl-C] — quit",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
             ];
-            let hint_para = Paragraph::new(hint_lines).style(Style::default().fg(Color::White));
+            let hint_para = Paragraph::new(hint_lines).style(
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+            );
             frame.render_widget(hint_para, content_area);
         }
         (None, None, Some(task_id), Some(run)) => {
@@ -553,10 +570,12 @@ pub fn render(app: &App, frame: &mut Frame) {
                     Line::from(""),
                     Line::from(vec![Span::styled(
                         "  This task is no longer available.",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                     )]),
                 ])
-                .style(Style::default().fg(Color::White));
+                .style(
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+                );
                 frame.render_widget(hint, task_area);
             }
         }
@@ -569,17 +588,23 @@ pub fn render(app: &App, frame: &mut Frame) {
             // Header: run path and aggregate status.
             let header_lines: Vec<Line> = vec![
                 Line::from(vec![
-                    Span::styled("Run: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "Run: ",
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    ),
                     Span::styled(
                         run.task_list_path.display().to_string(),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "Status: ",
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    ),
                     Span::styled(
                         status_label(&run.status),
-                        Style::default().fg(status_color(&run.status)),
+                        Style::default().fg(status_color(&run.status, app)),
                     ),
                     Span::styled(
                         format!(
@@ -587,7 +612,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                             run.tasks.len(),
                             if run.tasks.len() == 1 { "" } else { "s" }
                         ),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                     ),
                 ]),
                 Line::from(""),
@@ -627,7 +652,9 @@ pub fn render(app: &App, frame: &mut Frame) {
             // affect tests that don't open tabs.
             render_tab_bar(app, frame, tab_area);
 
-            let header_para = Paragraph::new(header_lines).style(Style::default().fg(Color::White));
+            let header_para = Paragraph::new(header_lines).style(
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+            );
             frame.render_widget(header_para, header_area);
 
             // Render ingestion report panel (0-height area is a no-op inside).
@@ -678,11 +705,13 @@ pub fn render(app: &App, frame: &mut Frame) {
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  Select a run, or press Enter on a plan to view it.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
                 Line::from(""),
             ];
-            let hint_para = Paragraph::new(hint_lines).style(Style::default().fg(Color::White));
+            let hint_para = Paragraph::new(hint_lines).style(
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+            );
             frame.render_widget(hint_para, hint_area);
         }
     }
@@ -751,12 +780,16 @@ pub fn render(app: &App, frame: &mut Frame) {
         let count = app.error_messages.len();
         (
             format!("[e] errors({})", count),
-            Style::default().bg(Color::DarkGray).fg(Color::Yellow),
+            Style::default()
+                .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
         )
     } else {
         (
             "[e] errors".to_string(),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default()
+                .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
         )
     };
     // The blocked notice precedes the trailer so its full text stays inside the
@@ -766,7 +799,9 @@ pub fn render(app: &App, frame: &mut Frame) {
     // The status bar is built as a `Line` of `Span`s so the error-badge span
     // can carry its own colour (warn/yellow) while the rest stays White/DarkGray.
     let verbose_state = if app.verbose_mode { "on" } else { "off" };
-    let default_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let default_style = Style::default()
+        .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" [^P] cmds  [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] doctor  [wheel] scroll  "),
@@ -786,7 +821,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     if app.is_browsing()
         && let Some(browser) = app.browser.as_ref()
     {
-        render_file_browser(browser, frame, area);
+        render_file_browser(app, browser, frame, area);
     }
 
     // ── Provider configuration editor overlay ──────────────────────────────────
@@ -795,7 +830,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     if app.is_editing_providers()
         && let Some(editor) = app.provider_editor.as_ref()
     {
-        render_provider_editor(editor, frame, area);
+        render_provider_editor(app, editor, frame, area);
     }
 
     // ── Doctor health-check overlay (task 0046) ──────────────────────────────────
@@ -809,7 +844,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     if app.is_command_palette()
         && let Some(p) = app.command_palette.as_ref()
     {
-        render_command_palette(p, frame, area);
+        render_command_palette(app, p, frame, area);
     }
 
     // ── Settings overlay (plan 0070) ──────────────────────────────────────────────
@@ -817,14 +852,14 @@ pub fn render(app: &App, frame: &mut Frame) {
     if app.is_settings()
         && let Some(s) = app.settings.as_ref()
     {
-        render_settings(s, frame, area);
+        render_settings(app, s, frame, area);
     }
 
     // ── Mouse text-selection highlight ─────────────────────────────────────────
     // Applied last so it reverses whatever pane or overlay drew beneath the
     // dragged region. See `crate::selection` for why selection lives in-app.
     if let Some(sel) = app.selection {
-        sel.highlight(frame.buffer_mut());
+        sel.highlight(frame.buffer_mut(), &app.active_theme);
     }
 }
 
@@ -862,7 +897,10 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
     let mut x = area.x;
     let area_end = area.x.saturating_add(area.width);
     // Leading divider so the first chip reads as a bordered tab.
-    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        "│",
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+    ));
     x = x.saturating_add(1);
 
     for (idx, tab) in app.tabs.open_tabs.iter().enumerate() {
@@ -891,14 +929,19 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
         let is_active = app.tabs.active_tab == Some(idx);
         let style = if is_active {
             Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
+                .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(Color::DarkGray).fg(Color::Gray)
+            Style::default()
+                .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
         };
         spans.push(Span::styled(chip, style));
-        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "│",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        ));
         // Chip width + 1 for the trailing divider.
         x = x.saturating_add(chip_w).saturating_add(1);
     }
@@ -958,17 +1001,23 @@ fn render_plan_task_pane(
     push_line!(Line::from(vec![Span::styled(
         format!("{} — {}", preview.id, preview.title),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
             .add_modifier(Modifier::BOLD),
     )]));
     push_line!(Line::from(vec![
-        Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(plan.slug.clone(), Style::default().fg(Color::Gray)),
+        Span::styled(
+            "Plan: ",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        ),
+        Span::styled(
+            plan.slug.clone(),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        ),
     ]));
     if preview.gated {
         push_line!(Line::from(vec![Span::styled(
             "Gated — blocked until prerequisites land",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
         )]));
     }
     push_line!(Line::from(""));
@@ -978,19 +1027,23 @@ fn render_plan_task_pane(
         if preview.depends_on.is_empty() {
             push_line!(Line::from(Span::styled(
                 "(no further detail in TASKS.md)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             )));
         } else {
             push_line!(Line::from(vec![
-                Span::styled("Depends on: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Depends on: ",
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                ),
                 Span::styled(
                     preview.depends_on.join(", "),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                 ),
             ]));
         }
     } else {
-        let base_style = Style::default().fg(Color::White);
+        let base_style =
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
         for l in crate::markup::render_markdown(&preview.body, base_style, content_area.width) {
             push_line!(l);
         }
@@ -1037,7 +1090,7 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .title(format!(" Dependencies — {} ", view_label))
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1059,7 +1112,7 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                                 // id line if the task is not present.
                                 match run.tasks.iter().find(|t| &t.id == dep_id) {
                                     Some(dep) => {
-                                        let (badge, color) = task_state_badge(&dep.state);
+                                        let (badge, color) = task_state_badge(&dep.state, app);
                                         Line::from(vec![Span::styled(
                                             format!("{} {}", badge, dep.id.0),
                                             Style::default().fg(color),
@@ -1067,20 +1120,21 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                                     }
                                     None => Line::from(vec![Span::styled(
                                         format!("  {}", dep_id.0),
-                                        Style::default().fg(Color::DarkGray),
+                                        Style::default()
+                                            .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                                     )]),
                                 }
                             })
                             .collect(),
                         _ => vec![Line::from(vec![Span::styled(
                             "  No dependencies.",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                         )])],
                     }
                 }
                 _ => vec![Line::from(vec![Span::styled(
                     "  No task focused.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )])],
             };
             let dep_total = lines.len() as u16;
@@ -1105,18 +1159,25 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                     match selected {
                         Some(root) if !root.depends_on.is_empty() => {
                             let mut acc: Vec<Line> = Vec::new();
-                            render_dependency_tree_children(run, &root.depends_on, "", 0, &mut acc);
+                            render_dependency_tree_children(
+                                app,
+                                run,
+                                &root.depends_on,
+                                "",
+                                0,
+                                &mut acc,
+                            );
                             acc
                         }
                         _ => vec![Line::from(vec![Span::styled(
                             "  No dependencies.",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                         )])],
                     }
                 }
                 _ => vec![Line::from(vec![Span::styled(
                     "  No task focused.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )])],
             };
             let dep_total = lines.len() as u16;
@@ -1144,7 +1205,8 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                             // Nothing has started yet — friendly placeholder.
                             vec![Line::from(vec![Span::styled(
                                 "  No timing yet.",
-                                Style::default().fg(Color::DarkGray),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             )])]
                         }
                         Some(span_start) => {
@@ -1172,7 +1234,7 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                             run.tasks
                                 .iter()
                                 .map(|task| {
-                                    let (_badge, color) = task_state_badge(&task.state);
+                                    let (_badge, color) = task_state_badge(&task.state, app);
                                     let label = truncate_label(&task.id.0, LABEL_COLS);
                                     let bar: String = if bar_width == 0 {
                                         // Pane too narrow — omit bar.
@@ -1209,7 +1271,7 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                 }
                 _ => vec![Line::from(vec![Span::styled(
                     "  No tasks.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )])],
             };
             let dep_total = lines.len() as u16;
@@ -1243,6 +1305,7 @@ const DEPENDENCY_TREE_MAX_DEPTH: usize = 2;
 /// present in `run.tasks`) renders with a `[?]` badge.  Recursion stops once
 /// `depth` exceeds [`DEPENDENCY_TREE_MAX_DEPTH`].
 fn render_dependency_tree_children(
+    app: &App,
     run: &makina_core::api::RunView,
     deps: &[makina_core::api::TaskId],
     prefix: &str,
@@ -1254,7 +1317,7 @@ fn render_dependency_tree_children(
         let connector = if is_last { "└── " } else { "├── " };
         match run.tasks.iter().find(|t| &t.id == dep_id) {
             Some(dep) => {
-                let (badge, color) = task_state_badge(&dep.state);
+                let (badge, color) = task_state_badge(&dep.state, app);
                 acc.push(Line::from(vec![Span::styled(
                     format!("{prefix}{connector}{badge} {}", dep.id.0),
                     Style::default().fg(color),
@@ -1264,6 +1327,7 @@ fn render_dependency_tree_children(
                     // blank gap past the last child.
                     let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
                     render_dependency_tree_children(
+                        app,
                         run,
                         &dep.depends_on,
                         &child_prefix,
@@ -1276,7 +1340,7 @@ fn render_dependency_tree_children(
                 // Missing/unknown id: render the bare id with a `[?]` badge.
                 acc.push(Line::from(vec![Span::styled(
                     format!("{prefix}{connector}[?] {}", dep_id.0),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]));
             }
         }
@@ -1385,7 +1449,7 @@ fn role_metric_lines(app: &App, task: &makina_core::api::TaskView) -> Vec<Line<'
             }
             lines.push(Line::from(Span::styled(
                 text,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             )));
         }
     }
@@ -1416,14 +1480,14 @@ fn task_activity_indicators(app: &App, task: &makina_core::api::TaskView) -> Vec
             let idle_secs = (app.tick - last_activity_tick) / 4;
             let idle_color = if let Some(idle_cap) = app.idle_secs_config {
                 if idle_secs >= idle_cap {
-                    Color::Red
+                    app.active_theme.get(crate::theme::ThemeRole::Error)
                 } else if idle_secs >= idle_cap / 2 {
-                    Color::Yellow
+                    app.active_theme.get(crate::theme::ThemeRole::Warning)
                 } else {
-                    Color::DarkGray
+                    app.active_theme.get(crate::theme::ThemeRole::Dim)
                 }
             } else {
-                Color::DarkGray
+                app.active_theme.get(crate::theme::ThemeRole::Dim)
             };
             spans.push(Span::styled(
                 format!("  idle {}s", idle_secs),
@@ -1442,12 +1506,12 @@ fn task_activity_indicators(app: &App, task: &makina_core::api::TaskView) -> Vec
                 let secs = remaining_secs % 60;
                 spans.push(Span::styled(
                     format!("  · wall-clock {}m {}s left", minutes, secs),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 ));
             } else {
                 spans.push(Span::styled(
                     "  · wall-clock exceeded",
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)),
                 ));
             }
         }
@@ -1494,9 +1558,9 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
         .title(title)
         .borders(Borders::TOP)
         .border_style(if focused {
-            Style::default().fg(Color::Blue)
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Info))
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
         });
 
     let inner = block.inner(area);
@@ -1517,9 +1581,9 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     task.gate_iterations, task.review_iterations
                 );
                 let style = if task.gate_iterations + task.review_iterations == 0 {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
                 };
                 detail_lines.push(Line::from(Span::styled(counts, style)));
 
@@ -1541,7 +1605,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     let reason_text = format!("failed: {} — {}", label, reason.message);
                     detail_lines.push(Line::from(Span::styled(
                         reason_text,
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)),
                     )));
                     detail_lines.push(Line::from(""));
                 }
@@ -1554,7 +1618,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
             };
             detail_lines.push(Line::from(vec![Span::styled(
                 hint,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             )]));
 
             let para = Paragraph::new(detail_lines);
@@ -1573,9 +1637,9 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     task.gate_iterations, task.review_iterations
                 );
                 let style = if task.gate_iterations + task.review_iterations == 0 {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
                 };
                 detail_lines.push(Line::from(Span::styled(counts, style)));
 
@@ -1597,7 +1661,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     let reason_text = format!("failed: {} — {}", label, reason.message);
                     detail_lines.push(Line::from(Span::styled(
                         reason_text,
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)),
                     )));
                     detail_lines.push(Line::from(""));
                 }
@@ -1605,7 +1669,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 
             detail_lines.push(Line::from(vec![Span::styled(
                 "  No exchange yet.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             )]));
 
             let para = Paragraph::new(detail_lines);
@@ -1625,9 +1689,9 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     task.gate_iterations, task.review_iterations
                 );
                 let style = if task.gate_iterations + task.review_iterations == 0 {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
                 };
                 lines.push(Line::from(Span::styled(counts, style)));
 
@@ -1649,7 +1713,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                     let reason_text = format!("failed: {} — {}", label, reason.message);
                     lines.push(Line::from(Span::styled(
                         reason_text,
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)),
                     )));
                     lines.push(Line::from(""));
                 }
@@ -1700,7 +1764,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 /// Width is taken from the pane's inner area so wrapping matches the pane, and
 /// the body reuses plan 0020's hardened `render_markdown` — no new parser.
 fn render_task_entry_pane(
-    _app: &App,
+    app: &App,
     run: &RunView,
     task_idx: usize,
     frame: &mut Frame,
@@ -1709,7 +1773,7 @@ fn render_task_entry_pane(
     let block = Block::default()
         .title(" Task Entry ")
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::Blue));
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Info)));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1721,12 +1785,12 @@ fn render_task_entry_pane(
         lines.push(Line::from(vec![Span::styled(
             format!("{} — {}", task.id, task.title),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
                 .add_modifier(Modifier::BOLD),
         )]));
 
         // State badge
-        let (badge, badge_color) = task_state_badge(&task.state);
+        let (badge, badge_color) = task_state_badge(&task.state, app);
         lines.push(Line::from(vec![Span::styled(
             format!("  {}", badge),
             Style::default().fg(badge_color),
@@ -1742,7 +1806,7 @@ fn render_task_entry_pane(
                 .join(", ");
             lines.push(Line::from(vec![Span::styled(
                 format!("  Depends on: {}", deps_str),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             )]));
         }
 
@@ -1752,7 +1816,7 @@ fn render_task_entry_pane(
                 "gate ×{}  ·  review ×{}",
                 task.gate_iterations, task.review_iterations
             );
-            let style = Style::default().fg(Color::Yellow);
+            let style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning));
             lines.push(Line::from(Span::styled(counts, style)));
         }
 
@@ -1760,7 +1824,8 @@ fn render_task_entry_pane(
 
         // Entry text rendered through Markdown
         let content_width = inner.width;
-        let base_style = Style::default().fg(Color::White);
+        let base_style =
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
         lines.extend(crate::markup::render_markdown(
             &task.entry_text,
             base_style,
@@ -1773,7 +1838,7 @@ fn render_task_entry_pane(
         // Task not found placeholder
         let placeholder = Line::from(vec![Span::styled(
             "  Task not found.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         )]);
         let para = Paragraph::new(vec![placeholder]);
         frame.render_widget(para, inner);
@@ -1858,19 +1923,25 @@ pub(crate) fn render_plan_accordion_pane(
 
     // Header: plan name and directory
     push_line!(Line::from(vec![
-        Span::styled("Plan: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Plan: ",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+        ),
         Span::styled(
             plan.slug.clone(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
     push_line!(Line::from(vec![
-        Span::styled("Dir:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Dir:  ",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+        ),
         Span::styled(
             plan.dir.display().to_string(),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         ),
     ]));
     push_line!(Line::from(""));
@@ -1886,6 +1957,7 @@ pub(crate) fn render_plan_accordion_pane(
     let scope_focused = matches!(app.focused_section, Some(AccordionSection::Scope));
     accordion_header_rows.push((AccordionSection::Scope, rendered_row));
     for l in render_accordion_section(
+        app,
         "SCOPE",
         AccordionSection::Scope,
         &expanded,
@@ -1902,6 +1974,7 @@ pub(crate) fn render_plan_accordion_pane(
     let arch_focused = matches!(app.focused_section, Some(AccordionSection::Architecture));
     accordion_header_rows.push((AccordionSection::Architecture, rendered_row));
     for l in render_accordion_section(
+        app,
         "ARCHITECTURE",
         AccordionSection::Architecture,
         &expanded,
@@ -1921,6 +1994,7 @@ pub(crate) fn render_plan_accordion_pane(
     let tasks_focused = matches!(app.focused_section, Some(AccordionSection::Tasks));
     accordion_header_rows.push((AccordionSection::Tasks, rendered_row));
     for l in render_accordion_section(
+        app,
         "TASKS",
         AccordionSection::Tasks,
         &expanded,
@@ -1937,6 +2011,7 @@ pub(crate) fn render_plan_accordion_pane(
     let status_focused = matches!(app.focused_section, Some(AccordionSection::Status));
     accordion_header_rows.push((AccordionSection::Status, rendered_row));
     for l in render_accordion_section(
+        app,
         "STATUS",
         AccordionSection::Status,
         &expanded,
@@ -1952,7 +2027,7 @@ pub(crate) fn render_plan_accordion_pane(
     // Footer help text
     push_line!(Line::from(Span::styled(
         "  [s] scope  [a] arch  [t] tasks  [z] status  [◄] [►] tabs  [Ctrl+W] close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )));
 
     // `rendered_row` now holds the total rendered height in terminal rows.
@@ -2017,8 +2092,9 @@ pub(crate) fn render_plan_accordion_pane(
 ///
 /// Returns a Vec<Line> containing the header (expanded/collapsed marker) and,
 /// if expanded, the content lines with proper indentation.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn render_accordion_section(
+    app: &App,
     title: &str,
     section: AccordionSection,
     expanded_set: &HashSet<AccordionSection>,
@@ -2033,16 +2109,18 @@ fn render_accordion_section(
 
     // Section header with focus styling
     let marker_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
         .add_modifier(Modifier::BOLD);
 
     let mut title_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
         .add_modifier(Modifier::BOLD);
 
     if focused {
         // Apply a distinctive background and bold modifier when focused.
-        title_style = title_style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        title_style = title_style
+            .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+            .add_modifier(Modifier::BOLD);
     }
 
     result.push(Line::from(vec![
@@ -2061,7 +2139,8 @@ fn render_accordion_section(
             // 2-space indent so the indented lines still fit the viewport, then
             // prepend the indent so the body stays nested under its header.
             let body_width = content_width.saturating_sub(2);
-            let base = Style::default().fg(Color::White);
+            let base =
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
             for mut line in crate::markup::render_markdown(content, base, body_width) {
                 line.spans.insert(0, Span::raw("  "));
                 result.push(line);
@@ -2128,7 +2207,7 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .title(" Errors ")
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::Red));
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2136,7 +2215,7 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
     if app.error_messages.is_empty() {
         let para = Paragraph::new(Line::from(vec![Span::styled(
             "  No errors.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         )]));
         frame.render_widget(para, inner);
         return;
@@ -2148,9 +2227,9 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
         .iter()
         .map(|msg| {
             let color = match msg.level {
-                ErrorLevel::Error => Color::Red,
-                ErrorLevel::Warn => Color::Yellow,
-                ErrorLevel::Info => Color::DarkGray,
+                ErrorLevel::Error => app.active_theme.get(crate::theme::ThemeRole::Error),
+                ErrorLevel::Warn => app.active_theme.get(crate::theme::ThemeRole::Warning),
+                ErrorLevel::Info => app.active_theme.get(crate::theme::ThemeRole::Dim),
             };
             Line::from(vec![Span::styled(
                 format!("  {}", msg.text),
@@ -2203,8 +2282,11 @@ fn render_provider_warning(app: &App, frame: &mut Frame, area: Rect) {
         first.provider, first.command
     );
 
-    let para =
-        Paragraph::new(warning_text).style(Style::default().fg(Color::Yellow).bg(Color::Black));
+    let para = Paragraph::new(warning_text).style(
+        Style::default()
+            .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
+            .bg(app.active_theme.get(crate::theme::ThemeRole::Background)),
+    );
 
     frame.render_widget(para, area);
 }
@@ -2229,9 +2311,9 @@ fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
 
     let has_blocking = run.report.is_blocked();
     let border_color = if has_blocking {
-        Color::Red
+        app.active_theme.get(crate::theme::ThemeRole::Error)
     } else {
-        Color::Yellow
+        app.active_theme.get(crate::theme::ThemeRole::Warning)
     };
     let title = if has_blocking {
         " Blocking Issues "
@@ -2253,8 +2335,8 @@ fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
         .iter()
         .map(|issue| {
             let color = match issue.severity {
-                IssueSeverity::Blocking => Color::Red,
-                IssueSeverity::Warning => Color::Yellow,
+                IssueSeverity::Blocking => app.active_theme.get(crate::theme::ThemeRole::Error),
+                IssueSeverity::Warning => app.active_theme.get(crate::theme::ThemeRole::Warning),
             };
             let source = match issue.source {
                 IssueSource::Interpreter => "interpreter",
@@ -2300,11 +2382,11 @@ fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
 /// (no literal escape byte survives), overlaying a diff base colour where the
 /// line is a diff add/remove/hunk line. ANSI SGR foreground wins where present;
 /// modifiers (e.g. BOLD) are always preserved. Two-space indented.
-fn diff_overlaid_content_line(text_line: &str) -> Line<'static> {
+fn diff_overlaid_content_line(text_line: &str, theme: &crate::theme::Theme) -> Line<'static> {
     use crate::ansi::{AnsiSpan, diff_line_style, parse_ansi};
 
-    let diff_style = diff_line_style(text_line);
-    let ansi_spans = parse_ansi(text_line);
+    let diff_style = diff_line_style(text_line, theme);
+    let ansi_spans = parse_ansi(text_line, theme);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Two-space indent, default-styled, owning its text.
@@ -2340,8 +2422,14 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
         ExchangeContent::Prompt { text } => {
             // Role label + prompt text on separate lines.
             let (label, label_color) = match entry.role {
-                AgentRole::Developer => ("▶ Developer prompt", Color::Green),
-                AgentRole::Reviewer => ("▶ Reviewer prompt", Color::Yellow),
+                AgentRole::Developer => (
+                    "▶ Developer prompt",
+                    app.active_theme.get(crate::theme::ThemeRole::Success),
+                ),
+                AgentRole::Reviewer => (
+                    "▶ Reviewer prompt",
+                    app.active_theme.get(crate::theme::ThemeRole::Warning),
+                ),
             };
             lines.push(Line::from(vec![Span::styled(
                 label,
@@ -2353,21 +2441,27 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             for text_line in text.lines() {
                 lines.push(Line::from(vec![Span::styled(
                     format!("  {text_line}"),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
                 )]));
             }
             if text.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
                     "  (empty)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]));
             }
         }
         ExchangeContent::Response { text, complete } => {
             // Response entry.
             let (resp_label, resp_color) = match entry.role {
-                AgentRole::Developer => ("◀ Developer response", Color::Cyan),
-                AgentRole::Reviewer => ("◀ Reviewer response", Color::Magenta),
+                AgentRole::Developer => (
+                    "◀ Developer response",
+                    app.active_theme.get(crate::theme::ThemeRole::Accent),
+                ),
+                AgentRole::Reviewer => (
+                    "◀ Reviewer response",
+                    app.active_theme.get(crate::theme::ThemeRole::Accent),
+                ),
             };
             lines.push(Line::from(vec![Span::styled(
                 resp_label,
@@ -2382,14 +2476,15 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                 if text.is_empty() {
                     lines.push(Line::from(vec![Span::styled(
                         "  ▌",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                     )]));
                 } else {
                     // Append cursor to the last line if text is present.
                     if let Some(last_line) = lines.last_mut() {
-                        last_line
-                            .spans
-                            .push(Span::styled("▌", Style::default().fg(Color::DarkGray)));
+                        last_line.spans.push(Span::styled(
+                            "▌",
+                            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                        ));
                     }
                 }
             }
@@ -2403,8 +2498,14 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
         // the answer.  In compact mode only the header line is shown.
         ExchangeContent::Thought { text } => {
             let (label, label_color) = match entry.role {
-                AgentRole::Developer => ("💭 Developer thought", Color::Green),
-                AgentRole::Reviewer => ("💭 Reviewer thought", Color::Yellow),
+                AgentRole::Developer => (
+                    "💭 Developer thought",
+                    app.active_theme.get(crate::theme::ThemeRole::Success),
+                ),
+                AgentRole::Reviewer => (
+                    "💭 Reviewer thought",
+                    app.active_theme.get(crate::theme::ThemeRole::Warning),
+                ),
             };
             lines.push(Line::from(vec![Span::styled(
                 label,
@@ -2414,7 +2515,8 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             )]));
             // Thought body only in verbose mode.
             if app.verbose_mode {
-                let base_style = Style::default().fg(Color::DarkGray);
+                let base_style =
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
                 let mut thought_lines = crate::markup::render_markdown(text, base_style, width);
                 // Indent all thought lines by 2 spaces.
                 for line in &mut thought_lines {
@@ -2436,11 +2538,11 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             ..
         } => {
             let status_color = match status.as_str() {
-                "pending" => Color::DarkGray,
-                "in_progress" => Color::Cyan,
-                "completed" => Color::Green,
-                "failed" => Color::Red,
-                _ => Color::White,
+                "pending" => app.active_theme.get(crate::theme::ThemeRole::Dim),
+                "in_progress" => app.active_theme.get(crate::theme::ThemeRole::Accent),
+                "completed" => app.active_theme.get(crate::theme::ThemeRole::Success),
+                "failed" => app.active_theme.get(crate::theme::ThemeRole::Error),
+                _ => app.active_theme.get(crate::theme::ThemeRole::Foreground),
             };
             let compacted_title = crate::markup::compact_paths(title, &app.repo_root);
             lines.push(Line::from(vec![Span::styled(
@@ -2454,7 +2556,7 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                 for text_line in content.lines() {
                     // Re-use the Response arm's ANSI + diff overlay so an edit
                     // diff in tool output is syntax-coloured the same way.
-                    lines.push(diff_overlaid_content_line(text_line));
+                    lines.push(diff_overlaid_content_line(text_line, &app.active_theme));
                 }
             }
         }
@@ -2470,7 +2572,12 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
 /// (directories suffixed with `/`), the highlighted selection, and a footer of
 /// key hints.  Drawn over a [`Clear`]ed region so the underlying layout does not
 /// bleed through.
-fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame, area: Rect) {
+fn render_file_browser(
+    app: &App,
+    browser: &crate::browser::FileBrowser,
+    frame: &mut Frame,
+    area: Rect,
+) {
     // Centre a box ~80% wide / 80% tall.
     let popup = centered_rect(80, 80, area);
 
@@ -2482,7 +2589,7 @@ fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame,
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
         .padding(Padding::horizontal(1));
 
     // Split the popup into a list area + a 1-row footer of hints.
@@ -2499,7 +2606,7 @@ fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame,
     if browser.entries.is_empty() {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
             "(empty directory)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         )]));
         frame.render_widget(empty, list_area);
     } else {
@@ -2508,13 +2615,19 @@ fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame,
             .iter()
             .map(|entry| {
                 let (icon, name_color) = if entry.is_dir {
-                    ("▸ ", Color::Cyan)
+                    ("▸ ", app.active_theme.get(crate::theme::ThemeRole::Accent))
                 } else {
-                    ("  ", Color::White)
+                    (
+                        "  ",
+                        app.active_theme.get(crate::theme::ThemeRole::Foreground),
+                    )
                 };
                 let suffix = if entry.is_dir { "/" } else { "" };
                 let line = Line::from(vec![
-                    Span::styled(icon, Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        icon,
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    ),
                     Span::styled(
                         format!("{}{}", entry.name, suffix),
                         Style::default().fg(name_color),
@@ -2525,8 +2638,8 @@ fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame,
             .collect();
 
         let highlight_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Magenta)
+            .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
+            .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
             .add_modifier(Modifier::BOLD);
 
         let list = List::new(items)
@@ -2540,13 +2653,18 @@ fn render_file_browser(browser: &crate::browser::FileBrowser, frame: &mut Frame,
 
     let footer = Paragraph::new(Line::from(vec![Span::styled(
         "[Enter] open/enter  [Backspace] up  [↑↓/jk] move  [Esc] cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
 }
 
 /// Render the provider configuration editor modal.
-fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame, area: Rect) {
+fn render_provider_editor(
+    app: &App,
+    editor: &crate::app::ProviderEditor,
+    frame: &mut Frame,
+    area: Rect,
+) {
     // Centre a box ~85% wide / 85% tall.
     let popup = centered_rect(85, 85, area);
 
@@ -2558,7 +2676,7 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
         .padding(Padding::horizontal(1));
 
     let inner = block.inner(popup);
@@ -2579,10 +2697,10 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
     for (idx, provider) in editor.providers.iter().enumerate() {
         let style = if editor.selected_provider == Some(idx) {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
         };
         let line = Line::from(vec![Span::styled(
             format!("  Provider: {}", provider.name),
@@ -2594,7 +2712,7 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
     // Add role assignments section
     let roles_header = Line::from(vec![Span::styled(
         "  Roles:",
-        Style::default().fg(Color::Magenta),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
     )]);
     items.push(ListItem::new(roles_header));
 
@@ -2623,7 +2741,7 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
             let detail = fmt_role(label, assignment);
             items.push(ListItem::new(Line::from(vec![Span::styled(
                 detail,
-                Style::default().fg(Color::White),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
             )])));
         }
     }
@@ -2636,7 +2754,7 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
     if has_discovered {
         items.push(ListItem::new(Line::from(vec![Span::styled(
             "  Discovered (live agent):",
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
         )])));
 
         if let Some(modes) = &editor.available_modes {
@@ -2653,7 +2771,7 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
                 .collect();
             items.push(ListItem::new(Line::from(vec![Span::styled(
                 format!("    modes: {}", names.join("  ")),
-                Style::default().fg(Color::Green),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success)),
             )])));
         }
 
@@ -2678,15 +2796,15 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
             for choice in &opt.options {
                 items.push(ListItem::new(Line::from(vec![Span::styled(
                     format!("    model: {}{}", choice.value, effort_hint),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success)),
                 )])));
             }
         }
     }
 
     let highlight_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
+        .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
         .add_modifier(Modifier::BOLD);
 
     let list = List::new(items)
@@ -2700,7 +2818,7 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
     // Footer with hints
     let footer = Paragraph::new(Line::from(vec![Span::styled(
         "[Enter] commit  [↑↓/jk] navigate  [Esc] cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
 }
@@ -2709,7 +2827,12 @@ fn render_provider_editor(editor: &crate::app::ProviderEditor, frame: &mut Frame
 ///
 /// A modal that lists all available commands, filtered by user input,
 /// with navigation and selection highlighting.
-fn render_command_palette(palette: &crate::app::CommandPalette, frame: &mut Frame, area: Rect) {
+fn render_command_palette(
+    app: &App,
+    palette: &crate::app::CommandPalette,
+    frame: &mut Frame,
+    area: Rect,
+) {
     // Centre a box ~60% wide / 60% tall.
     let popup = centered_rect(60, 60, area);
 
@@ -2721,7 +2844,7 @@ fn render_command_palette(palette: &crate::app::CommandPalette, frame: &mut Fram
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
         .padding(Padding::horizontal(1));
 
     let inner = block.inner(popup);
@@ -2745,34 +2868,53 @@ fn render_command_palette(palette: &crate::app::CommandPalette, frame: &mut Fram
     let filter_widget = Paragraph::new(filter_text);
     frame.render_widget(filter_widget, filter_area);
 
-    // Build the list of items from filtered actions
-    let filtered_actions = palette.filtered();
-    let items: Vec<ListItem> = filtered_actions
-        .iter()
-        .map(|action| ListItem::new(Line::from(vec![Span::raw(action.label)])))
-        .collect();
+    // Build the list of items based on mode
+    let items: Vec<ListItem> = if let Some(ref theme_names) = palette.theme_selector {
+        // Theme selector mode: filter and display theme names
+        if palette.filter.is_empty() {
+            theme_names
+                .iter()
+                .map(|name| ListItem::new(Line::from(vec![Span::raw(name)])))
+                .collect()
+        } else {
+            let filter_lower = palette.filter.to_lowercase();
+            theme_names
+                .iter()
+                .filter(|name| name.to_lowercase().contains(&filter_lower))
+                .map(|name| ListItem::new(Line::from(vec![Span::raw(name)])))
+                .collect()
+        }
+    } else {
+        // Normal action list mode
+        let filtered_actions = palette.filtered();
+        filtered_actions
+            .iter()
+            .map(|action| ListItem::new(Line::from(vec![Span::raw(action.label())])))
+            .collect()
+    };
 
     // Highlight style for selected row
     let highlight_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
+        .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
         .add_modifier(Modifier::BOLD);
 
+    let items_len = items.len();
     let list = List::new(items)
         .highlight_style(highlight_style)
         .highlight_symbol("▶ ");
 
     let mut state = ListState::default();
     // Select the appropriate row, clamping to the filtered list size
-    if !filtered_actions.is_empty() {
-        state.select(Some(palette.selected.min(filtered_actions.len() - 1)));
+    if items_len > 0 {
+        state.select(Some(palette.selected.min(items_len - 1)));
     }
     frame.render_stateful_widget(list, list_area, &mut state);
 
     // Footer with hints
     let footer = Paragraph::new(Line::from(vec![Span::styled(
         "↑/↓ select · Enter run · Esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
 }
@@ -2782,7 +2924,7 @@ fn render_command_palette(palette: &crate::app::CommandPalette, frame: &mut Fram
 /// A modal that displays editable configuration fields (gate iterations,
 /// reviewer iterations, wall-clock seconds, idle seconds, concurrency),
 /// with highlighting for the focused field and error messages.
-fn render_settings(settings: &crate::app::Settings, frame: &mut Frame, area: Rect) {
+fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame, area: Rect) {
     // Centre a box ~70% wide / 70% tall.
     let popup = centered_rect(70, 70, area);
 
@@ -2794,7 +2936,7 @@ fn render_settings(settings: &crate::app::Settings, frame: &mut Frame, area: Rec
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
         .padding(Padding::horizontal(1));
 
     let inner = block.inner(popup);
@@ -2861,11 +3003,11 @@ fn render_settings(settings: &crate::app::Settings, frame: &mut Frame, area: Rec
 
         let style = if is_focused {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
+                .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
         };
 
         let line = Line::from(vec![Span::styled(text, style)]);
@@ -2877,7 +3019,7 @@ fn render_settings(settings: &crate::app::Settings, frame: &mut Frame, area: Rec
 
     // If there's an error, render it in red
     if let Some(error) = &settings.error {
-        let error_style = Style::default().fg(Color::Red);
+        let error_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error));
         let error_line = Line::from(vec![Span::styled(error.clone(), error_style)]);
         let error_para = Paragraph::new(error_line);
         frame.render_widget(error_para, error_area);
@@ -2886,7 +3028,7 @@ fn render_settings(settings: &crate::app::Settings, frame: &mut Frame, area: Rec
     // Footer with hints
     let footer = Paragraph::new(Line::from(vec![Span::styled(
         "↑/↓ field · 0-9 edit · Enter save · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
 }
@@ -2932,7 +3074,7 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
         .padding(Padding::horizontal(1));
 
     let inner = block.inner(popup);
@@ -2967,14 +3109,17 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
         }
     };
     let config_style = if config_check == "✓" {
-        Style::default().fg(Color::Green)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success))
     } else {
-        Style::default().fg(Color::Red)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error))
     };
     items.push(ListItem::new(Line::from(vec![
         Span::styled(config_check, config_style.add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(config_msg, Style::default().fg(Color::White)),
+        Span::styled(
+            config_msg,
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        ),
     ])));
 
     // Check 2: Providers resolvable
@@ -3001,9 +3146,9 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
         )
     };
     let providers_style = if providers_check == "✓" {
-        Style::default().fg(Color::Green)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success))
     } else {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
     };
     items.push(ListItem::new(Line::from(vec![
         Span::styled(
@@ -3011,7 +3156,10 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
             providers_style.add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(providers_msg, Style::default().fg(Color::White)),
+        Span::styled(
+            providers_msg,
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        ),
     ])));
 
     // Check 3: Base branch exists in repo
@@ -3027,14 +3175,17 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
         )
     };
     let branch_style = if branch_check == "✓" {
-        Style::default().fg(Color::Green)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success))
     } else {
-        Style::default().fg(Color::Red)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error))
     };
     items.push(ListItem::new(Line::from(vec![
         Span::styled(branch_check, branch_style.add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(branch_msg, Style::default().fg(Color::White)),
+        Span::styled(
+            branch_msg,
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        ),
     ])));
 
     // Check 4: .makina/ directory present and writable (relative to the repo
@@ -3058,18 +3209,22 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
         )
     };
     let makina_style = if makina_check == "✓" {
-        Style::default().fg(Color::Green)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success))
     } else {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
     };
     items.push(ListItem::new(Line::from(vec![
         Span::styled(makina_check, makina_style.add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(makina_msg, Style::default().fg(Color::White)),
+        Span::styled(
+            makina_msg,
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        ),
     ])));
 
     // Render the checklist
-    let list = List::new(items).style(Style::default().fg(Color::White));
+    let list = List::new(items)
+        .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)));
     frame.render_widget(list, list_area);
 
     // Footer with hints: show [w] scaffold hint if no config exists
@@ -3087,7 +3242,7 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
     };
     let footer = Paragraph::new(Line::from(vec![Span::styled(
         footer_text,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
 }
@@ -3117,11 +3272,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a titled [`Block`] with a focus-aware border style.
-fn panel_block(title: &str, focused: bool) -> Block<'static> {
+fn panel_block(app: &App, title: &str, focused: bool) -> Block<'static> {
     let border_style = if focused {
-        Style::default().fg(Color::Blue)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Info))
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
     };
     Block::default()
         .title(format!(" {title} "))
@@ -3167,25 +3322,31 @@ fn run_label(run: &makina_core::api::RunView) -> String {
 /// The badge is a fixed-width 3-character label shown in the sidebar List.
 /// Colours match the same palette used by [`status_color`] so they are
 /// consistent between the sidebar and the main-panel header.
-fn status_badge(s: &makina_core::api::RunStatus) -> (&'static str, Color) {
+fn status_badge(s: &makina_core::api::RunStatus, app: &App) -> (&'static str, Color) {
     use makina_core::api::RunStatus;
     match s {
-        RunStatus::Pending => ("[·]", Color::DarkGray),
-        RunStatus::Running => ("[▶]", Color::Green),
-        RunStatus::Paused => ("[‖]", Color::Yellow),
-        RunStatus::Completed => ("[✓]", Color::Cyan),
-        RunStatus::Failed => ("[✗]", Color::Red),
+        RunStatus::Pending => ("[·]", app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        RunStatus::Running => (
+            "[▶]",
+            app.active_theme.get(crate::theme::ThemeRole::Success),
+        ),
+        RunStatus::Paused => (
+            "[‖]",
+            app.active_theme.get(crate::theme::ThemeRole::Warning),
+        ),
+        RunStatus::Completed => ("[✓]", app.active_theme.get(crate::theme::ThemeRole::Accent)),
+        RunStatus::Failed => ("[✗]", app.active_theme.get(crate::theme::ThemeRole::Error)),
     }
 }
 
-fn status_color(s: &makina_core::api::RunStatus) -> Color {
+fn status_color(s: &makina_core::api::RunStatus, app: &App) -> Color {
     use makina_core::api::RunStatus;
     match s {
-        RunStatus::Pending => Color::DarkGray,
-        RunStatus::Running => Color::Green,
-        RunStatus::Paused => Color::Yellow,
-        RunStatus::Completed => Color::Cyan,
-        RunStatus::Failed => Color::Red,
+        RunStatus::Pending => app.active_theme.get(crate::theme::ThemeRole::Dim),
+        RunStatus::Running => app.active_theme.get(crate::theme::ThemeRole::Success),
+        RunStatus::Paused => app.active_theme.get(crate::theme::ThemeRole::Warning),
+        RunStatus::Completed => app.active_theme.get(crate::theme::ThemeRole::Accent),
+        RunStatus::Failed => app.active_theme.get(crate::theme::ThemeRole::Error),
     }
 }
 
@@ -3194,16 +3355,34 @@ fn status_color(s: &makina_core::api::RunStatus) -> Color {
 /// Badge format is a short bracketed label (≤12 chars) consistent with the
 /// RunStatus badges in the sidebar.  Colours reuse the same palette as
 /// [`task_state_color`].
-fn task_state_badge(s: &makina_core::api::TaskState) -> (&'static str, Color) {
+fn task_state_badge(s: &makina_core::api::TaskState, app: &App) -> (&'static str, Color) {
     use makina_core::api::TaskState;
     match s {
-        TaskState::New => ("[new]", Color::DarkGray),
-        TaskState::Ready => ("[ready]", Color::White),
-        TaskState::InProgress => ("[▶ working]", Color::Green),
-        TaskState::InReview => ("[⧗ review]", Color::Yellow),
-        TaskState::Done => ("[✓ done]", Color::Cyan),
-        TaskState::Failed => ("[✗ failed]", Color::Red),
-        TaskState::Skipped => ("[⊘ skipped]", Color::DarkGray),
+        TaskState::New => ("[new]", app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        TaskState::Ready => (
+            "[ready]",
+            app.active_theme.get(crate::theme::ThemeRole::Foreground),
+        ),
+        TaskState::InProgress => (
+            "[▶ working]",
+            app.active_theme.get(crate::theme::ThemeRole::Success),
+        ),
+        TaskState::InReview => (
+            "[⧗ review]",
+            app.active_theme.get(crate::theme::ThemeRole::Warning),
+        ),
+        TaskState::Done => (
+            "[✓ done]",
+            app.active_theme.get(crate::theme::ThemeRole::Accent),
+        ),
+        TaskState::Failed => (
+            "[✗ failed]",
+            app.active_theme.get(crate::theme::ThemeRole::Error),
+        ),
+        TaskState::Skipped => (
+            "[⊘ skipped]",
+            app.active_theme.get(crate::theme::ThemeRole::Dim),
+        ),
     }
 }
 
@@ -4244,6 +4423,7 @@ mod tests {
         // The selected row must have the highlight background (Cyan in our
         // palette) and the highlight symbol "▶ " prepended by ratatui.
         let mut terminal = make_terminal(100, 30);
+        let th = crate::theme::ayu_dark();
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![
             RunView {
@@ -4272,15 +4452,15 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        // Find a cell with the Cyan background (the highlight colour) — there
+        // Find a cell with the Accent background (the highlight colour) — there
         // must be at least one such cell within the sidebar region (columns 0..30).
         let has_highlight = buf
             .content()
             .iter()
-            .any(|cell| cell.bg == ratatui::style::Color::Cyan);
+            .any(|cell| cell.bg == th.get(crate::theme::ThemeRole::Accent));
         assert!(
             has_highlight,
-            "selected row must use Cyan highlight background"
+            "selected row must use Accent highlight background"
         );
     }
 
@@ -4289,6 +4469,7 @@ mod tests {
     #[test]
     fn render_running_badge_uses_green_fg() {
         let mut terminal = make_terminal(100, 24);
+        let th = crate::theme::ayu_dark();
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
@@ -4308,13 +4489,14 @@ mod tests {
         let has_green = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Green);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Success));
         assert!(has_green, "Running status badge must use Green foreground");
     }
 
     #[test]
     fn render_failed_badge_uses_red_fg() {
         let mut terminal = make_terminal(100, 24);
+        let th = crate::theme::ayu_dark();
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
@@ -4333,7 +4515,7 @@ mod tests {
         let has_red = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Red);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Error));
         assert!(has_red, "Failed status badge must use Red foreground");
     }
 
@@ -4342,6 +4524,7 @@ mod tests {
     #[test]
     fn render_ingestion_panel_shows_blocking_issue() {
         let mut terminal = make_terminal(100, 24);
+        let th = crate::theme::ayu_dark();
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
@@ -4382,13 +4565,14 @@ mod tests {
         let has_red = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Red);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Error));
         assert!(has_red, "Blocking issue line must use Red foreground");
     }
 
     #[test]
     fn render_ingestion_panel_shows_warning_issue() {
         let mut terminal = make_terminal(100, 24);
+        let th = crate::theme::ayu_dark();
         let api = Arc::new(PlaceholderApi::empty());
         let runs = vec![RunView {
             id: RunId(1),
@@ -4421,7 +4605,7 @@ mod tests {
         let has_yellow = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Yellow);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Warning));
         assert!(has_yellow, "Warning issue line must use Yellow foreground");
     }
 
@@ -4578,6 +4762,7 @@ mod tests {
     #[test]
     fn render_file_browser_highlights_selection() {
         let mut terminal = make_terminal(100, 30);
+        let th = crate::theme::ayu_dark();
         // Select the second entry.
         let app = browsing_app(
             vec![
@@ -4602,10 +4787,10 @@ mod tests {
         let has_highlight = buf
             .content()
             .iter()
-            .any(|cell| cell.bg == ratatui::style::Color::Magenta);
+            .any(|cell| cell.bg == th.get(crate::theme::ThemeRole::Accent));
         assert!(
             has_highlight,
-            "selected browser row must use the Magenta highlight background"
+            "selected browser row must use the Accent highlight background"
         );
     }
 
@@ -5171,6 +5356,7 @@ mod tests {
     #[test]
     fn render_task_status_badge_colors() {
         let mut terminal = make_terminal(120, 30);
+        let th = crate::theme::ayu_dark();
         let app = task_status_app();
 
         terminal.draw(|f| render(&app, f)).unwrap();
@@ -5180,21 +5366,21 @@ mod tests {
         let has_cyan = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Cyan);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Accent));
         assert!(has_cyan, "Done badge must use Cyan foreground");
 
         // Red for Failed.
         let has_red = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Red);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Error));
         assert!(has_red, "Failed badge must use Red foreground");
 
         // Green for InProgress.
         let has_green = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Green);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Success));
         assert!(has_green, "InProgress badge must use Green foreground");
     }
 
@@ -5516,22 +5702,23 @@ mod tests {
     }
 
     /// **Task row highlight:** when Main panel is focused the focused task row
-    /// must be highlighted (Cyan background).
+    /// must be highlighted (Accent background).
     #[test]
     fn render_focused_task_row_is_highlighted() {
         let mut terminal = make_terminal(120, 40);
+        let th = crate::theme::ayu_dark();
         let app = exchange_app();
 
         terminal.draw(|f| render(&app, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        let has_cyan = buf
+        let has_accent = buf
             .content()
             .iter()
-            .any(|cell| cell.bg == ratatui::style::Color::Cyan);
+            .any(|cell| cell.bg == th.get(crate::theme::ThemeRole::Accent));
         assert!(
-            has_cyan,
-            "focused task row must use Cyan highlight background"
+            has_accent,
+            "focused task row must use Accent highlight background"
         );
     }
 
@@ -5552,6 +5739,7 @@ mod tests {
         };
 
         let mut terminal = make_terminal(120, 40);
+        let th = crate::theme::ayu_dark();
 
         let api = Arc::new(PlaceholderApi::empty());
         let run = RunView {
@@ -5620,11 +5808,13 @@ mod tests {
         };
         let added_fg_cyan = (0..buf.area.height).any(|row| {
             row_text(row).contains("+added")
-                && (0..buf.area.width).any(|col| buf[(col, row)].fg == ratatui::style::Color::Cyan)
+                && (0..buf.area.width)
+                    .any(|col| buf[(col, row)].fg == th.get(crate::theme::ThemeRole::Accent))
         });
         let hunk_fg_cyan = (0..buf.area.height).any(|row| {
             row_text(row).contains("@@ -1,2 +1,2 @@")
-                && (0..buf.area.width).any(|col| buf[(col, row)].fg == ratatui::style::Color::Cyan)
+                && (0..buf.area.width)
+                    .any(|col| buf[(col, row)].fg == th.get(crate::theme::ThemeRole::Accent))
         });
         assert!(
             added_fg_cyan,
@@ -5783,6 +5973,7 @@ mod tests {
         use crate::app::{ErrorLevel, ErrorMessage};
 
         let mut terminal = make_terminal(120, 40);
+        let th = crate::theme::ayu_dark();
         let mut app = exchange_app();
         app.error_pane_open = true;
         app.error_messages.push(ErrorMessage {
@@ -5805,7 +5996,7 @@ mod tests {
         let has_red = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Red);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Error));
         assert!(
             has_red,
             "Error-level message must be rendered with Red foreground"
@@ -5884,7 +6075,7 @@ mod tests {
                     // Expect Cyan (Developer response color), not Green (old diff color).
                     assert_eq!(
                         span.style.fg,
-                        Some(Color::Cyan),
+                        Some(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                         "Response text must use the response colour (Cyan for Developer)"
                     );
                 }
@@ -5979,14 +6170,15 @@ mod tests {
         );
 
         // (c) Diff styling reaches the tool content: the `+added line` row must
-        // carry at least one Green-foreground cell.
-        let added_fg_green = (0..buf.area.height).any(|row| {
+        // carry at least one Success-color (green) foreground cell from theme.
+        let expected_fg = app.active_theme.get(crate::theme::ThemeRole::Success);
+        let added_fg_success = (0..buf.area.height).any(|row| {
             row_text(row).contains("+added line")
-                && (0..buf.area.width).any(|col| buf[(col, row)].fg == Color::Green)
+                && (0..buf.area.width).any(|col| buf[(col, row)].fg == expected_fg)
         });
         assert!(
-            added_fg_green,
-            "the `+added line` in tool content must have a Green-foreground cell (diff styling)"
+            added_fg_success,
+            "the `+added line` in tool content must have a Success foreground cell (diff styling)"
         );
     }
 
@@ -6650,6 +6842,7 @@ mod tests {
         };
 
         let mut terminal = make_terminal(100, 30);
+        let th = crate::theme::ayu_dark();
         let api = Arc::new(PlaceholderApi::empty());
         let run = RunView {
             id: RunId(1),
@@ -6702,7 +6895,7 @@ mod tests {
         let has_red = buf
             .content()
             .iter()
-            .any(|cell| cell.fg == ratatui::style::Color::Red);
+            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Error));
         assert!(has_red, "failure reason line must use Red foreground");
     }
 
@@ -7625,6 +7818,7 @@ mod tests {
             filter: "set".to_string(),
             actions: crate::app::CommandPalette::default_actions(),
             selected: 0,
+            theme_selector: None,
         });
 
         terminal.draw(|f| render(&app, f)).unwrap();
@@ -8717,6 +8911,49 @@ mod tests {
         assert!(
             screen.contains("very long line"),
             "Long text should be rendered with wrapping"
+        );
+    }
+
+    // ── Theme Validation ─────────────────────────────────────────────────────
+
+    /// Headless TestBackend render under ayu_mirage() theme asserts that a known
+    /// cell holds the Mirage-resolved color (distinct from Ayu Dark), proving
+    /// theme switching reaches the render path.
+    #[test]
+    fn render_with_ayu_mirage_theme_resolves_colors() {
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Switch to Ayu Mirage theme
+        app.active_theme = crate::theme::ayu_mirage();
+
+        terminal
+            .draw(|frame| render(&app, frame))
+            .expect("draw must succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+
+        // Find a cell in the title bar that should have been rendered with theme colors.
+        // The title bar is at the top and uses Info role for background (Ayu Mirage: Rgb(128, 191, 255))
+        // and Foreground role for text (Ayu Mirage: Rgb(204, 202, 194)).
+        // We look for a cell that has one of these colors applied.
+        // Mirage's Info background (Rgb(128,191,255)) differs from the Ayu Dark
+        // default (Rgb(115,184,255)), so finding a cell painted with the Mirage
+        // value proves the active theme — not the Dark default — reached render.
+        let mirage_info_bg = Color::Rgb(128, 191, 255); // Ayu Mirage Info background
+
+        let mut found_mirage_color = false;
+        for cell in buffer.content() {
+            if cell.bg == mirage_info_bg {
+                found_mirage_color = true;
+                break;
+            }
+        }
+
+        assert!(
+            found_mirage_color,
+            "Title bar should contain at least one cell with Ayu Mirage Info background color (Rgb(128, 191, 255))"
         );
     }
 }

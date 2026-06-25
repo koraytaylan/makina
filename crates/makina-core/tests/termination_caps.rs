@@ -139,6 +139,7 @@ fn config(gates: Vec<GateConfig>, caps: CapsConfig) -> Config {
         gates,
         base_branch: "develop".into(),
         merge: MergeConfig::default(),
+        theme_name: "Ayu Dark".into(),
     }
 }
 

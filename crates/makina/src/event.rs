@@ -385,18 +385,28 @@ async fn resolve_io(
         // Extract the selected action's event from the palette before App::update
         // clears it, then re-dispatch that event through the normal intent path so
         // the event loop processes it exactly as a fresh intent.
+        // Theme selector Enter is handled in App::update with mutable access.
         AppEvent::CommandPaletteExecute => {
-            let selected_event = app.command_palette.as_ref().and_then(|palette| {
+            if let Some(palette) = app.command_palette.as_ref() {
+                if palette.theme_selector.is_some() {
+                    // In theme selector mode: apply the selection
+                    return (AppEvent::ApplyThemeSelection, None);
+                }
+
+                // Normal action mode: extract the selected action
                 let filtered = palette.filtered();
-                filtered
-                    .get(palette.selected)
-                    .map(|action| action.event.clone())
-            });
-            match selected_event {
-                Some(event) => (event, None),
-                // No valid selection (shouldn't happen) — just tick.
-                None => (AppEvent::Tick, None),
+                if let Some(action) = filtered.get(palette.selected) {
+                    return match action {
+                        crate::app::PaletteAction::Regular { event, .. } => (event.clone(), None),
+                        crate::app::PaletteAction::NestedThemeSelector { .. } => {
+                            // Signal to App::update to enter theme selector mode
+                            (AppEvent::EnterThemeSelector, None)
+                        }
+                    };
+                }
             }
+            // No valid selection (shouldn't happen) — just tick.
+            (AppEvent::Tick, None)
         }
         // ── Project discovery (plan 0025) ──────────────────────────────────────
         // Force re-run discovery regardless of the [discovery] stamp, re-scan,
@@ -452,6 +462,24 @@ async fn resolve_io(
                 // Run nodes and plan nodes (from other branches) don't respond to Enter.
                 _ => (AppEvent::Tick, None),
             }
+        }
+        // ── Theme selection commit (plan 0036) ──────────────────────────────────
+        // When the user selects a theme in the nested palette selector, persist
+        // the chosen theme name to `{repo_root}/.makina/config.toml` before
+        // `App::update` applies it in memory.  The selected name is read from
+        // the palette's current filtered selection; if no valid name is found
+        // nothing is written and we fall through with no status.
+        AppEvent::ApplyThemeSelection => {
+            let theme_name = app.command_palette.as_ref().and_then(|palette| {
+                let names = palette.filtered_theme_names();
+                names.get(palette.selected).map(|s| (*s).clone())
+            });
+            let status = if let Some(name) = theme_name {
+                commit_theme_selection(app, &name).await
+            } else {
+                None
+            };
+            (AppEvent::ApplyThemeSelection, status)
         }
         // Everything else passes straight through.
         other => (other, None),
@@ -701,6 +729,65 @@ async fn commit_settings(app: &App) -> Option<String> {
     // Write the file.
     match tokio::fs::write(&config_path, toml_str).await {
         Ok(()) => Some("Settings saved".to_string()),
+        Err(e) => Some(format!("Config write error: {e}")),
+    }
+}
+
+/// Persist the chosen theme name to `{repo_root}/.makina/config.toml`.
+///
+/// Follows the same merge-preserving recipe as `commit_settings`: read the
+/// current on-disk `GlobalConfig` (default on miss), rebuild it with only
+/// `theme_name` replaced, and write it back — so providers, roles, caps, and
+/// all other fields round-trip untouched.
+///
+/// Returns `Some("Theme saved")` on success, `Some(err)` on any error, and
+/// `Some("Unknown theme")` if `theme_name` is not one of the built-in themes.
+async fn commit_theme_selection(app: &App, theme_name: &str) -> Option<String> {
+    use makina_core::config::GlobalConfig;
+    use makina_core::paths::config_file;
+
+    // Validate: only names that appear in builtin_themes() are accepted.
+    let known = crate::theme::Theme::builtin_themes()
+        .into_iter()
+        .any(|t| t.name == theme_name);
+    if !known {
+        return Some("Unknown theme".to_string());
+    }
+
+    // Read the current on-disk config so we don't lose providers, roles, caps,
+    // or any other fields.  On read failure start from a default.
+    let config_path = config_file(&app.repo_root);
+    let existing: GlobalConfig = if config_path.exists() {
+        match tokio::fs::read_to_string(&config_path).await {
+            Ok(s) => toml::from_str::<GlobalConfig>(&s).unwrap_or_default(),
+            Err(_) => GlobalConfig::default(),
+        }
+    } else {
+        GlobalConfig::default()
+    };
+
+    // Rebuild with only theme_name replaced; everything else is preserved.
+    let updated = GlobalConfig {
+        theme_name: theme_name.to_string(),
+        ..existing
+    };
+
+    // Serialise to TOML.
+    let toml_str = match toml::to_string_pretty(&updated) {
+        Ok(s) => s,
+        Err(e) => return Some(format!("Config serialise error: {e}")),
+    };
+
+    // Ensure the parent directory exists.
+    if let Some(parent) = config_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return Some(format!("Config write error: {e}"));
+    }
+
+    // Write the file.
+    match tokio::fs::write(&config_path, toml_str).await {
+        Ok(()) => Some("Theme saved".to_string()),
         Err(e) => Some(format!("Config write error: {e}")),
     }
 }
@@ -2739,6 +2826,7 @@ mod tests {
             concurrency: 1,
             base_branch: "develop".into(),
             merge: makina_core::config::MergeConfig::default(),
+            theme_name: "Ayu Dark".into(),
         };
 
         let api = Arc::new(makina_core::orchestrator::CoreApi::new(
@@ -4018,5 +4106,92 @@ wall_clock_secs = 1200
             &test_app(),
         );
         assert!(matches!(ev, AppEvent::FocusLeftOrCollapse));
+    }
+
+    /// `commit_theme_selection` writes the chosen theme name to the config file,
+    /// preserves all other `GlobalConfig` fields, and rejects unknown names.
+    ///
+    /// Steps exercised:
+    /// 1. A known name (`"Ayu Mirage"`) writes `theme_name` to the config.
+    /// 2. Pre-existing `providers` / `roles` fields are preserved in the output.
+    /// 3. An unknown name returns `Some("Unknown theme")` without writing any file.
+    #[tokio::test]
+    async fn commit_theme_selection_writes_to_config() {
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        // ── Setup: temp repo with an existing config ──────────────────────────
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path();
+
+        let existing_config = r#"
+[[providers]]
+name = "claude"
+command = "claude-acp"
+
+[roles]
+developer = { provider = "claude" }
+reviewer = { provider = "claude" }
+
+[caps]
+gate_iterations = 5
+reviewer_iterations = 2
+wall_clock_secs = 600
+"#;
+        let config_path = repo_root.join(".makina/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&config_path, existing_config).expect("write existing");
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let app = App::new(api, vec![], repo_root.to_path_buf());
+
+        // ── 1. Writing a valid theme name succeeds ────────────────────────────
+        let status = commit_theme_selection(&app, "Ayu Mirage").await;
+        assert_eq!(
+            status,
+            Some("Theme saved".to_string()),
+            "valid theme must return 'Theme saved'"
+        );
+
+        // ── 2. The file now contains the new theme_name ───────────────────────
+        let raw = std::fs::read_to_string(&config_path).expect("read config");
+        let cfg: makina_core::config::GlobalConfig = toml::from_str(&raw).expect("parse config");
+        assert_eq!(cfg.theme_name, "Ayu Mirage", "theme_name must be written");
+
+        // ── 3. Other fields are preserved ─────────────────────────────────────
+        assert!(
+            !cfg.providers.is_empty(),
+            "providers must be preserved after theme commit"
+        );
+        assert_eq!(
+            cfg.providers[0].name, "claude",
+            "provider name must be unchanged"
+        );
+        assert!(
+            cfg.roles.developer.is_some(),
+            "developer role must be preserved"
+        );
+        assert_eq!(
+            cfg.caps.gate_iterations, 5,
+            "gate_iterations must be unchanged"
+        );
+
+        // ── 4. An unknown theme name is rejected ──────────────────────────────
+        let unknown_status = commit_theme_selection(&app, "NonExistentTheme").await;
+        assert_eq!(
+            unknown_status,
+            Some("Unknown theme".to_string()),
+            "unknown theme name must return error string"
+        );
+
+        // The file content must be unchanged after the rejected write attempt.
+        let raw_after = std::fs::read_to_string(&config_path).expect("read config after rejection");
+        let cfg_after: makina_core::config::GlobalConfig =
+            toml::from_str(&raw_after).expect("parse config after rejection");
+        assert_eq!(
+            cfg_after.theme_name, "Ayu Mirage",
+            "theme_name must be unchanged after unknown-name rejection"
+        );
     }
 }

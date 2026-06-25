@@ -343,6 +343,11 @@ fn default_concurrency() -> usize {
     3
 }
 
+/// Returns the default theme name for serde field-level default.
+fn default_theme_name() -> String {
+    "Ayu Dark".to_string()
+}
+
 /// User/machine-level configuration, stored at `~/.makina/config.toml`.
 ///
 /// All sections are optional in the TOML file; absent sections fall back to
@@ -389,6 +394,10 @@ pub struct GlobalConfig {
     /// completes. Defaults to squash merge if not specified.
     #[serde(default)]
     pub merge: MergeConfig,
+
+    /// Active theme name (e.g. "Ayu Dark"). Absent/unknown ⇒ "Ayu Dark".
+    #[serde(default = "default_theme_name")]
+    pub theme_name: String,
 }
 
 impl Default for GlobalConfig {
@@ -401,6 +410,7 @@ impl Default for GlobalConfig {
             caps: CapsConfig::default(),
             concurrency: 3,
             merge: MergeConfig::default(),
+            theme_name: default_theme_name(),
         }
     }
 }
@@ -651,6 +661,9 @@ pub struct Config {
 
     /// Final merge configuration (project overrides global).
     pub merge: MergeConfig,
+
+    /// Active theme name (e.g. "Ayu Dark"). From the global layer; absent ⇒ "Ayu Dark".
+    pub theme_name: String,
 }
 
 impl Config {
@@ -763,6 +776,7 @@ impl Config {
             gates: project.gates,
             base_branch,
             merge,
+            theme_name: global.theme_name,
         }
     }
 
@@ -1987,6 +2001,42 @@ mod tests {
             config.merge.final_,
             FinalMerge::Squash,
             "project [merge] should override global"
+        );
+    }
+
+    // ── Theme config tests ────────────────────────────────────────────────────
+
+    /// **Acceptance criterion — globalconfig_deserializes_without_theme_name**
+    ///
+    /// A TOML lacking `theme_name` deserializes to `"Ayu Dark"`, and a TOML
+    /// with `theme_name = "Ayu Mirage"` round-trips to that value.
+    #[test]
+    fn globalconfig_deserializes_without_theme_name() {
+        // Test 1: TOML without theme_name defaults to "Ayu Dark"
+        let toml_without_theme = r#"
+        [backend]
+        command = "acp-cli"
+        "#;
+
+        let config = GlobalConfig::from_toml_str(toml_without_theme, "test-global")
+            .expect("TOML without theme_name is valid");
+        assert_eq!(
+            config.theme_name, "Ayu Dark",
+            "missing theme_name should default to 'Ayu Dark'"
+        );
+
+        // Test 2: TOML with theme_name = "Ayu Mirage" round-trips
+        let toml_with_mirage = r#"
+        theme_name = "Ayu Mirage"
+        [backend]
+        command = "acp-cli"
+        "#;
+
+        let config_mirage = GlobalConfig::from_toml_str(toml_with_mirage, "test-global")
+            .expect("TOML with theme_name='Ayu Mirage' is valid");
+        assert_eq!(
+            config_mirage.theme_name, "Ayu Mirage",
+            "theme_name='Ayu Mirage' should round-trip"
         );
     }
 }

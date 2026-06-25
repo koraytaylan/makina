@@ -262,11 +262,12 @@ async fn main() {
         !stdout.trim().is_empty()
     };
 
-    // Clone providers, roles, caps, and concurrency before config is moved into the API.
+    // Clone providers, roles, caps, concurrency, and theme_name before config is moved into the API.
     let providers_for_app = config.providers.clone();
     let roles_for_app = config.roles.clone();
     let caps_for_app = config.caps.clone();
     let concurrency_for_app = config.concurrency;
+    let theme_name_for_app = config.theme_name.clone();
 
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
         ingestion_interpreter,
@@ -293,6 +294,14 @@ async fn main() {
         caps_for_app,
         concurrency_for_app,
     );
+
+    // Restore theme from GlobalConfig; unknown/absent names fall back to Ayu Dark with no panic.
+    let active_theme = makina::theme::Theme::builtin_themes()
+        .into_iter()
+        .find(|t| t.name == theme_name_for_app)
+        .unwrap_or_else(makina::theme::ayu_dark);
+    app.active_theme = active_theme;
+
     app.load_initial_exchanges();
 
     // ── Terminal lifecycle ────────────────────────────────────────────────────

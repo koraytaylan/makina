@@ -34,5 +34,6 @@ pub mod markup;
 pub mod placeholder;
 pub mod replay;
 pub mod selection;
+pub mod theme;
 pub mod tui;
 pub mod ui;
