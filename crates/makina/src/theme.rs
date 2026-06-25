@@ -154,7 +154,7 @@ pub fn ayu_light() -> Theme {
     colors.insert(ThemeRole::Error, Color::Rgb(230, 80, 80)); // #E65050 common.error
     colors.insert(ThemeRole::Info, Color::Rgb(71, 138, 204)); // #478ACC vcs.modified
     colors.insert(ThemeRole::CodeBlock, Color::Rgb(71, 138, 204)); // same as Info, adjusted for light background
-    colors.insert(ThemeRole::FocusBg, Color::Rgb(200, 215, 240)); // pale blue, distinct from white Background #F8F9FA
+    colors.insert(ThemeRole::FocusBg, Color::Rgb(160, 188, 230)); // periwinkle, distinct from white Background #F8F9FA AND pale SelectionBg #D7E4F6
 
     let ansi = [
         Color::Rgb(92, 97, 102),
@@ -232,7 +232,50 @@ mod tests {
         // Check CodeBlock value for Ayu Light
         assert_eq!(th.get(ThemeRole::CodeBlock), Color::Rgb(71, 138, 204));
         // Check FocusBg value for Ayu Light
-        assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(200, 215, 240));
+        assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(160, 188, 230));
+    }
+
+    /// Regression guard for the focused-state distinctness gap fixed in plan 0037:
+    /// every built-in theme's FocusBg (focused-widget background) must be clearly
+    /// distinguishable from its SelectionBg (row-selection highlight), or a focused
+    /// accordion section and a selected row look identical. The Ayu Light theme
+    /// originally violated this — FocusBg #C8D7F0 vs SelectionBg #D7E4F6 were only
+    /// 20.7 apart in RGB space.
+    #[test]
+    fn focus_bg_is_distinct_from_selection_bg_in_every_theme() {
+        // Minimum acceptable Euclidean RGB distance. Ayu Dark (~49) and Mirage (~74)
+        // already clear this comfortably; the floor catches near-collisions like the
+        // pre-fix Ayu Light value (20.7).
+        const MIN_DISTANCE: f64 = 40.0;
+
+        fn rgb(c: Color) -> (f64, f64, f64) {
+            match c {
+                Color::Rgb(r, g, b) => (r as f64, g as f64, b as f64),
+                other => panic!("expected Color::Rgb, got {other:?}"),
+            }
+        }
+        fn distance(a: Color, b: Color) -> f64 {
+            let (ar, ag, ab) = rgb(a);
+            let (br, bg, bb) = rgb(b);
+            ((ar - br).powi(2) + (ag - bg).powi(2) + (ab - bb).powi(2)).sqrt()
+        }
+
+        for theme in Theme::builtin_themes() {
+            let focus = theme.get(ThemeRole::FocusBg);
+            let selection = theme.get(ThemeRole::SelectionBg);
+            let d = distance(focus, selection);
+            assert!(
+                d >= MIN_DISTANCE,
+                "Theme {:?}: FocusBg {:?} and SelectionBg {:?} are only {:.1} apart \
+                 (need >= {:.1}); a focused widget would be visually indistinct from a \
+                 selected row.",
+                theme.name,
+                focus,
+                selection,
+                d,
+                MIN_DISTANCE
+            );
+        }
     }
 
     #[test]

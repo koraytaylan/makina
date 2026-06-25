@@ -9059,7 +9059,7 @@ mod tests {
     /// span.  The FocusBg color is distinct in each Ayu variant:
     ///   Dark   → Rgb(40,  80,  120)
     ///   Mirage → Rgb(70,  110, 160)
-    ///   Light  → Rgb(200, 215, 240)
+    ///   Light  → Rgb(160, 188, 230)
     ///
     /// The accordion layout is:
     ///   row 0: "Plan: {slug}"
