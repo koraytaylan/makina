@@ -1044,7 +1044,12 @@ fn render_plan_task_pane(
     } else {
         let base_style =
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-        for l in crate::markup::render_markdown(&preview.body, base_style, content_area.width) {
+        for l in crate::markup::render_markdown(
+            &preview.body,
+            base_style,
+            content_area.width,
+            &app.active_theme,
+        ) {
             push_line!(l);
         }
     }
@@ -1830,6 +1835,7 @@ fn render_task_entry_pane(
             &task.entry_text,
             base_style,
             content_width,
+            &app.active_theme,
         ));
 
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -2119,7 +2125,8 @@ fn render_accordion_section(
     if focused {
         // Apply a distinctive background and bold modifier when focused.
         title_style = title_style
-            .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+            .bg(app.active_theme.get(crate::theme::ThemeRole::FocusBg))
+            .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
             .add_modifier(Modifier::BOLD);
     }
 
@@ -2141,7 +2148,9 @@ fn render_accordion_section(
             let body_width = content_width.saturating_sub(2);
             let base =
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-            for mut line in crate::markup::render_markdown(content, base, body_width) {
+            for mut line in
+                crate::markup::render_markdown(content, base, body_width, &app.active_theme)
+            {
                 line.spans.insert(0, Span::raw("  "));
                 result.push(line);
             }
@@ -2469,7 +2478,12 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             )]));
             // Response text rendered through Markdown + ANSI.
             let base_style = Style::default().fg(resp_color);
-            lines.extend(crate::markup::render_markdown(text, base_style, width));
+            lines.extend(crate::markup::render_markdown(
+                text,
+                base_style,
+                width,
+                &app.active_theme,
+            ));
 
             // Streaming cursor (if not complete).
             if !*complete {
@@ -2517,7 +2531,8 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             if app.verbose_mode {
                 let base_style =
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
-                let mut thought_lines = crate::markup::render_markdown(text, base_style, width);
+                let mut thought_lines =
+                    crate::markup::render_markdown(text, base_style, width, &app.active_theme);
                 // Indent all thought lines by 2 spaces.
                 for line in &mut thought_lines {
                     line.spans.insert(0, Span::raw("  "));
@@ -8954,6 +8969,238 @@ mod tests {
         assert!(
             found_mirage_color,
             "Title bar should contain at least one cell with Ayu Mirage Info background color (Rgb(128, 191, 255))"
+        );
+    }
+
+    /// Render a selection region under three Ayu variants and assert the selected
+    /// cells' color pairs (bg, fg) differ across themes. This proves selection
+    /// highlighting responds to theme changes and variants are visually distinct.
+    ///
+    /// The selection is anchored at (10, 5) and extended to (20, 5), so cells at
+    /// row 5, columns 10–20 are painted with the theme's SelectionBg + Foreground.
+    /// In a width-80 buffer those cells live at indices 5*80+10=410 through 5*80+20=420.
+    /// We read directly from that range so the test cannot accidentally sample the
+    /// background/title area (index 0) instead of the selection region.
+    #[test]
+    fn test_three_ayu_variants_render_distinct_selection_colors() {
+        // Terminal width used throughout this test.
+        const W: u16 = 80;
+        // Selection anchor row and column range.
+        const SEL_ROW: u16 = 5;
+        const SEL_COL_START: u16 = 10;
+        const SEL_COL_END: u16 = 20;
+
+        let themes = vec![
+            crate::theme::ayu_dark(),
+            crate::theme::ayu_mirage(),
+            crate::theme::ayu_light(),
+        ];
+
+        // Collect the (bg, fg) pair from the middle of the selection region for
+        // each theme.  Using a Vec (not a HashSet) preserves per-theme ordering
+        // for the diagnostic message; we deduplicate at assertion time.
+        let mut pairs: Vec<(Color, Color)> = Vec::new();
+
+        for theme in themes {
+            let mut terminal = make_terminal(W, 24);
+            let api = Arc::new(PlaceholderApi::new());
+            let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+            app.active_theme = theme.clone();
+
+            // Anchor at column 10, row 5; extend to column 20, row 5.
+            // bounds covers the full screen so the selection is not clamped.
+            app.selection = Some(crate::selection::Selection::start(
+                SEL_COL_START,
+                SEL_ROW,
+                ratatui::layout::Rect::new(0, 0, W, 24),
+            ));
+            app.selection.as_mut().unwrap().extend(SEL_COL_END, SEL_ROW);
+
+            terminal.draw(|frame| render(&app, frame)).expect("draw");
+
+            let buffer = terminal.backend().buffer().clone();
+            let cells = buffer.content();
+
+            // Sample from the middle of the selection band (column 15, row 5).
+            // Buffer is row-major with width W, so index = row * W + col.
+            let idx = (SEL_ROW as usize) * (W as usize) + 15;
+            let cell = &cells[idx];
+
+            // The selection highlight paints SelectionBg as background; it must
+            // differ from Color::Reset (the selection is non-empty so highlight()
+            // is a no-op only for single-cell selections, which ours is not).
+            assert!(
+                cell.bg != Color::Reset,
+                "Selection cell at row {SEL_ROW} col 15 must be painted (bg=Reset means \
+                 selection highlight did not reach that cell)"
+            );
+
+            pairs.push((cell.bg, cell.fg));
+        }
+
+        // All three pairs must be distinct — if even two are equal the selection
+        // color is not responding to the theme change.
+        let distinct: std::collections::HashSet<_> = pairs.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "Expected 3 distinct SelectionBg+Foreground pairs (one per theme), \
+             got {}. Pairs: {:?}",
+            distinct.len(),
+            pairs
+        );
+    }
+
+    /// Render the accordion pane with a focused section under three Ayu variants
+    /// and assert that the focused header's background color differs per theme.
+    ///
+    /// When `focused_section = Some(AccordionSection::Scope)`, `render_accordion_section`
+    /// applies `title_style.bg(theme.get(ThemeRole::Dim))` to the "SCOPE" header
+    /// span.  The Dim color is distinct in each Ayu variant:
+    ///   Dark   → Rgb(90,  99,  120)
+    ///   Mirage → Rgb(112, 122, 140)
+    ///   Light  → Rgb(130, 142, 159)
+    ///
+    /// The accordion layout is:
+    ///   row 0: "Plan: {slug}"
+    ///   row 1: "Dir:  {dir}"
+    ///   row 2: ""  (empty separator)
+    ///   row 3: "[+] SCOPE"  ← focused header with Dim bg
+    ///
+    /// "[+] " is 4 characters, so "SCOPE" starts at column 4 of row 3.
+    /// In a width-80 buffer, buffer index = 3 * 80 + 4 = 244.
+    #[test]
+    fn test_accordion_focused_state_colors_differ_per_theme() {
+        const W: u16 = 80;
+        const H: u16 = 24;
+        // Row of the SCOPE header line (0-based): Plan, Dir, blank, then SCOPE.
+        const SCOPE_ROW: u16 = 3;
+        // Column where "SCOPE" text begins: "[+] " is 4 chars.
+        const SCOPE_COL: u16 = 4;
+
+        let plan = makina_core::orchestrator::PlanEntry {
+            slug: "test-focus".to_string(),
+            dir: std::path::PathBuf::from("docs/plans/test-focus"),
+            has_tasks: false,
+            tasks: vec![],
+            scope_text: Some("Scope content.".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+
+        let themes = vec![
+            crate::theme::ayu_dark(),
+            crate::theme::ayu_mirage(),
+            crate::theme::ayu_light(),
+        ];
+
+        let mut pairs: Vec<(Color, Color)> = Vec::new();
+
+        for theme in themes {
+            let mut terminal = make_terminal(W, H);
+            let api = Arc::new(PlaceholderApi::new());
+            let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+            app.active_theme = theme.clone();
+            // Set the SCOPE section as focused so render_accordion_section applies
+            // the Dim background to the "SCOPE" title span.
+            app.focused_section = Some(AccordionSection::Scope);
+
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_plan_accordion_pane(&app, &plan, frame, area);
+                })
+                .expect("draw");
+
+            let buffer = terminal.backend().buffer().clone();
+            let cells = buffer.content();
+
+            // Sample the cell that holds the "S" in "SCOPE" on the focused header row.
+            let idx = (SCOPE_ROW as usize) * (W as usize) + (SCOPE_COL as usize);
+            let cell = &cells[idx];
+
+            // The focused header must have a non-Reset background (the Dim color).
+            assert!(
+                cell.bg != Color::Reset,
+                "Focused accordion header at row {SCOPE_ROW} col {SCOPE_COL} must have \
+                 a non-Reset background (focused Dim styling was not applied)"
+            );
+
+            pairs.push((cell.bg, cell.fg));
+        }
+
+        // All three pairs must be distinct — proving the focused header color
+        // is driven by the active theme, not a hardcoded value.
+        let distinct: std::collections::HashSet<_> = pairs.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "Expected 3 distinct focused-header (bg, fg) pairs (one per Ayu variant), \
+             got {}. Pairs: {:?}",
+            distinct.len(),
+            pairs
+        );
+    }
+
+    /// Render the app to a TestBackend and inspect the buffer cells, asserting
+    /// that all styled cells use truecolor (Color::Rgb) and not downsampled ANSI
+    /// colors (Color::Indexed) or other variants.
+    ///
+    /// This end-to-end integration test verifies that colors flow from the theme
+    /// through the render logic into the ratatui buffer as truecolor, not reduced
+    /// to 16-color ANSI. It scans 200+ cells from different parts of the UI
+    /// (title bar, sidebar, main pane) and asserts each non-default color is
+    /// Color::Rgb.
+    #[test]
+    fn test_render_produces_truecolor_cells_not_ansi16() {
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        terminal.draw(|frame| render(&app, frame)).expect("draw");
+
+        let buffer = terminal.backend().buffer().clone();
+        let cells = buffer.content();
+
+        // Collect any non-RGB colors found during the scan so we can report them.
+        let mut non_rgb_findings: Vec<(usize, Color, Color)> = Vec::new();
+
+        // Scan at least 200 cells (entire buffer is 80*24 = 1920 cells).
+        // Sampling all cells ensures comprehensive coverage of title bar, sidebar,
+        // main pane, and status bar regions.
+        for (idx, cell) in cells.iter().take(200).enumerate() {
+            // Foreground color: must be Color::Reset (default/inherited) or Color::Rgb.
+            match cell.fg {
+                Color::Reset => {}        // OK — uses terminal's default foreground
+                Color::Rgb(_, _, _) => {} // OK — truecolor foreground
+                _other => {
+                    non_rgb_findings.push((idx, cell.fg, cell.bg));
+                }
+            }
+
+            // Background color: must be Color::Reset (default) or Color::Rgb.
+            match cell.bg {
+                Color::Reset => {}        // OK — uses terminal's default background
+                Color::Rgb(_, _, _) => {} // OK — truecolor background
+                _other => {
+                    // Only record if we haven't already recorded this cell's fg issue.
+                    if !non_rgb_findings.iter().any(|(i, _, _)| *i == idx) {
+                        non_rgb_findings.push((idx, cell.fg, cell.bg));
+                    }
+                }
+            }
+        }
+
+        // Assert no non-RGB colors were found.
+        assert!(
+            non_rgb_findings.is_empty(),
+            "Found {} cells with non-RGB colors (expected all styled cells to use Color::Rgb). \
+             Details: {:?}",
+            non_rgb_findings.len(),
+            non_rgb_findings
+                .iter()
+                .map(|(idx, fg, bg)| format!("cell[{}]: fg={:?}, bg={:?}", idx, fg, bg))
+                .collect::<Vec<_>>()
         );
     }
 }

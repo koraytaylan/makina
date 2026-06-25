@@ -14,9 +14,11 @@ pub enum ThemeRole {
     Warning,     // partial / pending
     Error,       // failed / removed
     Info,        // informational / modified
+    CodeBlock,   // foreground color for code blocks and inline code
+    FocusBg,     // active/focused widget backgrounds
 }
 
-pub const ALL_ROLES: [ThemeRole; 10] = [
+pub const ALL_ROLES: [ThemeRole; 12] = [
     ThemeRole::Background,
     ThemeRole::Foreground,
     ThemeRole::Dim,
@@ -27,6 +29,8 @@ pub const ALL_ROLES: [ThemeRole; 10] = [
     ThemeRole::Warning,
     ThemeRole::Error,
     ThemeRole::Info,
+    ThemeRole::CodeBlock,
+    ThemeRole::FocusBg,
 ];
 
 /// A complete theme: semantic roles + a 16-entry ANSI palette (0–7 normal
@@ -69,6 +73,8 @@ pub fn ayu_dark() -> Theme {
     colors.insert(ThemeRole::Warning, Color::Rgb(255, 180, 84)); // #FFB454 palette.yellow
     colors.insert(ThemeRole::Error, Color::Rgb(217, 87, 87)); // #D95757 common.error
     colors.insert(ThemeRole::Info, Color::Rgb(115, 184, 255)); // #73B8FF vcs.modified
+    colors.insert(ThemeRole::CodeBlock, Color::Rgb(115, 184, 255)); // same as Info for consistency
+    colors.insert(ThemeRole::FocusBg, Color::Rgb(40, 80, 120)); // darker, more saturated blue
 
     let ansi = [
         Color::Rgb(10, 14, 20),
@@ -107,6 +113,8 @@ pub fn ayu_mirage() -> Theme {
     colors.insert(ThemeRole::Warning, Color::Rgb(255, 205, 102)); // #FFCD66 palette.yellow
     colors.insert(ThemeRole::Error, Color::Rgb(255, 102, 102)); // #FF6666 common.error
     colors.insert(ThemeRole::Info, Color::Rgb(128, 191, 255)); // #80BFFF vcs.modified
+    colors.insert(ThemeRole::CodeBlock, Color::Rgb(128, 191, 255)); // same as Info
+    colors.insert(ThemeRole::FocusBg, Color::Rgb(70, 110, 160)); // similar dark-blue tone
 
     let ansi = [
         Color::Rgb(25, 30, 42),
@@ -145,6 +153,8 @@ pub fn ayu_light() -> Theme {
     colors.insert(ThemeRole::Warning, Color::Rgb(235, 164, 0)); // #EBA400 palette.yellow
     colors.insert(ThemeRole::Error, Color::Rgb(230, 80, 80)); // #E65050 common.error
     colors.insert(ThemeRole::Info, Color::Rgb(71, 138, 204)); // #478ACC vcs.modified
+    colors.insert(ThemeRole::CodeBlock, Color::Rgb(71, 138, 204)); // same as Info, adjusted for light background
+    colors.insert(ThemeRole::FocusBg, Color::Rgb(200, 215, 240)); // pale blue, distinct from white Background #F8F9FA
 
     let ansi = [
         Color::Rgb(92, 97, 102),
@@ -197,10 +207,32 @@ mod tests {
         assert_eq!(th.get(ThemeRole::Background), Color::Rgb(13, 16, 23));
         assert_eq!(th.get(ThemeRole::Accent), Color::Rgb(230, 180, 80));
         assert_eq!(th.get(ThemeRole::Error), Color::Rgb(217, 87, 87));
+        assert_eq!(th.get(ThemeRole::CodeBlock), Color::Rgb(115, 184, 255));
+        assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(40, 80, 120));
 
         // Check ANSI entries (normal red at index 1, bright red at index 9)
         assert_eq!(th.ansi(1), Color::Rgb(211, 99, 106));
         assert_eq!(th.ansi(9), Color::Rgb(240, 113, 120));
+    }
+
+    #[test]
+    fn ayu_mirage_pins_expected_values() {
+        let th = ayu_mirage();
+
+        // Check CodeBlock value for Ayu Mirage
+        assert_eq!(th.get(ThemeRole::CodeBlock), Color::Rgb(128, 191, 255));
+        // Check FocusBg value for Ayu Mirage
+        assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(70, 110, 160));
+    }
+
+    #[test]
+    fn ayu_light_pins_expected_values() {
+        let th = ayu_light();
+
+        // Check CodeBlock value for Ayu Light
+        assert_eq!(th.get(ThemeRole::CodeBlock), Color::Rgb(71, 138, 204));
+        // Check FocusBg value for Ayu Light
+        assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(200, 215, 240));
     }
 
     #[test]
@@ -246,5 +278,36 @@ mod tests {
             .unwrap_or_else(ayu_dark);
 
         assert_eq!(resolved.name, "Ayu Dark");
+    }
+
+    #[test]
+    fn all_theme_colors_are_rgb_not_indexed() {
+        // Verify that all builtin themes use only Color::Rgb for roles and ANSI entries,
+        // not Color::Indexed, Color::Ansi, or named colors. This guards against accidental
+        // downsampling to 16-color ANSI and ensures truecolor output.
+        for theme in Theme::builtin_themes() {
+            // Check all roles are defined as Color::Rgb
+            for &role in &ALL_ROLES {
+                let color = theme.get(role);
+                match color {
+                    Color::Rgb(_, _, _) => {} // OK — all theme roles must be RGB
+                    _ => panic!(
+                        "Theme {:?} role {:?} is not Color::Rgb, got {:?}",
+                        theme.name, role, color
+                    ),
+                }
+            }
+            // Check all 16 ANSI palette entries are Color::Rgb
+            for i in 0..16 {
+                let ansi_color = theme.ansi(i);
+                match ansi_color {
+                    Color::Rgb(_, _, _) => {} // OK
+                    _ => panic!(
+                        "Theme {:?} ANSI[{}] is not Color::Rgb, got {:?}",
+                        theme.name, i, ansi_color
+                    ),
+                }
+            }
+        }
     }
 }

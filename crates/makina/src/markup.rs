@@ -73,7 +73,12 @@ fn strip_ansi(text: &str) -> String {
 }
 
 /// Render CommonMark + GFM tables to styled lines, wrapped to `width`.
-pub fn render_markdown(text: &str, base: Style, width: u16) -> Vec<Line<'static>> {
+pub fn render_markdown(
+    text: &str,
+    base: Style,
+    width: u16,
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
     // If text contains ANSI codes, strip them first to avoid Markdown parser
     // breaking them up across spans. This means ANSI styling is lost when
     // Markdown is present, but ensures no literal escape bytes appear.
@@ -125,23 +130,32 @@ pub fn render_markdown(text: &str, base: Style, width: u16) -> Vec<Line<'static>
                     out.push(finalize_line(std::mem::take(&mut spans)));
                 }
                 in_code_block = true;
-                style = base.add_modifier(Modifier::DIM);
+                // Use theme-aware colors for code blocks
+                let code_style = Style::default()
+                    .fg(theme.get(crate::theme::ThemeRole::CodeBlock))
+                    .bg(theme.get(crate::theme::ThemeRole::Background))
+                    .add_modifier(Modifier::DIM);
+                style = code_style;
             }
             Event::Code(t) => {
-                spans.push(Span::styled(
-                    t.to_string(),
-                    base.add_modifier(Modifier::DIM | Modifier::REVERSED),
-                ));
+                // Inline code: use theme-aware colors
+                let code_style = Style::default()
+                    .fg(theme.get(crate::theme::ThemeRole::CodeBlock))
+                    .bg(theme.get(crate::theme::ThemeRole::Background))
+                    .add_modifier(Modifier::DIM);
+                spans.push(Span::styled(t.to_string(), code_style));
             }
             Event::Text(t) => {
                 let text_str = t.to_string();
                 if in_code_block {
                     // Split code block text on newlines; each line becomes its own Line
+                    // Use theme-aware colors for code block body
+                    let code_style = Style::default()
+                        .fg(theme.get(crate::theme::ThemeRole::CodeBlock))
+                        .bg(theme.get(crate::theme::ThemeRole::Background))
+                        .add_modifier(Modifier::DIM);
                     for line in text_str.split('\n') {
-                        out.push(Line::from(Span::styled(
-                            format!("  {}", line),
-                            base.add_modifier(Modifier::DIM),
-                        )));
+                        out.push(Line::from(Span::styled(format!("  {}", line), code_style)));
                     }
                 } else {
                     // Wrap text to width when not in a code block
@@ -331,11 +345,12 @@ pub fn compact_paths(s: &str, repo_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme;
 
     #[test]
     fn markup_renders_heading_bold_list_and_code() {
         let text = "# Heading\n\nThis is **bold** and *italic*.\n\n- Item 1\n- Item 2\n\n`code`";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         // Assert that we have some output
         assert!(!lines.is_empty());
@@ -363,7 +378,7 @@ mod tests {
     #[test]
     fn markup_renders_gfm_table() {
         let text = "| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         // Table should render to at least 2 lines (header and row)
         assert!(lines.len() >= 2);
@@ -399,7 +414,7 @@ mod tests {
     #[test]
     fn markup_renders_markdown_with_ansi() {
         let text = "# Title\n\nText with \x1b[38;5;208mwarning\x1b[0m color";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         // Should have rendered content
         assert!(!lines.is_empty());
@@ -422,7 +437,7 @@ mod tests {
     #[test]
     fn renders_heading_bold_italic_strikethrough_and_inline_code() {
         let text = "# H\n\n**b** *i* ~~s~~ `c`";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         let all_text: String = lines
             .iter()
@@ -452,7 +467,7 @@ mod tests {
     #[test]
     fn renders_fenced_code_block_preserving_line_breaks() {
         let text = "```\nfn main() {\n    body\n}\n```";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         // Should have at least 3 lines for the code (fn main, body, closing brace)
         assert!(
@@ -484,7 +499,7 @@ mod tests {
     fn renders_indented_code_block() {
         // 4-space indentation marks a code block in Markdown
         let text = "Normal text\n\n    fn test() {\n        println!(\"hello\");\n    }";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         let all_text: String = lines
             .iter()
@@ -502,7 +517,7 @@ mod tests {
     #[test]
     fn renders_ordered_unordered_and_nested_lists() {
         let text = "1. a\n2. b\n\n- x\n  - y";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         let all_text: String = lines
             .iter()
@@ -526,7 +541,7 @@ mod tests {
     #[test]
     fn renders_blockquote() {
         let text = "> quoted";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         let all_text: String = lines
             .iter()
@@ -549,7 +564,7 @@ mod tests {
     #[test]
     fn renders_link_text_and_dim_url() {
         let text = "[docs](https://x.y)";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         let all_text: String = lines
             .iter()
@@ -566,7 +581,7 @@ mod tests {
     #[test]
     fn renders_thematic_break_as_rule() {
         let text = "a\n\n---\n\nb";
-        let lines = super::render_markdown(text, Style::default(), 80);
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
         let all_text: String = lines
             .iter()
@@ -591,7 +606,8 @@ mod tests {
     fn soft_and_hard_breaks_split_lines() {
         // Soft break (single newline)
         let text_soft = "l1\nl2";
-        let lines_soft = super::render_markdown(text_soft, Style::default(), 80);
+        let lines_soft =
+            super::render_markdown(text_soft, Style::default(), 80, &theme::ayu_dark());
         assert!(
             lines_soft.len() >= 2,
             "Soft break should create multiple lines"
@@ -599,7 +615,8 @@ mod tests {
 
         // Hard break (double space + newline)
         let text_hard = "l1  \nl2";
-        let lines_hard = super::render_markdown(text_hard, Style::default(), 80);
+        let lines_hard =
+            super::render_markdown(text_hard, Style::default(), 80, &theme::ayu_dark());
         assert!(
             lines_hard.len() >= 2,
             "Hard break should create multiple lines"
@@ -609,7 +626,7 @@ mod tests {
     #[test]
     fn wraps_long_paragraph_to_small_width() {
         let text = "This is a very long paragraph with many words that should wrap to fit within a small width";
-        let lines = super::render_markdown(text, Style::default(), 20);
+        let lines = super::render_markdown(text, Style::default(), 20, &theme::ayu_dark());
 
         // Should produce multiple lines
         assert!(
@@ -640,11 +657,11 @@ mod tests {
         for (i, _) in full_text.char_indices() {
             let prefix = &full_text[..i];
             // Should not panic
-            let _lines = super::render_markdown(prefix, Style::default(), 80);
+            let _lines = super::render_markdown(prefix, Style::default(), 80, &theme::ayu_dark());
         }
 
         // Also test the full text
-        let _lines = super::render_markdown(full_text, Style::default(), 80);
+        let _lines = super::render_markdown(full_text, Style::default(), 80, &theme::ayu_dark());
     }
 
     #[test]
@@ -653,7 +670,7 @@ mod tests {
         let text = "# Introduction\n\nThis is a paragraph with **bold** and *italic* text.\n\n## Features\n\n- First item\n- Second item\n  - Nested item\n\n1. Ordered one\n2. Ordered two\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n| Header A | Header B |\n|----------|----------|\n| Cell A1  | Cell B1  |\n| Cell A2  | Cell B2  |\n\n[Visit Documentation](https://example.com/docs)\n\n> This is a blockquote\n> with multiple lines\n\n---\n\nFinal paragraph with ~~strikethrough~~ and `inline code`.";
 
         let base_style = Style::default();
-        let lines = super::render_markdown(text, base_style, 80);
+        let lines = super::render_markdown(text, base_style, 80, &theme::ayu_dark());
 
         // Assert that we have rendered output
         assert!(!lines.is_empty(), "Should render to at least one line");
@@ -898,11 +915,11 @@ mod tests {
         for (i, _) in full_text.char_indices() {
             let prefix = &full_text[..i];
             // Should never panic, even for incomplete markup.
-            let _lines = super::render_markdown(prefix, base_style, 80);
+            let _lines = super::render_markdown(prefix, base_style, 80, &theme::ayu_dark());
         }
 
         // Also render the complete text
-        let lines = super::render_markdown(full_text, base_style, 80);
+        let lines = super::render_markdown(full_text, base_style, 80, &theme::ayu_dark());
         assert!(!lines.is_empty(), "Complete text should render to lines");
 
         // Verify that the full text renders all expected content
@@ -922,7 +939,7 @@ mod tests {
         let text = "# Warning Alert\n\nThe system reported \x1b[38;5;208merror\x1b[0m during processing.\n\nDetails: \x1b[1mBold error message\x1b[0m in the logs.";
 
         let base_style = Style::default();
-        let lines = super::render_markdown(text, base_style, 80);
+        let lines = super::render_markdown(text, base_style, 80, &theme::ayu_dark());
 
         // Should have rendered content
         assert!(!lines.is_empty(), "Should render content");
@@ -983,7 +1000,7 @@ mod tests {
         let base_style = Style::default();
         let width: u16 = 20;
 
-        let lines = super::render_markdown(text, base_style, width);
+        let lines = super::render_markdown(text, base_style, width, &theme::ayu_dark());
 
         // Should produce multiple lines to fit the narrow width
         assert!(
