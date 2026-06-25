@@ -4,7 +4,7 @@ Task-level status lives here.
 
 **Status:** ✅ Complete — 10/11 tasks landed on `implement-plan/0037`; squash-merged into develop as `0ae1a2c4221cbc4278d5068aa733156c5d5b411f`.
 
-_Last updated: 2026-06-25, against develop._
+_Last updated: 2026-06-25, against develop (incl. post-merge review follow-ups `56d0033`, `ce18a5e`, `5462669`)._
 
 - **Goal:** The three built-in Ayu variants (Dark, Mirage, Light) render visibly
   distinct in every color-bearing context. Markdown code blocks pull from the
@@ -35,7 +35,21 @@ _Last updated: 2026-06-25, against develop._
 - **Outcome:** 10 of 11 tasks landed and squash-merged into develop
   (`0ae1a2c4221cbc4278d5068aa733156c5d5b411f`). The one gated task
   (`verify-hardcoded-colors-are-fixed`) was not run, as expected for a GATED
-  task with no dependents unblocked by the audit.
+  task with no dependents unblocked by the audit (the grep sweep found zero
+  production `Color::` literals in `ui.rs`/`ansi.rs` — every match is test-only).
+- **Post-merge follow-ups** (from an adversarial review of the merged result;
+  all green under `cargo fmt`/`clippy`/`test`):
+  - `56d0033` — committed this STATUS update and removed three audit scratch
+    files that landed at the repo root (`AUDIT_MARKDOWN_CALLSITES.md`,
+    `AUDIT_RESULTS.md`, `GREP_AUDIT_LOG.md`).
+  - `ce18a5e` — fixed stale `Dim`→`FocusBg` references in the accordion test's
+    docs and added a positive truecolor assertion to the buffer test (it
+    previously only asserted the *absence* of non-RGB cells).
+  - `5462669` — closed a residual distinctness gap the plan's Done-when did not
+    cover: Ayu Light `FocusBg` (200,215,240) was only 20.7 RGB-units from
+    `SelectionBg` (215,228,246). Repainted to `#A0BCE6` (160,188,230, ~70 units
+    away) and added `focus_bg_is_distinct_from_selection_bg_in_every_theme` as a
+    regression guard (40-unit floor across all built-in themes).
 
 | WS | Workstream | Task | State |
 |---|---|---|---|
