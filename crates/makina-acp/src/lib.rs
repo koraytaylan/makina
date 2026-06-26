@@ -55,7 +55,7 @@
 //!         | AcpResponseChunk::ToolCall { .. }
 //!         | AcpResponseChunk::ToolCallUpdate { .. }
 //!         | AcpResponseChunk::CurrentModeUpdate { .. } => {}
-//!         AcpResponseChunk::TurnComplete(_reason) => break,
+//!         AcpResponseChunk::TurnComplete { .. } => break,
 //!     }
 //! }
 //! drop(stream);

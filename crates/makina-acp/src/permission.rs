@@ -83,6 +83,92 @@ pub struct WorktreePolicy {
     worktree: PathBuf,
 }
 
+/// Check if a target path resolves to somewhere under the worktree.
+///
+/// This function resolves the target path via its parent directory (so a
+/// not-yet-created file under the worktree is not falsely denied) and checks
+/// if the result is contained within the worktree.
+fn resolves_under(target: &str, worktree: &Path) -> bool {
+    let target_path = Path::new(target);
+
+    // Handle absolute paths and relative paths.
+    let resolved_path = if target_path.is_absolute() {
+        // For absolute paths, try to canonicalize the parent directory.
+        match target_path.parent() {
+            Some(parent) => {
+                match std::fs::canonicalize(parent) {
+                    Ok(canonical_parent) => {
+                        canonical_parent.join(target_path.file_name().unwrap_or_default())
+                    }
+                    Err(_) => {
+                        // Parent doesn't exist or can't be canonicalized.
+                        // Fall back to lexical normalization.
+                        normalize_path(target_path)
+                    }
+                }
+            }
+            None => target_path.to_path_buf(),
+        }
+    } else {
+        // For relative paths, resolve relative to the worktree.
+        let joined = worktree.join(target_path);
+        match joined.parent() {
+            Some(parent) => {
+                match std::fs::canonicalize(parent) {
+                    Ok(canonical_parent) => {
+                        canonical_parent.join(joined.file_name().unwrap_or_default())
+                    }
+                    Err(_) => {
+                        // Parent doesn't exist; use lexical normalization.
+                        normalize_path(&joined)
+                    }
+                }
+            }
+            None => joined,
+        }
+    };
+
+    // Check if the resolved path is under the worktree.
+    // Canonicalize the worktree for comparison.
+    let worktree_canonical = match std::fs::canonicalize(worktree) {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            // Worktree doesn't exist; use lexical normalization.
+            normalize_path(worktree)
+        }
+    };
+
+    // Check containment: resolved_path must start with worktree_canonical or be equal.
+    resolved_path.starts_with(&worktree_canonical)
+}
+
+/// Normalize a path lexically without requiring it to exist.
+///
+/// Handles `.` and `..` components to produce a normalized absolute path.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            std::path::Component::CurDir => {
+                // Skip `.` components
+            }
+            std::path::Component::RootDir
+            | std::path::Component::Normal(_)
+            | std::path::Component::Prefix(_) => {
+                components.push(component);
+            }
+        }
+    }
+    let mut result = PathBuf::new();
+    for component in components {
+        result.push(component);
+    }
+    result
+}
+
 impl WorktreePolicy {
     /// Build a policy that will auto-allow inside the supplied worktree path.
     pub fn new(worktree: impl Into<PathBuf>) -> Self {
@@ -95,6 +181,31 @@ impl WorktreePolicy {
 impl PermissionPolicy for WorktreePolicy {
     fn decide(&self, ctx: &PermissionRequestContext<'_>) -> PermissionDecision {
         if ctx.working_dir == self.worktree {
+            // Validate that any tool-call locations resolve under the worktree.
+            if let Some(locations) = ctx
+                .tool_call
+                .extra
+                .get("locations")
+                .and_then(|v| v.as_array())
+            {
+                for loc in locations {
+                    if let Some(path) = loc.get("path").and_then(|p| p.as_str())
+                        && !resolves_under(path, &self.worktree)
+                    {
+                        tracing::warn!(
+                            path = ?path,
+                            worktree = ?self.worktree,
+                            "tool-call path escapes worktree"
+                        );
+                        return PermissionDecision {
+                            allow: false,
+                            option_id: None,
+                            reason: "path escapes worktree".into(),
+                        };
+                    }
+                }
+            }
+
             // Deterministically select the first offered allow-once option.
             // Order is the order the agent supplied; first match is stable.
             if let Some(opt) = ctx
@@ -279,5 +390,137 @@ mod tests {
         assert!(!decision.allow);
         assert!(decision.option_id.is_none());
         assert!(!decision.reason.is_empty());
+    }
+
+    #[test]
+    fn test_worktree_policy_denies_paths_outside_worktree() {
+        let worktree = PathBuf::from("/tmp/makina-worktrees/task-test");
+        let policy = WorktreePolicy::new(worktree.clone());
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "locations".into(),
+            serde_json::json!([
+                { "path": "/etc/passwd" }
+            ]),
+        );
+
+        let params = RequestPermissionParams {
+            session_id: "s".into(),
+            options: vec![PermissionOption {
+                option_id: "proceed_once".into(),
+                name: "Allow".into(),
+                kind: PermissionOptionKind::AllowOnce,
+            }],
+            tool_call: ToolCall {
+                tool_call_id: "t".into(),
+                status: None,
+                title: None,
+                kind: None,
+                extra,
+            },
+        };
+        let ctx = PermissionRequestContext {
+            session_id: &params.session_id,
+            working_dir: &worktree,
+            tool_call: &params.tool_call,
+            options: &params.options,
+        };
+
+        let decision = policy.decide(&ctx);
+        assert!(!decision.allow, "should deny path outside worktree");
+        assert!(decision.option_id.is_none());
+        assert_eq!(decision.reason, "path escapes worktree");
+    }
+
+    #[test]
+    fn test_worktree_policy_allows_paths_inside_worktree() {
+        use std::fs;
+        use std::io::Write;
+
+        // Create a temporary worktree directory for testing.
+        let temp_dir = std::env::temp_dir().join("makina-test-worktree");
+        let _ = fs::remove_dir_all(&temp_dir); // Clean up any previous test run
+        fs::create_dir_all(&temp_dir).expect("failed to create temp worktree");
+
+        let policy = WorktreePolicy::new(temp_dir.clone());
+
+        // Create a file inside the worktree.
+        let existing_file = temp_dir.join("existing.txt");
+        let mut f = fs::File::create(&existing_file).expect("failed to create test file");
+        f.write_all(b"test").expect("failed to write test file");
+
+        // Also test a not-yet-created file under the worktree.
+        let not_yet_created = temp_dir.join("not_yet_created.txt");
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "locations".into(),
+            serde_json::json!([
+                { "path": existing_file.to_string_lossy().to_string() },
+                { "path": not_yet_created.to_string_lossy().to_string() },
+            ]),
+        );
+
+        let params = RequestPermissionParams {
+            session_id: "s".into(),
+            options: vec![PermissionOption {
+                option_id: "proceed_once".into(),
+                name: "Allow".into(),
+                kind: PermissionOptionKind::AllowOnce,
+            }],
+            tool_call: ToolCall {
+                tool_call_id: "t".into(),
+                status: None,
+                title: None,
+                kind: None,
+                extra,
+            },
+        };
+        let ctx = PermissionRequestContext {
+            session_id: &params.session_id,
+            working_dir: &temp_dir,
+            tool_call: &params.tool_call,
+            options: &params.options,
+        };
+
+        let decision = policy.decide(&ctx);
+        assert!(decision.allow, "should allow paths inside worktree");
+        assert_eq!(decision.option_id.as_deref(), Some("proceed_once"));
+
+        // Clean up.
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_worktree_policy_allows_missing_locations() {
+        let worktree = PathBuf::from("/tmp/makina-worktrees/task-test");
+        let policy = WorktreePolicy::new(worktree.clone());
+
+        let params = RequestPermissionParams {
+            session_id: "s".into(),
+            options: vec![PermissionOption {
+                option_id: "proceed_once".into(),
+                name: "Allow".into(),
+                kind: PermissionOptionKind::AllowOnce,
+            }],
+            tool_call: ToolCall {
+                tool_call_id: "t".into(),
+                status: None,
+                title: None,
+                kind: None,
+                extra: Default::default(), // No "locations" key
+            },
+        };
+        let ctx = PermissionRequestContext {
+            session_id: &params.session_id,
+            working_dir: &worktree,
+            tool_call: &params.tool_call,
+            options: &params.options,
+        };
+
+        let decision = policy.decide(&ctx);
+        assert!(decision.allow, "should allow when locations are missing");
+        assert_eq!(decision.option_id.as_deref(), Some("proceed_once"));
     }
 }

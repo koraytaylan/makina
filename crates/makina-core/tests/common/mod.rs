@@ -86,6 +86,7 @@ pub fn test_session_config() -> SessionConfig {
         effort: None,
         extra: None,
         task_id: None,
+        run_id: "test-run".into(),
     }
 }
 

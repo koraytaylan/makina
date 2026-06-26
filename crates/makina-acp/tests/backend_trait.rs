@@ -36,9 +36,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// `Box<dyn AgentSession>` so tests only touch the trait surface.
 async fn session_over_mock(behavior: MockBehavior, system_prompt: &str) -> Box<dyn AgentSession> {
     let (reader, writer, _mock) = spawn_mock_agent(behavior);
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .expect("handshake should succeed");
+    let client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .expect("handshake should succeed");
     Box::new(AcpSession::from_client(client, system_prompt))
 }
 
@@ -282,9 +283,17 @@ async fn mid_turn_disconnect_surfaces_transport_error_no_false_turn_complete() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let client = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
-        .await
-        .expect("handshake ok");
+    let client = AcpClient::with_transport(
+        client_read,
+        client_write,
+        "/tmp",
+        None,
+        None,
+        String::new(),
+        None,
+    )
+    .await
+    .expect("handshake ok");
     let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
 
     let mut stream = session
@@ -403,9 +412,10 @@ async fn system_prompt_is_prepended_to_first_turn_only() {
         ..MockBehavior::default()
     };
     let (reader, writer, _mock) = spawn_mock_agent_recording(behavior, Arc::clone(&log));
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .unwrap();
+    let client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .unwrap();
     let mut session: Box<dyn AgentSession> =
         Box::new(AcpSession::from_client(client, "You are a developer."));
 
@@ -437,9 +447,10 @@ async fn empty_system_prompt_adds_no_prelude() {
         ..MockBehavior::default()
     };
     let (reader, writer, _mock) = spawn_mock_agent_recording(behavior, Arc::clone(&log));
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .unwrap();
+    let client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .unwrap();
     let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
 
     let _ = drain_ok(session.prompt(Prompt::new("just the task")).await.unwrap()).await;
@@ -508,6 +519,8 @@ async fn interleaved_permission_request_completes_turn_and_records_audit_entry()
         &worktree,
         None,
         Some(Arc::clone(&capturing) as Arc<dyn AuditSink>),
+        String::new(),
+        None,
     )
     .await
     .expect("handshake should succeed");
@@ -544,4 +557,112 @@ async fn interleaved_permission_request_completes_turn_and_records_audit_entry()
         Some("proceed_once"),
         "WorktreePolicy selects the allow_once option"
     );
+}
+
+#[tokio::test]
+async fn acp_session_cancel_sends_cancel_notification() {
+    // Hand-rolled peer: performs the ACP handshake with a known session_id, then
+    // reads the next line and verifies it is a `session/cancel` notification
+    // carrying that same session_id. This ensures `AcpSession::cancel()` actually
+    // serialises the notification onto the wire.
+    use serde_json::Value;
+
+    let (client_io, peer_io) = tokio::io::duplex(8192);
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+    let expected_session_id = "cancel-test-session";
+
+    let peer = tokio::spawn(async move {
+        let mut lines = BufReader::new(peer_read).lines();
+
+        macro_rules! send {
+            ($v:expr) => {{
+                let mut bytes = serde_json::to_vec(&$v).unwrap();
+                bytes.push(b'\n');
+                peer_write.write_all(&bytes).await.unwrap();
+                peer_write.flush().await.unwrap();
+            }};
+        }
+
+        // Handshake: initialize
+        let _ = lines.next_line().await.unwrap();
+        send!(serde_json::json!({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {},
+                "authMethods": [],
+                "agentInfo": { "name": "mock", "version": "0" }
+            }
+        }));
+
+        // Handshake: session/new — return the known session_id
+        let _ = lines.next_line().await.unwrap();
+        send!(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "sessionId": "cancel-test-session" }
+        }));
+
+        // Now expect a session/cancel notification (no response needed — it is fire-and-forget).
+        let cancel_line = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("expected session/cancel line");
+        let cancel_msg: Value =
+            serde_json::from_str(cancel_line.trim()).expect("session/cancel must be valid JSON");
+
+        assert_eq!(
+            cancel_msg["jsonrpc"], "2.0",
+            "cancel notification must carry jsonrpc:2.0"
+        );
+        assert_eq!(
+            cancel_msg["method"], "session/cancel",
+            "notification method must be session/cancel"
+        );
+        assert!(
+            cancel_msg.get("id").is_none() || cancel_msg["id"].is_null(),
+            "notifications must not carry an id"
+        );
+        assert_eq!(
+            cancel_msg["params"]["sessionId"], "cancel-test-session",
+            "cancel notification must carry the session_id"
+        );
+
+        // Drain any further client writes until EOF so the task exits cleanly.
+        while let Ok(Some(_)) = lines.next_line().await {}
+    });
+
+    // Connect the client over the hand-rolled peer.
+    let client = AcpClient::with_transport(
+        client_read,
+        client_write,
+        "/tmp/repo",
+        None,
+        None,
+        String::new(),
+        None,
+    )
+    .await
+    .expect("handshake should succeed");
+
+    assert_eq!(
+        client.session_id(),
+        expected_session_id,
+        "client should expose the session_id returned by the peer"
+    );
+
+    // Wrap in a session and fire cancel.
+    let session = AcpSession::from_client(client, "");
+    let result = session.cancel().await;
+    assert!(
+        result.is_ok(),
+        "cancel() should succeed when session is live: {result:?}"
+    );
+
+    // Drop the session so the transport closes (write half dropped → peer sees EOF).
+    drop(session);
+    peer.await
+        .expect("mock peer task must complete without panic");
 }

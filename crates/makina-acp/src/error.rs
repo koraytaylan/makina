@@ -12,6 +12,7 @@
 //! | [`Protocol`]         | `Transport`                      |
 //! | [`Rpc`]              | `Transport`                      |
 //! | [`AgentExited`]      | `Transport`                      |
+//! | [`TurnTimeout`]      | `Transport`                      |
 //! | [`Closed`]           | `Terminated`                     |
 //!
 //! [`Spawn`]: AcpError::Spawn
@@ -19,6 +20,7 @@
 //! [`Protocol`]: AcpError::Protocol
 //! [`Rpc`]: AcpError::Rpc
 //! [`AgentExited`]: AcpError::AgentExited
+//! [`TurnTimeout`]: AcpError::TurnTimeout
 //! [`Closed`]: AcpError::Closed
 
 use crate::protocol::JsonRpcError;
@@ -65,6 +67,10 @@ pub enum AcpError {
     /// return this.
     #[error("ACP client is closed")]
     Closed,
+
+    /// A bounded control RPC exceeded its deadline without a matching response.
+    #[error("agent turn timed out after {secs}s")]
+    TurnTimeout { secs: u64 },
 }
 
 impl AcpError {

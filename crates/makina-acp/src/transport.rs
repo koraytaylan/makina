@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::Utc;
 use makina_core::governance::{AuditDecision, AuditEntry, AuditSink, PolicyInfo, ToolRef};
@@ -40,6 +41,13 @@ use crate::protocol::{
     OutgoingErrorResponse, OutgoingNotification, OutgoingRequest, OutgoingResponse,
     PermissionOutcome, PermissionResponse, RequestPermissionParams, SessionNotificationParams,
 };
+
+/// Default deadline for a short control RPC (initialize / session_new /
+/// set_mode / set_config_option). A wedged agent that never replies to one of
+/// these must not stall the orchestrator past this window. The long
+/// `session/prompt` turn is NOT bounded by this — the minutes-scale wall-clock
+/// cap is its outer backstop.
+pub const CONTROL_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// Why the reader task stopped — recorded so late callers get a precise error
 /// instead of a generic "channel closed".
@@ -119,6 +127,10 @@ struct SenderInner<W> {
     working_dir: PathBuf,
     /// Sink for audit entries produced on permission decisions.
     audit_sink: Arc<dyn AuditSink>,
+    /// Run ID captured at transport construction time.
+    run_id: String,
+    /// Task ID captured at transport construction time.
+    task_id: Option<String>,
 }
 
 /// The **send side** of a connected transport: issue requests/notifications and
@@ -154,10 +166,15 @@ where
     /// Returns the raw `result` value on success, or a typed error if the agent
     /// replied with a JSON-RPC error, the connection dropped, or the payload was
     /// malformed.
+    ///
+    /// If `timeout` is `Some(duration)`, the receive will be aborted with
+    /// `AcpError::TurnTimeout` if no response arrives within that duration.
+    /// If `timeout` is `None`, the receive will await indefinitely.
     pub async fn send_request<P: Serialize>(
         &self,
         method: &str,
         params: P,
+        timeout: Option<Duration>,
     ) -> Result<serde_json::Value> {
         // Fail fast if the reader already terminated.
         if let Some(err) = self.inner.shared.ended_error() {
@@ -189,15 +206,26 @@ where
         }
 
         // Await the reader task routing our response (or a terminal wake-up).
-        match rx.await {
-            Ok(result) => result,
-            // The sender was dropped without a value — only happens if the
-            // reader task panicked. Surface whatever terminal reason we have.
-            Err(_) => Err(self
-                .inner
-                .shared
-                .ended_error()
-                .unwrap_or_else(|| AcpError::Transport("reader task ended".into()))),
+        let recv = async {
+            match rx.await {
+                Ok(result) => result,
+                // The sender was dropped without a value — only happens if the
+                // reader task panicked. Surface whatever terminal reason we have.
+                Err(_) => Err(self
+                    .inner
+                    .shared
+                    .ended_error()
+                    .unwrap_or_else(|| AcpError::Transport("reader task ended".into()))),
+            }
+        };
+        match timeout {
+            Some(dur) => match tokio::time::timeout(dur, recv).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(AcpError::TurnTimeout {
+                    secs: dur.as_secs(),
+                }),
+            },
+            None => recv.await,
         }
     }
 
@@ -208,6 +236,17 @@ where
         }
         let notification = OutgoingNotification::new(method, params);
         self.write_message(&notification).await
+    }
+
+    /// Send a `session/cancel` notification to gracefully cancel an in-flight turn.
+    pub async fn send_cancel(&self, session_id: &str) -> Result<()> {
+        self.send_notification(
+            crate::protocol::METHOD_SESSION_CANCEL,
+            crate::protocol::CancelParams {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await
     }
 
     /// Send a JSON-RPC success response to an inbound request (e.g. a
@@ -277,6 +316,8 @@ where
         policy: Arc<dyn PermissionPolicy>,
         working_dir: PathBuf,
         audit_sink: Arc<dyn AuditSink>,
+        run_id: String,
+        task_id: Option<String>,
     ) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -292,6 +333,8 @@ where
                 policy,
                 working_dir,
                 audit_sink,
+                run_id,
+                task_id,
             }),
         };
 
@@ -321,8 +364,9 @@ where
         &self,
         method: &str,
         params: P,
+        timeout: Option<Duration>,
     ) -> Result<serde_json::Value> {
-        self.sender.send_request(method, params).await
+        self.sender.send_request(method, params, timeout).await
     }
 
     /// Send a JSON-RPC notification (delegates to the sender).
@@ -500,8 +544,8 @@ async fn route_message<W>(
                             };
                             let entry = AuditEntry {
                                 timestamp: Utc::now(),
-                                run_id: "acp-transport".to_string(),
-                                task_id: None,
+                                run_id: sender.inner.run_id.clone(),
+                                task_id: sender.inner.task_id.clone(),
                                 session_id: Some(params.session_id.clone()),
                                 tool,
                                 decision: audit_decision,
@@ -597,6 +641,8 @@ mod tests {
             Arc::new(WorktreePolicy::new(cwd.clone())),
             cwd,
             Arc::new(NoopAuditSink),
+            "test-run".into(),
+            None,
         );
         (transport, peer_read, peer_write)
     }
@@ -628,7 +674,7 @@ mod tests {
         });
 
         let result = transport
-            .send_request("ping", serde_json::json!({ "v": 1 }))
+            .send_request("ping", serde_json::json!({ "v": 1 }), None)
             .await
             .unwrap();
         assert_eq!(result["ok"], true);
@@ -650,7 +696,7 @@ mod tests {
             write_line(&mut peer_write, &reply.to_string()).await;
         });
 
-        let err = transport.send_request("nope", ()).await.unwrap_err();
+        let err = transport.send_request("nope", (), None).await.unwrap_err();
         match err {
             AcpError::Rpc(e) => {
                 assert_eq!(e.code, -32601);
@@ -695,7 +741,7 @@ mod tests {
         // half keeps the stream alive — so we must `shutdown()` explicitly.)
         peer_write.shutdown().await.unwrap();
 
-        let err = transport.send_request("ping", ()).await.unwrap_err();
+        let err = transport.send_request("ping", (), None).await.unwrap_err();
         assert!(
             matches!(err, AcpError::AgentExited { .. }),
             "expected AgentExited after EOF, got {err:?}"
@@ -723,7 +769,7 @@ mod tests {
         });
 
         // Despite the leading noise, the request/response still completes.
-        let result = transport.send_request("ping", ()).await.unwrap();
+        let result = transport.send_request("ping", (), None).await.unwrap();
         assert_eq!(result["ok"], true);
         peer.await.unwrap();
     }
@@ -760,6 +806,8 @@ mod tests {
             policy,
             worktree.clone(),
             sink as Arc<dyn AuditSink>,
+            "test-run".into(),
+            None,
         );
 
         // Peer script: handshake, start prompt, inject one permission request,
@@ -851,18 +899,24 @@ mod tests {
             .send_request(
                 "initialize",
                 json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"t","version":"0"}}),
+                None,
             )
             .await
             .unwrap();
 
         let _new = transport
-            .send_request("session/new", json!({"cwd": worktree, "mcpServers":[]}))
+            .send_request(
+                "session/new",
+                json!({"cwd": worktree, "mcpServers":[]}),
+                None,
+            )
             .await
             .unwrap();
 
         let prompt_fut = transport.send_request(
             "session/prompt",
             json!({"sessionId":"sess-perm-test","prompt":[{"type":"text","text":"work"}]}),
+            None,
         );
 
         let prompt_res = prompt_fut.await.unwrap();
@@ -874,5 +928,202 @@ mod tests {
         let captured = entries.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].decision, AuditDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn test_control_request_times_out_when_no_response() {
+        let (transport, _peer_read, _peer_write) = duplex_transport();
+        // Drop peer_write so no response will be sent; the request will timeout.
+        // Use a short timeout for testing.
+        let timeout = Some(Duration::from_millis(50));
+        let err = transport
+            .send_request("ping", serde_json::json!({ "v": 1 }), timeout)
+            .await
+            .unwrap_err();
+
+        // Verify we get TurnTimeout, not AgentExited or other error.
+        match err {
+            AcpError::TurnTimeout { secs } => {
+                // The timeout is in milliseconds (50), but we convert to seconds for the error message.
+                assert_eq!(secs, 0); // 50ms rounds down to 0 seconds
+            }
+            other => panic!("expected TurnTimeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_send_request_is_not_capped() {
+        let (transport, mut peer_read, mut peer_write) = duplex_transport();
+
+        let peer = tokio::spawn(async move {
+            // Simulate a slow (but valid) response.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let req_line = read_line(&mut peer_read).await;
+            let req: serde_json::Value = serde_json::from_str(&req_line).unwrap();
+            let id = req["id"].as_u64().unwrap();
+            let reply = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } });
+            write_line(&mut peer_write, &reply.to_string()).await;
+        });
+
+        // Prompt call with None (no timeout) should wait for the response even if it's slow.
+        let result = transport
+            .send_request("session/prompt", serde_json::json!({ "v": 1 }), None)
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_send_cancel_serializes_notification() {
+        let (transport, mut peer_read, _peer_write) = duplex_transport();
+
+        let peer = tokio::spawn(async move {
+            // Read the cancel notification sent by the client
+            let notif_line = read_line(&mut peer_read).await;
+            let notif: serde_json::Value = serde_json::from_str(&notif_line).unwrap();
+
+            // Verify it's a JSON-RPC notification with correct method and params
+            assert_eq!(notif["jsonrpc"], "2.0");
+            assert_eq!(notif["method"], "session/cancel");
+            assert!(
+                notif.get("id").is_none(),
+                "notifications should not have an id"
+            );
+            assert_eq!(notif["params"]["sessionId"], "test-session");
+        });
+
+        // Send a cancel notification for a test session
+        transport
+            .sender()
+            .send_cancel("test-session")
+            .await
+            .unwrap();
+
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_audit_entry_carries_injected_run_and_task_ids() {
+        // In-memory duplex with custom run_id and task_id.
+        let (client_io, peer_io) = tokio::io::duplex(8 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (mut peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        let worktree = PathBuf::from("/tmp/makina-test-run-task-ids");
+        let policy: Arc<dyn PermissionPolicy> = Arc::new(WorktreePolicy::new(worktree.clone()));
+        let sink = Arc::new(TestAuditSink::default());
+        let entries = sink.entries.clone();
+
+        // Create transport with known run_id and task_id
+        let test_run_id = "custom-run-id-123".to_string();
+        let test_task_id = Some("custom-task-id-456".to_string());
+
+        let transport = Transport::new(
+            client_read,
+            client_write,
+            policy,
+            worktree.clone(),
+            sink as Arc<dyn AuditSink>,
+            test_run_id.clone(),
+            test_task_id.clone(),
+        );
+
+        // Peer script: handshake, start prompt, inject permission request.
+        let peer = tokio::spawn(async move {
+            // initialize
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_u64().unwrap();
+            write_line(
+                &mut peer_write,
+                &json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}}).to_string(),
+            )
+            .await;
+
+            // session/new
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_u64().unwrap();
+            write_line(
+                &mut peer_write,
+                &json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"sess-ids-test"}})
+                    .to_string(),
+            )
+            .await;
+
+            // session/prompt (keep pending)
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let prompt_id = req["id"].as_u64().unwrap();
+
+            // Mid-turn: send permission request
+            let perm_id = 99u64;
+            let perm_req = json!({
+                "jsonrpc": "2.0",
+                "id": perm_id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "sess-ids-test",
+                    "options": [
+                        {"optionId": "ok", "name": "OK", "kind": "allow_once"}
+                    ],
+                    "toolCall": {
+                        "toolCallId": "test_tool_123",
+                        "title": "Test Tool"
+                    }
+                }
+            });
+            write_line(&mut peer_write, &perm_req.to_string()).await;
+
+            // Read the response
+            let resp_line = read_line(&mut peer_read).await;
+            let _resp: Value = serde_json::from_str(&resp_line).unwrap();
+
+            // Complete the prompt
+            let done = json!({
+                "jsonrpc": "2.0",
+                "id": prompt_id,
+                "result": { "stopReason": "end_turn" }
+            });
+            write_line(&mut peer_write, &done.to_string()).await;
+        });
+
+        // Client side: drive handshake + prompt
+        let _init = transport
+            .send_request(
+                "initialize",
+                json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"t","version":"0"}}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let _new = transport
+            .send_request(
+                "session/new",
+                json!({"cwd": worktree, "mcpServers":[]}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let prompt_fut = transport.send_request(
+            "session/prompt",
+            json!({"sessionId":"sess-ids-test","prompt":[{"type":"text","text":"test"}]}),
+            None,
+        );
+
+        let _prompt_res = prompt_fut.await.unwrap();
+
+        peer.await.unwrap();
+
+        // Verify the audit entry carries the injected run_id and task_id.
+        let captured = entries.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let entry = &captured[0];
+        assert_eq!(entry.run_id, test_run_id);
+        assert_eq!(entry.task_id, test_task_id);
+        assert_eq!(entry.decision, AuditDecision::Allow);
     }
 }

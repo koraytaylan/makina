@@ -40,9 +40,10 @@ async fn auth_methods_are_surfaced_from_initialize() {
     let behavior = MockBehavior::default();
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .expect("handshake should succeed");
+    let client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .expect("handshake should succeed");
 
     let methods = client.auth_methods();
     assert_eq!(
@@ -68,9 +69,10 @@ async fn empty_auth_methods_surfaces_empty_slice() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .expect("handshake should succeed");
+    let client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .expect("handshake should succeed");
 
     assert!(
         client.auth_methods().is_empty(),
@@ -93,9 +95,10 @@ async fn multiple_auth_methods_with_extra_fields_are_surfaced() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .expect("handshake should succeed");
+    let client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .expect("handshake should succeed");
 
     let methods = client.auth_methods();
     assert_eq!(methods.len(), 2, "two auth methods should be surfaced");
@@ -299,7 +302,7 @@ while read -r _line; do :; done
             | makina_acp::AcpResponseChunk::ToolCall { .. }
             | makina_acp::AcpResponseChunk::ToolCallUpdate { .. }
             | makina_acp::AcpResponseChunk::CurrentModeUpdate { .. } => {}
-            makina_acp::AcpResponseChunk::TurnComplete(_) => break,
+            makina_acp::AcpResponseChunk::TurnComplete { .. } => break,
         }
     }
 
@@ -337,6 +340,7 @@ async fn acp_backend_spawn_of_missing_binary_is_spawn_not_auth_error() {
         effort: None,
         extra: None,
         task_id: None,
+        run_id: String::new(),
     };
     match backend.spawn(config).await {
         Err(BackendError::Spawn { .. }) => {

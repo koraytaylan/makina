@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::Stream;
 use futures::future::BoxFuture;
@@ -47,11 +48,11 @@ use crate::protocol::{
     InitializeResult, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
     SessionUpdate, StopReason,
 };
-use crate::transport::Transport;
+use crate::transport::{CONTROL_REQUEST_TIMEOUT_SECS, Transport};
 
 /// Boxed write half used by the production (subprocess) transport, so
 /// [`AcpClient`] is not generic over the stream type.
-type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
+pub type BoxedWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
 /// Default client identity reported to the agent during `initialize`.
 const CLIENT_NAME: &str = "makina";
@@ -81,6 +82,10 @@ pub struct AcpCommand {
     /// Audit sink that receives one entry per permission decision.
     /// Defaults to [`makina_core::governance::NoopAuditSink`].
     pub(crate) audit_sink: Arc<dyn makina_core::governance::AuditSink>,
+    /// The run id associated with this session.
+    pub run_id: String,
+    /// The task id associated with this session.
+    pub task_id: Option<String>,
 }
 
 // Manual Debug: the Arc<dyn …> impls are not guaranteed Debug.
@@ -94,6 +99,8 @@ impl std::fmt::Debug for AcpCommand {
             .field("working_dir", &self.working_dir)
             .field("env", &self.env)
             .field("has_policy_override", &self.policy.is_some())
+            .field("run_id", &self.run_id)
+            .field("task_id", &self.task_id)
             .finish_non_exhaustive()
     }
 }
@@ -108,6 +115,8 @@ impl AcpCommand {
             env: Vec::new(),
             policy: None,
             audit_sink: Arc::new(NoopAuditSink),
+            run_id: String::new(),
+            task_id: None,
         }
     }
 
@@ -237,8 +246,13 @@ pub enum AcpResponseChunk {
         /// The id of the mode the agent switched to.
         current_mode_id: String,
     },
-    /// The turn finished; carries the agent's stop reason.
-    TurnComplete(StopReason),
+    /// The turn finished; carries the agent's stop reason and token usage.
+    TurnComplete {
+        /// Reason the agent stopped.
+        stop_reason: StopReason,
+        /// Optional token usage counts from the turn.
+        usage: Option<crate::protocol::TurnUsage>,
+    },
 }
 
 // ── The client ───────────────────────────────────────────────────────────────────
@@ -335,6 +349,8 @@ impl AcpClient {
         cwd: impl AsRef<Path>,
         policy: Option<Arc<dyn crate::permission::PermissionPolicy>>,
         audit_sink: Option<Arc<dyn makina_core::governance::AuditSink>>,
+        run_id: String,
+        task_id: Option<String>,
     ) -> Result<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -351,6 +367,8 @@ impl AcpClient {
             policy,
             cwd.clone(),
             sink,
+            run_id,
+            task_id,
         );
         let mut client = Self::from_parts(None, None, transport);
         client.handshake(&cwd).await?;
@@ -390,7 +408,11 @@ impl AcpClient {
         };
         let init_value = self
             .transport
-            .send_request(protocol::METHOD_INITIALIZE, &init_params)
+            .send_request(
+                protocol::METHOD_INITIALIZE,
+                &init_params,
+                Some(Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS)),
+            )
             .await?;
         let init: InitializeResult = serde_json::from_value(init_value)
             .map_err(|e| AcpError::protocol(format!("invalid initialize result: {e}")))?;
@@ -416,7 +438,11 @@ impl AcpClient {
         };
         let session_value = self
             .transport
-            .send_request(protocol::METHOD_SESSION_NEW, &new_session_params)
+            .send_request(
+                protocol::METHOD_SESSION_NEW,
+                &new_session_params,
+                Some(Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS)),
+            )
             .await?;
         let session: NewSessionResult = serde_json::from_value(session_value)
             .map_err(|e| AcpError::protocol(format!("invalid session/new result: {e}")))?;
@@ -430,6 +456,11 @@ impl AcpClient {
     /// The session id assigned by the agent.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// A cloned, `'static` send side for out-of-band notifications (e.g. cancel).
+    pub fn sender_clone(&self) -> crate::transport::TransportSender<BoxedWriter> {
+        self.transport.sender().clone()
     }
 
     /// The protocol version the agent agreed to.
@@ -496,7 +527,11 @@ impl AcpClient {
 
         let sender = self.transport.sender().clone();
         let _response: serde_json::Value = sender
-            .send_request(protocol::METHOD_SESSION_SET_MODE, &params)
+            .send_request(
+                protocol::METHOD_SESSION_SET_MODE,
+                &params,
+                Some(Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS)),
+            )
             .await?;
 
         Ok(())
@@ -528,7 +563,11 @@ impl AcpClient {
 
         let sender = self.transport.sender().clone();
         let _response: serde_json::Value = sender
-            .send_request(protocol::METHOD_SESSION_SET_CONFIG_OPTION, &params)
+            .send_request(
+                protocol::METHOD_SESSION_SET_CONFIG_OPTION,
+                &params,
+                Some(Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS)),
+            )
             .await?;
 
         Ok(())
@@ -606,7 +645,7 @@ impl AcpClient {
         let sender = self.transport.sender().clone();
         let response: BoxFuture<'static, Result<PromptResult>> = Box::pin(async move {
             let value = sender
-                .send_request(protocol::METHOD_SESSION_PROMPT, &params)
+                .send_request(protocol::METHOD_SESSION_PROMPT, &params, None)
                 .await?;
             serde_json::from_value::<PromptResult>(value)
                 .map_err(|e| AcpError::protocol(format!("invalid session/prompt result: {e}")))
@@ -777,7 +816,15 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
     // Use the single shared derivation so the production and test paths are
     // always in sync (see `AcpCommand::transport_inputs`).
     let (policy, sink) = command.transport_inputs();
-    let transport = Transport::new(reader, writer, policy, cwd, sink);
+    let transport = Transport::new(
+        reader,
+        writer,
+        policy,
+        cwd,
+        sink,
+        command.run_id.clone(),
+        command.task_id.clone(),
+    );
     Ok((child, pgid, transport))
 }
 
@@ -898,7 +945,7 @@ enum StreamState {
     /// alias the borrowed transport.
     Streaming(BoxFuture<'static, Result<PromptResult>>),
     /// Response received; emit `TurnComplete` next, then finish.
-    Completing(StopReason),
+    Completing(StopReason, Option<crate::protocol::TurnUsage>),
     /// Terminal: the stream has ended.
     Done,
 }
@@ -1018,7 +1065,7 @@ impl Stream for PromptStream<'_> {
                                     this.buffered.push_back(chunk);
                                 }
                             }
-                            this.state = StreamState::Completing(result.stop_reason);
+                            this.state = StreamState::Completing(result.stop_reason, result.usage);
                             continue;
                         }
                         Poll::Ready(Err(e)) => {
@@ -1028,14 +1075,17 @@ impl Stream for PromptStream<'_> {
                         Poll::Pending => return Poll::Pending,
                     }
                 }
-                StreamState::Completing(_) => {
-                    // Take the stop reason and finish.
-                    let StreamState::Completing(reason) =
+                StreamState::Completing(..) => {
+                    // Take the stop reason and usage, and finish.
+                    let StreamState::Completing(stop_reason, usage) =
                         std::mem::replace(&mut this.state, StreamState::Done)
                     else {
                         unreachable!("state checked in match arm")
                     };
-                    return Poll::Ready(Some(Ok(AcpResponseChunk::TurnComplete(reason))));
+                    return Poll::Ready(Some(Ok(AcpResponseChunk::TurnComplete {
+                        stop_reason,
+                        usage,
+                    })));
                 }
                 StreamState::Done => return Poll::Ready(None),
             }

@@ -103,6 +103,7 @@ impl ModelNormalizer {
             effort: None,
             extra: None,
             task_id: Some(slug.to_string()),
+            run_id: String::new(),
         };
         let mut session = self
             .backend

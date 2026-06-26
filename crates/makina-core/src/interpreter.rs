@@ -821,6 +821,7 @@ impl TaskListInterpreter for ModelInterpreter {
             effort: None,
             extra: None,
             task_id: None,
+            run_id: String::new(),
         };
         let mut session = self.backend.spawn(config).await?;
 
@@ -917,6 +918,7 @@ impl ModelInterpreter {
             effort: None,
             extra: None,
             task_id: None,
+            run_id: String::new(),
         };
         let mut session = self.backend.spawn(config).await?;
 

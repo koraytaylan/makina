@@ -11,6 +11,7 @@ mod common;
 use common::{MockBehavior, spawn_mock_agent};
 use futures::StreamExt;
 use makina_acp::{AcpClient, AcpResponseChunk, StopReason};
+use serde_json::json;
 
 /// Drain a prompt stream into (assembled text, stop reason), asserting the
 /// stream ends with exactly one `TurnComplete`.
@@ -29,9 +30,9 @@ async fn drain(stream: makina_acp::PromptStream<'_>) -> (String, StopReason) {
             | AcpResponseChunk::ToolCall { .. }
             | AcpResponseChunk::ToolCallUpdate { .. }
             | AcpResponseChunk::CurrentModeUpdate { .. } => {}
-            AcpResponseChunk::TurnComplete(reason) => {
+            AcpResponseChunk::TurnComplete { stop_reason, .. } => {
                 assert!(stop.is_none(), "TurnComplete must appear exactly once");
-                stop = Some(reason);
+                stop = Some(stop_reason);
             }
         }
     }
@@ -47,9 +48,9 @@ async fn drain_all(stream: makina_acp::PromptStream<'_>) -> (Vec<AcpResponseChun
     let mut stream = stream;
     while let Some(item) = stream.next().await {
         match item.expect("no error item expected in a clean turn") {
-            AcpResponseChunk::TurnComplete(reason) => {
+            AcpResponseChunk::TurnComplete { stop_reason, .. } => {
                 assert!(stop.is_none(), "TurnComplete must appear exactly once");
-                stop = Some(reason);
+                stop = Some(stop_reason);
             }
             other => chunks.push(other),
         }
@@ -69,9 +70,10 @@ async fn full_handshake_and_streamed_prompt_response() {
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
     // connect() performs initialize + session/new against the mock.
-    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .expect("handshake should succeed");
+    let mut client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .expect("handshake should succeed");
 
     // Handshake results are visible.
     assert_eq!(client.session_id(), "sess-xyz");
@@ -116,9 +118,10 @@ async fn non_message_updates_are_emitted_as_rich_chunks() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .unwrap();
+    let mut client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .unwrap();
 
     let stream = client.prompt("go").unwrap();
     let (chunks, stop) = drain_all(stream).await;
@@ -197,9 +200,10 @@ async fn thought_and_tool_events_are_delivered() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .unwrap();
+    let mut client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .unwrap();
 
     let stream = client.prompt("go").unwrap();
     let (chunks, stop) = drain_all(stream).await;
@@ -244,9 +248,10 @@ async fn two_sequential_turns_on_one_session() {
     };
     let (reader, writer, mock) = spawn_mock_agent(behavior);
 
-    let mut client = AcpClient::with_transport(reader, writer, "/tmp/repo", None, None)
-        .await
-        .unwrap();
+    let mut client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .unwrap();
 
     // First turn.
     {
@@ -264,4 +269,89 @@ async fn two_sequential_turns_on_one_session() {
     client.shutdown().await.unwrap();
     drop(client);
     mock.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_acp_client_exposes_session_id_and_sender() {
+    // Verify that AcpClient exposes its session_id (existing getter) and a
+    // sender_clone() returning a 'static TransportSender.
+    let behavior = MockBehavior {
+        session_id: "test-session-xyz".into(),
+        chunks: vec!["hello".into()],
+        stop_reason: "end_turn".into(),
+        ..MockBehavior::default()
+    };
+    let (reader, writer, _mock) = spawn_mock_agent(behavior);
+
+    let mut client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .expect("handshake should succeed");
+
+    // Verify session_id getter matches the mock's session_id.
+    assert_eq!(client.session_id(), "test-session-xyz");
+
+    // Verify sender_clone() returns without panicking and produces a clonable sender.
+    let sender = client.sender_clone();
+    let _sender_clone = sender.clone();
+
+    // Run a prompt to exercise the full protocol before cleanup.
+    let stream = client.prompt("test query").expect("prompt accepted");
+    let (text, stop) = drain(stream).await;
+    assert!(!text.is_empty(), "mock should return a text response");
+    assert_eq!(stop, StopReason::EndTurn);
+
+    client.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn test_prompt_result_with_usage_is_included_in_chunk() {
+    // Verify that PromptStream builds a TurnComplete chunk with usage from the agent.
+    let behavior = MockBehavior {
+        session_id: "sess-usage".into(),
+        chunks: vec!["hello".into()],
+        stop_reason: "end_turn".into(),
+        usage: Some(json!({
+            "inputTokens": 42,
+            "outputTokens": 100
+        })),
+        ..MockBehavior::default()
+    };
+    let (reader, writer, mock) = spawn_mock_agent(behavior);
+
+    let mut client =
+        AcpClient::with_transport(reader, writer, "/tmp/repo", None, None, String::new(), None)
+            .await
+            .expect("handshake should succeed");
+
+    // Run the turn and collect the streamed response.
+    let stream = client
+        .prompt("What is the answer?")
+        .expect("prompt accepted");
+
+    let mut saw_usage = false;
+    let mut stream = stream;
+    while let Some(item) = stream.next().await {
+        match item.expect("no error item expected in a clean turn") {
+            AcpResponseChunk::Text(_) => {}
+            AcpResponseChunk::Thought(_)
+            | AcpResponseChunk::ToolCall { .. }
+            | AcpResponseChunk::ToolCallUpdate { .. }
+            | AcpResponseChunk::CurrentModeUpdate { .. } => {}
+            AcpResponseChunk::TurnComplete { stop_reason, usage } => {
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                // Verify the usage was threaded through.
+                assert!(usage.is_some(), "usage should be present in TurnComplete");
+                let u = usage.unwrap();
+                assert_eq!(u.input_tokens, Some(42), "input_tokens should be 42");
+                assert_eq!(u.output_tokens, Some(100), "output_tokens should be 100");
+                saw_usage = true;
+            }
+        }
+    }
+    assert!(saw_usage, "should have seen TurnComplete with usage");
+
+    client.shutdown().await.expect("shutdown is clean");
+    drop(client);
+    mock.await.expect("mock agent task completes");
 }

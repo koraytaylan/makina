@@ -47,9 +47,17 @@ async fn agent_eof_during_handshake_is_typed_error() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let err = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
-        .await
-        .expect_err("handshake against a dead agent must fail");
+    let err = AcpClient::with_transport(
+        client_read,
+        client_write,
+        "/tmp",
+        None,
+        None,
+        String::new(),
+        None,
+    )
+    .await
+    .expect_err("handshake against a dead agent must fail");
     assert!(
         matches!(err, AcpError::AgentExited { .. } | AcpError::Transport(_)),
         "expected AgentExited/Transport, got {err:?}"
@@ -95,9 +103,17 @@ async fn handshake_tolerates_non_jsonrpc_preamble() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let client = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
-        .await
-        .expect("handshake must succeed despite non-JSON preamble");
+    let client = AcpClient::with_transport(
+        client_read,
+        client_write,
+        "/tmp",
+        None,
+        None,
+        String::new(),
+        None,
+    )
+    .await
+    .expect("handshake must succeed despite non-JSON preamble");
     assert_eq!(client.session_id(), "noisy-sess");
     assert_eq!(
         client.agent_info().map(|i| i.name.as_str()),
@@ -129,9 +145,17 @@ async fn handshake_with_invalid_result_payload_is_protocol_error() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let err = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
-        .await
-        .expect_err("an invalid initialize result must fail");
+    let err = AcpClient::with_transport(
+        client_read,
+        client_write,
+        "/tmp",
+        None,
+        None,
+        String::new(),
+        None,
+    )
+    .await
+    .expect_err("an invalid initialize result must fail");
     assert!(
         matches!(err, AcpError::Protocol(_)),
         "expected Protocol error, got {err:?}"
@@ -176,9 +200,17 @@ async fn agent_disconnect_mid_turn_yields_error_then_ends() {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
-    let mut client = AcpClient::with_transport(client_read, client_write, "/tmp", None, None)
-        .await
-        .expect("handshake ok");
+    let mut client = AcpClient::with_transport(
+        client_read,
+        client_write,
+        "/tmp",
+        None,
+        None,
+        String::new(),
+        None,
+    )
+    .await
+    .expect("handshake ok");
 
     let mut stream = client.prompt("go").expect("prompt accepted");
 
@@ -198,7 +230,7 @@ async fn agent_disconnect_mid_turn_yields_error_then_ends() {
             Ok(AcpResponseChunk::Thought(_))
             | Ok(AcpResponseChunk::ToolCall { .. })
             | Ok(AcpResponseChunk::ToolCallUpdate { .. }) => {}
-            Ok(AcpResponseChunk::TurnComplete(_)) => {
+            Ok(AcpResponseChunk::TurnComplete { .. }) => {
                 panic!("turn should not complete after a mid-turn disconnect");
             }
             Err(e) => {

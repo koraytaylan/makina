@@ -81,8 +81,8 @@ async fn real_cli_prompt_response() {
                 AcpResponseChunk::Thought(_)
                 | AcpResponseChunk::ToolCall { .. }
                 | AcpResponseChunk::ToolCallUpdate { .. } => {}
-                AcpResponseChunk::TurnComplete(reason) => {
-                    eprintln!("\n[turn complete: {reason:?}]");
+                AcpResponseChunk::TurnComplete { stop_reason, .. } => {
+                    eprintln!("\n[turn complete: {stop_reason:?}]");
                     completed = true;
                     break;
                 }
@@ -122,6 +122,7 @@ async fn real_cli_prompt_response_through_the_backend_trait() {
         effort: None,
         extra: None,
         task_id: None,
+        run_id: String::new(),
     };
 
     let mut session = backend

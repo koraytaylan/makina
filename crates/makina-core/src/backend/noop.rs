@@ -55,6 +55,7 @@
 //!     effort: None,
 //!     extra: None,
 //!     task_id: None,
+//!     run_id: String::new(),
 //! };
 //!
 //! let mut session = backend.spawn(config).await.unwrap();
@@ -313,6 +314,7 @@ mod tests {
             effort: None,
             extra: None,
             task_id: None,
+            run_id: String::new(),
         }
     }
 
@@ -557,6 +559,7 @@ mod tests {
                 effort: None,
                 extra: None,
                 task_id: None,
+                run_id: String::new(),
             };
             let mut session = self
                 .backend

@@ -54,7 +54,7 @@
 //! can refine role-specific prompting without touching the bridge.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use makina_core::api;
@@ -67,6 +67,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::client::{AcpClient, AcpCommand, AcpResponseChunk};
 use crate::error::AcpError;
+use crate::protocol::StopReason;
 
 /// Buffer size for the mpsc channel that carries mapped [`ResponseEvent`]s from
 /// the per-turn worker task to the consumer's [`ResponseStream`].
@@ -84,7 +85,7 @@ const CHANNEL_CAPACITY: usize = 64;
 /// | `AcpError`                              | `BackendError` |
 /// |-----------------------------------------|----------------|
 /// | `Spawn`                                 | `Spawn`        |
-/// | `Transport` / `Protocol` / `Rpc` / `AgentExited` | `Transport` |
+/// | `Transport` / `Protocol` / `Rpc` / `AgentExited` / `TurnTimeout` | `Transport` |
 /// | `Closed`                                | `Terminated`   |
 fn map_error(err: AcpError) -> BackendError {
     match err {
@@ -193,15 +194,17 @@ impl AcpBackend {
         self
     }
 
-    /// Build the [`AcpCommand`] for a session in `working_dir`.
+    /// Build the [`AcpCommand`] for a session in `working_dir` with run/task ids.
     ///
     /// The command carries the backend's audit sink and no policy override (the
     /// default [`crate::permission::WorktreePolicy`] will be built from
     /// `working_dir` at connect time).
-    fn command_for(&self, working_dir: PathBuf) -> AcpCommand {
-        let mut command = AcpCommand::new(self.program.clone(), working_dir)
+    fn command_for(&self, config: &SessionConfig) -> AcpCommand {
+        let mut command = AcpCommand::new(self.program.clone(), config.working_dir.clone())
             .args(self.args.clone())
             .with_audit_sink(Arc::clone(&self.audit_sink));
+        command.run_id = config.run_id.clone();
+        command.task_id = config.task_id.clone();
         for (key, value) in &self.env {
             command = command.env(key.clone(), value.clone());
         }
@@ -209,26 +212,26 @@ impl AcpBackend {
     }
 
     /// Test-only seam: connect a client over `reader`/`writer` using the policy
-    /// and audit sink that `spawn` would thread through for `working_dir`.
+    /// and audit sink that `spawn` would thread through.
     ///
     /// This is the acceptance-test entry point for `gateway-threading`: it calls
-    /// `command_for(working_dir)` (the same path as `spawn`) and then calls
-    /// `AcpClient::with_transport` with the command's `effective_policy()` and
-    /// `audit_sink`, so the test's capturing sink reaches the transport through
-    /// the real `AcpBackend → command_for → AcpCommand` wiring rather than being
-    /// injected directly.
+    /// `command_for(&config)` (the same path as `spawn`) and then calls
+    /// `AcpClient::with_transport` with the command's `effective_policy()`,
+    /// `audit_sink`, and run/task ids, so the test's capturing sink and ids
+    /// reach the transport through the real `AcpBackend → command_for → AcpCommand`
+    /// wiring rather than being injected directly.
     #[cfg(test)]
     pub(crate) async fn spawn_with_transport<R, W>(
         &self,
         reader: R,
         writer: W,
-        working_dir: PathBuf,
+        config: SessionConfig,
     ) -> crate::error::Result<AcpClient>
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let command = self.command_for(working_dir);
+        let command = self.command_for(&config);
         // Use the single shared derivation (same path as spawn_transport) so the
         // test seam and the production path always agree on which policy/sink to
         // thread through (see `AcpCommand::transport_inputs`).
@@ -239,6 +242,8 @@ impl AcpBackend {
             &command.working_dir,
             Some(policy),
             Some(sink),
+            command.run_id.clone(),
+            command.task_id.clone(),
         )
         .await
     }
@@ -261,7 +266,7 @@ impl AgentBackend for AcpBackend {
     /// Connect failures are mapped to [`BackendError`] (`Spawn` for spawn
     /// failures, `Transport` for handshake/protocol failures).
     async fn spawn(&self, config: SessionConfig) -> Result<Box<dyn AgentSession>, BackendError> {
-        let command = self.command_for(config.working_dir);
+        let command = self.command_for(&config);
         let mut client = AcpClient::connect(command).await.map_err(map_error)?;
 
         // Apply role assignments (mode, model, effort) if advertised.
@@ -385,6 +390,19 @@ pub struct AcpSession {
     /// Capabilities snapshot taken from the client at construction time (after
     /// `session/new` handshake). `None` if the agent did not advertise any.
     capabilities: Option<api::SessionCapabilities>,
+    /// A cloned, `'static` send side for out-of-band notifications (e.g. cancel).
+    /// Stored at construction so it is available even while `self.client` is `None`
+    /// (moved into a turn worker). Set to `None` on `terminate()` so the writer
+    /// `Arc` is released when the session ends — avoiding a reference that would
+    /// outlive the transport and delay EOF on the peer's read side.
+    cancel_sender: Option<crate::transport::TransportSender<crate::client::BoxedWriter>>,
+    /// The session id assigned by the agent. Stored at construction so it is
+    /// available even while `self.client` is `None` (moved into a turn worker).
+    session_id: String,
+    /// The stop_reason from the last completed turn, shared with the worker task
+    /// via an Arc<Mutex>. Updated by the worker after turn completion, readable
+    /// by this session at any time.
+    last_stop_reason: Arc<Mutex<Option<StopReason>>>,
 }
 
 impl AcpSession {
@@ -402,6 +420,8 @@ impl AcpSession {
     pub fn from_client(client: AcpClient, system_prompt: impl Into<String>) -> Self {
         let system_prompt = system_prompt.into();
         let capabilities = build_capabilities(&client);
+        let cancel_sender = client.sender_clone();
+        let session_id = client.session_id().to_string();
         Self {
             client: Some(client),
             pending_return: None,
@@ -409,6 +429,9 @@ impl AcpSession {
             // a stray leading blank line.
             system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
             capabilities,
+            cancel_sender: Some(cancel_sender),
+            session_id,
+            last_stop_reason: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -443,6 +466,33 @@ impl AcpSession {
             None => text,
         }
     }
+
+    /// Send a `session/cancel` notification to gracefully cancel an in-flight turn.
+    ///
+    /// This method fires the cancel through a sender clone stored at construction,
+    /// so it works even while `self.client` is `None` (moved into a turn worker).
+    /// The cancel is best-effort: if the agent is already done, the notification
+    /// is a no-op; if the agent receives it mid-turn it should exit gracefully.
+    ///
+    /// Returns [`BackendError::Terminated`] if the session has already been
+    /// terminated (the stored sender was released by [`AgentSession::terminate`]).
+    pub async fn cancel(&self) -> Result<(), BackendError> {
+        match &self.cancel_sender {
+            Some(sender) => sender
+                .send_cancel(&self.session_id)
+                .await
+                .map_err(map_error),
+            None => Err(BackendError::Terminated),
+        }
+    }
+
+    /// Return the stop_reason from the last completed turn, if any.
+    ///
+    /// Returns `None` if no turn has completed yet, or if the turn completed
+    /// without a stop_reason (though a well-formed ACP agent always provides one).
+    pub fn last_stop_reason(&self) -> Option<StopReason> {
+        self.last_stop_reason.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -475,12 +525,14 @@ impl AgentSession for AcpSession {
         let (return_tx, return_rx) = oneshot::channel::<AcpClient>();
         self.pending_return = Some(return_rx);
 
+        let stop_cell = Arc::clone(&self.last_stop_reason);
+
         tokio::spawn(async move {
             // Drive one ACP turn. Inside `run_turn`, `client.prompt` borrows
             // `client` to build the `PromptStream`; that borrow ends when
             // `run_turn` returns (its stream local is dropped), so the client is
             // free to move again here.
-            run_turn(&mut client, text, &event_tx).await;
+            run_turn(&mut client, text, &event_tx, &stop_cell).await;
             // Return the (no-longer-borrowed) client so the session can reuse or
             // shut it down. If the session was dropped meanwhile the send fails
             // and the client is dropped here — its own `Drop` tears the
@@ -497,10 +549,20 @@ impl AgentSession for AcpSession {
     /// still-running turn is wound down cleanly), then calls
     /// [`AcpClient::shutdown`]. Idempotent: once terminated the client is `None`
     /// and subsequent calls return `Ok(())`.
+    ///
+    /// Also drops the `cancel_sender` so the writer `Arc` is released promptly,
+    /// allowing the peer's read side to see EOF without waiting for `AcpSession`
+    /// itself to be dropped.
     async fn terminate(&mut self) -> Result<(), BackendError> {
         // Reclaim the client from any pending turn so we can shut it down (and so
         // a still-running worker is wound down rather than leaked).
         self.reclaim_client().await;
+
+        // Release the cancel sender now so the transport's write Arc is freed
+        // as soon as the client drops, rather than when AcpSession is dropped.
+        // This avoids holding the writer alive past the point where the peer
+        // expects EOF (the peer reads until EOF to detect client shutdown).
+        self.cancel_sender = None;
 
         match self.client.take() {
             Some(mut client) => {
@@ -549,6 +611,7 @@ async fn run_turn(
     client: &mut AcpClient,
     text: String,
     event_tx: &mpsc::Sender<Result<ResponseEvent, BackendError>>,
+    stop_cell: &Arc<Mutex<Option<StopReason>>>,
 ) {
     use futures::StreamExt;
 
@@ -595,20 +658,23 @@ async fn run_turn(
             Ok(AcpResponseChunk::CurrentModeUpdate { current_mode_id }) => {
                 Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })
             }
-            Ok(AcpResponseChunk::TurnComplete(_reason)) => {
+            Ok(AcpResponseChunk::TurnComplete { stop_reason, usage }) => {
                 // Final item on a clean turn. Forward it; whether or not the
-                // consumer is still listening, the turn is over. The ACP
-                // `stop_reason` is intentionally dropped — `ResponseEvent::TurnComplete`
-                // carries no reason in the MVP.
+                // consumer is still listening, the turn is over. Store the
+                // stop_reason in the shared cell so callers can inspect it.
                 //
-                // Usage is mapped to `None` here (MVP fallback): the ACP
-                // `PromptResult.usage` field is parsed by the protocol layer but
-                // not yet threaded through `AcpResponseChunk::TurnComplete`
-                // (would require changing `client.rs`).  Behaviour is identical —
-                // usage simply never lights up until that threading is added.
+                // The ACP `usage` from the agent is now threaded through via
+                // `AcpResponseChunk::TurnComplete`.
+                // Convert protocol::TurnUsage → api::UsageStats.
+                let usage = usage.map(|u| api::UsageStats {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                });
                 let _ = event_tx
-                    .send(Ok(ResponseEvent::TurnComplete { usage: None }))
+                    .send(Ok(ResponseEvent::TurnComplete { usage }))
                     .await;
+                // Write the stop_reason to the shared cell.
+                *stop_cell.lock().unwrap() = Some(stop_reason);
                 return;
             }
             // Mid-turn failure: surface a typed error item and stop. The ACP
@@ -705,6 +771,7 @@ mod tests {
             effort: None,
             extra: None,
             task_id: None,
+            run_id: "test-run".into(),
         };
         // The Ok variant (`Box<dyn AgentSession>`) is not Debug, so match rather
         // than `unwrap_err()`.
@@ -720,7 +787,17 @@ mod tests {
         let backend = AcpBackend::new("gemini", vec!["--acp".into(), "--quiet".into()])
             .env("FOO", "bar")
             .env("BAZ", "qux");
-        let command = backend.command_for(PathBuf::from("/work/dir"));
+        let config = makina_core::backend::SessionConfig {
+            working_dir: PathBuf::from("/work/dir"),
+            system_prompt: "test".into(),
+            mode: None,
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: "test-run".into(),
+        };
+        let command = backend.command_for(&config);
 
         assert_eq!(command.program, PathBuf::from("gemini"));
         assert_eq!(command.args, vec!["--acp".to_string(), "--quiet".into()]);
@@ -732,33 +809,96 @@ mod tests {
                 ("BAZ".to_string(), "qux".to_string()),
             ]
         );
+        assert_eq!(command.run_id, "test-run");
+        assert_eq!(command.task_id, None);
     }
 
-    #[test]
-    fn compose_first_turn_prepends_only_once() {
-        // We can't build a real AcpClient without a transport here, so test the
-        // prompt-composition logic directly on a session whose client is None
-        // (compose_first_turn does not touch the client).
-        let mut session = AcpSession {
-            client: None,
-            pending_return: None,
-            system_prompt: Some("SYS".to_string()),
-            capabilities: None,
-        };
-        assert_eq!(session.compose_first_turn("turn1".into()), "SYS\n\nturn1");
-        // The prompt is consumed; later turns are verbatim.
-        assert_eq!(session.compose_first_turn("turn2".into()), "turn2");
+    /// Build a minimal [`AcpClient`] connected to a scripted handshake peer.
+    ///
+    /// The peer replies to `initialize` and `session/new` with the given
+    /// `session_id`, then drains all remaining lines until EOF — it does not
+    /// answer any `session/prompt` calls.  Used by the compose-first-turn tests
+    /// which only need a live session (not a full turn).
+    async fn minimal_session(system_prompt: &str) -> AcpSession {
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, peer_io) = tokio::io::duplex(8 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        // Peer: answer initialize + session/new, then drain (no prompts answered).
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(peer_read).lines();
+            // initialize
+            if let Ok(Some(line)) = lines.next_line().await {
+                let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let id = &req["id"];
+                let resp = json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"agentInfo":{"name":"m","version":"0"}}});
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                peer_write.write_all(&bytes).await.unwrap();
+                peer_write.flush().await.unwrap();
+            }
+            // session/new
+            if let Ok(Some(line)) = lines.next_line().await {
+                let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let id = &req["id"];
+                let resp =
+                    json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"unit-test-session"}});
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                peer_write.write_all(&bytes).await.unwrap();
+                peer_write.flush().await.unwrap();
+            }
+            // Drain remaining lines until the client closes.
+            while let Ok(Some(_)) = lines.next_line().await {}
+        });
+
+        let client = AcpClient::with_transport(
+            client_read,
+            client_write,
+            "/tmp",
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .expect("minimal handshake must succeed");
+        AcpSession::from_client(client, system_prompt)
     }
 
-    #[test]
-    fn compose_first_turn_without_system_prompt_is_verbatim() {
-        let mut session = AcpSession {
-            client: None,
-            pending_return: None,
-            system_prompt: None,
-            capabilities: None,
-        };
-        assert_eq!(session.compose_first_turn("hello".into()), "hello");
+    #[tokio::test]
+    async fn compose_first_turn_prepends_only_once() {
+        // Verify that `compose_first_turn` prepends the system prompt on the first
+        // call and sends subsequent turns verbatim.  Uses a minimal session so the
+        // private method can be called directly on `AcpSession`.
+        let mut session = minimal_session("System prompt here.").await;
+
+        let first = session.compose_first_turn("do task A".to_string());
+        assert_eq!(
+            first, "System prompt here.\n\ndo task A",
+            "first turn must include the system-prompt prelude"
+        );
+
+        let second = session.compose_first_turn("do task B".to_string());
+        assert_eq!(
+            second, "do task B",
+            "second turn must be verbatim (system prompt consumed on first call)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_first_turn_without_system_prompt_is_verbatim() {
+        // With an empty system prompt, every turn is sent verbatim.
+        let mut session = minimal_session("").await;
+
+        let first = session.compose_first_turn("just the task".to_string());
+        assert_eq!(
+            first, "just the task",
+            "empty system prompt must not add a stray prelude"
+        );
     }
 
     /// Gateway-threading unit test (task `gateway-threading`).
@@ -816,7 +956,17 @@ mod tests {
             AcpBackend::new("echo", vec!["--acp".into()]).with_audit_sink(Arc::clone(&sink_arc));
 
         // Prove the Arc flows into the command (same pointer, not a copy).
-        let command = backend.command_for(worktree.clone());
+        let config = makina_core::backend::SessionConfig {
+            working_dir: worktree.clone(),
+            system_prompt: "test".into(),
+            mode: None,
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: "test-run".into(),
+        };
+        let command = backend.command_for(&config);
         assert!(
             Arc::ptr_eq(&sink_arc, &command.audit_sink),
             "command_for must carry the exact Arc injected into the backend"
@@ -898,7 +1048,7 @@ mod tests {
 
         // ── connect through the backend seam, not bare with_transport ───────
         let client = backend
-            .spawn_with_transport(client_read, client_write, worktree)
+            .spawn_with_transport(client_read, client_write, config)
             .await
             .expect("spawn_with_transport handshake must succeed");
 
@@ -946,6 +1096,408 @@ mod tests {
             recorded[0].option_id.as_deref(),
             Some("proceed_once"),
             "WorktreePolicy must select the allow_once option"
+        );
+        // ── verify run_id and task_id are threaded through ────────────────
+        assert_eq!(
+            recorded[0].run_id, "test-run",
+            "AuditEntry.run_id must match SessionConfig.run_id"
+        );
+        assert_eq!(
+            recorded[0].task_id.as_deref(),
+            None,
+            "AuditEntry.task_id must match SessionConfig.task_id"
+        );
+    }
+
+    /// Unit test for task `usage-through-backend-trait`.
+    ///
+    /// Proves that `ResponseEvent::TurnComplete` emits the actual `usage` from the
+    /// agent (converted `protocol::TurnUsage` → `api::UsageStats`) instead of
+    /// `None`. Constructs a session via `from_client` against a mock agent whose
+    /// `session/prompt` result carries usage, then verifies the emitted
+    /// `ResponseEvent::TurnComplete` holds the expected `api::UsageStats` counts.
+    #[tokio::test]
+    async fn test_acp_backend_emits_usage_in_turn_complete() {
+        use futures::StreamExt as _;
+        use makina_core::backend::{AgentSession, ResponseEvent};
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let session_id = "test-usage-session";
+        let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        // Mock peer: answer initialize + session/new, then respond to prompt with usage.
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(peer_read).lines();
+
+            macro_rules! send {
+                ($v:expr) => {{
+                    let mut bytes = serde_json::to_vec(&$v).unwrap();
+                    bytes.push(b'\n');
+                    peer_write.write_all(&bytes).await.unwrap();
+                    peer_write.flush().await.unwrap();
+                }};
+            }
+
+            // initialize
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({
+                "jsonrpc": "2.0", "id": 0,
+                "result": { "protocolVersion": 1, "agentCapabilities": {},
+                            "authMethods": [], "agentInfo": { "name": "test-agent", "version": "1.0" } }
+            }));
+
+            // session/new
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({ "jsonrpc": "2.0", "id": 1,
+                          "result": { "sessionId": session_id } }));
+
+            // session/prompt: read it
+            let _ = lines.next_line().await.unwrap();
+
+            // Send a text chunk via session/update notification
+            send!(json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": { "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "Hello, world!" } }
+                }
+            }));
+
+            // Send the final result with usage data
+            send!(json!({ "jsonrpc": "2.0", "id": 2,
+                          "result": {
+                              "stopReason": "end_turn",
+                              "usage": {
+                                  "inputTokens": 42,
+                                  "outputTokens": 100
+                              }
+                          } }));
+        });
+
+        // Build session and run the turn
+        let client = AcpClient::with_transport(
+            client_read,
+            client_write,
+            "/tmp",
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .expect("handshake must succeed");
+        let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
+
+        let stream = session
+            .prompt(makina_core::backend::Prompt::new("hello"))
+            .await
+            .expect("prompt accepted");
+
+        // Collect the stream and verify usage in TurnComplete
+        let mut text = String::new();
+        let mut found_usage = false;
+        let mut stream = stream;
+        while let Some(item) = stream.next().await {
+            match item.expect("no error expected") {
+                ResponseEvent::TextChunk { text: chunk } => text.push_str(&chunk),
+                ResponseEvent::TurnComplete { usage } => {
+                    // This is the main assertion: usage must be present and correct
+                    assert!(usage.is_some(), "TurnComplete must carry usage");
+                    let usage = usage.unwrap();
+                    assert_eq!(
+                        usage.input_tokens,
+                        Some(42),
+                        "input tokens must be converted from protocol to api"
+                    );
+                    assert_eq!(
+                        usage.output_tokens,
+                        Some(100),
+                        "output tokens must be converted from protocol to api"
+                    );
+                    found_usage = true;
+                }
+                // Ignore other events
+                _ => {}
+            }
+        }
+
+        assert!(found_usage, "TurnComplete event must have been emitted");
+        assert_eq!(text, "Hello, world!", "full text must be assembled");
+    }
+
+    /// Unit test for task `stop-reason-session-state`.
+    ///
+    /// Proves that `AcpSession` stores the stop_reason from the last completed
+    /// turn and exposes it via `last_stop_reason()`. Constructs a session via
+    /// `from_client` against a mock agent whose `session/prompt` result carries
+    /// a specific stop_reason, drives a full turn, then verifies the session's
+    /// stored stop_reason matches the mock agent's reason.
+    #[tokio::test]
+    async fn test_acp_session_stores_last_stop_reason() {
+        use futures::StreamExt as _;
+        use makina_core::backend::{AgentSession, ResponseEvent};
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let session_id = "test-stop-reason-session";
+        let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        // Mock peer: answer initialize + session/new, then respond to prompt with a specific stop_reason.
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(peer_read).lines();
+
+            macro_rules! send {
+                ($v:expr) => {{
+                    let mut bytes = serde_json::to_vec(&$v).unwrap();
+                    bytes.push(b'\n');
+                    peer_write.write_all(&bytes).await.unwrap();
+                    peer_write.flush().await.unwrap();
+                }};
+            }
+
+            // initialize
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({
+                "jsonrpc": "2.0", "id": 0,
+                "result": { "protocolVersion": 1, "agentCapabilities": {},
+                            "authMethods": [], "agentInfo": { "name": "test-agent", "version": "1.0" } }
+            }));
+
+            // session/new
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({ "jsonrpc": "2.0", "id": 1,
+                          "result": { "sessionId": session_id } }));
+
+            // session/prompt: read it
+            let _ = lines.next_line().await.unwrap();
+
+            // Send a text chunk via session/update notification
+            send!(json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": { "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "Refusal message" } }
+                }
+            }));
+
+            // Send the final result with stopReason: refusal
+            send!(json!({ "jsonrpc": "2.0", "id": 2,
+                          "result": {
+                              "stopReason": "refusal",
+                              "usage": {
+                                  "inputTokens": 10,
+                                  "outputTokens": 5
+                              }
+                          } }));
+        });
+
+        // Build session and run the turn
+        let client = AcpClient::with_transport(
+            client_read,
+            client_write,
+            "/tmp",
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .expect("handshake must succeed");
+        let mut session = AcpSession::from_client(client, "");
+
+        // Before running the turn, last_stop_reason should be None
+        assert_eq!(
+            session.last_stop_reason(),
+            None,
+            "last_stop_reason should be None before any turn"
+        );
+
+        let stream = session
+            .prompt(makina_core::backend::Prompt::new("try something"))
+            .await
+            .expect("prompt accepted");
+
+        // Drive the stream to completion to allow the worker to write the stop_reason
+        let mut stream = stream;
+        let mut turn_completed = false;
+        while let Some(item) = stream.next().await {
+            if let ResponseEvent::TurnComplete { .. } = item.expect("no error expected") {
+                turn_completed = true;
+            }
+        }
+
+        assert!(turn_completed, "TurnComplete must be emitted");
+
+        // After the turn completes, last_stop_reason should be Some(Refusal)
+        let stored_reason = session.last_stop_reason();
+        assert_eq!(
+            stored_reason,
+            Some(StopReason::Refusal),
+            "last_stop_reason must match the agent's stop_reason"
+        );
+    }
+
+    /// Unit test for task `acp-backend-pass-run-task-ids`.
+    ///
+    /// Proves that run_id and task_id thread from `SessionConfig` through
+    /// `spawn` → `command_for`/`AcpCommand` → `spawn_with_transport` →
+    /// `with_transport` → `Transport::new` into every emitted `AuditEntry`.
+    ///
+    /// The test spawns a session via the `spawn_with_transport`/`from_client`
+    /// seam with known run/task ids, drives a turn that causes a permission
+    /// request, and asserts the emitted `AuditEntry` carries those exact ids.
+    #[tokio::test]
+    async fn test_acp_backend_spawn_threads_run_task_ids() {
+        use futures::StreamExt as _;
+        use makina_core::backend::AgentSession;
+        use makina_core::governance::{AuditEntry, AuditSink};
+        use serde_json::json;
+        use std::sync::Mutex;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const PERM_REQUEST_ID: u64 = 7777;
+        const EXPECTED_RUN_ID: &str = "run-abc-123";
+        const EXPECTED_TASK_ID: &str = "task-xyz-456";
+
+        // ── capturing sink ──────────────────────────────────────────────────
+        #[derive(Clone, Default)]
+        struct CapturingSink {
+            entries: Arc<Mutex<Vec<AuditEntry>>>,
+        }
+        impl AuditSink for CapturingSink {
+            fn record(&self, entry: AuditEntry) {
+                self.entries.lock().unwrap().push(entry);
+            }
+        }
+
+        let sink = CapturingSink::default();
+        let entries_handle = Arc::clone(&sink.entries);
+        let sink_arc: Arc<dyn AuditSink> = Arc::new(sink);
+
+        // ── backend and worktree ────────────────────────────────────────────
+        let worktree = std::env::temp_dir().join("makina-backend-run-task-ids-test");
+        let _ = std::fs::create_dir_all(&worktree);
+        let backend =
+            AcpBackend::new("echo", vec!["--acp".into()]).with_audit_sink(Arc::clone(&sink_arc));
+
+        // ── config with known run_id and task_id ───────────────────────────
+        let config = makina_core::backend::SessionConfig {
+            working_dir: worktree.clone(),
+            system_prompt: "test".into(),
+            mode: None,
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: Some(EXPECTED_TASK_ID.to_string()),
+            run_id: EXPECTED_RUN_ID.to_string(),
+        };
+
+        // ── mock peer ───────────────────────────────────────────────────────
+        let session_id = "sess-run-task-ids";
+        let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        let peer = tokio::spawn(async move {
+            let mut lines = BufReader::new(peer_read).lines();
+
+            macro_rules! send {
+                ($v:expr) => {{
+                    let mut bytes = serde_json::to_vec(&$v).unwrap();
+                    bytes.push(b'\n');
+                    peer_write.write_all(&bytes).await.unwrap();
+                    peer_write.flush().await.unwrap();
+                }};
+            }
+
+            // initialize
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({
+                "jsonrpc": "2.0", "id": 0,
+                "result": { "protocolVersion": 1, "agentCapabilities": {},
+                            "authMethods": [], "agentInfo": { "name": "mock", "version": "0" } }
+            }));
+
+            // session/new
+            let _ = lines.next_line().await.unwrap();
+            send!(json!({ "jsonrpc": "2.0", "id": 1,
+                          "result": { "sessionId": session_id } }));
+
+            // session/prompt: read it
+            let _ = lines.next_line().await.unwrap();
+
+            // inject a permission request so the transport emits an AuditEntry
+            send!(json!({
+                "jsonrpc": "2.0", "id": PERM_REQUEST_ID,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": session_id,
+                    "options": [
+                        { "optionId": "proceed_always", "name": "Always", "kind": "allow_always" },
+                        { "optionId": "proceed_once",   "name": "Allow",  "kind": "allow_once"  }
+                    ],
+                    "toolCall": {
+                        "toolCallId": "write_file__run_task_id_test",
+                        "title": "Write file"
+                    }
+                }
+            }));
+
+            // read the client's permission response
+            if let Ok(Some(_)) = lines.next_line().await {}
+
+            // send one text chunk and complete
+            send!(json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": { "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "ids threaded" } }
+                }
+            }));
+            send!(json!({ "jsonrpc": "2.0", "id": 2,
+                          "result": { "stopReason": "end_turn" } }));
+        });
+
+        // ── spawn session via backend seam ──────────────────────────────────
+        let client = backend
+            .spawn_with_transport(client_read, client_write, config)
+            .await
+            .expect("spawn_with_transport handshake must succeed");
+
+        // ── drive one full turn ─────────────────────────────────────────────
+        let mut session: Box<dyn AgentSession> = Box::new(AcpSession::from_client(client, ""));
+        let stream = session
+            .prompt(makina_core::backend::Prompt::new("thread the ids"))
+            .await
+            .expect("prompt accepted");
+
+        let mut stream = stream;
+        while let Some(item) = stream.next().await {
+            item.expect("no stream error expected");
+        }
+
+        session.terminate().await.expect("terminate ok");
+        peer.await.expect("mock peer task panicked");
+
+        // ── key assertion: AuditEntry carries the injected run_id/task_id ──
+        let recorded = entries_handle.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one AuditEntry must be recorded");
+        assert_eq!(
+            recorded[0].run_id, EXPECTED_RUN_ID,
+            "AuditEntry.run_id must match SessionConfig.run_id threaded through spawn"
+        );
+        assert_eq!(
+            recorded[0].task_id.as_deref(),
+            Some(EXPECTED_TASK_ID),
+            "AuditEntry.task_id must match SessionConfig.task_id threaded through spawn"
         );
     }
 }

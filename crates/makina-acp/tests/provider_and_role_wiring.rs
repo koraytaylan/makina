@@ -405,6 +405,8 @@ async fn selections_applied_after_session_new() {
         std::env::temp_dir(),
         None,
         None,
+        String::new(),
+        None,
     )
     .await
     .expect("handshake should succeed");

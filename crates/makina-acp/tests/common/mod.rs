@@ -64,6 +64,8 @@ pub struct MockBehavior {
     /// continues the turn normally.  The value is the `toolCallId` to use in the
     /// permission request, with a single `allow_once` option offered.
     pub inject_permission_request: Option<String>,
+    /// Optional usage counts to include in the prompt result (e.g. `{ "inputTokens": 42, "outputTokens": 100 }`).
+    pub usage: Option<Value>,
 }
 
 impl Default for MockBehavior {
@@ -77,6 +79,7 @@ impl Default for MockBehavior {
             // Default: advertise one auth method so tests can assert observability.
             auth_methods: vec![json!({ "type": "oauth" })],
             inject_permission_request: None,
+            usage: None,
         }
     }
 }
@@ -337,12 +340,16 @@ async fn run_mock<R, W>(
                 }
 
                 // Finish the turn.
+                let mut result = json!({ "stopReason": behavior.stop_reason });
+                if let Some(usage) = &behavior.usage {
+                    result["usage"] = usage.clone();
+                }
                 send(
                     &mut writer,
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "result": { "stopReason": behavior.stop_reason }
+                        "result": result
                     }),
                 )
                 .await;

@@ -430,7 +430,7 @@ pub struct PromptResult {
 ///
 /// Both fields are optional because a backend may report one count without
 /// the other. `#[serde(default)]` ensures missing fields parse as `None`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnUsage {
     /// Prompt/input tokens consumed by the turn, if reported.

@@ -252,6 +252,7 @@ pub fn session_config_for(
         effort,
         extra: None,
         task_id: None,
+        run_id: String::new(),
     }
 }
 

@@ -124,6 +124,14 @@ pub struct SessionConfig {
     /// sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+
+    /// The run id associated with this session.
+    ///
+    /// Set by the orchestrator when spawning a Developer or Reviewer session.
+    /// Backends may use it for logging or routing; a value of `""` (empty string)
+    /// means "no run context" — e.g. standalone sessions or older invocations.
+    #[serde(default)]
+    pub run_id: String,
 }
 
 /// A single turn prompt sent to an [`AgentSession`].
@@ -440,6 +448,7 @@ mod tests {
             effort: None,
             extra: None,
             task_id: None,
+            run_id: "test-run".into(),
         };
         let mut session: Box<dyn AgentSession> = backend.spawn(config).await.unwrap();
 
@@ -495,6 +504,7 @@ mod tests {
             effort: None,
             extra: None,
             task_id: None,
+            run_id: "test-run".into(),
         };
         let mut session = backend.spawn(config).await.unwrap();
         session.terminate().await.unwrap();
@@ -517,6 +527,7 @@ mod tests {
             effort: None,
             extra: None,
             task_id: None,
+            run_id: "test-run".into(),
         };
         let serialised = toml::to_string(&config).expect("serialise config to TOML");
         let deserialised: SessionConfig =

@@ -237,6 +237,7 @@ pub async fn discover_project(
         effort: None,
         extra: None,
         task_id: None,
+        run_id: String::new(),
     };
     let mut session = backend.spawn(cfg).await?;
 
