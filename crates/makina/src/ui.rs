@@ -842,14 +842,15 @@ pub fn render(app: &App, frame: &mut Frame) {
     }
 
     // ── Doctor health-check overlay (task 0046) ──────────────────────────────────
-    // Drawn after help overlay so it sits on top when both might be open.
+    // Drawn before the help overlay. Both call Clear() first and are toggled by
+    // distinct keys, so at most one is open at a time.
     if app.is_viewing_doctor() {
         render_doctor(app, frame, area);
     }
 
     // ── Help overlay (plan 0038) ──────────────────────────────────────────────────
-    // Drawn after provider editor but before doctor so it sits under doctor if both
-    // might be open (help is less urgent than doctor).
+    // Drawn after the doctor overlay, so if both were ever open help would sit on
+    // top. Both call Clear() first, so neither leaks through the other.
     if app.help_mode_active {
         render_help_overlay(app, frame, area);
     }
@@ -4259,7 +4260,7 @@ mod tests {
     /// The status bar must show the current dependency view label.
     #[test]
     fn status_bar_shows_current_view_label() {
-        // The status bar carries more hints now ([^P] cmds + [e] errors badge + [?] doctor
+        // The status bar carries more hints now ([^P] cmds + [e] errors badge + [?] help
         // + [wheel] scroll), so use a wider terminal to ensure the trailing
         // `view:` label is not clipped before the assertions run.
         let mut terminal = make_terminal(220, 24);
