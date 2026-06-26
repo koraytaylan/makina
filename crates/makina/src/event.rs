@@ -135,6 +135,7 @@ pub async fn run(
             browsing: app.is_browsing(),
             editing_providers: app.is_editing_providers(),
             viewing_doctor: app.is_viewing_doctor(),
+            help_mode_active: app.help_mode_active,
             command_palette: app.is_command_palette(),
             settings: app.is_settings(),
         };
@@ -1167,6 +1168,7 @@ struct ModalState {
     browsing: bool,
     editing_providers: bool,
     viewing_doctor: bool,
+    help_mode_active: bool,
     command_palette: bool,
     settings: bool,
 }
@@ -1187,7 +1189,7 @@ fn translate_terminal_event(
     app: &crate::app::App,
 ) -> AppEvent {
     match ev {
-        CrosstermEvent::Key(key) => translate_key(key, modal, focused_panel, plan_tab_active),
+        CrosstermEvent::Key(key) => translate_key(key, modal, focused_panel, plan_tab_active, app),
         CrosstermEvent::Resize(w, h) => AppEvent::Resize(w, h),
         // Mouse wheel scrolls the focused exchange pane regardless of the
         // `browsing` flag (the exchange pane is not the browser).
@@ -1248,11 +1250,13 @@ fn translate_key(
     modal: ModalState,
     focused_panel: crate::app::Panel,
     plan_tab_active: bool,
+    app: &crate::app::App,
 ) -> AppEvent {
     let ModalState {
         browsing,
         editing_providers,
         viewing_doctor,
+        help_mode_active,
         command_palette,
         settings,
     } = modal;
@@ -1320,6 +1324,13 @@ fn translate_key(
             KeyCode::Char(c) => AppEvent::SettingsInput(c),
             _ => AppEvent::Tick,
         }
+    } else if help_mode_active {
+        // ── Help overlay keymap ──────────────────────────────────────────────
+        // Esc or `q` closes the help overlay.
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => AppEvent::CloseHelpMode,
+            _ => AppEvent::Tick,
+        }
     } else if viewing_doctor {
         // ── Doctor overlay keymap ────────────────────────────────────────────
         // Esc closes the doctor; w writes starter config (if no config exists).
@@ -1361,8 +1372,10 @@ fn translate_key(
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
             // Open the provider/role configuration editor.
             KeyCode::Char('g') | KeyCode::Char('G') => AppEvent::OpenProviderEditor,
+            // Toggle the help overlay showing all keybindings.
+            KeyCode::Char('?') => AppEvent::ToggleHelpMode,
             // Open the doctor health-check overlay.
-            KeyCode::Char('?') => AppEvent::OpenDoctor,
+            KeyCode::Char('!') => AppEvent::OpenDoctor,
             // ── Accordion toggles (plan 0032) ────────────────────────────────────
             // s/a/t/z toggle accordion sections when the main pane is focused and
             // a plan tab is active. Otherwise, these fall back to run-control keys.
@@ -1438,6 +1451,21 @@ fn translate_key(
                 Panel::Sidebar => AppEvent::OpenFocusedNode,
                 Panel::Main => AppEvent::ToggleTreeNode,
             },
+            // PgUp/PgDn: scroll the error pane when it's open.
+            KeyCode::PageUp => {
+                if app.error_pane_open {
+                    AppEvent::ErrorPaneScrollUp
+                } else {
+                    AppEvent::Tick
+                }
+            }
+            KeyCode::PageDown => {
+                if app.error_pane_open {
+                    AppEvent::ErrorPaneScrollDown
+                } else {
+                    AppEvent::Tick
+                }
+            }
             _ => AppEvent::Tick,
         }
     }

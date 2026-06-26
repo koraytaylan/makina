@@ -716,6 +716,14 @@ pub fn render(app: &App, frame: &mut Frame) {
         }
     }
 
+    // Add error pane geometry if it's open (for mouse hitbox testing).
+    if app.error_pane_open && error_area.height > 0 && error_area.width > 0 {
+        panel_geoms.push(PanelGeometry {
+            panel: crate::app::ScrollablePanel::ErrorPane,
+            rect: error_area,
+        });
+    }
+
     // Record the accumulated panel geometries for hitbox testing in the event loop.
     app.set_panel_geometries(panel_geoms);
 
@@ -804,7 +812,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!(" [^P] cmds  [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] doctor  [wheel] scroll  "),
+            format!(" [^P] cmds  [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] help  [wheel] scroll  "),
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -834,13 +842,20 @@ pub fn render(app: &App, frame: &mut Frame) {
     }
 
     // ── Doctor health-check overlay (task 0046) ──────────────────────────────────
-    // Drawn last so it sits on top of all other overlays.
+    // Drawn after help overlay so it sits on top when both might be open.
     if app.is_viewing_doctor() {
         render_doctor(app, frame, area);
     }
 
+    // ── Help overlay (plan 0038) ──────────────────────────────────────────────────
+    // Drawn after provider editor but before doctor so it sits under doctor if both
+    // might be open (help is less urgent than doctor).
+    if app.help_mode_active {
+        render_help_overlay(app, frame, area);
+    }
+
     // ── Command palette overlay (plan 0069) ────────────────────────────────────
-    // Drawn after doctor so it sits on top when both might be open.
+    // Drawn after help overlay so it sits on top when both might be open.
     if app.is_command_palette()
         && let Some(p) = app.command_palette.as_ref()
     {
@@ -935,7 +950,7 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
         } else {
             Style::default()
                 .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
-                .fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
         };
         spans.push(Span::styled(chip, style));
         spans.push(Span::styled(
@@ -2247,14 +2262,15 @@ fn render_error_pane(app: &App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    // Auto-scroll so the latest messages stay visible.
+    // Mirror the exchange pane (ui.rs:1733–1749): record scroll_max for clamping,
+    // then render at the bottom while following or at the stored offset otherwise.
     let pane_height = inner.height as usize;
     let total_lines = lines.len();
-    let scroll_offset = if total_lines > pane_height {
-        (total_lines - pane_height) as u16
-    } else {
-        0
-    };
+    let scroll_max = total_lines.saturating_sub(pane_height) as u16;
+    app.last_scroll_maxes
+        .borrow_mut()
+        .insert(crate::app::ScrollablePanel::ErrorPane, scroll_max);
+    let scroll_offset = app.panel_offset(crate::app::ScrollablePanel::ErrorPane, scroll_max);
 
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -3257,6 +3273,164 @@ fn render_doctor(app: &App, frame: &mut Frame, area: Rect) {
     };
     let footer = Paragraph::new(Line::from(vec![Span::styled(
         footer_text,
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+    )]));
+    frame.render_widget(footer, footer_area);
+}
+
+/// Render the full-screen help overlay showing all keybindings grouped by category.
+fn render_help_overlay(app: &App, frame: &mut Frame, area: Rect) {
+    // Centre a box ~75% wide / 80% tall.
+    let popup = centered_rect(75, 80, area);
+
+    // Clear the region first so the popup is opaque.
+    frame.render_widget(Clear, popup);
+
+    let title = " Help — Keybindings ";
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split the popup into content area + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let content_area = chunks[0];
+    let footer_area = chunks[1];
+
+    // Build the keybindings grouped by category
+    let mut lines: Vec<Line> = Vec::new();
+
+    let section_style = Style::default()
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+        .add_modifier(Modifier::BOLD);
+    let binding_style =
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
+    let key_style = Style::default()
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Success))
+        .add_modifier(Modifier::BOLD);
+
+    // Run Control
+    lines.push(Line::from(Span::styled("Run Control", section_style)));
+    lines.push(Line::from(vec![
+        Span::styled("[o]", key_style),
+        Span::styled(" open browser  ", binding_style),
+        Span::styled("[s]", key_style),
+        Span::styled(" start run  ", binding_style),
+        Span::styled("[p]", key_style),
+        Span::styled(" pause", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[c]", key_style),
+        Span::styled(" cancel  ", binding_style),
+        Span::styled("[r]", key_style),
+        Span::styled(" retry focused", binding_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // Navigation
+    lines.push(Line::from(Span::styled("Navigation", section_style)));
+    lines.push(Line::from(vec![
+        Span::styled("[Tab]", key_style),
+        Span::styled(" next focus  ", binding_style),
+        Span::styled("[Shift+Tab]", key_style),
+        Span::styled(" prev focus", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[↑/↓ or j/k]", key_style),
+        Span::styled(" select up/down  ", binding_style),
+        Span::styled("[←/→]", key_style),
+        Span::styled(" collapse/expand", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[Alt+←/→]", key_style),
+        Span::styled(" prev/next tab  ", binding_style),
+        Span::styled("[Ctrl+W]", key_style),
+        Span::styled(" close tab", binding_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // View
+    lines.push(Line::from(Span::styled("View", section_style)));
+    lines.push(Line::from(vec![
+        Span::styled("[v]", key_style),
+        Span::styled(" cycle dependency view  ", binding_style),
+        Span::styled("[e]", key_style),
+        Span::styled(" toggle error pane", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[l]", key_style),
+        Span::styled(" open log  ", binding_style),
+        Span::styled("[Ctrl+O]", key_style),
+        Span::styled(" toggle verbose", binding_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // Accordion (plan tab)
+    lines.push(Line::from(Span::styled(
+        "Accordion (Plan Tab Active)",
+        section_style,
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("[s]", key_style),
+        Span::styled(" toggle Scope  ", binding_style),
+        Span::styled("[a]", key_style),
+        Span::styled(" toggle Architecture", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[t]", key_style),
+        Span::styled(" toggle Tasks  ", binding_style),
+        Span::styled("[z]", key_style),
+        Span::styled(" toggle Status", binding_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // Selection
+    lines.push(Line::from(Span::styled("Selection / Tree", section_style)));
+    lines.push(Line::from(vec![
+        Span::styled("[Space]", key_style),
+        Span::styled(" toggle tree node  ", binding_style),
+        Span::styled("[Enter]", key_style),
+        Span::styled(" open/toggle section", binding_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // Other
+    lines.push(Line::from(Span::styled("Other", section_style)));
+    lines.push(Line::from(vec![
+        Span::styled("[?]", key_style),
+        Span::styled(" toggle help  ", binding_style),
+        Span::styled("[!]", key_style),
+        Span::styled(" doctor", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[d]", key_style),
+        Span::styled(" dismiss warning  ", binding_style),
+        Span::styled("[g]", key_style),
+        Span::styled(" provider editor", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[Ctrl+P]", key_style),
+        Span::styled(" command palette  ", binding_style),
+        Span::styled("[q/Esc]", key_style),
+        Span::styled(" quit", binding_style),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, content_area);
+
+    // Footer with hints
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "[Esc] or [q] close",
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);

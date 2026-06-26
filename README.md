@@ -61,7 +61,7 @@ backend command and the Planner mechanism.
 ```toml
 [backend]
 command = "gemini"
-args    = ["--acp", "--yolo"]   # see "Limitations" re: --yolo
+args    = ["--acp"]
 
 [planner]
 mechanism = "one-shot-agent"
@@ -146,13 +146,12 @@ git clone /path/to/repo /tmp/repo-trial && cd /tmp/repo-trial
 | [`makina-acp`](crates/makina-acp) | The ACP agent-backend: spawns the agent CLI and speaks JSON-RPC over stdio. |
 | [`makina`](crates/makina) | The ratatui TUI — the binary and entry point. |
 
-## Limitations (MVP)
+## Limitations & Governance (MVP)
 
-- Some agents require an auto-approve flag (gemini's `--yolo`); without it the
-  agent's permission prompt stalls the turn — Makina's ACP client does not yet
-  answer `session/request_permission`.
-- Task-graph state lives in memory; `.makina/tasks/{slug}.json` persistence and crash
-  recovery are not implemented yet.
+- Task-graph state and task metadata are persisted in `.makina/tasks/{slug}.json`
+  with crash recovery (plans 0029/0030).
+- Permission requests are answered automatically by `WorktreePolicy`, which
+  auto-allows operations inside the assigned worktree and audits every decision.
 
 These and prioritized next steps are tracked in
 [`docs/trial/trial-findings.md`](docs/trial/trial-findings.md).

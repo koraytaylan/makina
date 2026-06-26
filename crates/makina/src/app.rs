@@ -681,6 +681,10 @@ pub enum AppEvent {
     ScrollUpAt(u16, u16),
     /// Scroll down at the given (column, row) — used for mouse-position-aware routing.
     ScrollDownAt(u16, u16),
+    /// Scroll the error pane one line up (PgUp key when error pane is open).
+    ErrorPaneScrollUp,
+    /// Scroll the error pane one line down (PgDn key when error pane is open).
+    ErrorPaneScrollDown,
     /// Left mouse button pressed at `(column, row)` — begin a text selection.
     SelectionStart(u16, u16),
     /// Mouse dragged to `(column, row)` with the left button held — extend the
@@ -829,8 +833,14 @@ pub enum AppEvent {
     /// [`App::provider_warning_dismissed`] so the banner stops rendering.
     DismissProviderWarning,
 
+    // ── Help overlay (plan 0038) ──────────────────────────────────────────────
+    /// User pressed `?` to toggle the help overlay showing all keybindings.
+    ToggleHelpMode,
+    /// User pressed Escape or `q` to close the help overlay.
+    CloseHelpMode,
+
     // ── Doctor health-check overlay (task 0046) ──────────────────────────────
-    /// User requested to open the doctor health-check overlay (pressed `?`).
+    /// User requested to open the doctor health-check overlay (pressed `!`).
     OpenDoctor,
     /// Close the doctor overlay and return to the normal view (Esc).
     CloseDoctor,
@@ -1029,6 +1039,8 @@ pub enum ScrollablePanel {
     DependencyView,
     /// The task entry pane (when a task tab is active).
     TaskEntry,
+    /// The error pane overlay.
+    ErrorPane,
 }
 
 /// Geometry of a single scrollable panel (used for mouse hitbox testing).
@@ -1170,6 +1182,12 @@ pub struct App {
     /// disengages auto-follow; scrolling back down to the bottom re-engages it.
     pub exchange_auto_follow: bool,
 
+    /// Whether the error pane auto-follows the bottom of the log.
+    ///
+    /// Defaults to `true` (newest error always visible).  Scrolling up
+    /// disengages auto-follow; scrolling back down to the bottom re-engages it.
+    pub error_pane_auto_follow: bool,
+
     /// Per-panel manual scroll offset (in lines from top). Key is the panel;
     /// a missing key defaults to 0. Written only from `App::update`, so a plain
     /// `HashMap` (no interior mutability needed).
@@ -1202,6 +1220,11 @@ pub struct App {
 
     /// Whether the error pane is currently visible.
     pub error_pane_open: bool,
+
+    /// Whether the help overlay is currently visible.
+    ///
+    /// Toggled by pressing `?` and dismissed with Escape or `q`.
+    pub help_mode_active: bool,
 
     /// Bounded ring of error-pane messages.  Capped at [`ERROR_MESSAGES_CAP`]
     /// by evicting the oldest; see [`App::push_error`].
@@ -1611,12 +1634,14 @@ impl App {
             task_last_activity_tick: HashMap::new(),
             task_step_start_tick: HashMap::new(),
             exchange_auto_follow: true,
+            error_pane_auto_follow: true,
             scroll_offsets: std::collections::HashMap::new(),
             last_scroll_maxes: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_event: None,
             status_message: None,
             busy: None,
             error_pane_open: false,
+            help_mode_active: false,
             error_messages: Vec::new(),
             unseen_errors: false,
             repo_root,
@@ -1692,6 +1717,13 @@ impl App {
         // Mark errors as unseen if the pane is not currently open.
         if !self.error_pane_open {
             self.unseen_errors = true;
+        }
+        // When auto-follow is engaged, a new error snaps the view to the newest entry
+        // (reset the offset to 0 so panel_offset will render at scroll_max).
+        // If the user has scrolled up (auto-follow disengaged), leave the stored offset
+        // untouched so a new error does NOT yank the view back down.
+        if self.error_pane_auto_follow {
+            self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
         }
     }
 
@@ -1910,9 +1942,9 @@ impl App {
         }
     }
 
-    /// Scroll the given panel up by one line, disengaging auto-follow if the panel is the exchange pane.
+    /// Scroll the given panel up by one line, disengaging auto-follow if the panel is the exchange or error pane.
     pub fn scroll_up(&mut self, panel: ScrollablePanel) {
-        // Only the exchange pane has auto-follow logic.
+        // Only the exchange and error panes have auto-follow logic.
         if panel == ScrollablePanel::Exchange && self.exchange_auto_follow {
             self.exchange_auto_follow = false;
             // Anchor the manual offset to the last rendered bottom.
@@ -1924,6 +1956,17 @@ impl App {
                 .unwrap_or(0);
             self.scroll_offsets
                 .insert(ScrollablePanel::Exchange, bottom);
+        } else if panel == ScrollablePanel::ErrorPane && self.error_pane_auto_follow {
+            self.error_pane_auto_follow = false;
+            // Anchor the manual offset to the last rendered bottom.
+            let bottom = self
+                .last_scroll_maxes
+                .borrow()
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0);
+            self.scroll_offsets
+                .insert(ScrollablePanel::ErrorPane, bottom);
         }
         let current = self.scroll_offsets.entry(panel).or_insert(0);
         *current = current.saturating_sub(1);
@@ -1935,6 +1978,8 @@ impl App {
         *current = current.saturating_add(1).min(scroll_max);
         if panel == ScrollablePanel::Exchange && *current == scroll_max {
             self.exchange_auto_follow = true;
+        } else if panel == ScrollablePanel::ErrorPane && *current == scroll_max {
+            self.error_pane_auto_follow = true;
         }
     }
 
@@ -1955,10 +2000,21 @@ impl App {
 
     /// The render-time scroll offset for any panel, clamped to scroll_max.
     /// The exchange pane delegates to `effective_offset` so auto-follow is honored;
+    /// the error pane honors `error_pane_auto_follow` similarly;
     /// every other panel uses its stored offset clamped to scroll_max.
     pub fn panel_offset(&self, panel: ScrollablePanel, scroll_max: u16) -> u16 {
         if panel == ScrollablePanel::Exchange {
             self.effective_offset(scroll_max)
+        } else if panel == ScrollablePanel::ErrorPane {
+            if self.error_pane_auto_follow {
+                scroll_max
+            } else {
+                self.scroll_offsets
+                    .get(&ScrollablePanel::ErrorPane)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(scroll_max)
+            }
         } else {
             self.scroll_offsets
                 .get(&panel)
@@ -2052,6 +2108,14 @@ impl App {
                 if self.error_pane_open {
                     self.unseen_errors = false;
                 }
+                true
+            }
+            AppEvent::ToggleHelpMode => {
+                self.help_mode_active = !self.help_mode_active;
+                true
+            }
+            AppEvent::CloseHelpMode => {
+                self.help_mode_active = false;
                 true
             }
             AppEvent::OpenLog => {
@@ -2193,6 +2257,20 @@ impl App {
                         .unwrap_or(0);
                     self.scroll_down(panel, scroll_max);
                 }
+                true
+            }
+            AppEvent::ErrorPaneScrollUp => {
+                self.scroll_up(ScrollablePanel::ErrorPane);
+                true
+            }
+            AppEvent::ErrorPaneScrollDown => {
+                let max = self
+                    .last_scroll_maxes
+                    .borrow()
+                    .get(&ScrollablePanel::ErrorPane)
+                    .copied()
+                    .unwrap_or(0);
+                self.scroll_down(ScrollablePanel::ErrorPane, max);
                 true
             }
             // ── Mouse text selection ──────────────────────────────────────────
@@ -3115,6 +3193,11 @@ impl App {
     fn load_exchanges_for_selected_run(&mut self) {
         use makina_core::paths;
 
+        // Seed the displayed countdown from the resolved config cap on the App; the
+        // Supervisor still enforces the real cap. RunView carries no caps field,
+        // so we read from App.
+        self.wall_clock_secs_config = self.caps.wall_clock_secs;
+
         let Some(run) = self.selected_run() else {
             return;
         };
@@ -3409,6 +3492,218 @@ mod tests {
             app.error_messages.last().unwrap().text,
             format!("msg {}", total - 1),
             "most recent message must be retained"
+        );
+    }
+
+    /// Error pane scroll: manual offset clamps to `[0, scroll_max]`,
+    /// scrolling up disengages auto-follow, and scrolling back down to the
+    /// bottom re-engages it (mirroring exchange pane behavior).
+    #[test]
+    fn error_pane_scroll_clamps_and_auto_follow_reengages() {
+        let mut app = make_app();
+        let max: u16 = 3;
+
+        // Default: auto-follow engaged, offset at the top.
+        assert!(app.error_pane_auto_follow);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+
+        // scroll_up clears auto-follow.
+        app.scroll_up(ScrollablePanel::ErrorPane);
+        assert!(
+            !app.error_pane_auto_follow,
+            "scroll_up must clear error_pane_auto_follow"
+        );
+
+        // scroll_up never goes below 0.
+        app.scroll_up(ScrollablePanel::ErrorPane);
+        app.scroll_up(ScrollablePanel::ErrorPane);
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "scroll_up must not go below 0"
+        );
+
+        // scroll_down never exceeds max.
+        for _ in 0..(max + 5) {
+            app.scroll_down(ScrollablePanel::ErrorPane, max);
+            assert!(
+                app.scroll_offsets
+                    .get(&ScrollablePanel::ErrorPane)
+                    .copied()
+                    .unwrap_or(0)
+                    <= max,
+                "scroll_down must never exceed scroll_max"
+            );
+        }
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0),
+            max
+        );
+
+        // scroll_down reaching max re-sets auto-follow.
+        assert!(
+            app.error_pane_auto_follow,
+            "scroll_down reaching scroll_max must re-set error_pane_auto_follow"
+        );
+    }
+
+    /// ErrorPaneScrollUp event scrolls the error pane up when open.
+    #[test]
+    fn test_error_pane_scrolls_up_on_pgup() {
+        let mut app = make_app();
+
+        // Set up scroll space and disengage auto-follow first.
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::ErrorPane, 10);
+        app.error_pane_auto_follow = false;
+        app.scroll_offsets.insert(ScrollablePanel::ErrorPane, 5);
+
+        let offset_before = app
+            .scroll_offsets
+            .get(&ScrollablePanel::ErrorPane)
+            .copied()
+            .unwrap_or(0);
+
+        // ErrorPaneScrollUp should decrease offset.
+        app.update(AppEvent::ErrorPaneScrollUp);
+        assert!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0)
+                < offset_before,
+            "ErrorPaneScrollUp must decrement error pane offset"
+        );
+    }
+
+    /// ErrorPaneScrollDown event scrolls the error pane down when open.
+    #[test]
+    fn test_error_pane_scrolls_down_on_pgdn() {
+        let mut app = make_app();
+        let max: u16 = 10;
+
+        // Set up scroll space.
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::ErrorPane, max);
+
+        let offset_before = app
+            .scroll_offsets
+            .get(&ScrollablePanel::ErrorPane)
+            .copied()
+            .unwrap_or(0);
+
+        // ErrorPaneScrollDown should increase offset.
+        app.update(AppEvent::ErrorPaneScrollDown);
+        assert!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0)
+                > offset_before,
+            "ErrorPaneScrollDown must increment error pane offset"
+        );
+    }
+
+    /// Auto-follow disengages when user scrolls up.
+    #[test]
+    fn test_error_pane_auto_follow_disengages_on_scroll_up() {
+        let mut app = make_app();
+
+        // Start with auto-follow engaged.
+        assert!(app.error_pane_auto_follow);
+
+        // Scroll up should disengage auto-follow.
+        app.scroll_up(ScrollablePanel::ErrorPane);
+        assert!(
+            !app.error_pane_auto_follow,
+            "scroll_up must disengage error_pane_auto_follow"
+        );
+    }
+
+    /// New error does not yank the view when user has scrolled up.
+    #[test]
+    fn test_error_pane_new_error_does_not_yank_when_scrolled_up() {
+        let mut app = make_app();
+
+        // Set up scroll space.
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::ErrorPane, 10);
+
+        // Manually set the offset to simulate user scrolling.
+        app.scroll_offsets.insert(ScrollablePanel::ErrorPane, 5);
+
+        // Disengage auto-follow.
+        app.error_pane_auto_follow = false;
+
+        // Verify the offset is 5.
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0),
+            5
+        );
+
+        // Push a new error while auto-follow is disengaged.
+        app.push_error(ErrorMessage {
+            timestamp: std::time::SystemTime::now(),
+            level: ErrorLevel::Error,
+            text: "new error".into(),
+        });
+
+        // The offset should NOT change (not yanked to bottom).
+        // Since auto_follow is false, push_error should not reset the offset.
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0),
+            5,
+            "new error must NOT yank the view when auto-follow is disengaged"
+        );
+    }
+
+    /// When auto-follow is engaged, new error snaps to the newest entry.
+    #[test]
+    fn test_error_pane_new_error_snaps_to_newest_when_auto_follow_engaged() {
+        let mut app = make_app();
+
+        // Start with auto-follow engaged (default).
+        assert!(app.error_pane_auto_follow);
+
+        // Set an initial offset.
+        app.scroll_offsets.insert(ScrollablePanel::ErrorPane, 5);
+
+        // Push a new error while auto-follow is engaged.
+        app.push_error(ErrorMessage {
+            timestamp: std::time::SystemTime::now(),
+            level: ErrorLevel::Error,
+            text: "new error".into(),
+        });
+
+        // The offset should be reset to 0 (so panel_offset will render at scroll_max).
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::ErrorPane)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "new error must snap to bottom when auto-follow is engaged"
         );
     }
 
@@ -9387,5 +9682,60 @@ mod tests {
             Some(0),
             "ActivateTab to a task tab re-syncs selected_run"
         );
+    }
+
+    // ── Help overlay tests (plan 0038) ───────────────────────────────────────
+    #[test]
+    fn test_help_overlay_opens_on_question_mark() {
+        let mut app = make_app();
+
+        // Initially, help overlay should be closed
+        assert!(
+            !app.help_mode_active,
+            "help_mode_active should initially be false"
+        );
+
+        // Sending ToggleHelpMode should open the help overlay
+        app.update(AppEvent::ToggleHelpMode);
+        assert!(
+            app.help_mode_active,
+            "ToggleHelpMode should set help_mode_active to true"
+        );
+    }
+
+    #[test]
+    fn test_help_overlay_closes_on_escape() {
+        let mut app = make_app();
+
+        // Open the help overlay
+        app.help_mode_active = true;
+        assert!(app.help_mode_active, "help overlay should be open");
+
+        // Sending CloseHelpMode (from Escape or q) should close it
+        app.update(AppEvent::CloseHelpMode);
+        assert!(
+            !app.help_mode_active,
+            "CloseHelpMode should set help_mode_active to false"
+        );
+    }
+
+    #[test]
+    fn test_help_overlay_toggles() {
+        let mut app = make_app();
+
+        // Initially closed
+        assert!(!app.help_mode_active);
+
+        // First toggle opens it
+        app.update(AppEvent::ToggleHelpMode);
+        assert!(app.help_mode_active);
+
+        // Second toggle closes it
+        app.update(AppEvent::ToggleHelpMode);
+        assert!(!app.help_mode_active);
+
+        // Third toggle opens it again
+        app.update(AppEvent::ToggleHelpMode);
+        assert!(app.help_mode_active);
     }
 }
