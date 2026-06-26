@@ -37,7 +37,7 @@
 use chrono::{DateTime, Utc};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -53,12 +53,52 @@ use crate::app::{
 };
 use makina_core::api::{FailureKind, RunView, TaskId};
 
+/// Render markdown with caching by (text_hash, width).
+/// Subsequent calls with identical text and width return the cached result without re-parsing.
+fn render_markdown_cached(
+    app: &App,
+    text: &str,
+    base: Style,
+    width: u16,
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
+    use crate::app::hash_text;
+    let key = (hash_text(text), width);
+    if let Some(lines) = app.markdown_cache.borrow().get(&key) {
+        return lines.clone();
+    }
+    let lines = crate::markup::render_markdown(text, base, width, theme);
+    app.markdown_cache.borrow_mut().insert(key, lines.clone());
+    lines
+}
+
 /// Render the full TUI layout into `frame`.
 ///
 /// When the modal file browser is active ([`App::is_browsing`]) it is drawn as
 /// an overlay on top of the normal layout (task 28).
 pub fn render(app: &App, frame: &mut Frame) {
     let area = frame.area();
+
+    // ── Small-terminal guard ──────────────────────────────────────────────────
+    // First statement in render(), before any layout. Below this the normal panes
+    // overlap and are unusable; draw a single readable centered message and return.
+    const MIN_W: u16 = 40;
+    const MIN_H: u16 = 10;
+    if area.width < MIN_W || area.height < MIN_H {
+        // Render a centered "Terminal too small" message and return early.
+        // Use the full area (not a centered_rect sub-rect) so the message is
+        // always visible even on a 20×5 terminal where a 30%-height sub-rect
+        // would be ≤1 row and clip the text.
+        let message = vec![
+            Line::from(vec![Span::raw("Terminal too small")]),
+            Line::from(vec![Span::raw("(minimum 40×10)")]),
+        ];
+        let paragraph = Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)));
+        frame.render_widget(paragraph, area);
+        return;
+    }
 
     // Check if any provider is missing and warning hasn't been dismissed —
     // if so, reserve one extra line for the warning banner.
@@ -84,10 +124,13 @@ pub fn render(app: &App, frame: &mut Frame) {
     let status_area = vertical[3];
 
     // ── Body horizontal split ─────────────────────────────────────────────────
-    // sidebar (30%) / main (70%)
+    // Body split is driven by the user's saved sidebar width, not a fixed 30/70.
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([
+            Constraint::Percentage(app.sidebar_width_percent),
+            Constraint::Percentage(100 - app.sidebar_width_percent),
+        ])
         .split(body_area);
 
     let sidebar_area = body[0];
@@ -1060,7 +1103,8 @@ fn render_plan_task_pane(
     } else {
         let base_style =
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-        for l in crate::markup::render_markdown(
+        for l in render_markdown_cached(
+            app,
             &preview.body,
             base_style,
             content_area.width,
@@ -1847,7 +1891,8 @@ fn render_task_entry_pane(
         let content_width = inner.width;
         let base_style =
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-        lines.extend(crate::markup::render_markdown(
+        lines.extend(render_markdown_cached(
+            app,
             &task.entry_text,
             base_style,
             content_width,
@@ -2165,7 +2210,7 @@ fn render_accordion_section(
             let base =
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
             for mut line in
-                crate::markup::render_markdown(content, base, body_width, &app.active_theme)
+                render_markdown_cached(app, content, base, body_width, &app.active_theme)
             {
                 line.spans.insert(0, Span::raw("  "));
                 result.push(line);
@@ -2495,7 +2540,8 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             )]));
             // Response text rendered through Markdown + ANSI.
             let base_style = Style::default().fg(resp_color);
-            lines.extend(crate::markup::render_markdown(
+            lines.extend(render_markdown_cached(
+                app,
                 text,
                 base_style,
                 width,
@@ -2549,7 +2595,7 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                 let base_style =
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
                 let mut thought_lines =
-                    crate::markup::render_markdown(text, base_style, width, &app.active_theme);
+                    render_markdown_cached(app, text, base_style, width, &app.active_theme);
                 // Indent all thought lines by 2 spaces.
                 for line in &mut thought_lines {
                     line.spans.insert(0, Span::raw("  "));
@@ -2703,7 +2749,7 @@ fn render_provider_editor(
     // Clear the region first so the popup is opaque.
     frame.render_widget(Clear, popup);
 
-    let title = " Configure Providers & Roles ";
+    let title = " View Providers & Roles ";
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -2848,10 +2894,16 @@ fn render_provider_editor(
     frame.render_stateful_widget(list, list_area, &mut state);
 
     // Footer with hints
-    let footer = Paragraph::new(Line::from(vec![Span::styled(
-        "[Enter] commit  [↑↓/jk] navigate  [Esc] cancel",
-        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-    )]));
+    let footer = Paragraph::new(vec![
+        Line::from(vec![Span::styled(
+            "[Enter] commit  [↑↓/jk] navigate  [Esc] cancel",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        )]),
+        Line::from(vec![Span::styled(
+            "(Read-only; edits via .makina/config.toml)",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        )]),
+    ]);
     frame.render_widget(footer, footer_area);
 }
 
@@ -9317,6 +9369,46 @@ mod tests {
         );
     }
 
+    // ── Markdown cache (plan 0039) ────────────────────────────────────────────
+
+    /// The markdown cache must return the same (cached) result when called twice
+    /// with identical text and width, and must not grow the cache on the second call.
+    #[test]
+    fn test_markdown_cache_hits_on_same_text_and_width() {
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let theme = crate::theme::ayu_dark();
+        let style = Style::default().fg(Color::Reset);
+        let text = "# Heading\n\nSome **bold** text.";
+        let width = 80u16;
+
+        // First call: populate the cache
+        let result1 = render_markdown_cached(&app, text, style, width, &theme);
+        assert!(
+            !result1.is_empty(),
+            "markdown render should produce at least one line"
+        );
+        let cache_len_after_first = app.markdown_cache.borrow().len();
+        assert_eq!(
+            cache_len_after_first, 1,
+            "cache should have 1 entry after first call"
+        );
+
+        // Second call: should hit the cache and not grow it
+        let result2 = render_markdown_cached(&app, text, style, width, &theme);
+        let cache_len_after_second = app.markdown_cache.borrow().len();
+        assert_eq!(
+            cache_len_after_second, 1,
+            "cache should still have 1 entry after second call (cache must not grow)"
+        );
+
+        // Results must be identical
+        assert_eq!(
+            result1, result2,
+            "cached result must match the direct result"
+        );
+    }
+
     /// Render the app to a TestBackend and inspect the buffer cells, asserting
     /// that all styled cells use truecolor (Color::Rgb) and not downsampled ANSI
     /// colors (Color::Indexed) or other variants.
@@ -9390,6 +9482,96 @@ mod tests {
                 .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..))),
             "Expected at least one truecolor (Color::Rgb) cell among the first 200 \
              scanned cells, found none — the styled title row may not be rendering."
+        );
+    }
+
+    // ── Sidebar resize: small-terminal fallback (plan 0039) ──────────────────
+    // NOTE: test_sidebar_resize_left_clamps_to_min and
+    // test_sidebar_resize_right_clamps_to_max live in app.rs (the correct layer
+    // for AppEvent dispatch tests) and are not duplicated here.
+
+    #[test]
+    fn test_small_terminal_renders_fallback_message() {
+        let mut terminal = make_terminal(20, 5);
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Render into a terminal below MIN_W×MIN_H (20×5 < 40×10).
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        // Collect all text rendered into the buffer.
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        // The fallback message must be present.
+        assert!(
+            screen.contains("Terminal too small"),
+            "buffer must contain 'Terminal too small'; got: {:?}",
+            screen,
+        );
+
+        // Normal layout widgets must be absent — the guard returns before any
+        // layout split, so sidebar/detail/title-bar/status-bar widgets are not drawn.
+        assert!(
+            !screen.contains("Runs"),
+            "normal sidebar widget 'Runs' must NOT appear in small-terminal fallback; got: {:?}",
+            screen,
+        );
+        assert!(
+            !screen.contains("Detail"),
+            "normal main-pane 'Detail' must NOT appear in small-terminal fallback; got: {:?}",
+            screen,
+        );
+        assert!(
+            !screen.contains("Makina"),
+            "title bar 'Makina' must NOT appear in small-terminal fallback; got: {:?}",
+            screen,
+        );
+    }
+
+    // ── Provider editor rename (plan 0039) ──────────────────────────────────
+
+    #[test]
+    fn test_provider_editor_title_is_view_not_configure() {
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Open the provider editor by dispatching the OpenProviderEditor event.
+        let _ = app.update(crate::app::AppEvent::OpenProviderEditor);
+
+        // Render the frame.
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        // Collect all text rendered into the buffer.
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        // Assert the title contains "View" and not "Configure".
+        assert!(
+            screen.contains("View Providers & Roles"),
+            "provider editor modal title must contain 'View Providers & Roles'; got: {:?}",
+            screen,
+        );
+        assert!(
+            !screen.contains("Configure Providers & Roles"),
+            "provider editor modal title must NOT contain 'Configure Providers & Roles'; got: {:?}",
+            screen,
+        );
+
+        // Assert the read-only hint is present in the footer.
+        assert!(
+            screen.contains("Read-only"),
+            "provider editor footer must contain 'Read-only' hint; got: {:?}",
+            screen,
         );
     }
 }

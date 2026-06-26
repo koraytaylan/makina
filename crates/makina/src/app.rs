@@ -556,7 +556,8 @@ pub struct Settings {
 
 // ── Provider configuration editor ──────────────────────────────────────────────
 
-/// State for the provider/role configuration editor modal.
+/// A read-only view of the current providers and role assignments.
+/// Edit paths (add/remove provider, reassign roles, change model/effort) are deferred to a future plan.
 #[derive(Debug, Clone)]
 pub struct ProviderEditor {
     /// The editable list of providers.
@@ -919,6 +920,12 @@ pub enum AppEvent {
     /// shown.  Does not collide with `o`/`O` (the file-browser key) because the
     /// Ctrl modifier is checked first in `event.rs`.
     ToggleVerbose,
+
+    // ── Sidebar resizing (plan 0039) ───────────────────────────────────────────
+    /// User pressed Shift+Left to decrease the sidebar width by 2%.
+    ResizeSidebarLeft,
+    /// User pressed Shift+Right to increase the sidebar width by 2%.
+    ResizeSidebarRight,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -1199,6 +1206,14 @@ pub struct App {
     /// path at `ui.rs:1301`. A missing key defaults to 0 (no scroll needed).
     pub last_scroll_maxes: std::cell::RefCell<std::collections::HashMap<ScrollablePanel, u16>>,
 
+    /// Cache of parsed markdown lines keyed by (text_hash, width). `RefCell` because
+    /// the `&App` render pass populates it via `render_markdown_cached` — this follows
+    /// the interior-mutability pattern of `last_scroll_maxes`. Cleared when the active
+    /// tab changes or content is updated.
+    pub markdown_cache: std::cell::RefCell<
+        std::collections::HashMap<(u64, u16), Vec<ratatui::text::Line<'static>>>,
+    >,
+
     /// Last api event received — stored for test assertions and status-bar
     /// display.  Will be used by tasks 27–31 for richer updates.
     pub last_event: Option<Event>,
@@ -1301,6 +1316,11 @@ pub struct App {
     /// `Ctrl+O` ([`AppEvent::ToggleVerbose`]).  Defaults to `false` (compact).
     pub verbose_mode: bool,
 
+    // ── Sidebar resizing (plan 0039) ───────────────────────────────────────────
+    /// User's current sidebar width as a percentage of the body. Adjusted by
+    /// ResizeSidebarLeft/Right and clamped to [10, 50] so neither pane collapses.
+    pub sidebar_width_percent: u16,
+
     // ── Theming (plan 0036) ───────────────────────────────────────────────────
     /// Active color theme, read during render. Defaults to Ayu Dark; restored from GlobalConfig on startup and mutated by the 'Switch theme' palette action.
     pub active_theme: crate::theme::Theme,
@@ -1356,6 +1376,15 @@ pub struct App {
     /// click can open/focus that node's tab (mirrors keyboard Enter). Cleared
     /// and repopulated every frame, so scrolling and resizes self-correct.
     pub sidebar_node_bounds: std::cell::RefCell<Vec<(usize, Rect)>>,
+}
+
+/// Compute a hash of the input text for cache key generation.
+pub fn hash_text(text: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl App {
@@ -1637,6 +1666,7 @@ impl App {
             error_pane_auto_follow: true,
             scroll_offsets: std::collections::HashMap::new(),
             last_scroll_maxes: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_event: None,
             status_message: None,
             busy: None,
@@ -1665,6 +1695,7 @@ impl App {
             discovered_plans: Vec::new(),
             tabs: TabState::new(),
             accordion_state: HashMap::new(),
+            sidebar_width_percent: 30,
             selection: None,
             selection_panes: std::cell::RefCell::new(Vec::new()),
             panel_geometries: std::cell::RefCell::new(Vec::new()),
@@ -2347,6 +2378,8 @@ impl App {
 
             // ── Task-status view (task 29) ────────────────────────────────────
             AppEvent::RunLoaded(full_run) => {
+                // Clear markdown cache when content changes
+                self.markdown_cache.borrow_mut().clear();
                 // Replace or insert the RunView with the fully-populated one from
                 // the api.  If an entry with the same id already exists (i.e. the
                 // placeholder inserted by RunOpened), replace it in-place so the
@@ -3055,6 +3088,7 @@ impl App {
             // ── Tabbed content pane (plan 0031) ───────────────────────────────
             AppEvent::OpenTab(content) => {
                 self.tabs.open_tab(content);
+                self.markdown_cache.borrow_mut().clear();
                 self.sync_selected_run_to_active_tab();
                 true
             }
@@ -3062,6 +3096,7 @@ impl App {
                 if let Some(active) = self.tabs.active_tab {
                     self.tabs.close_tab(active);
                 }
+                self.markdown_cache.borrow_mut().clear();
                 self.sync_selected_run_to_active_tab();
                 true
             }
@@ -3069,6 +3104,7 @@ impl App {
                 if !self.tabs.open_tabs.is_empty() {
                     let next = (self.tabs.active_tab.unwrap_or(0) + 1) % self.tabs.open_tabs.len();
                     self.tabs.active_tab = Some(next);
+                    self.markdown_cache.borrow_mut().clear();
                 }
                 self.sync_selected_run_to_active_tab();
                 true
@@ -3078,6 +3114,7 @@ impl App {
                     let len = self.tabs.open_tabs.len();
                     let prev = (self.tabs.active_tab.unwrap_or(0) + len - 1) % len;
                     self.tabs.active_tab = Some(prev);
+                    self.markdown_cache.borrow_mut().clear();
                 }
                 self.sync_selected_run_to_active_tab();
                 true
@@ -3086,6 +3123,7 @@ impl App {
             AppEvent::ActivateTab(idx) => {
                 if idx < self.tabs.open_tabs.len() {
                     self.tabs.active_tab = Some(idx);
+                    self.markdown_cache.borrow_mut().clear();
                     self.sync_selected_run_to_active_tab();
                 }
                 true
@@ -3163,6 +3201,16 @@ impl App {
             // ── Verbose mode (plan 0021) ──────────────────────────────────────
             AppEvent::ToggleVerbose => {
                 self.verbose_mode = !self.verbose_mode;
+                true
+            }
+            AppEvent::ResizeSidebarLeft => {
+                // Step the sidebar by 2% per keystroke, clamped so the sidebar stays in
+                // [10, 50]% and the main pane always keeps at least half the body.
+                self.sidebar_width_percent = self.sidebar_width_percent.saturating_sub(2).max(10);
+                true
+            }
+            AppEvent::ResizeSidebarRight => {
+                self.sidebar_width_percent = (self.sidebar_width_percent + 2).min(50);
                 true
             }
         }
@@ -9737,5 +9785,41 @@ mod tests {
         // Third toggle opens it again
         app.update(AppEvent::ToggleHelpMode);
         assert!(app.help_mode_active);
+    }
+
+    // ── Sidebar resizing (plan 0039) ───────────────────────────────────────────
+
+    #[test]
+    fn test_sidebar_resize_left_clamps_to_min() {
+        let mut app = make_app();
+
+        // Start at 30% (default).
+        assert_eq!(app.sidebar_width_percent, 30);
+
+        // Dispatch ResizeSidebarLeft 10 times to try to go below the minimum.
+        for _ in 0..10 {
+            let changed = app.update(AppEvent::ResizeSidebarLeft);
+            assert!(changed, "ResizeSidebarLeft must return true");
+        }
+
+        // Should clamp to 10% (minimum).
+        assert_eq!(app.sidebar_width_percent, 10);
+    }
+
+    #[test]
+    fn test_sidebar_resize_right_clamps_to_max() {
+        let mut app = make_app();
+
+        // Start at 30% (default).
+        assert_eq!(app.sidebar_width_percent, 30);
+
+        // Dispatch ResizeSidebarRight 10 times to try to go above the maximum.
+        for _ in 0..10 {
+            let changed = app.update(AppEvent::ResizeSidebarRight);
+            assert!(changed, "ResizeSidebarRight must return true");
+        }
+
+        // Should clamp to 50% (maximum).
+        assert_eq!(app.sidebar_width_percent, 50);
     }
 }

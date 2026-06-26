@@ -1389,6 +1389,10 @@ fn translate_key(
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 if focused_panel == Panel::Main && plan_tab_active {
                     AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Architecture)
+                } else if !plan_tab_active {
+                    AppEvent::StatusMessage(
+                        "Accordion toggle not available here — open a plan tab.".to_string(),
+                    )
                 } else {
                     AppEvent::Tick
                 }
@@ -1396,6 +1400,10 @@ fn translate_key(
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 if focused_panel == Panel::Main && plan_tab_active {
                     AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Tasks)
+                } else if !plan_tab_active {
+                    AppEvent::StatusMessage(
+                        "Accordion toggle not available here — open a plan tab.".to_string(),
+                    )
                 } else {
                     AppEvent::Tick
                 }
@@ -1403,6 +1411,10 @@ fn translate_key(
             KeyCode::Char('z') | KeyCode::Char('Z') => {
                 if focused_panel == Panel::Main && plan_tab_active {
                     AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Status)
+                } else if !plan_tab_active {
+                    AppEvent::StatusMessage(
+                        "Accordion toggle not available here — open a plan tab.".to_string(),
+                    )
                 } else {
                     AppEvent::Tick
                 }
@@ -1424,6 +1436,14 @@ fn translate_key(
             // Alt+Left/Right to cycle between open tabs (must come before plain arrow keys).
             KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => AppEvent::PrevTab,
             KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => AppEvent::NextTab,
+            // ── Sidebar resizing (plan 0039) ──────────────────────────────────────
+            // Shift+Left/Right to resize the sidebar width (must come before plain arrow keys).
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                AppEvent::ResizeSidebarLeft
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                AppEvent::ResizeSidebarRight
+            }
             // Ctrl+W to close the active tab.
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 AppEvent::CloseTab
@@ -4220,6 +4240,81 @@ wall_clock_secs = 600
         assert_eq!(
             cfg_after.theme_name, "Ayu Mirage",
             "theme_name must be unchanged after unknown-name rejection"
+        );
+    }
+
+    #[test]
+    fn test_accordion_key_outside_plan_tab_emits_status() {
+        use crate::app::Panel;
+
+        let app = test_app();
+
+        // Test 'a' key outside a plan tab (plan_tab_active = false) in Main panel
+        let ev_a = translate_terminal_event(
+            key_press(KeyCode::Char('a'), KeyModifiers::NONE),
+            ModalState::default(),
+            Panel::Main,
+            false, // plan_tab_active = false
+            &app,
+        );
+        assert!(
+            matches!(ev_a, AppEvent::StatusMessage(ref msg) if msg == "Accordion toggle not available here — open a plan tab."),
+            "pressing 'a' outside a plan tab should emit StatusMessage with expected text"
+        );
+
+        // Test 't' key outside a plan tab in Main panel
+        let ev_t = translate_terminal_event(
+            key_press(KeyCode::Char('t'), KeyModifiers::NONE),
+            ModalState::default(),
+            Panel::Main,
+            false, // plan_tab_active = false
+            &app,
+        );
+        assert!(
+            matches!(ev_t, AppEvent::StatusMessage(ref msg) if msg == "Accordion toggle not available here — open a plan tab."),
+            "pressing 't' outside a plan tab should emit StatusMessage with expected text"
+        );
+
+        // Test 'z' key outside a plan tab in Main panel
+        let ev_z = translate_terminal_event(
+            key_press(KeyCode::Char('z'), KeyModifiers::NONE),
+            ModalState::default(),
+            Panel::Main,
+            false, // plan_tab_active = false
+            &app,
+        );
+        assert!(
+            matches!(ev_z, AppEvent::StatusMessage(ref msg) if msg == "Accordion toggle not available here — open a plan tab."),
+            "pressing 'z' outside a plan tab should emit StatusMessage with expected text"
+        );
+
+        // Verify that when plan_tab_active is true in Main panel, the keys toggle sections
+        let ev_a_with_plan = translate_terminal_event(
+            key_press(KeyCode::Char('a'), KeyModifiers::NONE),
+            ModalState::default(),
+            Panel::Main,
+            true, // plan_tab_active = true
+            &app,
+        );
+        assert!(
+            matches!(
+                ev_a_with_plan,
+                AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Architecture)
+            ),
+            "pressing 'a' with an active plan tab in Main panel should toggle Architecture section"
+        );
+
+        // Verify that when plan_tab_active is true in Sidebar, the key is a Tick (no-op)
+        let ev_a_sidebar = translate_terminal_event(
+            key_press(KeyCode::Char('a'), KeyModifiers::NONE),
+            ModalState::default(),
+            Panel::Sidebar,
+            true, // plan_tab_active = true
+            &app,
+        );
+        assert!(
+            matches!(ev_a_sidebar, AppEvent::Tick),
+            "pressing 'a' with an active plan tab in Sidebar should be a Tick"
         );
     }
 }

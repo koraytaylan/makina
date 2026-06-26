@@ -43,13 +43,18 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Role color; panics (with the role name) if undefined — the value-pinning
-    /// test guards every built-in theme so this never fires at render time.
+    /// Role color; returns Color::Reset (the terminal default) if undefined — the value-pinning
+    /// test guards every built-in theme so this never fires at render time, but custom themes
+    /// may have incomplete role definitions.
     pub fn get(&self, role: ThemeRole) -> Color {
-        *self
-            .colors
-            .get(&role)
-            .unwrap_or_else(|| panic!("theme {:?} missing role {:?}", self.name, role))
+        *self.colors.get(&role).unwrap_or_else(|| {
+            tracing::warn!(
+                "theme {} missing role {:?}, using fallback",
+                self.name,
+                role
+            );
+            &Color::Reset
+        })
     }
     /// ANSI palette entry (index 0–15).
     pub fn ansi(&self, index: usize) -> Color {
@@ -352,5 +357,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_theme_get_missing_role_returns_default() {
+        // Construct a Theme with an incomplete colors map (missing one role)
+        let mut colors = HashMap::new();
+        colors.insert(ThemeRole::Background, Color::Rgb(0, 0, 0));
+        colors.insert(ThemeRole::Foreground, Color::Rgb(255, 255, 255));
+        // Deliberately omit ThemeRole::Accent to test the fallback
+
+        let theme = Theme {
+            name: "Incomplete Theme".to_string(),
+            colors,
+            ansi: [Color::Rgb(0, 0, 0); 16],
+        };
+
+        // Calling get on the missing role should return Color::Reset and not panic
+        let result = theme.get(ThemeRole::Accent);
+        assert_eq!(
+            result,
+            Color::Reset,
+            "Missing role should return Color::Reset as fallback"
+        );
     }
 }
