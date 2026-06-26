@@ -44,6 +44,7 @@
 //! (task 23), concurrency (task 24), and termination caps (task 25 — gate +
 //! reviewer + wall-clock) are all implemented in `supervisor.rs`.
 
+pub mod agent_turn;
 pub mod developer;
 pub mod planner;
 pub mod reviewer;

@@ -384,8 +384,9 @@ async fn resolve_io(
         AppEvent::OpenLog => (AppEvent::Tick, None),
         // ── Command palette execute (task command-palette-keys) ──────────────────
         // Extract the selected action's event from the palette before App::update
-        // clears it, then re-dispatch that event through the normal intent path so
-        // the event loop processes it exactly as a fresh intent.
+        // clears it. IO-backed events (RetryFocused, DiscoverProject) are re-dispatched
+        // through background_tx so they receive a full resolve_io pass (plan 0041);
+        // non-IO events pass straight to App::update.
         // Theme selector Enter is handled in App::update with mutable access.
         AppEvent::CommandPaletteExecute => {
             if let Some(palette) = app.command_palette.as_ref() {
@@ -398,7 +399,19 @@ async fn resolve_io(
                 let filtered = palette.filtered();
                 if let Some(action) = filtered.get(palette.selected) {
                     return match action {
-                        crate::app::PaletteAction::Regular { event, .. } => (event.clone(), None),
+                        crate::app::PaletteAction::Regular { event, .. } => {
+                            // IO-backed events need a full resolve_io pass to work correctly
+                            // (e.g., RetryFocused → retry_focused, DiscoverProject → discover_project).
+                            // Send them over background_tx and return Tick for this pass;
+                            // the event loop will reprocess them through resolve_io.
+                            match event {
+                                AppEvent::RetryFocused | AppEvent::DiscoverProject => {
+                                    let _ = background_tx.try_send(event.clone());
+                                    (AppEvent::Tick, None)
+                                }
+                                _ => (event.clone(), None),
+                            }
+                        }
                         crate::app::PaletteAction::NestedThemeSelector { .. } => {
                             // Signal to App::update to enter theme selector mode
                             (AppEvent::EnterThemeSelector, None)
@@ -612,79 +625,16 @@ async fn commit_provider_config(app: &App) -> Option<String> {
 /// `base_branch` tables are NOT preserved. The gates-aware project-config
 /// writer lands in plan 0025.
 async fn commit_settings(app: &App) -> Option<String> {
+    use crate::settings_validation::validate_settings;
     use makina_core::config::{CapsConfig, GlobalConfig};
     use makina_core::paths::config_file;
 
     let settings = app.settings.as_ref()?;
 
-    // Parse and validate every field.
-    let gate_iterations = match settings.gate_iterations.parse::<u32>() {
-        Ok(val) => {
-            if val >= 1 {
-                val
-            } else {
-                return Some("caps.gate_iterations must be at least 1".to_string());
-            }
-        }
-        Err(_) => {
-            return Some("caps.gate_iterations must be a positive integer".to_string());
-        }
-    };
-
-    let reviewer_iterations = match settings.reviewer_iterations.parse::<u32>() {
-        Ok(val) => {
-            if val >= 1 {
-                val
-            } else {
-                return Some("caps.reviewer_iterations must be at least 1".to_string());
-            }
-        }
-        Err(_) => {
-            return Some("caps.reviewer_iterations must be a positive integer".to_string());
-        }
-    };
-
-    let wall_clock_secs = match settings.wall_clock_secs.parse::<u64>() {
-        Ok(val) => {
-            if val >= 1 {
-                val
-            } else {
-                return Some("caps.wall_clock_secs must be at least 1".to_string());
-            }
-        }
-        Err(_) => {
-            return Some("caps.wall_clock_secs must be a positive integer".to_string());
-        }
-    };
-
-    let idle_secs = if settings.idle_secs.is_empty() {
-        None
-    } else {
-        match settings.idle_secs.parse::<u64>() {
-            Ok(val) => {
-                if val >= 1 {
-                    Some(val)
-                } else {
-                    return Some("caps.idle_secs must be at least 1".to_string());
-                }
-            }
-            Err(_) => {
-                return Some("caps.idle_secs must be a positive integer".to_string());
-            }
-        }
-    };
-
-    let concurrency = match settings.concurrency.parse::<usize>() {
-        Ok(val) => {
-            if val >= 1 {
-                val
-            } else {
-                return Some("concurrency must be at least 1".to_string());
-            }
-        }
-        Err(_) => {
-            return Some("concurrency must be a positive integer".to_string());
-        }
+    // Parse and validate every field using the shared validator.
+    let valid = match validate_settings(settings) {
+        Ok(v) => v,
+        Err(reason) => return Some(reason),
     };
 
     // Read the current on-disk config (if any) so we don't lose fields we
@@ -703,12 +653,12 @@ async fn commit_settings(app: &App) -> Option<String> {
     // replace caps and concurrency with the new values.
     let updated = GlobalConfig {
         caps: CapsConfig {
-            gate_iterations,
-            reviewer_iterations,
-            wall_clock_secs,
-            idle_secs,
+            gate_iterations: valid.gate_iterations,
+            reviewer_iterations: valid.reviewer_iterations,
+            wall_clock_secs: valid.wall_clock_secs,
+            idle_secs: valid.idle_secs,
         },
-        concurrency,
+        concurrency: valid.concurrency,
         ..existing_global
     };
 
@@ -3268,6 +3218,82 @@ A description that is long enough to pass minimums.
         assert!(
             api.commands.lock().unwrap().is_empty(),
             "no command must be issued when nothing is retryable"
+        );
+    }
+
+    /// Palette "Retry failed task" action re-dispatches through resolve_io and
+    /// issues `Command::RetryTask` / `Command::RetryFailedTasks` (plan 0041).
+    #[tokio::test]
+    async fn palette_retry_action_issues_retry_command() {
+        use crate::app::{AppEvent, TreeNode};
+        use makina_core::api::{Command, RunId, RunStatus, TaskState};
+        // Create an app with a failed task using the retry_app helper.
+        let (mut app, api) = retry_app(vec![task_view("a", TaskState::Failed)], RunStatus::Failed);
+        // Move focus to the failed task.
+        app.tree_move(1);
+        assert!(
+            matches!(app.focused_node(), Some(TreeNode::Task { task: 0, .. })),
+            "the focused node must be the failed task"
+        );
+
+        // Open the palette.
+        app.update(AppEvent::OpenCommandPalette);
+        assert!(app.is_command_palette());
+        let palette = app.command_palette.as_ref().expect("palette must be open");
+
+        // Find the "Retry failed task" action. The default actions are:
+        // 0: Open task list
+        // 1: Configure providers & roles
+        // 2: Settings
+        // 3: Doctor
+        // 4: Retry failed task
+        // 5: Discover project
+        // 6: Quit
+        let retry_index = palette
+            .actions
+            .iter()
+            .position(|a| match a {
+                crate::app::PaletteAction::Regular { label, .. } => *label == "Retry failed task",
+                _ => false,
+            })
+            .expect("Retry failed task action must exist");
+
+        // Set selected to point to the Retry action.
+        app.command_palette.as_mut().unwrap().selected = retry_index;
+
+        // Resolve CommandPaletteExecute; it should re-dispatch RetryFocused over
+        // background_tx and return Tick.
+        let (ev1, status1) = resolve_io_for_test(&app, AppEvent::CommandPaletteExecute).await;
+        assert!(
+            matches!(ev1, AppEvent::Tick),
+            "CommandPaletteExecute with an IO-backed event must return Tick for re-dispatch; got {:?}",
+            ev1
+        );
+        assert!(
+            status1.is_none(),
+            "no immediate status message; the re-dispatched event will produce one"
+        );
+
+        // Manually simulate the re-dispatch: resolve RetryFocused through resolve_io,
+        // which calls retry_focused and issues the command.
+        let (ev2, status2) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
+        assert!(
+            matches!(ev2, AppEvent::Tick),
+            "RetryFocused resolves to Tick; got {:?}",
+            ev2
+        );
+        assert!(status2.is_some(), "retry must surface a status message");
+
+        // Verify the orchestrator received the retry command.
+        let cmds = api.commands.lock().unwrap().clone();
+        assert_eq!(cmds.len(), 1, "exactly one command must be issued");
+        assert!(
+            matches!(
+                &cmds[0],
+                Command::RetryTask { run: RunId(7), task } if task.0 == "a"
+            ),
+            "Retry action on a Failed task must issue RetryTask{{run:7, task:a}}; got {:?}",
+            cmds[0]
         );
     }
 

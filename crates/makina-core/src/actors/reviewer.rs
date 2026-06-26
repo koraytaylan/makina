@@ -44,17 +44,17 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use futures::StreamExt;
 use kameo::actor::ActorRef;
 
 use crate::api;
-use crate::backend::{AgentBackend, Prompt, ResponseEvent};
+use crate::backend::{AgentBackend, Prompt};
 use crate::config::RoleAssignment;
-use crate::roles::{Role, current_model_from, parse_review_verdict, session_config_for};
+use crate::roles::{Role, parse_review_verdict, session_config_for};
 use crate::task::Task;
 
+use super::agent_turn::{DrainError, drain_agent_turn};
 use super::supervisor::{EventSink, Supervisor};
 
 // ── Typed error for the Review reply ─────────────────────────────────────────
@@ -254,136 +254,26 @@ impl kameo::message::Message<Review> for Reviewer {
         //    chunk as a live `ResponseChunk` and the turn end as `TurnComplete`.
         //    When `idle_secs` is configured, wrap each next() await with a timeout
         //    so the watchdog fires on prolonged silence.
-        let mut output = String::new();
         let mut events = stream;
-        loop {
-            let item = match msg.idle_secs {
-                Some(idle) => {
-                    let timeout_duration = Duration::from_secs(idle);
-                    match tokio::time::timeout(timeout_duration, events.next()).await {
-                        Ok(item) => item,
-                        Err(_elapsed) => {
-                            // Idle timeout fired: no output for idle_secs.
-                            drop(events);
-                            let _ = session.terminate().await;
-                            (msg.sink)(api::Event::TaskIdle {
-                                run: msg.run,
-                                task: task_id.clone(),
-                                idle_secs: idle,
-                            });
-                            return Err(ReviewerError::IdleTimeout { idle_secs: idle });
-                        }
-                    }
-                }
-                None => events.next().await,
-            };
-
-            match item {
-                Some(Ok(ResponseEvent::TextChunk { text })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Reviewer,
-                        event: api::ExchangeEvent::ResponseChunk { text: text.clone() },
-                    });
-                    output.push_str(&text);
-                }
-                // Thought and tool events are side-channel only: they are
-                // forwarded to the live `AgentExchange` stream for observability
-                // but MUST NOT contribute to `output` (the verdict text is built
-                // solely from `TextChunk`/`ResponseChunk`).
-                Some(Ok(ResponseEvent::ThoughtChunk { text })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Reviewer,
-                        event: api::ExchangeEvent::ThoughtChunk { text },
-                    });
-                }
-                Some(Ok(ResponseEvent::ToolCall {
-                    id,
-                    title,
-                    kind,
-                    status,
-                    detail,
-                })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Reviewer,
-                        event: api::ExchangeEvent::ToolCall {
-                            id,
-                            title,
-                            kind,
-                            status,
-                            content: detail,
-                        },
-                    });
-                }
-                Some(Ok(ResponseEvent::ToolCallUpdate {
-                    id,
-                    status,
-                    title,
-                    detail,
-                })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Reviewer,
-                        event: api::ExchangeEvent::ToolCallUpdate {
-                            id,
-                            status,
-                            title,
-                            content: detail,
-                        },
-                    });
-                }
-                Some(Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })) => {
-                    (msg.sink)(api::Event::CurrentModeUpdate {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Reviewer,
-                        current_mode_id,
-                    });
-                }
-                Some(Ok(ResponseEvent::TurnComplete { usage })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Reviewer,
-                        event: api::ExchangeEvent::TurnComplete,
-                    });
-                    let model = self
-                        .assignment
-                        .as_ref()
-                        .and_then(|a| a.model.clone())
-                        .or_else(|| current_model_from(session.capabilities().as_ref()))
-                        .unwrap_or_else(|| "(default)".to_string());
-                    (msg.sink)(api::Event::RoleTurnMetrics {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Reviewer,
-                        model,
-                        duration_ms: turn_start.elapsed().as_millis() as u64,
-                        usage,
-                    });
-                    break;
-                }
-                Some(Err(e)) => {
-                    drop(events);
-                    let _ = session.terminate().await;
-                    return Err(ReviewerError::Other(format!("reviewer stream error: {e}")));
-                }
-                None => {
-                    drop(events);
-                    let _ = session.terminate().await;
-                    return Err(ReviewerError::Other(
-                        "reviewer stream ended unexpectedly".to_string(),
-                    ));
-                }
+        let (output, _usage) = drain_agent_turn(
+            &mut *session,
+            &mut events,
+            api::AgentRole::Reviewer,
+            task_id.clone(),
+            msg.idle_secs,
+            &msg.sink,
+            msg.run,
+            turn_start,
+            self.assignment.as_ref(),
+        )
+        .await
+        .map_err(|err| match err {
+            DrainError::IdleTimeout { idle_secs } => ReviewerError::IdleTimeout { idle_secs },
+            DrainError::Stream(e) => ReviewerError::Other(format!("reviewer stream error: {e}")),
+            DrainError::EndedUnexpectedly => {
+                ReviewerError::Other("reviewer stream ended unexpectedly".to_string())
             }
-        }
-        drop(events);
+        })?;
 
         // 5. Terminate the session (idempotent).
         let _ = session.terminate().await;

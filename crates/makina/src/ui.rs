@@ -2228,7 +2228,6 @@ fn render_accordion_section(
 }
 
 /// Format the tasks section content: task list with GATED markers and dependencies.
-#[allow(dead_code)]
 fn format_tasks_section(tasks: &[makina_core::orchestrator::PlanTaskPreview]) -> String {
     if tasks.is_empty() {
         return "(no tasks)".to_string();

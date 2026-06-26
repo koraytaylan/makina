@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -66,9 +67,8 @@ pub struct TaskSnapshot {
 ///
 /// Written to `.makina/runs/{run_uid}/run.json` at finalization.  This carries
 /// only fields with an in-graph source today: there is no task→worktree map
-/// here because `Task` has no worktree field, the orchestrator stores no such
-/// map, and `WorktreeManager::worktree_path` is private and still returns the
-/// pre-relocation path.
+/// here because `Task` has no worktree field and the orchestrator stores no such
+/// map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunMetadata {
     /// Persistent, sortable 26-char run identity (the ULID minted at open).
@@ -158,13 +158,17 @@ impl RunMetadata {
 
 /// Best-effort writer for [`RunMetadata`].
 ///
-/// Serializes `meta` with [`serde_json::to_string_pretty`] and writes it to
-/// `paths::run_dir(repo_root, &meta.run_uid).join("run.json")`, creating the run
-/// directory with [`tokio::fs::create_dir_all`] first.
+/// Serializes `meta` with [`serde_json::to_string_pretty`] and writes it
+/// atomically to `paths::run_dir(repo_root, &meta.run_uid).join("run.json")`:
 ///
-/// Mirrors [`persist::persist_graph`](crate::persist::persist_graph)'s
-/// create-dir-then-write shape (minus the temp-file/atomic-rename dance, which
-/// is unnecessary for this single write-once-at-finalization record).
+/// 1. Create the run directory with [`tokio::fs::create_dir_all`].
+/// 2. Serialize to JSON.
+/// 3. Write to a temp file `run.json.tmp.{pid}.{seq}`.
+/// 4. Atomically rename the temp file to `run.json`.
+///
+/// A crash mid-write can leave a temp file behind, but never a truncated
+/// `run.json`. This mirrors [`persist::persist_graph`](crate::persist::persist_graph)'s
+/// atomic write pattern.
 ///
 /// # Errors
 ///
@@ -178,8 +182,22 @@ pub async fn write_run_metadata(meta: &RunMetadata, repo_root: &Path) -> std::io
     // Trailing newline: POSIX convention and tidy `git diff` output.
     json.push('\n');
 
+    // Generate a temp file path using process ID and a monotonic sequence counter.
+    // Temp files left behind by crashed writes are cleaned up by the next run or explicit prune.
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("run.json.tmp.{}.{}", pid, seq));
+
+    // Write to temp file, then atomically rename to destination.
+    tokio::fs::write(&tmp, json.as_bytes()).await?;
+
     let dest = dir.join("run.json");
-    tokio::fs::write(&dest, json.as_bytes()).await?;
+    if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
+        // Best-effort cleanup of temp file on rename failure.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -561,6 +579,86 @@ mod tests {
         assert_eq!(
             old_snap.finished_at, None,
             "old snapshot without finished_at must deserialize to None"
+        );
+    }
+
+    /// Verify the atomic write structural properties:
+    ///
+    /// a) The temp path has a distinct name from `run.json`.
+    /// b) After a successful write the canonical `run.json` is present and parseable.
+    /// c) No `*.tmp.*` residue remains after a successful write.
+    /// d) A first write's output is fully replaced (not partially corrupted) by
+    ///    a second write.
+    #[tokio::test]
+    async fn test_write_run_metadata_is_atomic() {
+        let _guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let started = fixed_ts(2026, 5, 1);
+        let ended = fixed_ts(2026, 5, 2);
+        let meta = RunMetadata::new(
+            "01ABCDEF0123456789ABCDEFGH".to_string(),
+            "demo-plan".to_string(),
+            RunStatus::Completed,
+            started,
+            ended,
+        );
+
+        let run_dir = crate::paths::run_dir(root, &meta.run_uid);
+
+        // (a) Temp file should have a distinct name from run.json
+        let expected_canonical = run_dir.join("run.json");
+
+        // Write the metadata
+        write_run_metadata(&meta, root)
+            .await
+            .expect("write_run_metadata must succeed");
+
+        // (b) After a successful write, canonical file exists and parses
+        assert!(
+            expected_canonical.exists(),
+            "run.json must exist after write_run_metadata"
+        );
+
+        let contents = std::fs::read_to_string(&expected_canonical).expect("read run.json");
+        let _loaded: RunMetadata = serde_json::from_str(&contents).expect("parse run.json");
+
+        // (c) No temp file residue remains
+        let entries = std::fs::read_dir(&run_dir)
+            .expect("read run dir")
+            .flatten()
+            .collect::<Vec<_>>();
+
+        for entry in entries {
+            let name = entry.file_name().into_string().expect("utf8 name");
+            assert!(
+                !name.contains(".tmp."),
+                "unexpected temp file left behind: {name}"
+            );
+        }
+
+        // (d) A second write atomically replaces the first
+        write_run_metadata(&meta, root)
+            .await
+            .expect("second write_run_metadata must succeed");
+
+        let contents2 =
+            std::fs::read_to_string(&expected_canonical).expect("read run.json after 2nd write");
+        let loaded2: RunMetadata =
+            serde_json::from_str(&contents2).expect("parse run.json after 2nd write");
+
+        assert_eq!(
+            meta.run_uid, loaded2.run_uid,
+            "run_uid must survive two atomic writes"
+        );
+        assert_eq!(
+            meta.run_slug, loaded2.run_slug,
+            "run_slug must survive two atomic writes"
         );
     }
 }

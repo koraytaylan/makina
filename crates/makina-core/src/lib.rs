@@ -9,6 +9,7 @@ pub mod actors;
 pub mod api;
 pub mod audit;
 pub mod backend;
+pub mod cmd_output;
 pub mod config;
 pub mod constants;
 pub mod dependency;

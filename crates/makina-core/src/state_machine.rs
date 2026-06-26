@@ -322,18 +322,17 @@ mod tests {
     //! # Coverage strategy
     //!
     //! The primary test (`exhaustive_transition_table`) iterates the full
-    //! Cartesian product of all 7 states × all 12 events (84 pairs total).
+    //! Cartesian product of all 7 states × all 14 events (98 pairs total).
     //! For each pair it asserts the exact expected outcome: `Ok(target)` for
-    //! the 19 legal transitions and `Err(IllegalTransition)` for the remaining
-    //! 65 pairs.  This single test is sufficient proof that the implementation
+    //! the 21 legal transitions and `Err(IllegalTransition)` for the remaining
+    //! 77 pairs.  This single test is sufficient proof that the implementation
     //! matches the architecture diagram exactly.
     //!
     //! The legal count grew from 9 → 14 in task 25 (`termination-caps`) ...
     //! Plan-0002 added `MergeConflict` (legal only from InReview) as the 11th event.
-    //! This task adds `DependencyFailed` as the 12th event (legal from each active
-    //! state → the new 7th state `Skipped`), so the table grows by one state and
-    //! one event: 6 → 7 states, 11 → 12 events, 66 → 84 pairs, 15 → 19 legal,
-    //! 51 → 65 illegal.
+    //! Plan-0017 added `RetryRequested` and `DependencyReset` as the 13th and 14th
+    //! events, growing the table further: 7 states, 14 events, 98 pairs, 21 legal,
+    //! 77 illegal.
     //!
     //! Supporting tests cover `is_terminal` and `legal_events` independently.
 
@@ -343,8 +342,8 @@ mod tests {
     // ── Legal transition set ──────────────────────────────────────────────────
 
     /// The complete set of legal `(from, event, to)` triples from the
-    /// architecture state diagram (now 19 entries: 15 + the 4 DependencyFailed
-    /// edges into Skipped).  Used both by `exhaustive_transition_table` and as
+    /// architecture state diagram (now 21 entries: 15 + the 4 DependencyFailed
+    /// edges into Skipped + the 2 reset transitions from plan 0017).  Used both by `exhaustive_transition_table` and as
     /// documentation of intent.
     fn legal_table() -> Vec<(TaskState, TaskEvent, TaskState)> {
         use TaskEvent::*;
@@ -404,15 +403,15 @@ mod tests {
 
     // ── Exhaustive Cartesian-product test ─────────────────────────────────────
 
-    /// For every `(state, event)` pair in the 7×12 Cartesian product:
+    /// For every `(state, event)` pair in the 7×14 Cartesian product:
     /// - If the pair is in the legal table → assert `Ok(expected_target)`.
     /// - Otherwise → assert `Err(IllegalTransition { from, event })`.
     ///
     /// This is the definitive proof that the FSM implementation matches the
-    /// architecture diagram: 19 legal transitions and 65 illegal ones, totalling
-    /// 84 assertions. (Task 25 grew the table; plan-0002 added MergeConflict;
-    /// this task adds DependencyFailed as the 12th event and Skipped as the 7th
-    /// state, with 4 new legal edges into Skipped.)
+    /// architecture diagram: 21 legal transitions and 77 illegal ones, totalling
+    /// 98 assertions. (Task 25 grew the table; plan-0002 added MergeConflict;
+    /// plan-0017 added RetryRequested and DependencyReset as the 13th and 14th events
+    /// with 2 new legal edges.)
     #[test]
     fn exhaustive_transition_table() {
         use std::collections::HashMap;

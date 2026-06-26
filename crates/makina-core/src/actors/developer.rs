@@ -47,17 +47,17 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use futures::StreamExt;
 use kameo::actor::ActorRef;
 
 use crate::api;
-use crate::backend::{AgentBackend, Prompt, ResponseEvent};
+use crate::backend::{AgentBackend, Prompt};
 use crate::config::RoleAssignment;
-use crate::roles::{Role, current_model_from, session_config_for};
+use crate::roles::{Role, session_config_for};
 use crate::task::Task;
 
+use super::agent_turn::{DrainError, drain_agent_turn};
 use super::supervisor::{EventSink, Supervisor};
 
 // ── Typed error for the Develop reply ────────────────────────────────────────
@@ -284,140 +284,28 @@ impl kameo::message::Message<Develop> for Developer {
         //    `TurnComplete` (task 31).
         //    When `idle_secs` is configured, wrap each next() await with a timeout
         //    so the watchdog fires on prolonged silence.
-        let mut output = String::new();
         let mut events = stream;
-        loop {
-            let item = match msg.idle_secs {
-                Some(idle) => {
-                    let timeout_duration = Duration::from_secs(idle);
-                    match tokio::time::timeout(timeout_duration, events.next()).await {
-                        Ok(item) => item,
-                        Err(_elapsed) => {
-                            // Idle timeout fired: no output for idle_secs.
-                            drop(events);
-                            let _ = session.terminate().await;
-                            (msg.sink)(api::Event::TaskIdle {
-                                run: msg.run,
-                                task: task_id.clone(),
-                                idle_secs: idle,
-                            });
-                            return Err(DeveloperError::IdleTimeout { idle_secs: idle });
-                        }
-                    }
-                }
-                None => events.next().await,
-            };
-
-            match item {
-                Some(Ok(ResponseEvent::TextChunk { text })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Developer,
-                        event: api::ExchangeEvent::ResponseChunk { text: text.clone() },
-                    });
-                    output.push_str(&text);
-                }
-                // Thought and tool events are side-channel only: they are
-                // forwarded to the live `AgentExchange` stream for observability
-                // but MUST NOT contribute to `output` (the final answer text is
-                // built solely from `TextChunk`/`ResponseChunk`).
-                Some(Ok(ResponseEvent::ThoughtChunk { text })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Developer,
-                        event: api::ExchangeEvent::ThoughtChunk { text },
-                    });
-                }
-                Some(Ok(ResponseEvent::ToolCall {
-                    id,
-                    title,
-                    kind,
-                    status,
-                    detail,
-                })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Developer,
-                        event: api::ExchangeEvent::ToolCall {
-                            id,
-                            title,
-                            kind,
-                            status,
-                            content: detail,
-                        },
-                    });
-                }
-                Some(Ok(ResponseEvent::ToolCallUpdate {
-                    id,
-                    status,
-                    title,
-                    detail,
-                })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Developer,
-                        event: api::ExchangeEvent::ToolCallUpdate {
-                            id,
-                            status,
-                            title,
-                            content: detail,
-                        },
-                    });
-                }
-                Some(Ok(ResponseEvent::CurrentModeUpdate { current_mode_id })) => {
-                    (msg.sink)(api::Event::CurrentModeUpdate {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Developer,
-                        current_mode_id,
-                    });
-                }
-                Some(Ok(ResponseEvent::TurnComplete { usage })) => {
-                    (msg.sink)(api::Event::AgentExchange {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Developer,
-                        event: api::ExchangeEvent::TurnComplete,
-                    });
-                    let model = self
-                        .assignment
-                        .as_ref()
-                        .and_then(|a| a.model.clone())
-                        .or_else(|| current_model_from(session.capabilities().as_ref()))
-                        .unwrap_or_else(|| "(default)".to_string());
-                    (msg.sink)(api::Event::RoleTurnMetrics {
-                        run: msg.run,
-                        task: task_id.clone(),
-                        role: api::AgentRole::Developer,
-                        model,
-                        duration_ms: turn_start.elapsed().as_millis() as u64,
-                        usage,
-                    });
-                    break;
-                }
-                Some(Err(e)) => {
-                    drop(events);
-                    let _ = session.terminate().await;
-                    return Err(DeveloperError::Other(format!(
-                        "developer stream error: {e}"
-                    )));
-                }
-                None => {
-                    drop(events);
-                    let _ = session.terminate().await;
-                    return Err(DeveloperError::Other(
-                        "developer stream ended unexpectedly".to_string(),
-                    ));
-                }
+        let (output, _usage) = drain_agent_turn(
+            &mut *session,
+            &mut events,
+            api::AgentRole::Developer,
+            task_id.clone(),
+            msg.idle_secs,
+            &msg.sink,
+            msg.run,
+            turn_start,
+            self.assignment.as_ref(),
+        )
+        .await
+        .map_err(|err| match err {
+            DrainError::IdleTimeout { idle_secs } => DeveloperError::IdleTimeout { idle_secs },
+            DrainError::Stream(e) => DeveloperError::Other(format!("developer stream error: {e}")),
+            DrainError::EndedUnexpectedly => {
+                DeveloperError::Other("developer stream ended unexpectedly".to_string())
             }
-        }
-        drop(events);
+        })?;
 
-        // 5. Terminate the session (idempotent).
+        // 5. Terminate the session (idempotent — also called on error paths above).
         let _ = session.terminate().await;
 
         // ── Commit the agent's changes to the task branch (task 23) ───────────
@@ -536,288 +424,7 @@ fn build_develop_prompt(task: &Task, feedback: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{AgentBackend, BackendError, ResponseEvent, ResponseStream};
-    use futures::stream;
-
-    // ── Drain helper (test-only mirror of the production watchdog loop) ───────
-
-    /// Drain a [`ResponseStream`] with an optional idle watchdog.
-    ///
-    /// Mirrors the production loop in [`Developer::handle`] so the three
-    /// required acceptance tests can exercise the watchdog logic without
-    /// spinning up a full kameo actor stack or a real git worktree.
-    ///
-    /// - `Some(idle)` → each `next()` is wrapped in
-    ///   `tokio::time::timeout(idle)`.  On elapse: `IdleTimeout`.
-    /// - `None` → bare `next()`, identical to the pre-watchdog code (legacy path).
-    ///
-    /// On `TurnComplete`, emits both `AgentExchange::TurnComplete` and
-    /// `RoleTurnMetrics` (matching the production handler) so tests that use
-    /// this helper observe the same event sequence.
-    async fn drain_stream_with_watchdog(
-        mut stream: ResponseStream,
-        idle_secs: Option<u64>,
-        sink: &dyn Fn(api::Event),
-        run: api::RunId,
-        task: api::TaskId,
-    ) -> Result<String, DeveloperError> {
-        let mut output = String::new();
-        loop {
-            let item = match idle_secs {
-                Some(idle) => {
-                    let timeout_duration = Duration::from_secs(idle);
-                    match tokio::time::timeout(timeout_duration, stream.next()).await {
-                        Ok(item) => item,
-                        Err(_elapsed) => {
-                            sink(api::Event::TaskIdle {
-                                run,
-                                task: task.clone(),
-                                idle_secs: idle,
-                            });
-                            return Err(DeveloperError::IdleTimeout { idle_secs: idle });
-                        }
-                    }
-                }
-                None => stream.next().await,
-            };
-
-            match item {
-                Some(Ok(ResponseEvent::TextChunk { text })) => {
-                    output.push_str(&text);
-                }
-                Some(Ok(ResponseEvent::TurnComplete { usage })) => {
-                    sink(api::Event::AgentExchange {
-                        run,
-                        task: task.clone(),
-                        role: api::AgentRole::Developer,
-                        event: api::ExchangeEvent::TurnComplete,
-                    });
-                    sink(api::Event::RoleTurnMetrics {
-                        run,
-                        task: task.clone(),
-                        role: api::AgentRole::Developer,
-                        model: "(default)".to_string(),
-                        duration_ms: 0,
-                        usage,
-                    });
-                    break;
-                }
-                // Side-channel events don't contribute to output.
-                Some(Ok(_)) => {}
-                Some(Err(e)) => {
-                    return Err(DeveloperError::Other(format!("stream error: {e}")));
-                }
-                None => {
-                    return Err(DeveloperError::Other(
-                        "stream ended unexpectedly".to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(output)
-    }
-
-    // ── Stream builders ───────────────────────────────────────────────────────
-
-    /// Build a stream that yields `initial` text chunks immediately, then stalls
-    /// forever (uses `futures::stream::pending` for the tail).  Because the tail
-    /// never resolves, a `tokio::time::timeout` on the *next* `next()` call will
-    /// fire once virtual time is advanced past the threshold.
-    fn stalling_stream(initial: &[&str]) -> ResponseStream {
-        use futures::StreamExt;
-        let head: Vec<Result<ResponseEvent, BackendError>> = initial
-            .iter()
-            .map(|t| {
-                Ok(ResponseEvent::TextChunk {
-                    text: t.to_string(),
-                })
-            })
-            .collect();
-        // Append a tail that never yields.
-        let tail: ResponseStream = Box::pin(futures::stream::pending());
-        Box::pin(stream::iter(head).chain(tail))
-    }
-
-    /// Build a stream that yields one text chunk, waits for `delay` (using
-    /// `tokio::time::sleep` so virtual time works), then yields another chunk
-    /// and `TurnComplete`.  The delay is shorter than `idle_secs` to prove the
-    /// timer resets on activity.
-    fn periodic_stream(delay: Duration) -> ResponseStream {
-        use futures::stream;
-        let s = stream::unfold(0u32, move |state| async move {
-            match state {
-                0 => {
-                    // First chunk: immediately available.
-                    Some((
-                        Ok(ResponseEvent::TextChunk {
-                            text: "hello".to_string(),
-                        }),
-                        1,
-                    ))
-                }
-                1 => {
-                    // Delay (shorter than idle_secs/2), then a second chunk.
-                    tokio::time::sleep(delay).await;
-                    Some((
-                        Ok(ResponseEvent::TextChunk {
-                            text: " world".to_string(),
-                        }),
-                        2,
-                    ))
-                }
-                _ => {
-                    // TurnComplete.
-                    Some((Ok(ResponseEvent::TurnComplete { usage: None }), u32::MAX))
-                }
-            }
-        });
-        Box::pin(s)
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// A no-op sink for tests that don't care about emitted events.
-    fn noop_sink(_: api::Event) {}
-
-    // ── Tests ─────────────────────────────────────────────────────────────────
-
-    /// **Acceptance test 1/3** — `idle_watchdog_fires_on_silence`
-    ///
-    /// A stream that yields one chunk then stalls, combined with a small
-    /// `idle_secs` and a much larger wall-clock cap.  The idle watchdog MUST
-    /// fire before the wall-clock cap would, and the result MUST be
-    /// `DeveloperError::IdleTimeout`.
-    ///
-    /// Uses `tokio::time::pause` + `advance` (virtual time) so the test is
-    /// fully deterministic and completes in microseconds.
-    #[tokio::test(start_paused = true)]
-    async fn idle_watchdog_fires_on_silence() {
-        let idle_secs: u64 = 5;
-        // Large wall-clock cap: 1 hour — the idle watchdog must fire first.
-        let _wall_clock_secs: u64 = 3600;
-
-        // Stream: one chunk immediately, then stalls forever.
-        let stream = stalling_stream(&["initial chunk"]);
-
-        // The drain will block waiting for the second item.
-        // Advance virtual time past idle_secs to trigger the timeout.
-        let drain_fut = drain_stream_with_watchdog(
-            stream,
-            Some(idle_secs),
-            &noop_sink,
-            api::RunId(0),
-            api::TaskId::new("test-task"),
-        );
-
-        // Race the drain against advancing virtual time.
-        // `tokio::time::sleep` inside `timeout` uses the virtual clock when paused.
-        let result = tokio::time::timeout(Duration::from_secs(idle_secs + 1), drain_fut)
-            .await
-            .expect("test future should complete once virtual time is advanced");
-
-        // The drain must return IdleTimeout, NOT a completion.
-        match result {
-            Err(DeveloperError::IdleTimeout { idle_secs: n }) => {
-                assert_eq!(n, idle_secs, "idle_secs in the error must match the config");
-            }
-            Ok(output) => panic!("expected IdleTimeout, got Ok({output:?})"),
-            Err(DeveloperError::Other(msg)) => panic!("expected IdleTimeout, got Other({msg})"),
-        }
-    }
-
-    /// **Acceptance test 2/3** — `idle_watchdog_resets_on_activity`
-    ///
-    /// A stream that emits a chunk every `idle_secs/2` — well below the idle
-    /// threshold.  The watchdog MUST NOT fire; the drain MUST complete normally
-    /// (`Ok`).
-    ///
-    /// Uses `tokio::time::pause` / `start_paused = true` so `sleep` calls in
-    /// the stream use virtual time.
-    #[tokio::test(start_paused = true)]
-    async fn idle_watchdog_resets_on_activity() {
-        let idle_secs: u64 = 10;
-        // Each chunk arrives after idle_secs/2 — within the threshold.
-        let inter_chunk_delay = Duration::from_secs(idle_secs / 2);
-
-        let stream = periodic_stream(inter_chunk_delay);
-
-        let result = drain_stream_with_watchdog(
-            stream,
-            Some(idle_secs),
-            &noop_sink,
-            api::RunId(0),
-            api::TaskId::new("test-task"),
-        )
-        .await;
-
-        match result {
-            Ok(output) => {
-                assert!(
-                    output.contains("hello"),
-                    "output must contain the streamed text; got {output:?}"
-                );
-                assert!(
-                    output.contains("world"),
-                    "both chunks must be present; got {output:?}"
-                );
-            }
-            Err(DeveloperError::IdleTimeout { idle_secs: n }) => {
-                panic!("watchdog fired unexpectedly at {n}s — activity should have reset it");
-            }
-            Err(DeveloperError::Other(msg)) => panic!("unexpected error: {msg}"),
-        }
-    }
-
-    /// **Acceptance test 3/3** — `idle_disabled_matches_legacy`
-    ///
-    /// With `idle_secs = None`, a stalling stream is bounded ONLY by an external
-    /// wall-clock cap (not by any idle logic inside `drain_stream_with_watchdog`).
-    /// This proves the `None` path is byte-for-byte the legacy behaviour: no
-    /// `IdleTimeout` is ever returned.
-    ///
-    /// To avoid the test hanging forever (the stalling stream never resolves),
-    /// we race the drain against a short `tokio::time::timeout` that represents
-    /// "the wall-clock cap fired".  We assert that:
-    /// (a) the drain did NOT return `IdleTimeout`,
-    /// (b) and the only reason it didn't complete was the external wall-clock cap.
-    #[tokio::test(start_paused = true)]
-    async fn idle_disabled_matches_legacy() {
-        // Stalling stream — would block forever without an external timeout.
-        let stream = stalling_stream(&["one chunk"]);
-
-        // The drain should stall (no idle watchdog); the outer timeout simulates
-        // the wall-clock cap firing after a short virtual duration.
-        let wall_clock_cap = Duration::from_secs(1);
-        let drain_result = tokio::time::timeout(
-            wall_clock_cap,
-            drain_stream_with_watchdog(
-                stream,
-                None, // idle watchdog disabled
-                &noop_sink,
-                api::RunId(0),
-                api::TaskId::new("test-task"),
-            ),
-        )
-        .await;
-
-        // The drain must have been stopped by the external wall-clock cap (Elapsed),
-        // NOT by an IdleTimeout from within the drain itself.
-        match drain_result {
-            Err(_elapsed) => {
-                // Correct: the wall-clock cap (outer timeout) fired.
-                // This is the legacy path — the drain blocked until cancelled.
-            }
-            Ok(Err(DeveloperError::IdleTimeout { .. })) => {
-                panic!("idle watchdog must NOT fire when idle_secs is None");
-            }
-            Ok(Ok(_)) => {
-                panic!("stream was supposed to stall; it completed instead");
-            }
-            Ok(Err(DeveloperError::Other(msg))) => {
-                panic!("unexpected other error: {msg}");
-            }
-        }
-    }
+    use crate::backend::AgentBackend;
 
     // ── Acceptance test: metrics_event_carries_model_and_duration ─────────────
 

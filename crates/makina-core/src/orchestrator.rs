@@ -187,7 +187,6 @@ fn is_plan_tasks_path(path: &std::path::Path) -> bool {
 }
 
 /// Check if `dir` follows the plan convention (both SCOPE.md and ARCHITECTURE.md exist).
-#[allow(dead_code)]
 fn is_plan_convention_dir(dir: &Path) -> bool {
     dir.join("SCOPE.md").is_file() && dir.join("ARCHITECTURE.md").is_file()
 }

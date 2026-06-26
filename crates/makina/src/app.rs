@@ -457,8 +457,10 @@ pub struct CommandPalette {
 impl CommandPalette {
     /// The default action set. Most entries carry an existing intent
     /// (`OpenBrowser`, `OpenDoctor`, `OpenProviderEditor`, `OpenSettings`,
-    /// `Quit`); forward-referenced ones (`RetryFocusedTask`, `DiscoverProject`)
-    /// carry the new stub variant.
+    /// `Quit`, `RetryFocused`, `DiscoverProject`). The palette dispatches IO-backed
+    /// events, which are re-dispatched through `resolve_io` (so "Retry failed task"
+    /// reaches `retry_focused`, plan 0017; "Discover project" reaches `discover_project`,
+    /// plan 0025).
     pub fn default_actions() -> Vec<PaletteAction> {
         vec![
             PaletteAction::Regular {
@@ -479,7 +481,7 @@ impl CommandPalette {
             },
             PaletteAction::Regular {
                 label: "Retry failed task",
-                event: AppEvent::RetryFocusedTask,
+                event: AppEvent::RetryFocused,
             },
             PaletteAction::Regular {
                 label: "Discover project",
@@ -906,10 +908,10 @@ pub enum AppEvent {
     /// Only applies if the active tab is a plan tab; otherwise it is a no-op.
     ToggleAccordionSection(AccordionSection),
 
-    // ── Placeholder stubs for forward-referenced plans ────────────────────────
-    /// User requested to retry the focused task (plan 0017).
-    RetryFocusedTask,
-    /// User requested to discover the project (plan 0025).
+    // ── Project discovery (plan 0025) ─────────────────────────────────────────
+    /// User requested to discover the project (plan 0025). Dispatched by the
+    /// palette and handled in `resolve_io` → `discover_project`, which issues
+    /// `Command::DiscoverProject` to the orchestrator.
     DiscoverProject,
 
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
@@ -1831,7 +1833,6 @@ impl App {
     }
 
     /// Return the static accordion section cycle order (used by Tab logic).
-    #[allow(dead_code)] // Used by downstream move_focus_forward/backward tasks
     pub(crate) fn accordion_section_order() -> &'static [AccordionSection] {
         &[
             AccordionSection::Scope,
@@ -2966,124 +2967,32 @@ impl App {
 
             AppEvent::SettingsCommit => {
                 if let Some(settings) = &mut self.settings {
-                    // Validate all fields before applying.
-                    let mut has_error = false;
-                    let mut gate_iterations = 0u32;
-                    let mut reviewer_iterations = 0u32;
-                    let mut wall_clock_secs = 0u64;
-                    let mut idle_secs = None;
-                    let mut concurrency = 0usize;
-
-                    // Parse gate_iterations
-                    if let Ok(val) = settings.gate_iterations.parse::<u32>() {
-                        if val >= 1 {
-                            gate_iterations = val;
-                        } else {
-                            settings.error =
-                                Some("caps.gate_iterations must be at least 1".to_string());
-                            has_error = true;
+                    // Validate all fields using the shared validator.
+                    use crate::settings_validation::validate_settings;
+                    match validate_settings(settings) {
+                        Ok(valid) => {
+                            // All validation passed; apply the values.
+                            self.caps.gate_iterations = valid.gate_iterations;
+                            self.caps.reviewer_iterations = valid.reviewer_iterations;
+                            self.caps.wall_clock_secs = valid.wall_clock_secs;
+                            self.caps.idle_secs = valid.idle_secs;
+                            self.concurrency = valid.concurrency;
+                            self.mode = Mode::Normal;
+                            self.settings = None;
                         }
-                    } else {
-                        settings.error =
-                            Some("caps.gate_iterations must be a positive integer".to_string());
-                        has_error = true;
-                    }
-
-                    // Parse reviewer_iterations
-                    if !has_error {
-                        if let Ok(val) = settings.reviewer_iterations.parse::<u32>() {
-                            if val >= 1 {
-                                reviewer_iterations = val;
-                            } else {
-                                settings.error =
-                                    Some("caps.reviewer_iterations must be at least 1".to_string());
-                                has_error = true;
-                            }
-                        } else {
-                            settings.error = Some(
-                                "caps.reviewer_iterations must be a positive integer".to_string(),
-                            );
-                            has_error = true;
+                        Err(msg) => {
+                            // Validation failed; set the error and keep the modal open.
+                            settings.error = Some(msg);
                         }
                     }
-
-                    // Parse wall_clock_secs
-                    if !has_error {
-                        if let Ok(val) = settings.wall_clock_secs.parse::<u64>() {
-                            if val >= 1 {
-                                wall_clock_secs = val;
-                            } else {
-                                settings.error =
-                                    Some("caps.wall_clock_secs must be at least 1".to_string());
-                                has_error = true;
-                            }
-                        } else {
-                            settings.error =
-                                Some("caps.wall_clock_secs must be a positive integer".to_string());
-                            has_error = true;
-                        }
-                    }
-
-                    // Parse idle_secs (optional)
-                    if !has_error {
-                        if settings.idle_secs.is_empty() {
-                            idle_secs = None;
-                        } else if let Ok(val) = settings.idle_secs.parse::<u64>() {
-                            if val >= 1 {
-                                idle_secs = Some(val);
-                            } else {
-                                settings.error =
-                                    Some("caps.idle_secs must be at least 1".to_string());
-                                has_error = true;
-                            }
-                        } else {
-                            settings.error =
-                                Some("caps.idle_secs must be a positive integer".to_string());
-                            has_error = true;
-                        }
-                    }
-
-                    // Parse concurrency
-                    if !has_error {
-                        if let Ok(val) = settings.concurrency.parse::<usize>() {
-                            if val >= 1 {
-                                concurrency = val;
-                            } else {
-                                settings.error = Some("concurrency must be at least 1".to_string());
-                                has_error = true;
-                            }
-                        } else {
-                            settings.error =
-                                Some("concurrency must be a positive integer".to_string());
-                            has_error = true;
-                        }
-                    }
-
-                    if !has_error {
-                        // All validation passed; apply the values.
-                        self.caps.gate_iterations = gate_iterations;
-                        self.caps.reviewer_iterations = reviewer_iterations;
-                        self.caps.wall_clock_secs = wall_clock_secs;
-                        self.caps.idle_secs = idle_secs;
-                        self.concurrency = concurrency;
-                        self.mode = Mode::Normal;
-                        self.settings = None;
-                    }
-                    // If has_error, keep the modal open with the error set.
                 }
                 true
             }
 
-            // ── Placeholder stubs for forward-referenced plans ────────────────────
-            AppEvent::RetryFocusedTask => {
-                self.status_message = Some("retry not yet available (plan 0017)".to_string());
-                true
-            }
-            AppEvent::DiscoverProject => {
-                self.status_message =
-                    Some("project discovery not yet available (plan 0025)".to_string());
-                true
-            }
+            // ── Project discovery (plan 0025) ─────────────────────────────────────
+            // Palette IO actions are re-dispatched through `resolve_io`, so
+            // `DiscoverProject` is handled in `event.rs:discover_project()` and never
+            // reaches this arm (plan 0041).
 
             // ── Tabbed content pane (plan 0031) ───────────────────────────────
             AppEvent::OpenTab(content) => {
@@ -3212,6 +3121,17 @@ impl App {
             AppEvent::ResizeSidebarRight => {
                 self.sidebar_width_percent = (self.sidebar_width_percent + 2).min(50);
                 true
+            }
+
+            // ── Project discovery (plan 0025) ─────────────────────────────────────
+            // DiscoverProject is handled in resolve_io::discover_project and should
+            // never reach this arm due to re-dispatch on the palette path (plan 0041).
+            // If it does reach here, the re-dispatch logic failed.
+            AppEvent::DiscoverProject => {
+                unreachable!(
+                    "DiscoverProject should be handled in resolve_io; \
+                    if this fires, the palette re-dispatch logic (plan 0041) is broken"
+                )
             }
         }
     }

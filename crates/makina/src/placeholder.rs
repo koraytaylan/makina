@@ -69,7 +69,7 @@ impl PlaceholderApi {
     ///
     /// Useful for tests that need full control over the initial state and
     /// want to observe only the events they explicitly trigger via `execute()`.
-    #[allow(dead_code)] // used by tests; production binary uses `new()`
+    #[cfg(test)]
     pub fn empty() -> Self {
         let (event_tx, _) = broadcast::channel(64);
         Self {

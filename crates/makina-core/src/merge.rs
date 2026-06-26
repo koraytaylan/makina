@@ -92,6 +92,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::cmd_output::combine_output;
+
 // ── MergeError ────────────────────────────────────────────────────────────────
 
 /// An error that prevented the squash-merge from being **carried out** at all.
@@ -471,29 +473,6 @@ impl SquashMerger {
     }
 }
 
-// ── Output helper ───────────────────────────────────────────────────────────────
-
-/// Combine a git command's stdout and stderr into one human-readable string.
-///
-/// `merge --squash` prints conflict detail to stdout (the "CONFLICT (content):"
-/// lines) and some notices to stderr, so both are surfaced for diagnosis /
-/// agent reconciliation.  Decoded lossily (git output is text, not guaranteed
-/// UTF-8); empty streams are omitted.
-fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let out = String::from_utf8_lossy(stdout);
-    let err = String::from_utf8_lossy(stderr);
-
-    let out = out.trim_end();
-    let err = err.trim_end();
-
-    match (out.is_empty(), err.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => out.to_string(),
-        (true, false) => format!("stderr:\n{err}"),
-        (false, false) => format!("{out}\nstderr:\n{err}"),
-    }
-}
-
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -503,14 +482,6 @@ mod tests {
     //! the integration tests in `tests/squash_merge.rs` against real temp repos.
 
     use super::*;
-
-    #[test]
-    fn combine_output_merges_streams() {
-        assert_eq!(combine_output(b"out", b""), "out");
-        assert_eq!(combine_output(b"", b"err"), "stderr:\nerr");
-        assert_eq!(combine_output(b"out", b"err"), "out\nstderr:\nerr");
-        assert_eq!(combine_output(b"", b""), "");
-    }
 
     #[test]
     fn merger_stores_config() {
