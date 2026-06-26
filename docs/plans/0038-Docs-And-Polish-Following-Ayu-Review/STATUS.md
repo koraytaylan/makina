@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete.
 
 _Last updated: 2026-06-26, against develop._
 
@@ -12,5 +12,5 @@ _Last updated: 2026-06-26, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | README-Fix-Permissions-And-Persistence | `readme-permissions-fix` | 📋 Planned |
-| 0002 | TUI-Polish-Fixes | `inactive-tab-styling-fix`, `wall-clock-sync-fix`, `help-overlay-implementation`, `error-pane-scroll-support` | 📋 Planned |
+| 0001 | README-Fix-Permissions-And-Persistence | `readme-permissions-fix` | ✅ Done |
+| 0002 | TUI-Polish-Fixes | `inactive-tab-styling-fix`, `wall-clock-sync-fix`, `help-overlay-implementation`, `error-pane-scroll-support` | ✅ Done |
