@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete.
 
 _Last updated: 2026-06-26, against develop._
 
@@ -12,6 +12,6 @@ _Last updated: 2026-06-26, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Theme-Robustness-And-Markdown-Caching | `theme-fallback`, `markdown-cache` | 📋 Planned |
-| 0002 | Key-Feedback-Sidebar-And-Provider-Editor | `key-feedback-status`, `sidebar-resize` | 📋 Planned |
-| 0003 | Provider-Editor-Rename-Or-Implement | `provider-editor-rename` | 📋 Planned |
+| 0001 | Theme-Robustness-And-Markdown-Caching | `theme-fallback`, `markdown-cache` | ✅ Done |
+| 0002 | Key-Feedback-Sidebar-And-Provider-Editor | `key-feedback-status`, `sidebar-resize` | ✅ Done |
+| 0003 | Provider-Editor-Rename-Or-Implement | `provider-editor-rename` | ✅ Done |
