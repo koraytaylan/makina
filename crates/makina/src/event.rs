@@ -943,27 +943,53 @@ command = "cargo fmt --check"
 ///
 /// Called from the event loop's `OpenLog` arm (not from `resolve_io`) because
 /// it needs mutable access to `tui` for the teardown/restore cycle.
-async fn open_log(tui: &mut Tui, app: &App) -> Option<String> {
+/// Resolve the on-disk log path to show for a task, preferring the live agent
+/// transcript the orchestrator writes (`{logs}/{task_id}_transcript.jsonl`, see
+/// `orchestrator.rs`) over the tracing `RunFileLayer` file (`{task_id}.log`).
+///
+/// The `.log` file is only written when a tracing span carries a `task_slug`
+/// field; the running orchestrator persists the transcript directly instead, so
+/// the transcript is the file that actually exists in practice. Returns `None`
+/// when neither has been written yet.
+fn resolve_task_log_path(
+    repo_root: &std::path::Path,
+    run_uid: &str,
+    task_id: &str,
+) -> Option<std::path::PathBuf> {
     use makina_core::paths;
+    let transcript = paths::run_dir(repo_root, run_uid)
+        .join("logs")
+        .join(format!("{task_id}_transcript.jsonl"));
+    if transcript.exists() {
+        return Some(transcript);
+    }
+    let legacy = paths::task_log(repo_root, run_uid, task_id);
+    if legacy.exists() {
+        return Some(legacy);
+    }
+    None
+}
+
+async fn open_log(tui: &mut Tui, app: &App) -> Option<String> {
     use std::process::Command;
 
-    // Get the currently focused task's run id and task id.
-    let run = match app.selected_run() {
-        Some(r) => r,
-        None => return Some("No run selected".to_string()),
-    };
-    let task_id = match app.selected_task_id() {
-        Some(t) => t,
-        None => return Some("No task selected".to_string()),
+    // Resolve the task whose log to open, preferring the active task tab, then
+    // the focused sidebar task, then the sidebar selection.
+    let Some((run_uid, task_id)) = app.log_target() else {
+        return Some(
+            "No task selected — open a task tab or pick a task in the sidebar".to_string(),
+        );
     };
 
-    // Derive the log path.
-    let log_path = paths::task_log(&app.repo_root, &run.run_uid, &task_id.0);
-
-    // Check if the log file exists.
-    if !log_path.exists() {
-        return Some("no log for this task yet".to_string());
-    }
+    // Resolve the on-disk log (transcript preferred), or report that none exists.
+    let log_path = match resolve_task_log_path(&app.repo_root, &run_uid, &task_id) {
+        Some(p) => p,
+        None => {
+            return Some(format!(
+                "no log for task '{task_id}' yet — it appears once the task's agent runs"
+            ));
+        }
+    };
 
     // Get the pager command, trying $PAGER first, then falling back to less.
     let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
@@ -3311,39 +3337,43 @@ A description that is long enough to pass minimums.
         };
         let mut app = crate::app::App::new(api, vec![run], repo_root.clone());
 
-        // Select the task.
+        // Select the task (sidebar-selection resolution path).
         app.selected_run = Some(0);
         app.selected_task = Some(0);
 
-        // Construct the expected path using the same logic as log.rs.
-        let expected = makina_core::paths::task_log(&repo_root, run_id_str, "my-task");
+        // log_target resolves the (run_uid, task_id) to show a log for.
+        let (run_uid, task_id) = app.log_target().expect("a task is selected");
+        assert_eq!(run_uid, run_id_str);
+        assert_eq!(task_id, "my-task");
 
-        // Derive the path from the app state.
-        if let Some(run) = app.selected_run() {
-            if let Some(task_id) = app.selected_task_id() {
-                let actual = makina_core::paths::task_log(&repo_root, &run.run_uid, &task_id.0);
-                assert_eq!(
-                    actual, expected,
-                    "derived path must match paths::task_log output"
-                );
-                // After plan-0029, task_log lives under state_root (HOME-based), not repo_root.
-                let state_root = makina_core::paths::state_root(&repo_root);
-                assert!(
-                    expected.starts_with(&state_root),
-                    "path should be under state_root ({}), got {}",
-                    state_root.display(),
-                    expected.display()
-                );
-                assert!(
-                    expected.to_string_lossy().ends_with("my-task.log"),
-                    "path should end with task-id.log"
-                );
-            } else {
-                panic!("no task selected");
-            }
-        } else {
-            panic!("no run selected");
-        }
+        // Before anything is written, no log path resolves (the `L` key reports
+        // "no log yet" rather than opening a nonexistent file).
+        assert!(
+            resolve_task_log_path(&repo_root, &run_uid, &task_id).is_none(),
+            "no log should resolve before any transcript/log is written"
+        );
+
+        // The orchestrator writes the agent transcript to
+        // {logs}/{task_id}_transcript.jsonl — that is the file `L` must open
+        // (regression: it previously looked only at the never-written {task}.log).
+        let logs_dir =
+            makina_core::paths::run_logs_dir(&repo_root, &run_uid).expect("create logs dir");
+        let transcript = logs_dir.join(format!("{task_id}_transcript.jsonl"));
+        std::fs::write(&transcript, "{\"event\":\"exchange\"}\n").expect("write transcript");
+        assert_eq!(
+            resolve_task_log_path(&repo_root, &run_uid, &task_id),
+            Some(transcript.clone()),
+            "resolve_task_log_path must return the written transcript"
+        );
+
+        // Even if a legacy {task}.log is also present, the transcript wins.
+        let legacy = makina_core::paths::task_log(&repo_root, &run_uid, &task_id);
+        std::fs::write(&legacy, "legacy\n").expect("write legacy log");
+        assert_eq!(
+            resolve_task_log_path(&repo_root, &run_uid, &task_id),
+            Some(transcript),
+            "the live transcript must take precedence over the legacy .log"
+        );
 
         // Restore HOME.
         // SAFETY: serialised by HOME_ENV_LOCK

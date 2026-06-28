@@ -1891,6 +1891,37 @@ impl App {
             .map(|r| r.id)
     }
 
+    /// Resolve the `(run_uid, task_id)` whose log the `[L]` key should open,
+    /// preferring (1) the active task tab, then (2) the focused sidebar task
+    /// node, then (3) the sidebar selection. Returns `None` when no task is in
+    /// context (e.g. a plan tab or a run header) so the caller can hint.
+    ///
+    /// Returns owned strings so the caller can drop the borrow before the
+    /// terminal teardown/pager cycle in `crate::event::open_log`.
+    pub fn log_target(&self) -> Option<(String, String)> {
+        // 1. Active task tab → its run + task.
+        if let Some(active) = self.tabs.active_tab
+            && let Some(TabContent::Task { plan_slug, task_id }) = self.tabs.open_tabs.get(active)
+            && let Some(run) = self.runs.iter().find(|r| {
+                makina_core::orchestrator::plan_slug(&r.task_list_path) == *plan_slug
+                    && r.tasks.iter().any(|t| t.id == *task_id)
+            })
+        {
+            return Some((run.run_uid.clone(), task_id.0.clone()));
+        }
+        // 2. Focused sidebar task node.
+        if let Some(TreeNode::Task { run, task }) = self.focused_node()
+            && let Some(rv) = self.runs.get(run)
+            && let Some(tv) = rv.tasks.get(task)
+        {
+            return Some((rv.run_uid.clone(), tv.id.0.clone()));
+        }
+        // 3. Sidebar selection (selected_run + selected_task).
+        let run = self.selected_run()?;
+        let tv = self.selected_task.and_then(|i| run.tasks.get(i))?;
+        Some((run.run_uid.clone(), tv.id.0.clone()))
+    }
+
     /// Return the [`TaskId`] of the currently focused task within the selected
     /// Run, if any.
     ///
@@ -4484,6 +4515,49 @@ mod tests {
             app.active_run_id(),
             Some(RunId(9)),
             "active_run_id must resolve the context plan's open run"
+        );
+    }
+
+    /// `log_target` resolves the (run_uid, task_id) from the ACTIVE TASK TAB even
+    /// when the sidebar selection points elsewhere — so `[L]` opens the log of
+    /// the task the user is actually viewing.
+    #[test]
+    fn log_target_resolves_from_active_task_tab() {
+        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+        let api = Arc::new(PlaceholderApi::new());
+        let run = RunView {
+            id: RunId(3),
+            run_uid: "run-uid-3".to_string(),
+            task_list_path: PathBuf::from("/tmp/docs/plans/0042-demo/TASKS.md"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("build-thing"),
+                title: "Build thing".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: String::new(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        // No sidebar task selected, but a task tab for the run's task is active.
+        app.selected_task = None;
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "0042-demo".to_string(),
+            task_id: TaskId::new("build-thing"),
+        });
+        app.tabs.active_tab = Some(0);
+
+        assert_eq!(
+            app.log_target(),
+            Some(("run-uid-3".to_string(), "build-thing".to_string())),
+            "log_target must resolve the active task tab's run_uid + task_id"
         );
     }
 
