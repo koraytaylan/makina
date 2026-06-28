@@ -177,9 +177,11 @@ pub fn render_markdown(
                         let bg_style =
                             Style::default().bg(theme.get(crate::theme::ThemeRole::CodeBlockBg));
 
-                        // Pad line to width so the band spans full viewport width
-                        let line_width: usize =
-                            line_spans.iter().map(|s| s.content.chars().count()).sum();
+                        // Pad line to width so the band spans full viewport width.
+                        // Measure by DISPLAY width (Span::width → unicode-width),
+                        // matching how ratatui lays out the line — char count would
+                        // under-measure CJK/emoji/wide glyphs and wrap the band.
+                        let line_width: usize = line_spans.iter().map(|s| s.width()).sum();
                         // saturating_sub guards against a code line wider than the
                         // viewport (would otherwise underflow and panic/over-allocate).
                         let padding_needed = (width as usize).saturating_sub(line_width);
@@ -609,6 +611,13 @@ mod tests {
             .iter()
             .filter(|c| c.is_some() && *c != &Some(ratatui::style::Color::Reset))
             .collect::<Vec<_>>();
+        // Guard against vacuity: if the fallback regressed to drop the color
+        // (fg=None/Reset), colored_spans would be empty and the loop below would
+        // pass without checking anything. There must be at least one colored span.
+        assert!(
+            !colored_spans.is_empty(),
+            "monochrome fallback must emit at least one CodeBlock-colored span"
+        );
         for color in colored_spans {
             assert_eq!(
                 color,
@@ -623,6 +632,23 @@ mod tests {
             code_line.style.bg,
             Some(bg_color),
             "Code line should have CodeBlockBg background"
+        );
+    }
+
+    /// A code line WIDER than the viewport must not panic. The full-width band
+    /// padding uses `(width).saturating_sub(line_width)`; before that guard a
+    /// line longer than `width` underflowed (debug panic / huge release alloc).
+    /// Regression for plan 0042 follow-up fix (a).
+    #[test]
+    fn renders_code_block_line_wider_than_width_without_panic() {
+        let text = "```\nlet very_long_variable_name = some_function_call(1, 2, 3);\n```";
+        // Width far narrower than the code line — exercises the saturating_sub path.
+        let lines = super::render_markdown(text, Style::default(), 10, &theme::ayu_dark());
+        // It rendered (no panic) and the over-wide code line still carries the band.
+        let bg_color = theme::ayu_dark().get(crate::theme::ThemeRole::CodeBlockBg);
+        assert!(
+            lines.iter().any(|l| l.style.bg == Some(bg_color)),
+            "the over-wide code line must still render with the CodeBlockBg band"
         );
     }
 

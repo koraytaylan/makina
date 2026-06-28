@@ -1945,18 +1945,15 @@ fn render_task_entry_pane(
 
         lines.push(Line::from(""));
 
-        // Get the task's expanded accordion sections from the app state.
-        // Default to both Scope and Execution expanded for backward compatibility.
+        // Get the task's expanded accordion sections from the app state. A task
+        // with no entry yet defaults to Scope + Execution expanded — the SAME
+        // default the toggle handler seeds, so the first s/z press toggles the
+        // section the user pressed (see default_task_accordion_sections).
         let expanded = app
             .task_accordion_expanded
             .get(&task.id)
             .cloned()
-            .unwrap_or_else(|| {
-                let mut default = HashSet::new();
-                default.insert(AccordionSection::Scope);
-                default.insert(AccordionSection::Execution);
-                default
-            });
+            .unwrap_or_else(crate::app::default_task_accordion_sections);
 
         let content_width = inner.width;
 

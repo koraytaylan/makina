@@ -236,22 +236,31 @@ mod tests {
         assert!(gray_lum > 0.2 && gray_lum < 0.8);
     }
 
+    /// The theme Background's luminance selects the syntect highlight theme
+    /// (dark→Dracula, light→OneHalfLight), which assigns DIFFERENT foreground
+    /// colors to the same tokens. Asserting span COUNT alone is tautological
+    /// (the count is fixed by tokenization, not the chosen theme), so compare
+    /// the actual per-token colors: a dark vs light background must produce a
+    /// different color sequence. (If the luminance branch regressed to always
+    /// pick one theme, these would be identical.)
     #[test]
-    fn test_dark_theme_selection() {
-        let theme = crate::theme::ayu_dark(); // Background: #0D1017
-        let spans = highlight_code_line("let x = 1;", Some("rust"), &theme);
+    fn theme_selection_changes_colors_by_background_luminance() {
+        let dark = highlight_code_line("let x = 1;", Some("rust"), &crate::theme::ayu_dark());
+        let light = highlight_code_line("let x = 1;", Some("rust"), &crate::theme::ayu_light());
 
-        // Dark theme background should result in multiple spans for rust
-        assert!(spans.len() > 1);
-    }
+        // Both branches still tokenize into multiple spans (sanity).
+        assert!(dark.len() > 1, "dark theme must tokenize into >1 spans");
+        assert!(light.len() > 1, "light theme must tokenize into >1 spans");
 
-    #[test]
-    fn test_light_theme_selection() {
-        let theme = crate::theme::ayu_light(); // Background: #F8F9FA
-        let spans = highlight_code_line("let x = 1;", Some("rust"), &theme);
-
-        // Light theme background should result in multiple spans for rust
-        assert!(spans.len() > 1);
+        // Same tokenization → same span positions, so compare foregrounds
+        // positionally; at least one token's color must differ.
+        let dark_colors: Vec<_> = dark.iter().map(|s| s.style.fg).collect();
+        let light_colors: Vec<_> = light.iter().map(|s| s.style.fg).collect();
+        assert_ne!(
+            dark_colors, light_colors,
+            "dark and light backgrounds must select different syntect themes \
+             (different token foreground colors), not the same one"
+        );
     }
 
     #[test]

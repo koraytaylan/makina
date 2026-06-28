@@ -1042,6 +1042,18 @@ pub enum AccordionSection {
     Execution,
 }
 
+/// The default expanded accordion sections for a task detail tab: both `Scope`
+/// and `Execution` open, so a freshly opened task shows its description and live
+/// activity immediately.
+///
+/// Shared by the renderer (`render_task_entry_pane`) and the toggle handler
+/// (`ToggleTaskAccordionSection`) so the "first keypress" starting set matches
+/// what is on screen — otherwise the first `s`/`z` would toggle against an empty
+/// set and collapse the wrong section.
+pub fn default_task_accordion_sections() -> HashSet<AccordionSection> {
+    HashSet::from([AccordionSection::Scope, AccordionSection::Execution])
+}
+
 /// Identifies a scrollable panel for per-panel scroll state and hitbox testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScrollablePanel {
@@ -1319,7 +1331,9 @@ pub struct App {
 
     /// Accordion expand/collapse state for task tabs.
     /// Keyed by task id; the set contains sections that are expanded.
-    /// Sections not in the set are collapsed. All sections default to collapsed.
+    /// Sections not in the set are collapsed. A task with no entry yet defaults
+    /// to [`default_task_accordion_sections`] (Scope + Execution expanded) — both
+    /// the renderer and the toggle handler use that same default.
     pub task_accordion_expanded: HashMap<TaskId, HashSet<AccordionSection>>,
 
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
@@ -3198,7 +3212,13 @@ impl App {
                         self.tabs.open_tabs.get(active_idx)
                 {
                     let task_id = task_id.clone();
-                    let sections = self.task_accordion_expanded.entry(task_id).or_default();
+                    // Seed an absent entry with the SAME default the renderer uses
+                    // (Scope + Execution expanded), so the first toggle collapses
+                    // the section the user actually pressed instead of inverting.
+                    let sections = self
+                        .task_accordion_expanded
+                        .entry(task_id)
+                        .or_insert_with(default_task_accordion_sections);
                     if sections.contains(&section) {
                         sections.remove(&section);
                     } else {
@@ -8189,6 +8209,48 @@ mod tests {
                 .get(&plan_slug)
                 .is_some_and(|s| s.contains(&AccordionSection::Scope)),
             "SCOPE should be collapsed after toggle"
+        );
+    }
+
+    /// The first task-accordion toggle must collapse the section the user
+    /// pressed — not invert it. A fresh task tab renders with Scope + Execution
+    /// expanded; pressing `s` (Scope) must seed that same default and then remove
+    /// Scope, leaving {Execution}. (Regression: a previous `or_default()` seeded
+    /// an empty set, so the first press inserted Scope and silently collapsed
+    /// Execution instead.)
+    #[test]
+    fn task_accordion_first_toggle_collapses_pressed_section_not_inverted() {
+        use makina_core::api::TaskId;
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let task_id = TaskId::new("demo-task");
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "0001-test".to_string(),
+            task_id: task_id.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+        assert!(
+            !app.task_accordion_expanded.contains_key(&task_id),
+            "precondition: no accordion entry yet (renders with the default)"
+        );
+
+        // Press `s` (Scope). The starting set must match the render default
+        // {Scope, Execution}; toggling Scope removes it → {Execution}.
+        app.update(AppEvent::ToggleTaskAccordionSection(
+            AccordionSection::Scope,
+        ));
+        let set = app
+            .task_accordion_expanded
+            .get(&task_id)
+            .expect("toggle must create an entry");
+        assert!(
+            !set.contains(&AccordionSection::Scope),
+            "the pressed section (Scope) must be collapsed"
+        );
+        assert!(
+            set.contains(&AccordionSection::Execution),
+            "the untouched section (Execution) must stay expanded, not collapse"
         );
     }
 
