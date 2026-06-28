@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete.
 
 _Last updated: 2026-06-28, against develop._
 
@@ -12,9 +12,9 @@ _Last updated: 2026-06-28, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Tab Styling And Visibility | `fix-unfocused-tab-background-color` | 📋 Planned |
-| 0002 | Code-Block Rendering With Syntax | `add-codeblock-background-theme-role`, `add-syntect-code-highlighter`, `fix-codeblock-line-splitting-and-full-width-band` | 📋 Planned |
-| 0003 | Scrollbar Position Accuracy | `fix-scrollbar-state-initialization` | 📋 Planned |
-| 0004 | Cycle-Views Key Binding | `verify-and-document-cycle-dependency-view-binding` | 📋 Planned |
-| 0005 | Plan Execution Controls | `restore-run-control-dispatch-from-detail-pane` | 📋 Planned |
-| 0006 | Task-Detail Accordion Structure | `add-accordion-state-for-task-details`, `refactor-task-entry-pane-to-accordion-sections`, `wire-accordion-toggles-for-task-tabs` | 📋 Planned |
+| 0001 | Tab Styling And Visibility | `fix-unfocused-tab-background-color` | ✅ Done |
+| 0002 | Code-Block Rendering With Syntax | `add-codeblock-background-theme-role`, `add-syntect-code-highlighter`, `fix-codeblock-line-splitting-and-full-width-band` | ✅ Done |
+| 0003 | Scrollbar Position Accuracy | `fix-scrollbar-state-initialization` | ✅ Done |
+| 0004 | Cycle-Views Key Binding | `verify-and-document-cycle-dependency-view-binding` | ✅ Done |
+| 0005 | Plan Execution Controls | `restore-run-control-dispatch-from-detail-pane` | ✅ Done |
+| 0006 | Task-Detail Accordion Structure | `add-accordion-state-for-task-details`, `refactor-task-entry-pane-to-accordion-sections`, `wire-accordion-toggles-for-task-tabs` | ✅ Done |
