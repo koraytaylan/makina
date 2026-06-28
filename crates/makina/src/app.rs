@@ -1068,10 +1068,21 @@ pub enum ScrollablePanel {
     DependencyView,
     /// The task entry pane (when a task tab is active).
     TaskEntry,
-    /// The error pane overlay.
+    /// The bottom Output pane overlay (Problems / Logs tabs).
     ErrorPane,
-    /// The log panel overlay (the `[L]` in-TUI task log).
-    LogPane,
+}
+
+/// Which tab the bottom Output pane is showing.
+///
+/// The Output pane unifies the former error pane and log panel: `Problems`
+/// lists run-blocking ingestion issues + app error messages; `Logs` shows the
+/// context task's agent transcript. `[e]` opens/toggles Problems, `[L]` Logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputTab {
+    /// Ingestion blocking/warning issues + app error messages.
+    Problems,
+    /// The context task's agent exchange log.
+    Logs,
 }
 
 /// Geometry of a single scrollable panel (used for mouse hitbox testing).
@@ -1257,11 +1268,11 @@ pub struct App {
     /// idle.
     pub busy: Option<String>,
 
-    /// Whether the error pane is currently visible.
+    /// Whether the bottom Output pane is currently visible.
     pub error_pane_open: bool,
 
-    /// Whether the in-TUI log panel (`[L]`) is currently visible.
-    pub log_pane_open: bool,
+    /// Which tab the Output pane shows when open (`Problems` or `Logs`).
+    pub output_tab: OutputTab,
 
     /// Whether the help overlay is currently visible.
     ///
@@ -1732,7 +1743,7 @@ impl App {
             status_message: None,
             busy: None,
             error_pane_open: false,
-            log_pane_open: false,
+            output_tab: OutputTab::Problems,
             help_mode_active: false,
             error_messages: Vec::new(),
             unseen_errors: false,
@@ -1808,8 +1819,8 @@ impl App {
             // Drop the oldest message to maintain the bound.
             self.error_messages.remove(0);
         }
-        // Mark errors as unseen if the pane is not currently open.
-        if !self.error_pane_open {
+        // Mark errors as unseen unless the Problems tab is currently visible.
+        if !(self.error_pane_open && self.output_tab == OutputTab::Problems) {
             self.unseen_errors = true;
         }
         // When auto-follow is engaged, a new error snaps the view to the newest entry
@@ -1818,6 +1829,24 @@ impl App {
         // untouched so a new error does NOT yank the view back down.
         if self.error_pane_auto_follow {
             self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
+        }
+    }
+
+    /// Open the bottom Output pane on `tab`. Re-invoking with the tab that is
+    /// already showing closes the pane (toggle); invoking with the other tab
+    /// switches to it while keeping the pane open. Opening/switching resets the
+    /// pane scroll so the new content starts at a sensible position, and opening
+    /// `Problems` clears the unseen-errors badge.
+    pub fn open_output_tab(&mut self, tab: OutputTab) {
+        if self.error_pane_open && self.output_tab == tab {
+            self.error_pane_open = false;
+            return;
+        }
+        self.error_pane_open = true;
+        self.output_tab = tab;
+        self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
+        if tab == OutputTab::Problems {
+            self.unseen_errors = false;
         }
     }
 
@@ -2285,11 +2314,9 @@ impl App {
                 true
             }
             AppEvent::ToggleErrorPane => {
-                self.error_pane_open = !self.error_pane_open;
-                // Clear the unseen errors flag when the pane opens.
-                if self.error_pane_open {
-                    self.unseen_errors = false;
-                }
+                // `[e]`: open the Output pane on Problems; if it is already open
+                // on Problems, close it; if open on Logs, switch to Problems.
+                self.open_output_tab(OutputTab::Problems);
                 true
             }
             AppEvent::ToggleHelpMode => {
@@ -2301,12 +2328,9 @@ impl App {
                 true
             }
             AppEvent::ToggleLogPane => {
-                self.log_pane_open = !self.log_pane_open;
-                // Reset the log pane's scroll when it closes so it reopens at the
-                // top (mirrors the error pane's offset cleanup).
-                if !self.log_pane_open {
-                    self.scroll_offsets.remove(&ScrollablePanel::LogPane);
-                }
+                // `[L]`: open the Output pane on Logs; if already open on Logs,
+                // close it; if open on Problems, switch to Logs.
+                self.open_output_tab(OutputTab::Logs);
                 true
             }
             AppEvent::SelectUp => {
