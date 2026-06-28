@@ -1525,13 +1525,15 @@ impl App {
                     self.selected_run = Some(run_idx);
                 }
             }
-            Some(TabContent::Plan { plan_slug }) => {
+            // Plan and plan-task preview tabs (plan 0042): point selected_run at
+            // the run for that plan if one is open, else CLEAR any stale
+            // selection — so run-control acts on this plan (Start opens + runs
+            // it) instead of a previously selected, unrelated run.
+            Some(TabContent::Plan { plan_slug }) | Some(TabContent::PlanTask { plan_slug, .. }) => {
                 let plan_slug = plan_slug.clone();
-                if let Some(run_idx) = self.runs.iter().position(|run| {
+                self.selected_run = self.runs.iter().position(|run| {
                     makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
-                }) {
-                    self.selected_run = Some(run_idx);
-                }
+                });
             }
             _ => {}
         }
@@ -9938,6 +9940,51 @@ mod tests {
             app.selected_run,
             Some(1),
             "NextTab to second plan tab syncs selected_run to its run (1)"
+        );
+    }
+
+    /// Switching to a plan tab whose plan has NO open run must CLEAR a stale
+    /// `selected_run` — otherwise run-control (and the new Start-opens-the-plan
+    /// flow) would act on the previously selected, unrelated run. Regression for
+    /// the 0042 review finding on stale run-control targeting.
+    #[test]
+    fn switching_to_plan_tab_without_run_clears_stale_selection() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+
+        let mut app = make_app();
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+        // Only 0001-alpha has a run; 0002-beta has none.
+        app.runs = vec![RunView {
+            id: RunId(1),
+            run_uid: "run-1".to_string(),
+            task_list_path: PathBuf::from("docs/plans/0001-alpha/TASKS.md"),
+            status: RunStatus::Pending,
+            project: "test".to_string(),
+            tasks: vec![],
+            report: Default::default(),
+        }];
+        app.update(AppEvent::OpenTab(TabContent::Plan {
+            plan_slug: "0001-alpha".to_string(),
+        }));
+        app.update(AppEvent::OpenTab(TabContent::Plan {
+            plan_slug: "0002-beta".to_string(),
+        }));
+
+        // Activate the run-backed plan tab → selected_run points at run 0.
+        app.update(AppEvent::ActivateTab(0));
+        assert_eq!(app.selected_run, Some(0), "0001-alpha tab selects its run");
+
+        // Switch to the run-less plan tab → the stale selection must be cleared.
+        app.update(AppEvent::ActivateTab(1));
+        assert_eq!(
+            app.selected_run, None,
+            "switching to a plan with no run must clear the stale selection"
+        );
+        assert!(
+            app.active_run_id().is_none(),
+            "no run is controllable for a run-less plan (Start will open it)"
         );
     }
 
