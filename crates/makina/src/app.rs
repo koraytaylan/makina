@@ -1027,7 +1027,7 @@ impl Default for TabState {
     }
 }
 
-/// Accordion section identifier for plan tabs.
+/// Accordion section identifier for plan tabs and task detail tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccordionSection {
     /// SCOPE.md section
@@ -1822,6 +1822,57 @@ impl App {
     /// to obtain the currently focused Run.
     pub fn selected_run(&self) -> Option<&RunView> {
         self.selected_run.and_then(|i| self.runs.get(i))
+    }
+
+    /// The discovered plan the user is currently "in" — derived from the active
+    /// tab's slug (a plan or plan-task preview tab), falling back to the focused
+    /// sidebar node (a plan or plan-task node).
+    ///
+    /// This lets the run-control keys act on a discovered plan that has **no open
+    /// Run yet**: `Start` resolves the plan here and opens + runs its `TASKS.md`
+    /// (see `crate::event`), instead of forcing the user through the `[o]` file
+    /// browser. Returns `None` when the context is a run/run-task or nothing.
+    pub fn context_plan(&self) -> Option<&makina_core::orchestrator::PlanEntry> {
+        // Prefer the active tab's plan slug (Plan or PlanTask preview tabs).
+        if let Some(active) = self.tabs.active_tab
+            && let Some(content) = self.tabs.open_tabs.get(active)
+        {
+            let slug = match content {
+                TabContent::Plan { plan_slug } | TabContent::PlanTask { plan_slug, .. } => {
+                    Some(plan_slug.as_str())
+                }
+                TabContent::Task { .. } => None,
+            };
+            if let Some(slug) = slug {
+                return self.discovered_plans.iter().find(|p| p.slug == slug);
+            }
+        }
+        // Fall back to the focused sidebar node.
+        match self.focused_node() {
+            Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
+                self.discovered_plans.get(plan_idx)
+            }
+            _ => None,
+        }
+    }
+
+    /// The [`RunId`] a run-control key (start/pause/cancel/resume) should act on:
+    /// the explicitly selected run, or — when none is selected — the run that
+    /// matches the [`context_plan`](Self::context_plan), if one is already open.
+    ///
+    /// Returning the context plan's run here means that once a plan has been
+    /// started, Pause/Cancel/resume keep working from the plan tab even if the
+    /// sidebar cursor has moved off the run. Returns `None` when no run exists
+    /// for the current context (the caller may then open one for the plan).
+    pub fn active_run_id(&self) -> Option<makina_core::api::RunId> {
+        if let Some(run) = self.selected_run() {
+            return Some(run.id);
+        }
+        let plan = self.context_plan()?;
+        self.runs
+            .iter()
+            .find(|r| makina_core::orchestrator::plan_slug(&r.task_list_path) == plan.slug)
+            .map(|r| r.id)
     }
 
     /// Return the [`TaskId`] of the currently focused task within the selected
@@ -4369,6 +4420,49 @@ mod tests {
     fn selected_run_accessor_returns_none_when_empty() {
         let app = make_app();
         assert!(app.selected_run().is_none());
+    }
+
+    /// `active_run_id` falls back to the run matching the active plan tab when
+    /// nothing is explicitly selected — so run-control keys (pause/cancel/resume)
+    /// keep targeting a plan's run after it has been started, even if the sidebar
+    /// cursor has moved off it.
+    #[test]
+    fn active_run_id_falls_back_to_context_plan_run() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        // A run whose task_list_path resolves to plan slug "0099-demo".
+        let run = RunView {
+            id: RunId(9),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        // Discovered plan + active plan tab for the same slug, but no explicit
+        // selection.
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/tmp/docs/plans/0099-demo"),
+            slug: "0099-demo".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0099-demo".to_string(),
+        });
+        app.selected_run = None;
+
+        assert!(app.selected_run().is_none(), "no explicit selection");
+        assert_eq!(
+            app.active_run_id(),
+            Some(RunId(9)),
+            "active_run_id must resolve the context plan's open run"
+        );
     }
 
     // ── SelectUp / SelectDown navigation ─────────────────────────────────────

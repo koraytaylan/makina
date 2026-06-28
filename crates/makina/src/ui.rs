@@ -855,7 +855,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!(" [^P] cmds  [o] open  [s/p/c] start/pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] help  [wheel] scroll  "),
+            format!(" [^P] cmds  [o] open  [^S] start  [p/c] pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] log  [?] help  [wheel] scroll  "),
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -1828,7 +1828,10 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 /// Format the execution content for a task's Execution accordion section.
 ///
 /// Summarizes the task's exchanges and progress for the given (RunId, TaskId),
-/// showing iteration counts, activity indicators, role metrics, and failure reason if applicable.
+/// showing activity indicators, role metrics, and failure reason if applicable.
+/// Gate/review iteration counts are intentionally omitted here — they live in the
+/// always-visible task header (`render_task_entry_pane`) so they show even when the
+/// Execution section is collapsed or there are no exchanges yet.
 /// Falls back to "No execution yet — start the run (Ctrl+S)" when there are no exchanges.
 fn format_task_execution_content(
     app: &App,
@@ -1843,16 +1846,6 @@ fn format_task_execution_content(
     if !exchange_exists {
         // No execution yet — show empty state
         return "No execution yet — start the run (Ctrl+S)".to_string();
-    }
-
-    // Add iteration counts
-    if task.gate_iterations > 0 || task.review_iterations > 0 {
-        let counts = format!(
-            "gate ×{}  ·  review ×{}",
-            task.gate_iterations, task.review_iterations
-        );
-        content.push_str(&counts);
-        content.push('\n');
     }
 
     // Add activity indicators (idle time, wall-clock countdown) for in-progress tasks
@@ -4372,8 +4365,12 @@ mod tests {
 
         assert!(screen.contains("[o]"), "status bar must show [o] open");
         assert!(
-            screen.contains("[s/p/c]"),
-            "status bar must show the [s/p/c] start/pause/cancel hints"
+            screen.contains("[^S] start"),
+            "status bar must show the [^S] start hint"
+        );
+        assert!(
+            screen.contains("[p/c] pause/cancel"),
+            "status bar must show the [p/c] pause/cancel hints"
         );
     }
 

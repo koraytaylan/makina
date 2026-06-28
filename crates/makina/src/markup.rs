@@ -180,11 +180,9 @@ pub fn render_markdown(
                         // Pad line to width so the band spans full viewport width
                         let line_width: usize =
                             line_spans.iter().map(|s| s.content.chars().count()).sum();
-                        let padding_needed = if width > 0 {
-                            width as usize - line_width
-                        } else {
-                            0
-                        };
+                        // saturating_sub guards against a code line wider than the
+                        // viewport (would otherwise underflow and panic/over-allocate).
+                        let padding_needed = (width as usize).saturating_sub(line_width);
                         if padding_needed > 0 {
                             line_spans.push(Span::raw(" ".repeat(padding_needed)));
                         }

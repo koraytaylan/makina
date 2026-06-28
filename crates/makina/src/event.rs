@@ -328,6 +328,7 @@ async fn resolve_io(
                         std::sync::Arc::clone(&app.api),
                         entry.path.clone(),
                         background_tx.clone(),
+                        false,
                     );
                     (AppEvent::CloseBrowser, Some(status))
                 }
@@ -336,7 +337,34 @@ async fn resolve_io(
             }
         }
         // ── Run control (task 31) ─────────────────────────────────────────────
-        AppEvent::StartRun => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
+        // Start has an extra responsibility (plan 0042 follow-up): when there is
+        // no open Run for the current context but the user is in a discovered
+        // plan, `Start` opens that plan's TASKS.md as a new Run and auto-starts
+        // it — so a plan can be launched from its tab/node without the [o] file
+        // browser. When a Run already exists it just starts/resumes it.
+        AppEvent::StartRun => {
+            if app.active_run_id().is_some() {
+                (AppEvent::Tick, run_control(app, ControlKind::Start).await)
+            } else {
+                match resolve_plan_to_open(app) {
+                    Some(PlanOpen::Tasks { path, label }) => {
+                        spawn_open_run(
+                            std::sync::Arc::clone(&app.api),
+                            path,
+                            background_tx.clone(),
+                            true,
+                        );
+                        (AppEvent::Tick, Some(format!("Starting {label}…")))
+                    }
+                    Some(PlanOpen::NoTasks { label }) => (
+                        AppEvent::Tick,
+                        Some(format!("{label}: no TASKS.md to run — author tasks first")),
+                    ),
+                    // No run and no plan context: surface the standard hint.
+                    None => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
+                }
+            }
+        }
         AppEvent::PauseRun => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
         AppEvent::CancelRun => (AppEvent::Tick, run_control(app, ControlKind::Cancel).await),
         AppEvent::Reinterpret => (
@@ -546,17 +574,62 @@ fn spawn_open_run(
     api: std::sync::Arc<dyn makina_core::api::Api>,
     task_list_path: std::path::PathBuf,
     background_tx: mpsc::Sender<AppEvent>,
+    auto_start: bool,
 ) {
+    use makina_core::api::{Command, CommandOutcome};
     tokio::spawn(async move {
-        let result = api
-            .execute(makina_core::api::Command::OpenRun { task_list_path })
-            .await;
-        if let Err(e) = result {
-            let _ = background_tx
-                .send(AppEvent::StatusMessage(format!("Open failed: {e}")))
-                .await;
+        match api.execute(Command::OpenRun { task_list_path }).await {
+            // The new Run is created Pending; when the user's intent was to
+            // *start* the plan (not just open it), immediately issue StartRun on
+            // the freshly-opened run. The RunOpened/RunStatusChanged events flow
+            // back through subscribe() to update the UI.
+            Ok(CommandOutcome::RunOpened { run }) if auto_start => {
+                if let Err(e) = api.execute(Command::StartRun { run }).await {
+                    let _ = background_tx
+                        .send(AppEvent::StatusMessage(format!("Start failed: {e}")))
+                        .await;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = background_tx
+                    .send(AppEvent::StatusMessage(format!("Open failed: {e}")))
+                    .await;
+            }
         }
     });
+}
+
+/// What a `Start` press should do for the plan the user is currently in, when
+/// no Run exists for it yet (see [`resolve_plan_to_open`]).
+enum PlanOpen {
+    /// The plan has a `TASKS.md`: open it as a new Run at `path` and auto-start.
+    Tasks {
+        path: std::path::PathBuf,
+        label: String,
+    },
+    /// The plan has no `TASKS.md` to run yet.
+    NoTasks { label: String },
+}
+
+/// Resolve the [`App::context_plan`](crate::app::App::context_plan) into a
+/// startable target. Returns `None` when there is no plan context at all.
+///
+/// Only consulted when no run is open for the context (the caller checks
+/// [`App::active_run_id`](crate::app::App::active_run_id) first), so this never
+/// opens a duplicate Run for a plan that is already running.
+fn resolve_plan_to_open(app: &App) -> Option<PlanOpen> {
+    let plan = app.context_plan()?;
+    Some(if plan.has_tasks {
+        PlanOpen::Tasks {
+            path: plan.dir.join("TASKS.md"),
+            label: plan.slug.clone(),
+        }
+    } else {
+        PlanOpen::NoTasks {
+            label: plan.slug.clone(),
+        }
+    })
 }
 
 /// Write the provider/role configuration from the editor back to
@@ -947,12 +1020,11 @@ enum ControlKind {
 async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
     use makina_core::api::Command;
 
-    let run = match app.selected_run() {
-        Some(r) => r.id,
+    let run = match app.active_run_id() {
+        Some(r) => r,
         None => {
             return Some(
-                "No run selected — open a plan or task tab, or pick a run in the sidebar"
-                    .to_string(),
+                "No run selected — open a plan tab, or pick a task list with [o]".to_string(),
             );
         }
     };
@@ -1233,7 +1305,7 @@ fn translate_key(
     // otherwise quit (the universal escape hatch is preserved in modals and when
     // no run is selected so the user can always exit the app).
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if no_modal_active && app.selected_run().is_some() {
+        if no_modal_active && app.active_run_id().is_some() {
             return AppEvent::CancelRun;
         }
         return AppEvent::Quit;
@@ -1242,7 +1314,7 @@ fn translate_key(
     // Ctrl-P: pause the selected run when in normal mode with a run active;
     // otherwise open the command palette (consistent with prior behaviour).
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if no_modal_active && app.selected_run().is_some() {
+        if no_modal_active && app.active_run_id().is_some() {
             return AppEvent::PauseRun;
         }
         return AppEvent::OpenCommandPalette;
@@ -2425,7 +2497,178 @@ mod tests {
         assert!(matches!(ev, AppEvent::Tick));
         let msg = status.expect("must produce a status message");
         assert!(msg.contains("No run selected"));
-        assert!(msg.contains("open a plan or task tab"));
+        assert!(msg.contains("open a plan tab"));
+    }
+
+    /// **Start on a discovered plan with no Run (plan 0042 follow-up).** When the
+    /// active tab is a plan that has a `TASKS.md` and no Run is open for it,
+    /// `Start` must open that plan's `TASKS.md` as a new Run *and* auto-start it —
+    /// issuing `OpenRun{dir/TASKS.md}` followed by `StartRun{new run}` — so a plan
+    /// can be launched from its tab without the `[o]` file browser.
+    #[tokio::test]
+    async fn start_on_plan_tab_without_run_opens_and_starts_it() {
+        use crate::app::{App, AppEvent, TabContent};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        /// Records every command and reports a fresh RunId for OpenRun.
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command.clone());
+                match command {
+                    Command::OpenRun { .. } => Ok(CommandOutcome::RunOpened { run: RunId(42) }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                vec![]
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![],
+            std::path::PathBuf::from("."),
+        );
+        // A discovered plan with a TASKS.md, surfaced via an active plan tab. No
+        // Run exists for it.
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/tmp/docs/plans/0099-demo"),
+            slug: "0099-demo".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0099-demo".to_string(),
+        });
+        assert!(
+            app.active_run_id().is_none(),
+            "precondition: no Run is open for the plan"
+        );
+
+        // Start on the plan tab spawns the open+auto-start in the background and
+        // returns an immediate "Starting …" status.
+        let (tx, _rx) = background_events();
+        let (ev, status) = resolve_io(&app, AppEvent::StartRun, &tx).await;
+        assert!(matches!(ev, AppEvent::Tick));
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|m| m.contains("Starting") && m.contains("0099-demo")),
+            "Start on a plan must surface a 'Starting <plan>…' status; got {status:?}"
+        );
+
+        // The background task issues OpenRun then StartRun. Poll until both land.
+        let cmds = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let c = api.commands.lock().unwrap();
+                    if c.len() >= 2 {
+                        return c.clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background OpenRun+StartRun did not complete in time");
+
+        assert!(
+            matches!(&cmds[0], Command::OpenRun { task_list_path }
+                if task_list_path == &std::path::PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md")),
+            "first command must be OpenRun for the plan's TASKS.md; got {:?}",
+            cmds[0]
+        );
+        assert!(
+            matches!(cmds[1], Command::StartRun { run: RunId(42) }),
+            "second command must auto-start the freshly opened run; got {:?}",
+            cmds[1]
+        );
+    }
+
+    /// **Start on a plan with no `TASKS.md`.** Such a plan cannot be opened as a
+    /// Run, so `Start` reports a helpful message and issues no command.
+    #[tokio::test]
+    async fn start_on_plan_without_tasks_md_reports_and_issues_nothing() {
+        use crate::app::{App, AppEvent, TabContent};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command);
+                Ok(CommandOutcome::Acknowledged)
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                vec![]
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![],
+            std::path::PathBuf::from("."),
+        );
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/tmp/docs/plans/0100-empty"),
+            slug: "0100-empty".to_string(),
+            has_tasks: false,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0100-empty".to_string(),
+        });
+
+        let (ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
+        assert!(matches!(ev, AppEvent::Tick));
+        assert!(
+            status.as_deref().is_some_and(|m| m.contains("no TASKS.md")),
+            "Start on a tasks-less plan must report it has no TASKS.md; got {status:?}"
+        );
+        // Give any (erroneously) spawned task a chance to run, then assert none did.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            api.commands.lock().unwrap().is_empty(),
+            "no command must be issued for a plan with no TASKS.md"
+        );
     }
 
     /// A command error from the api is surfaced as a status message (not dropped).

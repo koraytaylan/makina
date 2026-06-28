@@ -161,8 +161,8 @@ mod tests {
             let has_content = !span.content.is_empty();
             let has_foreground = matches!(span.style.fg, Some(Color::Rgb(_, _, _)));
             assert!(
-                has_content || has_foreground,
-                "Span should have content or foreground color"
+                has_content && has_foreground,
+                "Span should have both content and a foreground color"
             );
         }
     }
