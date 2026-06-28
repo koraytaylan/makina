@@ -406,7 +406,7 @@ async fn resolve_io(
                             // the event loop will reprocess them through resolve_io.
                             match event {
                                 AppEvent::RetryFocused | AppEvent::DiscoverProject => {
-                                    let _ = background_tx.try_send(event.clone());
+                                    let _ = background_tx.send(event.clone()).await;
                                     (AppEvent::Tick, None)
                                 }
                                 _ => (event.clone(), None),
