@@ -530,7 +530,9 @@ pub fn render(app: &App, frame: &mut Frame) {
                 .split(content_area);
 
             let tab_area = plan_split[0];
-            let plan_area = plan_split[1];
+            // Carve a dependency-view sub-pane (when `v` is active) so it renders
+            // on a plan tab too, not only the bare selected-run view.
+            let plan_area = carve_dependency_overlay(app, frame, plan_split[1], &mut panel_geoms);
 
             // Render the tab bar
             render_tab_bar(app, frame, tab_area);
@@ -552,10 +554,11 @@ pub fn render(app: &App, frame: &mut Frame) {
                 .constraints([Constraint::Length(1), Constraint::Min(3)])
                 .split(content_area);
             render_tab_bar(app, frame, split[0]);
-            render_plan_task_pane(app, plan, preview, frame, split[1]);
+            let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
+            render_plan_task_pane(app, plan, preview, frame, task_area);
             panel_geoms.push(PanelGeometry {
                 panel: ScrollablePanel::PlanAccordion,
-                rect: split[1],
+                rect: task_area,
             });
         }
         (None, None, None, None) => {
@@ -590,7 +593,9 @@ pub fn render(app: &App, frame: &mut Frame) {
                 .split(content_area);
 
             let tab_area = task_split[0];
-            let task_area = task_split[1];
+            // Carve a dependency-view sub-pane (when `v` is active) so it renders
+            // on a task tab too.
+            let task_area = carve_dependency_overlay(app, frame, task_split[1], &mut panel_geoms);
 
             // Render the tab bar first so it stays visible even if the task
             // itself can't be resolved in the selected run.
@@ -1137,6 +1142,38 @@ fn render_plan_task_pane(
     }
 }
 
+/// When the dependency-view overlay is active, carve a sub-pane from the BOTTOM
+/// of `area`, render the overlay into it, and return the (reduced) top area for
+/// the main content. When the overlay is `Off`, returns `area` unchanged.
+///
+/// This is what makes the `v` cycle visible from plan/plan-task/task tabs too —
+/// not only the bare selected-run view (which carves its own pane out of the
+/// exchange region). See [`render_dependency_view`], which is plan-aware so the
+/// overlay shows a discovered plan's task graph even before it has a run.
+fn carve_dependency_overlay(
+    app: &App,
+    frame: &mut Frame,
+    area: Rect,
+    panel_geoms: &mut Vec<PanelGeometry>,
+) -> Rect {
+    if app.dependency_view == DependencyViewMode::Off || area.height < 6 {
+        return area;
+    }
+    let dep_height = (area.height / 2).max(3);
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(dep_height)])
+        .split(area);
+    let main_area = split[0];
+    let dep_area = split[1];
+    render_dependency_view(app, frame, dep_area);
+    panel_geoms.push(PanelGeometry {
+        panel: ScrollablePanel::DependencyView,
+        rect: dep_area,
+    });
+    main_area
+}
+
 /// This is the single shared entry point for all [`DependencyViewMode`]
 /// renderings: sibling tasks (`tui-dep-tree`, `tui-dep-timeline`) only add their
 /// match arms here.  The pane is a top-bordered `Dependencies` block; its body
@@ -1158,6 +1195,16 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
         .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // No run for the current context (e.g. a discovered plan tab that has not
+    // been started): render the plan's task graph from its preview tasks so the
+    // `v` cycle still shows something useful instead of an empty pane.
+    if app.selected_run().is_none()
+        && let Some(plan) = app.context_plan()
+    {
+        render_dependency_view_plan(app, plan, inner, frame);
+        return;
+    }
 
     match app.dependency_view {
         DependencyViewMode::List => {
@@ -1351,6 +1398,167 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
         }
         // `Off` is handled by the caller (this fn is not invoked).
         DependencyViewMode::Off => {}
+    }
+}
+
+/// Render the dependency overlay body for a discovered plan that has no run yet,
+/// sourcing the graph from the plan's preview tasks (`PlanTaskPreview`, which
+/// carry `depends_on` + `gated`). Mirrors the run-backed views:
+/// - `List`: one line per task, `id (GATED?) ← dep1, dep2`.
+/// - `Tree`: an ASCII forest rooted at tasks nothing depends on.
+/// - `Timeline`: a placeholder (no wall-clock timing until the plan is started).
+fn render_dependency_view_plan(
+    app: &App,
+    plan: &makina_core::orchestrator::PlanEntry,
+    inner: Rect,
+    frame: &mut Frame,
+) {
+    let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+    let fg = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
+    let gated_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning));
+
+    let lines: Vec<Line> = if plan.tasks.is_empty() {
+        vec![Line::from(vec![Span::styled(
+            "  No tasks in this plan.",
+            dim,
+        )])]
+    } else {
+        match app.dependency_view {
+            DependencyViewMode::List => plan
+                .tasks
+                .iter()
+                .map(|t| {
+                    let deps = if t.depends_on.is_empty() {
+                        "—".to_string()
+                    } else {
+                        t.depends_on.join(", ")
+                    };
+                    Line::from(vec![
+                        Span::styled(t.id.clone(), if t.gated { gated_style } else { fg }),
+                        Span::styled(if t.gated { " (GATED)" } else { "" }, gated_style),
+                        Span::styled(format!("  ← {deps}"), dim),
+                    ])
+                })
+                .collect(),
+            DependencyViewMode::Tree => {
+                // Roots = tasks that no other task depends on; render each root's
+                // prerequisite subtree so each chain appears once.
+                let depended_on: std::collections::HashSet<&str> = plan
+                    .tasks
+                    .iter()
+                    .flat_map(|t| t.depends_on.iter().map(String::as_str))
+                    .collect();
+                let mut acc: Vec<Line> = Vec::new();
+                for t in plan
+                    .tasks
+                    .iter()
+                    .filter(|t| !depended_on.contains(t.id.as_str()))
+                {
+                    render_plan_dependency_tree(
+                        app,
+                        &plan.tasks,
+                        &t.id,
+                        "",
+                        true,
+                        true,
+                        0,
+                        &mut acc,
+                    );
+                }
+                if acc.is_empty() {
+                    // Every task is depended on (a cycle, or single mutual pair) —
+                    // fall back to rendering every task as a root.
+                    for t in &plan.tasks {
+                        render_plan_dependency_tree(
+                            app,
+                            &plan.tasks,
+                            &t.id,
+                            "",
+                            true,
+                            true,
+                            0,
+                            &mut acc,
+                        );
+                    }
+                }
+                acc
+            }
+            DependencyViewMode::Timeline => {
+                vec![Line::from(vec![Span::styled(
+                    "  No timing yet — start the plan (Ctrl+S) to see the Gantt.",
+                    dim,
+                )])]
+            }
+            DependencyViewMode::Off => Vec::new(),
+        }
+    };
+
+    let dep_total = lines.len() as u16;
+    let dep_scroll_max = dep_total.saturating_sub(inner.height);
+    app.last_scroll_maxes
+        .borrow_mut()
+        .insert(ScrollablePanel::DependencyView, dep_scroll_max);
+    let dep_scroll_offset = app.panel_offset(ScrollablePanel::DependencyView, dep_scroll_max);
+    let para = Paragraph::new(lines).scroll((dep_scroll_offset, 0));
+    frame.render_widget(para, inner);
+}
+
+/// Recursively emit ASCII-tree lines for a plan preview task and its direct
+/// prerequisites, looked up by id in `tasks`. Caps at [`DEPENDENCY_TREE_MAX_DEPTH`]
+/// like the run-backed tree. `is_root` suppresses the connector for the top line.
+#[allow(clippy::too_many_arguments)]
+fn render_plan_dependency_tree(
+    app: &App,
+    tasks: &[makina_core::orchestrator::PlanTaskPreview],
+    id: &str,
+    prefix: &str,
+    is_last: bool,
+    is_root: bool,
+    depth: usize,
+    acc: &mut Vec<Line<'static>>,
+) {
+    let connector = if is_root {
+        ""
+    } else if is_last {
+        "└── "
+    } else {
+        "├── "
+    };
+    let task = tasks.iter().find(|t| t.id == id);
+    let (label, deps, gated) = match task {
+        Some(t) => (t.id.clone(), t.depends_on.clone(), t.gated),
+        None => (format!("{id} [?]"), Vec::new(), false),
+    };
+    let style = if gated {
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
+    } else if task.is_none() {
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+    } else {
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
+    };
+    let gated_suffix = if gated { " (GATED)" } else { "" };
+    acc.push(Line::from(vec![Span::styled(
+        format!("{prefix}{connector}{label}{gated_suffix}"),
+        style,
+    )]));
+    if depth < DEPENDENCY_TREE_MAX_DEPTH && !deps.is_empty() {
+        let child_prefix = if is_root {
+            prefix.to_string()
+        } else {
+            format!("{prefix}{}", if is_last { "    " } else { "│   " })
+        };
+        for (i, dep) in deps.iter().enumerate() {
+            render_plan_dependency_tree(
+                app,
+                tasks,
+                dep,
+                &child_prefix,
+                i + 1 == deps.len(),
+                false,
+                depth + 1,
+                acc,
+            );
+        }
     }
 }
 
@@ -5465,6 +5673,79 @@ mod tests {
         assert!(
             c_col > a_col,
             "grandchild 'c' must be indented deeper than parent 'a' (a_col={a_col}, c_col={c_col})"
+        );
+    }
+
+    /// The `v` dependency view must render on a PLAN tab too — sourcing the graph
+    /// from the plan's preview tasks even before it has a run. Regression: the
+    /// overlay previously rendered ONLY in the bare selected-run view, so on a
+    /// plan tab `v` cycled the mode but nothing appeared on screen.
+    #[test]
+    fn dependency_view_renders_on_plan_tab_from_preview_tasks() {
+        use crate::app::{DependencyViewMode, TabContent};
+        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.discovered_plans = vec![PlanEntry {
+            dir: std::path::PathBuf::from("/tmp/docs/plans/0007-demo"),
+            slug: "0007-demo".to_string(),
+            has_tasks: true,
+            tasks: vec![
+                PlanTaskPreview {
+                    id: "scaffold".to_string(),
+                    title: "Scaffold".to_string(),
+                    gated: false,
+                    depends_on: vec![],
+                    body: String::new(),
+                },
+                PlanTaskPreview {
+                    id: "wire-cli".to_string(),
+                    title: "Wire CLI".to_string(),
+                    gated: false,
+                    depends_on: vec!["scaffold".to_string()],
+                    body: String::new(),
+                },
+            ],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0007-demo".to_string(),
+        });
+        app.tabs.active_tab = Some(0);
+        assert!(
+            app.selected_run().is_none(),
+            "precondition: no run for the plan"
+        );
+
+        // List mode: the overlay renders with the plan's task ids.
+        app.dependency_view = DependencyViewMode::List;
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("Dependencies"),
+            "the Dependencies overlay must render on a plan tab"
+        );
+        assert!(
+            screen.contains("scaffold") && screen.contains("wire-cli"),
+            "plan task ids must appear in the dependency list"
+        );
+
+        // Tree mode: the dependency edge is drawn with ASCII connectors.
+        app.dependency_view = DependencyViewMode::Tree;
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("Dependencies"),
+            "the Dependencies overlay must render in tree mode on a plan tab"
+        );
+        assert!(
+            screen.contains("└── ") || screen.contains("├── "),
+            "tree mode must draw connectors for the plan's dependency edges"
         );
     }
 
