@@ -1435,9 +1435,21 @@ impl App {
     /// order shown in the sidebar (plans first, then runs and their tasks if expanded, repeat).
     pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
-        // Add discovered plans at the top. An expanded plan (not in
-        // `collapsed_plans`) contributes its parsed task previews as child nodes.
+        // Slugs of plans that already have an open Run. Such a plan is rendered
+        // as its (live) Run node below — NOT also as a static discovered-plan
+        // node, otherwise starting a plan would appear to duplicate it.
+        let run_slugs: std::collections::HashSet<String> = self
+            .runs
+            .iter()
+            .map(|r| makina_core::orchestrator::plan_slug(&r.task_list_path))
+            .collect();
+        // Add discovered plans at the top (skipping any that now have a Run). An
+        // expanded plan (not in `collapsed_plans`) contributes its parsed task
+        // previews as child nodes.
         for (plan_idx, plan) in self.discovered_plans.iter().enumerate() {
+            if run_slugs.contains(&plan.slug) {
+                continue;
+            }
             nodes.push(TreeNode::Plan { plan_idx });
             if !self.collapsed_plans.contains(&plan_idx) {
                 for task_idx in 0..plan.tasks.len() {
@@ -7960,6 +7972,58 @@ mod tests {
         assert!(
             matches!(nodes[0], TreeNode::Plan { plan_idx: 0 }),
             "First node should be a discovered plan"
+        );
+    }
+
+    /// Once a discovered plan has an open Run (e.g. after Start), the sidebar
+    /// shows ONLY the live Run node for that slug — not also the static
+    /// discovered-plan node — so starting a plan does not appear to duplicate it.
+    #[test]
+    fn started_plan_is_not_duplicated_as_plan_and_run() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/repo/docs/plans/0001-todo"),
+            slug: "0001-todo".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        // Plan-only: a single Plan node.
+        assert_eq!(
+            app.visible_tree_nodes()
+                .iter()
+                .filter(|n| matches!(n, TreeNode::Plan { .. }))
+                .count(),
+            1
+        );
+
+        // A Run is opened for the SAME plan slug (what Start does).
+        app.runs = vec![RunView {
+            id: RunId(1),
+            run_uid: "uid-1".to_string(),
+            task_list_path: PathBuf::from("/repo/docs/plans/0001-todo/TASKS.md"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        }];
+
+        let nodes = app.visible_tree_nodes();
+        assert!(
+            !nodes.iter().any(|n| matches!(n, TreeNode::Plan { .. })),
+            "the discovered-plan node must be hidden once its Run exists"
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|n| matches!(n, TreeNode::Run { .. }))
+                .count(),
+            1,
+            "only the live Run node represents the started plan"
         );
     }
 
