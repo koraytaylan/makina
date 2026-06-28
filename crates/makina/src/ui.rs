@@ -406,8 +406,8 @@ pub fn render(app: &App, frame: &mut Frame) {
                 .get(&ScrollablePanel::Sidebar)
                 .copied()
                 .unwrap_or(0);
-            let mut scrollbar_state =
-                ScrollbarState::new(total_items).position(sidebar_scroll_offset as usize);
+            let mut scrollbar_state = ScrollbarState::new(sidebar_scroll_max as usize)
+                .position(sidebar_scroll_offset as usize);
             let scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -993,7 +993,7 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+                .bg(app.active_theme.get(crate::theme::ThemeRole::Border))
                 .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
         };
         spans.push(Span::styled(chip, style));
@@ -1128,7 +1128,7 @@ fn render_plan_task_pane(
 
     if scroll_max > 0 {
         let mut scrollbar_state =
-            ScrollbarState::new(total_rendered_rows as usize).position(scroll_offset as usize);
+            ScrollbarState::new(scroll_max as usize).position(scroll_offset as usize);
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -1198,7 +1198,7 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                     }
                 }
                 _ => vec![Line::from(vec![Span::styled(
-                    "  No task focused.",
+                    "  Select a task to see its dependencies — v cycles the view",
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )])],
             };
@@ -1241,7 +1241,7 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
                     }
                 }
                 _ => vec![Line::from(vec![Span::styled(
-                    "  No task focused.",
+                    "  Select a task to see its dependencies — v cycles the view",
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )])],
             };
@@ -1812,7 +1812,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
             // Render scrollbar only when content exceeds the viewport.
             if scroll_max > 0 {
                 let mut scrollbar_state =
-                    ScrollbarState::new(total_lines).position(scroll_offset as usize);
+                    ScrollbarState::new(scroll_max as usize).position(scroll_offset as usize);
                 let scrollbar = Scrollbar::default()
                     .orientation(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(None)
@@ -1824,6 +1824,71 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 }
 
 // ── Task entry pane ───────────────────────────────────────────────────────────
+
+/// Format the execution content for a task's Execution accordion section.
+///
+/// Summarizes the task's exchanges and progress for the given (RunId, TaskId),
+/// showing iteration counts, activity indicators, role metrics, and failure reason if applicable.
+/// Falls back to "No execution yet — start the run (Ctrl+S)" when there are no exchanges.
+fn format_task_execution_content(
+    app: &App,
+    run: &RunView,
+    task: &makina_core::api::TaskView,
+) -> String {
+    let mut content = String::new();
+
+    // Check if there are any exchanges for this task
+    let exchange_exists = app.exchange_logs.contains_key(&(run.id, task.id.clone()));
+
+    if !exchange_exists {
+        // No execution yet — show empty state
+        return "No execution yet — start the run (Ctrl+S)".to_string();
+    }
+
+    // Add iteration counts
+    if task.gate_iterations > 0 || task.review_iterations > 0 {
+        let counts = format!(
+            "gate ×{}  ·  review ×{}",
+            task.gate_iterations, task.review_iterations
+        );
+        content.push_str(&counts);
+        content.push('\n');
+    }
+
+    // Add activity indicators (idle time, wall-clock countdown) for in-progress tasks
+    let activity_indicators = task_activity_indicators(app, task);
+    if !activity_indicators.is_empty() {
+        let activity_text = activity_indicators
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        content.push_str(&activity_text);
+        content.push('\n');
+    }
+
+    // Add per-role metrics
+    let metrics = role_metric_lines(app, task);
+    for line in metrics {
+        for span in &line.spans {
+            content.push_str(span.content.as_ref());
+        }
+        content.push('\n');
+    }
+
+    // Add failure reason if the task is failed
+    if let Some(reason) = &task.failure_reason {
+        let label = failure_kind_label(&reason.kind);
+        content.push_str(&format!("failed: {} — {}\n", label, reason.message));
+    }
+
+    // If we generated content, trim trailing newline; otherwise use empty state
+    if content.is_empty() {
+        "No execution data available".to_string()
+    } else {
+        content.trim_end().to_string()
+    }
+}
 
 /// Render a task's entry (metadata + Markdown body) into a bordered pane.
 /// Width is taken from the pane's inner area so wrapping matches the pane, and
@@ -1887,17 +1952,51 @@ fn render_task_entry_pane(
 
         lines.push(Line::from(""));
 
-        // Entry text rendered through Markdown
+        // Get the task's expanded accordion sections from the app state.
+        // Default to both Scope and Execution expanded for backward compatibility.
+        let expanded = app
+            .task_accordion_expanded
+            .get(&task.id)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut default = HashSet::new();
+                default.insert(AccordionSection::Scope);
+                default.insert(AccordionSection::Execution);
+                default
+            });
+
         let content_width = inner.width;
-        let base_style =
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-        lines.extend(render_markdown_cached(
+
+        // SCOPE section — task's static description rendered as Markdown
+        for l in render_accordion_section(
             app,
+            "Scope",
+            AccordionSection::Scope,
+            &expanded,
             &task.entry_text,
-            base_style,
+            false, // task tabs don't use focused_section highlighting
             content_width,
-            &app.active_theme,
-        ));
+            true, // render as markdown
+        ) {
+            lines.push(l);
+        }
+        lines.push(Line::from(""));
+
+        // EXECUTION section — live activity or empty state
+        let execution_content = format_task_execution_content(app, run, task);
+        for l in render_accordion_section(
+            app,
+            "Execution",
+            AccordionSection::Execution,
+            &expanded,
+            &execution_content,
+            false, // task tabs don't use focused_section highlighting
+            content_width,
+            false, // render as raw text, not markdown
+        ) {
+            lines.push(l);
+        }
+        lines.push(Line::from(""));
 
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
@@ -2145,7 +2244,7 @@ pub(crate) fn render_plan_accordion_pane(
             .copied()
             .unwrap_or(0)
             .min(accordion_scroll_max);
-        let mut scrollbar_state = ScrollbarState::new(total_rendered_rows as usize)
+        let mut scrollbar_state = ScrollbarState::new(accordion_scroll_max as usize)
             .position(accordion_scroll_offset as usize);
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
@@ -3413,7 +3512,10 @@ fn render_help_overlay(app: &App, frame: &mut Frame, area: Rect) {
     lines.push(Line::from(Span::styled("View", section_style)));
     lines.push(Line::from(vec![
         Span::styled("[v]", key_style),
-        Span::styled(" cycle dependency view  ", binding_style),
+        Span::styled(
+            " cycle dependency view (off → list → tree → timeline)  ",
+            binding_style,
+        ),
         Span::styled("[e]", key_style),
         Span::styled(" toggle error pane", binding_style),
     ]));
@@ -6835,16 +6937,25 @@ mod tests {
             .take(term_width)
             .collect();
 
+        // Compare rows up to the scrollbar area; scrollbar rendering may differ with
+        // correct scroll_max initialization, but content must be identical.
+        // The scrollbar occupies approximately the last 3-4 chars before the right border.
+        let content_end = term_width.saturating_sub(4);
+        let first_row_at_n_content =
+            first_row_at_n[..content_end.min(first_row_at_n.len())].to_string();
+        let row_n_at_offset_0_content =
+            row_n_at_offset_0[..content_end.min(row_n_at_offset_0.len())].to_string();
+
         assert_eq!(
-            first_row_at_n,
-            row_n_at_offset_0,
+            first_row_at_n_content,
+            row_n_at_offset_0_content,
             "With scroll_offset={N} the first visible content row of the exchange pane \
              (buffer row y={first_inner_y}) must equal the line originally at index {N} \
              (which appeared at row {} when offset=0); \
              \n  expected: '{}'\n  got:      '{}'",
             first_inner_y + N,
-            row_n_at_offset_0.trim_end(),
-            first_row_at_n.trim_end()
+            row_n_at_offset_0_content.trim_end(),
+            first_row_at_n_content.trim_end()
         );
 
         // Extra positive check: lines[N] must contain response text, not the header.

@@ -35,6 +35,7 @@ pub mod placeholder;
 pub mod replay;
 pub mod selection;
 pub mod settings_validation;
+pub mod syntax;
 pub mod theme;
 pub mod tui;
 pub mod ui;

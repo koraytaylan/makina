@@ -949,7 +949,12 @@ async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
 
     let run = match app.selected_run() {
         Some(r) => r.id,
-        None => return Some("No run selected".to_string()),
+        None => {
+            return Some(
+                "No run selected — open a plan or task tab, or pick a run in the sidebar"
+                    .to_string(),
+            );
+        }
     };
     let (command, verb) = match kind {
         ControlKind::Start => (Command::StartRun { run }, "Start"),
@@ -1216,13 +1221,30 @@ fn translate_key(
         return AppEvent::Tick;
     }
 
-    // Ctrl-C always quits, in any mode.
+    // Whether any modal overlay is currently active (determines normal-mode eligibility).
+    let no_modal_active = !command_palette
+        && !browsing
+        && !editing_providers
+        && !settings
+        && !help_mode_active
+        && !viewing_doctor;
+
+    // Ctrl-C: cancel the selected run when in normal mode with a run active;
+    // otherwise quit (the universal escape hatch is preserved in modals and when
+    // no run is selected so the user can always exit the app).
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if no_modal_active && app.selected_run().is_some() {
+            return AppEvent::CancelRun;
+        }
         return AppEvent::Quit;
     }
 
-    // Ctrl-P opens the command palette in Normal mode (before the per-mode cascade).
+    // Ctrl-P: pause the selected run when in normal mode with a run active;
+    // otherwise open the command palette (consistent with prior behaviour).
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if no_modal_active && app.selected_run().is_some() {
+            return AppEvent::PauseRun;
+        }
         return AppEvent::OpenCommandPalette;
     }
 
@@ -1326,12 +1348,30 @@ fn translate_key(
             KeyCode::Char('?') => AppEvent::ToggleHelpMode,
             // Open the doctor health-check overlay.
             KeyCode::Char('!') => AppEvent::OpenDoctor,
-            // ── Accordion toggles (plan 0032) ────────────────────────────────────
-            // s/a/t/z toggle accordion sections when the main pane is focused and
-            // a plan tab is active. Otherwise, these fall back to run-control keys.
+            // ── Run control with Ctrl modifiers (plan 0042, WS5) ──────────────────
+            // Ctrl+S starts the run from any normal-mode context (plan tab, task tab,
+            // sidebar). Ctrl+P/Ctrl+C are handled by the early-return guards above
+            // (context-sensitive: pause/cancel when a run is selected, otherwise
+            // open-palette/quit). Only Ctrl+S needs an arm here because the Ctrl+P
+            // and Ctrl+C early returns fire before this match expression.
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                AppEvent::StartRun
+            }
+            // ── Accordion toggles (plan 0032, extended for task tabs in plan 0042 WS6) ────
+            // s/a/t/z toggle accordion sections when the main pane is focused.
+            // For plan tabs: Scope/Architecture/Tasks/Status
+            // For task tabs: s/z toggle Scope/Execution
+            // Otherwise, falls back to run-control keys.
             KeyCode::Char('s') | KeyCode::Char('S') => {
+                let task_tab_active = app
+                    .tabs
+                    .active_tab
+                    .and_then(|idx| app.tabs.open_tabs.get(idx))
+                    .is_some_and(|content| matches!(content, crate::app::TabContent::Task { .. }));
                 if focused_panel == Panel::Main && plan_tab_active {
                     AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Scope)
+                } else if focused_panel == Panel::Main && task_tab_active {
+                    AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Scope)
                 } else {
                     AppEvent::StartRun
                 }
@@ -1359,11 +1399,19 @@ fn translate_key(
                 }
             }
             KeyCode::Char('z') | KeyCode::Char('Z') => {
+                let task_tab_active = app
+                    .tabs
+                    .active_tab
+                    .and_then(|idx| app.tabs.open_tabs.get(idx))
+                    .is_some_and(|content| matches!(content, crate::app::TabContent::Task { .. }));
                 if focused_panel == Panel::Main && plan_tab_active {
                     AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Status)
-                } else if !plan_tab_active {
+                } else if focused_panel == Panel::Main && task_tab_active {
+                    AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Execution)
+                } else if !plan_tab_active && !task_tab_active {
                     AppEvent::StatusMessage(
-                        "Accordion toggle not available here — open a plan tab.".to_string(),
+                        "Accordion toggle not available here — open a plan or task tab."
+                            .to_string(),
                     )
                 } else {
                     AppEvent::Tick
@@ -1673,6 +1721,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_translates_to_quit() {
+        // Ctrl+C with NO run selected falls back to Quit (the universal exit).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(
             translate_terminal_event(
@@ -1683,6 +1732,97 @@ mod tests {
                 &test_app()
             ),
             AppEvent::Quit
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_with_run_translates_to_cancel_run() {
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::api::{RunId, RunStatus, RunView};
+        use std::sync::Arc;
+
+        // Create an app that has one run so selected_run() is Some.
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: std::path::PathBuf::from(".tasks/ctrl-c.json"),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let app = App::new(api, vec![run], std::path::PathBuf::from("."));
+        assert!(
+            app.selected_run().is_some(),
+            "test precondition: run must be selected"
+        );
+
+        let ev = key_press(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &app
+            ),
+            AppEvent::CancelRun
+        ));
+    }
+
+    #[test]
+    fn ctrl_s_translates_to_start_run() {
+        // Ctrl+S always dispatches StartRun in normal mode (no run check at the
+        // translation layer — the IO layer handles the "no run selected" case).
+        let ev = key_press(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &test_app()
+            ),
+            AppEvent::StartRun
+        ));
+    }
+
+    #[test]
+    fn ctrl_p_with_run_translates_to_pause_run() {
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use makina_core::api::{RunId, RunStatus, RunView};
+        use std::sync::Arc;
+
+        // Create an app that has one run so selected_run() is Some.
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(2),
+            run_uid: String::new(),
+            task_list_path: std::path::PathBuf::from(".tasks/ctrl-p.json"),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let app = App::new(api, vec![run], std::path::PathBuf::from("."));
+        assert!(
+            app.selected_run().is_some(),
+            "test precondition: run must be selected"
+        );
+
+        let ev = key_press(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                ModalState::default(),
+                crate::app::Panel::Sidebar,
+                false,
+                &app
+            ),
+            AppEvent::PauseRun
         ));
     }
 
@@ -1959,7 +2099,9 @@ mod tests {
 
     #[test]
     fn c_key_translates_to_cancel_run() {
-        // Plain `c` (no modifier) is Cancel; Ctrl-C remains Quit (covered above).
+        // Plain `c` (no modifier) always cancels. Ctrl-C is context-sensitive:
+        // it cancels when a run is selected (see ctrl_c_with_run_translates_to_cancel_run),
+        // and quits otherwise (see ctrl_c_translates_to_quit).
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -2281,7 +2423,9 @@ mod tests {
 
         let (ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
         assert!(matches!(ev, AppEvent::Tick));
-        assert_eq!(status.as_deref(), Some("No run selected"));
+        let msg = status.expect("must produce a status message");
+        assert!(msg.contains("No run selected"));
+        assert!(msg.contains("open a plan or task tab"));
     }
 
     /// A command error from the api is surfaced as a status message (not dropped).
@@ -4310,7 +4454,7 @@ wall_clock_secs = 600
             &app,
         );
         assert!(
-            matches!(ev_z, AppEvent::StatusMessage(ref msg) if msg == "Accordion toggle not available here — open a plan tab."),
+            matches!(ev_z, AppEvent::StatusMessage(ref msg) if msg == "Accordion toggle not available here — open a plan or task tab."),
             "pressing 'z' outside a plan tab should emit StatusMessage with expected text"
         );
 

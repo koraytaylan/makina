@@ -54,6 +54,18 @@ fn wrap_words(text: &str, width: u16) -> Vec<String> {
     result
 }
 
+/// Split text on newlines, excluding the final empty element if text ends with '\n'.
+/// This prevents a spurious blank line after each code block source line.
+fn trimmed_lines(text: &str) -> Vec<&str> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    // If the last element is empty (text ends with '\n'), exclude it
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines[..lines.len() - 1].to_vec()
+    } else {
+        lines
+    }
+}
+
 /// Strip ANSI escape sequences from text, keeping only the visible characters.
 fn strip_ansi(text: &str) -> String {
     // Parse ANSI via ansi_to_tui and extract plain text, preserving line
@@ -97,6 +109,7 @@ pub fn render_markdown(
 
     // Track code block state
     let mut in_code_block = false;
+    let mut code_lang: Option<String> = None;
 
     // Track list context for nesting
     #[derive(Debug, Clone)]
@@ -124,18 +137,19 @@ pub fn render_markdown(
             Event::Start(Tag::Strikethrough) => {
                 style = style.add_modifier(Modifier::CROSSED_OUT);
             }
-            Event::Start(Tag::CodeBlock(_)) => {
+            Event::Start(Tag::CodeBlock(kind)) => {
                 // Code blocks: flush pending spans and enter code block mode
                 if !spans.is_empty() {
                     out.push(finalize_line(std::mem::take(&mut spans)));
                 }
                 in_code_block = true;
-                // Use theme-aware colors for code blocks
-                let code_style = Style::default()
-                    .fg(theme.get(crate::theme::ThemeRole::CodeBlock))
-                    .bg(theme.get(crate::theme::ThemeRole::Background))
-                    .add_modifier(Modifier::DIM);
-                style = code_style;
+                // Capture the fence language from CodeBlockKind::Fenced
+                code_lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) if !info.is_empty() => {
+                        Some(info.to_string())
+                    }
+                    _ => None,
+                };
             }
             Event::Code(t) => {
                 // Inline code: use theme-aware colors
@@ -148,14 +162,34 @@ pub fn render_markdown(
             Event::Text(t) => {
                 let text_str = t.to_string();
                 if in_code_block {
-                    // Split code block text on newlines; each line becomes its own Line
-                    // Use theme-aware colors for code block body
-                    let code_style = Style::default()
-                        .fg(theme.get(crate::theme::ThemeRole::CodeBlock))
-                        .bg(theme.get(crate::theme::ThemeRole::Background))
-                        .add_modifier(Modifier::DIM);
-                    for line in text_str.split('\n') {
-                        out.push(Line::from(Span::styled(format!("  {}", line), code_style)));
+                    // Split code block text on newlines; each line becomes its own Line.
+                    // Use trimmed_lines to skip the trailing empty element if text ends with '\n'.
+                    for line in trimmed_lines(&text_str) {
+                        // Get syntax-highlighted spans for this line
+                        let mut line_spans = vec![Span::raw("  ")]; // Keep the indent
+                        line_spans.extend(crate::syntax::highlight_code_line(
+                            line,
+                            code_lang.as_deref(),
+                            theme,
+                        ));
+
+                        // Apply full-width CodeBlockBg background band
+                        let bg_style =
+                            Style::default().bg(theme.get(crate::theme::ThemeRole::CodeBlockBg));
+
+                        // Pad line to width so the band spans full viewport width
+                        let line_width: usize =
+                            line_spans.iter().map(|s| s.content.chars().count()).sum();
+                        let padding_needed = if width > 0 {
+                            width as usize - line_width
+                        } else {
+                            0
+                        };
+                        if padding_needed > 0 {
+                            line_spans.push(Span::raw(" ".repeat(padding_needed)));
+                        }
+
+                        out.push(Line::from(line_spans).style(bg_style));
                     }
                 } else {
                     // Wrap text to width when not in a code block
@@ -179,6 +213,7 @@ pub fn render_markdown(
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
+                code_lang = None;
                 style = base;
             }
             Event::Start(Tag::List(start)) => {
@@ -469,10 +504,12 @@ mod tests {
         let text = "```\nfn main() {\n    body\n}\n```";
         let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
 
-        // Should have at least 3 lines for the code (fn main, body, closing brace)
-        assert!(
-            lines.len() >= 3,
-            "Expected at least 3 lines for code block, got {}",
+        // Should have exactly 3 lines for the code (fn main, body, closing brace)
+        // NOT 4 with a spurious blank line
+        assert_eq!(
+            lines.len(),
+            3,
+            "Expected exactly 3 lines for code block (one per source line), got {}",
             lines.len()
         );
 
@@ -486,13 +523,109 @@ mod tests {
         assert!(all_text.contains("}"));
         assert!(!all_text.contains("```"));
 
-        // At least some lines should be dim
-        let has_dim = lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.style.add_modifier(Modifier::DIM) == s.style)
-        });
-        assert!(has_dim);
+        // All code block lines should have CodeBlockBg background
+        let bg_color = theme::ayu_dark().get(crate::theme::ThemeRole::CodeBlockBg);
+        let all_have_bg = lines.iter().all(|l| l.style.bg == Some(bg_color));
+        assert!(
+            all_have_bg,
+            "All code block lines should have CodeBlockBg background"
+        );
+    }
+
+    #[test]
+    fn renders_fenced_code_block_with_language_syntax_highlighting() {
+        let text = "```rust\nlet x = 1;\n```";
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
+
+        // Should have exactly 1 line for the code (just "let x = 1;")
+        assert_eq!(
+            lines.len(),
+            1,
+            "Expected exactly 1 line for single-line code block, got {}",
+            lines.len()
+        );
+
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+
+        // Should contain the code without backticks
+        assert!(all_text.contains("let"));
+        assert!(all_text.contains("x"));
+        assert!(all_text.contains("1"));
+        assert!(!all_text.contains("```"));
+        assert!(!all_text.contains("rust"));
+
+        // The rust code should produce multiple spans with different colors
+        // (syntax highlighting should be applied)
+        let code_line = &lines[0];
+        let has_multiple_colored_spans = code_line
+            .spans
+            .iter()
+            .filter(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(_, _, _))))
+            .count()
+            > 1;
+        assert!(
+            has_multiple_colored_spans,
+            "Rust code should have multiple colored spans from syntax highlighting"
+        );
+
+        // Line should have CodeBlockBg background
+        let bg_color = theme::ayu_dark().get(crate::theme::ThemeRole::CodeBlockBg);
+        assert_eq!(
+            code_line.style.bg,
+            Some(bg_color),
+            "Code line should have CodeBlockBg background"
+        );
+    }
+
+    #[test]
+    fn renders_fenced_code_block_unknown_language_monochrome() {
+        let text = "```unknown_lang\nsome code here\n```";
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
+
+        // Should have exactly 1 line for the code
+        assert_eq!(
+            lines.len(),
+            1,
+            "Expected exactly 1 line for single-line code block, got {}",
+            lines.len()
+        );
+
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+
+        // Should contain the code without backticks
+        assert!(all_text.contains("some code here"));
+        assert!(!all_text.contains("```"));
+
+        // Unknown language should render as monochrome (single span or all same color)
+        let code_line = &lines[0];
+        let span_colors: Vec<_> = code_line.spans.iter().map(|s| s.style.fg).collect();
+        // All non-indent spans should have the same CodeBlock color
+        let code_block_color = theme::ayu_dark().get(crate::theme::ThemeRole::CodeBlock);
+        let colored_spans = span_colors
+            .iter()
+            .filter(|c| c.is_some() && *c != &Some(ratatui::style::Color::Reset))
+            .collect::<Vec<_>>();
+        for color in colored_spans {
+            assert_eq!(
+                color,
+                &Some(code_block_color),
+                "Unknown language code should use monochrome CodeBlock color"
+            );
+        }
+
+        // Line should have CodeBlockBg background
+        let bg_color = theme::ayu_dark().get(crate::theme::ThemeRole::CodeBlockBg);
+        assert_eq!(
+            code_line.style.bg,
+            Some(bg_color),
+            "Code line should have CodeBlockBg background"
+        );
     }
 
     #[test]

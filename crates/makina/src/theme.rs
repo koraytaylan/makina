@@ -15,10 +15,11 @@ pub enum ThemeRole {
     Error,       // failed / removed
     Info,        // informational / modified
     CodeBlock,   // foreground color for code blocks and inline code
+    CodeBlockBg, // background surface for code block bands
     FocusBg,     // active/focused widget backgrounds
 }
 
-pub const ALL_ROLES: [ThemeRole; 12] = [
+pub const ALL_ROLES: [ThemeRole; 13] = [
     ThemeRole::Background,
     ThemeRole::Foreground,
     ThemeRole::Dim,
@@ -30,6 +31,7 @@ pub const ALL_ROLES: [ThemeRole; 12] = [
     ThemeRole::Error,
     ThemeRole::Info,
     ThemeRole::CodeBlock,
+    ThemeRole::CodeBlockBg,
     ThemeRole::FocusBg,
 ];
 
@@ -79,6 +81,7 @@ pub fn ayu_dark() -> Theme {
     colors.insert(ThemeRole::Error, Color::Rgb(217, 87, 87)); // #D95757 common.error
     colors.insert(ThemeRole::Info, Color::Rgb(115, 184, 255)); // #73B8FF vcs.modified
     colors.insert(ThemeRole::CodeBlock, Color::Rgb(115, 184, 255)); // same as Info for consistency
+    colors.insert(ThemeRole::CodeBlockBg, Color::Rgb(22, 27, 36)); // #161B24 subtle darker band
     colors.insert(ThemeRole::FocusBg, Color::Rgb(40, 80, 120)); // darker, more saturated blue
 
     let ansi = [
@@ -119,6 +122,7 @@ pub fn ayu_mirage() -> Theme {
     colors.insert(ThemeRole::Error, Color::Rgb(255, 102, 102)); // #FF6666 common.error
     colors.insert(ThemeRole::Info, Color::Rgb(128, 191, 255)); // #80BFFF vcs.modified
     colors.insert(ThemeRole::CodeBlock, Color::Rgb(128, 191, 255)); // same as Info
+    colors.insert(ThemeRole::CodeBlockBg, Color::Rgb(39, 45, 56)); // #272D38 subtle darker band
     colors.insert(ThemeRole::FocusBg, Color::Rgb(70, 110, 160)); // similar dark-blue tone
 
     let ansi = [
@@ -159,6 +163,7 @@ pub fn ayu_light() -> Theme {
     colors.insert(ThemeRole::Error, Color::Rgb(230, 80, 80)); // #E65050 common.error
     colors.insert(ThemeRole::Info, Color::Rgb(71, 138, 204)); // #478ACC vcs.modified
     colors.insert(ThemeRole::CodeBlock, Color::Rgb(71, 138, 204)); // same as Info, adjusted for light background
+    colors.insert(ThemeRole::CodeBlockBg, Color::Rgb(238, 241, 244)); // #EEF1F4 subtle gray band
     colors.insert(ThemeRole::FocusBg, Color::Rgb(160, 188, 230)); // periwinkle, distinct from white Background #F8F9FA AND pale SelectionBg #D7E4F6
 
     let ansi = [
@@ -213,6 +218,7 @@ mod tests {
         assert_eq!(th.get(ThemeRole::Accent), Color::Rgb(230, 180, 80));
         assert_eq!(th.get(ThemeRole::Error), Color::Rgb(217, 87, 87));
         assert_eq!(th.get(ThemeRole::CodeBlock), Color::Rgb(115, 184, 255));
+        assert_eq!(th.get(ThemeRole::CodeBlockBg), Color::Rgb(22, 27, 36));
         assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(40, 80, 120));
 
         // Check ANSI entries (normal red at index 1, bright red at index 9)
@@ -226,6 +232,8 @@ mod tests {
 
         // Check CodeBlock value for Ayu Mirage
         assert_eq!(th.get(ThemeRole::CodeBlock), Color::Rgb(128, 191, 255));
+        // Check CodeBlockBg value for Ayu Mirage
+        assert_eq!(th.get(ThemeRole::CodeBlockBg), Color::Rgb(39, 45, 56));
         // Check FocusBg value for Ayu Mirage
         assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(70, 110, 160));
     }
@@ -236,6 +244,8 @@ mod tests {
 
         // Check CodeBlock value for Ayu Light
         assert_eq!(th.get(ThemeRole::CodeBlock), Color::Rgb(71, 138, 204));
+        // Check CodeBlockBg value for Ayu Light
+        assert_eq!(th.get(ThemeRole::CodeBlockBg), Color::Rgb(238, 241, 244));
         // Check FocusBg value for Ayu Light
         assert_eq!(th.get(ThemeRole::FocusBg), Color::Rgb(160, 188, 230));
     }

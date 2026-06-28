@@ -908,6 +908,11 @@ pub enum AppEvent {
     /// Only applies if the active tab is a plan tab; otherwise it is a no-op.
     ToggleAccordionSection(AccordionSection),
 
+    // ── Accordion sections for task tabs (plan 0042, WS6) ───────────────────
+    /// Toggle the accordion section for the active task tab.
+    /// Only applies if the active tab is a task tab; otherwise it is a no-op.
+    ToggleTaskAccordionSection(AccordionSection),
+
     // ── Project discovery (plan 0025) ─────────────────────────────────────────
     /// User requested to discover the project (plan 0025). Dispatched by the
     /// palette and handled in `resolve_io` → `discover_project`, which issues
@@ -1033,6 +1038,8 @@ pub enum AccordionSection {
     Tasks,
     /// STATUS.md section
     Status,
+    /// Execution section (for task details)
+    Execution,
 }
 
 /// Identifies a scrollable panel for per-panel scroll state and hitbox testing.
@@ -1310,6 +1317,11 @@ pub struct App {
     /// Sections not in the set are collapsed. All sections default to collapsed.
     pub accordion_state: HashMap<String, HashSet<AccordionSection>>,
 
+    /// Accordion expand/collapse state for task tabs.
+    /// Keyed by task id; the set contains sections that are expanded.
+    /// Sections not in the set are collapsed. All sections default to collapsed.
+    pub task_accordion_expanded: HashMap<TaskId, HashSet<AccordionSection>>,
+
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
     /// Whether verbose mode is currently on.
     ///
@@ -1478,23 +1490,36 @@ impl App {
     /// (`find_task_idx_in_run`), but `selected_run` is otherwise driven only by
     /// the sidebar cursor. Without this sync, switching to a task tab (via tab
     /// click or Next/Prev) while the cursor sits on a plan node leaves
-    /// `selected_run = None`, so the task tab renders a blank pane. Plan tabs
-    /// need no run and are left untouched.
+    /// `selected_run = None`, so the task tab renders a blank pane.
+    ///
+    /// For plan tabs, sync to the run corresponding to that plan (plan 0042, WS5)
+    /// so `Ctrl+S` can start/pause/cancel from a plan tab without manually
+    /// selecting the run in the sidebar.
     fn sync_selected_run_to_active_tab(&mut self) {
         let Some(active) = self.tabs.active_tab else {
             return;
         };
-        let Some(TabContent::Task { plan_slug, task_id }) = self.tabs.open_tabs.get(active) else {
-            return;
-        };
-        let plan_slug = plan_slug.clone();
-        let task_id = task_id.clone();
         let prev_run = self.selected_run;
-        if let Some(run_idx) = self.runs.iter().position(|run| {
-            makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
-                && run.tasks.iter().any(|t| t.id == task_id)
-        }) {
-            self.selected_run = Some(run_idx);
+        match self.tabs.open_tabs.get(active) {
+            Some(TabContent::Task { plan_slug, task_id }) => {
+                let plan_slug = plan_slug.clone();
+                let task_id = task_id.clone();
+                if let Some(run_idx) = self.runs.iter().position(|run| {
+                    makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
+                        && run.tasks.iter().any(|t| t.id == task_id)
+                }) {
+                    self.selected_run = Some(run_idx);
+                }
+            }
+            Some(TabContent::Plan { plan_slug }) => {
+                let plan_slug = plan_slug.clone();
+                if let Some(run_idx) = self.runs.iter().position(|run| {
+                    makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
+                }) {
+                    self.selected_run = Some(run_idx);
+                }
+            }
+            _ => {}
         }
         if self.selected_run != prev_run {
             self.load_exchanges_for_selected_run();
@@ -1697,6 +1722,7 @@ impl App {
             discovered_plans: Vec::new(),
             tabs: TabState::new(),
             accordion_state: HashMap::new(),
+            task_accordion_expanded: HashMap::new(),
             sidebar_width_percent: 30,
             selection: None,
             selection_panes: std::cell::RefCell::new(Vec::new()),
@@ -2132,6 +2158,13 @@ impl App {
                     DependencyViewMode::Tree => DependencyViewMode::Timeline,
                     DependencyViewMode::Timeline => DependencyViewMode::Off,
                 };
+                let label = match self.dependency_view {
+                    DependencyViewMode::Off => "off",
+                    DependencyViewMode::List => "list",
+                    DependencyViewMode::Tree => "tree",
+                    DependencyViewMode::Timeline => "timeline",
+                };
+                self.status_message = Some(format!("Dependency view: {}", label));
                 true
             }
             AppEvent::ToggleErrorPane => {
@@ -3098,6 +3131,23 @@ impl App {
                 {
                     let plan_slug = plan_slug.clone();
                     let sections = self.accordion_state.entry(plan_slug).or_default();
+                    if sections.contains(&section) {
+                        sections.remove(&section);
+                    } else {
+                        sections.insert(section);
+                    }
+                }
+                true
+            }
+
+            AppEvent::ToggleTaskAccordionSection(section) => {
+                // Only toggle if the active tab is a task tab.
+                if let Some(active_idx) = self.tabs.active_tab
+                    && let Some(TabContent::Task { task_id, .. }) =
+                        self.tabs.open_tabs.get(active_idx)
+                {
+                    let task_id = task_id.clone();
+                    let sections = self.task_accordion_expanded.entry(task_id).or_default();
                     if sections.contains(&section) {
                         sections.remove(&section);
                     } else {
@@ -4128,12 +4178,25 @@ mod tests {
         assert_eq!(app.dependency_view, DependencyViewMode::Off);
         app.update(AppEvent::CycleDependencyView);
         assert_eq!(app.dependency_view, DependencyViewMode::List);
+        assert_eq!(
+            app.status_message,
+            Some("Dependency view: list".to_string())
+        );
         app.update(AppEvent::CycleDependencyView);
         assert_eq!(app.dependency_view, DependencyViewMode::Tree);
+        assert_eq!(
+            app.status_message,
+            Some("Dependency view: tree".to_string())
+        );
         app.update(AppEvent::CycleDependencyView);
         assert_eq!(app.dependency_view, DependencyViewMode::Timeline);
+        assert_eq!(
+            app.status_message,
+            Some("Dependency view: timeline".to_string())
+        );
         app.update(AppEvent::CycleDependencyView);
         assert_eq!(app.dependency_view, DependencyViewMode::Off);
+        assert_eq!(app.status_message, Some("Dependency view: off".to_string()));
     }
 
     #[test]
@@ -9649,6 +9712,76 @@ mod tests {
             app.selected_run,
             Some(0),
             "ActivateTab to a task tab re-syncs selected_run"
+        );
+    }
+
+    /// Plan tabs should also sync selected_run to the run for that plan
+    /// (plan 0042, WS5), so Ctrl+S can start/pause/cancel from a plan tab
+    /// without manually selecting the run in the sidebar.
+    #[test]
+    fn switching_to_plan_tab_syncs_selected_run() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+
+        let mut app = make_app();
+
+        // Set up discovered plans (0001-alpha and 0002-beta from make_plan_entries).
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+
+        let plan_slug_0 = "0001-alpha".to_string();
+        let plan_slug_1 = "0002-beta".to_string();
+
+        // Inject test runs matching the plan slugs.
+        // The plan_slug is derived from task_list_path by makina_core::orchestrator::plan_slug,
+        // which extracts the slug from paths like "docs/plans/0001-alpha/TASKS.md".
+        app.runs = vec![
+            RunView {
+                id: RunId(1),
+                run_uid: "run-1".to_string(),
+                task_list_path: PathBuf::from("docs/plans/0001-alpha/TASKS.md"),
+                status: RunStatus::Pending,
+                project: "test".to_string(),
+                tasks: vec![],
+                report: Default::default(),
+            },
+            RunView {
+                id: RunId(2),
+                run_uid: "run-2".to_string(),
+                task_list_path: PathBuf::from("docs/plans/0002-beta/TASKS.md"),
+                status: RunStatus::Pending,
+                project: "test".to_string(),
+                tasks: vec![],
+                report: Default::default(),
+            },
+        ];
+
+        // Open plan tabs for both slugs.
+        app.update(AppEvent::OpenTab(TabContent::Plan {
+            plan_slug: plan_slug_0.clone(),
+        }));
+        app.update(AppEvent::OpenTab(TabContent::Plan {
+            plan_slug: plan_slug_1.clone(),
+        }));
+        assert_eq!(app.tabs.open_tabs.len(), 2, "two plan tabs open");
+
+        // Clear selected_run to simulate focus on a sidebar plan node.
+        app.selected_run = None;
+
+        // Activating a plan tab should sync selected_run to that plan's run.
+        app.update(AppEvent::ActivateTab(0));
+        assert_eq!(
+            app.selected_run,
+            Some(0),
+            "ActivateTab to first plan tab syncs selected_run to its run (0)"
+        );
+
+        // Switching to the second plan tab should sync to its run.
+        app.update(AppEvent::NextTab);
+        assert_eq!(
+            app.selected_run,
+            Some(1),
+            "NextTab to second plan tab syncs selected_run to its run (1)"
         );
     }
 

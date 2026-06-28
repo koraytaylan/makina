@@ -30,6 +30,8 @@ tracing-appender = { workspace = true }
 time = "=0.3.47"
 pulldown-cmark = { version = "0.12", default-features = false }
 ansi-to-tui = "8"
+syntect = { version = "5.3", default-features = false, features = ["parsing", "fancy-regex", "metadata"] }
+two-face = "0.2"
 # JSON serialization for replay module (reading transcripts)
 serde_json = { workspace = true }
 # Chrono for DateTime<Utc> / Utc::now() in the Gantt Timeline render.
