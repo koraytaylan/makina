@@ -202,19 +202,6 @@ pub async fn run(
                 continue;
             }
 
-            // OpenLog requires tui for terminal teardown/restore, so it is
-            // handled here (in the loop body, where `tui` is accessible) rather
-            // than in `resolve_io` (which does not receive `tui`).
-            if matches!(event, AppEvent::OpenLog) {
-                let status = open_log(tui, app).await;
-                if let Some(msg) = status {
-                    app.update(AppEvent::StatusMessage(msg));
-                }
-                // Force a full repaint after the pager exits.
-                tui.draw(|frame| ui::render(app, frame))?;
-                continue;
-            }
-
             // IO-layer resolution: browser intents (open / enter dir / select
             // file) need filesystem reads or an async `execute`; run controls
             // (start/pause/cancel) need an async `execute` against the selected
@@ -402,14 +389,6 @@ async fn resolve_io(
             let status = write_doctor_scaffold(app).await;
             (AppEvent::Tick, status)
         }
-        // ── Open log (task 0049) ──────────────────────────────────────────────
-        // Resolve the focused task's log path, spawn $PAGER on it, and return a
-        // status message (success, absence, or error).  If the file doesn't exist,
-        // emit "no log for this task yet" instead of opening.
-        // OpenLog is intercepted before resolve_io in the event loop so tui
-        // is accessible for terminal teardown/restore.  This arm is unreachable
-        // in production but kept so the match stays exhaustive.
-        AppEvent::OpenLog => (AppEvent::Tick, None),
         // ── Command palette execute (task command-palette-keys) ──────────────────
         // Extract the selected action's event from the palette before App::update
         // clears it. IO-backed events (RetryFocused, DiscoverProject) are re-dispatched
@@ -932,102 +911,6 @@ command = "cargo fmt --check"
     }
 }
 
-/// Open the focused task's log in `$PAGER`, or report its absence.
-///
-/// Derives the log path from the run id + task id using [`makina_core::paths::task_log`],
-/// tears down the TUI (leaves the alternate screen / disables raw mode via
-/// [`Tui::restore`]), spawns `$PAGER` (fallback `less`, then `more`) on the
-/// file, waits for it to exit, then re-initialises the terminal via
-/// [`Tui::reinit`] so the TUI can resume from where it left off.  If the file
-/// is absent, emits "no log for this task yet" without tearing down the terminal.
-///
-/// Called from the event loop's `OpenLog` arm (not from `resolve_io`) because
-/// it needs mutable access to `tui` for the teardown/restore cycle.
-/// Resolve the on-disk log path to show for a task, preferring the live agent
-/// transcript the orchestrator writes (`{logs}/{task_id}_transcript.jsonl`, see
-/// `orchestrator.rs`) over the tracing `RunFileLayer` file (`{task_id}.log`).
-///
-/// The `.log` file is only written when a tracing span carries a `task_slug`
-/// field; the running orchestrator persists the transcript directly instead, so
-/// the transcript is the file that actually exists in practice. Returns `None`
-/// when neither has been written yet.
-fn resolve_task_log_path(
-    repo_root: &std::path::Path,
-    run_uid: &str,
-    task_id: &str,
-) -> Option<std::path::PathBuf> {
-    use makina_core::paths;
-    let transcript = paths::run_dir(repo_root, run_uid)
-        .join("logs")
-        .join(format!("{task_id}_transcript.jsonl"));
-    if transcript.exists() {
-        return Some(transcript);
-    }
-    let legacy = paths::task_log(repo_root, run_uid, task_id);
-    if legacy.exists() {
-        return Some(legacy);
-    }
-    None
-}
-
-async fn open_log(tui: &mut Tui, app: &App) -> Option<String> {
-    use std::process::Command;
-
-    // Resolve the task whose log to open, preferring the active task tab, then
-    // the focused sidebar task, then the sidebar selection.
-    let Some((run_uid, task_id)) = app.log_target() else {
-        return Some(
-            "No task selected — open a task tab or pick a task in the sidebar".to_string(),
-        );
-    };
-
-    // Resolve the on-disk log (transcript preferred), or report that none exists.
-    let log_path = match resolve_task_log_path(&app.repo_root, &run_uid, &task_id) {
-        Some(p) => p,
-        None => {
-            return Some(format!(
-                "no log for task '{task_id}' yet — it appears once the task's agent runs"
-            ));
-        }
-    };
-
-    // Get the pager command, trying $PAGER first, then falling back to less.
-    let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
-
-    // Tear down the TUI before handing the terminal to the pager: leave the
-    // alternate screen and disable raw mode so the pager output is visible.
-    tui.restore();
-
-    // Spawn the pager and wait for it to exit.
-    let result = Command::new(&pager_cmd).arg(&log_path).status();
-    let msg = match result {
-        Ok(status) => {
-            if status.success() {
-                Some(format!("Opened {} in {}", log_path.display(), pager_cmd))
-            } else {
-                Some(format!("{} exit code: {:?}", pager_cmd, status.code()))
-            }
-        }
-        Err(e) => {
-            // If the preferred pager failed, try the fallback (less or more).
-            let fallback = if pager_cmd != "less" { "less" } else { "more" };
-            if let Ok(fb_status) = Command::new(fallback).arg(&log_path).status()
-                && fb_status.success()
-            {
-                Some(format!("Opened {} in {fallback}", log_path.display()))
-            } else {
-                Some(format!("Failed to open log: {e}"))
-            }
-        }
-    };
-
-    // Restore the TUI: re-enter the alternate screen, enable raw mode, and
-    // force a full repaint so no pager output bleeds through.
-    let _ = tui.reinit();
-
-    msg
-}
-
 /// Which run-control command a key intent maps to.
 #[derive(Debug, Clone, Copy)]
 enum ControlKind {
@@ -1431,8 +1314,8 @@ fn translate_key(
             KeyCode::Char('v') | KeyCode::Char('V') => AppEvent::CycleDependencyView,
             // Toggle the error pane open/closed.
             KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
-            // Open the focused task's log in $PAGER.
-            KeyCode::Char('l') | KeyCode::Char('L') => AppEvent::OpenLog,
+            // Toggle the in-TUI log panel (the context task's agent log).
+            KeyCode::Char('l') | KeyCode::Char('L') => AppEvent::ToggleLogPane,
             // Toggle verbose mode on/off (Ctrl+O — checked BEFORE the plain
             // `o`/`O` → OpenBrowser arm so the modifier guard wins).
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3291,98 +3174,45 @@ A description that is long enough to pass minimums.
         drop(tmp); // keep dir alive till end
     }
 
-    /// The derived log path from `open_log` must match the path constructed by
-    /// `makina_core::paths::task_log`.  This is a unit test of the path logic
-    /// without spawning a pager.
+    /// `log_pane_target` resolves the (RunId, TaskId) from the sidebar selection
+    /// (selected_run + selected_task) when no task tab/node takes precedence.
     #[test]
-    fn open_log_resolves_expected_path() {
+    fn log_pane_target_resolves_from_selection() {
         use crate::placeholder::PlaceholderApi;
-        use makina_core::HOME_ENV_LOCK;
         use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
         use std::path::PathBuf;
         use std::sync::Arc;
 
-        let _guard = HOME_ENV_LOCK.blocking_lock();
-
-        // Set HOME to a temp dir so state_root resolves deterministically.
-        let temp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", temp_home.path()) };
-
-        // Create a minimal app with a run and task.
         let api = Arc::new(PlaceholderApi::empty());
-        let repo_root = PathBuf::from("/test/repo");
-        let run_id_str = "run-001-test";
-        let task = TaskView {
-            id: TaskId::new("my-task"),
-            title: "Test Task".into(),
-            state: TaskState::Done,
-            gate_iterations: 0,
-            review_iterations: 0,
-            depends_on: vec![],
-            started_at: None,
-            finished_at: None,
-            failure_reason: None,
-            entry_text: String::new(),
-        };
         let run = RunView {
             id: RunId(123),
-            run_uid: run_id_str.to_string(),
+            run_uid: "run-001-test".to_string(),
             task_list_path: PathBuf::from("sample.json"),
             status: RunStatus::Completed,
             project: "test".to_string(),
-            tasks: vec![task],
+            tasks: vec![TaskView {
+                id: TaskId::new("my-task"),
+                title: "Test Task".into(),
+                state: TaskState::Done,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: String::new(),
+            }],
             report: makina_core::api::IngestionReport::default(),
         };
-        let mut app = crate::app::App::new(api, vec![run], repo_root.clone());
-
-        // Select the task (sidebar-selection resolution path).
+        let mut app = crate::app::App::new(api, vec![run], PathBuf::from("/test/repo"));
         app.selected_run = Some(0);
         app.selected_task = Some(0);
 
-        // log_target resolves the (run_uid, task_id) to show a log for.
-        let (run_uid, task_id) = app.log_target().expect("a task is selected");
-        assert_eq!(run_uid, run_id_str);
-        assert_eq!(task_id, "my-task");
-
-        // Before anything is written, no log path resolves (the `L` key reports
-        // "no log yet" rather than opening a nonexistent file).
-        assert!(
-            resolve_task_log_path(&repo_root, &run_uid, &task_id).is_none(),
-            "no log should resolve before any transcript/log is written"
-        );
-
-        // The orchestrator writes the agent transcript to
-        // {logs}/{task_id}_transcript.jsonl — that is the file `L` must open
-        // (regression: it previously looked only at the never-written {task}.log).
-        let logs_dir =
-            makina_core::paths::run_logs_dir(&repo_root, &run_uid).expect("create logs dir");
-        let transcript = logs_dir.join(format!("{task_id}_transcript.jsonl"));
-        std::fs::write(&transcript, "{\"event\":\"exchange\"}\n").expect("write transcript");
         assert_eq!(
-            resolve_task_log_path(&repo_root, &run_uid, &task_id),
-            Some(transcript.clone()),
-            "resolve_task_log_path must return the written transcript"
+            app.log_pane_target(),
+            Some((RunId(123), TaskId::new("my-task"))),
+            "log_pane_target must resolve the sidebar selection's (RunId, TaskId)"
         );
-
-        // Even if a legacy {task}.log is also present, the transcript wins.
-        let legacy = makina_core::paths::task_log(&repo_root, &run_uid, &task_id);
-        std::fs::write(&legacy, "legacy\n").expect("write legacy log");
-        assert_eq!(
-            resolve_task_log_path(&repo_root, &run_uid, &task_id),
-            Some(transcript),
-            "the live transcript must take precedence over the legacy .log"
-        );
-
-        // Restore HOME.
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
     }
 
     /// The doctor scaffold action must refuse to run when a config file already

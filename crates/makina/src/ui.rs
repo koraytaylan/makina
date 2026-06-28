@@ -533,6 +533,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             // Carve a dependency-view sub-pane (when `v` is active) so it renders
             // on a plan tab too, not only the bare selected-run view.
             let plan_area = carve_dependency_overlay(app, frame, plan_split[1], &mut panel_geoms);
+            let plan_area = carve_log_overlay(app, frame, plan_area, &mut panel_geoms);
 
             // Render the tab bar
             render_tab_bar(app, frame, tab_area);
@@ -555,6 +556,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 .split(content_area);
             render_tab_bar(app, frame, split[0]);
             let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
+            let task_area = carve_log_overlay(app, frame, task_area, &mut panel_geoms);
             render_plan_task_pane(app, plan, preview, frame, task_area);
             panel_geoms.push(PanelGeometry {
                 panel: ScrollablePanel::PlanAccordion,
@@ -596,6 +598,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             // Carve a dependency-view sub-pane (when `v` is active) so it renders
             // on a task tab too.
             let task_area = carve_dependency_overlay(app, frame, task_split[1], &mut panel_geoms);
+            let task_area = carve_log_overlay(app, frame, task_area, &mut panel_geoms);
 
             // Render the tab bar first so it stays visible even if the task
             // itself can't be resolved in the selected run.
@@ -729,6 +732,10 @@ pub fn render(app: &App, frame: &mut Frame) {
                 });
                 dep_split[1]
             };
+            // The `[L]` log panel carves a further sub-pane from the bottom of
+            // whatever exchange area remains.
+            let exchange_pane_area =
+                carve_log_overlay(app, frame, exchange_pane_area, &mut panel_geoms);
             render_exchange_pane(app, frame, exchange_pane_area, main_focused);
             panel_geoms.push(PanelGeometry {
                 panel: ScrollablePanel::Exchange,
@@ -1172,6 +1179,78 @@ fn carve_dependency_overlay(
         rect: dep_area,
     });
     main_area
+}
+
+/// Like [`carve_dependency_overlay`] but for the `[L]` log panel: when
+/// `app.log_pane_open`, reserve a bottom sub-pane, render the context task's log
+/// into it, and return the (reduced) top area for the main content.
+fn carve_log_overlay(
+    app: &App,
+    frame: &mut Frame,
+    area: Rect,
+    panel_geoms: &mut Vec<PanelGeometry>,
+) -> Rect {
+    if !app.log_pane_open || area.height < 6 {
+        return area;
+    }
+    let log_height = (area.height / 2).max(3);
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(log_height)])
+        .split(area);
+    let main_area = split[0];
+    let log_area = split[1];
+    render_log_view(app, frame, log_area);
+    panel_geoms.push(PanelGeometry {
+        panel: ScrollablePanel::LogPane,
+        rect: log_area,
+    });
+    main_area
+}
+
+/// Render the `[L]` log panel: the agent exchange log for the task in context
+/// ([`App::log_pane_target`]), reusing the exchange pane's line builder so the
+/// content matches what the run view shows. Falls back to a hint when no task is
+/// in context (e.g. a plan tab) or the task has produced no log yet.
+fn render_log_view(app: &App, frame: &mut Frame, area: Rect) {
+    let target = app.log_pane_target();
+    let title = match &target {
+        Some((_, task_id)) => format!(" Log — {} ", task_id.0),
+        None => " Log ".to_string(),
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+    let lines: Vec<Line> = match target.and_then(|(run, task)| app.exchange_logs.get(&(run, task)))
+    {
+        Some(log) if !log.entries.is_empty() => log
+            .entries
+            .iter()
+            .flat_map(|e| exchange_entry_lines(e, app, inner.width))
+            .collect(),
+        Some(_) => vec![Line::from(vec![Span::styled(
+            "  No log entries yet for this task.",
+            dim,
+        )])],
+        None => vec![Line::from(vec![Span::styled(
+            "  Select a task (open a task tab or pick one in the sidebar) to see its log.",
+            dim,
+        )])],
+    };
+
+    let total = lines.len() as u16;
+    let scroll_max = total.saturating_sub(inner.height);
+    app.last_scroll_maxes
+        .borrow_mut()
+        .insert(ScrollablePanel::LogPane, scroll_max);
+    let offset = app.panel_offset(ScrollablePanel::LogPane, scroll_max);
+    let para = Paragraph::new(lines).scroll((offset, 0));
+    frame.render_widget(para, inner);
 }
 
 /// This is the single shared entry point for all [`DependencyViewMode`]
@@ -6244,6 +6323,51 @@ mod tests {
         }));
 
         app
+    }
+
+    /// `[L]` toggles an in-TUI log panel (like the `v` dependency view) that
+    /// shows the context task's agent log at the bottom. Regression: the old
+    /// `L` shelled out to `$PAGER` and showed nothing in many contexts.
+    #[test]
+    fn log_pane_toggles_and_renders_context_task_log() {
+        use crate::app::{AppEvent, TabContent};
+        use makina_core::api::TaskId;
+
+        let mut app = exchange_app();
+        // Open a task tab for task-a so the log target is deterministic.
+        let slug = makina_core::orchestrator::plan_slug(&app.runs[0].task_list_path);
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: slug,
+            task_id: TaskId::new("task-a"),
+        });
+        app.tabs.active_tab = Some(0);
+
+        // Closed by default: no log panel on screen.
+        let mut terminal = make_terminal(120, 40);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        assert!(
+            !screen_of(&terminal).contains("Log — task-a"),
+            "log panel must be hidden until toggled"
+        );
+
+        // Toggle open with the L event.
+        app.update(AppEvent::ToggleLogPane);
+        assert!(app.log_pane_open, "ToggleLogPane must open the panel");
+        let mut terminal = make_terminal(120, 40);
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("Log — task-a"),
+            "log panel header must name the context task"
+        );
+        assert!(
+            screen.contains("implement X"),
+            "log panel must render the task's logged agent exchange"
+        );
+
+        // Toggle closed again.
+        app.update(AppEvent::ToggleLogPane);
+        assert!(!app.log_pane_open, "ToggleLogPane must close the panel");
     }
 
     /// **Live streaming (done-when):** after feeding PromptSent + chunks +

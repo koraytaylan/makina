@@ -703,8 +703,9 @@ pub enum AppEvent {
     Tick,
     /// Toggle the error pane open/closed (`e` / `E`).
     ToggleErrorPane,
-    /// Open the focused task's log in `$PAGER` (`L`).
-    OpenLog,
+    /// Toggle the in-TUI log panel open/closed (`l` / `L`) — shows the context
+    /// task's agent log at the bottom, like the `v` dependency view.
+    ToggleLogPane,
 
     // ── Task-status view (task 29) ────────────────────────────────────────────
     /// A full [`RunView`] (with its task list) was fetched from the api and
@@ -1069,6 +1070,8 @@ pub enum ScrollablePanel {
     TaskEntry,
     /// The error pane overlay.
     ErrorPane,
+    /// The log panel overlay (the `[L]` in-TUI task log).
+    LogPane,
 }
 
 /// Geometry of a single scrollable panel (used for mouse hitbox testing).
@@ -1256,6 +1259,9 @@ pub struct App {
 
     /// Whether the error pane is currently visible.
     pub error_pane_open: bool,
+
+    /// Whether the in-TUI log panel (`[L]`) is currently visible.
+    pub log_pane_open: bool,
 
     /// Whether the help overlay is currently visible.
     ///
@@ -1714,6 +1720,7 @@ impl App {
             status_message: None,
             busy: None,
             error_pane_open: false,
+            log_pane_open: false,
             help_mode_active: false,
             error_messages: Vec::new(),
             unseen_errors: false,
@@ -1891,14 +1898,14 @@ impl App {
             .map(|r| r.id)
     }
 
-    /// Resolve the `(run_uid, task_id)` whose log the `[L]` key should open,
+    /// Resolve the `(RunId, TaskId)` whose agent log the `[L]` panel should show,
     /// preferring (1) the active task tab, then (2) the focused sidebar task
     /// node, then (3) the sidebar selection. Returns `None` when no task is in
-    /// context (e.g. a plan tab or a run header) so the caller can hint.
+    /// context (e.g. a plan tab or a run header) so the panel can hint.
     ///
-    /// Returns owned strings so the caller can drop the borrow before the
-    /// terminal teardown/pager cycle in `crate::event::open_log`.
-    pub fn log_target(&self) -> Option<(String, String)> {
+    /// Keyed for an `exchange_logs` lookup (the panel reuses the live in-memory
+    /// agent exchanges rendered by the exchange pane).
+    pub fn log_pane_target(&self) -> Option<(RunId, TaskId)> {
         // 1. Active task tab → its run + task.
         if let Some(active) = self.tabs.active_tab
             && let Some(TabContent::Task { plan_slug, task_id }) = self.tabs.open_tabs.get(active)
@@ -1907,19 +1914,19 @@ impl App {
                     && r.tasks.iter().any(|t| t.id == *task_id)
             })
         {
-            return Some((run.run_uid.clone(), task_id.0.clone()));
+            return Some((run.id, task_id.clone()));
         }
         // 2. Focused sidebar task node.
         if let Some(TreeNode::Task { run, task }) = self.focused_node()
             && let Some(rv) = self.runs.get(run)
             && let Some(tv) = rv.tasks.get(task)
         {
-            return Some((rv.run_uid.clone(), tv.id.0.clone()));
+            return Some((rv.id, tv.id.clone()));
         }
         // 3. Sidebar selection (selected_run + selected_task).
         let run = self.selected_run()?;
         let tv = self.selected_task.and_then(|i| run.tasks.get(i))?;
-        Some((run.run_uid.clone(), tv.id.0.clone()))
+        Some((run.id, tv.id.clone()))
     }
 
     /// Return the [`TaskId`] of the currently focused task within the selected
@@ -2281,9 +2288,13 @@ impl App {
                 self.help_mode_active = false;
                 true
             }
-            AppEvent::OpenLog => {
-                // This is an intent; the IO layer handles the actual file I/O.
-                // `update` returns true to trigger a redraw.
+            AppEvent::ToggleLogPane => {
+                self.log_pane_open = !self.log_pane_open;
+                // Reset the log pane's scroll when it closes so it reopens at the
+                // top (mirrors the error pane's offset cleanup).
+                if !self.log_pane_open {
+                    self.scroll_offsets.remove(&ScrollablePanel::LogPane);
+                }
                 true
             }
             AppEvent::SelectUp => {
@@ -4518,11 +4529,11 @@ mod tests {
         );
     }
 
-    /// `log_target` resolves the (run_uid, task_id) from the ACTIVE TASK TAB even
-    /// when the sidebar selection points elsewhere — so `[L]` opens the log of
-    /// the task the user is actually viewing.
+    /// `log_pane_target` resolves the (RunId, TaskId) from the ACTIVE TASK TAB
+    /// even when the sidebar selection points elsewhere — so `[L]` shows the log
+    /// of the task the user is actually viewing.
     #[test]
-    fn log_target_resolves_from_active_task_tab() {
+    fn log_pane_target_resolves_from_active_task_tab() {
         use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
         let api = Arc::new(PlaceholderApi::new());
         let run = RunView {
@@ -4555,9 +4566,9 @@ mod tests {
         app.tabs.active_tab = Some(0);
 
         assert_eq!(
-            app.log_target(),
-            Some(("run-uid-3".to_string(), "build-thing".to_string())),
-            "log_target must resolve the active task tab's run_uid + task_id"
+            app.log_pane_target(),
+            Some((RunId(3), TaskId::new("build-thing"))),
+            "log_pane_target must resolve the active task tab's (RunId, TaskId)"
         );
     }
 
