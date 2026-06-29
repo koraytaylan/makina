@@ -1298,7 +1298,11 @@ fn translate_terminal_event(
                         .active_tab
                         .and_then(|idx| app.tabs.open_tabs.get(idx))
                         .is_some_and(|content| {
-                            matches!(content, crate::app::TabContent::Task { .. })
+                            matches!(
+                                content,
+                                crate::app::TabContent::Task { .. }
+                                    | crate::app::TabContent::PlanTask { .. }
+                            )
                         });
                     if task_tab_active {
                         AppEvent::ToggleTaskAccordionSection(*section)
@@ -1487,13 +1491,19 @@ fn translate_key(
             // ── Accordion toggles (plan 0032, extended for task tabs in plan 0042 WS6) ────
             // s/a/t/z toggle accordion sections when the main pane is focused.
             // For plan tabs: Scope/Architecture/Tasks/Status
-            // For task tabs: s/z toggle Scope/Execution.
+            // For task detail tabs: s/z toggle Scope/Execution.
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 let task_tab_active = app
                     .tabs
                     .active_tab
                     .and_then(|idx| app.tabs.open_tabs.get(idx))
-                    .is_some_and(|content| matches!(content, crate::app::TabContent::Task { .. }));
+                    .is_some_and(|content| {
+                        matches!(
+                            content,
+                            crate::app::TabContent::Task { .. }
+                                | crate::app::TabContent::PlanTask { .. }
+                        )
+                    });
                 if focused_panel == Panel::Main && plan_tab_active {
                     AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Scope)
                 } else if focused_panel == Panel::Main && task_tab_active {
@@ -1529,7 +1539,13 @@ fn translate_key(
                     .tabs
                     .active_tab
                     .and_then(|idx| app.tabs.open_tabs.get(idx))
-                    .is_some_and(|content| matches!(content, crate::app::TabContent::Task { .. }));
+                    .is_some_and(|content| {
+                        matches!(
+                            content,
+                            crate::app::TabContent::Task { .. }
+                                | crate::app::TabContent::PlanTask { .. }
+                        )
+                    });
                 if focused_panel == Panel::Main && plan_tab_active {
                     AppEvent::ToggleAccordionSection(crate::app::AccordionSection::Status)
                 } else if focused_panel == Panel::Main && task_tab_active {
@@ -4550,6 +4566,39 @@ wall_clock_secs = 1200
     }
 
     #[test]
+    fn s_and_z_keys_in_main_with_plan_task_tab_toggle_task_sections() {
+        let mut app = test_app();
+        app.tabs.open_tab(crate::app::TabContent::PlanTask {
+            plan_slug: "test-plan".to_string(),
+            task_id: "preview-task".to_string(),
+        });
+
+        let ev_s = translate_terminal_event(
+            key_press(KeyCode::Char('s'), KeyModifiers::NONE),
+            ModalState::default(),
+            crate::app::Panel::Main,
+            false,
+            &app,
+        );
+        assert!(matches!(
+            ev_s,
+            AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Scope)
+        ));
+
+        let ev_z = translate_terminal_event(
+            key_press(KeyCode::Char('z'), KeyModifiers::NONE),
+            ModalState::default(),
+            crate::app::Panel::Main,
+            false,
+            &app,
+        );
+        assert!(matches!(
+            ev_z,
+            AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Execution)
+        ));
+    }
+
+    #[test]
     fn s_key_in_sidebar_with_plan_tab_is_tick() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
@@ -4819,6 +4868,40 @@ wall_clock_secs = 1200
         assert!(matches!(
             ev,
             AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Execution)
+        ));
+    }
+
+    #[test]
+    fn test_plan_task_accordion_header_click_toggles_task_section() {
+        use ratatui::layout::Rect;
+
+        let mut app = test_app();
+        app.tabs.open_tab(crate::app::TabContent::PlanTask {
+            plan_slug: "test-plan".to_string(),
+            task_id: "preview-task".to_string(),
+        });
+        *app.accordion_header_bounds.borrow_mut() = vec![(
+            crate::app::AccordionSection::Scope,
+            Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 1,
+            },
+        )];
+
+        let click_inside = mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 7);
+        let ev = translate_terminal_event(
+            click_inside,
+            ModalState::default(),
+            crate::app::Panel::Main,
+            false,
+            &app,
+        );
+
+        assert!(matches!(
+            ev,
+            AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Scope)
         ));
     }
 

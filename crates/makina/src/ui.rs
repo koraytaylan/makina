@@ -45,7 +45,11 @@ use ratatui::{
         Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
-use std::collections::HashSet;
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    hash::{Hash, Hasher},
+};
 
 use crate::app::{
     AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
@@ -53,8 +57,8 @@ use crate::app::{
 };
 use makina_core::api::{FailureKind, RunView, TaskId};
 
-/// Render markdown with caching by (text_hash, width).
-/// Subsequent calls with identical text and width return the cached result without re-parsing.
+/// Render markdown with caching by (text_hash, width, style/theme context).
+/// Subsequent calls with identical inputs return the cached result without re-parsing.
 fn render_markdown_cached(
     app: &App,
     text: &str,
@@ -63,13 +67,43 @@ fn render_markdown_cached(
     theme: &crate::theme::Theme,
 ) -> Vec<Line<'static>> {
     use crate::app::hash_text;
-    let key = (hash_text(text), width);
+    let key = (hash_text(text), width, markdown_context_hash(base, theme));
     if let Some(lines) = app.markdown_cache.borrow().get(&key) {
         return lines.clone();
     }
     let lines = crate::markup::render_markdown(text, base, width, theme);
     app.markdown_cache.borrow_mut().insert(key, lines.clone());
     lines
+}
+
+fn markdown_context_hash(base: Style, theme: &crate::theme::Theme) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{base:?}").hash(&mut hasher);
+    theme.name.hash(&mut hasher);
+    for role in crate::theme::ALL_ROLES {
+        role.hash(&mut hasher);
+        format!("{:?}", theme.get(role)).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn indent_line(mut line: Line<'static>, indent: &'static str) -> Line<'static> {
+    line.spans.insert(0, Span::styled(indent, line.style));
+    line
+}
+
+fn render_indented_markdown(
+    app: &App,
+    content: &str,
+    base: Style,
+    content_width: u16,
+    indent_width: u16,
+) -> Vec<Line<'static>> {
+    let body_width = content_width.saturating_sub(indent_width);
+    render_markdown_cached(app, content, base, body_width, &app.active_theme)
+        .into_iter()
+        .map(|line| indent_line(line, "  "))
+        .collect()
 }
 
 /// Render the full TUI layout into `frame`.
@@ -513,9 +547,10 @@ pub fn render(app: &App, frame: &mut Frame) {
     let content_area = main_split[0];
     let error_area = main_split[1];
 
-    // Content precedence: an active plan tab (opened via the tab system in plan 0032)
-    // is rendered via render_plan_accordion_pane; an active task tab is rendered via
-    // render_task_entry_pane; otherwise the selected run's view; otherwise a hint.
+    // Content precedence: an active plan tab is rendered via
+    // render_plan_accordion_pane; an active task detail tab (live or preview) is
+    // rendered via the task-entry pane; otherwise the selected run's view;
+    // otherwise a hint.
     let active_plan_tab = app.tabs.active_tab.and_then(|idx| {
         app.tabs.open_tabs.get(idx).and_then(|tab_content| {
             if let crate::app::TabContent::Plan { plan_slug } = tab_content {
@@ -593,8 +628,8 @@ pub fn render(app: &App, frame: &mut Frame) {
             });
         }
         (None, Some((plan, preview)), _, _) => {
-            // An active plan-task tab shows the task preview (id, title, gated,
-            // dependencies) in its own pane, with the tab bar above.
+            // An active plan-task tab uses the same task-detail pane as a live
+            // task tab, with preview data in Scope and an empty Execution state.
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(3)])
@@ -603,7 +638,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
             render_plan_task_pane(app, plan, preview, frame, task_area);
             panel_geoms.push(PanelGeometry {
-                panel: ScrollablePanel::PlanAccordion,
+                panel: ScrollablePanel::TaskEntry,
                 rect: task_area,
             });
         }
@@ -1096,133 +1131,18 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para, area);
 }
 
-/// Render the content pane for an active plan-task tab: the task's id and title,
-/// then its FULL section body from the plan's TASKS.md rendered as Markdown
-/// (best effort), scrollable with a scrollbar like the plan-accordion pane.
-///
-/// A discovered plan's task is a read-only preview ([`PlanTaskPreview`]), not a
-/// running task, so the body is the parsed Markdown under the task heading, not
-/// a live exchange. Falls back to the parsed metadata when no body was captured.
+/// Render the content pane for an active plan-task tab using the same task-detail
+/// accordion as a live task tab. A discovered plan's task is still a read-only
+/// preview ([`PlanTaskPreview`]), but its Scope/Execution layout should not
+/// diverge from the task detail the user sees once a run exists.
 fn render_plan_task_pane(
     app: &App,
-    plan: &makina_core::orchestrator::PlanEntry,
+    _plan: &makina_core::orchestrator::PlanEntry,
     preview: &makina_core::orchestrator::PlanTaskPreview,
     frame: &mut Frame,
     area: Rect,
 ) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    // Reserve the rightmost column for the scrollbar (mirrors the accordion pane).
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
-    let content_area = cols[0];
-    let scrollbar_area = cols[1];
-
-    // Wrap-aware row counting so scroll bounds account for soft-wrapped lines.
-    let rendered_rows_for_line = |line: &Line<'_>| -> u16 {
-        let w = line.width();
-        if content_area.width == 0 || w == 0 {
-            1
-        } else {
-            (w as u32)
-                .div_ceil(content_area.width as u32)
-                .min(u16::MAX as u32) as u16
-        }
-    };
-
-    let mut rendered_row: u16 = 0;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    macro_rules! push_line {
-        ($l:expr) => {{
-            let l: Line<'static> = $l;
-            rendered_row += rendered_rows_for_line(&l);
-            lines.push(l);
-        }};
-    }
-
-    // Header: `id — title`, plan slug, and a gated note.
-    push_line!(Line::from(vec![Span::styled(
-        format!("{} — {}", preview.id, preview.title),
-        Style::default()
-            .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
-            .add_modifier(Modifier::BOLD),
-    )]));
-    push_line!(Line::from(vec![
-        Span::styled(
-            "Plan: ",
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-        ),
-        Span::styled(
-            plan.slug.clone(),
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-        ),
-    ]));
-    if preview.gated {
-        push_line!(Line::from(vec![Span::styled(
-            "Gated — blocked until prerequisites land",
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
-        )]));
-    }
-    push_line!(Line::from(""));
-
-    // Body: the full task section from TASKS.md, rendered as Markdown.
-    if preview.body.trim().is_empty() {
-        if preview.depends_on.is_empty() {
-            push_line!(Line::from(Span::styled(
-                "(no further detail in TASKS.md)",
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-            )));
-        } else {
-            push_line!(Line::from(vec![
-                Span::styled(
-                    "Depends on: ",
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                ),
-                Span::styled(
-                    preview.depends_on.join(", "),
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
-                ),
-            ]));
-        }
-    } else {
-        let base_style =
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-        for l in render_markdown_cached(
-            app,
-            &preview.body,
-            base_style,
-            content_area.width,
-            &app.active_theme,
-        ) {
-            push_line!(l);
-        }
-    }
-
-    let total_rendered_rows = rendered_row;
-    let scroll_max = total_rendered_rows.saturating_sub(content_area.height);
-    app.last_scroll_maxes
-        .borrow_mut()
-        .insert(ScrollablePanel::PlanAccordion, scroll_max);
-    let scroll_offset = app.panel_offset(ScrollablePanel::PlanAccordion, scroll_max);
-
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
-    frame.render_widget(para, content_area);
-
-    if scroll_max > 0 {
-        let mut scrollbar_state =
-            ScrollbarState::new(scroll_max as usize).position(scroll_offset as usize);
-        let scrollbar = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None);
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-    }
+    render_task_detail_pane(app, TaskDetailSource::PlanPreview { preview }, frame, area);
 }
 
 /// When the dependency-view overlay is active, carve a sub-pane from the BOTTOM
@@ -2301,11 +2221,10 @@ fn render_task_execution_section(
         let body_width = content_width.saturating_sub(2);
         let log = log_opt.expect("checked above");
         for entry in &log.entries {
-            for mut entry_line in exchange_entry_lines(entry, app, body_width) {
+            for entry_line in exchange_entry_lines(entry, app, body_width) {
                 // Indent each rendered line by 2 spaces so the body nests
                 // under the "Execution" header, matching the SCOPE section.
-                entry_line.spans.insert(0, Span::raw("  "));
-                result.push(entry_line);
+                result.push(indent_line(entry_line, "  "));
             }
         }
     } else {
@@ -2323,25 +2242,51 @@ fn render_task_execution_section(
     result
 }
 
-/// Render a task's entry (metadata + Markdown body) into a bordered pane.
-/// Width is taken from the pane's inner area so wrapping matches the pane, and
-/// the body reuses plan 0020's hardened `render_markdown` — no new parser.
-///
-/// Scrolls vertically with per-panel state keyed by [`ScrollablePanel::TaskEntry`]:
-/// the content area is split to reserve a rightmost scrollbar column, wrap-aware
-/// row accounting sets `last_scroll_maxes[TaskEntry]`, and the stored
-/// `scroll_offsets[TaskEntry]` offset is applied via `Paragraph::scroll`. This
-/// mirrors `render_plan_accordion_pane` / `render_plan_task_pane` — without it,
-/// a task entry taller than the viewport could not be scrolled, so the Markdown
-/// body was clipped with no way to reach the rest (including the Execution
-/// section below the fold).
-fn render_task_entry_pane(
+#[derive(Clone, Copy)]
+enum TaskDetailSource<'a> {
+    Live {
+        run: &'a RunView,
+        task: &'a makina_core::api::TaskView,
+    },
+    PlanPreview {
+        preview: &'a makina_core::orchestrator::PlanTaskPreview,
+    },
+}
+
+fn render_task_execution_empty_section(
     app: &App,
-    run: &RunView,
-    task_idx: usize,
-    frame: &mut Frame,
-    area: Rect,
-) {
+    expanded: &HashSet<AccordionSection>,
+) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    let is_expanded = expanded.contains(&AccordionSection::Execution);
+    let marker = if is_expanded { "[-]" } else { "[+]" };
+
+    let marker_style = Style::default()
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
+        .add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+        .add_modifier(Modifier::BOLD);
+    result.push(Line::from(vec![
+        Span::styled(marker, marker_style),
+        Span::raw(" "),
+        Span::styled("Execution", title_style),
+    ]));
+
+    if is_expanded {
+        result.push(Line::from(""));
+        result.push(Line::from(vec![Span::styled(
+            "  No execution yet — start the plan to create a run",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        )]));
+    }
+
+    result
+}
+
+/// Render task detail (metadata + Scope/Execution accordions) into a bordered pane.
+/// This is the single detail layout for both plan-task previews and live task tabs.
+fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .title(" Task Entry ")
         .borders(Borders::TOP)
@@ -2354,164 +2299,242 @@ fn render_task_entry_pane(
         return;
     }
 
-    if let Some(task) = run.tasks.get(task_idx) {
-        // Reserve the rightmost column for the scrollbar so text is not
-        // overpainted, and so the markdown wrap width matches the visible width.
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .split(inner);
-        let content_area = cols[0];
-        let scrollbar_area = cols[1];
+    // Reserve the rightmost column for the scrollbar so text is not
+    // overpainted, and so the markdown wrap width matches the visible width.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let content_area = cols[0];
+    let scrollbar_area = cols[1];
 
-        // Helper: number of terminal rows a single Line occupies when rendered
-        // with `Wrap { trim: false }` at the content column width. Mirrors the
-        // accounting in `render_plan_accordion_pane` / `render_plan_task_pane`.
-        let rendered_rows_for_line = |line: &Line<'_>| -> u16 {
-            let w = line.width();
-            if content_area.width == 0 || w == 0 {
-                1
+    let rendered_rows_for_line = |line: &Line<'_>| -> u16 {
+        let w = line.width();
+        if content_area.width == 0 || w == 0 {
+            1
+        } else {
+            (w as u32)
+                .div_ceil(content_area.width as u32)
+                .min(u16::MAX as u32) as u16
+        }
+    };
+
+    let mut rendered_row: u16 = 0;
+    let mut accordion_header_rows: Vec<(AccordionSection, u16)> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    macro_rules! push_line {
+        ($l:expr) => {{
+            let l: Line<'static> = $l;
+            rendered_row += rendered_rows_for_line(&l);
+            lines.push(l);
+        }};
+    }
+
+    let (
+        task_key,
+        id,
+        title,
+        scope_text,
+        dependency_text,
+        badge,
+        badge_color,
+        gated,
+        gate_iterations,
+        review_iterations,
+    ) = match source {
+        TaskDetailSource::Live { task, .. } => {
+            let deps = if task.depends_on.is_empty() {
+                None
             } else {
-                (w as u32)
-                    .div_ceil(content_area.width as u32)
-                    .min(u16::MAX as u32) as u16
-            }
-        };
-
-        let mut rendered_row: u16 = 0;
-        let mut accordion_header_rows: Vec<(AccordionSection, u16)> = Vec::new();
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        macro_rules! push_line {
-            ($l:expr) => {{
-                let l: Line<'static> = $l;
-                rendered_row += rendered_rows_for_line(&l);
-                lines.push(l);
-            }};
+                Some(
+                    task.depends_on
+                        .iter()
+                        .map(|id| id.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            };
+            let (badge, badge_color) = task_state_badge(&task.state, app);
+            (
+                task.id.clone(),
+                task.id.0.as_str(),
+                task.title.as_str(),
+                Cow::Borrowed(task.entry_text.as_str()),
+                deps,
+                badge,
+                badge_color,
+                false,
+                task.gate_iterations,
+                task.review_iterations,
+            )
         }
+        TaskDetailSource::PlanPreview { preview } => {
+            let scope = if preview.body.trim().is_empty() {
+                Cow::Borrowed("(no further detail in TASKS.md)")
+            } else {
+                Cow::Borrowed(preview.body.as_str())
+            };
+            let deps = if preview.depends_on.is_empty() {
+                None
+            } else {
+                Some(preview.depends_on.join(", "))
+            };
+            let (badge, badge_color) = if preview.gated {
+                (
+                    "[gated]",
+                    app.active_theme.get(crate::theme::ThemeRole::Warning),
+                )
+            } else {
+                (
+                    "[planned]",
+                    app.active_theme.get(crate::theme::ThemeRole::Dim),
+                )
+            };
+            (
+                TaskId::new(preview.id.clone()),
+                preview.id.as_str(),
+                preview.title.as_str(),
+                scope,
+                deps,
+                badge,
+                badge_color,
+                preview.gated,
+                0,
+                0,
+            )
+        }
+    };
 
-        // Task header: ID and title
+    push_line!(Line::from(vec![Span::styled(
+        format!("{id} — {title}"),
+        Style::default()
+            .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+            .add_modifier(Modifier::BOLD),
+    )]));
+    push_line!(Line::from(vec![Span::styled(
+        format!("  {badge}"),
+        Style::default().fg(badge_color),
+    )]));
+
+    if gated {
         push_line!(Line::from(vec![Span::styled(
-            format!("{} — {}", task.id, task.title),
-            Style::default()
-                .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
-                .add_modifier(Modifier::BOLD),
+            "  Gated — blocked until prerequisites land",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
         )]));
+    }
 
-        // State badge
-        let (badge, badge_color) = task_state_badge(&task.state, app);
+    if let Some(deps_str) = dependency_text {
         push_line!(Line::from(vec![Span::styled(
-            format!("  {}", badge),
-            Style::default().fg(badge_color),
+            format!("  Depends on: {deps_str}"),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         )]));
+    }
 
-        // Dependencies and gated status
-        if !task.depends_on.is_empty() {
-            let deps_str = task
-                .depends_on
-                .iter()
-                .map(|id| id.0.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            push_line!(Line::from(vec![Span::styled(
-                format!("  Depends on: {}", deps_str),
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-            )]));
+    if gate_iterations > 0 || review_iterations > 0 {
+        let counts = format!("gate ×{gate_iterations}  ·  review ×{review_iterations}");
+        let style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning));
+        push_line!(Line::from(Span::styled(counts, style)));
+    }
+
+    push_line!(Line::from(""));
+
+    let expanded = app
+        .task_accordion_expanded
+        .get(&task_key)
+        .cloned()
+        .unwrap_or_else(crate::app::default_task_accordion_sections);
+
+    let content_width = content_area.width;
+
+    accordion_header_rows.push((AccordionSection::Scope, rendered_row));
+    for l in render_accordion_section(
+        app,
+        "Scope",
+        AccordionSection::Scope,
+        &expanded,
+        &scope_text,
+        false,
+        content_width,
+        true,
+    ) {
+        push_line!(l);
+    }
+    push_line!(Line::from(""));
+
+    accordion_header_rows.push((AccordionSection::Execution, rendered_row));
+    let execution_lines = match source {
+        TaskDetailSource::Live { run, task } => {
+            render_task_execution_section(app, run, task, &expanded, content_width)
         }
+        TaskDetailSource::PlanPreview { .. } => render_task_execution_empty_section(app, &expanded),
+    };
+    for l in execution_lines {
+        push_line!(l);
+    }
+    push_line!(Line::from(""));
 
-        // Add metrics if available
-        if task.gate_iterations > 0 || task.review_iterations > 0 {
-            let counts = format!(
-                "gate ×{}  ·  review ×{}",
-                task.gate_iterations, task.review_iterations
-            );
-            let style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning));
-            push_line!(Line::from(Span::styled(counts, style)));
+    let total_rendered_rows = rendered_row;
+    let task_scroll_max = total_rendered_rows.saturating_sub(content_area.height);
+    app.last_scroll_maxes
+        .borrow_mut()
+        .insert(ScrollablePanel::TaskEntry, task_scroll_max);
+
+    let task_scroll_offset = app.panel_offset(ScrollablePanel::TaskEntry, task_scroll_max);
+
+    let mut computed_bounds = Vec::new();
+    for (section, header_rendered_row) in accordion_header_rows {
+        if header_rendered_row >= task_scroll_offset
+            && header_rendered_row < task_scroll_offset + content_area.height
+        {
+            computed_bounds.push((
+                section,
+                Rect {
+                    x: content_area.x,
+                    y: content_area.y + (header_rendered_row - task_scroll_offset),
+                    width: content_area.width,
+                    height: 1,
+                },
+            ));
         }
+    }
+    *app.accordion_header_bounds.borrow_mut() = computed_bounds;
 
-        push_line!(Line::from(""));
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((task_scroll_offset, 0));
+    frame.render_widget(para, content_area);
 
-        // Get the task's expanded accordion sections from the app state. A task
-        // with no entry yet defaults to Scope + Execution expanded — the SAME
-        // default the toggle handler seeds, so the first s/z press toggles the
-        // section the user pressed (see default_task_accordion_sections).
-        let expanded = app
-            .task_accordion_expanded
-            .get(&task.id)
-            .cloned()
-            .unwrap_or_else(crate::app::default_task_accordion_sections);
+    if task_scroll_max > 0 {
+        let mut scrollbar_state =
+            ScrollbarState::new(task_scroll_max as usize).position(task_scroll_offset as usize);
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+}
 
-        let content_width = content_area.width;
-
-        // SCOPE section — task's static description rendered as Markdown
-        accordion_header_rows.push((AccordionSection::Scope, rendered_row));
-        for l in render_accordion_section(
-            app,
-            "Scope",
-            AccordionSection::Scope,
-            &expanded,
-            &task.entry_text,
-            false, // task tabs don't use focused_section highlighting
-            content_width,
-            true, // render as markdown
-        ) {
-            push_line!(l);
-        }
-        push_line!(Line::from(""));
-
-        // EXECUTION section — live activity, metrics, and the full exchange
-        // log (prompts, thoughts, tools, responses) in chronological order.
-        // Rendered via render_task_execution_section (not render_accordion_section)
-        // because the body is rich Vec<Line> content, not a plain string.
-        accordion_header_rows.push((AccordionSection::Execution, rendered_row));
-        for l in render_task_execution_section(app, run, task, &expanded, content_width) {
-            push_line!(l);
-        }
-        push_line!(Line::from(""));
-
-        // Per-panel scroll clamp ceiling: how many rows can be scrolled before
-        // the last line of content reaches the top of the viewport.
-        let total_rendered_rows = rendered_row;
-        let task_scroll_max = total_rendered_rows.saturating_sub(content_area.height);
-        app.last_scroll_maxes
-            .borrow_mut()
-            .insert(ScrollablePanel::TaskEntry, task_scroll_max);
-
-        let task_scroll_offset = app.panel_offset(ScrollablePanel::TaskEntry, task_scroll_max);
-
-        let mut computed_bounds = Vec::new();
-        for (section, header_rendered_row) in accordion_header_rows {
-            if header_rendered_row >= task_scroll_offset
-                && header_rendered_row < task_scroll_offset + content_area.height
-            {
-                computed_bounds.push((
-                    section,
-                    Rect {
-                        x: content_area.x,
-                        y: content_area.y + (header_rendered_row - task_scroll_offset),
-                        width: content_area.width,
-                        height: 1,
-                    },
-                ));
-            }
-        }
-        *app.accordion_header_bounds.borrow_mut() = computed_bounds;
-
-        let para = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((task_scroll_offset, 0));
-        frame.render_widget(para, content_area);
-
-        if task_scroll_max > 0 {
-            let mut scrollbar_state =
-                ScrollbarState::new(task_scroll_max as usize).position(task_scroll_offset as usize);
-            let scrollbar = Scrollbar::default()
-                .orientation(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None);
-            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-        }
+/// Render a task's entry (metadata + Markdown body) into a bordered pane.
+/// Width is taken from the pane's inner area so wrapping matches the pane, and
+/// the body reuses plan 0020's hardened `render_markdown` — no new parser.
+fn render_task_entry_pane(
+    app: &App,
+    run: &RunView,
+    task_idx: usize,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    if let Some(task) = run.tasks.get(task_idx) {
+        render_task_detail_pane(app, TaskDetailSource::Live { run, task }, frame, area);
     } else {
         // Task not found placeholder
+        let block = Block::default()
+            .title(" Task Entry ")
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Info)));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         let placeholder = Line::from(vec![Span::styled(
             "  Task not found.",
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
@@ -2815,13 +2838,9 @@ fn render_accordion_section(
             // of showing raw CommonMark source. Wrap to the pane width minus the
             // 2-space indent so the indented lines still fit the viewport, then
             // prepend the indent so the body stays nested under its header.
-            let body_width = content_width.saturating_sub(2);
             let base =
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-            for mut line in
-                render_markdown_cached(app, content, base, body_width, &app.active_theme)
-            {
-                line.spans.insert(0, Span::raw("  "));
+            for line in render_indented_markdown(app, content, base, content_width, 2) {
                 result.push(line);
             }
         } else {
@@ -3342,13 +3361,7 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             if app.verbose_mode {
                 let base_style =
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
-                let mut thought_lines =
-                    render_markdown_cached(app, text, base_style, width, &app.active_theme);
-                // Indent all thought lines by 2 spaces.
-                for line in &mut thought_lines {
-                    line.spans.insert(0, Span::raw("  "));
-                }
-                lines.extend(thought_lines);
+                lines.extend(render_indented_markdown(app, text, base_style, width, 2));
             }
         }
         // ── Tool (agent tool invocation) ──────────────────────────────────
@@ -10978,6 +10991,29 @@ mod tests {
         assert_eq!(
             result1, result2,
             "cached result must match the direct result"
+        );
+    }
+
+    #[test]
+    fn markdown_cache_separates_base_style_and_theme() {
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        let text = "same **markdown**";
+        let width = 80u16;
+        let dark = crate::theme::ayu_dark();
+        let light = crate::theme::ayu_light();
+        let accent = Style::default().fg(dark.get(crate::theme::ThemeRole::Accent));
+        let dim = Style::default().fg(dark.get(crate::theme::ThemeRole::Dim));
+
+        let _ = render_markdown_cached(&app, text, accent, width, &dark);
+        let _ = render_markdown_cached(&app, text, dim, width, &dark);
+        let _ = render_markdown_cached(&app, text, accent, width, &light);
+
+        assert_eq!(
+            app.markdown_cache.borrow().len(),
+            3,
+            "same text and width must cache separately for style/theme contexts"
         );
     }
 

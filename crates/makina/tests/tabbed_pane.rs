@@ -386,7 +386,7 @@ fn opening_plan_tasks_creates_distinct_task_tabs() {
                 title: "Wire the thing".to_string(),
                 gated: false,
                 depends_on: vec![],
-                body: "Connect the widget to the bus.\n\n- **Done when:** the bus reports READY."
+                body: "Connect the widget to the bus.\n\nUse **shared markdown** rendering.\n\n```rust\nlet ready = true;\n```\n\n- **Done when:** the bus reports READY."
                     .to_string(),
             },
             PlanTaskPreview {
@@ -462,6 +462,22 @@ fn opening_plan_tasks_creates_distinct_task_tabs() {
     assert!(
         screen.contains("Connect the widget to the bus"),
         "active task tab renders the full task body from TASKS.md"
+    );
+    assert!(
+        screen.contains("[-] Scope") && screen.contains("[-] Execution"),
+        "active plan-task tab renders the task-detail accordion"
+    );
+    assert!(
+        screen.contains("No execution yet"),
+        "fresh plan-task detail shows the same empty Execution state"
+    );
+    assert!(
+        screen.contains("shared markdown") && !screen.contains("**shared markdown**"),
+        "task preview Scope renders markdown instead of raw source"
+    );
+    assert!(
+        screen.contains("let ready = true;") && !screen.contains("```"),
+        "task preview Scope renders fenced code blocks instead of raw fences"
     );
     assert!(
         screen.contains("Done when"),

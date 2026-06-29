@@ -1360,12 +1360,12 @@ pub struct App {
     /// path at `ui.rs:1301`. A missing key defaults to 0 (no scroll needed).
     pub last_scroll_maxes: std::cell::RefCell<std::collections::HashMap<ScrollablePanel, u16>>,
 
-    /// Cache of parsed markdown lines keyed by (text_hash, width). `RefCell` because
-    /// the `&App` render pass populates it via `render_markdown_cached` — this follows
-    /// the interior-mutability pattern of `last_scroll_maxes`. Cleared when the active
-    /// tab changes or content is updated.
+    /// Cache of parsed markdown lines keyed by (text_hash, width, render_context_hash).
+    /// `RefCell` because the `&App` render pass populates it via
+    /// `render_markdown_cached` — this follows the interior-mutability pattern of
+    /// `last_scroll_maxes`. Cleared when the active tab changes or content is updated.
     pub markdown_cache: std::cell::RefCell<
-        std::collections::HashMap<(u64, u16), Vec<ratatui::text::Line<'static>>>,
+        std::collections::HashMap<(u64, u16, u64), Vec<ratatui::text::Line<'static>>>,
     >,
 
     /// Last api event received — stored for test assertions and status-bar
@@ -2293,11 +2293,11 @@ impl App {
     /// `SelectDown`/`ScrollUp`/`ScrollDown`) should target when the main pane is
     /// focused, based on the *active tab's* content type:
     ///
-    /// * `TabContent::Task` → [`ScrollablePanel::TaskEntry`] (the task entry pane
-    ///   rendered by `render_task_entry_pane`).
-    /// * `TabContent::Plan` | `TabContent::PlanTask` →
-    ///   [`ScrollablePanel::PlanAccordion`] (the plan / plan-task accordion pane
-    ///   rendered by `render_plan_accordion_pane` / `render_plan_task_pane`).
+    /// * `TabContent::Task` | `TabContent::PlanTask` → [`ScrollablePanel::TaskEntry`]
+    ///   (the task detail pane rendered by `render_task_entry_pane` /
+    ///   `render_plan_task_pane`).
+    /// * `TabContent::Plan` → [`ScrollablePanel::PlanAccordion`] (the plan
+    ///   accordion pane rendered by `render_plan_accordion_pane`).
     /// * No active tab (the bare selected-run view) → [`ScrollablePanel::Exchange`]
     ///   (preserves the legacy behaviour: Up/Down scrolls the exchange pane).
     ///
@@ -2309,10 +2309,10 @@ impl App {
             .active_tab
             .and_then(|idx| self.tabs.open_tabs.get(idx))
         {
-            Some(TabContent::Task { .. }) => ScrollablePanel::TaskEntry,
-            Some(TabContent::Plan { .. }) | Some(TabContent::PlanTask { .. }) => {
-                ScrollablePanel::PlanAccordion
+            Some(TabContent::Task { .. }) | Some(TabContent::PlanTask { .. }) => {
+                ScrollablePanel::TaskEntry
             }
+            Some(TabContent::Plan { .. }) => ScrollablePanel::PlanAccordion,
             None => ScrollablePanel::Exchange,
         }
     }
@@ -2688,8 +2688,8 @@ impl App {
                     }
                     Panel::Main => {
                         // Main focus: scroll the active tab's pane up. The target
-                        // depends on the active tab type — a Task tab scrolls its
-                        // task entry pane, a Plan/PlanTask tab scrolls the accordion,
+                        // depends on the active tab type — a Task/PlanTask tab scrolls its
+                        // task entry pane, a Plan tab scrolls the accordion,
                         // and the bare run view scrolls the exchange pane.
                         self.scroll_up(self.main_scroll_target());
                     }
@@ -3340,6 +3340,7 @@ impl App {
                             .find(|t| t.name == name)
                     {
                         self.active_theme = theme;
+                        self.markdown_cache.borrow_mut().clear();
                         palette.theme_selector = None; // Exit theme selector mode
                     }
                 }
@@ -3789,12 +3790,15 @@ impl App {
             }
 
             AppEvent::ToggleTaskAccordionSection(section) => {
-                // Only toggle if the active tab is a task tab.
+                // Only toggle if the active tab is a task detail tab.
                 if let Some(active_idx) = self.tabs.active_tab
-                    && let Some(TabContent::Task { task_id, .. }) =
-                        self.tabs.open_tabs.get(active_idx)
+                    && let Some(content) = self.tabs.open_tabs.get(active_idx)
                 {
-                    let task_id = task_id.clone();
+                    let task_id = match content {
+                        TabContent::Task { task_id, .. } => task_id.clone(),
+                        TabContent::PlanTask { task_id, .. } => TaskId::new(task_id.clone()),
+                        TabContent::Plan { .. } => return true,
+                    };
                     // Seed an absent entry with the SAME default the renderer uses
                     // (Scope + Execution expanded), so the first toggle collapses
                     // the section the user actually pressed instead of inverting.
@@ -9120,7 +9124,7 @@ mod tests {
 
         assert_eq!(state.open_tabs.len(), 2);
         assert_eq!(state.active_tab, Some(0));
-        assert_eq!(state.open_tabs.get(0), Some(&content2));
+        assert_eq!(state.open_tabs.first(), Some(&content2));
     }
 
     // ── Accordion state tests ──────────────────────────────────────────────────
@@ -9228,6 +9232,37 @@ mod tests {
         assert!(
             set.contains(&AccordionSection::Execution),
             "the untouched section (Execution) must stay expanded, not collapse"
+        );
+    }
+
+    #[test]
+    fn plan_task_accordion_toggle_uses_task_detail_state() {
+        use makina_core::api::TaskId;
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+
+        let task_id = TaskId::new("preview-task");
+        app.tabs.open_tab(TabContent::PlanTask {
+            plan_slug: "0001-test".to_string(),
+            task_id: task_id.0.clone(),
+        });
+        app.tabs.active_tab = Some(0);
+
+        app.update(AppEvent::ToggleTaskAccordionSection(
+            AccordionSection::Execution,
+        ));
+
+        let set = app
+            .task_accordion_expanded
+            .get(&task_id)
+            .expect("plan-task toggle must create task accordion state");
+        assert!(
+            set.contains(&AccordionSection::Scope),
+            "Scope must stay expanded from the default set"
+        );
+        assert!(
+            !set.contains(&AccordionSection::Execution),
+            "the pressed plan-task Execution section must collapse"
         );
     }
 
@@ -10444,9 +10479,9 @@ mod tests {
     }
 
     /// `main_scroll_target` resolves to [`ScrollablePanel::PlanAccordion`] for
-    /// both `TabContent::Plan` and `TabContent::PlanTask` tabs.
+    /// plan tabs and [`ScrollablePanel::TaskEntry`] for plan-task detail tabs.
     #[test]
-    fn main_scroll_target_plan_tabs_route_to_plan_accordion() {
+    fn main_scroll_target_plan_and_plan_task_tabs_route_to_their_rendered_panes() {
         let mut app = make_app();
         app.tabs.open_tab(crate::app::TabContent::Plan {
             plan_slug: "p".to_string(),
@@ -10464,8 +10499,8 @@ mod tests {
         });
         assert_eq!(
             app2.main_scroll_target(),
-            ScrollablePanel::PlanAccordion,
-            "a PlanTask tab must route keyboard scrolls to the PlanAccordion pane"
+            ScrollablePanel::TaskEntry,
+            "a PlanTask tab must route keyboard scrolls to the TaskEntry pane"
         );
     }
 
