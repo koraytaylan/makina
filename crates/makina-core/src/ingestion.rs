@@ -18,17 +18,40 @@ const MIN_DONE_WHEN_LEN: usize = 12;
 /// Minimum trimmed length for a substantive task description.
 const MIN_DESCRIPTION_LEN: usize = 12;
 
-/// Markers that indicate placeholder / incomplete content (case-insensitive
-/// substring match against title, description, or done_when).
-const PLACEHOLDER_MARKERS: &[&str] = &[
-    "tbd",
-    "todo",
-    "???",
-    "fixme",
-    "xxx",
-    "fill in",
-    "to be defined",
-];
+/// Markers that indicate placeholder / incomplete content, matched
+/// case-insensitively and **whole-word** against title, description, or
+/// done_when (so a substring inside a real word does not trip them).
+const PLACEHOLDER_MARKERS: &[&str] = &["tbd", "???", "fixme", "fill in", "to be defined"];
+
+/// Placeholder markers that are ALSO common domain words — notably `todo` (every
+/// todo-list app) and `xxx`. These are only treated as placeholders when written
+/// in the conventional ALL-CAPS form, so a todo-list plan's ordinary lowercase
+/// "todo" / "Todo" is NOT flagged while a genuine "TODO: …" marker still is.
+/// Matched whole-word against the original-case text.
+const UPPERCASE_PLACEHOLDER_MARKERS: &[&str] = &["TODO", "XXX"];
+
+/// Whole-word containment: true when `needle` occurs in `haystack` bounded by
+/// non-alphanumeric characters (or the string ends). Callers lowercase both
+/// sides for case-insensitive checks; pass original case for case-sensitive
+/// (ALL-CAPS) checks. `needle` is assumed ASCII (all markers are).
+fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let i = from + rel;
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let end = i + needle.len();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = i + 1;
+    }
+    false
+}
 
 /// First words that make a multi-word title non-actionable (articles, vague
 /// collectives, etc.).  Titles whose first word (lowercased) matches one of
@@ -435,15 +458,24 @@ pub fn qualify(graph: &TaskGraph) -> Vec<IngestionIssue> {
             });
         }
 
-        // (2) placeholder-text: lowered title/desc/done_when contains any marker
-        // (substring match, including multi-word markers like "fill in").
+        // (2) placeholder-text: a whole-word marker appears in title/desc/done_when.
+        // Case-insensitive for unambiguous markers; ALL-CAPS-only for the
+        // domain-word markers (TODO/XXX) so a todo-list plan is not blocked.
         let has_placeholder = {
             let t = task.title.to_lowercase();
             let d = task.description.to_lowercase();
             let w = task.done_when.to_lowercase();
-            PLACEHOLDER_MARKERS
-                .iter()
-                .any(|m| t.contains(m) || d.contains(m) || w.contains(m))
+            let ci_hit = PLACEHOLDER_MARKERS.iter().any(|m| {
+                contains_whole_word(&t, m)
+                    || contains_whole_word(&d, m)
+                    || contains_whole_word(&w, m)
+            });
+            let cs_hit = UPPERCASE_PLACEHOLDER_MARKERS.iter().any(|m| {
+                contains_whole_word(&task.title, m)
+                    || contains_whole_word(&task.description, m)
+                    || contains_whole_word(&task.done_when, m)
+            });
+            ci_hit || cs_hit
         };
         if has_placeholder {
             issues.push(IngestionIssue {
@@ -1058,6 +1090,40 @@ Desc.
             issues
         );
         assert_eq!(issues.len(), 1);
+    }
+
+    /// A todo-list plan uses the word "todo" everywhere; that lowercase domain
+    /// usage must NOT be flagged as placeholder text. Regression: a
+    /// case-insensitive substring match on "todo" blocked every todo-app plan
+    /// (the sandbox/todo first-run experience). An ALL-CAPS "TODO" placeholder is
+    /// still caught by `qualify_flags_placeholder_text`.
+    #[test]
+    fn qualify_does_not_flag_lowercase_todo_domain_word() {
+        let now = Utc::now();
+        let t = Task {
+            id: TaskId::new("cmd-add-list"),
+            title: "Add the `todo add` and `todo list` commands".to_string(),
+            description: "Implement adding a todo and listing todos from the JSON store."
+                .to_string(),
+            done_when: "Running `todo add x` then `todo list` shows the new todo.".to_string(),
+            depends_on: vec![],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        };
+        let g = make_graph(vec![t]);
+        let issues = qualify(&g);
+        assert!(
+            !issues.iter().any(|i| i.code == "placeholder-text"),
+            "lowercase domain 'todo' must NOT be flagged as placeholder; got: {:?}",
+            issues
+        );
     }
 
     #[test]
