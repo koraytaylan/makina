@@ -19,7 +19,7 @@
 //! registry.  This is the seam used by [`crate::orchestrator::CoreApi::runs`] to
 //! surface historical runs that have been evicted from memory.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -239,6 +239,62 @@ pub fn read_run_metadata(repo_root: &Path, run_uid: &str) -> std::io::Result<Opt
     }
 }
 
+fn effective_plan_slug(meta: &RunMetadata) -> String {
+    if !meta.plan_slug().is_empty() {
+        meta.plan_slug().to_string()
+    } else if let Some(p) = meta.run_slug().strip_suffix("-tasks") {
+        if !p.is_empty() {
+            p.to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn synthetic_task_list_path(effective_plan: &str, run_slug: &str) -> std::path::PathBuf {
+    if !effective_plan.is_empty() {
+        std::path::PathBuf::from_iter(["docs", "plans", effective_plan, "TASKS.md"])
+    } else {
+        std::path::PathBuf::from(format!(".tasks/{run_slug}.json"))
+    }
+}
+
+fn find_plan_tasks_path(repo_root: &Path, effective_plan: &str) -> Option<std::path::PathBuf> {
+    if effective_plan.is_empty() {
+        return None;
+    }
+
+    let plans_dir = repo_root.join("docs").join("plans");
+    if let Ok(entries) = std::fs::read_dir(&plans_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("TASKS.md");
+            if candidate.is_file() && crate::orchestrator::plan_slug(&candidate) == effective_plan {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let candidate = plans_dir.join(effective_plan).join("TASKS.md");
+    candidate.is_file().then_some(candidate)
+}
+
+fn task_entry_fallbacks(repo_root: &Path, effective_plan: &str) -> HashMap<String, String> {
+    let Some(tasks_path) = find_plan_tasks_path(repo_root, effective_plan) else {
+        return HashMap::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(tasks_path) else {
+        return HashMap::new();
+    };
+
+    crate::orchestrator::parse_plan_tasks(&contents)
+        .into_iter()
+        .filter(|task| !task.body.trim().is_empty())
+        .map(|task| (task.id, task.body))
+        .collect()
+}
+
 /// Build a [`RunView`] from a [`RunMetadata`] snapshot, assigning `id` as the
 /// session-scoped [`RunId`] and using `repo_root` to derive the `project` label.
 ///
@@ -253,6 +309,8 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
+    let effective_plan = effective_plan_slug(meta);
+    let fallback_entries = task_entry_fallbacks(repo_root, &effective_plan);
 
     let tasks: Vec<TaskView> = meta
         .tasks()
@@ -271,7 +329,11 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
             started_at: t.started_at,
             finished_at: t.finished_at,
             failure_reason: t.failure_reason.clone(),
-            entry_text: t.entry_text.clone(),
+            entry_text: if t.entry_text.trim().is_empty() {
+                fallback_entries.get(&t.id).cloned().unwrap_or_default()
+            } else {
+                t.entry_text.clone()
+            },
         })
         .collect();
 
@@ -284,22 +346,7 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
     //   participate in sidebar plan/run dedup and context resolution.
     // - Fall back to the old `.tasks/{run_slug}.json` for non-plan runs and
     //   pre-plan_slug records whose run_slug does not look plan-like.
-    let effective_plan = if !meta.plan_slug().is_empty() {
-        meta.plan_slug().to_string()
-    } else if let Some(p) = meta.run_slug().strip_suffix("-tasks") {
-        if !p.is_empty() {
-            p.to_string()
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-    let task_list_path = if !effective_plan.is_empty() {
-        std::path::PathBuf::from_iter(["docs", "plans", &effective_plan, "TASKS.md"])
-    } else {
-        std::path::PathBuf::from(format!(".tasks/{}.json", meta.run_slug()))
-    };
+    let task_list_path = synthetic_task_list_path(&effective_plan, meta.run_slug());
 
     RunView {
         id,
@@ -573,6 +620,80 @@ mod tests {
         assert_eq!(t2.review_iterations, 1);
         assert_eq!(t2.depends_on, vec![TaskId::new("task-one")]);
         assert_eq!(t2.entry_text, "Task two scope.");
+    }
+
+    #[test]
+    fn disk_run_without_entry_text_recovers_scope_from_plan_tasks_md() {
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        let run_uid = "01OLDRUNENTRYTEXT000000000";
+
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let plan_dir = root
+            .join("docs")
+            .join("plans")
+            .join("0042-Detail-Pane-Rendering-And-Interaction-Fixes");
+        std::fs::create_dir_all(&plan_dir).expect("create plan dir");
+        std::fs::write(
+            plan_dir.join("TASKS.md"),
+            r#"# Tasks
+
+## 0001 — Workstream
+
+### scope-task — Scope Task
+
+Recovered task scope from the original plan file.
+
+- **Done when:** the task detail Scope section is not empty.
+- **Depends on:** —
+"#,
+        )
+        .expect("write TASKS.md");
+
+        let old_json = r#"{
+  "run_uid": "01OLDRUNENTRYTEXT000000000",
+  "run_slug": "0042-detail-pane-rendering-and-interaction-fixes-tasks",
+  "plan_slug": "0042-detail-pane-rendering-and-interaction-fixes",
+  "status": "completed",
+  "started_at": "2026-05-01T10:00:00Z",
+  "ended_at": "2026-05-01T11:00:00Z",
+  "tasks": [
+    {
+      "id": "scope-task",
+      "title": "Scope Task",
+      "state": "done",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "depends_on": []
+    }
+  ]
+}
+"#;
+        let run_dir_path = crate::paths::run_dir(root, run_uid);
+        std::fs::create_dir_all(&run_dir_path).expect("create run dir");
+        std::fs::write(run_dir_path.join("run.json"), old_json).expect("write old run.json");
+
+        let mut next_id = 1u64;
+        let live: HashSet<String> = HashSet::new();
+        let views = load_disk_run_views(root, &live, &mut next_id);
+
+        assert_eq!(views.len(), 1);
+        let task = views[0].tasks.first().expect("task reconstructed");
+        assert!(
+            task.entry_text
+                .contains("Recovered task scope from the original plan file."),
+            "old run snapshot should recover task body from matching TASKS.md, got {:?}",
+            task.entry_text
+        );
+        assert!(
+            task.entry_text
+                .contains("the task detail Scope section is not empty"),
+            "fallback should preserve the Done-when bullet in the task body"
+        );
     }
 
     /// A [`TaskSnapshot`] with `started_at`/`finished_at` set survives a
