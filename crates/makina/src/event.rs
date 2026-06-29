@@ -1287,6 +1287,13 @@ fn translate_terminal_event(
                     .find(|(_, r)| in_bounds(r))
                 {
                     AppEvent::OpenTreeRow(*idx)
+                } else if let Some((key, _)) = app
+                    .tool_diff_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(_, r)| in_bounds(r))
+                {
+                    AppEvent::ToggleToolDiff(key.clone())
                 } else if let Some((section, _)) = app
                     .accordion_header_bounds
                     .borrow()
@@ -1766,10 +1773,10 @@ mod tests {
     }
 
     /// A left click hit-tests, in priority order, tab close icons, tab chips,
-    /// then sidebar rows (all recorded during render), falling back to a text
-    /// selection when the click lands on none. This is what makes clicking a tab
-    /// switch tabs, clicking a close icon close it, and clicking a sidebar row
-    /// open/focus its tab.
+    /// sidebar rows, tool diff headers, then accordion headers (all recorded
+    /// during render), falling back to a text selection when the click lands on
+    /// none. This is what makes clicking a tab switch tabs, clicking a close
+    /// icon close it, and clicking a sidebar row open/focus its tab.
     #[test]
     fn left_click_hit_tests_tab_close_icons_tabs_then_sidebar_rows() {
         use ratatui::layout::Rect;
@@ -1803,6 +1810,20 @@ mod tests {
                 height: 1,
             },
         ));
+        let tool_key = crate::app::ToolDiffKey {
+            run: makina_core::api::RunId(1),
+            task: makina_core::api::TaskId::new("task"),
+            tool_id: "write-tool".to_string(),
+        };
+        app.tool_diff_bounds.borrow_mut().push((
+            tool_key.clone(),
+            Rect {
+                x: 25,
+                y: 7,
+                width: 30,
+                height: 1,
+            },
+        ));
 
         let click = |col, row| {
             translate_terminal_event(
@@ -1829,6 +1850,11 @@ mod tests {
             matches!(click(4, 3), AppEvent::OpenTreeRow(2)),
             "click on a sidebar row opens that node"
         );
+        // Inside an expandable diff header → toggle that diff.
+        match click(30, 7) {
+            AppEvent::ToggleToolDiff(key) => assert_eq!(key, tool_key),
+            other => panic!("click on a tool diff header must toggle it, got {other:?}"),
+        }
         // Outside both → fall back to text selection.
         assert!(
             matches!(click(50, 20), AppEvent::SelectionStart(50, 20)),

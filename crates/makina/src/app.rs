@@ -1024,6 +1024,9 @@ pub enum AppEvent {
     /// Only applies if the active tab is a task tab; otherwise it is a no-op.
     ToggleTaskAccordionSection(AccordionSection),
 
+    /// Toggle a captured edit/write tool diff inside a task's Execution section.
+    ToggleToolDiff(ToolDiffKey),
+
     // ── Project discovery (plan 0025) ─────────────────────────────────────────
     /// User requested to discover the project (plan 0025). Dispatched by the
     /// palette and handled in `resolve_io` → `discover_project`, which issues
@@ -1034,9 +1037,10 @@ pub enum AppEvent {
     /// Toggle verbose mode on/off (`Ctrl+O`).
     ///
     /// In verbose mode the exchange pane additionally renders full thought text
-    /// and the captured tool/edit content; in compact mode only the headers are
-    /// shown.  Does not collide with `o`/`O` (the file-browser key) because the
-    /// Ctrl modifier is checked first in `event.rs`.
+    /// and captured tool/edit content. Compact mode keeps concise previews and
+    /// lets edit/write diffs expand independently. Does not collide with `o`/`O`
+    /// (the file-browser key) because the Ctrl modifier is checked first in
+    /// `event.rs`.
     ToggleVerbose,
 
     // ── Sidebar resizing (plan 0039) ───────────────────────────────────────────
@@ -1060,6 +1064,14 @@ pub struct RoleTurnMetric {
     pub duration_ms: u64,
     /// Token usage when the backend reported it.
     pub usage: Option<makina_core::api::UsageStats>,
+}
+
+/// Stable key for a single expandable tool diff in the task execution log.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolDiffKey {
+    pub run: RunId,
+    pub task: TaskId,
+    pub tool_id: String,
 }
 
 /// A pane a mouse text selection can target.
@@ -1486,12 +1498,15 @@ pub struct App {
     /// the renderer and the toggle handler use that same default.
     pub task_accordion_expanded: HashMap<TaskId, HashSet<AccordionSection>>,
 
+    /// Expanded edit/write tool diffs in task Execution sections.
+    pub expanded_tool_diffs: HashSet<ToolDiffKey>,
+
     // ── Verbose mode (plan 0021) ──────────────────────────────────────────────
     /// Whether verbose mode is currently on.
     ///
-    /// When `true`, the exchange pane renders full thought text and the captured
-    /// tool/edit content in addition to the concise headers.  Toggled by
-    /// `Ctrl+O` ([`AppEvent::ToggleVerbose`]).  Defaults to `false` (compact).
+    /// When `true`, the exchange pane renders full thought text and captured
+    /// tool/edit content in addition to concise headers. Toggled by `Ctrl+O`
+    /// ([`AppEvent::ToggleVerbose`]). Defaults to `false` (compact).
     pub verbose_mode: bool,
 
     // ── Sidebar resizing (plan 0039) ───────────────────────────────────────────
@@ -1543,6 +1558,10 @@ pub struct App {
     /// Cleared and repopulated every frame, so resizes and pane reflows self-correct.
     /// `RefCell` so the `&App` render pass can rewrite it, mirroring `selection_panes`.
     pub accordion_header_bounds: std::cell::RefCell<Vec<(AccordionSection, Rect)>>,
+
+    /// Bounding box of each visible expandable tool-diff header, keyed by its
+    /// run/task/tool id. Cleared and repopulated every frame.
+    pub tool_diff_bounds: std::cell::RefCell<Vec<(ToolDiffKey, Rect)>>,
 
     /// Bounding box of each tab chip in the tab bar, keyed by its index in
     /// `tabs.open_tabs`, recorded during `render_tab_bar` so a mouse click can
@@ -1999,11 +2018,13 @@ impl App {
             tabs: TabState::new(),
             accordion_state: HashMap::new(),
             task_accordion_expanded: HashMap::new(),
+            expanded_tool_diffs: HashSet::new(),
             sidebar_width_percent: 30,
             selection: None,
             selection_panes: std::cell::RefCell::new(Vec::new()),
             panel_geometries: std::cell::RefCell::new(Vec::new()),
             accordion_header_bounds: std::cell::RefCell::new(Vec::new()),
+            tool_diff_bounds: std::cell::RefCell::new(Vec::new()),
             tab_bounds: std::cell::RefCell::new(Vec::new()),
             tab_close_bounds: std::cell::RefCell::new(Vec::new()),
             sidebar_node_bounds: std::cell::RefCell::new(Vec::new()),
@@ -3811,6 +3832,13 @@ impl App {
                     } else {
                         sections.insert(section);
                     }
+                }
+                true
+            }
+
+            AppEvent::ToggleToolDiff(key) => {
+                if !self.expanded_tool_diffs.insert(key.clone()) {
+                    self.expanded_tool_diffs.remove(&key);
                 }
                 true
             }
@@ -8230,6 +8258,23 @@ mod tests {
             !app.verbose_mode,
             "verbose_mode must be false after second toggle"
         );
+    }
+
+    #[test]
+    fn toggle_tool_diff_flips_single_key() {
+        let mut app = make_app();
+        let key = ToolDiffKey {
+            run: RunId(1),
+            task: TaskId::new("model"),
+            tool_id: "write-tool".to_string(),
+        };
+
+        assert!(app.expanded_tool_diffs.is_empty());
+        assert!(app.update(AppEvent::ToggleToolDiff(key.clone())));
+        assert!(app.expanded_tool_diffs.contains(&key));
+
+        app.update(AppEvent::ToggleToolDiff(key.clone()));
+        assert!(!app.expanded_tool_diffs.contains(&key));
     }
 
     #[test]

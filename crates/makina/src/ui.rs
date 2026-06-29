@@ -53,7 +53,7 @@ use std::{
 
 use crate::app::{
     AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
-    ScrollablePanel, TabContent, TreeNode,
+    ScrollablePanel, TabContent, ToolDiffKey, TreeNode,
 };
 use makina_core::api::{FailureKind, RunView, TaskId};
 
@@ -113,6 +113,7 @@ fn render_indented_markdown(
 pub fn render(app: &App, frame: &mut Frame) {
     let area = frame.area();
     app.accordion_header_bounds.borrow_mut().clear();
+    app.tool_diff_bounds.borrow_mut().clear();
 
     // ── Small-terminal guard ──────────────────────────────────────────────────
     // First statement in render(), before any layout. Below this the normal panes
@@ -2153,14 +2154,20 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 ///
 /// When there is no exchange yet (the run hasn't started, or the task hasn't
 /// been picked up), the empty-state hint is shown instead.
+struct TaskExecutionSectionRender {
+    lines: Vec<Line<'static>>,
+    tool_diff_line_keys: Vec<(usize, ToolDiffKey)>,
+}
+
 fn render_task_execution_section(
     app: &App,
     run: &RunView,
     task: &makina_core::api::TaskView,
     expanded: &HashSet<AccordionSection>,
     content_width: u16,
-) -> Vec<Line<'static>> {
+) -> TaskExecutionSectionRender {
     let mut result = Vec::new();
+    let mut tool_diff_line_keys = Vec::new();
     let is_expanded = expanded.contains(&AccordionSection::Execution);
     let marker = if is_expanded { "[-]" } else { "[+]" };
 
@@ -2179,7 +2186,10 @@ fn render_task_execution_section(
     ]));
 
     if !is_expanded {
-        return result;
+        return TaskExecutionSectionRender {
+            lines: result,
+            tool_diff_line_keys,
+        };
     }
 
     result.push(Line::from(""));
@@ -2221,7 +2231,33 @@ fn render_task_execution_section(
         let body_width = content_width.saturating_sub(2);
         let log = log_opt.expect("checked above");
         for entry in &log.entries {
-            for entry_line in exchange_entry_lines(entry, app, body_width) {
+            let maybe_tool_diff_key = match &entry.content {
+                crate::app::ExchangeContent::Tool {
+                    id,
+                    title,
+                    kind,
+                    content,
+                    ..
+                } if tool_content_is_expandable_diff(title, kind, content) => Some(ToolDiffKey {
+                    run: run.id,
+                    task: task.id.clone(),
+                    tool_id: id.clone(),
+                }),
+                _ => None,
+            };
+            let expanded_tool_diff = maybe_tool_diff_key
+                .as_ref()
+                .is_some_and(|key| app.expanded_tool_diffs.contains(key));
+            for (entry_line_idx, entry_line) in
+                exchange_entry_lines_with_tool_diff(entry, app, body_width, expanded_tool_diff)
+                    .into_iter()
+                    .enumerate()
+            {
+                if entry_line_idx == 0
+                    && let Some(key) = maybe_tool_diff_key.as_ref()
+                {
+                    tool_diff_line_keys.push((result.len(), key.clone()));
+                }
                 // Indent each rendered line by 2 spaces so the body nests
                 // under the "Execution" header, matching the SCOPE section.
                 result.push(indent_line(entry_line, "  "));
@@ -2239,7 +2275,10 @@ fn render_task_execution_section(
         )]));
     }
 
-    result
+    TaskExecutionSectionRender {
+        lines: result,
+        tool_diff_line_keys,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2256,7 +2295,7 @@ enum TaskDetailSource<'a> {
 fn render_task_execution_empty_section(
     app: &App,
     expanded: &HashSet<AccordionSection>,
-) -> Vec<Line<'static>> {
+) -> TaskExecutionSectionRender {
     let mut result = Vec::new();
     let is_expanded = expanded.contains(&AccordionSection::Execution);
     let marker = if is_expanded { "[-]" } else { "[+]" };
@@ -2281,7 +2320,10 @@ fn render_task_execution_empty_section(
         )]));
     }
 
-    result
+    TaskExecutionSectionRender {
+        lines: result,
+        tool_diff_line_keys: Vec::new(),
+    }
 }
 
 /// Render task detail (metadata + Scope/Execution accordions) into a bordered pane.
@@ -2321,6 +2363,7 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
 
     let mut rendered_row: u16 = 0;
     let mut accordion_header_rows: Vec<(AccordionSection, u16)> = Vec::new();
+    let mut tool_diff_header_rows: Vec<(ToolDiffKey, u16)> = Vec::new();
     let mut lines: Vec<Line<'static>> = Vec::new();
     macro_rules! push_line {
         ($l:expr) => {{
@@ -2462,13 +2505,21 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
     push_line!(Line::from(""));
 
     accordion_header_rows.push((AccordionSection::Execution, rendered_row));
-    let execution_lines = match source {
+    let TaskExecutionSectionRender {
+        lines: execution_lines,
+        tool_diff_line_keys,
+    } = match source {
         TaskDetailSource::Live { run, task } => {
             render_task_execution_section(app, run, task, &expanded, content_width)
         }
         TaskDetailSource::PlanPreview { .. } => render_task_execution_empty_section(app, &expanded),
     };
-    for l in execution_lines {
+    for (line_idx, l) in execution_lines.into_iter().enumerate() {
+        for (diff_line_idx, key) in &tool_diff_line_keys {
+            if *diff_line_idx == line_idx {
+                tool_diff_header_rows.push((key.clone(), rendered_row));
+            }
+        }
         push_line!(l);
     }
     push_line!(Line::from(""));
@@ -2498,6 +2549,24 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
         }
     }
     *app.accordion_header_bounds.borrow_mut() = computed_bounds;
+
+    let mut computed_tool_diff_bounds = Vec::new();
+    for (key, header_rendered_row) in tool_diff_header_rows {
+        if header_rendered_row >= task_scroll_offset
+            && header_rendered_row < task_scroll_offset + content_area.height
+        {
+            computed_tool_diff_bounds.push((
+                key,
+                Rect {
+                    x: content_area.x,
+                    y: content_area.y + (header_rendered_row - task_scroll_offset),
+                    width: content_area.width,
+                    height: 1,
+                },
+            ));
+        }
+    }
+    *app.tool_diff_bounds.borrow_mut() = computed_tool_diff_bounds;
 
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -3243,7 +3312,47 @@ fn compact_tool_content_preview(content: &str, app: &App) -> Option<String> {
     compact_exchange_preview(content, COMPACT_EXCHANGE_PREVIEW_CHARS)
 }
 
+fn tool_content_has_change_lines(content: &str) -> bool {
+    content.lines().any(|line| {
+        (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("--- "))
+    })
+}
+
+fn tool_content_has_diff_markers(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| line.starts_with("--- ") || line.starts_with("@@"))
+}
+
+fn tool_title_suggests_edit(title: &str) -> bool {
+    title.starts_with("Write ")
+        || title.starts_with("Edit ")
+        || title.starts_with("Editing ")
+        || title.contains("Write `")
+        || title.contains("Editing `")
+}
+
+fn tool_content_is_expandable_diff(title: &str, kind: &Option<String>, content: &str) -> bool {
+    if content.trim().is_empty() || !tool_content_has_change_lines(content) {
+        return false;
+    }
+    let edit_kind = kind
+        .as_deref()
+        .is_some_and(|k| matches!(k, "edit" | "write" | "file_edit"));
+    edit_kind || tool_title_suggests_edit(title) || tool_content_has_diff_markers(content)
+}
+
 fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Line<'static>> {
+    exchange_entry_lines_with_tool_diff(entry, app, width, false)
+}
+
+fn exchange_entry_lines_with_tool_diff(
+    entry: &ExchangeEntry,
+    app: &App,
+    width: u16,
+    expanded_tool_diff: bool,
+) -> Vec<Line<'static>> {
     use crate::app::ExchangeContent;
     use makina_core::api::AgentRole;
 
@@ -3370,6 +3479,7 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
         // verbose mode renders the full content below with diff styling.
         ExchangeContent::Tool {
             title,
+            kind,
             status,
             content,
             ..
@@ -3382,13 +3492,23 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                 _ => app.active_theme.get(crate::theme::ThemeRole::Foreground),
             };
             let compacted_title = crate::markup::compact_paths(title, &app.repo_root);
+            let is_diff = tool_content_is_expandable_diff(title, kind, content);
+            let show_full_content = app.verbose_mode || (is_diff && expanded_tool_diff);
             let mut spans = vec![Span::styled(
                 format!("⚙ {compacted_title} [{status}]"),
                 Style::default()
                     .fg(status_color)
                     .add_modifier(Modifier::BOLD),
             )];
-            if !app.verbose_mode
+            if is_diff {
+                let marker = if show_full_content { "[-]" } else { "[+]" };
+                let preview = compact_tool_content_preview(content, app)
+                    .unwrap_or_else(|| "diff captured".to_string());
+                spans.push(Span::styled(
+                    format!(" {marker} diff: {preview}"),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                ));
+            } else if !app.verbose_mode
                 && let Some(preview) = compact_tool_content_preview(content, app)
             {
                 spans.push(Span::styled(
@@ -3397,8 +3517,9 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                 ));
             }
             lines.push(Line::from(spans));
-            // Tool content only in verbose mode.
-            if app.verbose_mode {
+            // Diff-like edit/write tools expand inline; other tool content only
+            // renders in verbose mode.
+            if show_full_content {
                 for text_line in content.lines() {
                     // Re-use the Response arm's ANSI + diff overlay so an edit
                     // diff in tool output is syntax-coloured the same way.
@@ -9158,12 +9279,75 @@ mod tests {
             "compact plan tool rows must include captured plan details; got:\n{flattened}"
         );
         assert!(
-            flattened.contains("Write `src/model.rs` [completed]: +2 -1 in src/model.rs"),
+            flattened.contains("Write `src/model.rs` [completed] [+] diff: +2 -1 in src/model.rs"),
             "compact write-tool rows must summarize changed lines and file path; got:\n{flattened}"
         );
         assert!(
             flattened.contains("new model field"),
             "compact write-tool rows must include the first changed line; got:\n{flattened}"
+        );
+        assert!(
+            !flattened.contains("render preview"),
+            "collapsed compact write-tool rows should not render the full diff body; got:\n{flattened}"
+        );
+    }
+
+    #[test]
+    fn expandable_tool_diff_shows_full_body_when_open() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let tool = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "write-tool".to_string(),
+                title: "Write `src/model.rs`".to_string(),
+                kind: Some("edit".to_string()),
+                status: "completed".to_string(),
+                content: "--- src/model.rs\n-old model field\n+new model field\n+render preview"
+                    .to_string(),
+            },
+        };
+
+        let collapsed = exchange_entry_lines(&tool, &app, 100)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            collapsed.contains("[+] diff: +2 -1 in src/model.rs"),
+            "collapsed edit tool should advertise an expandable diff; got:\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("render preview"),
+            "collapsed edit tool should not include the full diff body; got:\n{collapsed}"
+        );
+
+        let expanded = exchange_entry_lines_with_tool_diff(&tool, &app, 100, true)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            expanded.contains("[-] diff: +2 -1 in src/model.rs"),
+            "expanded edit tool should show an open diff marker; got:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("+render preview"),
+            "expanded edit tool should include the full diff body; got:\n{expanded}"
         );
     }
 
