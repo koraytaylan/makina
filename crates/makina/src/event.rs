@@ -138,6 +138,7 @@ pub async fn run(
             help_mode_active: app.help_mode_active,
             command_palette: app.is_command_palette(),
             settings: app.is_settings(),
+            reset_confirm: app.is_confirming_reset(),
         };
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
@@ -336,6 +337,9 @@ async fn resolve_io(
         // synth ids for which run() returns None; attempting Start on them must
         // fall through to opening a fresh run for the plan instead of erroring.
         AppEvent::StartRun => {
+            if let Some(msg) = reset_block_message(app) {
+                return (AppEvent::Tick, Some(msg));
+            }
             let has_live_run = if let Some(rid) = app.active_run_id() {
                 app.api.run(rid).await.is_some()
             } else {
@@ -371,7 +375,7 @@ async fn resolve_io(
         ),
         // ── Context-sensitive retry (plan 0017) ───────────────────────────────
         AppEvent::RetryFocused => (AppEvent::Tick, retry_focused(app).await),
-        AppEvent::ResetRun => (AppEvent::Tick, reset_active_run(app).await),
+        AppEvent::ResetRun => start_reset_active_run(app, background_tx).await,
         AppEvent::PurgeWorktrees => (AppEvent::Tick, purge_worktrees(app).await),
         // ── Provider configuration editor commit (task 0041) ──────────────────
         // Write the editor's current providers + roles back to the project config
@@ -892,6 +896,10 @@ enum ControlKind {
 async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
     use makina_core::api::Command;
 
+    if let Some(msg) = reset_block_message(app) {
+        return Some(msg);
+    }
+
     let run = match app.active_run_id() {
         Some(r) => r,
         None => {
@@ -928,6 +936,10 @@ async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
 async fn retry_focused(app: &App) -> Option<String> {
     use crate::app::TreeNode;
     use makina_core::api::{Command, RunStatus, TaskState};
+
+    if let Some(msg) = reset_block_message(app) {
+        return Some(msg);
+    }
 
     // Resolve the focused node into an optional retry command + a label.
     let command: Option<(Command, String)> = match app.focused_node() {
@@ -986,61 +998,129 @@ async fn retry_focused(app: &App) -> Option<String> {
     Some("nothing to retry here".to_string())
 }
 
-async fn reset_active_run(app: &App) -> Option<String> {
-    use makina_core::api::Command;
+fn reset_block_message(app: &App) -> Option<String> {
+    let slug = app.reset_context_slug()?;
+    let label = app.resetting_label(&slug)?;
+    Some(format!("{label} is resetting; wait for reset to finish"))
+}
+
+async fn start_reset_active_run(
+    app: &App,
+    background_tx: &mpsc::Sender<AppEvent>,
+) -> (AppEvent, Option<String>) {
+    if let Some(msg) = reset_block_message(app) {
+        return (AppEvent::CloseResetConfirmation, Some(msg));
+    }
 
     if let Some(run) = app.active_run_id()
-        && app.api.run(run).await.is_some()
+        && let Some(run_view) = app.api.run(run).await
     {
-        return match app.api.execute(Command::ResetRun { run }).await {
-            Ok(_) => Some(format!("Reset {run}")),
-            Err(e) => Some(format!("Reset failed: {e}")),
-        };
+        let slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+        let label = reset_label_from_path(&run_view.task_list_path);
+        spawn_reset_run(
+            std::sync::Arc::clone(&app.api),
+            run,
+            slug.clone(),
+            label.clone(),
+            background_tx.clone(),
+        );
+        return (AppEvent::ResetStarted { slug, label }, None);
     }
 
     if let Some(plan) = app.context_plan() {
         if !plan.has_tasks {
-            return Some(format!(
-                "{}: no TASKS.md to reset — author tasks first",
-                plan.slug
-            ));
+            return (
+                AppEvent::CloseResetConfirmation,
+                Some(format!(
+                    "{}: no TASKS.md to reset — author tasks first",
+                    plan.slug
+                )),
+            );
         }
-        return open_and_reset_task_list(app, plan.dir.join("TASKS.md"), plan.slug.clone()).await;
+        let slug = plan.slug.clone();
+        let label = plan.slug.clone();
+        spawn_open_and_reset_task_list(
+            std::sync::Arc::clone(&app.api),
+            plan.dir.join("TASKS.md"),
+            slug.clone(),
+            label.clone(),
+            background_tx.clone(),
+        );
+        return (AppEvent::ResetStarted { slug, label }, None);
     }
 
     if let Some(run_view) = app.selected_run() {
-        let label = run_view
-            .task_list_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("selected run")
-            .to_string();
-        return open_and_reset_task_list(app, run_view.task_list_path.clone(), label).await;
+        let slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+        let label = reset_label_from_path(&run_view.task_list_path);
+        spawn_open_and_reset_task_list(
+            std::sync::Arc::clone(&app.api),
+            run_view.task_list_path.clone(),
+            slug.clone(),
+            label.clone(),
+            background_tx.clone(),
+        );
+        return (AppEvent::ResetStarted { slug, label }, None);
     }
 
-    Some("No plan or run selected — open or select a plan first".to_string())
+    (
+        AppEvent::CloseResetConfirmation,
+        Some("No plan or run selected — open or select a plan first".to_string()),
+    )
 }
 
-async fn open_and_reset_task_list(
-    app: &App,
-    task_list_path: std::path::PathBuf,
+fn reset_label_from_path(path: &std::path::Path) -> String {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .or_else(|| path.file_stem().and_then(|s| s.to_str()))
+        .unwrap_or("selected run")
+        .to_string()
+}
+
+fn spawn_reset_run(
+    api: std::sync::Arc<dyn makina_core::api::Api>,
+    run: makina_core::api::RunId,
+    slug: String,
     label: String,
-) -> Option<String> {
+    background_tx: mpsc::Sender<AppEvent>,
+) {
+    use makina_core::api::Command;
+
+    tokio::spawn(async move {
+        let message = match api.execute(Command::ResetRun { run }).await {
+            Ok(_) => format!("Reset {label}"),
+            Err(e) => format!("Reset failed: {e}"),
+        };
+        let _ = background_tx
+            .send(AppEvent::ResetFinished { slug, message })
+            .await;
+    });
+}
+
+fn spawn_open_and_reset_task_list(
+    api: std::sync::Arc<dyn makina_core::api::Api>,
+    task_list_path: std::path::PathBuf,
+    slug: String,
+    label: String,
+    background_tx: mpsc::Sender<AppEvent>,
+) {
     use makina_core::api::{Command, CommandOutcome};
 
-    match app.api.execute(Command::OpenRun { task_list_path }).await {
-        Ok(CommandOutcome::RunOpened { run }) => {
-            match app.api.execute(Command::ResetRun { run }).await {
-                Ok(_) => Some(format!("Reset {label}")),
-                Err(e) => Some(format!("Reset failed: {e}")),
+    tokio::spawn(async move {
+        let message = match api.execute(Command::OpenRun { task_list_path }).await {
+            Ok(CommandOutcome::RunOpened { run }) => {
+                match api.execute(Command::ResetRun { run }).await {
+                    Ok(_) => format!("Reset {label}"),
+                    Err(e) => format!("Reset failed: {e}"),
+                }
             }
-        }
-        Ok(_) => Some(format!(
-            "Reset failed: opening {label} did not return a run"
-        )),
-        Err(e) => Some(format!("Reset failed: {e}")),
-    }
+            Ok(_) => format!("Reset failed: opening {label} did not return a run"),
+            Err(e) => format!("Reset failed: {e}"),
+        };
+        let _ = background_tx
+            .send(AppEvent::ResetFinished { slug, message })
+            .await;
+    });
 }
 
 async fn purge_worktrees(app: &App) -> Option<String> {
@@ -1138,6 +1218,7 @@ struct ModalState {
     help_mode_active: bool,
     command_palette: bool,
     settings: bool,
+    reset_confirm: bool,
 }
 
 /// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
@@ -1247,6 +1328,7 @@ fn translate_key(
         help_mode_active,
         command_palette,
         settings,
+        reset_confirm,
     } = modal;
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
@@ -1263,11 +1345,22 @@ fn translate_key(
 
     // Ctrl-P always opens the command palette. Pause moved into the palette so
     // this chord is stable even during an active run.
-    if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if key.code == KeyCode::Char('p')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !reset_confirm
+    {
         return AppEvent::OpenCommandPalette;
     }
 
-    if command_palette {
+    if reset_confirm {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                AppEvent::CloseResetConfirmation
+            }
+            KeyCode::Enter => AppEvent::ResetRun,
+            _ => AppEvent::Tick,
+        }
+    } else if command_palette {
         // ── Command palette keymap ────────────────────────────────────────────
         // Esc closes the palette; Enter executes the selected action; Up/Down move
         // the selection; Backspace removes filter chars; letters feed the filter.
@@ -2602,11 +2695,33 @@ mod tests {
             plan_slug: "0099-demo".to_string(),
         });
 
-        let (ev, status) = resolve_io_for_test(&app, AppEvent::ResetRun).await;
-        assert!(matches!(ev, AppEvent::Tick));
-        assert_eq!(status.as_deref(), Some("Reset 0099-demo"));
+        let (tx, mut rx) = background_events();
+        let (ev, status) = resolve_io(&app, AppEvent::ResetRun, &tx).await;
+        assert!(status.is_none());
+        assert!(
+            matches!(
+                ev,
+                AppEvent::ResetStarted {
+                    ref slug,
+                    ref label
+                } if slug == "0099-demo" && label == "0099-demo"
+            ),
+            "reset must immediately mark the plan as resetting; got {ev:?}"
+        );
 
-        let cmds = api.commands.lock().unwrap().clone();
+        let cmds = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                {
+                    let c = api.commands.lock().unwrap();
+                    if c.len() >= 2 {
+                        return c.clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background OpenRun+ResetRun did not complete in time");
         assert!(
             matches!(&cmds[0], Command::OpenRun { task_list_path }
                 if task_list_path == &std::path::PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md")),
@@ -2617,6 +2732,82 @@ mod tests {
             matches!(cmds[1], Command::ResetRun { run: RunId(42) }),
             "second command must reset the freshly opened run; got {:?}",
             cmds[1]
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(AppEvent::ResetFinished { slug, message })
+                    if slug == "0099-demo" && message == "Reset 0099-demo"
+            ),
+            "background reset must report completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_on_resetting_plan_is_blocked_without_spawning_work() {
+        use crate::app::{App, AppEvent, TabContent};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command);
+                Ok(CommandOutcome::Acknowledged)
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                vec![]
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![],
+            std::path::PathBuf::from("."),
+        );
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/tmp/docs/plans/0099-demo"),
+            slug: "0099-demo".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0099-demo".to_string(),
+        });
+        app.update(AppEvent::ResetStarted {
+            slug: "0099-demo".to_string(),
+            label: "0099-demo".to_string(),
+        });
+
+        let (tx, _rx) = background_events();
+        let (ev, status) = resolve_io(&app, AppEvent::StartRun, &tx).await;
+
+        assert!(matches!(ev, AppEvent::Tick));
+        assert_eq!(
+            status.as_deref(),
+            Some("0099-demo is resetting; wait for reset to finish")
+        );
+        assert!(
+            api.commands.lock().unwrap().is_empty(),
+            "StartRun must not open/start while reset is in progress"
         );
     }
 

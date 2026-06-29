@@ -414,6 +414,8 @@ pub enum Mode {
     CommandPalette,
     /// The settings modal (task 0070).
     Settings,
+    /// Confirmation modal before resetting a plan/run.
+    ResetConfirm,
 }
 
 // ── Command palette ──────────────────────────────────────────────────────────
@@ -483,7 +485,7 @@ impl CommandPalette {
             },
             PaletteAction::Regular {
                 label: "Reset selected plan/run",
-                event: AppEvent::ResetRun,
+                event: AppEvent::RequestResetRun,
             },
             PaletteAction::Regular {
                 label: "Purge Makina worktrees",
@@ -574,6 +576,14 @@ pub struct Settings {
     pub focused: SettingsField,
     /// Last validation error (rendered under the field), or `None`.
     pub error: Option<String>,
+}
+
+/// Confirmation details for resetting the current plan/run.
+#[derive(Debug, Clone)]
+pub struct ResetConfirmation {
+    pub slug: String,
+    pub label: String,
+    pub task_list_path: PathBuf,
 }
 
 pub fn final_merge_label(mode: FinalMerge) -> &'static str {
@@ -861,7 +871,15 @@ pub enum AppEvent {
     RetryFocused,
 
     /// Reset the selected run/plan back to a fresh pending graph.
+    RequestResetRun,
+    /// Execute a reset after the confirmation modal has been accepted.
     ResetRun,
+    /// Close the reset confirmation modal without doing anything.
+    CloseResetConfirmation,
+    /// A reset has started in a background task.
+    ResetStarted { slug: String, label: String },
+    /// A background reset finished.
+    ResetFinished { slug: String, message: String },
 
     /// Purge Makina-created transient git worktrees for this repository.
     PurgeWorktrees,
@@ -1397,6 +1415,10 @@ pub struct App {
     /// [`Mode::Settings`].
     pub settings: Option<Settings>,
 
+    /// Reset confirmation modal state. `Some` only while [`App::mode`] is
+    /// [`Mode::ResetConfirm`].
+    pub reset_confirmation: Option<ResetConfirmation>,
+
     /// The resolved run capabilities (gate/reviewer iterations, wall-clock/idle
     /// timeouts). Seeded from the loaded config and editable via the settings
     /// modal.
@@ -1408,6 +1430,9 @@ pub struct App {
 
     /// What happens to a completed plan branch at run end.
     pub final_merge: FinalMerge,
+
+    /// Plan slugs currently being reset by a background task.
+    pub resetting_plans: HashMap<String, String>,
 
     /// State for the tabbed main content pane.
     pub tabs: TabState,
@@ -1924,9 +1949,11 @@ impl App {
             base_branch_exists: false,
             command_palette: None,
             settings: None,
+            reset_confirmation: None,
             caps: makina_core::config::CapsConfig::default(),
             concurrency: 3,
             final_merge: FinalMerge::Squash,
+            resetting_plans: HashMap::new(),
             verbose_mode: false,
             active_theme: crate::theme::ayu_dark(),
             role_metrics: HashMap::new(),
@@ -2041,6 +2068,59 @@ impl App {
     /// Whether the settings modal is currently active.
     pub fn is_settings(&self) -> bool {
         self.mode == Mode::Settings
+    }
+
+    /// Whether the reset confirmation modal is currently active.
+    pub fn is_confirming_reset(&self) -> bool {
+        self.mode == Mode::ResetConfirm
+    }
+
+    /// Human label for a plan slug that is currently resetting.
+    pub fn resetting_label(&self, slug: &str) -> Option<&str> {
+        self.resetting_plans.get(slug).map(String::as_str)
+    }
+
+    /// Whether the given run belongs to a plan currently being reset.
+    pub fn is_resetting_run(&self, run: &RunView) -> bool {
+        let slug = makina_core::orchestrator::plan_slug(&run.task_list_path);
+        self.resetting_plans.contains_key(&slug)
+    }
+
+    /// The current plan/run slug for command guarding.
+    pub fn reset_context_slug(&self) -> Option<String> {
+        if let Some(plan) = self.context_plan() {
+            return Some(plan.slug.clone());
+        }
+        self.selected_run()
+            .map(|run| makina_core::orchestrator::plan_slug(&run.task_list_path))
+    }
+
+    /// Build reset confirmation details for the active plan/run context.
+    pub fn reset_confirmation_for_context(&self) -> Result<ResetConfirmation, String> {
+        if let Some(plan) = self.context_plan() {
+            if !plan.has_tasks {
+                return Err(format!(
+                    "{}: no TASKS.md to reset — author tasks first",
+                    plan.slug
+                ));
+            }
+            return Ok(ResetConfirmation {
+                slug: plan.slug.clone(),
+                label: plan.slug.clone(),
+                task_list_path: plan.dir.join("TASKS.md"),
+            });
+        }
+
+        if let Some(run) = self.selected_run() {
+            let slug = makina_core::orchestrator::plan_slug(&run.task_list_path);
+            return Ok(ResetConfirmation {
+                label: slug.clone(),
+                slug,
+                task_list_path: run.task_list_path.clone(),
+            });
+        }
+
+        Err("No plan or run selected — open or select a plan first".to_string())
     }
 
     /// Return the currently selected [`RunView`], if any.
@@ -2984,8 +3064,52 @@ impl App {
             | AppEvent::CancelRun
             | AppEvent::Reinterpret
             | AppEvent::RetryFocused
-            | AppEvent::ResetRun
             | AppEvent::PurgeWorktrees => true,
+
+            AppEvent::RequestResetRun => {
+                match self.reset_confirmation_for_context() {
+                    Ok(confirm) => {
+                        if self.resetting_plans.contains_key(&confirm.slug) {
+                            self.status_message =
+                                Some(format!("{} is already resetting", confirm.label));
+                            self.mode = Mode::Normal;
+                            self.command_palette = None;
+                        } else {
+                            self.reset_confirmation = Some(confirm);
+                            self.mode = Mode::ResetConfirm;
+                            self.command_palette = None;
+                        }
+                    }
+                    Err(msg) => {
+                        self.status_message = Some(msg);
+                        self.mode = Mode::Normal;
+                        self.command_palette = None;
+                    }
+                }
+                true
+            }
+
+            AppEvent::ResetRun => true,
+
+            AppEvent::CloseResetConfirmation => {
+                self.mode = Mode::Normal;
+                self.reset_confirmation = None;
+                true
+            }
+
+            AppEvent::ResetStarted { slug, label } => {
+                self.resetting_plans.insert(slug, label.clone());
+                self.mode = Mode::Normal;
+                self.reset_confirmation = None;
+                self.status_message = Some(format!("Resetting {label}..."));
+                true
+            }
+
+            AppEvent::ResetFinished { slug, message } => {
+                self.resetting_plans.remove(&slug);
+                self.status_message = Some(message);
+                true
+            }
 
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
@@ -7540,6 +7664,37 @@ mod tests {
             palette.filtered().len(),
             13,
             "full list restored after filter cleared"
+        );
+    }
+
+    #[test]
+    fn request_reset_run_opens_confirmation_for_plan_context() {
+        let mut app = make_app();
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from("/tmp/docs/plans/0099-demo"),
+            slug: "0099-demo".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0099-demo".to_string(),
+        });
+
+        let changed = app.update(AppEvent::RequestResetRun);
+
+        assert!(changed);
+        assert_eq!(app.mode, Mode::ResetConfirm);
+        let confirm = app
+            .reset_confirmation
+            .as_ref()
+            .expect("reset confirmation must be open");
+        assert_eq!(confirm.slug, "0099-demo");
+        assert_eq!(
+            confirm.task_list_path,
+            PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md")
         );
     }
 

@@ -226,12 +226,20 @@ pub fn render(app: &App, frame: &mut Frame) {
                         };
                         let (badge, badge_color) = status_badge(&run_view.status, app);
                         let name = run_label(run_view);
-                        let line = Line::from(vec![
+                        let mut spans = vec![
                             Span::raw(disclosure),
                             Span::styled(badge, Style::default().fg(badge_color)),
                             Span::styled(" ", Style::default()),
                             Span::raw(name),
-                        ]);
+                        ];
+                        if app.is_resetting_run(run_view) {
+                            spans.push(Span::styled(
+                                format!("  {} resetting", spinner_frame(app.tick)),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
+                            ));
+                        }
+                        let line = Line::from(spans);
                         ListItem::new(line)
                     }
                     TreeNode::Task { run, task } => {
@@ -314,6 +322,13 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 ),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                            ));
+                        }
+                        if app.resetting_label(&plan_entry.slug).is_some() {
+                            line_spans.push(Span::styled(
+                                format!("  {} resetting", spinner_frame(app.tick)),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
                             ));
                         }
                         ListItem::new(Line::from(line_spans))
@@ -441,7 +456,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         || app.is_editing_providers()
         || app.is_viewing_doctor()
         || app.is_command_palette()
-        || app.is_settings();
+        || app.is_settings()
+        || app.is_confirming_reset();
     app.set_selection_panes(if overlay_active {
         vec![crate::app::SelectionPane {
             hit: area,
@@ -939,6 +955,12 @@ pub fn render(app: &App, frame: &mut Frame) {
         && let Some(s) = app.settings.as_ref()
     {
         render_settings(app, s, frame, area);
+    }
+
+    if app.is_confirming_reset()
+        && let Some(confirm) = app.reset_confirmation.as_ref()
+    {
+        render_reset_confirmation(app, confirm, frame, area);
     }
 
     // ── Mouse text-selection highlight ─────────────────────────────────────────
@@ -3687,6 +3709,81 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
+}
+
+/// Render the destructive reset confirmation modal.
+fn render_reset_confirmation(
+    app: &App,
+    confirm: &crate::app::ResetConfirmation,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let popup = centered_rect(64, 34, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Confirm Reset ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning)))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+
+    let body = vec![
+        Line::from(vec![
+            Span::styled(
+                "Reset ",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+            ),
+            Span::styled(
+                confirm.label.clone(),
+                Style::default()
+                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "This will stop active work, remove Makina worktrees and the plan branch,",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        )]),
+        Line::from(vec![Span::styled(
+            "then re-read TASKS.md into a fresh pending run.",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Task list: ",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            ),
+            Span::styled(
+                confirm.task_list_path.display().to_string(),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "Reset does not merge or stage code changes.",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        )]),
+    ];
+
+    let paragraph = Paragraph::new(body).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, chunks[0]);
+
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "Enter confirm · Esc cancel",
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+    )]));
+    frame.render_widget(footer, chunks[1]);
 }
 
 /// Probe whether a directory is writable.
