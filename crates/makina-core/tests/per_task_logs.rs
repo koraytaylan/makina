@@ -264,6 +264,10 @@ fn task(id: &str) -> Task {
 async fn per_task_logs() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    // SAFETY: serialized by HOME_ENV_LOCK for the duration of this async test.
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
 
     let task_id_str = "per-task-log-task";
     let slug = "per-task-log-slug";

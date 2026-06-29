@@ -20,7 +20,9 @@
 //!
 //! - Backend is always `NoopBackend` — no real agent CLI, no model call.
 //! - Each test uses a fresh temporary git repo (`tempfile`).
-//! - Determinism via `ask`/await — no arbitrary sleeps.
+//! - Determinism via awaited scheduler completion — no arbitrary sleeps.
+
+mod common;
 
 use std::process::Command;
 use std::sync::Arc;
@@ -29,9 +31,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream;
 
-use makina_core::actors::{
-    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
-};
 use makina_core::api::FailureKind;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::backend::{
@@ -39,9 +38,7 @@ use makina_core::backend::{
 };
 use makina_core::config::{CapsConfig, Config, GateConfig};
 use makina_core::persist::{load_graph, tasks_path};
-use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-use makina_core::worktree::WorktreeManager;
 
 // ── FileWritingBackend ─────────────────────────────────────────────────────────
 //
@@ -223,43 +220,6 @@ fn task(id: &str, done_when: &str) -> Task {
     }
 }
 
-/// Spawn the actor tree over `repo_root` with the given `backend` and `config`,
-/// wire the concurrency deps into the hub via `SetSpokes`, and return
-/// `(root, supervisor_ref)`.
-async fn build_actor_tree(
-    repo_root: std::path::PathBuf,
-    backend: Arc<dyn AgentBackend>,
-    config: Config,
-) -> (
-    kameo::actor::ActorRef<RootSupervisor>,
-    kameo::actor::ActorRef<Supervisor>,
-) {
-    let root = RootSupervisor::start();
-
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
-            config,
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&backend),
-            reviewer_backend: Arc::clone(&backend),
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
-    (root, supervisor_ref)
-}
-
 // ── Test 1: happy path → Done ────────────────────────────────────────────────────
 
 /// A task that runs `New → Done` must produce a `.tasks/{slug}.json` whose
@@ -282,25 +242,19 @@ async fn persist_file_exists_and_matches_snapshot_after_done() {
         makina_core::config::ProjectConfig::default(),
     );
 
-    let (root, supervisor_ref) =
-        build_actor_tree(repo_root.clone(), Arc::new(backend), config).await;
-
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("persist-task", "the task is persisted")],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
     // Drive the run.
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must succeed");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config,
+    )
+    .await;
 
     assert_eq!(
         report.outcomes,
@@ -321,12 +275,7 @@ async fn persist_file_exists_and_matches_snapshot_after_done() {
         .expect("load_graph must succeed")
         .expect("artifact must be present");
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph must be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     // On-disk task must match the in-memory snapshot task.
     let disk_task = on_disk
@@ -369,8 +318,6 @@ async fn persist_file_exists_and_matches_snapshot_after_done() {
         disk_task.review_iterations, snap_task.review_iterations,
         "review_iterations must match"
     );
-
-    root.kill();
 }
 
 // ── Test 2: gate-cap → Failed ────────────────────────────────────────────────────
@@ -411,26 +358,18 @@ async fn persist_file_matches_snapshot_after_gate_cap_failed() {
         )
     };
 
-    let (root, supervisor_ref) =
-        build_actor_tree(repo_root.clone(), Arc::new(backend), config).await;
-
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("gate-task", "the gate passes")],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    // The run will end with a hard error (gate cap → Failed, driver returns Ok(Failed));
-    // RunReadyTasks returns Ok (not all failures are hard errors at the scheduler level).
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks returned");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config,
+    )
+    .await;
 
     assert_eq!(
         report.outcomes,
@@ -451,12 +390,7 @@ async fn persist_file_matches_snapshot_after_gate_cap_failed() {
         .expect("load_graph must succeed")
         .expect("artifact must be present");
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph must be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     let disk_task = on_disk
         .get(&TaskId::new("gate-task"))
@@ -492,8 +426,6 @@ async fn persist_file_matches_snapshot_after_gate_cap_failed() {
         disk_task.finished_at, snap_task.finished_at,
         "on-disk finished_at must match snapshot"
     );
-
-    root.kill();
 }
 
 // ── Test 3: reviewer-cap → Failed ───────────────────────────────────────────────
@@ -532,24 +464,18 @@ async fn persist_file_matches_snapshot_after_reviewer_cap_failed() {
         )
     };
 
-    let (root, supervisor_ref) =
-        build_actor_tree(repo_root.clone(), Arc::new(backend), config).await;
-
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("review-task", "the reviewer approves")],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks returned");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config,
+    )
+    .await;
 
     assert_eq!(
         report.outcomes,
@@ -570,12 +496,7 @@ async fn persist_file_matches_snapshot_after_reviewer_cap_failed() {
         .expect("load_graph must succeed")
         .expect("artifact must be present");
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph must be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     let disk_task = on_disk
         .get(&TaskId::new("review-task"))
@@ -611,8 +532,6 @@ async fn persist_file_matches_snapshot_after_reviewer_cap_failed() {
         disk_task.finished_at, snap_task.finished_at,
         "on-disk finished_at must match snapshot"
     );
-
-    root.kill();
 }
 
 // ── Test 4: task_view_carries_failure_reason ─────────────────────────────────
@@ -649,24 +568,18 @@ async fn task_view_carries_failure_reason() {
         )
     };
 
-    let (root, supervisor_ref) =
-        build_actor_tree(repo_root.clone(), Arc::new(backend), config).await;
-
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("reason-task", "the gate passes")],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must return");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config,
+    )
+    .await;
 
     assert_eq!(
         report.outcomes,
@@ -675,12 +588,7 @@ async fn task_view_carries_failure_reason() {
     );
 
     // Retrieve the final in-memory snapshot and check the failure_reason.
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph must be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     let snap_task = snapshot
         .get(&TaskId::new("reason-task"))
@@ -701,8 +609,6 @@ async fn task_view_carries_failure_reason() {
         !fr.message.is_empty(),
         "failure_reason.message must be non-empty"
     );
-
-    root.kill();
 }
 
 // ── Test 5: merge_conflict_classified_distinctly ──────────────────────────────
@@ -753,43 +659,19 @@ async fn merge_conflict_classified_distinctly() {
         makina_core::config::ProjectConfig::default(),
     );
 
-    // Build the actor tree manually (separate dev/reviewer backends).
-    let root = RootSupervisor::start();
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root.clone(), "develop".into()),
-            config,
-        },
-        RestartConfig::default(),
-    )
-    .await;
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend,
-            reviewer_backend,
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("conflict-task", "no conflict")],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must return");
+    let (report, graph_ref) = common::run_graph_in_repo_with_backends(
+        repo_root.clone(),
+        graph,
+        developer_backend,
+        reviewer_backend,
+        config,
+    )
+    .await;
 
     assert_eq!(
         report.outcomes,
@@ -798,12 +680,7 @@ async fn merge_conflict_classified_distinctly() {
     );
 
     // Check the in-memory snapshot for the classified failure reason.
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph must be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     let snap_task = snapshot
         .get(&TaskId::new("conflict-task"))
@@ -824,6 +701,4 @@ async fn merge_conflict_classified_distinctly() {
         !fr.message.is_empty(),
         "failure_reason.message must be non-empty"
     );
-
-    root.kill();
 }

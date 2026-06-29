@@ -15,14 +15,14 @@
 //!    `develop` yields [`MergeOutcome::Conflict`] AND leaves `develop` clean
 //!    (no conflict markers, clean `git status`, `HEAD` unchanged).  This is the
 //!    critical invariant.
-//! 3. **Loop integration** — the full Supervisor loop (NoopBackend, approve
+//! 3. **Loop integration** — the full scheduler loop (NoopBackend, approve
 //!    verdict) over a temp repo lands a squashed commit referencing the task on
 //!    `develop` and tears the worktree + branch down.
 //!
 //! # Test-strategy compliance (see `docs/spec/testing-strategy.md`)
 //!
 //! - Backend is always `NoopBackend` — no real agent CLI, no model call.
-//! - Determinism via `ask`/await — no arbitrary sleeps.
+//! - Determinism via awaited scheduler completion — no arbitrary sleeps.
 //! - Each test uses a fresh temporary git repo (`tempfile`); the real Makina repo
 //!   is never touched.  Real `git` is used (available in CI/dev) so we test the
 //!   actual git integration, mirroring `tests/worktree.rs` /
@@ -33,16 +33,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use makina_core::actors::{
-    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
-};
+mod common;
+
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::merge::{MergeOutcome, SquashMerger};
-use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-use makina_core::worktree::WorktreeManager;
 
 // ── Temp-repo helpers (mirror tests/worktree.rs & tests/develop_review_loop.rs) ──
 
@@ -369,46 +366,9 @@ fn task(id: &str, done_when: &str, deps: &[&str]) -> Task {
     }
 }
 
-/// Spawn the actor tree over `repo_root` with `backend` and wire the per-task
-/// spawn deps into the hub (task 24: the hub spawns spokes per task).
-async fn build_actor_tree(
-    repo_root: std::path::PathBuf,
-    backend: Arc<dyn AgentBackend>,
-) -> (
-    kameo::actor::ActorRef<RootSupervisor>,
-    kameo::actor::ActorRef<Supervisor>,
-) {
-    let root = RootSupervisor::start();
-
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
-            // No gates configured → the gate loop is a no-op and work advances
-            // straight to review (gate execution is forbidden in tests anyway).
-            config: Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&backend),
-            reviewer_backend: Arc::clone(&backend),
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
-    (root, supervisor_ref)
-}
-
 /// **Proves "approved task lands on develop + worktree torn down".**
 ///
-/// Runs the full Supervisor loop with the NoopBackend (approve verdict) over a
+/// Runs the full scheduler loop with the NoopBackend (approve verdict) over a
 /// temp repo.  With the NoopBackend the Developer makes no file change, so its
 /// `--allow-empty` commit on `task/{id}` + the (empty) squash still land ONE
 /// commit on `develop`.  Asserts:
@@ -426,32 +386,23 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
         r#"{"verdict":"approve"}"#.into(),
     ]);
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-    )
-    .await;
-
     let graph = TaskGraph {
         slug: "merge-loop-test".into(),
         tasks: vec![task("land-it", "the thing lands on develop", &[])],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
     // develop's state BEFORE the run (must be on develop in the main checkout).
     assert_eq!(current_branch(&repo_root), "develop");
     let count_before = commit_count(&repo_root);
 
     // ── Run the loop ──────────────────────────────────────────────────────────
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+    )
+    .await;
 
     // The task reached Done.
     assert_eq!(
@@ -459,12 +410,7 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
         vec![(TaskId::new("land-it"), TaskState::Done)],
         "land-it should reach Done after approve + merge"
     );
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     assert_eq!(
         snapshot.get(&TaskId::new("land-it")).unwrap().state,
         TaskState::Done
@@ -483,18 +429,15 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
     );
 
     // ── The worktree + branch were torn down ──────────────────────────────────
-    // The ask path uses an empty plan_slug ⇒ `--land-it` / `task/--land-it`.
-    let worktree_path = repo_root
-        .join(".makina")
-        .join("worktrees")
-        .join("--land-it");
+    let worktree_path = common::scheduler_worktree_path(&repo_root, "land-it");
+    let branch = common::scheduler_task_branch("land-it");
     assert!(
         !worktree_path.exists(),
         "worktree dir must be gone after the run"
     );
     assert!(
-        !branch_exists(&repo_root, "task/--land-it"),
-        "task/--land-it branch must be gone after the run"
+        !branch_exists(&repo_root, &branch),
+        "{branch} branch must be gone after the run"
     );
 
     // develop's working tree is clean (excluding .makina/ which the supervisor
@@ -510,6 +453,4 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
         "develop must be clean after the run; status:\n{}",
         status_porcelain(&repo_root)
     );
-
-    root.kill();
 }

@@ -4,9 +4,8 @@
 //! # Acceptance criterion
 //!
 //! Task 21 "done when": *a task runs end-to-end through the loop with the noop
-//! backend.*  These tests build the real actor tree (`RootSupervisor` →
-//! `Supervisor` hub + `Developer`/`Reviewer` spokes) over a temporary git repo,
-//! drive a `TaskGraph` through `RunReadyTasks`, and assert:
+//! backend.*  These tests drive the production scheduler over a temporary git
+//! repo and assert:
 //!
 //! 1. **Happy path** — a single task reaches `Done`; the worktree/branch were
 //!    created during the run and removed after; the Developer and Reviewer were
@@ -20,24 +19,21 @@
 //! # Test-strategy compliance (see `docs/spec/testing-strategy.md`)
 //!
 //! - Backend is always `NoopBackend` — no real agent CLI, no model call.
-//! - Determinism via `ask`/await — no arbitrary sleeps.
+//! - Determinism via awaited scheduler completion — no arbitrary sleeps.
 //! - Each test uses a fresh temporary git repo (`tempfile`); the real Makina repo
 //!   is never touched.  The temp-repo setup mirrors `tests/worktree.rs`.
+
+mod common;
 
 use std::process::Command;
 use std::sync::Arc;
 
 use chrono::Utc;
 
-use makina_core::actors::{
-    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
-};
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
-use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-use makina_core::worktree::WorktreeManager;
 
 // ── Temp-repo helper (mirrors tests/worktree.rs) ─────────────────────────────────
 
@@ -122,51 +118,6 @@ fn task(id: &str, done_when: &str, deps: &[&str]) -> Task {
     }
 }
 
-// ── Actor-tree builder ───────────────────────────────────────────────────────────
-
-/// Spawn the actor tree over `repo_root` with the given `backend`, wire the
-/// concurrency deps into the hub via `SetSpokes`, and return
-/// `(root, supervisor_ref)`.
-///
-/// Under task 24 the hub spawns a Developer/Reviewer pair **per task** itself, so
-/// the helper wires the means to do so (root ref, hub ref, shared backend)
-/// rather than pre-spawning a shared spoke pair.
-async fn build_actor_tree(
-    repo_root: std::path::PathBuf,
-    backend: Arc<dyn AgentBackend>,
-) -> (
-    kameo::actor::ActorRef<RootSupervisor>,
-    kameo::actor::ActorRef<Supervisor>,
-) {
-    let root = RootSupervisor::start();
-
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
-            // These task-21 tests configure NO gates, so the gate loop (task 22)
-            // is a no-op and the work advances straight to review.
-            config: Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    // Post-spawn wiring: hand the per-task-spawn deps to the hub.
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&backend),
-            reviewer_backend: Arc::clone(&backend),
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
-    (root, supervisor_ref)
-}
-
 // ── Acceptance test: a task runs end-to-end through the loop ─────────────────────
 
 /// **Acceptance criterion** — one task runs `New → Done` through the full
@@ -191,42 +142,29 @@ async fn single_task_runs_end_to_end_to_done() {
     ]);
     let backend_probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-    )
-    .await;
-
     // Provide a one-task graph.
     let graph = TaskGraph {
         slug: "loop-test".into(),
         tasks: vec![task("build-thing", "the thing builds", &[])],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    // Sanity: the worktree/branch do NOT exist before the run. The ask path uses
-    // an empty plan_slug, so the plan-scoped name is `--build-thing` /
-    // `task/--build-thing`.
-    let worktree_path = repo_root
-        .join(".makina")
-        .join("worktrees")
-        .join("--build-thing");
+    // Sanity: the worktree/branch do NOT exist before the run.
+    let worktree_path = common::scheduler_worktree_path(&repo_root, "build-thing");
+    let branch = common::scheduler_task_branch("build-thing");
     assert!(!worktree_path.exists(), "worktree must not exist pre-run");
     assert!(
-        !branch_exists(&repo_root, "task/--build-thing"),
+        !branch_exists(&repo_root, &branch),
         "branch must not exist pre-run"
     );
 
     // ── Trigger the run ───────────────────────────────────────────────────────
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+    )
+    .await;
 
     // The run drove exactly one task to Done.
     assert_eq!(
@@ -236,12 +174,7 @@ async fn single_task_runs_end_to_end_to_done() {
     );
 
     // The graph snapshot reflects the final Done state + finished timestamp.
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let done_task = snapshot
         .get(&TaskId::new("build-thing"))
         .expect("task must be present");
@@ -265,7 +198,7 @@ async fn single_task_runs_end_to_end_to_done() {
         "worktree dir must be gone after the run"
     );
     assert!(
-        !branch_exists(&repo_root, "task/--build-thing"),
+        !branch_exists(&repo_root, &branch),
         "branch must be gone after the run"
     );
 
@@ -286,8 +219,6 @@ async fn single_task_runs_end_to_end_to_done() {
         "reviewer prompt must request a review; got: {:?}",
         prompts[1]
     );
-
-    root.kill();
 }
 
 // ── Reject → approve test ────────────────────────────────────────────────────────
@@ -318,27 +249,18 @@ async fn reject_then_approve_relays_feedback_and_finishes_done() {
     ]);
     let backend_probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-    )
-    .await;
-
     let graph = TaskGraph {
         slug: "reject-test".into(),
         tasks: vec![task("fix-bug", "the bug is fixed", &[])],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+    )
+    .await;
 
     // Despite the rejection, the task ends Done.
     assert_eq!(
@@ -348,12 +270,7 @@ async fn reject_then_approve_relays_feedback_and_finishes_done() {
     );
 
     // review_iterations incremented to 1 (exactly one rejection).
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("fix-bug"))
         .expect("task must be present");
@@ -384,17 +301,12 @@ async fn reject_then_approve_relays_feedback_and_finishes_done() {
         prompts[0]
     );
 
-    // Worktree torn down after completion (empty plan_slug ⇒ `--fix-bug`).
-    let worktree_path = repo_root
-        .join(".makina")
-        .join("worktrees")
-        .join("--fix-bug");
+    // Worktree torn down after completion.
+    let worktree_path = common::scheduler_worktree_path(&repo_root, "fix-bug");
     assert!(
         !worktree_path.exists(),
         "worktree must be gone after the run"
     );
-
-    root.kill();
 }
 
 // ── Chain test: B depends on A ───────────────────────────────────────────────────
@@ -411,12 +323,6 @@ async fn dependency_chain_runs_a_then_b() {
     let backend =
         NoopBackend::with_responses(vec!["dev output".into(), r#"{"verdict":"approve"}"#.into()]);
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-    )
-    .await;
-
     // B depends on A; B is authored first to prove ordering is by readiness, not
     // by position in the task list.
     let graph = TaskGraph {
@@ -427,17 +333,14 @@ async fn dependency_chain_runs_a_then_b() {
         ],
     };
     graph.validate().expect("chain graph must validate");
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive both tasks without a hard error");
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+    )
+    .await;
 
     // A must complete before B (A was the only initially-ready task).
     assert_eq!(
@@ -450,12 +353,7 @@ async fn dependency_chain_runs_a_then_b() {
     );
 
     // Both tasks ended Done in the graph.
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     for id in ["task-a", "task-b"] {
         assert_eq!(
             snapshot.get(&TaskId::new(id)).expect("task present").state,
@@ -464,21 +362,7 @@ async fn dependency_chain_runs_a_then_b() {
         );
     }
 
-    // Both worktrees torn down (empty plan_slug ⇒ `--task-a` / `--task-b`).
-    assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("--task-a")
-            .exists()
-    );
-    assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("--task-b")
-            .exists()
-    );
-
-    root.kill();
+    // Both worktrees torn down.
+    assert!(!common::scheduler_worktree_path(&repo_root, "task-a").exists());
+    assert!(!common::scheduler_worktree_path(&repo_root, "task-b").exists());
 }

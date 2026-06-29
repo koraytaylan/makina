@@ -4,9 +4,8 @@
 //! # Acceptance criterion
 //!
 //! Task 25 "done when": *each cap independently drives a task to `failed`.*
-//! These tests build the real actor tree (`RootSupervisor` → `Supervisor` hub +
-//! per-task `Developer`/`Reviewer` spokes) over a temporary git repo, drive a
-//! `TaskGraph` through `RunReadyTasks`, and assert the task ends `Failed` for:
+//! These tests drive the production scheduler over a temporary git repo and
+//! assert the task ends `Failed` for:
 //!
 //! 1. **Gate cap** — an always-failing gate (`{name:"false",command:"false"}`)
 //!    with a small `caps.gate_iterations` → `Failed` (GateCapReached) after the
@@ -26,11 +25,14 @@
 //! - The gate-cap "gate" is the trivial deterministic shell builtin `false` run
 //!   in the temp worktree (NOT the env-dependent toolchain gates the strategy
 //!   forbids).
-//! - Determinism: caps 1 & 2 are `ask`-driven (no sleeps); cap 3 uses a backend
-//!   that sleeps WELL past the 1s cap (so the timeout always fires) plus a bounded
-//!   poll for the worktree teardown — never a fixed sleep to "wait for" success.
+//! - Determinism: caps 1 & 2 await scheduler completion (no sleeps); cap 3 uses
+//!   a backend that sleeps WELL past the 1s cap (so the timeout always fires)
+//!   plus a bounded poll for the worktree teardown — never a fixed sleep to
+//!   "wait for" success.
 //! - Each test uses a fresh temporary git repo (`tempfile`); the real repo is
 //!   never touched.  The temp-repo setup mirrors the other integration tests.
+
+mod common;
 
 use std::process::Command;
 use std::sync::Arc;
@@ -41,17 +43,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream;
 
-use makina_core::actors::{
-    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
-};
 use makina_core::backend::noop::NoopBackend;
 use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
 };
 use makina_core::config::{BackendConfig, CapsConfig, Config, GateConfig, PlannerConfig};
-use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-use makina_core::worktree::WorktreeManager;
 
 // ── Temp-repo helpers (mirror the other integration tests) ───────────────────────
 
@@ -111,7 +108,7 @@ fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
     !String::from_utf8_lossy(&output.stdout).trim().is_empty()
 }
 
-// ── Config / task / actor-tree builders ──────────────────────────────────────────
+// ── Config / task / scheduler helpers ───────────────────────────────────────────
 
 /// Build a resolved [`Config`] with explicit caps and gates.
 ///
@@ -180,40 +177,20 @@ fn task_with_deps(id: &str, deps: &[&str]) -> Task {
     }
 }
 
-/// Spawn the actor tree over `repo_root` with `backend` + `config`, wire the
-/// per-task-spawn deps via `SetSpokes`, and return `(root, supervisor_ref)`.
-async fn build_actor_tree(
+async fn run_with_timeout(
     repo_root: std::path::PathBuf,
+    graph: TaskGraph,
     backend: Arc<dyn AgentBackend>,
     cfg: Config,
-) -> (
-    kameo::actor::ActorRef<RootSupervisor>,
-    kameo::actor::ActorRef<Supervisor>,
-) {
-    let root = RootSupervisor::start();
-
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
-            config: cfg,
-        },
-        RestartConfig::default(),
+    timeout: Duration,
+) -> (makina_core::actors::RunReport, common::SharedTaskGraph) {
+    tokio::time::timeout(
+        timeout,
+        common::run_graph_in_repo_result(repo_root, graph, Arc::clone(&backend), backend, cfg),
     )
-    .await;
-
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&backend),
-            reviewer_backend: Arc::clone(&backend),
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
-    (root, supervisor_ref)
+    .await
+    .expect("run_graph must complete before the outer timeout")
+    .expect("run_graph must drive the loop without a hard error")
 }
 
 /// Poll (bounded) until the worktree directory for `task_id` is gone.
@@ -223,12 +200,7 @@ async fn build_actor_tree(
 /// teardown completes shortly *after* the run returns.  This polls a short
 /// deadline rather than using a fixed sleep (per the testing-strategy).
 async fn assert_worktree_gone(repo_root: &std::path::Path, task_id: &str) {
-    // The ask path uses an empty plan_slug, so the plan-scoped worktree dir name
-    // is `--{task_id}`.
-    let worktree_path = repo_root
-        .join(".makina")
-        .join("worktrees")
-        .join(format!("--{task_id}"));
+    let worktree_path = common::scheduler_worktree_path(repo_root, task_id);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if !worktree_path.exists() {
@@ -273,27 +245,18 @@ async fn gate_cap_drives_task_to_failed() {
         },
     );
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "gate-cap".into(),
+        tasks: vec![task("doomed-gate")],
+    };
+    let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         cfg,
+        Duration::from_secs(20),
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "gate-cap".into(),
-            tasks: vec![task("doomed-gate")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     assert_eq!(
         report.outcomes,
@@ -301,12 +264,7 @@ async fn gate_cap_drives_task_to_failed() {
         "an always-failing gate must drive the task to Failed at the cap"
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("doomed-gate"))
         .expect("task present");
@@ -329,22 +287,16 @@ async fn gate_cap_drives_task_to_failed() {
         "developer dispatched once per gate iteration, reviewer never reached; got {prompts:?}"
     );
 
-    // Worktree + branch torn down on the cap failure (no leak). The ask path uses
-    // an empty plan_slug ⇒ `--doomed-gate` / `task/--doomed-gate`.
+    // Worktree + branch torn down on the cap failure (no leak).
+    let branch = common::scheduler_task_branch("doomed-gate");
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("--doomed-gate")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "doomed-gate").exists(),
         "worktree must be torn down when the gate cap fails the task"
     );
     assert!(
-        !branch_exists(&repo_root, "task/--doomed-gate"),
+        !branch_exists(&repo_root, &branch),
         "branch must be torn down when the gate cap fails the task"
     );
-
-    root.kill();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -386,27 +338,18 @@ async fn reviewer_cap_drives_task_to_failed() {
         },
     );
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "reviewer-cap".into(),
+        tasks: vec![task("doomed-review")],
+    };
+    let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         cfg,
+        Duration::from_secs(20),
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "reviewer-cap".into(),
-            tasks: vec![task("doomed-review")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     assert_eq!(
         report.outcomes,
@@ -414,12 +357,7 @@ async fn reviewer_cap_drives_task_to_failed() {
         "an always-rejecting reviewer must drive the task to Failed at the cap"
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("doomed-review"))
         .expect("task present");
@@ -466,22 +404,16 @@ async fn reviewer_cap_drives_task_to_failed() {
         "Reviewer must run exactly {cap} times; got {review_prompts}"
     );
 
-    // Worktree + branch torn down on the cap failure (no leak). The ask path uses
-    // an empty plan_slug ⇒ `--doomed-review` / `task/--doomed-review`.
+    // Worktree + branch torn down on the cap failure (no leak).
+    let branch = common::scheduler_task_branch("doomed-review");
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("--doomed-review")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "doomed-review").exists(),
         "worktree must be torn down when the reviewer cap fails the task"
     );
     assert!(
-        !branch_exists(&repo_root, "task/--doomed-review"),
+        !branch_exists(&repo_root, &branch),
         "branch must be torn down when the reviewer cap fails the task"
     );
-
-    root.kill();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -593,32 +525,21 @@ async fn wall_clock_cap_drives_task_to_failed() {
         },
     );
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-        cfg,
-    )
-    .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "wall-clock-cap".into(),
-            tasks: vec![task("doomed-slow")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
     // Outer timeout: the run must complete near the 1s cap.  If the wall-clock
     // cap regressed, the backend's 10s sleep would otherwise hang the suite —
     // this turns that into a fast, clear failure.
-    let report = tokio::time::timeout(
+    let graph = TaskGraph {
+        slug: "wall-clock-cap".into(),
+        tasks: vec![task("doomed-slow")],
+    };
+    let (report, graph_ref) = run_with_timeout(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        cfg,
         Duration::from_secs(5),
-        supervisor_ref.ask(RunReadyTasks).send(),
     )
-    .await
-    .expect("RunReadyTasks must complete near the 1s wall-clock cap (did the cap fire?)")
-    .expect("RunReadyTasks must drive the loop without a hard error");
+    .await;
 
     assert_eq!(
         report.outcomes,
@@ -626,12 +547,7 @@ async fn wall_clock_cap_drives_task_to_failed() {
         "the wall-clock cap must drive the task to Failed"
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("doomed-slow"))
         .expect("task present");
@@ -655,19 +571,17 @@ async fn wall_clock_cap_drives_task_to_failed() {
     assert_worktree_gone(&repo_root, "doomed-slow").await;
     // Branch teardown rides along with the same `remove` call; once the worktree
     // dir is gone the branch is too (remove() removes both).
-    // Empty plan_slug on the ask path ⇒ `task/--doomed-slow`.
+    let branch = common::scheduler_task_branch("doomed-slow");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if !branch_exists(&repo_root, "task/--doomed-slow") {
+        if !branch_exists(&repo_root, &branch) {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("branch task/--doomed-slow leaked after the wall-clock cap fired");
+            panic!("branch {branch} leaked after the wall-clock cap fired");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-
-    root.kill();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -707,33 +621,24 @@ async fn dependents_of_failed_task_are_skipped() {
     );
     cfg.concurrency = 2;
 
-    let (root, supervisor_ref) = build_actor_tree(
+    // a = [], b = [a], c = [a], d = [b].
+    let graph = TaskGraph {
+        slug: "skip-dependents".into(),
+        tasks: vec![
+            task_with_deps("a", &[]),
+            task_with_deps("b", &["a"]),
+            task_with_deps("c", &["a"]),
+            task_with_deps("d", &["b"]),
+        ],
+    };
+    let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         cfg,
+        Duration::from_secs(20),
     )
     .await;
-
-    // a = [], b = [a], c = [a], d = [b].
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "skip-dependents".into(),
-            tasks: vec![
-                task_with_deps("a", &[]),
-                task_with_deps("b", &["a"]),
-                task_with_deps("c", &["a"]),
-                task_with_deps("d", &["b"]),
-            ],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     // `a` failed; `b`, `c`, `d` were transitively skipped.
     assert!(
@@ -753,12 +658,7 @@ async fn dependents_of_failed_task_are_skipped() {
         );
     }
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     let a = snapshot.get(&TaskId::new("a")).expect("a present");
     assert_eq!(a.state, TaskState::Failed, "a must end Failed");
@@ -775,6 +675,4 @@ async fn dependents_of_failed_task_are_skipped() {
             "dependent {id} must have finished_at stamped when Skipped"
         );
     }
-
-    root.kill();
 }

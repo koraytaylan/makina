@@ -112,6 +112,10 @@ Do the thing in `lib.rs`.
 async fn transcript_is_written_and_parses() {
     let repo = setup_temp_repo();
     let repo_root = repo.path().to_path_buf();
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    // SAFETY: serialized by HOME_ENV_LOCK for the duration of this async test.
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     let api = Arc::new(build_api(repo_root.clone()));
 
     // Write the task-list `.md` into the repo's plan directory so the

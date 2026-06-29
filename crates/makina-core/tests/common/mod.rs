@@ -1,4 +1,5 @@
 //! Shared integration-test helpers for `makina-core`.
+#![allow(dead_code)]
 //!
 //! Include this module in any integration test file with:
 //! ```ignore
@@ -17,15 +18,39 @@
 //!   Future integration tests (task 21+) may reuse these helpers or supersede them
 //!   with real actor-based drivers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use futures::StreamExt;
 
+use makina_core::actors::{RunControl, RunReport, run_graph};
+use makina_core::audit::NoopAuditRegistry;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::backend::{AgentBackend, Prompt, ResponseEvent, SessionConfig};
+use makina_core::config::Config;
+use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::paths;
 use makina_core::state_machine::{IllegalTransition, TaskEvent, transition};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
+use makina_core::worktree::WorktreeManager;
+use tokio::sync::Mutex as TokioMutex;
+
+pub type SharedTaskGraph = Arc<TokioMutex<TaskGraph>>;
+
+static TEST_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+fn ensure_writable_home() {
+    let _ = TEST_HOME.get_or_init(|| {
+        let home =
+            std::env::temp_dir().join(format!("makina-core-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create writable test HOME");
+        // SAFETY: this integration-test helper sets HOME once per test process,
+        // before constructing scheduler paths that need writable runtime state.
+        unsafe { std::env::set_var("HOME", &home) };
+        home
+    });
+}
 
 // ── Builders ──────────────────────────────────────────────────────────────────
 
@@ -72,6 +97,87 @@ pub fn sample_graph(slug: impl Into<String>, tasks: Vec<Task>) -> TaskGraph {
 /// `NoopBackend::with_responses` directly.
 pub fn noop_backend() -> NoopBackend {
     NoopBackend::with_responses(vec!["developer output".into(), "reviewer approved".into()])
+}
+
+/// Drive a graph through the production scheduler using the same backend for
+/// developer and reviewer turns.
+pub async fn run_graph_in_repo(
+    repo_root: PathBuf,
+    graph: TaskGraph,
+    backend: Arc<dyn AgentBackend>,
+    config: Config,
+) -> (RunReport, SharedTaskGraph) {
+    let result =
+        run_graph_in_repo_result(repo_root, graph, Arc::clone(&backend), backend, config).await;
+    let (report, shared) = result.expect("run_graph must drive the loop without a hard error");
+    (report, shared)
+}
+
+/// Drive a graph through the production scheduler with separate role backends.
+pub async fn run_graph_in_repo_with_backends(
+    repo_root: PathBuf,
+    graph: TaskGraph,
+    developer_backend: Arc<dyn AgentBackend>,
+    reviewer_backend: Arc<dyn AgentBackend>,
+    config: Config,
+) -> (RunReport, SharedTaskGraph) {
+    let result = run_graph_in_repo_result(
+        repo_root,
+        graph,
+        developer_backend,
+        reviewer_backend,
+        config,
+    )
+    .await;
+    let (report, shared) = result.expect("run_graph must drive the loop without a hard error");
+    (report, shared)
+}
+
+/// Fallible form of [`run_graph_in_repo_with_backends`] for tests that assert a
+/// run-level fatal error.
+pub async fn run_graph_in_repo_result(
+    repo_root: PathBuf,
+    graph: TaskGraph,
+    developer_backend: Arc<dyn AgentBackend>,
+    reviewer_backend: Arc<dyn AgentBackend>,
+    config: Config,
+) -> Result<(RunReport, SharedTaskGraph), String> {
+    ensure_writable_home();
+
+    let base_branch = config.base_branch.clone();
+    let run_slug = graph.slug.clone();
+    let shared = Arc::new(TokioMutex::new(graph));
+    let report = run_graph(
+        Arc::clone(&shared),
+        WorktreeManager::new(repo_root, base_branch),
+        config,
+        developer_backend,
+        reviewer_backend,
+        RunControl::silent(),
+        Arc::new(NoopAuditRegistry),
+        run_slug,
+        "test-run".to_string(),
+        String::new(),
+        Arc::new(StructuredTextInterpreter::new()),
+    )
+    .await?;
+
+    Ok((report, shared))
+}
+
+/// Clone the scheduler-owned graph for assertions.
+pub async fn graph_snapshot(shared: &SharedTaskGraph) -> TaskGraph {
+    shared.lock().await.clone()
+}
+
+/// Worktree path for the scheduler's test path (empty plan slug).
+pub fn scheduler_worktree_path(repo_root: &Path, task_id: &str) -> PathBuf {
+    paths::worktree(repo_root, "", task_id)
+}
+
+/// Task branch for the scheduler's test path (empty plan slug).
+pub fn scheduler_task_branch(task_id: &str) -> String {
+    format!("task/{}", paths::short_worktree_name("", task_id))
 }
 
 /// Build a [`SessionConfig`] suitable for test use.

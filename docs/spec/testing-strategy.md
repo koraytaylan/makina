@@ -11,20 +11,20 @@ All tasks MUST follow these conventions when writing new tests.
 
 - **Location**: in-module under `#[cfg(test)] mod tests { … }` in the source file.
 - **Scope**: pure logic in isolation — FSM transitions, config merge/validate, serde round-trips,
-  single-actor message acceptance (spawning the actor and sending it one message via `ask`).
+  small async helpers, role-turn prompt/response handling, and backend contracts.
 - **Dependencies**: only the module under test, standard library, and workspace crates.
   No real subprocesses, no real agent CLIs, no network, no disk I/O beyond `tempfile`.
 - **Examples in this codebase**:
   - `state_machine.rs` — exhaustive Cartesian-product test of every `(state, event)` pair.
   - `task.rs` — JSON round-trip, `TaskGraph::validate`, `TaskId` display / serde.
   - `backend/noop.rs` — NoopBackend contract tests (TurnComplete, idempotent terminate, recording).
-  - `actors/mod.rs` — all four actor skeletons spawn under `RootSupervisor` and accept their messages.
-  - `supervision.rs` — restart loop verified via a bounded poll on an `AtomicU32`.
+  - `actors/developer.rs` — Developer role-turn behavior, prompt construction, and metrics emission.
+  - `actors/reviewer.rs` — Reviewer verdict parsing and error classification.
 
 ### Integration Tests
 
 - **Location**: `crates/<crate>/tests/*.rs` (one file per feature surface being tested).
-- **Scope**: cross-module / multi-actor / end-to-end behavior exercised through the PUBLIC API
+- **Scope**: cross-module / scheduler / end-to-end behavior exercised through the PUBLIC API
   of the crate. Each `tests/*.rs` file is compiled as its own crate, so it can only access
   `pub` symbols.
 - **Shared helpers**: `crates/<crate>/tests/common/mod.rs` — included per file with `mod common;`.
@@ -41,26 +41,26 @@ All tasks MUST follow these conventions when writing new tests.
 
 Flaky tests erode confidence and slow delivery. Makina tests MUST be deterministic.
 
-### Prefer `ask` over `tell` + sleep
+### Prefer Awaited Futures Over Sleeps
 
-`kameo::actor::ActorRef::ask` (request/reply) awaits full message processing before returning.
-A reply cannot arrive before the handler finishes, so there is no race to observe.
+When exercising async behavior, await the concrete future or stream event that
+represents completion. `run_graph`, role-turn helpers, `CoreApi::execute`, and
+backend response streams all provide awaitable completion points, so tests should
+use those directly.
 
 ```rust
-// GOOD: ask waits for the handler to complete
-let result = actor.ask(MyMessage { … }).send().await?;
+// GOOD: await the production scheduler's result.
+let result = run_graph(/* ... */).await?;
 assert_eq!(result, expected);
 
-// BAD: tell fires and forgets; sleep is a race condition
-actor.tell(MyMessage { … }).await?;
+// BAD: sleeping assumes work completed.
 tokio::time::sleep(Duration::from_millis(50)).await;
 ```
 
 ### Poll with a bounded deadline (never fixed sleeps)
 
-When you must observe a side effect that happens outside an `ask` reply (e.g. a restart counter
-incremented in `on_start`), poll a shared atomic in a tight loop with an explicit deadline.
-This pattern comes from `supervision.rs`:
+When you must observe a side effect that is not returned by the awaited future
+(for example, an event on a broadcast stream), poll with an explicit deadline.
 
 ```rust
 async fn poll_until(counter: &Arc<AtomicU32>, target: u32, what: &str) {
@@ -141,7 +141,7 @@ session.terminate().await?;
 
 ### Asserting on `recorded_prompts()`
 
-After one or more sessions complete, inspect what the actor/simulator actually sent:
+After one or more sessions complete, inspect what the scheduler or role turn actually sent:
 
 ```rust
 let prompts = backend.recorded_prompts();
@@ -159,8 +159,8 @@ All sessions spawned from the same `NoopBackend` instance share the same recorde
 | Situation | Location |
 |-----------|----------|
 | Testing a single pure function (FSM, serde, config parse) | Unit test (`#[cfg(test)] mod tests`) |
-| Testing a single actor spawning + accepting a message | Unit test in the actor's source file |
-| Testing the interaction of two or more modules / actors | Integration test (`tests/`) |
+| Testing a single role-turn helper or backend contract | Unit test in the source file |
+| Testing the interaction of two or more modules / scheduler paths | Integration test (`tests/`) |
 | Testing the full lifecycle of a task through the FSM with the noop backend | Integration test (`tests/fsm_end_to_end.rs`) |
 | Reusable test helpers (builders, lifecycle drivers) | `tests/common/mod.rs` |
 | Testing real gate execution | NEVER in automated tests |
@@ -195,7 +195,6 @@ at the top. This compiles `tests/common/mod.rs` into the test crate.
 | Crate | Purpose |
 |-------|---------|
 | `tokio` (`#[tokio::test]`) | Async test runner (already a workspace dep) |
-| `kameo` | Actor spawning via `ask`/`tell` (workspace dep) |
 | `futures` (`StreamExt`) | Drain `ResponseStream` in tests |
 | `tempfile` | Temporary directories for file-system tests |
 | `serde_json` | JSON fixture loading / serialization assertions |
@@ -206,11 +205,10 @@ No additional test framework dependencies should be added without team discussio
 
 ## 7. Relationship to Future Tasks
 
-- **Task 21 (develop-review-loop)**: will build the real `Supervisor` orchestration loop.
-  It will reuse `NoopBackend` for its integration tests, and MAY reuse helpers from
-  `tests/common/mod.rs` (the lifecycle-driver simulator is explicitly labeled as test
-  scaffolding; task 21 owns the production version).
-- **Task 22 (gate-runner)**: gate execution is always forbidden in automated tests. Test
+- **Develop-review scheduler**: production lifecycle tests should drive `run_graph`
+  or `CoreApi` with `NoopBackend`, using helpers from `tests/common/mod.rs` where
+  possible.
+- **Gate runner**: gate execution is always forbidden in automated tests. Test
   gate logic with unit tests that mock the gate outcome.
-- **Task 30 (prompt-answer-stream)**: multi-chunk `NoopBackend` responses (newlines in the
+- **Prompt-answer stream**: multi-chunk `NoopBackend` responses (newlines in the
   canned response string produce one `TextChunk` per line) are available for streaming tests.

@@ -123,12 +123,10 @@ pub enum InterpretError {
 /// # Seam for task 18
 ///
 /// [`ModelInterpreter`] is the model-backed implementation added by task 18.
-/// The [`Planner`] actor receives its interpreter via dependency injection
-/// (`Arc<dyn TaskListInterpreter>` in [`PlannerArgs`]); the builder
-/// [`build_planner_interpreter`] selects between `StructuredTextInterpreter`
+/// The planner receives its interpreter via dependency injection
+/// (`Arc<dyn TaskListInterpreter>`); the builder [`build_planner_interpreter`]
+/// selects between `StructuredTextInterpreter`
 /// and `ModelInterpreter` based on the configured [`PlannerMechanism`].
-///
-/// [`Planner`]: crate::actors::planner::Planner
 #[async_trait]
 pub trait TaskListInterpreter: Send + Sync {
     /// Interpret structured task-list text into a runtime task graph.
@@ -147,10 +145,8 @@ pub trait TaskListInterpreter: Send + Sync {
     /// [`InterpretError::ValidationFailed`]; any syntax problem surfaces as
     /// [`InterpretError::ParseError`].
     ///
-    /// Implementors MUST NOT write to `.tasks/` or any other file — the
-    /// Supervisor is the sole writer of the artifact (via [`SetTaskGraph`]).
-    ///
-    /// [`SetTaskGraph`]: crate::actors::supervisor::SetTaskGraph
+    /// Implementors MUST NOT write to `.tasks/` or any other file; persistence
+    /// is owned by the scheduler.
     async fn interpret(&self, slug: &str, source_text: &str) -> Result<TaskGraph, InterpretError>;
 
     /// Generate a fresh [`TaskGraph`] for `slug` from a SCOPE/ARCHITECTURE brief

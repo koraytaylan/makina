@@ -16,7 +16,7 @@ develop_until_gates_pass(ctx, task_id, developer, worktree_path, feedback)
     → GateRunner::run_gates(&config.gates, worktree_path)
 ```
 
-**Key property:** gates **run after the Developer's coding turn and before the Reviewer's approval turn**. This ordering is enforced in the `task_driver` loop in `crates/makina-core/src/actors/supervisor.rs` (step 3–6): `develop_until_gates_pass` is called, it returns `ReadyForReview`, and *then* the `reviewer.ask(Review { … })` block executes.
+**Key property:** gates **run after the Developer's coding turn and before the Reviewer's approval turn**. This ordering is enforced in the `task_driver` loop in `crates/makina-core/src/actors/supervisor.rs`: `develop_until_gates_pass` is called, it returns `ReadyForReview`, and *then* the Reviewer role turn executes via `shield_review_turn`.
 
 ---
 
@@ -76,11 +76,11 @@ All gates are `GateConfig` structs (`crates/makina-core/src/config.rs`) with:
 
 ## 4. Execution Position in the Lifecycle
 
-The develop → gate → review loop, per `task_driver` in `supervisor.rs` (step 3–6):
+The develop → gate → review loop, per `task_driver` in `supervisor.rs`:
 
-1. **Developer** — `develop.ask(Develop { task, worktree, feedback, … })` implements the work
-2. **Gates** — `develop_until_gates_pass(ctx, task_id, developer, worktree, feedback)` runs all gates; a failing gate loops back to step 1 (Developer turn again) with failure feedback
-3. **Reviewer** — `reviewer.ask(Review { … })` (only reached if all gates pass)
+1. **Developer** — `shield_develop_turn(..., Develop { task, worktree, feedback, … })` implements the work
+2. **Gates** — `develop_until_gates_pass(ctx, task_id, worktree, feedback)` runs all gates; a failing gate loops back to step 1 (Developer turn again) with failure feedback
+3. **Reviewer** — `shield_review_turn(..., Review { … })` (only reached if all gates pass)
 4. **Merge** — approved work is squash-merged into the base branch
 
 **Gates run before the Reviewer.** A discovered gate can truly block the path to review — not just decorate the config.
@@ -151,7 +151,7 @@ The contract is implemented across these symbols (verified via grep):
 |--------|------|------|
 | `develop_until_gates_pass` | `crates/makina-core/src/actors/supervisor.rs` | The gate loop: asks the Developer, runs gates, on failure feeds output back and loops; on cap exhaustion emits `GateCapReached` |
 | `GateRunner::run_gates` | `crates/makina-core/src/gate.rs` | Runs each gate's command in order, stops at first non-zero, returns `GateOutcome::Passed` or `GateOutcome::Failed { gate, output, exit_code }` |
-| `task_driver` (step 3–6) | `crates/makina-core/src/actors/supervisor.rs` | The per-task state machine: calls `develop_until_gates_pass`, then (if gates passed) `reviewer.ask(Review …)` |
+| `task_driver` | `crates/makina-core/src/actors/supervisor.rs` | The per-task state machine: calls `develop_until_gates_pass`, then (if gates passed) invokes `shield_review_turn` |
 | `GateConfig` | `crates/makina-core/src/config.rs` | `{ name, command, image, source }`; `source` is `None` (manual) or `Some("discovered")` (discovered) |
 | `TaskEvent::GateFailed` | `crates/makina-core/src/state_machine.rs` | Fired when a gate exits non-zero; triggers InProgress self-loop |
 | `TaskEvent::GateCapReached` | `crates/makina-core/src/state_machine.rs` | Fired when `gate_iterations >= caps.gate_iterations`; moves task to Failed (terminal) |

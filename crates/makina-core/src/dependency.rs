@@ -77,7 +77,7 @@ use crate::task::{TaskGraph, TaskId};
 ///
 /// Construct with [`EdgeInferrer::new`], passing any existing interpreter.
 /// The resulting `EdgeInferrer` satisfies `TaskListInterpreter` itself, so it
-/// can be injected wherever an interpreter is expected (e.g. [`PlannerArgs`]).
+/// can be injected wherever an interpreter is expected.
 ///
 /// # Example
 ///
@@ -90,7 +90,6 @@ use crate::task::{TaskGraph, TaskId};
 /// // `interpreter` now wraps the deterministic parser with inferred edges.
 /// ```
 ///
-/// [`PlannerArgs`]: crate::actors::planner::PlannerArgs
 pub struct EdgeInferrer {
     inner: Arc<dyn TaskListInterpreter>,
 }

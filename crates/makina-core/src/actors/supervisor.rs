@@ -1,20 +1,14 @@
-//! Domain `Supervisor` actor — the coordination hub of the star topology.
+//! Tokio scheduler for the Makina develop-review pipeline.
 //!
 //! # Role
 //!
-//! The domain `Supervisor` is the **hub** of the star topology.  All other role
-//! actors (Planner, Developer, Reviewer) are spokes that communicate only with
-//! this hub — never with each other.
-//!
-//! Note: this is *not* [`crate::supervision::RootSupervisor`] (the fault-tolerance
-//! root).  The `Supervisor` here is a domain-level coordinator that the
-//! `RootSupervisor` manages as one of its supervised children.
+//! The scheduler coordinates ready tasks, worktree lifecycle, developer turns,
+//! gates, reviewer turns, squash merges, persistence, and run-control events.
 //!
 //! # The develop → review loop (task 21)
 //!
-//! The Supervisor drives each ready task end-to-end via a **sequential async
-//! flow** (request/reply `ask` against the spokes), which is simpler and cleaner
-//! than event-driven message ping-pong for a single-task-at-a-time loop:
+//! Each task driver moves a ready task end-to-end via a **sequential async
+//! flow**:
 //!
 //! ```text
 //! pick ready task
@@ -25,14 +19,14 @@
 //!   loop:
 //!     develop_until_gates_pass(task, worktree, feedback):     (task 22)
 //!       loop:
-//!         ask Developer.Develop{task, worktree, feedback}     (feedback=None first time)
+//!         develop(task, worktree, feedback)                  (feedback=None first time)
 //!         run gates in worktree
 //!           Passed       --GatesPassed--> InReview ; break
 //!           Failed{..}   --GateFailed--> InProgress (self-loop) ; gate_iterations += 1
 //!                        if gate_iterations >= caps.gate_iterations:
 //!                          --GateCapReached--> Failed ; teardown ; task fails
 //!                        else: feedback = gate output ; re-dispatch
-//!     ask Reviewer.Review{task, worktree}
+//!     review(task, worktree)
 //!       (dispatch/parse failure) --HardError--> Failed ; teardown   (task 25)
 //!       Approve  squash_merge(task/{id} → develop)      (task 23 — BEFORE teardown)
 //!                 Merged    --ReviewerApproved--> Done ; WorktreeManager::remove
@@ -49,11 +43,11 @@
 //! On top of the develop→review loop, the **scheduler** wraps each driver in a
 //! per-task `tokio::time::timeout(config.caps.wall_clock_secs)`.  If the deadline
 //! fires the driver future is cancelled (its [`DriverGuard`] tears down the
-//! worktree + spokes) and the scheduler applies `WallClockCapReached` → `Failed`
-//! under the graph lock (task 25).
+//! worktree) and the scheduler applies `WallClockCapReached` → `Failed` under
+//! the graph lock (task 25).
 //!
 //! Every state change goes through [`crate::state_machine::transition`]; the
-//! Supervisor keeps each [`Task::state`] in the shared graph updated as the
+//! scheduler keeps each [`Task::state`] in the shared graph updated as the
 //! source of truth.
 //!
 //! ## Gates (task 22 — implemented)
@@ -68,7 +62,7 @@
 //! (`GateCapReached`) on exhaustion.
 //!
 //! **Placement choice**: the architecture frames gates as "Developer-side"; the
-//! MVP implements them **Supervisor-coordinated** (the driver runs the gates and
+//! MVP implements them **scheduler-coordinated** (the driver runs the gates and
 //! re-dispatches the Developer with the failure output).  The agent still does
 //! the fixing; the gate EXECUTION is the reusable [`crate::gate::GateRunner`].
 //!
@@ -85,9 +79,8 @@
 //!
 //! ## Concurrency (task 24 — implemented)
 //!
-//! The Supervisor runs **multiple tasks in parallel**, one Developer/Reviewer
-//! pair per task, up to `config.concurrency`.  The sequential `run_ready_tasks`
-//! of task 21 is replaced by a [`scheduler`] that launches a [`task_driver`] per
+//! The scheduler runs **multiple tasks in parallel**, one driver per task, up to
+//! `config.concurrency`. It launches a [`task_driver`] per
 //! ready task on a [`tokio::task::JoinSet`], capped by a
 //! [`tokio::sync::Semaphore`].  *Within-task* logic (FSM, dev+gate loop, review
 //! loop, squash-merge, worktree lifecycle) is unchanged — concurrency is purely
@@ -126,44 +119,37 @@
 //! - **Idle / heartbeat detection** (FUTURE): only the three caps above exist;
 //!   there is no per-step idle timeout.
 //!
-//! # Messages
+//! # Entrypoint
 //!
-//! - [`SetTaskGraph`] — stores the current task graph; reply `()`.
-//! - [`SetSpokes`] — injects the concurrency dependencies (the `RootSupervisor`
-//!   ref, the hub's own ref, and the shared backend) the scheduler uses to spawn
-//!   a per-task Developer/Reviewer pair; reply `()`.
-//! - [`RunReadyTasks`] — drives every ready task to a terminal state, running up
-//!   to `config.concurrency` in parallel; reply [`RunReport`].
-//! - [`TaskGraphSnapshot`] — returns the current graph for introspection/testing.
+//! - [`run_graph`] drives every ready task to a terminal state, running up to
+//!   `config.concurrency` in parallel, and returns [`RunReport`].
 
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kameo::actor::ActorRef;
-use kameo::message::Context;
+use futures::FutureExt as _;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::api;
-use crate::audit::{AuditRegistry, NoopAuditRegistry};
+use crate::audit::AuditRegistry;
 use crate::backend::AgentBackend;
-use crate::config::{Config, FinalMerge};
+use crate::config::{Config, FinalMerge, RoleAssignment};
 use crate::gate::{GateOutcome, GateRunner};
 use crate::interpreter::TaskListInterpreter;
 use crate::merge::{MergeOutcome, SquashMerger, StageOutcome};
 use crate::paths;
 use crate::persist::persist_graph;
 use crate::state_machine::{TaskEvent, transition};
-use crate::supervision::{RestartConfig, RootSupervisor};
 use crate::task::{Task, TaskGraph, TaskId, TaskState};
 use crate::worktree::WorktreeManager;
 
-use super::developer::{Develop, Developer, DeveloperArgs, DeveloperError};
-use super::planner::{Planner, PlannerArgs};
-use super::reviewer::{Review, ReviewVerdict, Reviewer, ReviewerArgs, ReviewerError};
+use super::developer::{Develop, DevelopOutcome, DeveloperError, develop};
+use super::reviewer::{Review, ReviewVerdict, ReviewerError, review};
 
 // ── Live event emission (task 31: run-control) ──────────────────────────────────
 
@@ -194,9 +180,8 @@ pub type EventSink = Arc<dyn Fn(api::Event) + Send + Sync>;
 ///   launching and `abort_all()`s the in-flight `JoinSet` (each aborted
 ///   driver's [`DriverGuard`] still tears down its worktree/spokes — no leak).
 ///
-/// The `RunReadyTasks` ask path (the task-21–25 tests) uses
-/// [`RunControl::silent`]: a no-op sink, never paused, never cancelled — so the
-/// existing behavior is byte-for-byte unchanged (events are purely additive).
+/// Direct scheduler tests use [`RunControl::silent`]: a no-op sink, never
+/// paused, never cancelled.
 #[derive(Clone)]
 pub struct RunControl {
     /// The Run these events/controls belong to.
@@ -212,9 +197,7 @@ pub struct RunControl {
 impl RunControl {
     /// A control that emits nothing, never pauses, and never cancels.
     ///
-    /// Used by the `RunReadyTasks` ask path so the engine behaves exactly as it
-    /// did before task 31 (events are additive; the scheduler's pause/cancel
-    /// checks are inert).
+    /// Used by tests that do not need live events or run-control behavior.
     pub fn silent() -> Self {
         Self {
             run: api::RunId(0),
@@ -230,134 +213,9 @@ impl RunControl {
     }
 }
 
-// ── Actor ─────────────────────────────────────────────────────────────────────
-
-/// The domain coordination hub for the multi-agent pipeline.
-///
-/// Holds the active [`TaskGraph`], the shared resources used to drive tasks
-/// (worktree manager, gate runner, squash merger, config), and — after
-/// [`SetSpokes`] — the dependencies needed to spawn a per-task Developer/Reviewer
-/// pair (the `RootSupervisor` ref, the hub's own ref, and the agent backend).
-/// Spawnable as a supervised child of [`crate::supervision::RootSupervisor`].
-pub struct Supervisor {
-    /// The active task graph — the source of truth for scheduling and state.
-    ///
-    /// `None` until [`SetTaskGraph`] is received.  During a [`RunReadyTasks`]
-    /// run the graph is temporarily moved into a shared
-    /// `Arc<tokio::sync::Mutex<TaskGraph>>` so the concurrent drivers can update
-    /// it without holding `&mut self`; the final graph is moved back here when
-    /// the run completes (so [`TaskGraphSnapshot`] keeps working).
-    graph: Option<TaskGraph>,
-
-    /// Worktree/branch lifecycle manager.
-    ///
-    /// `None` until provided via [`SupervisorArgs`].  The Supervisor owns all
-    /// worktree create/remove calls (architecture invariant: only the Supervisor
-    /// manages worktree+branch lifecycle).  `Clone`/shared by reference into
-    /// every driver (the manager is safe for concurrent **distinct** task IDs —
-    /// see [`WorktreeManager`]).
-    worktree_manager: Option<WorktreeManager>,
-
-    /// The `RootSupervisor` ref, injected post-spawn via [`SetSpokes`].
-    ///
-    /// Used by the scheduler to spawn each task's Developer/Reviewer as
-    /// supervised children of the fault-tolerance root.  `None` until wired.
-    root: Option<ActorRef<RootSupervisor>>,
-
-    /// The hub's own ref, injected post-spawn via [`SetSpokes`].
-    ///
-    /// Needed because a per-task Developer/Reviewer's `Args` require an
-    /// `ActorRef<Supervisor>` (the star-topology anchor).  `None` until wired.
-    self_ref: Option<ActorRef<Supervisor>>,
-
-    /// The agent backend for the Developer role, injected post-spawn via [`SetSpokes`].
-    ///
-    /// Resolved from `config.roles.developer.provider`; cloned (`Arc`) into every
-    /// per-task Developer actor.  `None` until wired.
-    developer_backend: Option<Arc<dyn AgentBackend>>,
-
-    /// The agent backend for the Reviewer role, injected post-spawn via [`SetSpokes`].
-    ///
-    /// Resolved from `config.roles.reviewer.provider`; cloned (`Arc`) into every
-    /// per-task Reviewer actor.  May point to the same Arc as `developer_backend`
-    /// when both roles share a provider.  `None` until wired.
-    reviewer_backend: Option<Arc<dyn AgentBackend>>,
-
-    /// The resolved runtime configuration.
-    ///
-    /// Supplies `config.gates` (gate command lines), all three termination caps
-    /// (`config.caps.{gate_iterations, reviewer_iterations, wall_clock_secs}` —
-    /// task 25), and `config.concurrency` (the parallel-task limit the scheduler
-    /// enforces).  The whole [`Config`] is injected so every cap reads from the
-    /// same place.
-    config: Config,
-
-    /// Executes the configured gates in a task's worktree.
-    ///
-    /// Stateless and reused across all tasks/iterations; shared by reference into
-    /// every driver.  See [`GateRunner`].
-    gate_runner: GateRunner,
-
-    /// Squash-merges an approved task's branch into the base branch (task 23).
-    ///
-    /// Built from the same `repo_root` + `base_branch` as the
-    /// [`WorktreeManager`].  Stateless beyond its config, so it is shared by
-    /// reference into every driver — but the *merge step* mutates the single
-    /// shared `develop` checkout, so drivers serialize that step behind the
-    /// **develop merge lock** (see [`task_driver`]).  See [`SquashMerger`].
-    squash_merger: SquashMerger,
-}
-
-/// Construction arguments for [`Supervisor`].
-///
-/// The [`WorktreeManager`] is supplied at spawn time (it is `Clone`, satisfying
-/// the `Args: Clone + Sync` bound for supervised children).  The concurrency
-/// dependencies (root ref, self ref, backend) are NOT part of `Args` because the
-/// Developer/Reviewer need the Supervisor's ref to be constructed — a
-/// construction cycle — so they are injected afterwards via [`SetSpokes`].
-#[derive(Clone)]
-pub struct SupervisorArgs {
-    /// The worktree manager the Supervisor uses to create/tear down worktrees.
-    pub worktree_manager: WorktreeManager,
-
-    /// The resolved runtime [`Config`].
-    ///
-    /// Supplies the gate command lines (`config.gates`), the three termination
-    /// caps (`config.caps.{gate_iterations, reviewer_iterations, wall_clock_secs}`),
-    /// and the concurrency limit (`config.concurrency`).  `Config` is `Clone`,
-    /// satisfying the `Args: Clone + Sync` bound for supervised children.
-    pub config: Config,
-}
-
-impl kameo::actor::Actor for Supervisor {
-    type Args = SupervisorArgs;
-    type Error = std::convert::Infallible;
-
-    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // The squash-merger operates in the SAME main repo the worktree manager
-        // branches off, merging into the SAME base branch.  Derive it from the
-        // worktree manager's config so there is a single source of truth.
-        let squash_merger = SquashMerger::new(
-            args.worktree_manager.repo_root.clone(),
-            args.worktree_manager.base_branch.clone(),
-        );
-        Ok(Supervisor {
-            graph: None,
-            worktree_manager: Some(args.worktree_manager),
-            root: None,
-            self_ref: None,
-            developer_backend: None,
-            reviewer_backend: None,
-            config: args.config,
-            gate_runner: GateRunner::new(),
-            squash_merger,
-        })
-    }
-}
-
 // ── RunReport ───────────────────────────────────────────────────────────────────
 
-/// Summary returned by [`RunReadyTasks`].
+/// Summary returned by [`run_graph`].
 ///
 /// Reports the terminal outcome for each task the run touched.  Because tasks run
 /// **concurrently**, the order of `outcomes` reflects driver *completion* order
@@ -438,14 +296,6 @@ struct DriverContext {
     /// The resolved runtime config (gates, caps, base branch).
     config: Config,
 
-    /// The `RootSupervisor` ref — each driver spawns its task's Developer and
-    /// Reviewer as supervised children of this root.
-    root: ActorRef<RootSupervisor>,
-
-    /// The hub's own ref — used as the star-topology anchor in the per-task
-    /// Developer/Reviewer `Args`.
-    supervisor: ActorRef<Supervisor>,
-
     /// The agent backend for the Developer role.
     ///
     /// Resolved from `config.roles.developer.provider` at DriverContext construction
@@ -462,8 +312,8 @@ struct DriverContext {
 
     /// Per-run control + live-event sink (task 31).  Threaded into the scheduler
     /// (pause/cancel checks) and every [`task_driver`] (event emission +
-    /// Developer/Reviewer `AgentExchange`).  The `RunReadyTasks` ask path passes
-    /// [`RunControl::silent`] so behavior is unchanged there.
+    /// Developer/Reviewer `AgentExchange`). Tests that do not observe events
+    /// pass [`RunControl::silent`].
     control: RunControl,
 
     /// The audit registry: the Supervisor calls this to associate each task's
@@ -471,15 +321,15 @@ struct DriverContext {
     /// enabling the [`crate::audit::JsonlAuditSink`] to route audit entries to
     /// the correct `.tasks/{slug}/audit.jsonl` file.
     ///
-    /// The `RunReadyTasks` ask path passes [`crate::audit::NoopAuditRegistry`]
-    /// so the ask-path behavior is unchanged.
+    /// Tests that do not need audit routing pass
+    /// [`crate::audit::NoopAuditRegistry`].
     audit_registry: Arc<dyn AuditRegistry>,
 
     /// The task-graph slug (file stem of the task-list file), used as the
     /// sub-directory name under `.tasks/` when routing audit entries.
     ///
     /// Derived by the orchestrator from the task-list path when the run is
-    /// started; the `RunReadyTasks` ask path uses an empty string (no-op with
+    /// started; direct tests use an empty string (no-op with
     /// `NoopAuditRegistry`).
     run_slug: String,
 
@@ -487,7 +337,7 @@ struct DriverContext {
     /// orchestrator when the run is opened, threaded through so the audit ledger
     /// can key entries on a stable cross-process run id.
     ///
-    /// The `RunReadyTasks` ask path uses an empty string (no-op with
+    /// Direct tests use an empty string (no-op with
     /// `NoopAuditRegistry`).
     ///
     /// Consumed by the `AuditRegistry::register` call in `dispatch_task`, which
@@ -499,7 +349,7 @@ struct DriverContext {
     /// threaded from the orchestrator so per-task worktree calls can plan-scope
     /// their directory + branch names.
     ///
-    /// The `RunReadyTasks` ask path uses an empty string.
+    /// Direct tests use an empty string.
     ///
     /// Read when building per-task worktree directory + branch names: the
     /// driver passes it to `WorktreeManager::create`/`remove` so the worktree
@@ -566,261 +416,15 @@ impl DriverContext {
     }
 }
 
-// ── SetTaskGraph ────────────────────────────────────────────────────────────────
-
-/// Store (or replace) the active [`TaskGraph`].
-///
-/// The Supervisor holds the graph as the source of truth for all scheduling
-/// decisions and state mutations.
-pub struct SetTaskGraph(pub TaskGraph);
-
-impl kameo::message::Message<SetTaskGraph> for Supervisor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SetTaskGraph,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.graph = Some(msg.0);
-    }
-}
-
-// ── SetSpokes ─────────────────────────────────────────────────────────────────
-
-/// Inject the **concurrency dependencies** into the Supervisor.
-///
-/// This post-spawn wiring step breaks the hub↔spoke construction cycle.  Rather
-/// than a single shared Developer/Reviewer pair (the task-21 design), the
-/// concurrent scheduler (task 24) spawns **one Developer/Reviewer per task**, so
-/// the hub needs the pieces to do that spawning:
-///
-/// - `root` — the [`RootSupervisor`] under which per-task spokes are supervised.
-/// - `supervisor` — the hub's own ref (the spokes' star-topology anchor).
-/// - `backend` — the shared agent backend cloned into each spoke.
-///
-/// (The message keeps the historical name `SetSpokes` because it still performs
-/// the "wire up the spokes" role; it now wires the *means to spawn* per-task
-/// spokes instead of a fixed shared pair.)
-pub struct SetSpokes {
-    /// The fault-tolerance root under which per-task Developer/Reviewer actors
-    /// are spawned as supervised children.
-    pub root: ActorRef<RootSupervisor>,
-    /// The hub's own ref, used as the star-topology anchor in each per-task
-    /// Developer/Reviewer's `Args`.
-    pub supervisor: ActorRef<Supervisor>,
-    /// The agent backend for the Developer role.
-    ///
-    /// Resolved from `config.roles.developer.provider`; passed as
-    /// `DeveloperArgs.backend` for each per-task Developer actor.
-    pub developer_backend: Arc<dyn AgentBackend>,
-    /// The agent backend for the Reviewer role.
-    ///
-    /// Resolved from `config.roles.reviewer.provider`; passed as
-    /// `ReviewerArgs.backend` for each per-task Reviewer actor.  May be the same
-    /// Arc as `developer_backend` when both roles share a provider.
-    pub reviewer_backend: Arc<dyn AgentBackend>,
-}
-
-impl kameo::message::Message<SetSpokes> for Supervisor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SetSpokes,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.root = Some(msg.root);
-        self.self_ref = Some(msg.supervisor);
-        self.developer_backend = Some(msg.developer_backend);
-        self.reviewer_backend = Some(msg.reviewer_backend);
-    }
-}
-
-// ── RunReadyTasks ─────────────────────────────────────────────────────────────
-
-/// Drive every ready task to a terminal state, running up to
-/// `config.concurrency` in parallel.
-///
-/// A task is "ready" once all of its `depends_on` are `Done`.  The Supervisor
-/// launches a driver per ready task (capped by a semaphore at
-/// `config.concurrency`), and as each completes it re-evaluates readiness and
-/// launches more, until every task is terminal or no progress is possible.  A
-/// task becoming `Done` can unlock dependents, which the scheduler then picks up.
-///
-/// # Reply
-///
-/// [`RunReport`] listing the terminal outcome of each task driven (in
-/// driver-completion order — tasks ran concurrently).  A per-task hard error
-/// records that task as `Failed` (and transitively `Skipped`s its dependents)
-/// but does NOT halt the run (sched-continue-on-failure): the scheduler keeps
-/// launching the remaining independent ready tasks. Only a genuine driver
-/// *panic* (or a cancel) stops launching new work; in-flight drivers are always
-/// awaited.
-pub struct RunReadyTasks;
-
-impl kameo::message::Message<RunReadyTasks> for Supervisor {
-    type Reply = Result<RunReport, String>;
-
-    async fn handle(
-        &mut self,
-        _msg: RunReadyTasks,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.run_ready_tasks().await
-    }
-}
-
-// ── TaskGraphSnapshot ───────────────────────────────────────────────────────────
-
-/// Return a snapshot of the current task graph for introspection and testing.
-///
-/// Returns `None` if no graph has been set yet.
-pub struct TaskGraphSnapshot;
-
-impl kameo::message::Message<TaskGraphSnapshot> for Supervisor {
-    type Reply = Option<TaskGraph>;
-
-    async fn handle(
-        &mut self,
-        _msg: TaskGraphSnapshot,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.graph.clone()
-    }
-}
-
-// ── Orchestration entrypoint ────────────────────────────────────────────────────
-
-impl Supervisor {
-    /// Drive every ready task to a terminal state, up to `config.concurrency` at
-    /// once.
-    ///
-    /// This wraps the concurrent [`scheduler`].  It moves the held graph into a
-    /// shared `Arc<tokio::sync::Mutex<TaskGraph>>` (so the drivers can update it
-    /// without holding `&mut self`), runs the scheduler, then moves the final
-    /// graph back into `self` so [`TaskGraphSnapshot`] continues to reflect the
-    /// terminal state.
-    async fn run_ready_tasks(&mut self) -> Result<RunReport, String> {
-        // Take the graph out of self into a shared, lockable handle.  We restore
-        // it (the SAME, now-mutated graph) before returning, on every path.
-        let graph = self.graph.take().ok_or("supervisor has no graph")?;
-        let shared_graph = Arc::new(Mutex::new(graph));
-
-        // Build the shared driver context.  Missing wiring is a hard error — the
-        // scheduler cannot spawn per-task spokes without it.  The `RunReadyTasks`
-        // ask path is uncontrolled: no events, never paused/cancelled, no audit
-        // registry (noop).
-        let ctx = match self.driver_context(
-            Arc::clone(&shared_graph),
-            RunControl::silent(),
-            Arc::new(NoopAuditRegistry),
-            String::new(),
-            String::new(),
-            String::new(),
-        ) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                // Restore the graph before bailing so self stays consistent.
-                self.restore_graph(shared_graph).await;
-                return Err(e);
-            }
-        };
-
-        let result = scheduler(ctx, self.config.concurrency).await;
-
-        // Move the (mutated) graph back into self regardless of the run result.
-        self.restore_graph(shared_graph).await;
-
-        result
-    }
-
-    /// Build the [`DriverContext`] from the Supervisor's wired resources.
-    ///
-    /// Errors if the concurrency dependencies (root ref / self ref / backend)
-    /// were not injected via [`SetSpokes`], or if the worktree manager is absent.
-    /// `control` carries the per-run event sink + pause/cancel signals (task 31);
-    /// pass [`RunControl::silent`] for the uncontrolled ask path.
-    /// `audit_registry`, `run_slug`, and `run_uid` are for the audit ledger;
-    /// `plan_slug` plan-scopes per-task worktree calls. Pass
-    /// `Arc::new(NoopAuditRegistry)` / `String::new()` ×3 for the ask path.
-    fn driver_context(
-        &self,
-        graph: Arc<Mutex<TaskGraph>>,
-        control: RunControl,
-        audit_registry: Arc<dyn AuditRegistry>,
-        run_slug: String,
-        run_uid: String,
-        plan_slug: String,
-    ) -> Result<DriverContext, String> {
-        let worktree_manager = self
-            .worktree_manager
-            .clone()
-            .ok_or("supervisor has no worktree manager")?;
-        let root = self
-            .root
-            .clone()
-            .ok_or("supervisor has no RootSupervisor ref (call SetSpokes first)")?;
-        let supervisor = self
-            .self_ref
-            .clone()
-            .ok_or("supervisor has no self ref (call SetSpokes first)")?;
-        let developer_backend = self
-            .developer_backend
-            .clone()
-            .ok_or("supervisor has no developer backend (call SetSpokes first)")?;
-        let reviewer_backend = self
-            .reviewer_backend
-            .clone()
-            .ok_or("supervisor has no reviewer backend (call SetSpokes first)")?;
-
-        Ok(DriverContext {
-            graph,
-            merge_lock: Arc::new(Mutex::new(())),
-            worktree_manager,
-            gate_runner: self.gate_runner.clone(),
-            squash_merger: self.squash_merger.clone(),
-            config: self.config.clone(),
-            root,
-            supervisor,
-            developer_backend,
-            reviewer_backend,
-            control,
-            audit_registry,
-            run_slug,
-            run_uid,
-            plan_slug,
-        })
-    }
-
-    /// Move the shared graph back into `self.graph`.
-    ///
-    /// At the point this is called all drivers have completed (the scheduler has
-    /// returned), so we are the sole remaining owner; `try_unwrap` succeeds and
-    /// avoids an extra clone.  On the off chance another `Arc` clone is still
-    /// alive we fall back to cloning the locked graph.
-    async fn restore_graph(&mut self, shared_graph: Arc<Mutex<TaskGraph>>) {
-        match Arc::try_unwrap(shared_graph) {
-            Ok(mutex) => self.graph = Some(mutex.into_inner()),
-            Err(arc) => {
-                let g = arc.lock().await;
-                self.graph = Some(g.clone());
-            }
-        }
-    }
-}
-
 // ── Public controlled entrypoint (task 31: run-control) ─────────────────────────
 
 /// Run a whole [`TaskGraph`] to terminal states under a [`RunControl`], emitting
 /// live [`api::Event`]s and honouring pause/cancel — the entrypoint the
 /// orchestrator (`CoreApi`) spawns on a background task.
 ///
-/// This builds a fresh actor tree (a [`RootSupervisor`] plus one [`Supervisor`]
-/// hub, wired via [`SetSpokes`]) over the shared graph, then runs the SAME
-/// concurrent [`scheduler`] the `RunReadyTasks` ask path uses — only with a real
-/// (non-silent) `control` so it publishes events and reacts to pause/cancel.
-/// The actor tree is torn down (`root.kill()`) on every exit path.
+/// This builds a [`DriverContext`] over the shared graph, then runs the
+/// concurrent [`scheduler`] with a real (non-silent) `control` so it publishes
+/// events and reacts to pause/cancel.
 ///
 /// Lifecycle events emitted here (the scheduler/drivers emit the per-task ones):
 /// - `RunStatusChanged{run, Running}` once, at the start;
@@ -846,7 +450,7 @@ pub async fn run_graph(
     run_slug: String,
     run_uid: String,
     plan_slug: String,
-    planner_interpreter: Arc<dyn TaskListInterpreter>,
+    _planner_interpreter: Arc<dyn TaskListInterpreter>,
 ) -> Result<RunReport, String> {
     // Open the run-scoped tracing span so every event emitted while driving this
     // graph carries the `run_uid` key. The `makina` binary's per-run file layer
@@ -868,7 +472,7 @@ pub async fn run_graph(
         run_slug,
         run_uid,
         plan_slug,
-        planner_interpreter,
+        _planner_interpreter,
     )
     .instrument(run_span)
     .await
@@ -886,7 +490,7 @@ async fn run_graph_inner(
     run_slug: String,
     run_uid: String,
     plan_slug: String,
-    planner_interpreter: Arc<dyn TaskListInterpreter>,
+    _planner_interpreter: Arc<dyn TaskListInterpreter>,
 ) -> Result<RunReport, String> {
     // Announce the run is now executing.
     control.emit(api::Event::RunStatusChanged {
@@ -909,43 +513,6 @@ async fn run_graph_inner(
         (worktree_manager.base_branch.clone(), worktree_manager)
     };
 
-    // Build the actor tree: fault-tolerance root + domain hub, then wire the
-    // per-task-spawn deps into the hub (the same shape as the test harness).
-    let root = RootSupervisor::start();
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: worktree_manager.clone(),
-            config: config.clone(),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&developer_backend),
-            reviewer_backend: Arc::clone(&reviewer_backend),
-        })
-        .send()
-        .await
-        .map_err(|e| format!("failed to wire supervisor spokes: {e}"))?;
-
-    // Spawn the Planner under the root (prod launch path). The interpreter is
-    // threaded from the orchestrator so the mechanism choice (structured-text
-    // vs model) is carried into the run's actor tree. The ref is not stored;
-    // spawning under the root is sufficient for lifecycle/observability.
-    let _planner_ref = RootSupervisor::spawn_child::<Planner>(
-        &root,
-        PlannerArgs {
-            supervisor: supervisor_ref.clone(),
-            interpreter: planner_interpreter,
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
     // Build the driver context directly (we drive the `scheduler` ourselves so
     // we keep ownership of the shared graph for the final status derivation).
     // 3. The per-task merger targets the plan branch (now checked out in repo_root).
@@ -961,8 +528,6 @@ async fn run_graph_inner(
         gate_runner: GateRunner::new(),
         squash_merger,
         config: config.clone(),
-        root: root.clone(),
-        supervisor: supervisor_ref.clone(),
         developer_backend,
         reviewer_backend,
         control: control.clone(),
@@ -973,9 +538,6 @@ async fn run_graph_inner(
     };
 
     let mut result = scheduler(ctx, config.concurrency).await;
-
-    // Tear down the actor tree (kills the hub + any lingering supervised spokes).
-    root.kill();
 
     // Final merge: decide whether to land plan/{slug} into base_branch (if all tasks Done).
     // This happens BEFORE restoring base_branch, so the plan branch is still checked out.
@@ -1213,8 +775,8 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
     // holding the graph mutex).
     //
     // The graph is guaranteed non-None here: the `take()` guard in the
-    // `RunReadyTasks` handler ensures `ctx.graph` is populated before the
-    // scheduler is entered.  This call creates `.tasks/{slug}.json` at run
+    // `run_graph` ensures `ctx.graph` is populated before the scheduler is
+    // entered.  This call creates `.tasks/{slug}.json` at run
     // start, so the file is present even if every task is skipped or fails
     // immediately.
     ctx.persist().await;
@@ -1552,26 +1114,22 @@ fn advance_to_ready(graph: &mut TaskGraph, task_id: &TaskId) -> Result<(), Strin
 
 /// RAII teardown guard for one task's per-task resources.
 ///
-/// Holds enough to tear down (best-effort) the task's worktree and to `kill` the
-/// task's Developer/Reviewer actors.  Teardown runs in `Drop` so that EVERY exit
-/// path of [`task_driver`] — `Ok`, `Err`, early-return, or panic/unwind — frees
-/// the worktree + branch and stops the per-task spokes (no leaks).
+/// Holds enough to tear down (best-effort) the task's worktree. Teardown runs
+/// in `Drop` so that EVERY exit path of [`task_driver`] — `Ok`, `Err`,
+/// early-return, or panic/unwind — frees the worktree + branch.
 ///
 /// Worktree removal is async (`WorktreeManager::remove`), but `Drop` is sync; we
 /// therefore tear the worktree down explicitly in the driver's terminal paths
 /// (where we can `.await`) and use this guard as the **safety net** for the
 /// unexpected/early-return/panic paths via a detached best-effort spawn on the
-/// current runtime.  The actor `kill()` calls are synchronous and always run in
-/// `Drop`.  In the normal (Ok/Err terminal) paths the driver has already awaited
-/// `remove` and set `worktree_removed = true`, so Drop only kills the spokes.
+/// current runtime. In the normal (Ok/Err terminal) paths the driver has already
+/// awaited `remove` and set `worktree_removed = true`, so Drop is a no-op.
 struct DriverGuard {
     task_id: String,
     /// Plan slug this task belongs to, used to plan-scope the worktree
     /// directory + branch during safety-net teardown.
     plan_slug: String,
     worktree_manager: WorktreeManager,
-    developer: Option<ActorRef<Developer>>,
-    reviewer: Option<ActorRef<Reviewer>>,
     /// Set to `true` once the driver has already torn the worktree down on a
     /// normal terminal path, so `Drop` does not redundantly try again.
     worktree_removed: bool,
@@ -1579,14 +1137,6 @@ struct DriverGuard {
 
 impl Drop for DriverGuard {
     fn drop(&mut self) {
-        // Always stop the per-task spokes (sync, cheap, idempotent).
-        if let Some(dev) = self.developer.take() {
-            dev.kill();
-        }
-        if let Some(rev) = self.reviewer.take() {
-            rev.kill();
-        }
-
         // Safety-net worktree teardown for paths that did not already remove it
         // (e.g. an unexpected early return or a panic).  Normal terminal paths
         // set `worktree_removed = true` after awaiting `remove`, so this is a
@@ -1608,17 +1158,59 @@ impl Drop for DriverGuard {
     }
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+async fn shield_develop_turn(
+    backend: Arc<dyn AgentBackend>,
+    assignment: Option<RoleAssignment>,
+    msg: Develop,
+) -> Result<DevelopOutcome, DeveloperError> {
+    match AssertUnwindSafe(develop(backend, assignment, msg))
+        .catch_unwind()
+        .await
+    {
+        Ok(reply) => reply,
+        Err(payload) => Err(DeveloperError::Other(format!(
+            "developer panicked: {}",
+            panic_payload_message(payload.as_ref())
+        ))),
+    }
+}
+
+async fn shield_review_turn(
+    backend: Arc<dyn AgentBackend>,
+    assignment: Option<RoleAssignment>,
+    msg: Review,
+) -> Result<ReviewVerdict, ReviewerError> {
+    match AssertUnwindSafe(review(backend, assignment, msg))
+        .catch_unwind()
+        .await
+    {
+        Ok(reply) => reply,
+        Err(payload) => Err(ReviewerError::Other(format!(
+            "reviewer panicked: {}",
+            panic_payload_message(payload.as_ref())
+        ))),
+    }
+}
+
 /// Drive a single task from its current state through the full develop→review
 /// loop to a terminal state, returning that terminal state.
 ///
 /// This is the per-task lifecycle extracted from task 21's `run_single_task`,
-/// now operating on the **shared** graph (via the [`DriverContext`]) and using a
-/// **per-task** Developer/Reviewer pair (spawned as supervised children of the
-/// `RootSupervisor`).  *Within-task* behavior is unchanged from task 21–23: FSM
-/// transitions, the dev+gate loop ([`develop_until_gates_pass`]), the review
-/// loop, the squash-merge on approve, and worktree create/teardown all happen
-/// exactly as before — only the graph access is now lock-guarded and the spokes
-/// are task-local.
+/// now operating on the **shared** graph (via the [`DriverContext`]). Within-task
+/// behavior is unchanged from task 21–23: FSM transitions, the dev+gate loop
+/// ([`develop_until_gates_pass`]), the review loop, the squash-merge on approve,
+/// and worktree create/teardown all happen exactly as before — only the graph
+/// access is now lock-guarded.
 ///
 /// # Graph-lock discipline (the deadlock/race surface — read this)
 ///
@@ -1657,46 +1249,16 @@ impl Drop for DriverGuard {
 ///
 /// # Resource release on every path (no leaks)
 ///
-/// A [`DriverGuard`] (RAII) kills the per-task spokes and best-effort-removes the
-/// worktree on Drop, covering early-returns/panics.  The normal terminal paths
-/// additionally `await` worktree removal explicitly (and mark the guard so it
-/// won't double-remove).  The semaphore permit is owned by the spawned future
-/// and released when this function returns (Ok or Err) or panics.
+/// A [`DriverGuard`] (RAII) best-effort-removes the worktree on Drop, covering
+/// early-returns/panics. The normal terminal paths additionally `await` worktree
+/// removal explicitly (and mark the guard so it won't double-remove). The
+/// semaphore permit is owned by the spawned future and released when this
+/// function returns (Ok or Err) or panics.
 async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState, String> {
-    // ── Spawn this task's OWN Developer + Reviewer (single Developer per task) ─
-    //
-    // Supervised children of the RootSupervisor, using the hub ref (star anchor)
-    // and the role-specific backend Arc.  Developer gets ctx.developer_backend;
-    // Reviewer gets ctx.reviewer_backend — they may be the same Arc when both
-    // roles share a provider, or distinct Arcs when configured separately.
-    // Torn down by the DriverGuard.
-    let developer = RootSupervisor::spawn_child::<Developer>(
-        &ctx.root,
-        DeveloperArgs {
-            supervisor: ctx.supervisor.clone(),
-            backend: Arc::clone(&ctx.developer_backend),
-            assignment: ctx.config.roles.developer.clone(),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-    let reviewer = RootSupervisor::spawn_child::<Reviewer>(
-        &ctx.root,
-        ReviewerArgs {
-            supervisor: ctx.supervisor.clone(),
-            backend: Arc::clone(&ctx.reviewer_backend),
-            assignment: ctx.config.roles.reviewer.clone(),
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
     let mut guard = DriverGuard {
         task_id: task_id.0.clone(),
         plan_slug: ctx.plan_slug.clone(),
         worktree_manager: ctx.worktree_manager.clone(),
-        developer: Some(developer.clone()),
-        reviewer: Some(reviewer.clone()),
         worktree_removed: false,
     };
 
@@ -1787,9 +1349,7 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
 
     loop {
         // ── Develop + gate loop (task 22) ──────────────────────────────────────
-        match develop_until_gates_pass(ctx, task_id, &developer, &worktree.path, feedback.take())
-            .await
-        {
+        match develop_until_gates_pass(ctx, task_id, &worktree.path, feedback.take()).await {
             Ok(DevelopGateOutcome::ReadyForReview) => {
                 // Gates passed; task is now InReview. Fall through to the Reviewer.
             }
@@ -1823,16 +1383,18 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
             let graph = ctx.graph.lock().await;
             task_clone_locked(&graph, task_id)?
         };
-        let review_result = reviewer
-            .ask(Review {
+        let review_result = shield_review_turn(
+            Arc::clone(&ctx.reviewer_backend),
+            ctx.config.roles.reviewer.clone(),
+            Review {
                 task: review_task,
                 worktree: worktree.path.clone(),
                 run: ctx.control.run,
                 sink: Arc::clone(&ctx.control.sink),
                 idle_secs: ctx.config.caps.idle_secs,
-            })
-            .send()
-            .await;
+            },
+        )
+        .await;
 
         // On reviewer ask/parse failure we are in `InReview`.  Task 25 made
         // `InReview --HardError--> Failed` legal, so we drive the task to a
@@ -1843,9 +1405,7 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
             Err(rev_err) => {
                 // Classify the typed error — no string matching needed.
                 let (failure_kind, msg): (api::FailureKind, String) = match rev_err {
-                    kameo::error::SendError::HandlerError(ReviewerError::IdleTimeout {
-                        idle_secs,
-                    }) => (
+                    ReviewerError::IdleTimeout { idle_secs } => (
                         api::FailureKind::IdleTimeout,
                         format!("no agent output for {idle_secs}s"),
                     ),
@@ -2088,8 +1648,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
 ///
 /// Identical within-task behavior to task 22 — only adapted for the concurrent
 /// driver: it takes the [`DriverContext`] (shared graph + gate runner + config)
-/// and the **per-task** Developer ref, and observes the graph-lock discipline
-/// (the guard is never held across an `.await`).
+/// and observes the graph-lock discipline (the guard is never held across an
+/// `.await`).
 ///
 /// Drives: dispatch the Developer (with `initial_feedback`), run all configured
 /// gates in the worktree; on a gate failure self-loop (InProgress
@@ -2106,7 +1666,6 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
 async fn develop_until_gates_pass(
     ctx: &DriverContext,
     task_id: &TaskId,
-    developer: &ActorRef<Developer>,
     worktree_path: &Path,
     initial_feedback: Option<String>,
 ) -> Result<DevelopGateOutcome, String> {
@@ -2119,24 +1678,24 @@ async fn develop_until_gates_pass(
             task_clone_locked(&graph, task_id)?
         };
 
-        let develop_result = developer
-            .ask(Develop {
+        let develop_result = shield_develop_turn(
+            Arc::clone(&ctx.developer_backend),
+            ctx.config.roles.developer.clone(),
+            Develop {
                 task,
                 worktree: worktree_path.to_path_buf(),
                 feedback: feedback.take(),
                 run: ctx.control.run,
                 sink: Arc::clone(&ctx.control.sink),
                 idle_secs: ctx.config.caps.idle_secs,
-            })
-            .send()
-            .await;
+            },
+        )
+        .await;
 
         if let Err(dev_err) = develop_result {
             // Classify the typed error — no string matching needed.
             let (failure_kind, msg): (api::FailureKind, String) = match dev_err {
-                kameo::error::SendError::HandlerError(DeveloperError::IdleTimeout {
-                    idle_secs,
-                }) => (
+                DeveloperError::IdleTimeout { idle_secs } => (
                     api::FailureKind::IdleTimeout,
                     format!("no agent output for {idle_secs}s"),
                 ),

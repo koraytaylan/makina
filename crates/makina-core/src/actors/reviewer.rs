@@ -1,41 +1,26 @@
-//! `Reviewer` actor — spoke that evaluates a Developer's output.
+//! Reviewer role turn — evaluates a Developer's output.
 //!
 //! # Role
 //!
-//! The `Reviewer` is a spoke in the star topology.  It holds a reference to the
-//! domain [`Supervisor`] hub and communicates only with it.  Its job is to
-//! receive a review assignment from the Supervisor, evaluate the Developer's
-//! changes (by driving the injected [`AgentBackend`]), parse the agent's
-//! structured verdict, and return a [`ReviewVerdict`] to the Supervisor.
-//!
-//! # Star topology
-//!
-//! The `Reviewer` holds an `ActorRef<Supervisor>` in its state — the **only**
-//! actor ref it is allowed to hold.  Reviewer-to-Developer communication is
-//! forbidden; all coordination routes through the Supervisor.
-//!
-//! **Note on stale refs after hub restart**: `ActorRef<Supervisor>` is `Clone +
-//! Send + Sync`, so it is a valid `Args` field and survives spoke-level restarts.
-//! However, if the domain `Supervisor` itself is restarted by the
-//! `RootSupervisor`, all spokes will hold a stale ref.  Resolving this is
-//! deferred to a later fault-tolerance task.
+//! The Reviewer turn receives a review assignment, evaluates the Developer's
+//! changes by driving the injected [`AgentBackend`], parses the structured
+//! verdict, and returns it to the scheduler.
 //!
 //! # Backend injection
 //!
-//! The agent backend is injected as `Arc<dyn AgentBackend>` via [`ReviewerArgs`]
-//! (mirroring the Developer).  Tests inject
+//! The agent backend is injected as `Arc<dyn AgentBackend>`. Tests inject
 //! [`NoopBackend`](crate::backend::noop::NoopBackend) configured to return a
 //! verdict JSON; production injects the ACP backend.
 //!
 //! # The review turn (task 21)
 //!
-//! On [`Review`] the actor:
+//! [`review`] does the following:
 //! 1. Builds a [`SessionConfig`] via [`session_config_for(Role::Reviewer, …)`].
 //! 2. Spawns a session on the backend with the task's worktree as the working dir.
 //! 3. Sends a prompt asking for a review of the task's work (per the
 //!    [`REVIEWER_SYSTEM_PROMPT`](crate::roles::REVIEWER_SYSTEM_PROMPT) contract).
 //! 4. Drains the [`ResponseStream`], then [`parse_review_verdict`]s the output.
-//! 5. Terminates the session and returns the [`ReviewVerdict`] to the Supervisor.
+//! 5. Terminates the session and returns the [`ReviewVerdict`].
 //!
 //! [`session_config_for(Role::Reviewer, …)`]: crate::roles::session_config_for
 //! [`SessionConfig`]: crate::backend::SessionConfig
@@ -46,8 +31,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kameo::actor::ActorRef;
-
 use crate::api;
 use crate::backend::{AgentBackend, Prompt};
 use crate::config::RoleAssignment;
@@ -55,7 +38,7 @@ use crate::roles::{Role, parse_review_verdict, session_config_for};
 use crate::task::Task;
 
 use super::agent_turn::{DrainError, drain_agent_turn};
-use super::supervisor::{EventSink, Supervisor};
+use super::supervisor::EventSink;
 
 // ── Typed error for the Review reply ─────────────────────────────────────────
 
@@ -93,67 +76,6 @@ impl std::fmt::Display for ReviewerError {
 /// to compile without change.
 pub use crate::roles::ReviewVerdict;
 
-// ── Actor ─────────────────────────────────────────────────────────────────────
-
-/// Spoke actor that evaluates a Developer's output and returns a
-/// [`ReviewVerdict`].
-///
-/// Spawnable as a supervised child of [`crate::supervision::RootSupervisor`].
-/// The `Supervisor` ref and the [`AgentBackend`] are passed via
-/// [`ReviewerArgs`].
-pub struct Reviewer {
-    /// Reference to the domain Supervisor hub.
-    ///
-    /// Retained as the star-topology anchor.  The current sequential loop
-    /// (task 21) drives the Reviewer via `ask` and reads the verdict reply, so
-    /// this ref is presently unused for outbound messages.
-    #[allow(dead_code)]
-    supervisor: ActorRef<Supervisor>,
-
-    /// The injected agent backend used to spawn reviewer sessions.
-    ///
-    /// Shared (`Arc`) with the Developer and the Supervisor's wiring.
-    backend: Arc<dyn AgentBackend>,
-
-    /// The role assignment (provider, mode, model, effort) for the Reviewer.
-    /// Carried to `session_config_for` so the ACP backend applies the selections.
-    assignment: Option<RoleAssignment>,
-}
-
-/// Construction arguments for [`Reviewer`].
-///
-/// Both fields are `Clone + Sync` (see [`DeveloperArgs`](super::developer::DeveloperArgs)
-/// for the reasoning), satisfying the `C::Args: Clone + Sync` bound required by
-/// [`crate::supervision::RootSupervisor::spawn_child`].
-#[derive(Clone)]
-pub struct ReviewerArgs {
-    /// The domain Supervisor hub this Reviewer will report to.
-    pub supervisor: ActorRef<Supervisor>,
-
-    /// The agent backend the Reviewer drives to produce a verdict.
-    pub backend: Arc<dyn AgentBackend>,
-
-    /// The role assignment (provider, mode, model, effort) for the Reviewer.
-    ///
-    /// When `Some`, the defaults from the assignment (mode/model/effort) are
-    /// threaded into [`SessionConfig`] so the ACP backend can apply them after
-    /// `session/new`. When `None`, no selections are applied.
-    pub assignment: Option<RoleAssignment>,
-}
-
-impl kameo::actor::Actor for Reviewer {
-    type Args = ReviewerArgs;
-    type Error = std::convert::Infallible;
-
-    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        Ok(Reviewer {
-            supervisor: args.supervisor,
-            backend: args.backend,
-            assignment: args.assignment,
-        })
-    }
-}
-
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 /// Instruct the Reviewer to evaluate the Developer's output for `task` inside
@@ -189,99 +111,91 @@ pub struct Review {
 /// across the spokes (addressing the actor-traits review note).
 pub type ReviewReply = Result<ReviewVerdict, ReviewerError>;
 
-impl kameo::message::Message<Review> for Reviewer {
-    type Reply = ReviewReply;
+/// Run one Reviewer turn against `backend`.
+pub async fn review(
+    backend: Arc<dyn AgentBackend>,
+    assignment: Option<RoleAssignment>,
+    msg: Review,
+) -> ReviewReply {
+    // 1. Build a reviewer session config rooted at the task's worktree,
+    //    carrying the role assignment (mode/model/effort) from `self.assignment`.
+    let config = {
+        let mut c = session_config_for(Role::Reviewer, msg.worktree.clone(), assignment.clone());
+        c.task_id = Some(msg.task.id.0.clone());
+        c
+    };
 
-    async fn handle(
-        &mut self,
-        msg: Review,
-        _ctx: &mut kameo::message::Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // 1. Build a reviewer session config rooted at the task's worktree,
-        //    carrying the role assignment (mode/model/effort) from `self.assignment`.
-        let config = {
-            let mut c = session_config_for(
-                Role::Reviewer,
-                msg.worktree.clone(),
-                self.assignment.clone(),
-            );
-            c.task_id = Some(msg.task.id.0.clone());
-            c
-        };
+    // 2. Spawn a session on the injected backend.
+    let mut session = backend
+        .spawn(config)
+        .await
+        .map_err(|e| ReviewerError::Other(format!("reviewer backend spawn failed: {e}")))?;
 
-        // 2. Spawn a session on the injected backend.
-        let mut session = self
-            .backend
-            .spawn(config)
-            .await
-            .map_err(|e| ReviewerError::Other(format!("reviewer backend spawn failed: {e}")))?;
+    let task_id = api::TaskId(msg.task.id.0.clone());
 
-        let task_id = api::TaskId(msg.task.id.0.clone());
-
-        // Surface discovered capabilities to the TUI (step 5 of task 0040).
-        if let Some(capabilities) = session.capabilities() {
-            (msg.sink)(api::Event::SessionCapabilities {
-                run: msg.run,
-                task: task_id.clone(),
-                role: api::AgentRole::Reviewer,
-                capabilities,
-            });
-        }
-
-        // 3. Prompt for a structured review verdict.
-        let prompt_text = build_review_prompt(&msg.task);
-
-        // Publish the outgoing prompt as the Reviewer "user turn" (task 31).
-        (msg.sink)(api::Event::AgentExchange {
+    // Surface discovered capabilities to the TUI (step 5 of task 0040).
+    if let Some(capabilities) = session.capabilities() {
+        (msg.sink)(api::Event::SessionCapabilities {
             run: msg.run,
             task: task_id.clone(),
             role: api::AgentRole::Reviewer,
-            event: api::ExchangeEvent::PromptSent {
-                text: prompt_text.clone(),
-            },
+            capabilities,
         });
-
-        let turn_start = Instant::now();
-        let stream = match session.prompt(Prompt::new(prompt_text)).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                let _ = session.terminate().await;
-                return Err(ReviewerError::Other(format!("reviewer prompt failed: {e}")));
-            }
-        };
-
-        // 4. Drain the response stream into the raw verdict text, publishing each
-        //    chunk as a live `ResponseChunk` and the turn end as `TurnComplete`.
-        //    When `idle_secs` is configured, wrap each next() await with a timeout
-        //    so the watchdog fires on prolonged silence.
-        let mut events = stream;
-        let (output, _usage) = drain_agent_turn(
-            &mut *session,
-            &mut events,
-            api::AgentRole::Reviewer,
-            task_id.clone(),
-            msg.idle_secs,
-            &msg.sink,
-            msg.run,
-            turn_start,
-            self.assignment.as_ref(),
-        )
-        .await
-        .map_err(|err| match err {
-            DrainError::IdleTimeout { idle_secs } => ReviewerError::IdleTimeout { idle_secs },
-            DrainError::Stream(e) => ReviewerError::Other(format!("reviewer stream error: {e}")),
-            DrainError::EndedUnexpectedly => {
-                ReviewerError::Other("reviewer stream ended unexpectedly".to_string())
-            }
-        })?;
-
-        // 5. Terminate the session (idempotent).
-        let _ = session.terminate().await;
-
-        // 6. Parse the agent's output into a structured verdict.
-        parse_review_verdict(&output)
-            .map_err(|e| ReviewerError::Other(format!("failed to parse review verdict: {e}")))
     }
+
+    // 3. Prompt for a structured review verdict.
+    let prompt_text = build_review_prompt(&msg.task);
+
+    // Publish the outgoing prompt as the Reviewer "user turn" (task 31).
+    (msg.sink)(api::Event::AgentExchange {
+        run: msg.run,
+        task: task_id.clone(),
+        role: api::AgentRole::Reviewer,
+        event: api::ExchangeEvent::PromptSent {
+            text: prompt_text.clone(),
+        },
+    });
+
+    let turn_start = Instant::now();
+    let stream = match session.prompt(Prompt::new(prompt_text)).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            let _ = session.terminate().await;
+            return Err(ReviewerError::Other(format!("reviewer prompt failed: {e}")));
+        }
+    };
+
+    // 4. Drain the response stream into the raw verdict text, publishing each
+    //    chunk as a live `ResponseChunk` and the turn end as `TurnComplete`.
+    //    When `idle_secs` is configured, wrap each next() await with a timeout
+    //    so the watchdog fires on prolonged silence.
+    let mut events = stream;
+    let (output, _usage) = drain_agent_turn(
+        &mut *session,
+        &mut events,
+        api::AgentRole::Reviewer,
+        task_id.clone(),
+        msg.idle_secs,
+        &msg.sink,
+        msg.run,
+        turn_start,
+        assignment.as_ref(),
+    )
+    .await
+    .map_err(|err| match err {
+        DrainError::IdleTimeout { idle_secs } => ReviewerError::IdleTimeout { idle_secs },
+        DrainError::Stream(e) => ReviewerError::Other(format!("reviewer stream error: {e}")),
+        DrainError::EndedUnexpectedly => {
+            ReviewerError::Other("reviewer stream ended unexpectedly".to_string())
+        }
+    })?;
+
+    // 5. Terminate the session (idempotent).
+    let _ = session.terminate().await;
+
+    // 6. Parse the agent's output into a structured verdict.
+    parse_review_verdict(&output)
+        .map_err(|e| ReviewerError::Other(format!("failed to parse review verdict: {e}")))
 }
 
 // ── Prompt construction ─────────────────────────────────────────────────────────

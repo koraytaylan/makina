@@ -143,7 +143,7 @@ git clone /path/to/repo /tmp/repo-trial && cd /tmp/repo-trial
 
 | Crate | Role |
 |-------|------|
-| [`makina-core`](crates/makina-core) | Orchestration engine: kameo actors, the task state machine, worktrees, gate runner, squash-merge, config, the agent-backend trait, and the `api` the TUI consumes. |
+| [`makina-core`](crates/makina-core) | Orchestration engine: Tokio scheduler, role turns, the task state machine, worktrees, gate runner, squash-merge, config, the agent-backend trait, and the `api` the TUI consumes. |
 | [`makina-acp`](crates/makina-acp) | The ACP agent-backend: spawns the agent CLI and speaks JSON-RPC over stdio. |
 | [`makina`](crates/makina) | The ratatui TUI — the binary and entry point. |
 

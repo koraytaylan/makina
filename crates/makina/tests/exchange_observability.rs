@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   NoopBackend::scripted([Text, Thought, Thought, ToolCall, Update, Update, Text])
-//!     → real Developer actor (forwards each ResponseEvent as an ExchangeEvent)
+//!     → real Developer turn (forwards each ResponseEvent as an ExchangeEvent)
 //!       → real CoreApi event stream (Event::AgentExchange)
 //!         → real App::update(AppEvent::ApiEvent(..))  (the binary's path for AgentExchange)
 //!           → App::exchange_logs[(RunId, task)]  (ExchangeLog)
@@ -20,7 +20,7 @@
 //! `AgentExchange` events (the binary additionally remaps `RunOpened`→`RunLoaded`,
 //! which is irrelevant to the exchange events under test).  There
 //! is no shortcut: every event observed here was produced by the real
-//! actor-forwarding code over the real broadcast event stream.
+//! role-turn forwarding code over the real broadcast event stream.
 //!
 //! # Why this would have FAILED before the plan
 //!
@@ -180,7 +180,7 @@ fn write_task_list(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 /// `AppEvent::ApiEvent` path the binary uses for `AgentExchange` events), and asserts the per-task
 /// `ExchangeLog`.
 ///
-/// Multi-thread runtime: the background scheduler + the per-task actor tree all
+/// Multi-thread runtime: the background scheduler + per-task driver futures all
 /// make progress concurrently while this test polls/consumes the event stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_turn_with_thoughts_and_tools_surfaces_in_exchange_log() {
@@ -190,6 +190,10 @@ async fn full_turn_with_thoughts_and_tools_surfaces_in_exchange_log() {
     ));
     let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::scripted(rich_turn()));
     let repo = setup_temp_repo();
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    // SAFETY: serialized by HOME_ENV_LOCK for the duration of this async test.
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     let wm = WorktreeManager::new(repo.path().to_path_buf(), "develop".into());
     let api: Arc<dyn Api> = Arc::new(CoreApi::new(interpreter, backend, wm, no_gate_config()));
 

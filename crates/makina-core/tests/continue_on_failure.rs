@@ -10,17 +10,16 @@
 //!    the failed one as `Failed`, and `run_with_timeout` does **not** return
 //!    `Err` (the run is a completed-but-failed run, not a hard run-level error).
 //! 2. **A genuine panic stays fatal** — when a driver future `panic!`s, the
-//!    `RunReadyTasks` reply is `Err(_)` whose message contains `"panicked"`
+//!    scheduler join result is `Err(_)` whose message contains `"panicked"`
 //!    (the `fatal_error` path in `scheduler`).
 //!
 //! # Failure injection (per the task spec)
 //!
 //! The run-wide `false`-gate path (gates live in `Config`) cannot fail exactly
 //! one of three independents, so these tests use **test-only backends keyed by
-//! task id**.  A session's task id is recoverable from
-//! [`SessionConfig::working_dir`] — the worktree path is
-//! `.makina/worktrees/{plan_slug}--{task_id}`, so the task id is the part of the
-//! final component after the `--` delimiter.
+//! task id**. A session's task id is recoverable from
+//! [`SessionConfig::working_dir`] by comparing its final component with
+//! `paths::short_worktree_name(plan_slug, task_id)`.
 //!
 //! - [`FailOneBackend`] returns `Err` from `prompt()` for the designated task
 //!   (driving it to `Failed` via the Developer hard-error path) and the usual
@@ -30,9 +29,12 @@
 //! # Test-strategy compliance (see `docs/spec/testing-strategy.md`)
 //!
 //! - The agent stand-in is an in-process backend — no real CLI, no model call.
-//! - Determinism: `ask`-driven, bounded by [`tokio::time::timeout`] — no sleeps.
+//! - Determinism: awaited scheduler completion, bounded by
+//!   [`tokio::time::timeout`] — no sleeps.
 //! - Each test uses a fresh temporary git repo (`tempfile`); the real repo is
 //!   never touched.  The temp-repo setup mirrors the other integration tests.
+
+mod common;
 
 use std::process::Command;
 use std::sync::Arc;
@@ -42,18 +44,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream;
 
-use makina_core::actors::{
-    RunReadyTasks, RunReport, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs,
-    TaskGraphSnapshot,
-};
+use makina_core::actors::RunReport;
 use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
 };
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::paths;
-use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-use makina_core::worktree::WorktreeManager;
 
 // ── Task matching ───────────────────────────────────────────────────────────────
 
@@ -281,7 +278,7 @@ fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-// ── Task / graph / actor-tree builders ───────────────────────────────────────────
+// ── Task / graph / scheduler helpers ────────────────────────────────────────────
 
 /// Build a `New` task with the given `id` and dependencies.
 fn task(id: &str, deps: &[&str]) -> Task {
@@ -311,63 +308,34 @@ fn config(concurrency: usize) -> Config {
     cfg
 }
 
-/// Spawn the actor tree over `repo_root` with `backend` + `config`, wire the
-/// per-task-spawn deps via `SetSpokes`, and return `(root, supervisor_ref)`.
-async fn build_actor_tree(
-    repo_root: std::path::PathBuf,
-    backend: Arc<dyn AgentBackend>,
-    cfg: Config,
-) -> (
-    kameo::actor::ActorRef<RootSupervisor>,
-    kameo::actor::ActorRef<Supervisor>,
-) {
-    let root = RootSupervisor::start();
-
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
-            config: cfg,
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&backend),
-            reviewer_backend: Arc::clone(&backend),
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
-    (root, supervisor_ref)
-}
-
-/// Bounded run: drive `RunReadyTasks` with a hard timeout so a deadlock fails
+/// Bounded run: drive the scheduler with a hard timeout so a deadlock fails
 /// fast instead of hanging the suite.  Unwraps the hub-level `Result` (the run
 /// must NOT hard-error for the continue-on-failure case).
-async fn run_with_timeout(supervisor_ref: &kameo::actor::ActorRef<Supervisor>) -> RunReport {
-    run_raw(supervisor_ref)
+async fn run_with_timeout(
+    repo_root: std::path::PathBuf,
+    graph: TaskGraph,
+    backend: Arc<dyn AgentBackend>,
+    cfg: Config,
+) -> (RunReport, common::SharedTaskGraph) {
+    run_raw(repo_root, graph, backend, cfg)
         .await
-        .expect("RunReadyTasks must not hard-error (a task-level failure must not halt the run)")
+        .expect("run_graph must not hard-error (a task-level failure must not halt the run)")
 }
 
-/// Bounded run returning the RAW hub-level `Result` (used by the panic test,
-/// which asserts an `Err`).  The kameo `SendError` envelope (which carries the
-/// hub-level `HandlerError(String)` on the fatal path) is flattened to a plain
-/// `String` so the message text (e.g. `"task driver panicked: …"`) is testable.
-async fn run_raw(supervisor_ref: &kameo::actor::ActorRef<Supervisor>) -> Result<RunReport, String> {
+/// Bounded run returning the raw scheduler `Result` for tests that assert a
+/// run-level fatal error.
+async fn run_raw(
+    repo_root: std::path::PathBuf,
+    graph: TaskGraph,
+    backend: Arc<dyn AgentBackend>,
+    cfg: Config,
+) -> Result<(RunReport, common::SharedTaskGraph), String> {
     tokio::time::timeout(
         Duration::from_secs(20),
-        supervisor_ref.ask(RunReadyTasks).send(),
+        common::run_graph_in_repo_result(repo_root, graph, Arc::clone(&backend), backend, cfg),
     )
     .await
-    .expect("RunReadyTasks must not deadlock (timed out)")
-    .map_err(|e| e.to_string())
+    .expect("run_graph must not deadlock (timed out)")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -382,30 +350,25 @@ async fn run_continues_after_one_independent_fails() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    // `b` fails; `a` and `c` succeed + approve.  The `RunReadyTasks` path scopes
+    // `b` fails; `a` and `c` succeed + approve.  The direct test path scopes
     // worktrees with an EMPTY plan slug (see `DriverContext::plan_slug`), so the
     // backend keys on `short_worktree_name("", "b")`.
     let backend = FailOneBackend::new("", "b", r#"{"verdict":"approve"}"#);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    // Three independent ready tasks (no deps).
+    let graph = TaskGraph {
+        slug: "continue-on-failure".into(),
+        tasks: vec![task("a", &[]), task("b", &[]), task("c", &[])],
+    };
+
+    // The run must NOT hard-error even though `b` fails.
+    let (report, _) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config(2),
     )
     .await;
-
-    // Three independent ready tasks (no deps).
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "continue-on-failure".into(),
-            tasks: vec![task("a", &[]), task("b", &[]), task("c", &[])],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    // The run must NOT hard-error even though `b` fails.
-    let report = run_with_timeout(&supervisor_ref).await;
 
     // The two independents reached `Done`; the failed one is `Failed`.
     assert!(
@@ -457,8 +420,6 @@ async fn run_continues_after_one_independent_fails() {
         "only the failed task may appear in failed_tasks; got {:?}",
         report.failed_tasks
     );
-
-    root.kill();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -480,28 +441,23 @@ async fn failed_task_reason_recorded_while_dependent_is_skipped() {
 
     // `b` fails; `a` succeeds + approves.  `d` depends on the failing `b`, so it
     // must be transitively Skipped.
-    // Empty plan slug: the `RunReadyTasks` path scopes worktrees unprefixed.
+    // Empty plan slug: the direct test path scopes worktrees unprefixed.
     let backend = FailOneBackend::new("", "b", r#"{"verdict":"approve"}"#);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    // Two independent ready tasks (a, b) plus d depending on the failing b.
+    let graph = TaskGraph {
+        slug: "failed-reason-dependent-skipped".into(),
+        tasks: vec![task("a", &[]), task("b", &[]), task("d", &["b"])],
+    };
+
+    // The run must NOT hard-error even though `b` fails.
+    let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config(2),
     )
     .await;
-
-    // Two independent ready tasks (a, b) plus d depending on the failing b.
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "failed-reason-dependent-skipped".into(),
-            tasks: vec![task("a", &[]), task("b", &[]), task("d", &["b"])],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    // The run must NOT hard-error even though `b` fails.
-    let report = run_with_timeout(&supervisor_ref).await;
 
     // The surviving independent reached `Done`; the failed one is `Failed`.
     assert!(
@@ -554,20 +510,13 @@ async fn failed_task_reason_recorded_while_dependent_is_skipped() {
     );
 
     // The dependent's Skipped terminal is also visible in the final graph.
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let d = snapshot.get(&TaskId::new("d")).expect("task d present");
     assert_eq!(
         d.state,
         TaskState::Skipped,
         "d must end Skipped in the final graph"
     );
-
-    root.kill();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -575,46 +524,38 @@ async fn failed_task_reason_recorded_while_dependent_is_skipped() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// **A backend panic does not halt the run** — the spec calls for a panic
-/// backend whose `AgentSession::prompt` `panic!`s for its task.  In this actor
-/// architecture every backend call runs inside a kameo spoke (`Developer` /
-/// `Reviewer`) actor whose handler is wrapped in `catch_unwind`, so a `prompt()`
-/// panic is CONTAINED at the spoke boundary: the in-flight `Develop` ask resolves
-/// to `SendError::ActorStopped`, which the driver maps to the same task-level
-/// hard error as any other backend failure.  Under sched-continue-on-failure
-/// that is no longer fatal, so the panicking task ends `Failed` while the two
-/// independents still reach `Done` and the hub-level run does NOT hard-error.
+/// backend whose `AgentSession::prompt` `panic!`s for its task. Role turns are
+/// wrapped in `catch_unwind`, so a `prompt()` panic is contained at the role-turn
+/// boundary and mapped to the same task-level hard error as any other backend
+/// failure. Under sched-continue-on-failure that is no longer fatal, so the
+/// panicking task ends `Failed` while the two independents still reach `Done` and
+/// the run does NOT hard-error.
 ///
 /// (The scheduler's `fatal_error` "task driver panicked: …" arm fires only for a
 /// genuine panic of the JoinSet-spawned *driver future* itself — see
 /// [`scheduler_fatal_arm_reports_a_genuine_driver_future_panic`], which proves
 /// that path directly.  No backend can reach it, because every backend call is
-/// behind a `catch_unwind`-wrapped spoke actor.)
+/// behind a `catch_unwind`-wrapped role turn.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backend_prompt_panic_is_contained_and_run_continues() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
-    // `b` panics; `a` and `c` succeed + approve.  Empty plan slug (RunReadyTasks).
+    // `b` panics; `a` and `c` succeed + approve.  Empty plan slug.
     let backend = PanicBackend::new("", "b", r#"{"verdict":"approve"}"#);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "panic-is-contained".into(),
+        tasks: vec![task("a", &[]), task("b", &[]), task("c", &[])],
+    };
+
+    // A contained backend panic must NOT hard-error the run.
+    let (report, _) = run_raw(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config(2),
     )
-    .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "panic-is-contained".into(),
-            tasks: vec![task("a", &[]), task("b", &[]), task("c", &[])],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    // A contained backend panic must NOT hard-error the run.
-    let report = run_raw(&supervisor_ref)
         .await
         .expect("a CONTAINED backend panic must not halt the run (only a true driver-future panic is fatal)");
 
@@ -639,8 +580,6 @@ async fn backend_prompt_panic_is_contained_and_run_continues() {
         "the panicking task b must be Failed in outcomes; got {:?}",
         report.outcomes
     );
-
-    root.kill();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -653,7 +592,7 @@ async fn backend_prompt_panic_is_contained_and_run_continues() {
 /// returns `Err` whose message contains `"panicked"`.
 ///
 /// Because no test backend can panic the JoinSet-spawned driver future (every
-/// backend call is behind a `catch_unwind`-wrapped spoke actor), this test
+/// backend call is behind a `catch_unwind`-wrapped role turn), this test
 /// reproduces the arm's logic against a `tokio::task::JoinSet` whose spawned
 /// future `panic!`s — mirroring `scheduler`'s
 /// `join_set.spawn(task_driver(...))` → `join_next()` →

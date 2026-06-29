@@ -14,9 +14,6 @@ license = "Elastic-2.0"
 # Async runtime
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal", "test-util"] }
 
-# Actor framework
-kameo = "0.20"
-
 # TUI
 ratatui = "0.30"
 

@@ -23,6 +23,10 @@ fn writes_warn_to_per_run_log() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let repo_root = tmp.path().to_path_buf();
     let run_uid = "01HXSAMPLE0000000000000001";
+    let _home_guard = makina_core::HOME_ENV_LOCK.blocking_lock();
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    // SAFETY: serialized by HOME_ENV_LOCK for the duration of this test.
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
 
     // Build the subscriber with ONLY the per-run file layer, rooted at the temp
     // repo, and install it for the duration of the closure.
@@ -37,7 +41,8 @@ fn writes_warn_to_per_run_log() {
     // The layer writes synchronously (std::fs append) — no async flush needed —
     // but `with_default` has also dropped the subscriber by now, so all writes
     // have completed. Resolve the same path the layer used and assert content.
-    let logs_dir = makina_core::paths::run_dir(&repo_root, run_uid).join("logs");
+    let logs_dir =
+        makina_core::paths::run_logs_dir(&repo_root, run_uid).expect("run_logs_dir must resolve");
     let log_file = logs_dir.join("run.log");
 
     assert!(

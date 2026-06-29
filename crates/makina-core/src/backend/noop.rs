@@ -290,15 +290,11 @@ impl AgentSession for NoopSession {
 #[cfg(test)]
 mod tests {
     //! Unit tests for [`NoopBackend`] and [`NoopSession`], plus the required
-    //! "actor drives backend without a real CLI" integration test using kameo.
+    //! "backend turn without a real CLI" integration test.
 
     use std::path::PathBuf;
 
     use futures::StreamExt;
-    use kameo::{
-        actor::{ActorRef, Spawn},
-        message::{Context, Message},
-    };
 
     use super::*;
     use crate::backend::{AgentBackend, BackendError, Prompt, ResponseEvent, SessionConfig};
@@ -503,133 +499,68 @@ mod tests {
         assert_eq!(recorded, vec!["from-s1", "from-s2"]);
     }
 
-    // ── actor-drives-backend test ─────────────────────────────────────────────
-    //
-    // Required test: "a test drives an actor through the backend without a real CLI".
-    //
-    // A tiny kameo actor (`BackendActor`) holds a `Box<dyn AgentBackend>`.  On
-    // receiving a `RunPrompt` message it:
-    //   1. Spawns a session from the backend.
-    //   2. Sends the prompt text from the message.
-    //   3. Drains the `ResponseStream`, collecting `TextChunk` text until
-    //      `TurnComplete`.
-    //   4. Terminates the session.
-    //   5. Returns the concatenated response text.
-    //
-    // The test then asserts:
-    //   a. The canned response came back correctly.
-    //   b. `recorded_prompts()` on the shared backend shows the exact prompt the
-    //      actor sent.
-
-    struct BackendActor {
+    async fn run_prompt_through_backend(
         backend: Box<dyn AgentBackend>,
-    }
-
-    impl kameo::actor::Actor for BackendActor {
-        type Args = Box<dyn AgentBackend>;
-        type Error = std::convert::Infallible;
-
-        async fn on_start(
-            args: Self::Args,
-            _actor_ref: ActorRef<Self>,
-        ) -> Result<Self, Self::Error> {
-            Ok(BackendActor { backend: args })
-        }
-    }
-
-    /// Message: run a single prompt through the backend and return the response.
-    struct RunPrompt {
         text: String,
-    }
+    ) -> Result<String, String> {
+        let config = SessionConfig {
+            working_dir: PathBuf::from("/tmp/noop-turn-test"),
+            system_prompt: "noop".to_string(),
+            mode: None,
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: String::new(),
+        };
+        let mut session = backend.spawn(config).await.map_err(|e| e.to_string())?;
 
-    impl Message<RunPrompt> for BackendActor {
-        type Reply = Result<String, String>;
+        let stream = session
+            .prompt(Prompt::new(text))
+            .await
+            .map_err(|e| e.to_string())?;
 
-        async fn handle(
-            &mut self,
-            msg: RunPrompt,
-            _ctx: &mut Context<Self, Self::Reply>,
-        ) -> Self::Reply {
-            // 1. Spawn a session.
-            let config = SessionConfig {
-                working_dir: PathBuf::from("/tmp/actor-test"),
-                system_prompt: "noop".to_string(),
-                mode: None,
-                model: None,
-                effort: None,
-                extra: None,
-                task_id: None,
-                run_id: String::new(),
-            };
-            let mut session = self
-                .backend
-                .spawn(config)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // 2. Send the prompt.
-            let stream = session
-                .prompt(Prompt::new(msg.text))
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // 3. Drain the stream, collecting TextChunk text until TurnComplete.
-            let mut collected = String::new();
-            let mut events = stream;
-            while let Some(item) = events.next().await {
-                match item.map_err(|e| e.to_string())? {
-                    ResponseEvent::TextChunk { text } => {
-                        if !collected.is_empty() {
-                            collected.push('\n');
-                        }
-                        collected.push_str(&text);
+        let mut collected = String::new();
+        let mut events = stream;
+        while let Some(item) = events.next().await {
+            match item.map_err(|e| e.to_string())? {
+                ResponseEvent::TextChunk { text } => {
+                    if !collected.is_empty() {
+                        collected.push('\n');
                     }
-                    // Side-channel events do not contribute to the collected
-                    // answer text.
-                    ResponseEvent::ThoughtChunk { .. }
-                    | ResponseEvent::ToolCall { .. }
-                    | ResponseEvent::ToolCallUpdate { .. }
-                    | ResponseEvent::CurrentModeUpdate { .. } => {}
-                    ResponseEvent::TurnComplete { .. } => break,
+                    collected.push_str(&text);
                 }
+                ResponseEvent::ThoughtChunk { .. }
+                | ResponseEvent::ToolCall { .. }
+                | ResponseEvent::ToolCallUpdate { .. }
+                | ResponseEvent::CurrentModeUpdate { .. } => {}
+                ResponseEvent::TurnComplete { .. } => break,
             }
-
-            // 4. Terminate the session.
-            session.terminate().await.map_err(|e| e.to_string())?;
-
-            // 5. Return collected response text.
-            Ok(collected)
         }
+
+        session.terminate().await.map_err(|e| e.to_string())?;
+
+        Ok(collected)
     }
 
     #[tokio::test]
-    async fn actor_drives_backend_without_real_cli() {
+    async fn backend_turn_runs_without_real_cli() {
         // Build a NoopBackend with a specific canned response and keep a clone
         // for later assertions (shared Arc recorder).
         let backend = NoopBackend::with_responses(vec!["the answer".into()]);
         let backend_clone = backend.clone();
 
-        // Spawn the actor, injecting the backend as a trait object.
-        let actor_ref = BackendActor::spawn(Box::new(backend) as Box<dyn AgentBackend>);
-
-        // Send the RunPrompt message and await the reply.
-        // ask().await returns Result<Reply::Ok, SendError<M, Reply::Error>>.
-        // With type Reply = Result<String, String>, Reply::Ok = String.
-        // So the outer Result wraps a SendError; the inner Result<String,String>
-        // is the handler's return value. We must send it via the kameo Reply
-        // machinery: for Result<T,E> kameo unwraps it and surfaces E as a
-        // HandlerError(SendError).  A clean success → Ok(String).
-        let response = actor_ref
-            .ask(RunPrompt {
-                text: "what is the question?".to_string(),
-            })
-            .await
-            .expect("actor ask failed (send error)");
+        let response = run_prompt_through_backend(
+            Box::new(backend) as Box<dyn AgentBackend>,
+            "what is the question?".to_string(),
+        )
+        .await
+        .expect("backend turn failed");
 
         // (a) Assert the canned response came back.
         assert_eq!(
             response, "the answer",
-            "actor should have received the canned response"
+            "turn should have received the canned response"
         );
 
         // (b) Assert the recorder captured the prompt the actor sent.

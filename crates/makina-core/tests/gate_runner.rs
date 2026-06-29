@@ -20,25 +20,22 @@
 //!   slow toolchain commands (`cargo test`, `clippy`) the strategy forbids.  The
 //!   task's done-when criteria explicitly require real `sh -c` gates run in the
 //!   worktree; these builtins are fast, side-effect-confined, and deterministic.
-//! - Determinism via `ask`/await — no arbitrary sleeps.
+//! - Determinism via awaited scheduler completion — no arbitrary sleeps.
 //! - Each test uses a fresh temporary git repo (`tempfile`); the real repo is
 //!   never touched.  The temp-repo setup mirrors `tests/develop_review_loop.rs`.
+
+mod common;
 
 use std::process::Command;
 use std::sync::Arc;
 
 use chrono::Utc;
 
-use makina_core::actors::{
-    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
-};
 use makina_core::api::FailureKind;
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{BackendConfig, CapsConfig, Config, GateConfig, PlannerConfig};
-use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-use makina_core::worktree::WorktreeManager;
 
 // ── Temp-repo helper (mirrors tests/develop_review_loop.rs) ──────────────────────
 
@@ -171,49 +168,6 @@ fn task(id: &str) -> Task {
     }
 }
 
-// ── Actor-tree builder ───────────────────────────────────────────────────────────
-
-/// Spawn the actor tree over `repo_root` with the given `backend` and `config`,
-/// wire the concurrency deps into the hub via `SetSpokes`, and return
-/// `(root, supervisor_ref)`.
-///
-/// Under task 24 the hub spawns a Developer/Reviewer pair **per task** itself, so
-/// the helper only wires the means to do so (root ref, hub ref, shared backend);
-/// it no longer pre-spawns a shared spoke pair.
-async fn build_actor_tree(
-    repo_root: std::path::PathBuf,
-    backend: Arc<dyn AgentBackend>,
-    config: Config,
-) -> (
-    kameo::actor::ActorRef<RootSupervisor>,
-    kameo::actor::ActorRef<Supervisor>,
-) {
-    let root = RootSupervisor::start();
-
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
-            config,
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&backend),
-            reviewer_backend: Arc::clone(&backend),
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
-    (root, supervisor_ref)
-}
-
 // ── Test 1: passing gates advance to review → done ───────────────────────────────
 
 /// **Done-when (1)** — a gate that always exits `0` lets the task pass gates,
@@ -232,27 +186,17 @@ async fn passing_gates_advance_to_review_and_done() {
     // A single gate that always passes.
     let config = config_with_gates(vec![gate("true", "true")], 5);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "gate-pass".into(),
+        tasks: vec![task("build-thing")],
+    };
+    let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config,
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "gate-pass".into(),
-            tasks: vec![task("build-thing")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     assert_eq!(
         report.outcomes,
@@ -260,12 +204,7 @@ async fn passing_gates_advance_to_review_and_done() {
         "passing gates should let the task reach Done"
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("build-thing"))
         .expect("task present");
@@ -277,15 +216,9 @@ async fn passing_gates_advance_to_review_and_done() {
 
     // Worktree torn down after approval.
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("build-thing")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "build-thing").exists(),
         "worktree must be gone after the run"
     );
-
-    root.kill();
 }
 
 // ── Test 2: gate failure loops, then passes ──────────────────────────────────────
@@ -326,27 +259,17 @@ async fn gate_failure_loops_then_passes_and_relays_feedback() {
     );
     let config = config_with_gates(vec![counter_gate], 5);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "gate-retry".into(),
+        tasks: vec![task("fix-thing")],
+    };
+    let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config,
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "gate-retry".into(),
-            tasks: vec![task("fix-thing")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     // Despite the first gate failure, the task ends Done.
     assert_eq!(
@@ -356,12 +279,7 @@ async fn gate_failure_loops_then_passes_and_relays_feedback() {
     );
 
     // Exactly one gate failure was counted.
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("fix-thing"))
         .expect("task present");
@@ -400,15 +318,9 @@ async fn gate_failure_loops_then_passes_and_relays_feedback() {
     );
 
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("fix-thing")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "fix-thing").exists(),
         "worktree must be gone after the run"
     );
-
-    root.kill();
 }
 
 // ── Test 3: discovered gate failure loops back to developer ─────────────────────
@@ -447,27 +359,17 @@ async fn discovered_gate_failure_loops_back_to_developer() {
     );
     let config = config_with_gates(vec![gate("configured", "true"), counter_gate], 5);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "discovered-gate-loop".into(),
+        tasks: vec![task("test-task")],
+    };
+    let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config,
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "discovered-gate-loop".into(),
-            tasks: vec![task("test-task")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     // Despite the discovered gate failure, the task ends Done.
     assert_eq!(
@@ -477,12 +379,7 @@ async fn discovered_gate_failure_loops_back_to_developer() {
     );
 
     // Exactly one gate failure was counted.
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("test-task"))
         .expect("task present");
@@ -521,15 +418,9 @@ async fn discovered_gate_failure_loops_back_to_developer() {
     );
 
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("test-task")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "test-task").exists(),
         "worktree must be gone after the run"
     );
-
-    root.kill();
 }
 
 // ── Test 4: passing gates proceed to reviewer ────────────────────────────────────
@@ -560,27 +451,17 @@ async fn passing_gates_proceed_to_reviewer() {
         5,
     );
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "discovered-pass".into(),
+        tasks: vec![task("passing-task")],
+    };
+    let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config,
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "discovered-pass".into(),
-            tasks: vec![task("passing-task")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     assert_eq!(
         report.outcomes,
@@ -588,12 +469,7 @@ async fn passing_gates_proceed_to_reviewer() {
         "passing gates (both configured and discovered) should let the task reach Done"
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("passing-task"))
         .expect("task present");
@@ -620,15 +496,9 @@ async fn passing_gates_proceed_to_reviewer() {
     );
 
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("passing-task")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "passing-task").exists(),
         "worktree must be gone after the run"
     );
-
-    root.kill();
 }
 
 // ── Test 5: cap moves the task to failed ─────────────────────────────────────────
@@ -656,27 +526,17 @@ async fn gate_cap_classifies_gatecap() {
     // A single always-failing discovered gate.
     let config = config_with_gates(vec![discovered_gate("always-fail", "false")], cap);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "discovered-gate-cap".into(),
+        tasks: vec![task("doomed-task")],
+    };
+    let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config,
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "discovered-gate-cap".into(),
-            tasks: vec![task("doomed-task")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     // The always-failing discovered gate drives the task to Failed via
     // GateCapReached.
@@ -686,12 +546,7 @@ async fn gate_cap_classifies_gatecap() {
         "an always-failing discovered gate should drive the task to Failed at the cap"
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("doomed-task"))
         .expect("task present");
@@ -733,15 +588,9 @@ async fn gate_cap_classifies_gatecap() {
 
     // The worktree was torn down on the cap failure (no leak).
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("doomed-task")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "doomed-task").exists(),
         "worktree must be torn down when the gate cap fails the task"
     );
-
-    root.kill();
 }
 
 // ── Test 6: cap moves the task to failed ─────────────────────────────────────────
@@ -763,27 +612,17 @@ async fn always_failing_gate_hits_cap_and_fails_task() {
     let cap = 3u32;
     let config = config_with_gates(vec![gate("false", "false")], cap);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let graph = TaskGraph {
+        slug: "gate-cap".into(),
+        tasks: vec![task("doomed-thing")],
+    };
+    let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config,
     )
     .await;
-
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "gate-cap".into(),
-            tasks: vec![task("doomed-thing")],
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
-
-    let report = supervisor_ref
-        .ask(RunReadyTasks)
-        .send()
-        .await
-        .expect("RunReadyTasks must drive the loop without a hard error");
 
     // The always-failing gate drives the task to Failed via GateCapReached.
     assert_eq!(
@@ -792,12 +631,7 @@ async fn always_failing_gate_hits_cap_and_fails_task() {
         "an always-failing gate should drive the task to Failed at the cap"
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask must not fail")
-        .expect("graph should be Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     let t = snapshot
         .get(&TaskId::new("doomed-thing"))
         .expect("task present");
@@ -828,13 +662,7 @@ async fn always_failing_gate_hits_cap_and_fails_task() {
 
     // The worktree was torn down on the cap failure (no leak).
     assert!(
-        !repo_root
-            .join(".makina")
-            .join("worktrees")
-            .join("doomed-thing")
-            .exists(),
+        !common::scheduler_worktree_path(&repo_root, "doomed-thing").exists(),
         "worktree must be torn down when the gate cap fails the task"
     );
-
-    root.kill();
 }

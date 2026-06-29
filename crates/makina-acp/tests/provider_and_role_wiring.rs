@@ -5,8 +5,7 @@
 //!
 //! 1. `roles_use_distinct_providers` — a config with two providers yields
 //!    Developer and Reviewer that use different backends. Exercises the full
-//!    wiring path: `run_graph` → `SetSpokes` (developer_backend / reviewer_backend)
-//!    → `task_driver` → DeveloperArgs / ReviewerArgs → each role's backend.
+//!    wiring path: `run_graph` → `task_driver` → each role's backend.
 //!
 //! 2. `selections_applied_after_session_new` — a mock agent advertising one
 //!    mode and one model config option results in `session/set_mode` and
@@ -171,9 +170,8 @@ impl AgentSession for SpySession {
 ///
 /// This test exercises the full wiring path:
 ///  - `run_graph(developer_backend=spy_a, reviewer_backend=spy_b)` →
-///  - `run_graph_inner` → `SetSpokes { developer_backend=spy_a, reviewer_backend=spy_b }` →
-///  - `task_driver` → `DeveloperArgs { backend: Arc::clone(&ctx.developer_backend) }` and
-///    `ReviewerArgs { backend: Arc::clone(&ctx.reviewer_backend) }`
+///  - `run_graph_inner` stores both backends on the driver context →
+///  - `task_driver` passes each backend to the matching role turn.
 ///
 /// After the run, `spy_a.spawn_count` > 0 (Developer called it) and
 /// `spy_b.spawn_count` > 0 (Reviewer called it). If both actors used the same
@@ -182,6 +180,10 @@ impl AgentSession for SpySession {
 async fn roles_use_distinct_providers() {
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    // SAFETY: serialized by HOME_ENV_LOCK for the duration of this async test.
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
 
     // spy_a is the Developer's backend — returns implementation text.
     let (spy_a, spawn_count_a) = SpyBackend::new(vec!["Implemented the feature.".into()]);
@@ -235,7 +237,7 @@ async fn roles_use_distinct_providers() {
     .await
     .expect("run_graph must not error");
 
-    // Task must reach Done — verifies both actors were exercised.
+    // Task must reach Done — verifies both role turns were exercised.
     assert_eq!(
         report.outcomes,
         vec![(TaskId::new(task_id), TaskState::Done)],
@@ -493,6 +495,10 @@ async fn two_providers_two_roles() {
 
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    // SAFETY: serialized by HOME_ENV_LOCK for the duration of this async test.
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
 
     // Create two spy backends: one for provider-a (Developer), one for provider-b (Reviewer).
     // Each backend will record:
@@ -583,7 +589,7 @@ async fn two_providers_two_roles() {
     .await
     .expect("run_graph must not error");
 
-    // Task must reach Done — verifies both Developer and Reviewer were exercised.
+    // Task must reach Done — verifies both Developer and Reviewer role turns were exercised.
     assert_eq!(
         report.outcomes,
         vec![(TaskId::new(task_id), TaskState::Done)],

@@ -51,6 +51,8 @@
 //! - Each test uses a fresh temporary git repo (`tempfile`); the real repo is
 //!   never touched.  The temp-repo setup mirrors the other integration tests.
 
+mod common;
+
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,16 +62,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream;
 
-use makina_core::actors::{
-    RunReadyTasks, SetSpokes, SetTaskGraph, Supervisor, SupervisorArgs, TaskGraphSnapshot,
-};
 use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
 };
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
-use makina_core::supervision::{RestartConfig, RootSupervisor};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-use makina_core::worktree::WorktreeManager;
 use tokio::sync::Barrier;
 
 // ── Instrumented backend ─────────────────────────────────────────────────────────
@@ -271,7 +268,7 @@ fn status_porcelain(path: &std::path::Path) -> String {
     git_stdout(path, &["status", "--porcelain"])
 }
 
-// ── Task / graph / actor-tree builders ───────────────────────────────────────────
+// ── Task / graph / scheduler helpers ────────────────────────────────────────────
 
 /// Build a `New` task with the given `id` and dependencies.
 fn task(id: &str, deps: &[&str]) -> Task {
@@ -301,54 +298,21 @@ fn config_with_concurrency(concurrency: usize) -> Config {
     cfg
 }
 
-/// Spawn the actor tree over `repo_root` with `backend` + `config`, wire the
-/// per-task-spawn deps, and return `(root, supervisor_ref)`.
-async fn build_actor_tree(
-    repo_root: std::path::PathBuf,
-    backend: Arc<dyn AgentBackend>,
-    config: Config,
-) -> (
-    kameo::actor::ActorRef<RootSupervisor>,
-    kameo::actor::ActorRef<Supervisor>,
-) {
-    let root = RootSupervisor::start();
-
-    let supervisor_ref = RootSupervisor::spawn_child::<Supervisor>(
-        &root,
-        SupervisorArgs {
-            worktree_manager: WorktreeManager::new(repo_root, "develop".into()),
-            config,
-        },
-        RestartConfig::default(),
-    )
-    .await;
-
-    supervisor_ref
-        .ask(SetSpokes {
-            root: root.clone(),
-            supervisor: supervisor_ref.clone(),
-            developer_backend: Arc::clone(&backend),
-            reviewer_backend: Arc::clone(&backend),
-        })
-        .send()
-        .await
-        .expect("SetSpokes must be accepted");
-
-    (root, supervisor_ref)
-}
-
-/// Bounded run: drive `RunReadyTasks` with a hard timeout so a deadlock fails
+/// Bounded run: drive the scheduler with a hard timeout so a deadlock fails
 /// fast instead of hanging the suite.
 async fn run_with_timeout(
-    supervisor_ref: &kameo::actor::ActorRef<Supervisor>,
-) -> makina_core::actors::RunReport {
+    repo_root: std::path::PathBuf,
+    graph: TaskGraph,
+    backend: Arc<dyn AgentBackend>,
+    config: Config,
+) -> (makina_core::actors::RunReport, common::SharedTaskGraph) {
     tokio::time::timeout(
         Duration::from_secs(20),
-        supervisor_ref.ask(RunReadyTasks).send(),
+        common::run_graph_in_repo_result(repo_root, graph, Arc::clone(&backend), backend, config),
     )
     .await
-    .expect("RunReadyTasks must not deadlock (timed out)")
-    .expect("RunReadyTasks must not hard-error")
+    .expect("run_graph must not deadlock (timed out)")
+    .expect("run_graph must not hard-error")
 }
 
 // ── Test 1: parallel up to the limit (max observed == N) ─────────────────────────
@@ -369,38 +333,27 @@ async fn parallel_up_to_the_limit() {
     let backend = CountingBackend::new(Some(N), r#"{"verdict":"approve"}"#);
     let probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-        config_with_concurrency(N),
-    )
-    .await;
-
     // M independent tasks (no deps).
     let tasks: Vec<Task> = (0..M).map(|i| task(&format!("task-{i}"), &[])).collect();
     let graph = TaskGraph {
         slug: "parallel-test".into(),
         tasks,
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = run_with_timeout(&supervisor_ref).await;
+    let (report, graph_ref) = run_with_timeout(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config_with_concurrency(N),
+    )
+    .await;
 
     // All M tasks reached Done.
     assert_eq!(report.outcomes.len(), M, "every task must be reported once");
     for (_, state) in &report.outcomes {
         assert_eq!(*state, TaskState::Done, "every task must reach Done");
     }
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask")
-        .expect("graph Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
     for i in 0..M {
         assert_eq!(
             snapshot
@@ -422,8 +375,6 @@ async fn parallel_up_to_the_limit() {
         "max observed concurrency must be exactly N (= {N}); got {}",
         probe.max_observed()
     );
-
-    root.kill();
 }
 
 // ── Test 2: cap enforced with M ≫ N (never exceeds N) ────────────────────────────
@@ -441,24 +392,19 @@ async fn cap_enforced_with_many_tasks() {
     let backend = CountingBackend::new(Some(N), r#"{"verdict":"approve"}"#);
     let probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let tasks: Vec<Task> = (0..M).map(|i| task(&format!("t-{i:02}"), &[])).collect();
+    let graph = TaskGraph {
+        slug: "cap-test".into(),
+        tasks,
+    };
+
+    let (report, _) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config_with_concurrency(N),
     )
     .await;
-
-    let tasks: Vec<Task> = (0..M).map(|i| task(&format!("t-{i:02}"), &[])).collect();
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "cap-test".into(),
-            tasks,
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph");
-
-    let report = run_with_timeout(&supervisor_ref).await;
 
     assert_eq!(report.outcomes.len(), M, "all M tasks reported once");
     for (_, state) in &report.outcomes {
@@ -472,8 +418,6 @@ async fn cap_enforced_with_many_tasks() {
         "max observed concurrency must equal the cap N (= {N}); got {}",
         probe.max_observed()
     );
-
-    root.kill();
 }
 
 // ── Test 3: dependencies still serialize (B never overlaps A) ─────────────────────
@@ -493,26 +437,20 @@ async fn dependencies_still_serialize() {
     let backend = CountingBackend::new(None, r#"{"verdict":"approve"}"#);
     let probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-        config_with_concurrency(2), // room for 2, but the dep forbids overlap.
-    )
-    .await;
-
     // B depends on A; B authored first to prove ordering is by readiness.
     let graph = TaskGraph {
         slug: "deps-test".into(),
         tasks: vec![task("task-b", &["task-a"]), task("task-a", &[])],
     };
     graph.validate().expect("graph validates");
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph");
 
-    let report = run_with_timeout(&supervisor_ref).await;
+    let (report, _) = run_with_timeout(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config_with_concurrency(2), // room for 2, but the dep forbids overlap.
+    )
+    .await;
 
     // Both reached Done, and A completed before B (A is first in completion order
     // because B could not start until A finished).
@@ -536,8 +474,6 @@ async fn dependencies_still_serialize() {
         "a dependent task must not overlap its dependency (max concurrency 1); got {}",
         probe.max_observed()
     );
-
-    root.kill();
 }
 
 // ── Test 4: single Developer per task / no double-dispatch ───────────────────────
@@ -560,24 +496,19 @@ async fn single_dispatch_per_task() {
     let backend = CountingBackend::new(None, r#"{"verdict":"approve"}"#);
     let probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let tasks: Vec<Task> = (0..M).map(|i| task(&format!("task-{i}"), &[])).collect();
+    let graph = TaskGraph {
+        slug: "dispatch-test".into(),
+        tasks,
+    };
+
+    let (report, _) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config_with_concurrency(N),
     )
     .await;
-
-    let tasks: Vec<Task> = (0..M).map(|i| task(&format!("task-{i}"), &[])).collect();
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "dispatch-test".into(),
-            tasks,
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph");
-
-    let report = run_with_timeout(&supervisor_ref).await;
 
     // Each task appears EXACTLY once in the report (no double-dispatch).
     assert_eq!(report.outcomes.len(), M, "exactly M outcomes");
@@ -607,8 +538,6 @@ async fn single_dispatch_per_task() {
         "exactly 2 prompts (dev + review) per task; got {}",
         probe.prompts()
     );
-
-    root.kill();
 }
 
 // ── Test 5: merge serialization (all commits land; develop clean) ────────────────
@@ -628,26 +557,21 @@ async fn merges_into_develop_are_serialized_and_clean() {
     // squash-merge step close together), stressing the develop merge lock.
     let backend = CountingBackend::new(Some(N), r#"{"verdict":"approve"}"#);
 
-    let (root, supervisor_ref) = build_actor_tree(
+    let tasks: Vec<Task> = (0..M).map(|i| task(&format!("land-{i}"), &[])).collect();
+    let graph = TaskGraph {
+        slug: "merge-test".into(),
+        tasks,
+    };
+
+    let count_before = commit_count(&repo_root);
+
+    let (report, _) = run_with_timeout(
         repo_root.clone(),
+        graph,
         Arc::new(backend) as Arc<dyn AgentBackend>,
         config_with_concurrency(N),
     )
     .await;
-
-    let tasks: Vec<Task> = (0..M).map(|i| task(&format!("land-{i}"), &[])).collect();
-    supervisor_ref
-        .ask(SetTaskGraph(TaskGraph {
-            slug: "merge-test".into(),
-            tasks,
-        }))
-        .send()
-        .await
-        .expect("SetTaskGraph");
-
-    let count_before = commit_count(&repo_root);
-
-    let report = run_with_timeout(&supervisor_ref).await;
 
     // All M tasks reached Done.
     assert_eq!(report.outcomes.len(), M);
@@ -680,8 +604,6 @@ async fn merges_into_develop_are_serialized_and_clean() {
         "develop must be clean after concurrent merges; status:\n{}",
         status_porcelain(&repo_root)
     );
-
-    root.kill();
 }
 
 // ── Test 6: per-driver start/end intervals are observable & overlap ───────────────
@@ -689,7 +611,7 @@ async fn merges_into_develop_are_serialized_and_clean() {
 /// **Done-when** (`sched-parallelism-instrument`) — each driver's start/end
 /// interval is observable via the already-existing `Task.started_at` /
 /// `Task.finished_at` timestamps (stamped by `mark_started_locked` /
-/// `mark_finished_locked`), read back through the `TaskGraphSnapshot` ask.
+/// `mark_finished_locked`), read back through the shared graph snapshot.
 ///
 /// With `concurrency = 2`, a 2-party barrier forces both drivers' prompts to be
 /// simultaneously active, so the two tasks' `[started_at, finished_at]` intervals
@@ -711,25 +633,19 @@ async fn driver_intervals_observable() {
     let backend = CountingBackend::new(Some(N), r#"{"verdict":"approve"}"#);
     let probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-        config_with_concurrency(N),
-    )
-    .await;
-
     // Two independent ready tasks (no deps) so both can run at once.
     let graph = TaskGraph {
         slug: "intervals-test".into(),
         tasks: vec![task("task-a", &[]), task("task-b", &[])],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = run_with_timeout(&supervisor_ref).await;
+    let (report, graph_ref) = run_with_timeout(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config_with_concurrency(N),
+    )
+    .await;
 
     // Both tasks reached Done.
     assert_eq!(report.outcomes.len(), 2, "both tasks must be reported");
@@ -746,12 +662,7 @@ async fn driver_intervals_observable() {
         probe.max_observed()
     );
 
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask")
-        .expect("graph Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     let a = snapshot
         .get(&TaskId::new("task-a"))
@@ -770,8 +681,6 @@ async fn driver_intervals_observable() {
         a_started < b_finished && b_started < a_finished,
         "driver intervals must overlap: a=[{a_started}, {a_finished}], b=[{b_started}, {b_finished}]"
     );
-
-    root.kill();
 }
 
 // ── Test 7: ≥2 drivers overlap at concurrency=2 (deterministic) ───────────────────
@@ -786,7 +695,7 @@ async fn driver_intervals_observable() {
 /// both drivers' prompts are simultaneously active, so the peak observed
 /// concurrency settles to exactly `2`.  We additionally read each driver's
 /// `[started_at, finished_at]` interval (exposed by `sched-parallelism-instrument`
-/// via the `TaskGraphSnapshot` ask) and assert the two intervals intersect —
+/// via the shared graph snapshot) and assert the two intervals intersect —
 /// cross-checked against `max_observed() == 2` so the assertion stays
 /// deterministic (the barrier, not timing, is what proves overlap).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -801,25 +710,19 @@ async fn drivers_overlap_under_concurrency_2() {
     let backend = CountingBackend::new(Some(N), r#"{"verdict":"approve"}"#);
     let probe = backend.clone();
 
-    let (root, supervisor_ref) = build_actor_tree(
-        repo_root.clone(),
-        Arc::new(backend) as Arc<dyn AgentBackend>,
-        config_with_concurrency(N),
-    )
-    .await;
-
     // Two independent ready tasks (no deps) so both can run at once.
     let graph = TaskGraph {
         slug: "overlap-test".into(),
         tasks: vec![task("task-a", &[]), task("task-b", &[])],
     };
-    supervisor_ref
-        .ask(SetTaskGraph(graph))
-        .send()
-        .await
-        .expect("SetTaskGraph must be accepted");
 
-    let report = run_with_timeout(&supervisor_ref).await;
+    let (report, graph_ref) = run_with_timeout(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        config_with_concurrency(N),
+    )
+    .await;
 
     // Both tasks reached Done.
     assert_eq!(report.outcomes.len(), N, "both tasks must be reported");
@@ -841,12 +744,7 @@ async fn drivers_overlap_under_concurrency_2() {
     // each driver's [started_at, finished_at] and assert they intersect.  This is
     // anchored on `max_observed() == 2` above, so the overlap claim stays
     // deterministic (the barrier — not timing — is what forces it).
-    let snapshot = supervisor_ref
-        .ask(TaskGraphSnapshot)
-        .send()
-        .await
-        .expect("snapshot ask")
-        .expect("graph Some");
+    let snapshot = common::graph_snapshot(&graph_ref).await;
 
     let a = snapshot
         .get(&TaskId::new("task-a"))
@@ -865,6 +763,4 @@ async fn drivers_overlap_under_concurrency_2() {
         a_started < b_finished && b_started < a_finished,
         "driver intervals must intersect: a=[{a_started}, {a_finished}], b=[{b_started}, {b_finished}]"
     );
-
-    root.kill();
 }
