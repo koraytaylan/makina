@@ -3205,7 +3205,7 @@ fn render_ingestion_panel(app: &App, frame: &mut Frame, area: Rect) {
 /// Convert a single [`ExchangeEntry`] into display [`Line`]s.
 ///
 /// Prompt entries get a role-coloured label header; response entries are
-/// indented and shown in a lighter colour.  An in-progress streaming response
+/// rendered through the shared Markdown path. An in-progress streaming response
 /// (not yet complete) gets a trailing `▌` cursor indicator.
 /// Render one content line: parse embedded ANSI SGR runs into styled spans
 /// (no literal escape byte survives), overlaying a diff base colour where the
@@ -3263,6 +3263,30 @@ fn compact_exchange_preview(text: &str, max_chars: usize) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+fn compact_markdown_preview(app: &App, text: &str, max_chars: usize) -> Option<String> {
+    let width = max_chars.clamp(40, 240) as u16;
+    let base_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+    let rendered = render_markdown_cached(app, text, base_style, width, &app.active_theme);
+    let plain = rendered
+        .iter()
+        .filter_map(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    compact_exchange_preview(&plain, max_chars)
+}
+
 fn compact_tool_content_preview(content: &str, app: &App) -> Option<String> {
     let mut files: Vec<String> = Vec::new();
     let mut added = 0usize;
@@ -3284,14 +3308,14 @@ fn compact_tool_content_preview(content: &str, app: &App) -> Option<String> {
         if let Some(text) = line.strip_prefix('+') {
             added += 1;
             if first_added.is_none() {
-                first_added = compact_exchange_preview(text.trim(), 64);
+                first_added = compact_markdown_preview(app, text.trim(), 64);
             }
             continue;
         }
         if let Some(text) = line.strip_prefix('-') {
             removed += 1;
             if first_removed.is_none() {
-                first_removed = compact_exchange_preview(text.trim(), 64);
+                first_removed = compact_markdown_preview(app, text.trim(), 64);
             }
         }
     }
@@ -3309,7 +3333,45 @@ fn compact_tool_content_preview(content: &str, app: &App) -> Option<String> {
         return Some(summary);
     }
 
-    compact_exchange_preview(content, COMPACT_EXCHANGE_PREVIEW_CHARS)
+    compact_markdown_preview(app, content, COMPACT_EXCHANGE_PREVIEW_CHARS)
+}
+
+fn content_looks_like_markdown(content: &str) -> bool {
+    if content.contains("```")
+        || content.contains("~~~")
+        || content.contains("**")
+        || content.contains("__")
+        || content.contains('`')
+        || content.contains("](")
+    {
+        return true;
+    }
+
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("# ")
+            || trimmed.starts_with("## ")
+            || trimmed.starts_with("### ")
+            || trimmed.starts_with("> ")
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.split_once(". ").is_some_and(|(prefix, _)| {
+                !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit())
+            })
+    })
+}
+
+fn render_tool_content_lines(app: &App, content: &str, width: u16) -> Vec<Line<'static>> {
+    if content_looks_like_markdown(content) {
+        let base_style =
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
+        render_indented_markdown(app, content, base_style, width, 2)
+    } else {
+        content
+            .lines()
+            .map(|text_line| diff_overlaid_content_line(text_line, &app.active_theme))
+            .collect()
+    }
 }
 
 fn tool_content_has_change_lines(content: &str) -> bool {
@@ -3360,7 +3422,7 @@ fn exchange_entry_lines_with_tool_diff(
 
     match &entry.content {
         ExchangeContent::Prompt { text } => {
-            // Role label + prompt text on separate lines.
+            // Role label + prompt Markdown on separate lines.
             let (label, label_color) = match entry.role {
                 AgentRole::Developer => (
                     "▶ Developer prompt",
@@ -3377,18 +3439,15 @@ fn exchange_entry_lines_with_tool_diff(
                     .fg(label_color)
                     .add_modifier(Modifier::BOLD),
             )]));
-            // Render prompt text lines (split on newlines).
-            for text_line in text.lines() {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("  {text_line}"),
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-                )]));
-            }
             if text.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
                     "  (empty)",
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]));
+            } else {
+                let base_style =
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
+                lines.extend(render_indented_markdown(app, text, base_style, width, 2));
             }
         }
         ExchangeContent::Response { text, complete } => {
@@ -3458,7 +3517,7 @@ fn exchange_entry_lines_with_tool_diff(
             )];
             if !app.verbose_mode
                 && let Some(preview) =
-                    compact_exchange_preview(text, COMPACT_EXCHANGE_PREVIEW_CHARS)
+                    compact_markdown_preview(app, text, COMPACT_EXCHANGE_PREVIEW_CHARS)
             {
                 spans.push(Span::styled(
                     format!(": {preview}"),
@@ -3476,7 +3535,8 @@ fn exchange_entry_lines_with_tool_diff(
         // ── Tool (agent tool invocation) ──────────────────────────────────
         // Header "⚙ <title> [<status>]" coloured by lifecycle status is always
         // rendered. Compact mode adds an inline preview of captured content;
-        // verbose mode renders the full content below with diff styling.
+        // verbose mode renders the full content below as Markdown when the
+        // payload is Markdown-like, otherwise with diff styling.
         ExchangeContent::Tool {
             title,
             kind,
@@ -3520,11 +3580,7 @@ fn exchange_entry_lines_with_tool_diff(
             // Diff-like edit/write tools expand inline; other tool content only
             // renders in verbose mode.
             if show_full_content {
-                for text_line in content.lines() {
-                    // Re-use the Response arm's ANSI + diff overlay so an edit
-                    // diff in tool output is syntax-coloured the same way.
-                    lines.push(diff_overlaid_content_line(text_line, &app.active_theme));
-                }
+                lines.extend(render_tool_content_lines(app, content, width));
             }
         }
     }
@@ -7383,6 +7439,155 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exchange_prompt_body_renders_markdown() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let entry = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Prompt {
+                text: "Please **review** this:\n\n```rust\nlet prompt_markdown = true;\n```"
+                    .to_string(),
+            },
+        };
+
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let rendered = exchange_entry_lines(&entry, &app, 100)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Please review this:"),
+            "prompt markdown text must render without inline markers; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("let prompt_markdown = true;"),
+            "prompt fenced-code contents must render; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("**review**") && !rendered.contains("```"),
+            "prompt body must not leak raw markdown markers; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn exchange_tool_markdown_content_renders_in_verbose_mode() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let entry = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "tool-markdown".to_string(),
+                title: "Reading tool output".to_string(),
+                kind: Some("read".to_string()),
+                status: "completed".to_string(),
+                content: "### Tool notes\n\nResult is **structured**.\n\n```rust\nlet tool_markdown = true;\n```"
+                    .to_string(),
+            },
+        };
+
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.verbose_mode = true;
+
+        let rendered = exchange_entry_lines(&entry, &app, 100)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Tool notes"),
+            "tool markdown heading text must render; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Result is structured."),
+            "tool inline markdown must render without markers; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("let tool_markdown = true;"),
+            "tool fenced-code contents must render; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("### Tool notes")
+                && !rendered.contains("**structured**")
+                && !rendered.contains("```"),
+            "tool content must not leak raw markdown markers; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn compact_exchange_previews_normalize_markdown() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let thought = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Thought {
+                text: "Considering **markdown** preview text.".to_string(),
+            },
+        };
+        let tool = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "tool-preview".to_string(),
+                title: "Reading notes".to_string(),
+                kind: Some("read".to_string()),
+                status: "completed".to_string(),
+                content: "Preview has **bold** text and `inline code`.".to_string(),
+            },
+        };
+
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        assert!(!app.verbose_mode);
+
+        let rendered = exchange_entry_lines(&thought, &app, 100)
+            .into_iter()
+            .chain(exchange_entry_lines(&tool, &app, 100))
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Considering markdown preview text."),
+            "compact thought preview must render markdown as text; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Preview has bold text and inline code."),
+            "compact tool preview must render markdown as text; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("**markdown**")
+                && !rendered.contains("**bold**")
+                && !rendered.contains("`inline code`"),
+            "compact previews must not leak raw markdown markers; got:\n{rendered}"
+        );
+    }
+
     /// **No exchange yet placeholder:** when a task has no exchange log
     /// entry the pane must show a sane placeholder.
     #[test]
@@ -10799,20 +11004,24 @@ mod tests {
             })
         };
         app.update(mk(ExchangeEvent::PromptSent {
-            text: "please implement the feature".into(),
+            text: "please **implement** the feature\n\n```rust\nlet prompt_markdown = true;\n```"
+                .into(),
         }));
         app.update(mk(ExchangeEvent::ThoughtChunk {
-            text: "planning the approach".into(),
+            text: "planning **the approach**\n\n```text\nthought-code\n```".into(),
         }));
         app.update(mk(ExchangeEvent::ToolCall {
             id: "tool-1".into(),
             title: "Editing src/lib.rs".into(),
-            kind: Some("edit".into()),
+            kind: Some("read".into()),
             status: "completed".into(),
-            content: Some("@@ -1 +1 @@\n+added line".into()),
+            content: Some(
+                "### Tool notes\n\nResult has **markdown**.\n\n```rust\nlet tool_markdown = true;\n```"
+                    .into(),
+            ),
         }));
         app.update(mk(ExchangeEvent::ResponseChunk {
-            text: "all done".into(),
+            text: "all **done**\n\n```rust\nlet response_markdown = true;\n```".into(),
         }));
         app.update(mk(ExchangeEvent::TurnComplete));
 
@@ -10834,12 +11043,20 @@ mod tests {
             "the prompt text must render in the Execution section"
         );
         assert!(
+            screen.contains("let prompt_markdown = true;"),
+            "the prompt fenced-code contents must render in the Execution section"
+        );
+        assert!(
             screen.contains("Developer thought"),
             "the thought entry header must render in the Execution section"
         );
         assert!(
             screen.contains("planning the approach"),
             "the thought body must render in verbose mode"
+        );
+        assert!(
+            screen.contains("thought-code"),
+            "the thought fenced-code contents must render in verbose mode"
         );
         assert!(
             screen.contains("Editing src/lib.rs"),
@@ -10850,12 +11067,33 @@ mod tests {
             "the tool status badge must render in the Execution section"
         );
         assert!(
+            screen.contains("Tool notes") && screen.contains("Result has markdown."),
+            "the tool markdown content must render in the Execution section"
+        );
+        assert!(
+            screen.contains("let tool_markdown = true;"),
+            "the tool fenced-code contents must render in the Execution section"
+        );
+        assert!(
             screen.contains("Developer response"),
             "the response entry label must render in the Execution section"
         );
         assert!(
             screen.contains("all done"),
             "the response text must render in the Execution section"
+        );
+        assert!(
+            screen.contains("let response_markdown = true;"),
+            "the response fenced-code contents must render in the Execution section"
+        );
+        assert!(
+            !screen.contains("**implement**")
+                && !screen.contains("**the approach**")
+                && !screen.contains("**markdown**")
+                && !screen.contains("**done**")
+                && !screen.contains("```")
+                && !screen.contains("### Tool notes"),
+            "Execution section must not leak raw markdown markers; screen:\n{screen}"
         );
 
         // Chronological order: the prompt must appear before the thought,

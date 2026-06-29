@@ -160,7 +160,7 @@ pub fn render_markdown(
                 spans.push(Span::styled(t.to_string(), code_style));
             }
             Event::Text(t) => {
-                let text_str = t.to_string();
+                let mut text_str = t.to_string();
                 if in_code_block {
                     // Split code block text on newlines; each line becomes its own Line.
                     // Use trimmed_lines to skip the trailing empty element if text ends with '\n'.
@@ -192,6 +192,18 @@ pub fn render_markdown(
                         out.push(Line::from(line_spans).style(bg_style));
                     }
                 } else {
+                    if !spans.is_empty() {
+                        let leading_spaces = text_str
+                            .chars()
+                            .take_while(|ch| *ch == ' ')
+                            .map(char::len_utf8)
+                            .sum::<usize>();
+                        if leading_spaces > 0 {
+                            let leading = text_str[..leading_spaces].to_string();
+                            spans.push(Span::styled(leading, style));
+                            text_str = text_str[leading_spaces..].to_string();
+                        }
+                    }
                     // Wrap text to width when not in a code block
                     let wrapped = wrap_words(&text_str, width);
                     for (i, chunk) in wrapped.into_iter().enumerate() {
@@ -408,6 +420,25 @@ mod tests {
             .iter()
             .any(|l| l.spans.iter().any(|s| s.style != Style::default()));
         assert!(has_any_style);
+    }
+
+    #[test]
+    fn inline_markdown_preserves_spaces_after_styled_spans() {
+        let text = "Please **review** this and consider `inline code` next.";
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
+        let all_text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+
+        assert!(
+            all_text.contains("Please review this"),
+            "markdown text must keep spaces around bold spans; got {all_text:?}"
+        );
+        assert!(
+            all_text.contains("inline code next"),
+            "markdown text must keep spaces around inline code spans; got {all_text:?}"
+        );
     }
 
     #[test]
