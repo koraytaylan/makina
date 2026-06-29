@@ -3361,16 +3361,21 @@ fn content_looks_like_markdown(content: &str) -> bool {
     })
 }
 
-fn render_tool_content_lines(app: &App, content: &str, width: u16) -> Vec<Line<'static>> {
-    if content_looks_like_markdown(content) {
-        let base_style =
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-        render_indented_markdown(app, content, base_style, width, 2)
-    } else {
+fn render_tool_content_lines(
+    app: &App,
+    content: &str,
+    width: u16,
+    prefer_diff: bool,
+) -> Vec<Line<'static>> {
+    if prefer_diff && !content_looks_like_markdown(content) {
         content
             .lines()
             .map(|text_line| diff_overlaid_content_line(text_line, &app.active_theme))
             .collect()
+    } else {
+        let base_style =
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
+        render_indented_markdown(app, content, base_style, width, 2)
     }
 }
 
@@ -3580,7 +3585,7 @@ fn exchange_entry_lines_with_tool_diff(
             // Diff-like edit/write tools expand inline; other tool content only
             // renders in verbose mode.
             if show_full_content {
-                lines.extend(render_tool_content_lines(app, content, width));
+                lines.extend(render_tool_content_lines(app, content, width, is_diff));
             }
         }
     }
@@ -6068,6 +6073,19 @@ mod tests {
             .collect()
     }
 
+    fn row_with_text_has_bg(
+        buf: &ratatui::buffer::Buffer,
+        needle: &str,
+        bg: ratatui::style::Color,
+    ) -> bool {
+        (0..buf.area.height).any(|row| {
+            let row_text = (0..buf.area.width)
+                .map(|col| buf[(col, row)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>();
+            row_text.contains(needle) && (0..buf.area.width).any(|col| buf[(col, row)].bg == bg)
+        })
+    }
+
     fn col_has_scrollbar(buf: &ratatui::buffer::Buffer, x: u16, y0: u16, y1: u16) -> bool {
         (y0..y1).any(|y| {
             let s = buf[(x, y)].symbol();
@@ -7530,6 +7548,44 @@ mod tests {
                 && !rendered.contains("**structured**")
                 && !rendered.contains("```"),
             "tool content must not leak raw markdown markers; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn exchange_tool_indented_code_content_renders_as_markdown() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let entry = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "tool-indented-markdown".to_string(),
+                title: "Reading markdown output".to_string(),
+                kind: Some("read".to_string()),
+                status: "completed".to_string(),
+                content: "Tool output:\n\n    let indented_tool_code = true;".to_string(),
+            },
+        };
+
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.verbose_mode = true;
+        let lines = exchange_entry_lines(&entry, &app, 100);
+        let code_bg = app.active_theme.get(crate::theme::ThemeRole::CodeBlockBg);
+
+        let code_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("let indented_tool_code = true;"))
+            })
+            .expect("indented markdown code line must render");
+        assert_eq!(
+            code_line.style.bg,
+            Some(code_bg),
+            "indented code in non-diff tool output must render as a markdown code block"
         );
     }
 
@@ -11112,6 +11168,113 @@ mod tests {
             "exchange entries must render in chronological order \
              (prompt@{prompt} < thought@{thought} < tool@{tool} < response@{response})"
         );
+    }
+
+    #[test]
+    fn task_detail_scope_and_execution_render_markdown_code_blocks_visually() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        let mut terminal = make_terminal(140, 70);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/markdown-detail.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("markdown-detail"),
+                title: "Markdown Detail".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "Scope has **bold** text.\n\n- Scope item one\n- Scope item two\n\n```rust\nlet scope_code = true;\n```"
+                    .to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.verbose_mode = true;
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "markdown-detail".to_string(),
+            task_id: TaskId::new("markdown-detail"),
+        });
+
+        let mk = |event: ExchangeEvent| {
+            AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: TaskId::new("markdown-detail"),
+                role: AgentRole::Developer,
+                event,
+            })
+        };
+        app.update(mk(ExchangeEvent::PromptSent {
+            text: "Prompt has **bold** text.\n\n```rust\nlet prompt_code = true;\n```".into(),
+        }));
+        app.update(mk(ExchangeEvent::ToolCall {
+            id: "tool-md".into(),
+            title: "Reading markdown output".into(),
+            kind: Some("read".into()),
+            status: "completed".into(),
+            content: Some(
+                "Tool result has **bold** text.\n\n```rust\nlet tool_code = true;\n```".into(),
+            ),
+        }));
+        app.update(mk(ExchangeEvent::ResponseChunk {
+            text: "Response has **bold** text.\n\n```rust\nlet response_code = true;\n```".into(),
+        }));
+        app.update(mk(ExchangeEvent::TurnComplete));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Scope has bold text."),
+            "Scope inline markdown must render without raw markers; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("- Scope item one") && screen.contains("- Scope item two"),
+            "Scope list items must render as consecutive markdown list rows; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Prompt has bold text.")
+                && screen.contains("Tool result has bold text.")
+                && screen.contains("Response has bold text."),
+            "Execution markdown bodies must render inline markdown; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("let scope_code = true;")
+                && screen.contains("let prompt_code = true;")
+                && screen.contains("let tool_code = true;")
+                && screen.contains("let response_code = true;"),
+            "Scope and Execution fenced-code contents must render; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("**bold**") && !screen.contains("```"),
+            "Task detail Scope/Execution must not leak raw markdown markers; screen:\n{screen}"
+        );
+
+        let buf = terminal.backend().buffer();
+        let code_bg = app.active_theme.get(crate::theme::ThemeRole::CodeBlockBg);
+        for needle in [
+            "let scope_code = true;",
+            "let prompt_code = true;",
+            "let tool_code = true;",
+            "let response_code = true;",
+        ] {
+            assert!(
+                row_with_text_has_bg(buf, needle, code_bg),
+                "code row {needle:?} must carry the CodeBlockBg background"
+            );
+        }
     }
 
     /// **Execution section shows the empty-state hint when there is no exchange

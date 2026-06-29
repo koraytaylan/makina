@@ -216,7 +216,9 @@ pub fn render_markdown(
                 }
             }
             Event::End(TagEnd::Heading(_)) | Event::End(TagEnd::Paragraph) => {
-                out.push(finalize_line(std::mem::take(&mut spans)));
+                if !spans.is_empty() {
+                    out.push(finalize_line(std::mem::take(&mut spans)));
+                }
                 style = base;
             }
             Event::HardBreak | Event::SoftBreak => {
@@ -258,7 +260,9 @@ pub fn render_markdown(
                 spans.push(Span::styled(marker, base));
             }
             Event::End(TagEnd::Item) => {
-                out.push(finalize_line(std::mem::take(&mut spans)));
+                if !spans.is_empty() {
+                    out.push(finalize_line(std::mem::take(&mut spans)));
+                }
                 style = base;
             }
             Event::Start(Tag::BlockQuote(_)) => {
@@ -724,6 +728,27 @@ mod tests {
         assert!(all_text.contains("b"));
         assert!(all_text.contains("x"));
         assert!(all_text.contains("y"));
+    }
+
+    #[test]
+    fn list_items_do_not_emit_blank_rows_between_items() {
+        let text = "- one\n- two\n- three";
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            vec!["- one", "- two", "- three"],
+            "plain list items should render as consecutive rows without bogus blank rows"
+        );
     }
 
     #[test]
