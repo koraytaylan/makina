@@ -155,11 +155,11 @@ fn tabbed_pane_renders_open_tabs() {
 
     // Both tab titles should appear in the rendered output
     assert!(
-        screen.contains("task-1"),
+        screen.contains("task task-1 ×"),
         "tab bar should show first task tab"
     );
     assert!(
-        screen.contains("task-2"),
+        screen.contains("task task-2 ×"),
         "tab bar should show second task tab"
     );
 }
@@ -491,7 +491,7 @@ fn render_records_tab_and_sidebar_click_bounds() {
 
     terminal.draw(|frame| ui::render(&app, frame)).unwrap();
 
-    // One clickable bound per open tab, each exactly one row tall.
+    // One clickable bound and one close bound per open tab, each exactly one row tall.
     let tab_bounds = app.tab_bounds.borrow();
     assert_eq!(tab_bounds.len(), 2, "two tab chips recorded");
     let mut indices: Vec<usize> = tab_bounds.iter().map(|(i, _)| *i).collect();
@@ -500,6 +500,27 @@ fn render_records_tab_and_sidebar_click_bounds() {
     for (_, r) in tab_bounds.iter() {
         assert_eq!(r.height, 1, "each tab chip is one row");
         assert!(r.width > 0, "each tab chip has positive width");
+    }
+    let tab_close_bounds = app.tab_close_bounds.borrow();
+    assert_eq!(tab_close_bounds.len(), 2, "two tab close icons recorded");
+    let mut close_indices: Vec<usize> = tab_close_bounds.iter().map(|(i, _)| *i).collect();
+    close_indices.sort_unstable();
+    assert_eq!(
+        close_indices,
+        vec![0, 1],
+        "close indices map to open-tab indices"
+    );
+    for (idx, r) in tab_close_bounds.iter() {
+        assert_eq!(r.height, 1, "each tab close icon is one row");
+        assert_eq!(r.width, 1, "each tab close icon is one column");
+        let (_, tab_rect) = tab_bounds
+            .iter()
+            .find(|(tab_idx, _)| tab_idx == idx)
+            .expect("close icon should belong to a tab chip");
+        assert!(
+            tab_rect.x <= r.x && r.x < tab_rect.x + tab_rect.width,
+            "close icon should sit inside its tab chip"
+        );
     }
 
     // One clickable bound per visible sidebar row.

@@ -172,6 +172,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     // around to absorb a stray click.
     app.sidebar_node_bounds.borrow_mut().clear();
     app.tab_bounds.borrow_mut().clear();
+    app.tab_close_bounds.borrow_mut().clear();
     if tree_nodes.is_empty() {
         // Empty state. While a background job is running (e.g. startup plan
         // discovery) show an animated spinner + label so the empty sidebar
@@ -963,14 +964,16 @@ pub fn render(app: &App, frame: &mut Frame) {
 ///
 /// Render the tab bar showing open tabs above the main content pane.
 ///
-/// Each tab is drawn as a `│ kind label │` chip — the active one bold on a Cyan
-/// background, inactive ones dim on DarkGray — so the row reads as a tab strip.
-/// The clickable bound of every chip is recorded in `app.tab_bounds` so the
-/// event loop can activate the tab under a mouse click (see the `Down(Left)`
-/// hit-test in `event::translate_terminal_event`).
+/// Each tab is drawn as a `│ kind label × │` chip — the active one bold on a
+/// Cyan background, inactive ones dim on DarkGray — so the row reads as a tab
+/// strip. The clickable bound of every chip is recorded in `app.tab_bounds` so
+/// the event loop can activate the tab under a mouse click, and each close glyph
+/// is recorded in `app.tab_close_bounds` so it can close that tab.
 fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
     let mut bounds = app.tab_bounds.borrow_mut();
     bounds.clear();
+    let mut close_bounds = app.tab_close_bounds.borrow_mut();
+    close_bounds.clear();
     if app.tabs.open_tabs.is_empty() {
         return; // No tabs to render
     }
@@ -993,7 +996,7 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
             TabContent::PlanTask { task_id, .. } => ("task ", task_id.clone()),
             TabContent::Plan { plan_slug } => ("plan ", plan_slug.clone()),
         };
-        let chip = format!(" {kind}{label} ");
+        let chip = format!(" {kind}{label} × ");
         let chip_w = chip.chars().count() as u16;
 
         // Record the clickable bound for this chip, clamped to the bar width.
@@ -1005,6 +1008,18 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
                     x,
                     y: area.y,
                     width,
+                    height: 1,
+                },
+            ));
+        }
+        let close_x = x.saturating_add(chip_w.saturating_sub(2));
+        if close_x < area_end {
+            close_bounds.push((
+                idx,
+                Rect {
+                    x: close_x,
+                    y: area.y,
+                    width: 1,
                     height: 1,
                 },
             ));

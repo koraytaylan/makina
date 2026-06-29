@@ -892,6 +892,9 @@ pub enum AppEvent {
     OpenTab(TabContent),
     /// Close the active tab.
     CloseTab,
+    /// Close the tab at the given index — a mouse click on a tab close icon
+    /// resolves to this.
+    CloseTabAt(usize),
     /// Switch to the next tab (or wrap to the first).
     NextTab,
     /// Switch to the previous tab (or wrap to the last).
@@ -1009,15 +1012,24 @@ impl TabState {
 
     /// Close the tab at the given index. If it was the active tab, switch to an adjacent tab.
     pub fn close_tab(&mut self, idx: usize) {
-        if idx < self.open_tabs.len() {
-            self.open_tabs.remove(idx);
-            if self.open_tabs.is_empty() {
-                self.active_tab = None;
-            } else if let Some(active) = self.active_tab
-                && active >= self.open_tabs.len()
-            {
-                self.active_tab = Some(self.open_tabs.len() - 1);
-            }
+        if idx >= self.open_tabs.len() {
+            return;
+        }
+
+        let active = self.active_tab;
+        self.open_tabs.remove(idx);
+        if self.open_tabs.is_empty() {
+            self.active_tab = None;
+        } else if let Some(active) = active {
+            self.active_tab = if active == idx {
+                Some(idx.min(self.open_tabs.len() - 1))
+            } else if idx < active {
+                Some(active - 1)
+            } else if active >= self.open_tabs.len() {
+                Some(self.open_tabs.len() - 1)
+            } else {
+                Some(active)
+            };
         }
     }
 }
@@ -1416,6 +1428,11 @@ pub struct App {
     /// activate the tab under the cursor. Cleared and repopulated every frame.
     pub tab_bounds: std::cell::RefCell<Vec<(usize, Rect)>>,
 
+    /// Bounding box of each tab close icon in the tab bar, keyed by its index in
+    /// `tabs.open_tabs`, recorded during `render_tab_bar` so a mouse click can
+    /// close the tab under the cursor. Cleared and repopulated every frame.
+    pub tab_close_bounds: std::cell::RefCell<Vec<(usize, Rect)>>,
+
     /// Bounding box of each visible sidebar row, keyed by its index in
     /// `visible_tree_nodes()`, recorded during the sidebar render so a mouse
     /// click can open/focus that node's tab (mirrors keyboard Enter). Cleared
@@ -1801,6 +1818,7 @@ impl App {
             panel_geometries: std::cell::RefCell::new(Vec::new()),
             accordion_header_bounds: std::cell::RefCell::new(Vec::new()),
             tab_bounds: std::cell::RefCell::new(Vec::new()),
+            tab_close_bounds: std::cell::RefCell::new(Vec::new()),
             sidebar_node_bounds: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -3262,6 +3280,16 @@ impl App {
                 self.markdown_cache.borrow_mut().clear();
                 self.sync_selected_run_to_active_tab();
                 true
+            }
+            AppEvent::CloseTabAt(idx) => {
+                if idx < self.tabs.open_tabs.len() {
+                    self.tabs.close_tab(idx);
+                    self.markdown_cache.borrow_mut().clear();
+                    self.sync_selected_run_to_active_tab();
+                    true
+                } else {
+                    false
+                }
             }
             AppEvent::NextTab => {
                 if !self.tabs.open_tabs.is_empty() {
@@ -8422,6 +8450,30 @@ mod tests {
         assert_eq!(state.active_tab, Some(0)); // Still valid (now points to second tab)
     }
 
+    #[test]
+    fn close_tab_before_active_preserves_active_content() {
+        let mut state = TabState::new();
+        let content1 = TabContent::Plan {
+            plan_slug: "0001".to_string(),
+        };
+        let content2 = TabContent::Plan {
+            plan_slug: "0002".to_string(),
+        };
+        let content3 = TabContent::Plan {
+            plan_slug: "0003".to_string(),
+        };
+        state.open_tab(content1);
+        state.open_tab(content2.clone());
+        state.open_tab(content3);
+        state.active_tab = Some(1);
+
+        state.close_tab(0);
+
+        assert_eq!(state.open_tabs.len(), 2);
+        assert_eq!(state.active_tab, Some(0));
+        assert_eq!(state.open_tabs.get(0), Some(&content2));
+    }
+
     // ── Accordion state tests ──────────────────────────────────────────────────
 
     #[test]
@@ -10217,6 +10269,40 @@ mod tests {
             Some(0),
             "out-of-range ActivateTab is a no-op"
         );
+    }
+
+    /// A mouse click on a tab close icon (resolved to `CloseTabAt`) closes that
+    /// specific tab without first activating it.
+    #[test]
+    fn close_tab_at_event_closes_requested_tab() {
+        use crate::app::TabContent;
+
+        let mut app = make_app_with_tasks();
+        let task_a = app.runs[0].tasks[0].id.clone();
+        let task_b = app.runs[0].tasks[1].id.clone();
+        let task_c = TaskId("task-c".to_string());
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "p".into(),
+            task_id: task_a,
+        });
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "p".into(),
+            task_id: task_b.clone(),
+        });
+        app.tabs.open_tab(TabContent::Task {
+            plan_slug: "p".into(),
+            task_id: task_c,
+        });
+        app.tabs.active_tab = Some(1);
+
+        app.update(AppEvent::CloseTabAt(0));
+
+        assert_eq!(app.tabs.open_tabs.len(), 2);
+        assert_eq!(app.tabs.active_tab, Some(0));
+        assert!(matches!(
+            app.tabs.open_tabs.first(),
+            Some(TabContent::Task { task_id, .. }) if task_id == &task_b
+        ));
     }
 
     /// A mouse click on a sidebar plan row (resolved to `OpenTreeRow`) opens a

@@ -1149,16 +1149,26 @@ fn translate_terminal_event(
             MouseEventKind::ScrollUp => AppEvent::ScrollUpAt(m.column, m.row),
             MouseEventKind::ScrollDown => AppEvent::ScrollDownAt(m.column, m.row),
             MouseEventKind::Down(MouseButton::Left) => {
-                // Hit-test, in priority order: a tab chip activates that tab; a
-                // sidebar row opens/focuses that node's tab (mirrors Enter); an
-                // accordion header toggles it; otherwise begin a text selection.
+                // Hit-test, in priority order: a tab close icon closes that tab;
+                // a tab chip activates it; a sidebar row opens/focuses that
+                // node's tab (mirrors Enter); an accordion header toggles it;
+                // otherwise begin a text selection.
                 let in_bounds = |r: &ratatui::layout::Rect| {
                     r.x <= m.column
                         && m.column < r.x + r.width
                         && r.y <= m.row
                         && m.row < r.y + r.height
                 };
-                if let Some((idx, _)) = app.tab_bounds.borrow().iter().find(|(_, r)| in_bounds(r)) {
+                if let Some((idx, _)) = app
+                    .tab_close_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(_, r)| in_bounds(r))
+                {
+                    AppEvent::CloseTabAt(*idx)
+                } else if let Some((idx, _)) =
+                    app.tab_bounds.borrow().iter().find(|(_, r)| in_bounds(r))
+                {
                     AppEvent::ActivateTab(*idx)
                 } else if let Some((idx, _)) = app
                     .sidebar_node_bounds
@@ -1625,12 +1635,13 @@ mod tests {
         );
     }
 
-    /// A left click hit-tests, in priority order, the tab chips then the sidebar
-    /// rows (both recorded during render), falling back to a text selection when
-    /// the click lands on neither. This is what makes clicking a tab switch tabs
-    /// and clicking a sidebar row open/focus its tab.
+    /// A left click hit-tests, in priority order, tab close icons, tab chips,
+    /// then sidebar rows (all recorded during render), falling back to a text
+    /// selection when the click lands on none. This is what makes clicking a tab
+    /// switch tabs, clicking a close icon close it, and clicking a sidebar row
+    /// open/focus its tab.
     #[test]
-    fn left_click_hit_tests_tabs_then_sidebar_rows() {
+    fn left_click_hit_tests_tab_close_icons_tabs_then_sidebar_rows() {
         use ratatui::layout::Rect;
 
         let app = test_app();
@@ -1641,6 +1652,15 @@ mod tests {
                 x: 5,
                 y: 0,
                 width: 8,
+                height: 1,
+            },
+        ));
+        app.tab_close_bounds.borrow_mut().push((
+            1,
+            Rect {
+                x: 12,
+                y: 0,
+                width: 1,
                 height: 1,
             },
         ));
@@ -1664,7 +1684,12 @@ mod tests {
             )
         };
 
-        // Inside the tab chip → activate that tab.
+        // Inside the close icon → close that tab, even though it overlaps the chip.
+        assert!(
+            matches!(click(12, 0), AppEvent::CloseTabAt(1)),
+            "click on a tab close icon closes it"
+        );
+        // Inside the tab chip but outside the close icon → activate that tab.
         assert!(
             matches!(click(6, 0), AppEvent::ActivateTab(1)),
             "click on a tab chip activates it"
