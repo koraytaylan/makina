@@ -1130,7 +1130,18 @@ fn translate_terminal_event(
                     .iter()
                     .find(|(_, r)| in_bounds(r))
                 {
-                    AppEvent::ToggleAccordionSection(*section)
+                    let task_tab_active = app
+                        .tabs
+                        .active_tab
+                        .and_then(|idx| app.tabs.open_tabs.get(idx))
+                        .is_some_and(|content| {
+                            matches!(content, crate::app::TabContent::Task { .. })
+                        });
+                    if task_tab_active {
+                        AppEvent::ToggleTaskAccordionSection(*section)
+                    } else {
+                        AppEvent::ToggleAccordionSection(*section)
+                    }
                 } else {
                     AppEvent::SelectionStart(m.column, m.row)
                 }
@@ -4354,6 +4365,40 @@ wall_clock_secs = 1200
 
         // Should dispatch SelectionStart instead
         assert!(matches!(ev2, AppEvent::SelectionStart(10, 10)));
+    }
+
+    #[test]
+    fn test_task_accordion_header_click_toggles_task_section() {
+        use ratatui::layout::Rect;
+
+        let mut app = test_app();
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "test-plan".to_string(),
+            task_id: makina_core::api::TaskId::new("test-task"),
+        });
+        *app.accordion_header_bounds.borrow_mut() = vec![(
+            crate::app::AccordionSection::Execution,
+            Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 1,
+            },
+        )];
+
+        let click_inside = mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 7);
+        let ev = translate_terminal_event(
+            click_inside,
+            ModalState::default(),
+            crate::app::Panel::Main,
+            false,
+            &app,
+        );
+
+        assert!(matches!(
+            ev,
+            AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Execution)
+        ));
     }
 
     #[test]

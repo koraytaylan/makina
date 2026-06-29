@@ -78,6 +78,7 @@ fn render_markdown_cached(
 /// an overlay on top of the normal layout (task 28).
 pub fn render(app: &App, frame: &mut Frame) {
     let area = frame.area();
+    app.accordion_header_bounds.borrow_mut().clear();
 
     // ── Small-terminal guard ──────────────────────────────────────────────────
     // First statement in render(), before any layout. Below this the normal panes
@@ -2271,6 +2272,7 @@ fn render_task_entry_pane(
         };
 
         let mut rendered_row: u16 = 0;
+        let mut accordion_header_rows: Vec<(AccordionSection, u16)> = Vec::new();
         let mut lines: Vec<Line<'static>> = Vec::new();
         macro_rules! push_line {
             ($l:expr) => {{
@@ -2334,6 +2336,7 @@ fn render_task_entry_pane(
         let content_width = content_area.width;
 
         // SCOPE section — task's static description rendered as Markdown
+        accordion_header_rows.push((AccordionSection::Scope, rendered_row));
         for l in render_accordion_section(
             app,
             "Scope",
@@ -2352,6 +2355,7 @@ fn render_task_entry_pane(
         // log (prompts, thoughts, tools, responses) in chronological order.
         // Rendered via render_task_execution_section (not render_accordion_section)
         // because the body is rich Vec<Line> content, not a plain string.
+        accordion_header_rows.push((AccordionSection::Execution, rendered_row));
         for l in render_task_execution_section(app, run, task, &expanded, content_width) {
             push_line!(l);
         }
@@ -2366,6 +2370,24 @@ fn render_task_entry_pane(
             .insert(ScrollablePanel::TaskEntry, task_scroll_max);
 
         let task_scroll_offset = app.panel_offset(ScrollablePanel::TaskEntry, task_scroll_max);
+
+        let mut computed_bounds = Vec::new();
+        for (section, header_rendered_row) in accordion_header_rows {
+            if header_rendered_row >= task_scroll_offset
+                && header_rendered_row < task_scroll_offset + content_area.height
+            {
+                computed_bounds.push((
+                    section,
+                    Rect {
+                        x: content_area.x,
+                        y: content_area.y + (header_rendered_row - task_scroll_offset),
+                        width: content_area.width,
+                        height: 1,
+                    },
+                ));
+            }
+        }
+        *app.accordion_header_bounds.borrow_mut() = computed_bounds;
 
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -9810,6 +9832,52 @@ mod tests {
             "Done when section must be rendered"
         );
         assert!(screen.contains("Item 1"), "List items must be rendered");
+    }
+
+    #[test]
+    fn task_entry_pane_records_clickable_accordion_headers() {
+        let mut terminal = make_terminal(120, 40);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("click-test"),
+                title: "Click Test".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "Clickable task scope.".to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "test-plan".to_string(),
+            task_id: TaskId::new("click-test"),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        let bounds = app.accordion_header_bounds.borrow();
+        let sections = bounds.iter().map(|(s, _)| *s).collect::<Vec<_>>();
+        assert!(
+            sections.contains(&crate::app::AccordionSection::Scope),
+            "task Scope header bound should be present; got {sections:?}"
+        );
+        assert!(
+            sections.contains(&crate::app::AccordionSection::Execution),
+            "task Execution header bound should be present; got {sections:?}"
+        );
     }
 
     /// **Task entry pane respects pane width:** the entry_text is rendered with

@@ -61,6 +61,10 @@ pub struct TaskSnapshot {
     /// Additive field: old `run.json` files without it still load with `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<crate::api::FailureReason>,
+    /// Raw Markdown entry for this task, used to reconstruct task-detail Scope
+    /// content for disk-loaded runs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entry_text: String,
 }
 
 /// A durable snapshot of a Run's identity and lifecycle window.
@@ -267,7 +271,7 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
             started_at: t.started_at,
             finished_at: t.finished_at,
             failure_reason: t.failure_reason.clone(),
-            entry_text: String::new(),
+            entry_text: t.entry_text.clone(),
         })
         .collect();
 
@@ -500,6 +504,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: "Task one scope.\n\n### Done when\n\nTask one done.".to_string(),
             },
             TaskSnapshot {
                 id: "task-two".to_string(),
@@ -511,6 +516,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
+                entry_text: "Task two scope.".to_string(),
             },
         ];
 
@@ -554,6 +560,10 @@ mod tests {
         assert_eq!(t1.gate_iterations, 0);
         assert_eq!(t1.review_iterations, 0);
         assert!(t1.depends_on.is_empty());
+        assert_eq!(
+            t1.entry_text, "Task one scope.\n\n### Done when\n\nTask one done.",
+            "task detail Scope content must survive disk reconstruction"
+        );
 
         let t2 = &view.tasks[1];
         assert_eq!(t2.id, TaskId::new("task-two"));
@@ -562,6 +572,7 @@ mod tests {
         assert_eq!(t2.gate_iterations, 1);
         assert_eq!(t2.review_iterations, 1);
         assert_eq!(t2.depends_on, vec![TaskId::new("task-one")]);
+        assert_eq!(t2.entry_text, "Task two scope.");
     }
 
     /// A [`TaskSnapshot`] with `started_at`/`finished_at` set survives a
@@ -585,6 +596,7 @@ mod tests {
             started_at: Some(ts0),
             finished_at: Some(ts1),
             failure_reason: None,
+            entry_text: "Persisted task scope.".to_string(),
         };
 
         let json = serde_json::to_string(&snap).expect("serialize TaskSnapshot");
@@ -599,6 +611,10 @@ mod tests {
             back.finished_at,
             Some(ts1),
             "finished_at must survive serde_json round-trip"
+        );
+        assert_eq!(
+            back.entry_text, "Persisted task scope.",
+            "entry_text must survive serde_json round-trip"
         );
 
         // --- case 2: old JSON without started_at/finished_at still deserializes ---
@@ -620,6 +636,10 @@ mod tests {
         assert_eq!(
             old_snap.finished_at, None,
             "old snapshot without finished_at must deserialize to None"
+        );
+        assert!(
+            old_snap.entry_text.is_empty(),
+            "old snapshot without entry_text must deserialize to empty text"
         );
     }
 
