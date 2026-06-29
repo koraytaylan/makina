@@ -447,54 +447,10 @@ async fn resolve_io(
             let status = discover_project(app).await;
             (AppEvent::Tick, status)
         }
-        // ── Open focused node (plan 0031) ────────────────────────────────────────
-        // User pressed Enter on a focused node in the sidebar. A plan opens its
-        // plan tab; a plan's task preview opens its own task tab; a run's task
-        // node opens a run-task tab. All route through the tab infrastructure.
-        AppEvent::OpenFocusedNode => {
-            use crate::app::{TabContent, TreeNode};
-            match app.focused_node() {
-                Some(TreeNode::Plan { plan_idx }) => {
-                    if let Some(plan) = app.discovered_plans.get(plan_idx) {
-                        let plan_slug = plan.slug.clone();
-                        (AppEvent::OpenTab(TabContent::Plan { plan_slug }), None)
-                    } else {
-                        (AppEvent::Tick, Some("Plan not found".to_string()))
-                    }
-                }
-                Some(TreeNode::PlanTask { plan_idx, task_idx }) => {
-                    // A plan's task preview opens its own task tab so each task
-                    // gets a distinct tab, matching the run-task case below.
-                    if let Some(plan) = app.discovered_plans.get(plan_idx)
-                        && let Some(preview) = plan.tasks.get(task_idx)
-                    {
-                        let tab_content = TabContent::PlanTask {
-                            plan_slug: plan.slug.clone(),
-                            task_id: preview.id.clone(),
-                        };
-                        return (AppEvent::OpenTab(tab_content), None);
-                    }
-                    (AppEvent::Tick, Some("Task not found".to_string()))
-                }
-                Some(TreeNode::Task { run, task }) => {
-                    // When Enter is pressed on a task node, open a new tab for that task.
-                    if let Some(run_view) = app.runs.get(run)
-                        && let Some(task_view) = run_view.tasks.get(task)
-                    {
-                        let plan_slug =
-                            makina_core::orchestrator::plan_slug(&run_view.task_list_path);
-                        let tab_content = TabContent::Task {
-                            plan_slug,
-                            task_id: task_view.id.clone(),
-                        };
-                        return (AppEvent::OpenTab(tab_content), None);
-                    }
-                    (AppEvent::Tick, Some("Task not found".to_string()))
-                }
-                // Run nodes and plan nodes (from other branches) don't respond to Enter.
-                _ => (AppEvent::Tick, None),
-            }
-        }
+        // OpenFocusedNode is handled directly in App::update (see OpenTreeRow for symmetry).
+        // It requires mutable sidebar/ tab mutations (expand, cursor, open_tab) so it
+        // no longer transforms in resolve_io; it passes through and update performs
+        // the opens + (for Plan nodes) the sidebar expansion.
         // ── Theme selection commit (plan 0036) ──────────────────────────────────
         // When the user selects a theme in the nested palette selector, persist
         // the chosen theme name to `{repo_root}/.makina/config.toml` before
@@ -1466,7 +1422,8 @@ fn translate_key(
                 Panel::Sidebar => AppEvent::ToggleTreeNode,
                 Panel::Main => AppEvent::Tick,
             },
-            // Enter: open the focused node in the sidebar, or toggle the focused accordion section in the main pane.
+            // Enter: open the focused node in the sidebar, or toggle the focused
+            // accordion section in the main pane.
             KeyCode::Enter => match focused_panel {
                 Panel::Sidebar => AppEvent::OpenFocusedNode,
                 Panel::Main => AppEvent::ToggleTreeNode,
@@ -3971,7 +3928,7 @@ wall_clock_secs = 1200
     async fn enter_key_on_plan_node_opens_detail_pane() {
         use crate::app::{App, AppEvent, TreeNode};
         use crate::placeholder::PlaceholderApi;
-        use makina_core::orchestrator::PlanEntry;
+        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
         use std::sync::Arc;
 
         let plan_dir = std::path::PathBuf::from("docs/plans/0001-test");
@@ -3983,7 +3940,13 @@ wall_clock_secs = 1200
             dir: plan_dir.clone(),
             slug: "0001-test".to_string(),
             has_tasks: true,
-            tasks: Vec::new(),
+            tasks: vec![PlanTaskPreview {
+                id: "t1".to_string(),
+                title: "First task".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
             scope_text: None,
             architecture_text: None,
             status_text: None,
@@ -3992,31 +3955,40 @@ wall_clock_secs = 1200
         // Move cursor to the plan node (index 0 in the tree)
         app.tree_cursor = Some(0);
 
+        // Simulate initial collapsed state (as PlansDiscovered would seed).
+        app.collapsed_plans = (0..app.discovered_plans.len()).collect();
+        assert!(
+            app.collapsed_plans.contains(&0),
+            "plan should start collapsed"
+        );
+
         // Verify we're focused on a plan node
         assert!(matches!(
             app.focused_node(),
             Some(TreeNode::Plan { plan_idx: 0 })
         ));
 
-        // Resolve OpenFocusedNode: Enter on a plan now opens the read-only plan
-        // detail pane (no run is interpreted/started). Since plan 0032,
-        // Enter on a plan opens a tab via OpenTab.
+        // Resolve OpenFocusedNode (now passes through; handling + expand is in update).
         let (tx, _rx) = background_events();
         let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
 
         assert!(
-            matches!(resolved, AppEvent::OpenTab(crate::app::TabContent::Plan { ref plan_slug }) if plan_slug == "0001-test"),
-            "Enter on a plan must open a tab (plan 0032), got {resolved:?}"
+            matches!(resolved, AppEvent::OpenFocusedNode),
+            "OpenFocusedNode now passes through resolve_io (no transform), got {resolved:?}"
         );
-        assert_eq!(status, None, "opening the plan tab needs no status message");
+        assert_eq!(status, None, "no status for open-focused");
 
-        // Applying the event opens the plan tab.
+        // Applying the event opens the plan tab AND expands the plan in sidebar.
         app.update(resolved);
         assert_eq!(app.tabs.open_tabs.len(), 1);
         assert!(matches!(
             &app.tabs.open_tabs[0],
             crate::app::TabContent::Plan { plan_slug } if plan_slug == "0001-test"
         ));
+        assert!(
+            !app.collapsed_plans.contains(&0),
+            "Enter on plan node must expand it in the sidebar"
+        );
     }
 
     /// Enter on a plan's task preview opens that task's OWN tab (a `PlanTask`
@@ -4059,8 +4031,8 @@ wall_clock_secs = 1200
         let (tx, _rx) = background_events();
         let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
         assert!(
-            matches!(&resolved, AppEvent::OpenTab(crate::app::TabContent::PlanTask { plan_slug, task_id }) if plan_slug == "0001-test" && task_id == "do-thing"),
-            "Enter on a plan-task preview must open its own task tab, got {resolved:?}"
+            matches!(resolved, AppEvent::OpenFocusedNode),
+            "OpenFocusedNode passes through, got {resolved:?}"
         );
         assert_eq!(status, None);
 

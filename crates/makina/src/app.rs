@@ -766,10 +766,12 @@ pub enum AppEvent {
     },
     /// Open the focused node in the sidebar (Enter).
     ///
-    /// User pressed Enter on a `TreeNode`. The IO layer resolves this by
-    /// examining the focused node and dispatching the appropriate event: a plan
-    /// (or plan-task) node opens a plan tab via [`AppEvent::OpenTab`]; a run's task
-    /// node resolves to [`AppEvent::OpenTab`].
+    /// - On a `Plan` node: opens its plan-details tab (via the tab system) and
+    ///   expands the plan in the sidebar so its task previews become visible.
+    /// - On a `PlanTask` or `Task` node: opens a dedicated tab for that task.
+    /// - On a `Run` node that corresponds to a discovered plan (e.g. a completed
+    ///   plan's run entry in the sidebar): opens the plan's details tab.
+    /// - Run nodes without an associated plan are unaffected (just remain selected).
     OpenFocusedNode,
 
     // ── Provider configuration editor (task 0041) ──────────────────────────────
@@ -1738,6 +1740,69 @@ impl App {
         }
     }
 
+    /// Open/focus the plan-details tab for the given discovered plan index, and
+    /// ensure the plan is expanded in the sidebar (revealing its task previews).
+    /// Called from Enter (OpenFocusedNode) on Plan nodes and from mouse click
+    /// (OpenTreeRow) on plan rows.
+    fn activate_plan_node(&mut self, plan_idx: usize) {
+        if let Some(plan) = self.discovered_plans.get(plan_idx) {
+            let plan_slug = plan.slug.clone();
+            self.tabs.open_tab(TabContent::Plan { plan_slug });
+            if !plan.tasks.is_empty() {
+                self.collapsed_plans.remove(&plan_idx);
+                self.move_cursor_to_plan_header(plan_idx);
+                self.sync_selection_from_cursor();
+            }
+        }
+    }
+
+    /// Perform the "activate/open" action for whatever tree node is currently
+    /// under `tree_cursor` (the highlighted sidebar row). This is the core of
+    /// handling Enter on a sidebar node (from OpenFocusedNode) and also the
+    /// fallback for Enter in the main pane when no accordion section is focused
+    /// (so that "plan highlighted in sidebar + Enter" works even if focus has
+    /// moved to main, e.g. after Right-arrow navigation).
+    fn activate_focused_tree_node(&mut self) {
+        match self.focused_node() {
+            Some(TreeNode::Plan { plan_idx }) => {
+                self.activate_plan_node(plan_idx);
+            }
+            Some(TreeNode::PlanTask { plan_idx, task_idx }) => {
+                if let Some(plan) = self.discovered_plans.get(plan_idx)
+                    && let Some(preview) = plan.tasks.get(task_idx)
+                {
+                    let tab_content = TabContent::PlanTask {
+                        plan_slug: plan.slug.clone(),
+                        task_id: preview.id.clone(),
+                    };
+                    self.tabs.open_tab(tab_content);
+                }
+            }
+            Some(TreeNode::Task { run, task }) => {
+                if let Some(run_view) = self.runs.get(run)
+                    && let Some(task_view) = run_view.tasks.get(task)
+                {
+                    let plan_slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+                    let tab_content = TabContent::Task {
+                        plan_slug,
+                        task_id: task_view.id.clone(),
+                    };
+                    self.tabs.open_tab(tab_content);
+                    self.sync_selected_run_to_active_tab();
+                }
+            }
+            Some(TreeNode::Run { run }) => {
+                if let Some(run_view) = self.runs.get(run) {
+                    let slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+                    if self.discovered_plans.iter().any(|p| p.slug == slug) {
+                        self.tabs.open_tab(TabContent::Plan { plan_slug: slug });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Build a new [`App`] with the given api, initial run list, and repo root.
     ///
     /// Call `api.runs().await` before constructing to obtain `initial_runs`.
@@ -2477,6 +2542,13 @@ impl App {
                 if collapsed_expandable {
                     self.tree_toggle_expand(); // expand it; cursor stays on the header
                 } else {
+                    // When crossing from an expanded (or leaf) plan into the main
+                    // pane, open its details tab so the content pane shows the plan
+                    // (SCOPE/ARCH/TASKS/STATUS). This makes arrow navigation into
+                    // a plan behave like Enter (open details) + Right (cross).
+                    if let Some(TreeNode::Plan { plan_idx }) = self.focused_node() {
+                        self.activate_plan_node(plan_idx);
+                    }
                     self.focused_panel = Panel::Main;
                 }
                 true
@@ -2635,6 +2707,13 @@ impl App {
                             } else {
                                 sections.insert(focused_section);
                             }
+                        } else {
+                            // No accordion section focused (or no active plan tab):
+                            // fall back to activating whatever is highlighted in the
+                            // sidebar. This lets Enter open a plan's details tab even
+                            // when focus is in main (e.g. after using Right to cross
+                            // into main while the plan header is the highlighted node).
+                            self.activate_focused_tree_node();
                         }
                     }
                 }
@@ -2845,8 +2924,7 @@ impl App {
             | AppEvent::PauseRun
             | AppEvent::CancelRun
             | AppEvent::Reinterpret
-            | AppEvent::RetryFocused
-            | AppEvent::OpenFocusedNode => true,
+            | AppEvent::RetryFocused => true,
 
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
@@ -3319,11 +3397,19 @@ impl App {
                 }
                 true
             }
+
+            // Keyboard Enter on the currently focused sidebar tree node.
+            // (Previously this was transformed in resolve_io to an OpenTab; now
+            // handled here so we can also expand plans, which requires &mut App.)
+            AppEvent::OpenFocusedNode => {
+                self.activate_focused_tree_node();
+                true
+            }
+
             // Mouse click on a sidebar row: move the cursor there and open/focus
-            // that node's tab, mirroring the keyboard Enter (`OpenFocusedNode`)
-            // path resolved in `event::resolve_io`. Kept here (not in
-            // `resolve_io`) because moving the cursor mutates `App`, which
-            // `resolve_io` cannot do (it takes `&App`).
+            // that node's tab (and for plans, expand), mirroring the keyboard Enter
+            // (`OpenFocusedNode`). Kept here (not in `resolve_io`) because cursor
+            // mutation is needed (resolve_io only sees &App).
             AppEvent::OpenTreeRow(idx) => {
                 let nodes = self.visible_tree_nodes();
                 let Some(node) = nodes.get(idx).copied() else {
@@ -3335,10 +3421,7 @@ impl App {
                 self.sync_selection_from_cursor();
                 match node {
                     TreeNode::Plan { plan_idx } => {
-                        if let Some(plan) = self.discovered_plans.get(plan_idx) {
-                            let plan_slug = plan.slug.clone();
-                            self.tabs.open_tab(TabContent::Plan { plan_slug });
-                        }
+                        self.activate_plan_node(plan_idx);
                     }
                     TreeNode::PlanTask { plan_idx, task_idx } => {
                         // A plan's task preview opens its own task tab (distinct
@@ -3364,9 +3447,18 @@ impl App {
                             self.sync_selected_run_to_active_tab();
                         }
                     }
-                    // Clicking a run header just selects it (handled by the cursor
-                    // sync above); it opens no tab, matching Enter on a run node.
-                    TreeNode::Run { .. } => {}
+                    TreeNode::Run { run } => {
+                        // Clicking a plan-style run header (e.g. completed plans)
+                        // now opens its plan details tab, matching the new Enter
+                        // behavior. Non-plan runs just select (no tab).
+                        if let Some(run_view) = self.runs.get(run) {
+                            let slug =
+                                makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+                            if self.discovered_plans.iter().any(|p| p.slug == slug) {
+                                self.tabs.open_tab(TabContent::Plan { plan_slug: slug });
+                            }
+                        }
+                    }
                 }
                 true
             }
@@ -8238,6 +8330,15 @@ mod tests {
             Panel::Main,
             "second Right on an expanded plan crosses to content"
         );
+        // Crossing into main from a plan also opens its details tab (so the
+        // content shows the plan spec, just like Enter on the plan node).
+        assert!(
+            app.tabs.open_tabs.iter().any(|t| matches!(
+                t,
+                TabContent::Plan { plan_slug } if plan_slug == "0001-alpha"
+            )),
+            "right-cross from plan must open its plan details tab"
+        );
     }
 
     /// `Left` collapses an expanded plan back to a single header row.
@@ -9084,30 +9185,43 @@ mod tests {
     }
 
     #[test]
-    fn enter_noop_when_no_section_focused() {
+    fn enter_falls_back_to_sidebar_node_when_no_section_focused() {
+        use makina_core::orchestrator::PlanEntry;
+
         let api = Arc::new(PlaceholderApi::new());
         let mut app = App::new(api, vec![], PathBuf::from("."));
 
-        let plan_slug = "0001-test".to_string();
-
-        // Open a plan tab
-        app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+        // Discover a plan so there is a highlightable Plan node in sidebar.
+        app.update(AppEvent::PlansDiscovered {
+            plans: vec![PlanEntry {
+                dir: PathBuf::from("docs/plans/0001-test"),
+                slug: "0001-test".to_string(),
+                has_tasks: false,
+                tasks: vec![],
+                scope_text: None,
+                architecture_text: None,
+                status_text: None,
+            }],
         });
-        app.tabs.active_tab = Some(0);
+        // Cursor should be on the plan (index 0).
+        assert!(matches!(
+            app.focused_node(),
+            Some(TreeNode::Plan { plan_idx: 0 })
+        ));
 
-        // Move focus to Main pane but don't focus a specific section
+        // No plan tab open yet. Focus main with no section focused.
         app.focused_panel = Panel::Main;
         app.focused_section = None;
 
-        // Press Enter (should be a no-op)
+        // Press Enter (from main, no section): should fall back to activating the
+        // highlighted sidebar plan node, opening its details tab.
         app.update(AppEvent::ToggleTreeNode);
 
-        // accordion_state should remain empty
-        assert!(
-            app.accordion_state.is_empty(),
-            "accordion_state should remain empty when no section is focused"
-        );
+        assert_eq!(app.tabs.open_tabs.len(), 1);
+        assert!(matches!(
+            &app.tabs.open_tabs[0],
+            TabContent::Plan { plan_slug } if plan_slug == "0001-test"
+        ));
     }
 
     #[test]
@@ -10344,6 +10458,88 @@ mod tests {
                 Some(TabContent::Plan { plan_slug }) if plan_slug == "0099-clickable"
             ),
             "clicking a plan row opens that plan's tab"
+        );
+    }
+
+    /// Enter (and click) on a *run* node for a plan slug that is discovered
+    /// (i.e. "completed plans" that appear only as their run entry due to dedup)
+    /// must open the plan details tab.
+    #[test]
+    fn enter_on_plan_run_node_opens_plan_details_tab() {
+        use crate::app::{AppEvent, TabContent, TreeNode};
+        use makina_core::api::{RunId, RunStatus, RunView};
+        use makina_core::orchestrator::PlanEntry;
+
+        let mut app = make_app();
+
+        // Discover a plan.
+        app.update(AppEvent::PlansDiscovered {
+            plans: vec![PlanEntry {
+                dir: PathBuf::from("docs/plans/0042-done"),
+                slug: "0042-done".to_string(),
+                has_tasks: true,
+                tasks: vec![],
+                scope_text: None,
+                architecture_text: None,
+                status_text: None,
+            }],
+        });
+
+        // Simulate a completed run for the exact same plan slug (so sidebar shows
+        // only the Run node, not a Plan node).
+        app.runs = vec![RunView {
+            id: RunId(42),
+            run_uid: "r42".to_string(),
+            task_list_path: PathBuf::from("docs/plans/0042-done/TASKS.md"),
+            status: RunStatus::Completed,
+            project: "demo".to_string(),
+            tasks: vec![],
+            report: Default::default(),
+        }];
+
+        let nodes = app.visible_tree_nodes();
+        // Should contain exactly one Run node (plan deduped away).
+        assert!(
+            nodes.iter().any(|n| matches!(n, TreeNode::Run { .. })),
+            "run node must be present"
+        );
+        assert!(
+            !nodes.iter().any(|n| matches!(n, TreeNode::Plan { .. })),
+            "no separate plan node when run for slug exists"
+        );
+
+        let run_row = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Run { .. }))
+            .unwrap();
+
+        // Position cursor (as if arrowed there) and press Enter.
+        app.tree_cursor = Some(run_row);
+        app.update(AppEvent::OpenFocusedNode);
+
+        assert_eq!(
+            app.tabs.open_tabs.len(),
+            1,
+            "Enter on plan-run must open a plan details tab"
+        );
+        assert!(
+            matches!(
+                &app.tabs.open_tabs[0],
+                TabContent::Plan { plan_slug } if plan_slug == "0042-done"
+            ),
+            "must have opened the plan tab for the run's slug"
+        );
+
+        // Also verify the mouse path (OpenTreeRow) does the same.
+        app.tabs.open_tabs.clear();
+        app.tabs.active_tab = None;
+        app.update(AppEvent::OpenTreeRow(run_row));
+        assert!(
+            matches!(
+                app.tabs.open_tabs.first(),
+                Some(TabContent::Plan { plan_slug }) if plan_slug == "0042-done"
+            ),
+            "click on plan-run row must also open plan details tab"
         );
     }
 
