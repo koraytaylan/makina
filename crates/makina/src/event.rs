@@ -329,8 +329,19 @@ async fn resolve_io(
         // plan, `Start` opens that plan's TASKS.md as a new Run and auto-starts
         // it — so a plan can be launched from its tab/node without the [o] file
         // browser. When a Run already exists it just starts/resumes it.
+        //
+        // We only treat an active_run_id as "existing" for control purposes if
+        // api.run(id) resolves it (i.e. it is backed by a live registry entry).
+        // Disk snapshot runs (seeded at launch from load_disk_run_views) have
+        // synth ids for which run() returns None; attempting Start on them must
+        // fall through to opening a fresh run for the plan instead of erroring.
         AppEvent::StartRun => {
-            if app.active_run_id().is_some() {
+            let has_live_run = if let Some(rid) = app.active_run_id() {
+                app.api.run(rid).await.is_some()
+            } else {
+                false
+            };
+            if has_live_run {
                 (AppEvent::Tick, run_control(app, ControlKind::Start).await)
             } else {
                 match resolve_plan_to_open(app) {

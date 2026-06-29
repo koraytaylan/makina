@@ -2,8 +2,8 @@
 //!
 //! [`RunMetadata`] is a small, self-describing record of a Run's identity and
 //! lifecycle window: its persistent [`run_uid`](RunMetadata::run_uid), the
-//! human-facing `run_slug`, the terminal [`RunStatus`], and the
-//! `started_at`/`ended_at` timestamps.  It is written **best-effort** at run
+//! human-facing `run_slug`, the derived `plan_slug`, the terminal [`RunStatus`],
+//! and the `started_at`/`ended_at` timestamps.  It is written **best-effort** at run
 //! finalization by [`write_run_metadata`] so that tooling (and humans) can
 //! reconstruct what happened in a run directory without replaying the audit log.
 //!
@@ -75,6 +75,13 @@ pub struct RunMetadata {
     run_uid: String,
     /// Human-facing run slug (e.g. the plan slug the run was opened from).
     run_slug: String,
+    /// Derived plan slug (parent dir of the originating task list). Stored so
+    /// disk-loaded [`RunView`]s can reconstruct a `task_list_path` for which
+    /// `plan_slug()` and run labels compute correctly, letting historical runs
+    /// for plans participate in sidebar deduplication and context resolution.
+    /// `#[serde(default)]` for back-compat with pre- plan_slug run.json files.
+    #[serde(default)]
+    plan_slug: String,
     /// Terminal status of the run.
     status: RunStatus,
     /// When the run transitioned to `Running`.
@@ -92,6 +99,7 @@ impl RunMetadata {
     pub fn new(
         run_uid: String,
         run_slug: String,
+        plan_slug: String,
         status: RunStatus,
         started_at: DateTime<Utc>,
         ended_at: DateTime<Utc>,
@@ -99,6 +107,7 @@ impl RunMetadata {
         Self {
             run_uid,
             run_slug,
+            plan_slug,
             status,
             started_at,
             ended_at,
@@ -110,6 +119,7 @@ impl RunMetadata {
     pub fn with_tasks(
         run_uid: String,
         run_slug: String,
+        plan_slug: String,
         status: RunStatus,
         started_at: DateTime<Utc>,
         ended_at: DateTime<Utc>,
@@ -118,6 +128,7 @@ impl RunMetadata {
         Self {
             run_uid,
             run_slug,
+            plan_slug,
             status,
             started_at,
             ended_at,
@@ -133,6 +144,12 @@ impl RunMetadata {
     /// The human-facing run slug (e.g. the plan slug the run was opened from).
     pub fn run_slug(&self) -> &str {
         &self.run_slug
+    }
+
+    /// The derived plan slug for the run's originating task list (used for
+    /// sidebar dedup etc). Empty for legacy records that predate the field.
+    pub fn plan_slug(&self) -> &str {
+        &self.plan_slug
     }
 
     /// The terminal status recorded for the run.
@@ -254,10 +271,31 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
         })
         .collect();
 
-    // Reconstruct the task-list path from the run_slug stored in the metadata.
-    // For disk snapshots the original absolute path is not persisted; we use a
-    // `.tasks/{slug}.json` relative path as a best-effort label.
-    let task_list_path = std::path::PathBuf::from(format!(".tasks/{}.json", meta.run_slug()));
+    // Reconstruct a task-list path for the RunView.
+    //
+    // - Prefer a synthetic `docs/plans/{plan}/TASKS.md` when we have a plan_slug
+    //   (or can derive one for legacy run_slugs ending in "-tasks"). This makes
+    //   `orchestrator::plan_slug(&path)` and `ui::run_label(&view)` return the
+    //   same values they do for live plan runs, so historical plan runs
+    //   participate in sidebar plan/run dedup and context resolution.
+    // - Fall back to the old `.tasks/{run_slug}.json` for non-plan runs and
+    //   pre-plan_slug records whose run_slug does not look plan-like.
+    let effective_plan = if !meta.plan_slug().is_empty() {
+        meta.plan_slug().to_string()
+    } else if let Some(p) = meta.run_slug().strip_suffix("-tasks") {
+        if !p.is_empty() {
+            p.to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let task_list_path = if !effective_plan.is_empty() {
+        std::path::PathBuf::from_iter(["docs", "plans", &effective_plan, "TASKS.md"])
+    } else {
+        std::path::PathBuf::from(format!(".tasks/{}.json", meta.run_slug()))
+    };
 
     RunView {
         id,
@@ -359,6 +397,7 @@ mod tests {
         let meta = RunMetadata::new(
             "01ABCDEF0123456789ABCDEFGH".to_string(),
             "demo-plan".to_string(),
+            "demo-plan".to_string(),
             RunStatus::Completed,
             started,
             ended,
@@ -381,6 +420,7 @@ mod tests {
 
         assert_eq!(loaded.run_uid, meta.run_uid, "run_uid must survive");
         assert_eq!(loaded.run_slug, meta.run_slug, "run_slug must survive");
+        assert_eq!(loaded.plan_slug, meta.plan_slug, "plan_slug must survive");
         assert_eq!(loaded.status, meta.status, "status must survive");
         assert_eq!(loaded.started_at, started, "started_at must survive");
         assert_eq!(loaded.ended_at, ended, "ended_at must survive");
@@ -476,6 +516,7 @@ mod tests {
 
         let meta = RunMetadata::with_tasks(
             "01ABCDEF0123456789ABCDEFGH".to_string(),
+            "demo-plan".to_string(),
             "demo-plan".to_string(),
             RunStatus::Completed,
             started,
@@ -604,6 +645,7 @@ mod tests {
         let meta = RunMetadata::new(
             "01ABCDEF0123456789ABCDEFGH".to_string(),
             "demo-plan".to_string(),
+            "demo-plan".to_string(),
             RunStatus::Completed,
             started,
             ended,
@@ -659,6 +701,62 @@ mod tests {
         assert_eq!(
             meta.run_slug, loaded2.run_slug,
             "run_slug must survive two atomic writes"
+        );
+        assert_eq!(
+            meta.plan_slug, loaded2.plan_slug,
+            "plan_slug must survive two atomic writes"
+        );
+    }
+
+    /// Legacy run.json (no `plan_slug` field) whose `run_slug` ends in `-tasks`
+    /// must reconstruct a `task_list_path` such that `plan_slug(&path)` recovers
+    /// the plan dir portion.  This ensures historical plan runs participate in
+    /// the TUI's plan-vs-run dedup (`visible_tree_nodes`) and `active_run_id`
+    /// even after restart, without id collisions or "separate run" display.
+    #[test]
+    fn legacy_plan_run_slug_without_plan_slug_field_reconstructs_path() {
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        let run_uid = "01LEGACYPLAN1234567890ABCD";
+
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        // Simulate old run.json for a plan run: run_slug has the full
+        // "parent-tasks" form, but no plan_slug field.
+        let old_json = r#"{
+  "run_uid": "01LEGACYPLAN1234567890ABCD",
+  "run_slug": "0027-plan-auto-discovery-tasks",
+  "status": "completed",
+  "started_at": "2026-05-01T10:00:00Z",
+  "ended_at": "2026-05-01T11:00:00Z"
+}
+"#;
+
+        let run_dir_path = crate::paths::run_dir(root, run_uid);
+        std::fs::create_dir_all(&run_dir_path).expect("create run dir");
+        std::fs::write(run_dir_path.join("run.json"), old_json).expect("write legacy run.json");
+
+        let mut next_id = 1u64;
+        let live: HashSet<String> = HashSet::new();
+        let views = load_disk_run_views(root, &live, &mut next_id);
+
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        // The reconstructed path must look plan-like so that plan_slug(v.task_list_path) == "0027-plan-auto-discovery"
+        assert!(
+            v.task_list_path
+                .to_string_lossy()
+                .contains("0027-plan-auto-discovery/TASKS.md"),
+            "legacy plan run must reconstruct plan-style TASKS.md path, got {}",
+            v.task_list_path.display()
+        );
+        let recovered = crate::orchestrator::plan_slug(&v.task_list_path);
+        assert_eq!(
+            recovered, "0027-plan-auto-discovery",
+            "plan_slug on reconstructed path must recover the plan slug for dedup"
         );
     }
 }

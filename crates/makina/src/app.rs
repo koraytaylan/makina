@@ -1446,17 +1446,15 @@ impl App {
     /// order shown in the sidebar (plans first, then runs and their tasks if expanded, repeat).
     pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
-        // Slugs of plans that already have an open Run. Such a plan is rendered
-        // as its (live) Run node below — NOT also as a static discovered-plan
-        // node, otherwise starting a plan would appear to duplicate it.
+        // Slugs of plans that already have an open Run (any status, deduped to
+        // latest below). Such a plan is rendered as its Run node — NOT also as
+        // static plan — otherwise starting would duplicate.
         let run_slugs: std::collections::HashSet<String> = self
             .runs
             .iter()
             .map(|r| makina_core::orchestrator::plan_slug(&r.task_list_path))
             .collect();
-        // Add discovered plans at the top (skipping any that now have a Run). An
-        // expanded plan (not in `collapsed_plans`) contributes its parsed task
-        // previews as child nodes.
+        // Add discovered plans at the top (skipping any that now have a Run).
         for (plan_idx, plan) in self.discovered_plans.iter().enumerate() {
             if run_slugs.contains(&plan.slug) {
                 continue;
@@ -1468,16 +1466,35 @@ impl App {
                 }
             }
         }
-        // Add open runs and their expanded tasks (existing logic).
+        // Add open runs and their expanded tasks, but deduplicated by plan slug
+        // (only for actual plan-style TASKS.md runs): keep only the most recent
+        // (highest run_uid) per plan. This detects and suppresses duplicate
+        // "same plan" entries when a plan has multiple previous (disk) runs.
+        // Non-plan runs (e.g. direct .md opens or test fixtures using .tasks/*.json)
+        // are never deduped by this.
+        let is_plan_style = |p: &std::path::Path| -> bool {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("TASKS.md"))
+        };
         for (run_idx, run) in self.runs.iter().enumerate() {
-            nodes.push(TreeNode::Run { run: run_idx });
-            // Only include tasks if this run is expanded (not in collapsed_runs).
-            if !self.collapsed_runs.contains(&run.id) {
-                for task_idx in 0..run.tasks.len() {
-                    nodes.push(TreeNode::Task {
-                        run: run_idx,
-                        task: task_idx,
-                    });
+            let add_this = if is_plan_style(&run.task_list_path) {
+                let pslug = makina_core::orchestrator::plan_slug(&run.task_list_path);
+                self.latest_run_for_plan(&pslug)
+                    .is_some_and(|lr| lr.id == run.id)
+            } else {
+                true
+            };
+            if add_this {
+                nodes.push(TreeNode::Run { run: run_idx });
+                // Only include tasks if this run is expanded (not in collapsed_runs).
+                if !self.collapsed_runs.contains(&run.id) {
+                    for task_idx in 0..run.tasks.len() {
+                        nodes.push(TreeNode::Task {
+                            run: run_idx,
+                            task: task_idx,
+                        });
+                    }
                 }
             }
         }
@@ -1547,10 +1564,19 @@ impl App {
             Some(TabContent::Task { plan_slug, task_id }) => {
                 let plan_slug = plan_slug.clone();
                 let task_id = task_id.clone();
-                if let Some(run_idx) = self.runs.iter().position(|run| {
-                    makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
-                        && run.tasks.iter().any(|t| t.id == task_id)
-                }) {
+                // Pick the *latest* run for the slug that contains the task (in case of
+                // multiple runs for same plan).
+                let best = self
+                    .runs
+                    .iter()
+                    .filter(|run| {
+                        makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
+                            && run.tasks.iter().any(|t| t.id == task_id)
+                    })
+                    .max_by_key(|run| &run.run_uid);
+                if let Some(run_view) = best
+                    && let Some(run_idx) = self.runs.iter().position(|r| r.id == run_view.id)
+                {
                     self.selected_run = Some(run_idx);
                 }
             }
@@ -1560,9 +1586,9 @@ impl App {
             // it) instead of a previously selected, unrelated run.
             Some(TabContent::Plan { plan_slug }) | Some(TabContent::PlanTask { plan_slug, .. }) => {
                 let plan_slug = plan_slug.clone();
-                self.selected_run = self.runs.iter().position(|run| {
-                    makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
-                });
+                self.selected_run = self
+                    .latest_run_for_plan(&plan_slug)
+                    .and_then(|r| self.runs.iter().position(|rr| rr.id == r.id));
             }
             _ => {}
         }
@@ -1927,16 +1953,23 @@ impl App {
     /// Returning the context plan's run here means that once a plan has been
     /// started, Pause/Cancel/resume keep working from the plan tab even if the
     /// sidebar cursor has moved off the run. Returns `None` when no run exists
+    /// Return the most recent run (by `run_uid` ULID, i.e. newest) matching the
+    /// given plan slug, if any. Used to deduplicate multiple historical runs for
+    /// the same plan so the sidebar does not show duplicate "same plan" entries.
+    pub(crate) fn latest_run_for_plan(&self, slug: &str) -> Option<&RunView> {
+        self.runs
+            .iter()
+            .filter(|r| makina_core::orchestrator::plan_slug(&r.task_list_path) == slug)
+            .max_by_key(|r| &r.run_uid)
+    }
+
     /// for the current context (the caller may then open one for the plan).
     pub fn active_run_id(&self) -> Option<makina_core::api::RunId> {
         if let Some(run) = self.selected_run() {
             return Some(run.id);
         }
         let plan = self.context_plan()?;
-        self.runs
-            .iter()
-            .find(|r| makina_core::orchestrator::plan_slug(&r.task_list_path) == plan.slug)
-            .map(|r| r.id)
+        self.latest_run_for_plan(&plan.slug).map(|r| r.id)
     }
 
     /// Resolve the `(RunId, TaskId)` whose agent log the `[L]` panel should show,
@@ -1950,12 +1983,19 @@ impl App {
         // 1. Active task tab → its run + task.
         if let Some(active) = self.tabs.active_tab
             && let Some(TabContent::Task { plan_slug, task_id }) = self.tabs.open_tabs.get(active)
-            && let Some(run) = self.runs.iter().find(|r| {
-                makina_core::orchestrator::plan_slug(&r.task_list_path) == *plan_slug
-                    && r.tasks.iter().any(|t| t.id == *task_id)
-            })
         {
-            return Some((run.id, task_id.clone()));
+            // Pick latest run for slug containing the task.
+            let best = self
+                .runs
+                .iter()
+                .filter(|r| {
+                    makina_core::orchestrator::plan_slug(&r.task_list_path) == *plan_slug
+                        && r.tasks.iter().any(|t| t.id == *task_id)
+                })
+                .max_by_key(|r| &r.run_uid);
+            if let Some(run) = best {
+                return Some((run.id, task_id.clone()));
+            }
         }
         // 2. Focused sidebar task node.
         if let Some(TreeNode::Task { run, task }) = self.focused_node()
@@ -8084,6 +8124,31 @@ mod tests {
                 .count(),
             1,
             "only the live Run node represents the started plan"
+        );
+
+        // Even with an additional older run for same slug (simulating two previous
+        // disk runs), dedup keeps only 1 run node (the latest uid), no plan dup.
+        app.runs.push(RunView {
+            id: RunId(2),
+            run_uid: "uid-0-older".to_string(), // lex smaller = older
+            task_list_path: PathBuf::from("/repo/docs/plans/0001-todo/TASKS.md"),
+            status: RunStatus::Completed,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        });
+        let nodes2 = app.visible_tree_nodes();
+        assert_eq!(
+            nodes2
+                .iter()
+                .filter(|n| matches!(n, TreeNode::Run { .. }))
+                .count(),
+            1,
+            "multiple runs for same plan must dedup to only the latest one"
+        );
+        assert!(
+            !nodes2.iter().any(|n| matches!(n, TreeNode::Plan { .. })),
+            "plan stub still hidden"
         );
     }
 

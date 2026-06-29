@@ -733,7 +733,7 @@ impl CoreState {
         // registry lock; drop the guard before awaiting the graph lock.  Also
         // snapshot the run's identity (run_uid/run_slug/started_at) so the
         // finalization-time `run.json` can be built without re-taking the lock.
-        let (graph, cancelled, run_uid, run_slug, started_at) = {
+        let (graph, cancelled, run_uid, run_slug, plan_slug, started_at) = {
             let runs = self.runs.lock().expect("runs registry mutex poisoned");
             match runs.get(&run.0) {
                 Some(entry) => {
@@ -747,6 +747,7 @@ impl CoreState {
                         cancelled,
                         entry.run_uid.clone(),
                         entry.run_slug.clone(),
+                        entry.plan_slug.clone(),
                         entry.started_at,
                     )
                 }
@@ -809,6 +810,7 @@ impl CoreState {
         let meta = RunMetadata::with_tasks(
             run_uid.clone(),
             run_slug,
+            plan_slug,
             status,
             started_at,
             Utc::now(),
@@ -2008,6 +2010,7 @@ impl CoreApi {
         let meta = RunMetadata::with_tasks(
             run_uid.clone(),
             run_slug.clone(),
+            plan_slug.clone(),
             RunStatus::Running,
             started_at,
             Utc::now(),
@@ -2209,6 +2212,19 @@ impl Api for CoreApi {
             &mut disk_next_id,
         );
         views.extend(disk_views);
+
+        // Claim the RunId numbers handed out to disk snapshots so that
+        // subsequent `alloc_id()` (used by OpenRun etc) cannot collide with
+        // them.  Without this, a fresh launch that loads N historical runs
+        // seeds app.runs with synth ids 1..N; the live next_id (still at 1)
+        // then re-allocates 1 for the first new run, RunOpened/RunLoaded
+        // clobbers the historical entry by id match, and "earlier run"
+        // disappears (or "merges" into the new one).
+        let after_disk = disk_next_id;
+        let live_next = self.state.next_id.load(Ordering::Relaxed);
+        if after_disk > live_next {
+            self.state.next_id.store(after_disk, Ordering::Relaxed);
+        }
 
         views
     }

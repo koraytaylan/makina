@@ -642,3 +642,85 @@ Do the second thing.
         );
     }
 }
+
+/// At process launch with historical runs (from load_disk_run_views), the
+/// RunIds assigned to disk snapshots must not collide with RunIds later
+/// allocated for live OpenRun.  Without advancing next_id in runs(), a
+/// plan with prior run would see synth disk id reused by first open, causing
+/// the TUI's RunOpened/RunLoaded overwrite to "merge" (clobber) the earlier
+/// run entry.
+#[tokio::test]
+async fn disk_snapshot_ids_do_not_collide_with_subsequent_live_open_ids() {
+    use makina_core::api::RunStatus;
+    use makina_core::run_metadata::{RunMetadata, write_run_metadata};
+
+    let _home = makina_core::HOME_ENV_LOCK.lock().await;
+    let tmp_home = tempfile::tempdir().expect("temp home");
+    let dir = tempfile::tempdir().expect("temp repo");
+    let root = dir.path();
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+    // Minimal git repo so WorktreeManager etc are happy.
+    run_git(root, &["init"]);
+    run_git(root, &["config", "user.email", "t@example.com"]);
+    run_git(root, &["config", "user.name", "T"]);
+    run_git(root, &["commit", "--allow-empty", "-m", "init"]);
+
+    // Seed one historical completed run (plan-like slug).
+    let run_uid = "01DISKIDCOLLISIONTEST0000000";
+    let meta = RunMetadata::new(
+        run_uid.to_string(),
+        "0027-foo-tasks".to_string(),
+        "0027-foo".to_string(),
+        RunStatus::Completed,
+        Utc::now(),
+        Utc::now(),
+    );
+    write_run_metadata(&meta, root)
+        .await
+        .expect("write disk meta");
+
+    let api = build_api(root.to_path_buf());
+
+    // First runs() at "launch" seeds the disk with a synth id.
+    let initial_views = api.runs().await;
+    assert_eq!(initial_views.len(), 1, "only the disk run");
+    let disk_id = initial_views[0].id;
+
+    // Open a (different) run; its allocated id must differ from disk's synth id.
+    // (The sample path here doesn't matter; we just need an OpenRun to alloc.)
+    let (_tmp, task_path) = {
+        let d = tempfile::tempdir().expect("tl dir");
+        let p = d.path().join("TASKS.md");
+        std::fs::write(&p, "### t — title\n\nDone when: x\n").expect("write tl");
+        (d, p)
+    };
+    let outcome = api
+        .execute(makina_core::api::Command::OpenRun {
+            task_list_path: task_path,
+        })
+        .await
+        .expect("open run");
+    let live_id = match outcome {
+        makina_core::api::CommandOutcome::RunOpened { run } => run,
+        other => panic!("expected RunOpened, got {other:?}"),
+    };
+
+    assert_ne!(
+        live_id, disk_id,
+        "live open id must not collide with disk snapshot id"
+    );
+
+    // After open, runs() should surface both (distinct ids).
+    let after = api.runs().await;
+    assert_eq!(after.len(), 2, "live open + the (re-snapshot) disk view");
+    // Disk synth ids are per-snapshot (based on peek at time of runs());
+    // the key guarantee is that the live open's allocated id differed from
+    // the initial disk id that the TUI would have seeded.
+    let after_ids: Vec<_> = after.iter().map(|v| v.id).collect();
+    assert!(after_ids.contains(&live_id));
+    assert_ne!(
+        live_id, disk_id,
+        "OpenRun must not reuse the disk snapshot's RunId"
+    );
+}
