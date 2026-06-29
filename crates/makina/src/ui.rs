@@ -629,15 +629,21 @@ pub fn render(app: &App, frame: &mut Frame) {
             });
         }
         (None, Some((plan, preview)), _, _) => {
-            // An active plan-task tab uses the same task-detail pane as a live
-            // task tab, with preview data in Scope and an empty Execution state.
+            // A plan-task tab starts as a read-only preview, then upgrades to
+            // the live task detail as soon as a matching run exists.
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(3)])
                 .split(content_area);
             render_tab_bar(app, frame, split[0]);
             let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
-            render_plan_task_pane(app, plan, preview, frame, task_area);
+            if let Some((run, task_idx)) =
+                find_live_plan_task_for_preview(app, &plan.slug, &preview.id)
+            {
+                render_task_entry_pane(app, run, task_idx, frame, task_area);
+            } else {
+                render_plan_task_pane(app, plan, preview, frame, task_area);
+            }
             panel_geoms.push(PanelGeometry {
                 panel: ScrollablePanel::TaskEntry,
                 rect: task_area,
@@ -2292,6 +2298,116 @@ enum TaskDetailSource<'a> {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanPreviewField {
+    DependsOn,
+    DoneWhen,
+}
+
+fn plan_preview_field_continues(line: &str) -> bool {
+    let trimmed = line.trim();
+    let trimmed_start = line.trim_start();
+    !trimmed.is_empty()
+        && !trimmed_start.starts_with("- ")
+        && !trimmed_start.starts_with("* ")
+        && !trimmed_start.starts_with("## ")
+        && !trimmed_start.starts_with("---")
+        && !trimmed_start.split_once(". ").is_some_and(|(prefix, _)| {
+            !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+fn append_plan_preview_field_text(target: &mut String, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push(' ');
+    }
+    target.push_str(text);
+}
+
+fn normalized_plan_preview_scope(body: &str) -> Option<String> {
+    let mut description_lines: Vec<String> = Vec::new();
+    let mut done_when = String::new();
+    let mut active_field: Option<PlanPreviewField> = None;
+    let mut in_code_fence = false;
+
+    for raw in body.lines() {
+        let trimmed_start = raw.trim_start();
+        let fence_line = trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~");
+
+        if !in_code_fence {
+            if trimmed_start
+                .strip_prefix("- **Depends on:**")
+                .or_else(|| trimmed_start.strip_prefix("- **Depends on**:"))
+                .is_some()
+            {
+                active_field = Some(PlanPreviewField::DependsOn);
+                continue;
+            }
+            if let Some(payload) = trimmed_start
+                .strip_prefix("- **Done when:**")
+                .or_else(|| trimmed_start.strip_prefix("- **Done when**:"))
+            {
+                append_plan_preview_field_text(&mut done_when, payload);
+                active_field = Some(PlanPreviewField::DoneWhen);
+                continue;
+            }
+            if let Some(field) = active_field {
+                if plan_preview_field_continues(raw) {
+                    if field == PlanPreviewField::DoneWhen {
+                        append_plan_preview_field_text(&mut done_when, raw);
+                    }
+                    continue;
+                }
+                active_field = None;
+            }
+        }
+
+        description_lines.push(raw.to_string());
+        if fence_line {
+            in_code_fence = !in_code_fence;
+            active_field = None;
+        }
+    }
+
+    let mut start = 0;
+    let mut end = description_lines.len();
+    while start < end && description_lines[start].trim().is_empty() {
+        start += 1;
+    }
+    while end > start && description_lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    let description = description_lines[start..end].join("\n");
+
+    let mut scope = String::new();
+    if !description.trim().is_empty() {
+        scope.push_str(&description);
+    }
+    if !done_when.trim().is_empty() {
+        if !scope.is_empty() {
+            scope.push_str("\n\n");
+        }
+        scope.push_str("### Done when\n\n");
+        scope.push_str(done_when.trim());
+    }
+
+    if scope.trim().is_empty() {
+        None
+    } else {
+        Some(scope)
+    }
+}
+
+fn plan_preview_scope_text(preview: &makina_core::orchestrator::PlanTaskPreview) -> Cow<'_, str> {
+    normalized_plan_preview_scope(&preview.body)
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed("(no further detail in TASKS.md)"))
+}
+
 fn render_task_execution_empty_section(
     app: &App,
     expanded: &HashSet<AccordionSection>,
@@ -2412,11 +2528,7 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
             )
         }
         TaskDetailSource::PlanPreview { preview } => {
-            let scope = if preview.body.trim().is_empty() {
-                Cow::Borrowed("(no further detail in TASKS.md)")
-            } else {
-                Cow::Borrowed(preview.body.as_str())
-            };
+            let scope = plan_preview_scope_text(preview);
             let deps = if preview.depends_on.is_empty() {
                 None
             } else {
@@ -2619,6 +2731,39 @@ fn render_task_entry_pane(
 fn find_task_idx_in_run(app: &App, task_id: &TaskId) -> Option<usize> {
     app.selected_run()
         .and_then(|run| run.tasks.iter().position(|t| &t.id == task_id))
+}
+
+fn find_live_plan_task_for_preview<'a>(
+    app: &'a App,
+    expected_plan_slug: &str,
+    task_id: &str,
+) -> Option<(&'a RunView, usize)> {
+    let task_id = TaskId::new(task_id);
+
+    if let Some(run) = app.selected_run()
+        && makina_core::orchestrator::plan_slug(&run.task_list_path) == expected_plan_slug
+        && let Some(task_idx) = run.tasks.iter().position(|task| task.id == task_id)
+    {
+        return Some((run, task_idx));
+    }
+
+    let mut best: Option<(&RunView, usize)> = None;
+    for run in &app.runs {
+        if makina_core::orchestrator::plan_slug(&run.task_list_path) != expected_plan_slug {
+            continue;
+        }
+        let Some(task_idx) = run.tasks.iter().position(|task| task.id == task_id) else {
+            continue;
+        };
+        let replace = match best {
+            Some((best_run, _)) => run.run_uid.as_str() > best_run.run_uid.as_str(),
+            None => true,
+        };
+        if replace {
+            best = Some((run, task_idx));
+        }
+    }
+    best
 }
 
 // ── Plan detail pane ──────────────────────────────────────────────────────────
@@ -11272,6 +11417,155 @@ mod tests {
         ] {
             assert!(
                 row_with_text_has_bg(buf, needle, code_bg),
+                "code row {needle:?} must carry the CodeBlockBg background"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_task_tab_uses_same_markdown_detail_before_and_after_start() {
+        use crate::app::{AppEvent, TabContent};
+        use makina_core::api::{AgentRole, Event, ExchangeEvent};
+        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
+
+        let mut terminal = make_terminal(150, 80);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.verbose_mode = true;
+        app.discovered_plans = vec![PlanEntry {
+            dir: PathBuf::from("docs/plans/0004-markdown-plan"),
+            slug: "0004-markdown-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![PlanTaskPreview {
+                id: "render-markdown".to_string(),
+                title: "Render Markdown".to_string(),
+                gated: false,
+                depends_on: vec!["setup-task".to_string()],
+                body: "Scope has **bold** preview.\n\n```rust\nlet preview_code = true;\n```\n\n- **Depends on:** setup-task\n- **Done when:** preview passes."
+                    .to_string(),
+            }],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::PlanTask {
+            plan_slug: "0004-markdown-plan".to_string(),
+            task_id: "render-markdown".to_string(),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let preview_screen = screen_of(&terminal);
+        assert!(
+            preview_screen.contains("Scope has bold preview."),
+            "preview Scope must render inline markdown; screen:\n{preview_screen}"
+        );
+        assert!(
+            preview_screen.contains("let preview_code = true;"),
+            "preview Scope must render fenced-code contents; screen:\n{preview_screen}"
+        );
+        assert!(
+            preview_screen.contains("Done when") && preview_screen.contains("preview passes."),
+            "preview Scope must render the same Done when section as a live task; screen:\n{preview_screen}"
+        );
+        assert!(
+            preview_screen.contains("Depends on: setup-task"),
+            "preview dependencies must stay in metadata; screen:\n{preview_screen}"
+        );
+        assert!(
+            !preview_screen.contains("**bold**")
+                && !preview_screen.contains("```")
+                && !preview_screen.contains("**Depends on:**")
+                && !preview_screen.contains("**Done when:**"),
+            "preview Scope must not leak raw task-list markdown fields; screen:\n{preview_screen}"
+        );
+        assert!(
+            row_with_text_has_bg(
+                terminal.backend().buffer(),
+                "let preview_code = true;",
+                app.active_theme.get(crate::theme::ThemeRole::CodeBlockBg),
+            ),
+            "preview code row must carry the CodeBlockBg background"
+        );
+
+        app.runs.push(RunView {
+            id: RunId(7),
+            run_uid: "run-live".to_string(),
+            task_list_path: PathBuf::from("docs/plans/0004-markdown-plan/TASKS.md"),
+            status: RunStatus::Running,
+            project: "test".to_string(),
+            tasks: vec![TaskView {
+                id: TaskId::new("render-markdown"),
+                title: "Render Markdown".to_string(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![TaskId::new("setup-task")],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "Scope has **bold** preview.\n\n```rust\nlet preview_code = true;\n```\n\n### Done when\n\npreview passes."
+                    .to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        });
+        app.selected_run = None;
+        app.selected_task = None;
+
+        let mk = |event: ExchangeEvent| {
+            AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(7),
+                task: TaskId::new("render-markdown"),
+                role: AgentRole::Developer,
+                event,
+            })
+        };
+        app.update(mk(ExchangeEvent::PromptSent {
+            text: "Prompt has **bold** live text.\n\n```rust\nlet live_prompt = true;\n```".into(),
+        }));
+        app.update(mk(ExchangeEvent::ThoughtChunk {
+            text: "Thought has **bold** live text.\n\n```text\nlive-thought\n```".into(),
+        }));
+        app.update(mk(ExchangeEvent::ResponseChunk {
+            text: "Response has **bold** live text.\n\n```rust\nlet live_response = true;\n```"
+                .into(),
+        }));
+        app.update(mk(ExchangeEvent::TurnComplete));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let live_screen = screen_of(&terminal);
+        assert!(
+            live_screen.contains("Developer prompt")
+                && live_screen.contains("Prompt has bold live text.")
+                && live_screen.contains("let live_prompt = true;"),
+            "live PlanTask tab must render prompt markdown through Execution; screen:\n{live_screen}"
+        );
+        assert!(
+            live_screen.contains("Developer thought")
+                && live_screen.contains("Thought has bold live text.")
+                && live_screen.contains("live-thought"),
+            "live PlanTask tab must render thought markdown through Execution; screen:\n{live_screen}"
+        );
+        assert!(
+            live_screen.contains("Developer response")
+                && live_screen.contains("Response has bold live text.")
+                && live_screen.contains("let live_response = true;"),
+            "live PlanTask tab must render response markdown through Execution; screen:\n{live_screen}"
+        );
+        assert!(
+            !live_screen.contains("No execution yet")
+                && !live_screen.contains("**bold**")
+                && !live_screen.contains("```"),
+            "live PlanTask tab must use live execution rendering, not preview/raw markdown; screen:\n{live_screen}"
+        );
+        let code_bg = app.active_theme.get(crate::theme::ThemeRole::CodeBlockBg);
+        for needle in [
+            "let preview_code = true;",
+            "let live_prompt = true;",
+            "live-thought",
+            "let live_response = true;",
+        ] {
+            assert!(
+                row_with_text_has_bg(terminal.backend().buffer(), needle, code_bg),
                 "code row {needle:?} must carry the CodeBlockBg background"
             );
         }
