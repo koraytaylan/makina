@@ -124,6 +124,13 @@ pub enum MergeError {
     /// e.g. `git` not on `PATH`).
     #[error("I/O error invoking git in squash merger: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The final "stage changes" mode refused to apply over a dirty checkout.
+    #[error("main worktree has uncommitted changes; refusing to stage plan changes:\n{status}")]
+    DirtyWorktree {
+        /// `git status --porcelain` output from the main worktree.
+        status: String,
+    },
 }
 
 // ── MergeOutcome ────────────────────────────────────────────────────────────────
@@ -146,6 +153,19 @@ pub enum MergeOutcome {
     Conflict {
         /// Git's reported conflict detail (combined stdout+stderr of the failed
         /// `merge --squash`), for diagnosis / agent reconciliation.
+        details: String,
+    },
+}
+
+/// The result of staging a completed plan's net diff into the main worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// The plan branch's net diff is now staged in `base_branch`'s checkout.
+    Staged,
+
+    /// The squash-style staging attempt conflicted; `base_branch` was restored.
+    Conflict {
+        /// Git's reported conflict detail.
         details: String,
     },
 }
@@ -395,6 +415,55 @@ impl SquashMerger {
         }
 
         Ok(MergeOutcome::Merged)
+    }
+
+    /// Stage `plan_branch`'s net diff onto `base_branch` without committing.
+    ///
+    /// This is the "human decides what happens next" finalization mode. It is
+    /// intentionally conservative: if the main checkout already has staged or
+    /// unstaged changes, the method refuses to apply anything and leaves the
+    /// plan branch available for manual recovery.
+    pub async fn final_stage_changes(&self, plan_branch: &str) -> Result<StageOutcome, MergeError> {
+        self.run_git_checked(
+            &["checkout", &self.base_branch],
+            &format!(
+                "git -C {} checkout {}",
+                self.repo_root.display(),
+                &self.base_branch
+            ),
+        )
+        .await?;
+
+        let status = self.run_git_raw(&["status", "--porcelain"]).await?;
+        if !status.status.success() {
+            return Err(MergeError::GitCommandFailed {
+                command: format!("git -C {} status --porcelain", self.repo_root.display()),
+                stderr: String::from_utf8_lossy(&status.stderr).trim().to_string(),
+            });
+        }
+        let status_text = String::from_utf8_lossy(&status.stdout).trim().to_string();
+        let blocking_status = status_text
+            .lines()
+            .filter(|line| !line.starts_with("?? .makina/"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !blocking_status.is_empty() {
+            return Err(MergeError::DirtyWorktree {
+                status: blocking_status,
+            });
+        }
+
+        let squash = self
+            .run_git_raw(&["merge", "--squash", plan_branch])
+            .await?;
+
+        if !squash.status.success() {
+            let details = combine_output(&squash.stdout, &squash.stderr);
+            self.restore_base_branch().await?;
+            return Ok(StageOutcome::Conflict { details });
+        }
+
+        Ok(StageOutcome::Staged)
     }
 
     // ── Private helpers ─────────────────────────────────────────────────────────

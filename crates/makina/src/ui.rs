@@ -3606,31 +3606,40 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
     // Build the list of settings fields
     let mut items: Vec<ListItem> = vec![];
 
+    let final_merge_value = format!(
+        "< {} >",
+        crate::app::final_merge_label(settings.final_merge)
+    );
     let fields = vec![
         (
             "Gate iterations",
-            &settings.gate_iterations,
+            settings.gate_iterations.as_str(),
             crate::app::SettingsField::GateIterations,
         ),
         (
             "Reviewer iterations",
-            &settings.reviewer_iterations,
+            settings.reviewer_iterations.as_str(),
             crate::app::SettingsField::ReviewerIterations,
         ),
         (
             "Wall-clock (s)",
-            &settings.wall_clock_secs,
+            settings.wall_clock_secs.as_str(),
             crate::app::SettingsField::WallClockSecs,
         ),
         (
             "Idle (s)",
-            &settings.idle_secs,
+            settings.idle_secs.as_str(),
             crate::app::SettingsField::IdleSecs,
         ),
         (
             "Concurrency",
-            &settings.concurrency,
+            settings.concurrency.as_str(),
             crate::app::SettingsField::Concurrency,
+        ),
+        (
+            "When work finishes",
+            final_merge_value.as_str(),
+            crate::app::SettingsField::FinalMerge,
         ),
     ];
 
@@ -3674,7 +3683,7 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
 
     // Footer with hints
     let footer = Paragraph::new(Line::from(vec![Span::styled(
-        "↑/↓ field · 0-9 edit · Enter save · Esc cancel",
+        "↑/↓ field · 0-9 edit · ←/→ option · Enter save · Esc cancel",
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
@@ -8829,6 +8838,7 @@ mod tests {
             wall_clock_secs: "600".to_string(),
             idle_secs: "".to_string(),
             concurrency: "4".to_string(),
+            final_merge: makina_core::config::FinalMerge::Squash,
             focused: crate::app::SettingsField::GateIterations,
             error: None,
         });
@@ -8840,6 +8850,10 @@ mod tests {
         assert!(
             screen.contains("Settings"),
             "modal must contain title 'Settings'; got:\n{screen}"
+        );
+        assert!(
+            screen.contains("When work finishes"),
+            "settings modal must show finalization mode; got:\n{screen}"
         );
 
         // Verify field values appear

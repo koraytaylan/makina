@@ -15,7 +15,7 @@ use makina_core::api::{
 };
 #[cfg(test)]
 use makina_core::config::RoleAssignment;
-use makina_core::config::{ProviderConfig, RolesConfig};
+use makina_core::config::{FinalMerge, ProviderConfig, RolesConfig};
 use ratatui::layout::Rect;
 
 use crate::browser::{DirEntry, FileBrowser};
@@ -482,6 +482,14 @@ impl CommandPalette {
                 event: AppEvent::RetryFocused,
             },
             PaletteAction::Regular {
+                label: "Reset selected plan/run",
+                event: AppEvent::ResetRun,
+            },
+            PaletteAction::Regular {
+                label: "Purge Makina worktrees",
+                event: AppEvent::PurgeWorktrees,
+            },
+            PaletteAction::Regular {
                 label: "Configure providers & roles",
                 event: AppEvent::OpenProviderEditor,
             },
@@ -550,6 +558,7 @@ pub enum SettingsField {
     WallClockSecs,
     IdleSecs, // empty buffer ⇒ None (disabled)
     Concurrency,
+    FinalMerge,
 }
 
 /// State for the settings modal: an editable text buffer per numeric field,
@@ -561,9 +570,35 @@ pub struct Settings {
     pub wall_clock_secs: String,
     pub idle_secs: String, // "" ⇒ None
     pub concurrency: String,
+    pub final_merge: FinalMerge,
     pub focused: SettingsField,
     /// Last validation error (rendered under the field), or `None`.
     pub error: Option<String>,
+}
+
+pub fn final_merge_label(mode: FinalMerge) -> &'static str {
+    match mode {
+        FinalMerge::Squash => "Squash merge into base branch",
+        FinalMerge::Stage => "Stage changes in main worktree",
+        FinalMerge::MergeCommit => "Merge commit into base branch",
+        FinalMerge::Manual => "Leave plan branch unmerged",
+    }
+}
+
+fn next_settings_final_merge(mode: FinalMerge) -> FinalMerge {
+    match mode {
+        FinalMerge::Squash => FinalMerge::Stage,
+        FinalMerge::Stage => FinalMerge::Squash,
+        FinalMerge::MergeCommit | FinalMerge::Manual => FinalMerge::Squash,
+    }
+}
+
+fn previous_settings_final_merge(mode: FinalMerge) -> FinalMerge {
+    match mode {
+        FinalMerge::Squash => FinalMerge::Stage,
+        FinalMerge::Stage => FinalMerge::Squash,
+        FinalMerge::MergeCommit | FinalMerge::Manual => FinalMerge::Stage,
+    }
 }
 
 // ── Provider configuration editor ──────────────────────────────────────────────
@@ -825,6 +860,12 @@ pub enum AppEvent {
     /// pure.
     RetryFocused,
 
+    /// Reset the selected run/plan back to a fresh pending graph.
+    ResetRun,
+
+    /// Purge Makina-created transient git worktrees for this repository.
+    PurgeWorktrees,
+
     /// A transient status-bar message to display (command outcome or error).
     ///
     /// Set by the IO layer after an `api.execute(...)` resolves so the user sees
@@ -893,6 +934,10 @@ pub enum AppEvent {
     SettingsInput(char),
     /// User pressed backspace in the focused settings field.
     SettingsBackspace,
+    /// Cycle a selectable settings field to the previous option.
+    SettingsPreviousOption,
+    /// Cycle a selectable settings field to the next option.
+    SettingsNextOption,
     /// User pressed enter to save settings.
     SettingsCommit,
     /// Close the settings screen without saving.
@@ -1360,6 +1405,9 @@ pub struct App {
     /// The resolved task concurrency limit (parallelism). Seeded from the loaded
     /// config and editable via the settings modal.
     pub concurrency: usize,
+
+    /// What happens to a completed plan branch at run end.
+    pub final_merge: FinalMerge,
 
     /// State for the tabbed main content pane.
     pub tabs: TabState,
@@ -1878,6 +1926,7 @@ impl App {
             settings: None,
             caps: makina_core::config::CapsConfig::default(),
             concurrency: 3,
+            final_merge: FinalMerge::Squash,
             verbose_mode: false,
             active_theme: crate::theme::ayu_dark(),
             role_metrics: HashMap::new(),
@@ -1913,6 +1962,7 @@ impl App {
         base_branch_exists: bool,
         caps: makina_core::config::CapsConfig,
         concurrency: usize,
+        final_merge: FinalMerge,
     ) -> Self {
         let mut app = Self::new(api, initial_runs, repo_root);
         app.providers = providers;
@@ -1922,6 +1972,7 @@ impl App {
         app.base_branch_exists = base_branch_exists;
         app.caps = caps;
         app.concurrency = concurrency;
+        app.final_merge = final_merge;
         app
     }
 
@@ -2932,7 +2983,9 @@ impl App {
             | AppEvent::PauseRun
             | AppEvent::CancelRun
             | AppEvent::Reinterpret
-            | AppEvent::RetryFocused => true,
+            | AppEvent::RetryFocused
+            | AppEvent::ResetRun
+            | AppEvent::PurgeWorktrees => true,
 
             AppEvent::StatusMessage(msg) => {
                 self.status_message = Some(msg);
@@ -3101,6 +3154,7 @@ impl App {
                         .map(|s| s.to_string())
                         .unwrap_or_default(),
                     concurrency: self.concurrency.to_string(),
+                    final_merge: self.final_merge,
                     focused: SettingsField::GateIterations,
                     error: None,
                 });
@@ -3112,11 +3166,12 @@ impl App {
             AppEvent::SettingsUp => {
                 if let Some(settings) = &mut self.settings {
                     settings.focused = match settings.focused {
-                        SettingsField::GateIterations => SettingsField::Concurrency,
+                        SettingsField::GateIterations => SettingsField::FinalMerge,
                         SettingsField::ReviewerIterations => SettingsField::GateIterations,
                         SettingsField::WallClockSecs => SettingsField::ReviewerIterations,
                         SettingsField::IdleSecs => SettingsField::WallClockSecs,
                         SettingsField::Concurrency => SettingsField::IdleSecs,
+                        SettingsField::FinalMerge => SettingsField::Concurrency,
                     };
                 }
                 true
@@ -3129,7 +3184,8 @@ impl App {
                         SettingsField::ReviewerIterations => SettingsField::WallClockSecs,
                         SettingsField::WallClockSecs => SettingsField::IdleSecs,
                         SettingsField::IdleSecs => SettingsField::Concurrency,
-                        SettingsField::Concurrency => SettingsField::GateIterations,
+                        SettingsField::Concurrency => SettingsField::FinalMerge,
+                        SettingsField::FinalMerge => SettingsField::GateIterations,
                     };
                 }
                 true
@@ -3155,6 +3211,7 @@ impl App {
                         SettingsField::Concurrency => {
                             settings.concurrency.push(c);
                         }
+                        SettingsField::FinalMerge => {}
                     }
                     // Re-validate the focused field inline.
                     settings.error = None;
@@ -3222,6 +3279,7 @@ impl App {
                                     Some("concurrency must be a positive integer".to_string());
                             }
                         }
+                        SettingsField::FinalMerge => {}
                     }
                 }
                 true
@@ -3245,6 +3303,7 @@ impl App {
                         SettingsField::Concurrency => {
                             settings.concurrency.pop();
                         }
+                        SettingsField::FinalMerge => {}
                     }
                     // Re-validate the focused field inline.
                     settings.error = None;
@@ -3312,7 +3371,28 @@ impl App {
                                     Some("concurrency must be a positive integer".to_string());
                             }
                         }
+                        SettingsField::FinalMerge => {}
                     }
+                }
+                true
+            }
+
+            AppEvent::SettingsPreviousOption => {
+                if let Some(settings) = &mut self.settings
+                    && settings.focused == SettingsField::FinalMerge
+                {
+                    settings.final_merge = previous_settings_final_merge(settings.final_merge);
+                    settings.error = None;
+                }
+                true
+            }
+
+            AppEvent::SettingsNextOption => {
+                if let Some(settings) = &mut self.settings
+                    && settings.focused == SettingsField::FinalMerge
+                {
+                    settings.final_merge = next_settings_final_merge(settings.final_merge);
+                    settings.error = None;
                 }
                 true
             }
@@ -3335,6 +3415,7 @@ impl App {
                             self.caps.wall_clock_secs = valid.wall_clock_secs;
                             self.caps.idle_secs = valid.idle_secs;
                             self.concurrency = valid.concurrency;
+                            self.final_merge = valid.final_merge;
                             self.mode = Mode::Normal;
                             self.settings = None;
                         }
@@ -5628,6 +5709,7 @@ mod tests {
             false,
             makina_core::config::CapsConfig::default(),
             3,
+            FinalMerge::Squash,
         );
 
         // Sanity: starts in Normal mode with no editor open.
@@ -7404,14 +7486,16 @@ mod tests {
         let palette = app.command_palette.as_ref().unwrap();
         assert_eq!(
             palette.filtered().len(),
-            11,
-            "full list must have 11 actions"
+            13,
+            "full list must have 13 actions"
         );
         for label in [
             "Start run",
             "Pause run",
             "Stop run",
             "Reset/retry focused task",
+            "Reset selected plan/run",
+            "Purge Makina worktrees",
         ] {
             assert!(
                 palette.actions.iter().any(|action| action.label() == label),
@@ -7454,7 +7538,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            11,
+            13,
             "full list restored after filter cleared"
         );
     }
@@ -7823,6 +7907,7 @@ mod tests {
         assert_eq!(settings.wall_clock_secs, "1200");
         assert_eq!(settings.idle_secs, "", "idle_secs must be empty when None");
         assert_eq!(settings.concurrency, "4");
+        assert_eq!(settings.final_merge, FinalMerge::Squash);
         assert_eq!(
             settings.focused,
             SettingsField::GateIterations,
@@ -7855,6 +7940,7 @@ mod tests {
         );
         assert_eq!(settings2.gate_iterations, "2");
         assert_eq!(settings2.concurrency, "2");
+        assert_eq!(settings2.final_merge, FinalMerge::Squash);
     }
 
     #[test]
@@ -7945,6 +8031,13 @@ mod tests {
             SettingsField::Concurrency
         );
 
+        // Down again -> FinalMerge.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::FinalMerge
+        );
+
         // Down again -> wraps to GateIterations.
         app.update(AppEvent::SettingsDown);
         assert_eq!(
@@ -7953,6 +8046,11 @@ mod tests {
         );
 
         // Up should go backward.
+        app.update(AppEvent::SettingsUp);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::FinalMerge
+        );
         app.update(AppEvent::SettingsUp);
         assert_eq!(
             app.settings.as_ref().unwrap().focused,
@@ -7995,6 +8093,36 @@ mod tests {
 
         app.update(AppEvent::SettingsBackspace);
         assert_eq!(app.settings.as_ref().unwrap().concurrency, "3");
+    }
+
+    #[test]
+    fn settings_cycles_final_merge_option() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenSettings);
+
+        for _ in 0..5 {
+            app.update(AppEvent::SettingsDown);
+        }
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::FinalMerge
+        );
+        assert_eq!(
+            app.settings.as_ref().unwrap().final_merge,
+            FinalMerge::Squash
+        );
+
+        app.update(AppEvent::SettingsNextOption);
+        assert_eq!(
+            app.settings.as_ref().unwrap().final_merge,
+            FinalMerge::Stage
+        );
+
+        app.update(AppEvent::SettingsPreviousOption);
+        assert_eq!(
+            app.settings.as_ref().unwrap().final_merge,
+            FinalMerge::Squash
+        );
     }
 
     #[test]
@@ -8053,12 +8181,25 @@ mod tests {
         app.update(AppEvent::SettingsInput('8'));
         assert_eq!(app.settings.as_ref().unwrap().concurrency, "8");
 
+        // Move to final merge and set it to Stage.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::FinalMerge
+        );
+        app.update(AppEvent::SettingsNextOption);
+        assert_eq!(
+            app.settings.as_ref().unwrap().final_merge,
+            FinalMerge::Stage
+        );
+
         // Commit.
         app.update(AppEvent::SettingsCommit);
 
         // Verify caps were updated.
         assert_eq!(app.caps.gate_iterations, 10);
         assert_eq!(app.concurrency, 8);
+        assert_eq!(app.final_merge, FinalMerge::Stage);
         assert_eq!(app.caps.reviewer_iterations, 3);
         assert_eq!(app.caps.wall_clock_secs, 1200);
         assert_eq!(app.caps.idle_secs, None);

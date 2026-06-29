@@ -153,7 +153,7 @@ use crate::backend::AgentBackend;
 use crate::config::{Config, FinalMerge};
 use crate::gate::{GateOutcome, GateRunner};
 use crate::interpreter::TaskListInterpreter;
-use crate::merge::{MergeOutcome, SquashMerger};
+use crate::merge::{MergeOutcome, SquashMerger, StageOutcome};
 use crate::paths;
 use crate::persist::persist_graph;
 use crate::state_machine::{TaskEvent, transition};
@@ -1016,6 +1016,17 @@ async fn run_graph_inner(
                         }
                     }
                 }
+                FinalMerge::Stage => match final_merger.final_stage_changes(&plan_branch).await {
+                    Ok(StageOutcome::Staged) => None,
+                    Ok(StageOutcome::Conflict { .. }) => Some(plan_branch.clone()),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "final stage-changes failed; leaving plan branch unmerged"
+                        );
+                        Some(plan_branch.clone())
+                    }
+                },
                 FinalMerge::MergeCommit => {
                     match final_merger
                         .final_merge_commit(&plan_branch, &merge_message)

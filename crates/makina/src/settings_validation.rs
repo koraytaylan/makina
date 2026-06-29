@@ -6,6 +6,7 @@
 //! own error-surfacing strategy (early return vs. modal error field).
 
 use crate::app::Settings;
+use makina_core::config::FinalMerge;
 
 /// Validated settings values extracted and type-converted from string input.
 #[derive(Debug, Clone)]
@@ -15,6 +16,7 @@ pub struct SettingsValidation {
     pub wall_clock_secs: u64,
     pub idle_secs: Option<u64>,
     pub concurrency: usize,
+    pub final_merge: FinalMerge,
 }
 
 /// Validates all settings fields and returns either a `SettingsValidation`
@@ -103,6 +105,7 @@ pub fn validate_settings(settings: &Settings) -> Result<SettingsValidation, Stri
         wall_clock_secs,
         idle_secs,
         concurrency,
+        final_merge: settings.final_merge,
     })
 }
 
@@ -124,6 +127,7 @@ mod tests {
             wall_clock_secs: wall_clock_secs.to_string(),
             idle_secs: idle_secs.to_string(),
             concurrency: concurrency.to_string(),
+            final_merge: FinalMerge::Squash,
             focused: SettingsField::GateIterations,
             error: None,
         }

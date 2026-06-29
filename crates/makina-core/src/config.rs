@@ -316,6 +316,8 @@ pub enum FinalMerge {
     /// One squash commit of the plan branch onto base_branch (the legacy shape).
     #[default]
     Squash,
+    /// Stage the plan branch's net diff in the base-branch checkout.
+    Stage,
     /// `git merge --no-ff plan/{slug}` — a true merge commit on base_branch.
     MergeCommit,
     /// Leave plan/{slug}; surface its name for a human to merge.
@@ -795,7 +797,7 @@ impl Config {
     /// - Each gate has a non-empty `name`.
     /// - Each gate has a non-empty `command`.
     /// - `base_branch` is non-empty.
-    /// - `[merge] final` is one of `"squash"`, `"merge-commit"`, or `"manual"` (unknown values rejected at parse time).
+    /// - `[merge] final` is one of `"squash"`, `"stage"`, `"merge-commit"`, or `"manual"` (unknown values rejected at parse time).
     ///
     /// # Errors
     ///
@@ -1897,6 +1899,7 @@ mod tests {
     ///
     /// The `[merge] final` field should parse from TOML strings:
     /// - `"squash"` → `FinalMerge::Squash`
+    /// - `"stage"` → `FinalMerge::Stage`
     /// - `"merge-commit"` → `FinalMerge::MergeCommit`
     /// - `"manual"` → `FinalMerge::Manual`
     #[test]
@@ -1914,6 +1917,19 @@ mod tests {
         )
         .expect("TOML with final='squash' is valid");
         assert_eq!(global_squash.merge.final_, FinalMerge::Squash);
+
+        let global_stage = GlobalConfig::from_toml_str(
+            r#"
+            [backend]
+            command = "acp-cli"
+
+            [merge]
+            final = "stage"
+            "#,
+            "global",
+        )
+        .expect("TOML with final='stage' is valid");
+        assert_eq!(global_stage.merge.final_, FinalMerge::Stage);
 
         // Test merge-commit mode
         let global_merge_commit = GlobalConfig::from_toml_str(

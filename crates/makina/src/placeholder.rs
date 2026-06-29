@@ -160,6 +160,27 @@ impl Api for PlaceholderApi {
                     Err(ApiError::UnknownRun { run })
                 }
             }
+            Command::ResetRun { run } => {
+                let mut runs = self.runs.lock().unwrap();
+                let Some(rv) = runs.iter_mut().find(|r| r.id == run) else {
+                    return Err(ApiError::UnknownRun { run });
+                };
+                rv.status = RunStatus::Pending;
+                for task in &mut rv.tasks {
+                    task.state = TaskState::New;
+                    task.gate_iterations = 0;
+                    task.review_iterations = 0;
+                    task.started_at = None;
+                    task.finished_at = None;
+                    task.failure_reason = None;
+                }
+                drop(runs);
+                let _ = self.event_tx.send(Event::RunStatusChanged {
+                    run,
+                    status: RunStatus::Pending,
+                });
+                Ok(CommandOutcome::Acknowledged)
+            }
             // Plan 0017: flip the targeted Failed task(s) back to Ready, mark the
             // run Running, and broadcast TaskRetried + the state changes — enough
             // for TUI tests to observe a retry without a real scheduler.
@@ -243,6 +264,7 @@ impl Api for PlaceholderApi {
             // Plan 0025: force-re-run project discovery. In the placeholder, just
             // acknowledge; the real implementation is in the orchestrator.
             Command::DiscoverProject => Ok(CommandOutcome::Acknowledged),
+            Command::PurgeWorktrees => Ok(CommandOutcome::Acknowledged),
         }
     }
 

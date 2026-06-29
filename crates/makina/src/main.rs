@@ -262,11 +262,12 @@ async fn main() {
         !stdout.trim().is_empty()
     };
 
-    // Clone providers, roles, caps, concurrency, and theme_name before config is moved into the API.
+    // Clone providers, roles, caps, concurrency, merge mode, and theme_name before config is moved into the API.
     let providers_for_app = config.providers.clone();
     let roles_for_app = config.roles.clone();
     let caps_for_app = config.caps.clone();
     let concurrency_for_app = config.concurrency;
+    let final_merge_for_app = config.merge.final_;
     let theme_name_for_app = config.theme_name.clone();
 
     let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
@@ -293,6 +294,7 @@ async fn main() {
         base_branch_exists,
         caps_for_app,
         concurrency_for_app,
+        final_merge_for_app,
     );
 
     // Restore theme from GlobalConfig; unknown/absent names fall back to Ayu Dark with no panic.

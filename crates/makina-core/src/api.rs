@@ -456,6 +456,16 @@ pub enum Command {
         run: RunId,
     },
 
+    /// Reset a run back to a freshly interpreted, pending task graph.
+    ///
+    /// Any active scheduler handle is cancelled, Makina task worktrees for the
+    /// run's current graph are removed, the plan integration branch is deleted,
+    /// and the source task list is interpreted again. The run is not restarted.
+    ResetRun {
+        /// The Run to reset.
+        run: RunId,
+    },
+
     /// Force-re-run project discovery regardless of any existing `[discovery]` stamp.
     ///
     /// Re-scans the repository, replaces all `source = "discovered"` gates with
@@ -466,6 +476,12 @@ pub enum Command {
     /// Non-fatal: if discovery fails, the error is logged and the command
     /// returns `Ok(Acknowledged)` rather than an error — the config is not modified.
     DiscoverProject,
+
+    /// Remove Makina-created git worktrees for the current repository.
+    ///
+    /// This only targets worktrees stored under Makina's transient state root for
+    /// the project; user-created worktrees elsewhere are ignored.
+    PurgeWorktrees,
 }
 
 /// The successful outcome of a [`Command`] executed via [`Api::execute`].
@@ -1128,7 +1144,9 @@ mod tests {
                         Err(ApiError::UnknownRun { run })
                     }
                 }
-                Command::RetryTask { run, .. } | Command::RetryFailedTasks { run } => {
+                Command::RetryTask { run, .. }
+                | Command::RetryFailedTasks { run }
+                | Command::ResetRun { run } => {
                     let runs = self.runs.lock().unwrap();
                     if runs.iter().any(|r| r.id == run) {
                         Ok(CommandOutcome::Acknowledged)
@@ -1140,6 +1158,7 @@ mod tests {
                     // Stub: acknowledge without doing real discovery.
                     Ok(CommandOutcome::Acknowledged)
                 }
+                Command::PurgeWorktrees => Ok(CommandOutcome::Acknowledged),
             }
         }
 

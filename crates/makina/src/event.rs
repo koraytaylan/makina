@@ -371,6 +371,8 @@ async fn resolve_io(
         ),
         // ── Context-sensitive retry (plan 0017) ───────────────────────────────
         AppEvent::RetryFocused => (AppEvent::Tick, retry_focused(app).await),
+        AppEvent::ResetRun => (AppEvent::Tick, reset_active_run(app).await),
+        AppEvent::PurgeWorktrees => (AppEvent::Tick, purge_worktrees(app).await),
         // ── Provider configuration editor commit (task 0041) ──────────────────
         // Write the editor's current providers + roles back to the project config
         // file (`{repo_root}/.makina/config.toml`).  Best-effort: on IO/serialise
@@ -382,13 +384,13 @@ async fn resolve_io(
             (AppEvent::ProviderEditorCommit, status)
         }
         // ── Settings commit (plan 0070) ──────────────────────────────────────
-        // Write the edited caps and concurrency back to the config file
+        // Write the edited caps, concurrency, and finalization mode back to the config file
         // (`{repo_root}/.makina/config.toml`). Validates all fields first;
         // on any error, returns the reason without writing. Like
         // commit_provider_config, this round-trips through GlobalConfig (which
         // has no gates/base_branch field), so ProjectConfig entries are NOT
         // preserved. The actual state update (closing the modal, applying values
-        // to app.caps/concurrency) is handled by App::update after this returns.
+        // to app.caps/concurrency/final_merge) is handled by App::update after this returns.
         AppEvent::SettingsCommit => {
             let status = commit_settings(app).await;
             (AppEvent::SettingsCommit, status)
@@ -623,10 +625,10 @@ async fn commit_provider_config(app: &App) -> Option<String> {
     }
 }
 
-/// Commit edited settings (caps and concurrency) to the config file.
+/// Commit edited settings (caps, concurrency, and final merge mode) to the config file.
 ///
 /// Follows the same pattern as `commit_provider_config`: read the current
-/// on-disk config (if any), rebuild it with the new caps/concurrency while
+/// on-disk config (if any), rebuild it with the new caps/concurrency/merge mode while
 /// preserving all other fields, and write it back. Validates all fields
 /// before writing; on any error returns Some(reason) without writing.
 ///
@@ -636,7 +638,7 @@ async fn commit_provider_config(app: &App) -> Option<String> {
 /// writer lands in plan 0025.
 async fn commit_settings(app: &App) -> Option<String> {
     use crate::settings_validation::validate_settings;
-    use makina_core::config::{CapsConfig, GlobalConfig};
+    use makina_core::config::{CapsConfig, GlobalConfig, MergeConfig};
     use makina_core::paths::config_file;
 
     let settings = app.settings.as_ref()?;
@@ -660,7 +662,7 @@ async fn commit_settings(app: &App) -> Option<String> {
     };
 
     // Build the updated global config: preserve all existing fields but
-    // replace caps and concurrency with the new values.
+    // replace caps, concurrency, and final merge mode with the new values.
     let updated = GlobalConfig {
         caps: CapsConfig {
             gate_iterations: valid.gate_iterations,
@@ -669,6 +671,9 @@ async fn commit_settings(app: &App) -> Option<String> {
             idle_secs: valid.idle_secs,
         },
         concurrency: valid.concurrency,
+        merge: MergeConfig {
+            final_: valid.final_merge,
+        },
         ..existing_global
     };
 
@@ -981,6 +986,33 @@ async fn retry_focused(app: &App) -> Option<String> {
     Some("nothing to retry here".to_string())
 }
 
+async fn reset_active_run(app: &App) -> Option<String> {
+    use makina_core::api::Command;
+
+    let Some(run) = app.active_run_id() else {
+        return Some("No run selected — open or select a plan first".to_string());
+    };
+    if app.api.run(run).await.is_none() {
+        return Some("No live run selected — start or open the plan first".to_string());
+    }
+
+    match app.api.execute(Command::ResetRun { run }).await {
+        Ok(_) => Some(format!("Reset {run}")),
+        Err(e) => Some(format!("Reset failed: {e}")),
+    }
+}
+
+async fn purge_worktrees(app: &App) -> Option<String> {
+    match app
+        .api
+        .execute(makina_core::api::Command::PurgeWorktrees)
+        .await
+    {
+        Ok(_) => Some("Purged Makina worktrees".to_string()),
+        Err(e) => Some(format!("Purge worktrees failed: {e}")),
+    }
+}
+
 /// Force-re-run project discovery, regardless of the [discovery] stamp.
 ///
 /// Issues `Command::DiscoverProject` to the orchestrator, which re-scans the
@@ -1232,13 +1264,16 @@ fn translate_key(
     } else if settings {
         // ── Settings modal keymap ────────────────────────────────────────────
         // Esc closes without saving; Enter commits; Up/Down navigate fields;
-        // 0-9 and Backspace edit the focused numeric field.
+        // 0-9 and Backspace edit numeric fields; Left/Right/Space cycle dropdowns.
         match key.code {
             KeyCode::Esc => AppEvent::CloseSettings,
             KeyCode::Enter => AppEvent::SettingsCommit,
             KeyCode::Up => AppEvent::SettingsUp,
             KeyCode::Down => AppEvent::SettingsDown,
+            KeyCode::Left => AppEvent::SettingsPreviousOption,
+            KeyCode::Right => AppEvent::SettingsNextOption,
             KeyCode::Backspace => AppEvent::SettingsBackspace,
+            KeyCode::Char(' ') => AppEvent::SettingsNextOption,
             KeyCode::Char(c) => AppEvent::SettingsInput(c),
             _ => AppEvent::Tick,
         }
@@ -3693,6 +3728,10 @@ wall_clock_secs = 1200
         app.settings.as_mut().unwrap().concurrency.clear();
         app.update(AppEvent::SettingsInput('8'));
 
+        // Move to finalization mode and select Stage.
+        app.update(AppEvent::SettingsDown);
+        app.update(AppEvent::SettingsNextOption);
+
         // Commit settings via resolve_io.
         let (_resolved_event, status) = resolve_io_for_test(&app, AppEvent::SettingsCommit).await;
 
@@ -3715,6 +3754,11 @@ wall_clock_secs = 1200
             "gate_iterations must be updated"
         );
         assert_eq!(new_config.concurrency, 8, "concurrency must be updated");
+        assert_eq!(
+            new_config.merge.final_,
+            makina_core::config::FinalMerge::Stage,
+            "final merge mode must be updated"
+        );
         assert_eq!(
             new_config.caps.reviewer_iterations, 3,
             "reviewer_iterations must be unchanged"
@@ -3808,6 +3852,56 @@ wall_clock_secs = 1200
                 &app
             ),
             AppEvent::SettingsDown
+        ));
+    }
+
+    #[test]
+    fn settings_option_keys_cycle_options() {
+        let app = test_app();
+
+        let left = key_press(KeyCode::Left, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                left,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
+                crate::app::Panel::Sidebar,
+                false,
+                &app
+            ),
+            AppEvent::SettingsPreviousOption
+        ));
+
+        let right = key_press(KeyCode::Right, KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                right,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
+                crate::app::Panel::Sidebar,
+                false,
+                &app
+            ),
+            AppEvent::SettingsNextOption
+        ));
+
+        let space = key_press(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                space,
+                ModalState {
+                    settings: true,
+                    ..ModalState::default()
+                },
+                crate::app::Panel::Sidebar,
+                false,
+                &app
+            ),
+            AppEvent::SettingsNextOption
         ));
     }
 

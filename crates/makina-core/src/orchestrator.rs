@@ -1878,6 +1878,132 @@ impl CoreApi {
         self.retry_impl(run, None).await
     }
 
+    /// Reset a run to a freshly interpreted Pending graph without re-dispatching.
+    async fn reset_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let repo_root = self.state.worktree_manager.repo_root.clone();
+
+        let (task_list_path, run_uid, run_slug, plan_slug, old_handle, old_graph) = {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            if entry.status == RunStatus::Running {
+                return Err(ApiError::InvalidCommand {
+                    reason: "stop or pause the run before resetting it".into(),
+                });
+            }
+            (
+                entry.task_list_path.clone(),
+                entry.run_uid.clone(),
+                entry.run_slug.clone(),
+                entry.plan_slug.clone(),
+                entry.handle.take(),
+                Arc::clone(&entry.graph),
+            )
+        };
+
+        if let Some(handle) = old_handle {
+            handle.cancel.cancel();
+        }
+
+        let old_task_ids = {
+            let g = old_graph.lock().await;
+            g.tasks.iter().map(|t| t.id.0.clone()).collect::<Vec<_>>()
+        };
+
+        for task_id in &old_task_ids {
+            if let Err(e) = self
+                .state
+                .worktree_manager
+                .remove(&plan_slug, task_id)
+                .await
+            {
+                tracing::warn!(
+                    run_uid = %run_uid,
+                    plan_slug = %plan_slug,
+                    task_id,
+                    error = %e,
+                    "failed to remove task worktree during run reset; continuing",
+                );
+            }
+        }
+        if !plan_slug.is_empty()
+            && let Err(e) = self
+                .state
+                .worktree_manager
+                .delete_plan_branch(&plan_slug)
+                .await
+        {
+            tracing::warn!(
+                run_uid = %run_uid,
+                plan_slug = %plan_slug,
+                error = %e,
+                "failed to delete plan branch during run reset; continuing",
+            );
+        }
+
+        let (new_graph, interpret_issues) = self
+            .interpret_and_seed(&run_slug, &task_list_path, &repo_root, false)
+            .await?;
+
+        let report = {
+            let mut issues = crate::ingestion::validate(&new_graph);
+            issues.extend(crate::ingestion::qualify(&new_graph));
+            issues.extend(interpret_issues);
+            crate::ingestion::IngestionReport { issues }
+        };
+        let graph_snapshot = (!new_graph.tasks.is_empty()).then(|| new_graph.clone());
+        let graph = Arc::new(AsyncMutex::new(new_graph));
+
+        {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            entry.graph = Arc::clone(&graph);
+            entry.report = report;
+            entry.status = RunStatus::Pending;
+            entry.started_at = None;
+            entry.handle = None;
+        }
+
+        if let Some(graph) = graph_snapshot
+            && let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await
+        {
+            tracing::warn!(
+                run_uid = %run_uid,
+                error = %e,
+                "failed to persist graph after run reset; continuing",
+            );
+        }
+
+        let _ = self.state.event_tx.send(Event::RunStatusChanged {
+            run,
+            status: RunStatus::Pending,
+        });
+        let _ = self.state.event_tx.send(Event::RunOpened {
+            run,
+            task_list_path,
+        });
+
+        Ok(CommandOutcome::Acknowledged)
+    }
+
+    async fn purge_worktrees(&self) -> Result<CommandOutcome, ApiError> {
+        self.state
+            .worktree_manager
+            .purge_makina_worktrees()
+            .await
+            .map_err(|e| ApiError::InvalidCommand {
+                reason: format!("failed to purge worktrees: {e}"),
+            })?;
+        Ok(CommandOutcome::Acknowledged)
+    }
+
     /// Shared implementation for `RetryTask`/`RetryFailedTasks`.
     ///
     /// `task == Some(id)` retries exactly one named `Failed` task (rejecting a
@@ -2125,6 +2251,8 @@ impl Api for CoreApi {
     /// * [`Command::ReinterpretRun`] re-reads the source (async, like OpenRun).
     /// * [`Command::RetryTask`] / [`Command::RetryFailedTasks`] reset the failed
     ///   task(s) + skipped cascade, persist, and re-dispatch (async, plan 0017).
+    /// * [`Command::ResetRun`] resets a run to a fresh Pending graph.
+    /// * [`Command::PurgeWorktrees`] removes Makina-created transient worktrees.
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
             Command::OpenRun { task_list_path } => self.open_run(task_list_path).await,
@@ -2139,7 +2267,9 @@ impl Api for CoreApi {
             // Retry is async: it persists the reset graph + run snapshot.
             Command::RetryTask { run, task } => self.retry_task(run, task).await,
             Command::RetryFailedTasks { run } => self.retry_failed_tasks(run).await,
+            Command::ResetRun { run } => self.reset_run(run).await,
             Command::DiscoverProject => self.force_discover_project().await,
+            Command::PurgeWorktrees => self.purge_worktrees().await,
         }
     }
 

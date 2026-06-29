@@ -62,7 +62,7 @@
 //! are similarly treated as best-effort and ignored (the git-level cleanup
 //! already happened).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -115,6 +115,15 @@ pub struct WorktreeHandle {
 
     /// Absolute path to the worktree directory on the filesystem.
     pub path: PathBuf,
+}
+
+/// Summary returned by [`WorktreeManager::purge_makina_worktrees`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorktreePurgeReport {
+    /// Number of registered git worktrees removed.
+    pub worktrees_removed: usize,
+    /// Number of orphan directories removed from Makina's transient worktree root.
+    pub orphan_dirs_removed: usize,
 }
 
 // ── WorktreeManager ───────────────────────────────────────────────────────────
@@ -320,6 +329,53 @@ impl WorktreeManager {
         self.remove_inner(plan_slug, task_id).await
     }
 
+    /// Purge every git worktree registered under Makina's transient worktree
+    /// directory for this repository.
+    ///
+    /// Only worktrees whose path starts with [`paths::worktrees_dir`] are touched;
+    /// user-created worktrees elsewhere are ignored. Branch cleanup is likewise
+    /// scoped to the branch checked out by those Makina worktrees.
+    pub async fn purge_makina_worktrees(&self) -> Result<WorktreePurgeReport, WorktreeError> {
+        let _op_guard = self.op_lock.lock().await;
+        self.git_worktree_prune().await?;
+
+        let worktrees_root = paths::worktrees_dir(&self.repo_root);
+        let registered = self.registered_worktrees().await?;
+        let mut worktrees_removed = 0usize;
+
+        for registered in registered
+            .into_iter()
+            .filter(|wt| wt.path.starts_with(&worktrees_root))
+        {
+            self.remove_worktree_path(&registered.path).await?;
+            if let Some(branch) = registered.branch.as_deref()
+                && branch.starts_with("task/")
+            {
+                self.delete_branch_if_exists(branch).await?;
+            }
+            worktrees_removed += 1;
+        }
+
+        let mut orphan_dirs_removed = 0usize;
+        if worktrees_root.exists() {
+            let mut entries = tokio::fs::read_dir(&worktrees_root).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.is_dir() {
+                    tokio::fs::remove_dir_all(&path).await?;
+                    orphan_dirs_removed += 1;
+                }
+            }
+        }
+
+        let _ = self.git_worktree_prune().await;
+
+        Ok(WorktreePurgeReport {
+            worktrees_removed,
+            orphan_dirs_removed,
+        })
+    }
+
     /// Worktree + branch teardown **without** acquiring `op_lock`.
     ///
     /// The caller MUST already hold `op_lock`: this is invoked by the public
@@ -335,24 +391,7 @@ impl WorktreeManager {
 
         // Remove the worktree (--force handles dirty checkouts; ignore
         // "not a worktree" / "not found" so the call is idempotent).
-        let wt_path_str = worktree_path.to_string_lossy();
-        let remove_result = self
-            .run_git(
-                &["worktree", "remove", "--force", &wt_path_str],
-                &format!(
-                    "git -C {} worktree remove --force {wt_path_str}",
-                    self.repo_root.display()
-                ),
-            )
-            .await;
-
-        if let Err(WorktreeError::GitCommandFailed { ref stderr, .. }) = remove_result
-            && !is_not_found_stderr(stderr)
-        {
-            // Treat "not a worktree", "not found", and similar "it's gone" messages
-            // as success — the goal is achieved.
-            return remove_result.map(|_| ());
-        }
+        self.remove_worktree_path(&worktree_path).await?;
 
         // Attempt to clean up the directory if it still exists on disk (e.g.
         // git removed the worktree registration but left the directory).
@@ -362,18 +401,7 @@ impl WorktreeManager {
         }
 
         // Delete the branch (treat "not found" as success).
-        let delete_result = self
-            .run_git(
-                &["branch", "-D", &branch],
-                &format!("git -C {} branch -D {branch}", self.repo_root.display()),
-            )
-            .await;
-
-        if let Err(WorktreeError::GitCommandFailed { ref stderr, .. }) = delete_result
-            && !is_not_found_stderr(stderr)
-        {
-            return delete_result.map(|_| ());
-        }
+        self.delete_branch_if_exists(&branch).await?;
 
         // Prune again to keep the git worktree list tidy.
         // Ignore errors here — we've already done what we can.
@@ -417,11 +445,88 @@ impl WorktreeManager {
         .map(|_| ())
     }
 
+    /// Delete `plan/{plan_slug}` if it exists, after restoring the base branch.
+    pub async fn delete_plan_branch(&self, plan_slug: &str) -> Result<(), WorktreeError> {
+        let _op_guard = self.op_lock.lock().await;
+        let branch = format!("plan/{plan_slug}");
+        if !self.branch_exists(&branch).await? {
+            return Ok(());
+        }
+        self.checkout(&self.base_branch).await?;
+        self.delete_branch_if_exists(&branch).await
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Compute the worktree path for a given plan slug + task ID.
     fn worktree_path(&self, plan_slug: &str, task_id: &str) -> PathBuf {
         paths::worktree(&self.repo_root, plan_slug, task_id)
+    }
+
+    async fn remove_worktree_path(&self, worktree_path: &Path) -> Result<(), WorktreeError> {
+        let wt_path_str = worktree_path.to_string_lossy();
+        let remove_result = self
+            .run_git(
+                &["worktree", "remove", "--force", &wt_path_str],
+                &format!(
+                    "git -C {} worktree remove --force {wt_path_str}",
+                    self.repo_root.display()
+                ),
+            )
+            .await;
+
+        if let Err(WorktreeError::GitCommandFailed { ref stderr, .. }) = remove_result
+            && !is_not_found_stderr(stderr)
+        {
+            return remove_result.map(|_| ());
+        }
+
+        if worktree_path.exists() {
+            let _ = tokio::fs::remove_dir_all(worktree_path).await;
+        }
+
+        Ok(())
+    }
+
+    async fn delete_branch_if_exists(&self, branch: &str) -> Result<(), WorktreeError> {
+        let delete_result = self
+            .run_git(
+                &["branch", "-D", branch],
+                &format!("git -C {} branch -D {branch}", self.repo_root.display()),
+            )
+            .await;
+
+        if let Err(WorktreeError::GitCommandFailed { ref stderr, .. }) = delete_result
+            && !is_not_found_stderr(stderr)
+        {
+            return delete_result.map(|_| ());
+        }
+
+        Ok(())
+    }
+
+    async fn registered_worktrees(&self) -> Result<Vec<RegisteredWorktree>, WorktreeError> {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .await
+            .map_err(WorktreeError::Io)?;
+
+        if !output.status.success() {
+            return Err(WorktreeError::GitCommandFailed {
+                command: format!(
+                    "git -C {} worktree list --porcelain",
+                    self.repo_root.display()
+                ),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+
+        Ok(parse_worktree_list_porcelain(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 
     /// Run `git worktree prune` in the repository.
@@ -471,6 +576,47 @@ impl WorktreeManager {
             })
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredWorktree {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn parse_worktree_list_porcelain(output: &str) -> Vec<RegisteredWorktree> {
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+
+    let flush = |entries: &mut Vec<RegisteredWorktree>,
+                 current_path: &mut Option<PathBuf>,
+                 current_branch: &mut Option<String>| {
+        if let Some(path) = current_path.take() {
+            entries.push(RegisteredWorktree {
+                path,
+                branch: current_branch.take(),
+            });
+        } else {
+            current_branch.take();
+        }
+    };
+
+    for line in output.lines() {
+        if line.is_empty() {
+            flush(&mut entries, &mut current_path, &mut current_branch);
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            flush(&mut entries, &mut current_path, &mut current_branch);
+            current_path = Some(PathBuf::from(path));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(branch.to_string());
+        }
+    }
+    flush(&mut entries, &mut current_path, &mut current_branch);
+
+    entries
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────

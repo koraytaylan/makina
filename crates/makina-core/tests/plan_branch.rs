@@ -29,17 +29,63 @@
 use std::process::Command;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
+use futures::stream;
 
 use makina_core::actors::{RunControl, run_graph};
 use makina_core::api::RunId;
 use makina_core::audit::NoopAuditRegistry;
-use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
+use makina_core::backend::{
+    AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
+};
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::worktree::WorktreeManager;
+
+#[derive(Clone)]
+struct WritingBackend {
+    file_name: String,
+    content: String,
+    response: String,
+}
+
+#[async_trait]
+impl AgentBackend for WritingBackend {
+    async fn spawn(&self, config: SessionConfig) -> Result<Box<dyn AgentSession>, BackendError> {
+        std::fs::write(config.working_dir.join(&self.file_name), &self.content).map_err(|e| {
+            BackendError::Spawn {
+                reason: e.to_string(),
+            }
+        })?;
+        Ok(Box::new(WritingSession {
+            response: self.response.clone(),
+        }))
+    }
+}
+
+struct WritingSession {
+    response: String,
+}
+
+#[async_trait]
+impl AgentSession for WritingSession {
+    async fn prompt(&mut self, _prompt: Prompt) -> Result<ResponseStream, BackendError> {
+        let events = vec![
+            Ok(ResponseEvent::TextChunk {
+                text: self.response.clone(),
+            }),
+            Ok(ResponseEvent::TurnComplete { usage: None }),
+        ];
+        Ok(Box::pin(stream::iter(events)))
+    }
+
+    async fn terminate(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
 
 // ── Temp-repo helpers (mirror tests/squash_merge.rs & tests/develop_review_loop.rs) ──
 
@@ -121,6 +167,10 @@ fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
 /// Get the SHA of a branch tip.
 fn branch_sha(path: &std::path::Path, branch: &str) -> String {
     git_stdout(path, &["rev-parse", branch])
+}
+
+fn git_cached_name_status(path: &std::path::Path) -> String {
+    git_stdout(path, &["diff", "--cached", "--name-status"])
 }
 
 /// Create a task with the given ID, title, and dependencies.
@@ -468,7 +518,15 @@ async fn final_squash_lands_one_commit_on_base() {
 
     // ── Task reached Done ────────────────────────────────────────────────────────
     assert_eq!(report.outcomes.len(), 1);
-    assert_eq!(report.outcomes[0].1, TaskState::Done);
+    let failure_reason = {
+        let g = graph.lock().await;
+        g.tasks[0].failure_reason.clone()
+    };
+    assert_eq!(
+        report.outcomes[0].1,
+        TaskState::Done,
+        "task should finish; failure_reason={failure_reason:?}"
+    );
 
     // ── Develop gained exactly one new commit ─────────────────────────────────────
     let develop_count_after = commit_count(&repo_root);
@@ -547,7 +605,15 @@ async fn final_merge_commit_creates_a_merge_commit() {
 
     // ── Task reached Done ────────────────────────────────────────────────────────
     assert_eq!(report.outcomes.len(), 1);
-    assert_eq!(report.outcomes[0].1, TaskState::Done);
+    let failure_reason = {
+        let g = graph.lock().await;
+        g.tasks[0].failure_reason.clone()
+    };
+    assert_eq!(
+        report.outcomes[0].1,
+        TaskState::Done,
+        "task should finish; failure_reason={failure_reason:?}"
+    );
 
     // ── plan_branch_left is None ─────────────────────────────────────────────────
     assert_eq!(
@@ -570,6 +636,95 @@ async fn final_merge_commit_creates_a_merge_commit() {
     assert!(
         merges.contains(&develop_head),
         "the new develop HEAD must appear in git rev-list --merges"
+    );
+}
+
+/// **Proves "Stage mode copies the plan diff to the main worktree as staged".**
+#[tokio::test]
+async fn final_stage_leaves_changes_staged_on_base() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().expect("temp HOME");
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
+
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    let develop_count_before = commit_count(&repo_root);
+
+    let backend = WritingBackend {
+        file_name: "staged.txt".into(),
+        content: "hello from plan\n".into(),
+        response: "Implemented the feature.".into(),
+    };
+    let reviewer = NoopBackend::with_responses(vec![r#"{"verdict":"approve"}"#.into()]);
+    let backend_ref = Arc::new(backend) as Arc<dyn AgentBackend>;
+    let reviewer_ref = Arc::new(reviewer) as Arc<dyn AgentBackend>;
+
+    let task = task("stage-task", "a staged task", &[]);
+    let mut config = Config::resolve(GlobalConfig::default(), ProjectConfig::default());
+    config.merge.final_ = makina_core::config::FinalMerge::Stage;
+
+    let worktree_manager = WorktreeManager::new(repo_root.clone(), "develop".into());
+    let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
+        slug: "stage-test".into(),
+        tasks: vec![task],
+    }));
+
+    let control = RunControl {
+        run: RunId(42),
+        sink: Arc::new(|_| {}),
+        pause: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+
+    let report = run_graph(
+        Arc::clone(&graph),
+        worktree_manager,
+        config,
+        backend_ref,
+        reviewer_ref,
+        control,
+        Arc::new(NoopAuditRegistry),
+        "run-slug".into(),
+        "run-uid".into(),
+        "stage-test".into(),
+        Arc::new(StructuredTextInterpreter::new()),
+    )
+    .await
+    .expect("run_graph should succeed");
+
+    assert_eq!(report.outcomes.len(), 1);
+    let failure_reason = {
+        let g = graph.lock().await;
+        g.tasks[0].failure_reason.clone()
+    };
+    assert_eq!(
+        report.outcomes[0].1,
+        TaskState::Done,
+        "task should finish; failure_reason={failure_reason:?}"
+    );
+    assert_eq!(
+        report.plan_branch_left, None,
+        "stage mode should treat staged changes as the requested final state"
+    );
+    assert_eq!(
+        current_branch(&repo_root),
+        "develop",
+        "repo_root should end on develop"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        develop_count_before,
+        "stage mode must not create a commit on develop"
+    );
+    assert_eq!(
+        git_cached_name_status(&repo_root),
+        "A\tstaged.txt",
+        "plan diff should be staged in the main worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("staged.txt")).unwrap(),
+        "hello from plan\n"
     );
 }
 
@@ -661,9 +816,10 @@ async fn final_manual_leaves_branch_and_reports_name() {
 /// This test uses a rejected task to force a failure.
 #[tokio::test]
 async fn failed_task_leaves_branch_in_every_mode() {
-    // Test all three final-merge modes with a forced failure.
+    // Test all final-merge modes with a forced failure.
     let modes = vec![
         makina_core::config::FinalMerge::Squash,
+        makina_core::config::FinalMerge::Stage,
         makina_core::config::FinalMerge::MergeCommit,
         makina_core::config::FinalMerge::Manual,
     ];

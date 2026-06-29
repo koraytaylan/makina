@@ -242,6 +242,12 @@ pub fn task_log(repo_root: &Path, run_id: &str, task_slug: &str) -> PathBuf {
         .join(format!("{task_slug}.log"))
 }
 
+/// Returns the transient directory that holds Makina-created task worktrees:
+/// `$HOME/.makina/projects/{ns}/worktrees/`.
+pub fn worktrees_dir(repo_root: &Path) -> PathBuf {
+    state_root(repo_root).join("worktrees")
+}
+
 /// Creates (if needed) and returns the per-run log directory:
 /// `$HOME/.makina/projects/{ns}/runs/{run_id}/logs`.
 ///
@@ -268,9 +274,7 @@ pub fn run_logs_dir(repo_root: &Path, run_id: &str) -> std::io::Result<PathBuf> 
 /// /home/user/.makina/projects/myrepo-<hash6>/worktrees/0003-task-a-xxxx
 /// ```
 pub fn worktree(repo_root: &Path, plan_slug: &str, task_id: &str) -> PathBuf {
-    state_root(repo_root)
-        .join("worktrees")
-        .join(short_worktree_name(plan_slug, task_id))
+    worktrees_dir(repo_root).join(short_worktree_name(plan_slug, task_id))
 }
 
 #[cfg(test)]
