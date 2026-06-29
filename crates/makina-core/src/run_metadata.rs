@@ -399,8 +399,9 @@ pub fn load_disk_run_views(
                 views.push(run_view_from_metadata(id, &meta, repo_root));
             }
             Ok(None) => {
-                // run.json absent — directory may be a partial/corrupt run.
-                tracing::warn!(run_uid = %run_uid, "run directory has no run.json; skipping");
+                // run.json absent can be intentional: reset removes completed
+                // snapshots while preserving logs/transcripts under the run dir.
+                tracing::debug!(run_uid = %run_uid, "run directory has no run.json; skipping");
             }
             Err(e) => {
                 tracing::warn!(run_uid = %run_uid, error = %e, "failed to read run.json; skipping");
