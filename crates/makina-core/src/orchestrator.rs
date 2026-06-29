@@ -788,7 +788,6 @@ impl CoreState {
                     started_at: t.started_at,
                     finished_at: t.finished_at,
                     failure_reason: t.failure_reason.clone(),
-                    entry_text: task_entry_text(t),
                 })
                 .collect();
             (terminal_status, snapshots)
@@ -2226,7 +2225,6 @@ impl CoreApi {
                 started_at: t.started_at,
                 finished_at: t.finished_at,
                 failure_reason: t.failure_reason.clone(),
-                entry_text: task_entry_text(t),
             })
             .collect();
         let started_at = started_at.unwrap_or_else(Utc::now);

@@ -61,10 +61,6 @@ pub struct TaskSnapshot {
     /// Additive field: old `run.json` files without it still load with `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<crate::api::FailureReason>,
-    /// Raw Markdown entry for this task, used to reconstruct task-detail Scope
-    /// content for disk-loaded runs.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub entry_text: String,
 }
 
 /// A durable snapshot of a Run's identity and lifecycle window.
@@ -280,7 +276,7 @@ fn find_plan_tasks_path(repo_root: &Path, effective_plan: &str) -> Option<std::p
     candidate.is_file().then_some(candidate)
 }
 
-fn task_entry_fallbacks(repo_root: &Path, effective_plan: &str) -> HashMap<String, String> {
+fn task_entry_sources(repo_root: &Path, effective_plan: &str) -> HashMap<String, String> {
     let Some(tasks_path) = find_plan_tasks_path(repo_root, effective_plan) else {
         return HashMap::new();
     };
@@ -288,11 +284,33 @@ fn task_entry_fallbacks(repo_root: &Path, effective_plan: &str) -> HashMap<Strin
         return HashMap::new();
     };
 
-    crate::orchestrator::parse_plan_tasks(&contents)
+    crate::interpreter::parse_structured_text(effective_plan, &contents)
+        .ok()
         .into_iter()
-        .filter(|task| !task.body.trim().is_empty())
-        .map(|task| (task.id, task.body))
+        .flat_map(|graph| graph.tasks)
+        .map(|task| {
+            (
+                task.id.0,
+                task_entry_text_from_parts(&task.description, &task.done_when),
+            )
+        })
+        .filter(|(_, entry_text)| !entry_text.trim().is_empty())
         .collect()
+}
+
+fn task_entry_text_from_parts(description: &str, done_when: &str) -> String {
+    let mut entry_text = String::new();
+    if !description.trim().is_empty() {
+        entry_text.push_str(description.trim());
+    }
+    if !done_when.trim().is_empty() {
+        if !entry_text.is_empty() {
+            entry_text.push_str("\n\n");
+        }
+        entry_text.push_str("### Done when\n\n");
+        entry_text.push_str(done_when.trim());
+    }
+    entry_text
 }
 
 /// Build a [`RunView`] from a [`RunMetadata`] snapshot, assigning `id` as the
@@ -300,7 +318,8 @@ fn task_entry_fallbacks(repo_root: &Path, effective_plan: &str) -> HashMap<Strin
 ///
 /// Tasks are reconstructed from the embedded [`TaskSnapshot`] slice.  When the
 /// slice is empty (an old `run.json` pre-dating this change) the returned view
-/// has no tasks — callers may optionally fall back to the task-list artifact.
+/// has no tasks. Task detail Scope text is reconstructed from the plan's
+/// `TASKS.md`; persisted run metadata carries state, not duplicated task prose.
 /// The ingestion report is left empty (no issues) for disk-loaded snapshots
 /// because the original `IngestionReport` is not persisted.
 fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> RunView {
@@ -310,7 +329,7 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
         .unwrap_or("")
         .to_string();
     let effective_plan = effective_plan_slug(meta);
-    let fallback_entries = task_entry_fallbacks(repo_root, &effective_plan);
+    let task_entries = task_entry_sources(repo_root, &effective_plan);
 
     let tasks: Vec<TaskView> = meta
         .tasks()
@@ -329,11 +348,7 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
             started_at: t.started_at,
             finished_at: t.finished_at,
             failure_reason: t.failure_reason.clone(),
-            entry_text: if t.entry_text.trim().is_empty() {
-                fallback_entries.get(&t.id).cloned().unwrap_or_default()
-            } else {
-                t.entry_text.clone()
-            },
+            entry_text: task_entries.get(&t.id).cloned().unwrap_or_default(),
         })
         .collect();
 
@@ -662,6 +677,29 @@ mod tests {
         // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
         unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
+        let plan_dir = root.join("docs").join("plans").join("demo-plan");
+        std::fs::create_dir_all(&plan_dir).expect("create plan dir");
+        std::fs::write(
+            plan_dir.join("TASKS.md"),
+            r#"# Tasks
+
+---
+
+## 0001 — Work
+
+### task-one — First task
+Task one scope from TASKS.
+- **Depends on:** —
+- **Done when:** Task one done from TASKS.
+
+### task-two — Second task
+Task two scope from TASKS.
+- **Depends on:** task-one
+- **Done when:** Task two done from TASKS.
+"#,
+        )
+        .expect("write TASKS.md");
+
         let started = fixed_ts(2026, 5, 1);
         let ended = fixed_ts(2026, 5, 2);
 
@@ -676,7 +714,6 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
-                entry_text: "Task one scope.\n\n### Done when\n\nTask one done.".to_string(),
             },
             TaskSnapshot {
                 id: "task-two".to_string(),
@@ -688,7 +725,6 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
-                entry_text: "Task two scope.".to_string(),
             },
         ];
 
@@ -705,6 +741,13 @@ mod tests {
         write_run_metadata(&meta, root)
             .await
             .expect("write_run_metadata must succeed");
+        let run_json =
+            std::fs::read_to_string(crate::paths::run_dir(root, meta.run_uid()).join("run.json"))
+                .expect("read persisted run metadata");
+        assert!(
+            !run_json.contains("entry_text"),
+            "run.json must not persist task Scope text; got {run_json}"
+        );
 
         // load_disk_run_views (the disk half of runs()) must surface this run as a
         // RunView with the correct task states and iteration counts — without any
@@ -733,8 +776,9 @@ mod tests {
         assert_eq!(t1.review_iterations, 0);
         assert!(t1.depends_on.is_empty());
         assert_eq!(
-            t1.entry_text, "Task one scope.\n\n### Done when\n\nTask one done.",
-            "task detail Scope content must survive disk reconstruction"
+            t1.entry_text,
+            "Task one scope from TASKS.\n\n### Done when\n\nTask one done from TASKS.",
+            "task detail Scope content must be reconstructed from TASKS.md"
         );
 
         let t2 = &view.tasks[1];
@@ -744,11 +788,14 @@ mod tests {
         assert_eq!(t2.gate_iterations, 1);
         assert_eq!(t2.review_iterations, 1);
         assert_eq!(t2.depends_on, vec![TaskId::new("task-one")]);
-        assert_eq!(t2.entry_text, "Task two scope.");
+        assert_eq!(
+            t2.entry_text,
+            "Task two scope from TASKS.\n\n### Done when\n\nTask two done from TASKS."
+        );
     }
 
     #[test]
-    fn disk_run_without_entry_text_recovers_scope_from_plan_tasks_md() {
+    fn disk_run_loads_scope_from_plan_tasks_md() {
         let _guard = HOME_ENV_LOCK.blocking_lock();
         let tmp_home = tempfile::tempdir().expect("create temp home");
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -811,21 +858,118 @@ Recovered task scope from the original plan file.
         assert!(
             task.entry_text
                 .contains("Recovered task scope from the original plan file."),
-            "old run snapshot should recover task body from matching TASKS.md, got {:?}",
+            "old run snapshot should load task body from matching TASKS.md, got {:?}",
             task.entry_text
         );
         assert!(
             task.entry_text
                 .contains("the task detail Scope section is not empty"),
-            "fallback should preserve the Done-when bullet in the task body"
+            "TASKS.md source should preserve the Done-when text in the task body"
+        );
+        assert!(
+            !task.entry_text.contains("**Done when:**")
+                && !task.entry_text.contains("**Depends on:**"),
+            "TASKS.md source should normalize task-list fields into live task scope, got {:?}",
+            task.entry_text
+        );
+    }
+
+    #[test]
+    fn disk_run_ignores_persisted_entry_text_and_loads_markdown_blocks_from_plan_tasks_md() {
+        let _guard = HOME_ENV_LOCK.blocking_lock();
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        let run_uid = "01FLATENTRYTEXT0000000000";
+
+        // SAFETY: serialised by HOME_ENV_LOCK
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let plan_dir = root.join("docs").join("plans").join("0001-initial");
+        std::fs::create_dir_all(&plan_dir).expect("create plan dir");
+        std::fs::write(
+            plan_dir.join("TASKS.md"),
+            r#"# Tasks
+
+---
+
+## 0001 — Initial
+
+### cargo-scaffold — Compiling Skeleton With Wired Dispatch
+Create a binary crate with the full dispatch skeleton.
+
+Steps:
+1. Create `Cargo.toml`:
+   ```toml
+   [package]
+   name = "todo"
+   ```
+2. Create `src/main.rs`:
+   ```rust,no_run
+   fn main() {
+       todo!();
+   }
+   ```
+
+- **Depends on:** —
+- **Done when:** `cargo build` succeeds and `cargo run -- --help` prints usage.
+"#,
+        )
+        .expect("write TASKS.md");
+
+        let old_json = r#"{
+  "run_uid": "01FLATENTRYTEXT0000000000",
+  "run_slug": "0001-initial-tasks",
+  "plan_slug": "0001-initial",
+  "status": "completed",
+  "started_at": "2026-05-01T10:00:00Z",
+  "ended_at": "2026-05-01T11:00:00Z",
+  "tasks": [
+    {
+      "id": "cargo-scaffold",
+      "title": "Compiling Skeleton With Wired Dispatch",
+      "state": "done",
+      "gate_iterations": 0,
+      "review_iterations": 0,
+      "depends_on": [],
+      "entry_text": "Create a binary crate with the full dispatch skeleton. Steps: 1. Create `Cargo.toml`: ```toml [package] name = \"todo\" ``` 2. Create `src/main.rs`: ```rust,no_run fn main() { todo!(); } ``` ### Done when `cargo build` succeeds and `cargo run -- --help` prints usage."
+    }
+  ]
+}
+"#;
+        let run_dir_path = crate::paths::run_dir(root, run_uid);
+        std::fs::create_dir_all(&run_dir_path).expect("create run dir");
+        std::fs::write(run_dir_path.join("run.json"), old_json).expect("write old run.json");
+
+        let mut next_id = 1u64;
+        let live: HashSet<String> = HashSet::new();
+        let views = load_disk_run_views(root, &live, &mut next_id);
+
+        assert_eq!(views.len(), 1);
+        let task = views[0].tasks.first().expect("task reconstructed");
+        assert!(
+            task.entry_text.contains("```toml\n") && task.entry_text.contains("```rust,no_run\n"),
+            "legacy persisted snapshot must be ignored in favor of source Markdown fences, got {:?}",
+            task.entry_text
+        );
+        assert!(
+            task.entry_text
+                .contains("### Done when\n\n`cargo build` succeeds"),
+            "TASKS.md source should use live task detail Done when shape, got {:?}",
+            task.entry_text
+        );
+        assert!(
+            !task.entry_text.contains("```toml [package]")
+                && !task.entry_text.contains("```rust,no_run fn main"),
+            "flattened inline fences must not survive, got {:?}",
+            task.entry_text
         );
     }
 
     /// A [`TaskSnapshot`] with `started_at`/`finished_at` set survives a
-    /// `serde_json` round-trip with the values intact.  Additionally, a
-    /// `TaskSnapshot` deserialized from JSON that **lacks** both fields (an old
-    /// `run.json`) still loads cleanly with `None/None` — verifying the
-    /// `#[serde(default)]` backward-compat contract.
+    /// `serde_json` round-trip with the values intact. Old JSON with or without
+    /// an `entry_text` field still loads cleanly, but that stale Scope copy is
+    /// ignored.
     #[test]
     fn snapshot_roundtrips_timestamps() {
         let ts0 = fixed_ts(2026, 3, 1);
@@ -842,10 +986,13 @@ Recovered task scope from the original plan file.
             started_at: Some(ts0),
             finished_at: Some(ts1),
             failure_reason: None,
-            entry_text: "Persisted task scope.".to_string(),
         };
 
         let json = serde_json::to_string(&snap).expect("serialize TaskSnapshot");
+        assert!(
+            !json.contains("entry_text"),
+            "new task snapshots must not persist task detail Scope text"
+        );
         let back: TaskSnapshot = serde_json::from_str(&json).expect("deserialize TaskSnapshot");
 
         assert_eq!(
@@ -858,11 +1005,6 @@ Recovered task scope from the original plan file.
             Some(ts1),
             "finished_at must survive serde_json round-trip"
         );
-        assert_eq!(
-            back.entry_text, "Persisted task scope.",
-            "entry_text must survive serde_json round-trip"
-        );
-
         // --- case 2: old JSON without started_at/finished_at still deserializes ---
         let old_json = r#"{
             "id": "old-task",
@@ -883,9 +1025,22 @@ Recovered task scope from the original plan file.
             old_snap.finished_at, None,
             "old snapshot without finished_at must deserialize to None"
         );
-        assert!(
-            old_snap.entry_text.is_empty(),
-            "old snapshot without entry_text must deserialize to empty text"
+        assert_eq!(old_snap.id, "old-task");
+
+        let legacy_with_entry_text = r#"{
+            "id": "legacy-task",
+            "title": "Legacy task",
+            "state": "done",
+            "gate_iterations": 0,
+            "review_iterations": 0,
+            "depends_on": [],
+            "entry_text": "Legacy persisted scope."
+        }"#;
+        let legacy_snap: TaskSnapshot = serde_json::from_str(legacy_with_entry_text)
+            .expect("old JSON with entry_text must deserialize");
+        assert_eq!(
+            legacy_snap.id, "legacy-task",
+            "legacy entry_text should be ignored while the task snapshot still loads"
         );
     }
 
