@@ -989,15 +989,56 @@ async fn retry_focused(app: &App) -> Option<String> {
 async fn reset_active_run(app: &App) -> Option<String> {
     use makina_core::api::Command;
 
-    let Some(run) = app.active_run_id() else {
-        return Some("No run selected — open or select a plan first".to_string());
-    };
-    if app.api.run(run).await.is_none() {
-        return Some("No live run selected — start or open the plan first".to_string());
+    if let Some(run) = app.active_run_id()
+        && app.api.run(run).await.is_some()
+    {
+        return match app.api.execute(Command::ResetRun { run }).await {
+            Ok(_) => Some(format!("Reset {run}")),
+            Err(e) => Some(format!("Reset failed: {e}")),
+        };
     }
 
-    match app.api.execute(Command::ResetRun { run }).await {
-        Ok(_) => Some(format!("Reset {run}")),
+    if let Some(plan) = app.context_plan() {
+        if !plan.has_tasks {
+            return Some(format!(
+                "{}: no TASKS.md to reset — author tasks first",
+                plan.slug
+            ));
+        }
+        return open_and_reset_task_list(app, plan.dir.join("TASKS.md"), plan.slug.clone()).await;
+    }
+
+    if let Some(run_view) = app.selected_run() {
+        let label = run_view
+            .task_list_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("selected run")
+            .to_string();
+        return open_and_reset_task_list(app, run_view.task_list_path.clone(), label).await;
+    }
+
+    Some("No plan or run selected — open or select a plan first".to_string())
+}
+
+async fn open_and_reset_task_list(
+    app: &App,
+    task_list_path: std::path::PathBuf,
+    label: String,
+) -> Option<String> {
+    use makina_core::api::{Command, CommandOutcome};
+
+    match app.api.execute(Command::OpenRun { task_list_path }).await {
+        Ok(CommandOutcome::RunOpened { run }) => {
+            match app.api.execute(Command::ResetRun { run }).await {
+                Ok(_) => Some(format!("Reset {label}")),
+                Err(e) => Some(format!("Reset failed: {e}")),
+            }
+        }
+        Ok(_) => Some(format!(
+            "Reset failed: opening {label} did not return a run"
+        )),
         Err(e) => Some(format!("Reset failed: {e}")),
     }
 }
@@ -2502,6 +2543,79 @@ mod tests {
         assert!(
             matches!(cmds[1], Command::StartRun { run: RunId(42) }),
             "second command must auto-start the freshly opened run; got {:?}",
+            cmds[1]
+        );
+    }
+
+    /// Reset mirrors the Start-on-plan fallback: an already-open plan tab with
+    /// no live Run should still be resettable from the command palette.
+    #[tokio::test]
+    async fn reset_on_plan_tab_without_live_run_opens_and_resets_it() {
+        use crate::app::{App, AppEvent, TabContent};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command.clone());
+                match command {
+                    Command::OpenRun { .. } => Ok(CommandOutcome::RunOpened { run: RunId(42) }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                vec![]
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![],
+            std::path::PathBuf::from("."),
+        );
+        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/tmp/docs/plans/0099-demo"),
+            slug: "0099-demo".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0099-demo".to_string(),
+        });
+
+        let (ev, status) = resolve_io_for_test(&app, AppEvent::ResetRun).await;
+        assert!(matches!(ev, AppEvent::Tick));
+        assert_eq!(status.as_deref(), Some("Reset 0099-demo"));
+
+        let cmds = api.commands.lock().unwrap().clone();
+        assert!(
+            matches!(&cmds[0], Command::OpenRun { task_list_path }
+                if task_list_path == &std::path::PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md")),
+            "first command must be OpenRun for the plan's TASKS.md; got {:?}",
+            cmds[0]
+        );
+        assert!(
+            matches!(cmds[1], Command::ResetRun { run: RunId(42) }),
+            "second command must reset the freshly opened run; got {:?}",
             cmds[1]
         );
     }
