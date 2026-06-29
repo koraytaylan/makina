@@ -564,6 +564,14 @@ fn log_event(ev: &Event) {
                 gate_count, scanned_files
             )
         }
+        Event::PlanOperation {
+            plan_slug,
+            phase,
+            message,
+            ..
+        } => {
+            eprintln!("  · PlanOperation {plan_slug} {phase:?}: {message}")
+        }
         Event::RunIntegrationBranchLeft { run, branch } => {
             eprintln!("  · RunIntegrationBranchLeft {run} → {branch}")
         }

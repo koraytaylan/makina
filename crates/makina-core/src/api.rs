@@ -707,6 +707,28 @@ pub struct ConfigOptionChoiceView {
     pub description: Option<String>,
 }
 
+/// Long-running plan-level operation surfaced to the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanOperationKind {
+    /// Reset a plan/run back to a fresh pending graph.
+    Reset,
+}
+
+/// Phase of a long-running plan operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanOperationPhase {
+    /// The operation has started.
+    Started,
+    /// The operation is still running and reports an intermediate step.
+    Step,
+    /// The operation completed successfully.
+    Finished,
+    /// The operation failed.
+    Failed,
+}
+
 /// An event emitted by the orchestrator and consumed by the TUI.
 ///
 /// The TUI subscribes once via [`Api::subscribe`] and drives a render loop
@@ -895,6 +917,20 @@ pub enum Event {
         gate_count: usize,
         /// Number of files scanned.
         scanned_files: usize,
+    },
+
+    /// Progress for a long-running plan-level operation such as reset.
+    PlanOperation {
+        /// Stable plan slug the operation applies to.
+        plan_slug: String,
+        /// Human-facing plan label.
+        label: String,
+        /// Operation kind.
+        operation: PlanOperationKind,
+        /// Current operation phase.
+        phase: PlanOperationPhase,
+        /// User-facing progress message.
+        message: String,
     },
 
     /// The run's integration branch was left unmerged (Manual mode, failed run, or merge conflict).

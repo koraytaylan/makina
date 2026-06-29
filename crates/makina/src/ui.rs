@@ -224,7 +224,15 @@ pub fn render(app: &App, frame: &mut Frame) {
                         } else {
                             "▾ "
                         };
-                        let (badge, badge_color) = status_badge(&run_view.status, app);
+                        let resetting = app.is_resetting_run(run_view);
+                        let (badge, badge_color) = if resetting {
+                            (
+                                spinner_frame(app.tick),
+                                app.active_theme.get(crate::theme::ThemeRole::Warning),
+                            )
+                        } else {
+                            status_badge(&run_view.status, app)
+                        };
                         let name = run_label(run_view);
                         let mut spans = vec![
                             Span::raw(disclosure),
@@ -232,9 +240,9 @@ pub fn render(app: &App, frame: &mut Frame) {
                             Span::styled(" ", Style::default()),
                             Span::raw(name),
                         ];
-                        if app.is_resetting_run(run_view) {
+                        if resetting {
                             spans.push(Span::styled(
-                                format!("  {} resetting", spinner_frame(app.tick)),
+                                "  resetting",
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
                             ));
@@ -253,26 +261,36 @@ pub fn render(app: &App, frame: &mut Frame) {
                         let last = *task + 1 == n;
                         let connector = if last { "  └ " } else { "  ├ " };
 
-                        let (badge, badge_color) = task_state_badge(&task_view.state, app);
-                        let badge_text = match task_view.state {
-                            makina_core::api::TaskState::InProgress
-                            | makina_core::api::TaskState::InReview => {
-                                format!("{} {}", spinner_frame(app.tick), badge)
-                            }
-                            _ => badge.to_string(),
+                        let resetting = app.is_resetting_run(run_view);
+                        let (badge_text, badge_color) = if resetting {
+                            (
+                                "[reset]".to_string(),
+                                app.active_theme.get(crate::theme::ThemeRole::Warning),
+                            )
+                        } else {
+                            let (badge, badge_color) = task_state_badge(&task_view.state, app);
+                            let badge_text = match task_view.state {
+                                makina_core::api::TaskState::InProgress
+                                | makina_core::api::TaskState::InReview => {
+                                    format!("{} {}", spinner_frame(app.tick), badge)
+                                }
+                                _ => badge.to_string(),
+                            };
+                            (badge_text, badge_color)
                         };
 
                         // Build failure label if needed
-                        let failure_label =
-                            if matches!(task_view.state, makina_core::api::TaskState::Failed) {
-                                if let Some(reason) = &task_view.failure_reason {
-                                    format!(" {}", failure_kind_label(&reason.kind))
-                                } else {
-                                    String::new()
-                                }
+                        let failure_label = if !resetting
+                            && matches!(task_view.state, makina_core::api::TaskState::Failed)
+                        {
+                            if let Some(reason) = &task_view.failure_reason {
+                                format!(" {}", failure_kind_label(&reason.kind))
                             } else {
                                 String::new()
-                            };
+                            }
+                        } else {
+                            String::new()
+                        };
 
                         let line = Line::from(vec![
                             Span::styled(
@@ -457,7 +475,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         || app.is_viewing_doctor()
         || app.is_command_palette()
         || app.is_settings()
-        || app.is_confirming_reset();
+        || app.is_confirming_reset()
+        || app.is_operation_notice();
     app.set_selection_panes(if overlay_active {
         vec![crate::app::SelectionPane {
             hit: area,
@@ -963,6 +982,12 @@ pub fn render(app: &App, frame: &mut Frame) {
         render_reset_confirmation(app, confirm, frame, area);
     }
 
+    if app.is_operation_notice()
+        && let Some(notice) = app.operation_notice.as_ref()
+    {
+        render_operation_notice(app, notice, frame, area);
+    }
+
     // ── Mouse text-selection highlight ─────────────────────────────────────────
     // Applied last so it reverses whatever pane or overlay drew beneath the
     // dragged region. See `crate::selection` for why selection lives in-app.
@@ -1236,8 +1261,68 @@ fn carve_dependency_overlay(
 /// for the task in context ([`App::log_pane_target`]), reusing the exchange
 /// pane's line builder so the content matches the run view. Falls back to a hint
 /// when no task is in context (e.g. a plan tab) or it has produced no log yet.
+fn wrap_plain_line(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    let max = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let current_len = current.chars().count();
+        let needed = if current.is_empty() {
+            word_len
+        } else {
+            current_len + 1 + word_len
+        };
+        if !current.is_empty() && needed > max {
+            lines.push(Line::from(vec![Span::styled(current, style)]));
+            current = word.to_string();
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+
+    if current.is_empty() {
+        lines.push(Line::from(vec![Span::styled(text.to_string(), style)]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(current, style)]));
+    }
+    lines
+}
+
 fn log_tab_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+    if let Some(op) = app.context_operation_log()
+        && !op.log.is_empty()
+    {
+        let phase = match op.phase {
+            makina_core::api::PlanOperationPhase::Started
+            | makina_core::api::PlanOperationPhase::Step => "running",
+            makina_core::api::PlanOperationPhase::Finished => "finished",
+            makina_core::api::PlanOperationPhase::Failed => "failed",
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                format!("  Reset {} ", op.label),
+                Style::default()
+                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("({phase})"), dim),
+        ])];
+        lines.push(Line::from(""));
+        for entry in &op.log {
+            lines.extend(wrap_plain_line(
+                &format!("  - {entry}"),
+                width,
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+            ));
+        }
+        return lines;
+    }
     match app
         .log_pane_target()
         .and_then(|(run, task)| app.exchange_logs.get(&(run, task)))
@@ -3786,6 +3871,99 @@ fn render_reset_confirmation(
     frame.render_widget(footer, chunks[1]);
 }
 
+/// Render a notice when a command is blocked by an in-flight plan operation.
+fn render_operation_notice(
+    app: &App,
+    notice: &crate::app::OperationNotice,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let popup = centered_rect(64, 34, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Reset In Progress ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning)))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+
+    let operation = app.plan_operations.get(&notice.slug);
+    let label = operation
+        .map(|op| op.label.as_str())
+        .unwrap_or(notice.slug.as_str());
+    let current_step = operation
+        .and_then(|op| op.log.last())
+        .map(String::as_str)
+        .unwrap_or("Reset is still running");
+
+    let body = vec![
+        Line::from(vec![Span::styled(
+            "That command is unavailable while this plan is resetting.",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Command: ",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            ),
+            Span::styled(
+                notice.attempted.clone(),
+                Style::default()
+                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Plan: ",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            ),
+            Span::styled(
+                label.to_string(),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Current step: ",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            ),
+            Span::styled(
+                current_step.to_string(),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Start, retry, stop, and reset are locked for this plan until reset finishes.",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        )]),
+        Line::from(vec![Span::styled(
+            "The Logs pane shows each backend reset step as it happens.",
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        )]),
+    ];
+
+    let paragraph = Paragraph::new(body).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, chunks[0]);
+
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "Enter/Esc close",
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+    )]));
+    frame.render_widget(footer, chunks[1]);
+}
+
 /// Probe whether a directory is writable.
 ///
 /// Reads the directory's metadata and reports writability. On Unix the mode
@@ -4334,6 +4512,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::TaskRetried { .. } => "TaskRetried",
         Event::RoleTurnMetrics { .. } => "RoleTurnMetrics",
         Event::ProjectDiscovered { .. } => "ProjectDiscovered",
+        Event::PlanOperation { .. } => "PlanOperation",
         Event::RunIntegrationBranchLeft { .. } => "RunIntegrationBranchLeft",
     }
 }

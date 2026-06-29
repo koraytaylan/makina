@@ -416,6 +416,8 @@ pub enum Mode {
     Settings,
     /// Confirmation modal before resetting a plan/run.
     ResetConfirm,
+    /// Modal explaining why an operation-gated command is unavailable.
+    OperationNotice,
 }
 
 // ── Command palette ──────────────────────────────────────────────────────────
@@ -584,6 +586,33 @@ pub struct ResetConfirmation {
     pub slug: String,
     pub label: String,
     pub task_list_path: PathBuf,
+}
+
+/// One plan-level operation tracked by a small UI state machine.
+#[derive(Debug, Clone)]
+pub struct PlanOperationState {
+    pub slug: String,
+    pub label: String,
+    pub kind: makina_core::api::PlanOperationKind,
+    pub phase: makina_core::api::PlanOperationPhase,
+    pub log: Vec<String>,
+}
+
+impl PlanOperationState {
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.phase,
+            makina_core::api::PlanOperationPhase::Started
+                | makina_core::api::PlanOperationPhase::Step
+        )
+    }
+}
+
+/// Modal shown when the user asks for a command blocked by a plan operation.
+#[derive(Debug, Clone)]
+pub struct OperationNotice {
+    pub slug: String,
+    pub attempted: String,
 }
 
 pub fn final_merge_label(mode: FinalMerge) -> &'static str {
@@ -880,6 +909,10 @@ pub enum AppEvent {
     ResetStarted { slug: String, label: String },
     /// A background reset finished.
     ResetFinished { slug: String, message: String },
+    /// A command was attempted while a plan operation is running.
+    OperationBlocked { slug: String, attempted: String },
+    /// Close the operation notice modal.
+    CloseOperationNotice,
 
     /// Purge Makina-created transient git worktrees for this repository.
     PurgeWorktrees,
@@ -1419,6 +1452,10 @@ pub struct App {
     /// [`Mode::ResetConfirm`].
     pub reset_confirmation: Option<ResetConfirmation>,
 
+    /// Operation notice modal state. `Some` only while [`App::mode`] is
+    /// [`Mode::OperationNotice`].
+    pub operation_notice: Option<OperationNotice>,
+
     /// The resolved run capabilities (gate/reviewer iterations, wall-clock/idle
     /// timeouts). Seeded from the loaded config and editable via the settings
     /// modal.
@@ -1431,8 +1468,8 @@ pub struct App {
     /// What happens to a completed plan branch at run end.
     pub final_merge: FinalMerge,
 
-    /// Plan slugs currently being reset by a background task.
-    pub resetting_plans: HashMap<String, String>,
+    /// Plan-level operations keyed by plan slug.
+    pub plan_operations: HashMap<String, PlanOperationState>,
 
     /// State for the tabbed main content pane.
     pub tabs: TabState,
@@ -1950,10 +1987,11 @@ impl App {
             command_palette: None,
             settings: None,
             reset_confirmation: None,
+            operation_notice: None,
             caps: makina_core::config::CapsConfig::default(),
             concurrency: 3,
             final_merge: FinalMerge::Squash,
-            resetting_plans: HashMap::new(),
+            plan_operations: HashMap::new(),
             verbose_mode: false,
             active_theme: crate::theme::ayu_dark(),
             role_metrics: HashMap::new(),
@@ -2075,15 +2113,34 @@ impl App {
         self.mode == Mode::ResetConfirm
     }
 
+    /// Whether an operation notice modal is currently active.
+    pub fn is_operation_notice(&self) -> bool {
+        self.mode == Mode::OperationNotice
+    }
+
     /// Human label for a plan slug that is currently resetting.
     pub fn resetting_label(&self, slug: &str) -> Option<&str> {
-        self.resetting_plans.get(slug).map(String::as_str)
+        self.plan_operations
+            .get(slug)
+            .filter(|op| op.kind == makina_core::api::PlanOperationKind::Reset && op.is_running())
+            .map(|op| op.label.as_str())
     }
 
     /// Whether the given run belongs to a plan currently being reset.
     pub fn is_resetting_run(&self, run: &RunView) -> bool {
         let slug = makina_core::orchestrator::plan_slug(&run.task_list_path);
-        self.resetting_plans.contains_key(&slug)
+        self.resetting_label(&slug).is_some()
+    }
+
+    /// Running operation for a plan slug, if any.
+    pub fn running_plan_operation(&self, slug: &str) -> Option<&PlanOperationState> {
+        self.plan_operations.get(slug).filter(|op| op.is_running())
+    }
+
+    /// Operation log for the current plan/run context.
+    pub fn context_operation_log(&self) -> Option<&PlanOperationState> {
+        let slug = self.reset_context_slug()?;
+        self.plan_operations.get(&slug)
     }
 
     /// The current plan/run slug for command guarding.
@@ -3069,10 +3126,12 @@ impl App {
             AppEvent::RequestResetRun => {
                 match self.reset_confirmation_for_context() {
                     Ok(confirm) => {
-                        if self.resetting_plans.contains_key(&confirm.slug) {
-                            self.status_message =
-                                Some(format!("{} is already resetting", confirm.label));
-                            self.mode = Mode::Normal;
+                        if self.running_plan_operation(&confirm.slug).is_some() {
+                            self.operation_notice = Some(OperationNotice {
+                                slug: confirm.slug,
+                                attempted: "Reset selected plan/run".to_string(),
+                            });
+                            self.mode = Mode::OperationNotice;
                             self.command_palette = None;
                         } else {
                             self.reset_confirmation = Some(confirm);
@@ -3098,16 +3157,51 @@ impl App {
             }
 
             AppEvent::ResetStarted { slug, label } => {
-                self.resetting_plans.insert(slug, label.clone());
+                self.plan_operations.insert(
+                    slug.clone(),
+                    PlanOperationState {
+                        slug,
+                        label: label.clone(),
+                        kind: makina_core::api::PlanOperationKind::Reset,
+                        phase: makina_core::api::PlanOperationPhase::Started,
+                        log: vec!["Starting reset".to_string()],
+                    },
+                );
                 self.mode = Mode::Normal;
                 self.reset_confirmation = None;
+                self.error_pane_open = true;
+                self.output_tab = OutputTab::Logs;
+                self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
                 self.status_message = Some(format!("Resetting {label}..."));
                 true
             }
 
             AppEvent::ResetFinished { slug, message } => {
-                self.resetting_plans.remove(&slug);
+                let failed = message.to_lowercase().contains("failed");
+                if let Some(op) = self.plan_operations.get_mut(&slug) {
+                    op.phase = if failed {
+                        makina_core::api::PlanOperationPhase::Failed
+                    } else {
+                        makina_core::api::PlanOperationPhase::Finished
+                    };
+                    if op.log.last().is_none_or(|last| last != &message) {
+                        op.log.push(message.clone());
+                    }
+                }
                 self.status_message = Some(message);
+                true
+            }
+
+            AppEvent::OperationBlocked { slug, attempted } => {
+                self.operation_notice = Some(OperationNotice { slug, attempted });
+                self.mode = Mode::OperationNotice;
+                self.command_palette = None;
+                true
+            }
+
+            AppEvent::CloseOperationNotice => {
+                self.operation_notice = None;
+                self.mode = Mode::Normal;
                 true
             }
 
@@ -4007,6 +4101,40 @@ impl App {
                     gate_count, scanned_files
                 );
                 self.status_message = Some(msg);
+            }
+            Event::PlanOperation {
+                plan_slug,
+                label,
+                operation,
+                phase,
+                message,
+            } => {
+                let op = self
+                    .plan_operations
+                    .entry(plan_slug.clone())
+                    .or_insert_with(|| PlanOperationState {
+                        slug: plan_slug.clone(),
+                        label: label.clone(),
+                        kind: *operation,
+                        phase: *phase,
+                        log: Vec::new(),
+                    });
+                op.label = label.clone();
+                op.kind = *operation;
+                op.phase = *phase;
+                if op.log.last().is_none_or(|last| last != message) {
+                    op.log.push(message.clone());
+                }
+                if matches!(
+                    phase,
+                    makina_core::api::PlanOperationPhase::Started
+                        | makina_core::api::PlanOperationPhase::Step
+                ) {
+                    self.error_pane_open = true;
+                    self.output_tab = OutputTab::Logs;
+                    self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
+                }
+                self.status_message = Some(message.clone());
             }
             // Run's integration branch was left unmerged (plan 0030).
             // Surface a status message with the branch name.
@@ -7696,6 +7824,72 @@ mod tests {
             confirm.task_list_path,
             PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md")
         );
+    }
+
+    #[test]
+    fn reset_started_tracks_operation_and_opens_logs() {
+        let mut app = make_app();
+
+        let changed = app.update(AppEvent::ResetStarted {
+            slug: "0099-demo".to_string(),
+            label: "Demo plan".to_string(),
+        });
+
+        assert!(changed);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.error_pane_open,
+            "reset progress should open the output pane"
+        );
+        assert_eq!(app.output_tab, OutputTab::Logs);
+        let op = app
+            .plan_operations
+            .get("0099-demo")
+            .expect("reset must create a tracked plan operation");
+        assert!(op.is_running());
+        assert_eq!(op.log, vec!["Starting reset".to_string()]);
+    }
+
+    #[test]
+    fn plan_operation_event_appends_visible_reset_progress() {
+        let mut app = make_app();
+
+        app.update(AppEvent::ApiEvent(Event::PlanOperation {
+            plan_slug: "0099-demo".to_string(),
+            label: "Demo plan".to_string(),
+            operation: makina_core::api::PlanOperationKind::Reset,
+            phase: makina_core::api::PlanOperationPhase::Step,
+            message: "Deleting plan branch".to_string(),
+        }));
+
+        assert!(app.error_pane_open);
+        assert_eq!(app.output_tab, OutputTab::Logs);
+        let op = app
+            .plan_operations
+            .get("0099-demo")
+            .expect("operation event must upsert plan operation state");
+        assert_eq!(op.phase, makina_core::api::PlanOperationPhase::Step);
+        assert_eq!(op.log, vec!["Deleting plan branch".to_string()]);
+        assert_eq!(app.status_message.as_deref(), Some("Deleting plan branch"));
+    }
+
+    #[test]
+    fn operation_blocked_opens_notice_modal() {
+        let mut app = make_app();
+
+        let changed = app.update(AppEvent::OperationBlocked {
+            slug: "0099-demo".to_string(),
+            attempted: "Start run".to_string(),
+        });
+
+        assert!(changed);
+        assert_eq!(app.mode, Mode::OperationNotice);
+        let notice = app
+            .operation_notice
+            .as_ref()
+            .expect("blocked operation must open notice modal");
+        assert_eq!(notice.slug, "0099-demo");
+        assert_eq!(notice.attempted, "Start run");
     }
 
     /// `CommandPaletteExecute` and `CloseCommandPalette` must return to normal mode.

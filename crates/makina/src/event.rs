@@ -139,6 +139,7 @@ pub async fn run(
             command_palette: app.is_command_palette(),
             settings: app.is_settings(),
             reset_confirm: app.is_confirming_reset(),
+            operation_notice: app.is_operation_notice(),
         };
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
@@ -337,8 +338,8 @@ async fn resolve_io(
         // synth ids for which run() returns None; attempting Start on them must
         // fall through to opening a fresh run for the plan instead of erroring.
         AppEvent::StartRun => {
-            if let Some(msg) = reset_block_message(app) {
-                return (AppEvent::Tick, Some(msg));
+            if let Some(event) = operation_blocked_event(app, "Start run") {
+                return (event, None);
             }
             let has_live_run = if let Some(rid) = app.active_run_id() {
                 app.api.run(rid).await.is_some()
@@ -367,14 +368,26 @@ async fn resolve_io(
                 }
             }
         }
-        AppEvent::PauseRun => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
-        AppEvent::CancelRun => (AppEvent::Tick, run_control(app, ControlKind::Cancel).await),
-        AppEvent::Reinterpret => (
-            AppEvent::Tick,
-            run_control(app, ControlKind::Reinterpret).await,
-        ),
+        AppEvent::PauseRun => match operation_blocked_event(app, "Pause run") {
+            Some(event) => (event, None),
+            None => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
+        },
+        AppEvent::CancelRun => match operation_blocked_event(app, "Stop run") {
+            Some(event) => (event, None),
+            None => (AppEvent::Tick, run_control(app, ControlKind::Cancel).await),
+        },
+        AppEvent::Reinterpret => match operation_blocked_event(app, "Reinterpret run") {
+            Some(event) => (event, None),
+            None => (
+                AppEvent::Tick,
+                run_control(app, ControlKind::Reinterpret).await,
+            ),
+        },
         // ── Context-sensitive retry (plan 0017) ───────────────────────────────
-        AppEvent::RetryFocused => (AppEvent::Tick, retry_focused(app).await),
+        AppEvent::RetryFocused => match operation_blocked_event(app, "Reset/retry focused task") {
+            Some(event) => (event, None),
+            None => (AppEvent::Tick, retry_focused(app).await),
+        },
         AppEvent::ResetRun => start_reset_active_run(app, background_tx).await,
         AppEvent::PurgeWorktrees => (AppEvent::Tick, purge_worktrees(app).await),
         // ── Provider configuration editor commit (task 0041) ──────────────────
@@ -896,10 +909,6 @@ enum ControlKind {
 async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
     use makina_core::api::Command;
 
-    if let Some(msg) = reset_block_message(app) {
-        return Some(msg);
-    }
-
     let run = match app.active_run_id() {
         Some(r) => r,
         None => {
@@ -936,10 +945,6 @@ async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
 async fn retry_focused(app: &App) -> Option<String> {
     use crate::app::TreeNode;
     use makina_core::api::{Command, RunStatus, TaskState};
-
-    if let Some(msg) = reset_block_message(app) {
-        return Some(msg);
-    }
 
     // Resolve the focused node into an optional retry command + a label.
     let command: Option<(Command, String)> = match app.focused_node() {
@@ -998,18 +1003,21 @@ async fn retry_focused(app: &App) -> Option<String> {
     Some("nothing to retry here".to_string())
 }
 
-fn reset_block_message(app: &App) -> Option<String> {
+fn operation_blocked_event(app: &App, attempted: &str) -> Option<AppEvent> {
     let slug = app.reset_context_slug()?;
-    let label = app.resetting_label(&slug)?;
-    Some(format!("{label} is resetting; wait for reset to finish"))
+    app.running_plan_operation(&slug)?;
+    Some(AppEvent::OperationBlocked {
+        slug,
+        attempted: attempted.to_string(),
+    })
 }
 
 async fn start_reset_active_run(
     app: &App,
     background_tx: &mpsc::Sender<AppEvent>,
 ) -> (AppEvent, Option<String>) {
-    if let Some(msg) = reset_block_message(app) {
-        return (AppEvent::CloseResetConfirmation, Some(msg));
+    if let Some(event) = operation_blocked_event(app, "Reset selected plan/run") {
+        return (event, None);
     }
 
     if let Some(run) = app.active_run_id()
@@ -1219,6 +1227,7 @@ struct ModalState {
     command_palette: bool,
     settings: bool,
     reset_confirm: bool,
+    operation_notice: bool,
 }
 
 /// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
@@ -1329,6 +1338,7 @@ fn translate_key(
         command_palette,
         settings,
         reset_confirm,
+        operation_notice,
     } = modal;
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
@@ -1348,11 +1358,19 @@ fn translate_key(
     if key.code == KeyCode::Char('p')
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !reset_confirm
+        && !operation_notice
     {
         return AppEvent::OpenCommandPalette;
     }
 
-    if reset_confirm {
+    if operation_notice {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                AppEvent::CloseOperationNotice
+            }
+            _ => AppEvent::Tick,
+        }
+    } else if reset_confirm {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 AppEvent::CloseResetConfirmation
@@ -2800,11 +2818,15 @@ mod tests {
         let (tx, _rx) = background_events();
         let (ev, status) = resolve_io(&app, AppEvent::StartRun, &tx).await;
 
-        assert!(matches!(ev, AppEvent::Tick));
-        assert_eq!(
-            status.as_deref(),
-            Some("0099-demo is resetting; wait for reset to finish")
+        assert!(
+            matches!(
+                ev,
+                AppEvent::OperationBlocked { ref slug, ref attempted }
+                    if slug == "0099-demo" && attempted == "Start run"
+            ),
+            "StartRun must open the operation notice while reset is in progress; got {ev:?}"
         );
+        assert!(status.is_none());
         assert!(
             api.commands.lock().unwrap().is_empty(),
             "StartRun must not open/start while reset is in progress"

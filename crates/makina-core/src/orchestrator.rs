@@ -89,7 +89,10 @@ use crate::backend::AgentBackend;
 use crate::config::Config;
 use crate::interpreter::TaskListInterpreter;
 use crate::paths;
-use crate::run_metadata::{RunMetadata, TaskSnapshot, load_disk_run_views, write_run_metadata};
+use crate::run_metadata::{
+    RunMetadata, TaskSnapshot, load_disk_run_views, remove_run_metadata_for_plan,
+    write_run_metadata,
+};
 use crate::task::TaskGraph;
 use crate::worktree::WorktreeManager;
 
@@ -1878,6 +1881,22 @@ impl CoreApi {
         self.retry_impl(run, None).await
     }
 
+    fn emit_plan_operation(
+        &self,
+        plan_slug: &str,
+        label: &str,
+        phase: crate::api::PlanOperationPhase,
+        message: impl Into<String>,
+    ) {
+        let _ = self.state.event_tx.send(Event::PlanOperation {
+            plan_slug: plan_slug.to_string(),
+            label: label.to_string(),
+            operation: crate::api::PlanOperationKind::Reset,
+            phase,
+            message: message.into(),
+        });
+    }
+
     /// Reset a run to a freshly interpreted Pending graph without re-dispatching.
     async fn reset_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
         let repo_root = self.state.worktree_manager.repo_root.clone();
@@ -1904,8 +1923,26 @@ impl CoreApi {
             )
         };
 
+        let label = if plan_slug.is_empty() {
+            run_slug.clone()
+        } else {
+            plan_slug.clone()
+        };
+        self.emit_plan_operation(
+            &plan_slug,
+            &label,
+            crate::api::PlanOperationPhase::Started,
+            "Starting reset",
+        );
+
         if let Some(handle) = old_handle {
             handle.cancel.cancel();
+            self.emit_plan_operation(
+                &plan_slug,
+                &label,
+                crate::api::PlanOperationPhase::Step,
+                "Cancelled in-flight scheduler",
+            );
         }
 
         let old_task_ids = {
@@ -1913,6 +1950,12 @@ impl CoreApi {
             g.tasks.iter().map(|t| t.id.0.clone()).collect::<Vec<_>>()
         };
 
+        self.emit_plan_operation(
+            &plan_slug,
+            &label,
+            crate::api::PlanOperationPhase::Step,
+            format!("Removing {} task worktree(s)", old_task_ids.len()),
+        );
         for task_id in &old_task_ids {
             if let Err(e) = self
                 .state
@@ -1929,24 +1972,49 @@ impl CoreApi {
                 );
             }
         }
-        if !plan_slug.is_empty()
-            && let Err(e) = self
+        if !plan_slug.is_empty() {
+            self.emit_plan_operation(
+                &plan_slug,
+                &label,
+                crate::api::PlanOperationPhase::Step,
+                "Deleting plan branch",
+            );
+            if let Err(e) = self
                 .state
                 .worktree_manager
                 .delete_plan_branch(&plan_slug)
                 .await
-        {
-            tracing::warn!(
-                run_uid = %run_uid,
-                plan_slug = %plan_slug,
-                error = %e,
-                "failed to delete plan branch during run reset; continuing",
-            );
+            {
+                tracing::warn!(
+                    run_uid = %run_uid,
+                    plan_slug = %plan_slug,
+                    error = %e,
+                    "failed to delete plan branch during run reset; continuing",
+                );
+            }
         }
 
-        let (new_graph, interpret_issues) = self
+        self.emit_plan_operation(
+            &plan_slug,
+            &label,
+            crate::api::PlanOperationPhase::Step,
+            "Re-reading TASKS.md",
+        );
+        let (new_graph, interpret_issues) = match self
             .interpret_and_seed(&run_slug, &task_list_path, &repo_root, false)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                self.emit_plan_operation(
+                    &plan_slug,
+                    &label,
+                    crate::api::PlanOperationPhase::Failed,
+                    format!("Reset failed while re-reading TASKS.md: {e}"),
+                );
+                return Err(e);
+            }
+        };
 
         let report = {
             let mut issues = crate::ingestion::validate(&new_graph);
@@ -1971,15 +2039,35 @@ impl CoreApi {
             entry.handle = None;
         }
 
-        if let Some(graph) = graph_snapshot
-            && let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await
-        {
-            tracing::warn!(
-                run_uid = %run_uid,
-                error = %e,
-                "failed to persist graph after run reset; continuing",
+        if let Some(graph) = graph_snapshot {
+            self.emit_plan_operation(
+                &plan_slug,
+                &label,
+                crate::api::PlanOperationPhase::Step,
+                "Persisting fresh pending graph",
             );
+            if let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await {
+                tracing::warn!(
+                    run_uid = %run_uid,
+                    error = %e,
+                    "failed to persist graph after run reset; continuing",
+                );
+            }
         }
+
+        self.emit_plan_operation(
+            &plan_slug,
+            &label,
+            crate::api::PlanOperationPhase::Step,
+            "Clearing completed run snapshots for this plan",
+        );
+        let removed = remove_run_metadata_for_plan(&repo_root, &plan_slug).await;
+        self.emit_plan_operation(
+            &plan_slug,
+            &label,
+            crate::api::PlanOperationPhase::Step,
+            format!("Cleared {removed} completed snapshot(s)"),
+        );
 
         let _ = self.state.event_tx.send(Event::RunStatusChanged {
             run,
@@ -1989,6 +2077,12 @@ impl CoreApi {
             run,
             task_list_path,
         });
+        self.emit_plan_operation(
+            &plan_slug,
+            &label,
+            crate::api::PlanOperationPhase::Finished,
+            "Reset complete",
+        );
 
         Ok(CommandOutcome::Acknowledged)
     }

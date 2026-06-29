@@ -413,6 +413,78 @@ pub fn load_disk_run_views(
     views
 }
 
+/// Remove persisted `run.json` files for a plan.
+///
+/// Reset uses this to prevent a previously terminal disk snapshot from
+/// resurrecting as `Completed` after the process restarts. The run directories
+/// are left in place so logs/transcripts are not deleted, but without `run.json`
+/// they no longer appear in `load_disk_run_views`.
+pub async fn remove_run_metadata_for_plan(repo_root: &Path, plan_slug: &str) -> usize {
+    if plan_slug.is_empty() {
+        return 0;
+    }
+
+    let runs_dir = crate::paths::state_root(repo_root).join("runs");
+    let mut dir = match tokio::fs::read_dir(&runs_dir).await {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read run metadata directory for reset cleanup");
+            return 0;
+        }
+    };
+
+    let mut removed = 0usize;
+    loop {
+        let entry = match dir.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to scan run metadata during reset cleanup");
+                break;
+            }
+        };
+        let run_json = entry.path().join("run.json");
+        let contents = match tokio::fs::read_to_string(&run_json).await {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    path = %run_json.display(),
+                    error = %e,
+                    "failed to read run metadata during reset cleanup"
+                );
+                continue;
+            }
+        };
+        let meta = match serde_json::from_str::<RunMetadata>(&contents) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(
+                    path = %run_json.display(),
+                    error = %e,
+                    "failed to parse run metadata during reset cleanup"
+                );
+                continue;
+            }
+        };
+        if effective_plan_slug(&meta) != plan_slug {
+            continue;
+        }
+        match tokio::fs::remove_file(&run_json).await {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %run_json.display(),
+                error = %e,
+                "failed to remove stale run metadata during reset cleanup"
+            ),
+        }
+    }
+
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +547,58 @@ mod tests {
         assert_eq!(loaded.status, meta.status, "status must survive");
         assert_eq!(loaded.started_at, started, "started_at must survive");
         assert_eq!(loaded.ended_at, ended, "ended_at must survive");
+    }
+
+    #[tokio::test]
+    async fn remove_run_metadata_for_plan_only_clears_matching_snapshots() {
+        let _guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let ts = fixed_ts(2026, 5, 1);
+        let target = RunMetadata::new(
+            "01TARGET000000000000000000".to_string(),
+            "target-plan".to_string(),
+            "target-plan".to_string(),
+            RunStatus::Completed,
+            ts,
+            ts,
+        );
+        let other = RunMetadata::new(
+            "01OTHER0000000000000000000".to_string(),
+            "other-plan".to_string(),
+            "other-plan".to_string(),
+            RunStatus::Completed,
+            ts,
+            ts,
+        );
+
+        write_run_metadata(&target, root)
+            .await
+            .expect("write target metadata");
+        write_run_metadata(&other, root)
+            .await
+            .expect("write other metadata");
+
+        let removed = remove_run_metadata_for_plan(root, "target-plan").await;
+
+        assert_eq!(removed, 1);
+        assert!(
+            !crate::paths::run_dir(root, &target.run_uid)
+                .join("run.json")
+                .exists(),
+            "target plan snapshot must be cleared"
+        );
+        assert!(
+            crate::paths::run_dir(root, &other.run_uid)
+                .join("run.json")
+                .exists(),
+            "other plan snapshot must be preserved"
+        );
     }
 
     /// A fixture with only an old `run.json` (no `tasks` field) must be surfaced
