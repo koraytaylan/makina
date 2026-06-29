@@ -2078,59 +2078,131 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 /// always-visible task header (`render_task_entry_pane`) so they show even when the
 /// Execution section is collapsed or there are no exchanges yet.
 /// Falls back to "No execution yet — start the run (Ctrl+S)" when there are no exchanges.
-fn format_task_execution_content(
+/// Build the Execution accordion section for a task detail tab as styled
+/// [`Line`]s — the header (matching [`render_accordion_section`]'s `[±] Title`
+/// style) followed, when expanded, by the live exchange log rendered in
+/// chronological order.
+///
+/// This is a dedicated renderer (instead of routing through
+/// [`render_accordion_section`]) because the Execution body is not a plain
+/// string: it is a sequence of styled [`ExchangeEntry`] turns (prompts,
+/// thoughts, tool calls, responses) produced by [`exchange_entry_lines`].
+/// `render_accordion_section` only takes a `&str`, so it would flatten the
+/// rich styling into raw text.  Here we mirror its header logic and then
+/// append:
+///
+/// 1. The metrics/activity/failure summary (so the at-a-glance status the
+///    Execution section already showed stays at the top).
+/// 2. Every exchange entry for `(run.id, task.id)` in arrival order —
+///    prompts (`▶ Developer prompt`), streaming responses (`◀ … response`),
+///    thought bursts (`💭 … thought`), and tool invocations
+///    (`⚙ <title> [<status>]`) — each rendered by [`exchange_entry_lines`]
+///    with its own styling, indented 2 spaces so it nests under the header.
+///
+/// When there is no exchange yet (the run hasn't started, or the task hasn't
+/// been picked up), the empty-state hint is shown instead.
+fn render_task_execution_section(
     app: &App,
     run: &RunView,
     task: &makina_core::api::TaskView,
-) -> String {
-    let mut content = String::new();
+    expanded: &HashSet<AccordionSection>,
+    content_width: u16,
+) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    let is_expanded = expanded.contains(&AccordionSection::Execution);
+    let marker = if is_expanded { "[-]" } else { "[+]" };
 
-    // Check if there are any exchanges for this task
-    let exchange_exists = app.exchange_logs.contains_key(&(run.id, task.id.clone()));
+    // Header — mirrors render_accordion_section (task tabs don't use focused
+    // highlighting, so no FocusBg branch).
+    let marker_style = Style::default()
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
+        .add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+        .add_modifier(Modifier::BOLD);
+    result.push(Line::from(vec![
+        Span::styled(marker, marker_style),
+        Span::raw(" "),
+        Span::styled("Execution", title_style),
+    ]));
 
-    if !exchange_exists {
-        // No execution yet — show empty state
-        return "No execution yet — start the run (Ctrl+S)".to_string();
+    if !is_expanded {
+        return result;
     }
 
-    // Add activity indicators (idle time, wall-clock countdown) for in-progress tasks
+    result.push(Line::from(""));
+
+    let log_opt = app.exchange_logs.get(&(run.id, task.id.clone()));
+    let has_exchange = log_opt.is_some_and(|log| !log.entries.is_empty());
+
+    // 1. Metrics / activity / failure summary at the top.
+    let mut had_summary = false;
     let activity_indicators = task_activity_indicators(app, task);
     if !activity_indicators.is_empty() {
-        let activity_text = activity_indicators
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<Vec<_>>()
-            .join("");
-        content.push_str(&activity_text);
-        content.push('\n');
+        let mut line_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+        line_spans.extend(activity_indicators);
+        result.push(Line::from(line_spans));
+        had_summary = true;
     }
-
-    // Add per-role metrics
-    let metrics = role_metric_lines(app, task);
-    for line in metrics {
-        for span in &line.spans {
-            content.push_str(span.content.as_ref());
-        }
-        content.push('\n');
+    for metric_line in role_metric_lines(app, task) {
+        let mut indented = metric_line;
+        indented.spans.insert(0, Span::raw("  "));
+        result.push(indented);
+        had_summary = true;
     }
-
-    // Add failure reason if the task is failed
     if let Some(reason) = &task.failure_reason {
         let label = failure_kind_label(&reason.kind);
-        content.push_str(&format!("failed: {} — {}\n", label, reason.message));
+        result.push(Line::from(vec![Span::styled(
+            format!("  failed: {} — {}", label, reason.message),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)),
+        )]));
+        had_summary = true;
+    }
+    if had_summary {
+        result.push(Line::from(""));
     }
 
-    // If we generated content, trim trailing newline; otherwise use empty state
-    if content.is_empty() {
-        "No execution data available".to_string()
+    // 2. Live exchange entries in chronological order, or the empty-state hint.
+    if has_exchange {
+        // The exchange entries are rendered against the full content width
+        // minus the 2-space indent so wrapping matches the indented body.
+        let body_width = content_width.saturating_sub(2);
+        let log = log_opt.expect("checked above");
+        for entry in &log.entries {
+            for mut entry_line in exchange_entry_lines(entry, app, body_width) {
+                // Indent each rendered line by 2 spaces so the body nests
+                // under the "Execution" header, matching the SCOPE section.
+                entry_line.spans.insert(0, Span::raw("  "));
+                result.push(entry_line);
+            }
+        }
     } else {
-        content.trim_end().to_string()
+        let hint = if app.exchange_logs.contains_key(&(run.id, task.id.clone())) {
+            "No exchange yet."
+        } else {
+            "No execution yet — start the run (Ctrl+S)"
+        };
+        result.push(Line::from(vec![Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        )]));
     }
+
+    result
 }
 
 /// Render a task's entry (metadata + Markdown body) into a bordered pane.
 /// Width is taken from the pane's inner area so wrapping matches the pane, and
 /// the body reuses plan 0020's hardened `render_markdown` — no new parser.
+///
+/// Scrolls vertically with per-panel state keyed by [`ScrollablePanel::TaskEntry`]:
+/// the content area is split to reserve a rightmost scrollbar column, wrap-aware
+/// row accounting sets `last_scroll_maxes[TaskEntry]`, and the stored
+/// `scroll_offsets[TaskEntry]` offset is applied via `Paragraph::scroll`. This
+/// mirrors `render_plan_accordion_pane` / `render_plan_task_pane` — without it,
+/// a task entry taller than the viewport could not be scrolled, so the Markdown
+/// body was clipped with no way to reach the rest (including the Execution
+/// section below the fold).
 fn render_task_entry_pane(
     app: &App,
     run: &RunView,
@@ -2146,11 +2218,46 @@ fn render_task_entry_pane(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
     if let Some(task) = run.tasks.get(task_idx) {
-        let mut lines: Vec<Line> = Vec::new();
+        // Reserve the rightmost column for the scrollbar so text is not
+        // overpainted, and so the markdown wrap width matches the visible width.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        let content_area = cols[0];
+        let scrollbar_area = cols[1];
+
+        // Helper: number of terminal rows a single Line occupies when rendered
+        // with `Wrap { trim: false }` at the content column width. Mirrors the
+        // accounting in `render_plan_accordion_pane` / `render_plan_task_pane`.
+        let rendered_rows_for_line = |line: &Line<'_>| -> u16 {
+            let w = line.width();
+            if content_area.width == 0 || w == 0 {
+                1
+            } else {
+                (w as u32)
+                    .div_ceil(content_area.width as u32)
+                    .min(u16::MAX as u32) as u16
+            }
+        };
+
+        let mut rendered_row: u16 = 0;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        macro_rules! push_line {
+            ($l:expr) => {{
+                let l: Line<'static> = $l;
+                rendered_row += rendered_rows_for_line(&l);
+                lines.push(l);
+            }};
+        }
 
         // Task header: ID and title
-        lines.push(Line::from(vec![Span::styled(
+        push_line!(Line::from(vec![Span::styled(
             format!("{} — {}", task.id, task.title),
             Style::default()
                 .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
@@ -2159,7 +2266,7 @@ fn render_task_entry_pane(
 
         // State badge
         let (badge, badge_color) = task_state_badge(&task.state, app);
-        lines.push(Line::from(vec![Span::styled(
+        push_line!(Line::from(vec![Span::styled(
             format!("  {}", badge),
             Style::default().fg(badge_color),
         )]));
@@ -2172,7 +2279,7 @@ fn render_task_entry_pane(
                 .map(|id| id.0.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            lines.push(Line::from(vec![Span::styled(
+            push_line!(Line::from(vec![Span::styled(
                 format!("  Depends on: {}", deps_str),
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             )]));
@@ -2185,10 +2292,10 @@ fn render_task_entry_pane(
                 task.gate_iterations, task.review_iterations
             );
             let style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning));
-            lines.push(Line::from(Span::styled(counts, style)));
+            push_line!(Line::from(Span::styled(counts, style)));
         }
 
-        lines.push(Line::from(""));
+        push_line!(Line::from(""));
 
         // Get the task's expanded accordion sections from the app state. A task
         // with no entry yet defaults to Scope + Execution expanded — the SAME
@@ -2200,7 +2307,7 @@ fn render_task_entry_pane(
             .cloned()
             .unwrap_or_else(crate::app::default_task_accordion_sections);
 
-        let content_width = inner.width;
+        let content_width = content_area.width;
 
         // SCOPE section — task's static description rendered as Markdown
         for l in render_accordion_section(
@@ -2213,28 +2320,43 @@ fn render_task_entry_pane(
             content_width,
             true, // render as markdown
         ) {
-            lines.push(l);
+            push_line!(l);
         }
-        lines.push(Line::from(""));
+        push_line!(Line::from(""));
 
-        // EXECUTION section — live activity or empty state
-        let execution_content = format_task_execution_content(app, run, task);
-        for l in render_accordion_section(
-            app,
-            "Execution",
-            AccordionSection::Execution,
-            &expanded,
-            &execution_content,
-            false, // task tabs don't use focused_section highlighting
-            content_width,
-            false, // render as raw text, not markdown
-        ) {
-            lines.push(l);
+        // EXECUTION section — live activity, metrics, and the full exchange
+        // log (prompts, thoughts, tools, responses) in chronological order.
+        // Rendered via render_task_execution_section (not render_accordion_section)
+        // because the body is rich Vec<Line> content, not a plain string.
+        for l in render_task_execution_section(app, run, task, &expanded, content_width) {
+            push_line!(l);
         }
-        lines.push(Line::from(""));
+        push_line!(Line::from(""));
 
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        frame.render_widget(para, inner);
+        // Per-panel scroll clamp ceiling: how many rows can be scrolled before
+        // the last line of content reaches the top of the viewport.
+        let total_rendered_rows = rendered_row;
+        let task_scroll_max = total_rendered_rows.saturating_sub(content_area.height);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::TaskEntry, task_scroll_max);
+
+        let task_scroll_offset = app.panel_offset(ScrollablePanel::TaskEntry, task_scroll_max);
+
+        let para = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((task_scroll_offset, 0));
+        frame.render_widget(para, content_area);
+
+        if task_scroll_max > 0 {
+            let mut scrollbar_state =
+                ScrollbarState::new(task_scroll_max as usize).position(task_scroll_offset as usize);
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None);
+            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+        }
     } else {
         // Task not found placeholder
         let placeholder = Line::from(vec![Span::styled(
@@ -6362,12 +6484,15 @@ mod tests {
         });
         app.tabs.active_tab = Some(0);
 
-        // Closed by default: no Output pane on screen.
+        // Closed by default: the Output/Logs pane header must not be on screen.
+        // (The task's exchange content itself IS visible in the task detail tab's
+        // Execution section — that's the intended behaviour — so we assert on the
+        // pane header, not on the log text.)
         let mut terminal = make_terminal(120, 40);
         terminal.draw(|f| render(&app, f)).unwrap();
         assert!(
-            !screen_of(&terminal).contains("implement X"),
-            "the log content must be hidden until the Logs tab is opened"
+            !screen_of(&terminal).contains("Logs [L]"),
+            "the Output pane must be closed until the Logs tab is opened"
         );
 
         // [L] opens the Output pane on the Logs tab.
@@ -9738,6 +9863,352 @@ mod tests {
         assert!(
             screen.contains("very long line"),
             "Long text should be rendered with wrapping"
+        );
+    }
+
+    /// **Task entry pane is scrollable when content overflows:** rendering a task
+    /// whose entry body is taller than the viewport must populate
+    /// `last_scroll_maxes[TaskEntry]` with a non-zero ceiling (so the scroll
+    /// machinery can move the offset) and draw a scrollbar in the reserved
+    /// rightmost column. Before the fix, `render_task_entry_pane` never set a
+    /// scroll max and never applied a scroll offset, so the Markdown body was
+    /// clipped with no way to reach the rest of the content.
+    #[test]
+    fn task_entry_pane_sets_scroll_max_and_renders_scrollbar_on_overflow() {
+        use crate::app::ScrollablePanel;
+
+        // 80×10 terminal: the content area for a task tab is tiny (after the
+        // title bar, tab bar, top border, and status bar), so a multi-line
+        // entry_text reliably overflows it.
+        let mut terminal = make_terminal(80, 10);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        // Build an entry_text with many list items so the rendered body is
+        // taller than the ~4-row content area.
+        let mut entry = String::new();
+        for i in 1..=30 {
+            entry.push_str(&format!("- item {}\n", i));
+        }
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("scroll-test"),
+                title: "Scroll Test".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: entry,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "test-plan".to_string(),
+            task_id: TaskId::new("scroll-test"),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+
+        // The render pass must have recorded a non-zero scroll max for the
+        // TaskEntry panel — this is the core regression: without it, the panel
+        // could not be scrolled at all.
+        let scroll_max = app
+            .last_scroll_maxes
+            .borrow()
+            .get(&ScrollablePanel::TaskEntry)
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            scroll_max > 0,
+            "TaskEntry scroll_max must be non-zero when content overflows the viewport, got {scroll_max}"
+        );
+
+        // A scrollbar must be rendered in the reserved rightmost column of the
+        // task entry pane. The layout mirrors the plan accordion: main_block
+        // (Borders::ALL + Padding::horizontal(1)) inner is x=26, width=52 for an
+        // 80-wide terminal (sidebar 30% = 24 cols). The task pane block uses
+        // Borders::TOP (no horizontal border/padding), then reserves 1 col for
+        // the scrollbar → content_area x=26 width=51, scrollbar column x=77.
+        let buf = terminal.backend().buffer();
+        let task_scrollbar_col: u16 = 77;
+        // Task rows: after the title bar (y=0), tab bar (y=1), block top border
+        // (y=2) → content starts at y=3; status bar is the last row (y=9).
+        let has_scrollbar = col_has_scrollbar(buf, task_scrollbar_col, 3, 9);
+        assert!(
+            has_scrollbar,
+            "a scrollbar must be rendered when task entry content overflows (x={task_scrollbar_col})"
+        );
+    }
+
+    /// **Task entry pane honours a stored scroll offset:** after setting a
+    /// non-zero `scroll_offsets[TaskEntry]`, the rendered screen must skip the
+    /// scrolled-off top lines (the first list item must disappear from the
+    /// top of the content area). This confirms `render_task_entry_pane`
+    // actually consumes the offset via `Paragraph::scroll`.
+    #[test]
+    fn task_entry_pane_applies_stored_scroll_offset() {
+        use crate::app::ScrollablePanel;
+
+        let mut terminal = make_terminal(80, 12);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        // Distinct, easily-searchable list items so we can detect which line
+        // sits at the top of the viewport before and after scrolling.
+        let mut entry = String::new();
+        for i in 1..=40 {
+            entry.push_str(&format!("- ZZZ-top-{}\n", i));
+        }
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("offset-test"),
+                title: "Offset Test".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: entry,
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "test-plan".to_string(),
+            task_id: TaskId::new("offset-test"),
+        });
+
+        // First render at offset 0 — the first item must be visible.
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_zero = screen_of(&terminal);
+        assert!(
+            screen_at_zero.contains("ZZZ-top-1"),
+            "first list item must be visible at scroll offset 0"
+        );
+
+        // Record the scroll max the render pass computed, then set an offset
+        // large enough to push item 1 off-screen.
+        let scroll_max = app
+            .last_scroll_maxes
+            .borrow()
+            .get(&ScrollablePanel::TaskEntry)
+            .copied()
+            .unwrap_or(0);
+        assert!(scroll_max > 0, "scroll_max must be populated by render");
+
+        app.scroll_offsets
+            .insert(ScrollablePanel::TaskEntry, scroll_max);
+
+        // Re-render at the stored offset — the first item must now be gone
+        // (scrolled off the top), proving render_task_entry_pane consumes the
+        // offset.
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen_at_max = screen_of(&terminal);
+        assert!(
+            !screen_at_max.contains("ZZZ-top-1"),
+            "first list item must be scrolled off-screen at scroll_offset == scroll_max"
+        );
+    }
+
+    /// **Execution section shows the full live exchange log in chronological
+    /// order:** when a task tab is open and the task has an exchange log, the
+    /// Execution accordion section must render every exchange entry — prompts,
+    /// thought bursts, tool invocations, and responses — in the order they
+    /// arrived, with their rich styling (role-coloured labels, `💭`/`⚙` headers,
+    /// status badges). Before the fix, the Execution section only showed the
+    /// metrics/activity summary as raw text and never included the actual
+    /// exchange entries, so the user could not see what the model was doing
+    /// from inside the task detail tab.
+    #[test]
+    fn task_entry_execution_section_shows_exchange_entries_in_order() {
+        use crate::app::AppEvent;
+        use makina_core::api::{
+            AgentRole, Event, ExchangeEvent, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        };
+
+        // A tall terminal so the whole execution body fits without scrolling.
+        let mut terminal = make_terminal(120, 60);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/exec-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("exec-task"),
+                title: "Exec Task".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "Do the thing.".to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "exec-test".to_string(),
+            task_id: TaskId::new("exec-task"),
+        });
+        // Verbose mode so thought bodies and tool content render too.
+        app.verbose_mode = true;
+
+        // Feed the exchange in chronological order:
+        //   1. prompt  2. thought  3. tool call  4. response chunks  5. complete
+        let mk = |event: ExchangeEvent| {
+            AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(1),
+                task: TaskId::new("exec-task"),
+                role: AgentRole::Developer,
+                event,
+            })
+        };
+        app.update(mk(ExchangeEvent::PromptSent {
+            text: "please implement the feature".into(),
+        }));
+        app.update(mk(ExchangeEvent::ThoughtChunk {
+            text: "planning the approach".into(),
+        }));
+        app.update(mk(ExchangeEvent::ToolCall {
+            id: "tool-1".into(),
+            title: "Editing src/lib.rs".into(),
+            kind: Some("edit".into()),
+            status: "completed".into(),
+            content: Some("@@ -1 +1 @@\n+added line".into()),
+        }));
+        app.update(mk(ExchangeEvent::ResponseChunk {
+            text: "all done".into(),
+        }));
+        app.update(mk(ExchangeEvent::TurnComplete));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The Execution section header must be present.
+        assert!(
+            screen.contains("Execution"),
+            "the Execution accordion header must render"
+        );
+        // All four entry kinds must appear, with their distinguishing labels.
+        assert!(
+            screen.contains("Developer prompt"),
+            "the prompt entry label must render in the Execution section"
+        );
+        assert!(
+            screen.contains("please implement the feature"),
+            "the prompt text must render in the Execution section"
+        );
+        assert!(
+            screen.contains("Developer thought"),
+            "the thought entry header must render in the Execution section"
+        );
+        assert!(
+            screen.contains("planning the approach"),
+            "the thought body must render in verbose mode"
+        );
+        assert!(
+            screen.contains("Editing src/lib.rs"),
+            "the tool title must render in the Execution section"
+        );
+        assert!(
+            screen.contains("[completed]"),
+            "the tool status badge must render in the Execution section"
+        );
+        assert!(
+            screen.contains("Developer response"),
+            "the response entry label must render in the Execution section"
+        );
+        assert!(
+            screen.contains("all done"),
+            "the response text must render in the Execution section"
+        );
+
+        // Chronological order: the prompt must appear before the thought,
+        // the thought before the tool, and the tool before the response.
+        let idx = |needle: &str| -> usize {
+            screen
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} must be present in the rendered screen"))
+        };
+        let prompt = idx("Developer prompt");
+        let thought = idx("Developer thought");
+        let tool = idx("Editing src/lib.rs");
+        let response = idx("Developer response");
+        assert!(
+            prompt < thought && thought < tool && tool < response,
+            "exchange entries must render in chronological order \
+             (prompt@{prompt} < thought@{thought} < tool@{tool} < response@{response})"
+        );
+    }
+
+    /// **Execution section shows the empty-state hint when there is no exchange
+    /// yet:** a freshly opened task tab with no exchange log must show the
+    /// "No execution yet" hint instead of a blank section. This preserves the
+    /// pre-refactor behaviour of `format_task_execution_content`.
+    #[test]
+    fn task_entry_execution_section_shows_empty_state_hint() {
+        let mut terminal = make_terminal(120, 40);
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/empty-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: TaskId::new("empty-task"),
+                title: "Empty Task".into(),
+                state: TaskState::Ready,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "Do nothing yet.".to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "empty-test".to_string(),
+            task_id: TaskId::new("empty-task"),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Execution"),
+            "the Execution accordion header must render"
+        );
+        assert!(
+            screen.contains("No execution yet"),
+            "the empty-state hint must render when there is no exchange log"
         );
     }
 

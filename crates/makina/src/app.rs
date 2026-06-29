@@ -1970,6 +1970,34 @@ impl App {
         Some((run.id, tv.id.clone()))
     }
 
+    /// Resolve which [`ScrollablePanel`] keyboard scroll events (`SelectUp`/
+    /// `SelectDown`/`ScrollUp`/`ScrollDown`) should target when the main pane is
+    /// focused, based on the *active tab's* content type:
+    ///
+    /// * `TabContent::Task` → [`ScrollablePanel::TaskEntry`] (the task entry pane
+    ///   rendered by `render_task_entry_pane`).
+    /// * `TabContent::Plan` | `TabContent::PlanTask` →
+    ///   [`ScrollablePanel::PlanAccordion`] (the plan / plan-task accordion pane
+    ///   rendered by `render_plan_accordion_pane` / `render_plan_task_pane`).
+    /// * No active tab (the bare selected-run view) → [`ScrollablePanel::Exchange`]
+    ///   (preserves the legacy behaviour: Up/Down scrolls the exchange pane).
+    ///
+    /// Mouse-wheel scroll events use `panel_at` hit-testing instead, so this is
+    /// only consulted by the keyboard paths that have no positional context.
+    pub fn main_scroll_target(&self) -> ScrollablePanel {
+        match self
+            .tabs
+            .active_tab
+            .and_then(|idx| self.tabs.open_tabs.get(idx))
+        {
+            Some(TabContent::Task { .. }) => ScrollablePanel::TaskEntry,
+            Some(TabContent::Plan { .. }) | Some(TabContent::PlanTask { .. }) => {
+                ScrollablePanel::PlanAccordion
+            }
+            None => ScrollablePanel::Exchange,
+        }
+    }
+
     /// Return the [`TaskId`] of the currently focused task within the selected
     /// Run, if any.
     ///
@@ -2340,8 +2368,11 @@ impl App {
                         self.tree_move(-1);
                     }
                     Panel::Main => {
-                        // Main focus: scroll the exchange pane up.
-                        self.scroll_up(ScrollablePanel::Exchange);
+                        // Main focus: scroll the active tab's pane up. The target
+                        // depends on the active tab type — a Task tab scrolls its
+                        // task entry pane, a Plan/PlanTask tab scrolls the accordion,
+                        // and the bare run view scrolls the exchange pane.
+                        self.scroll_up(self.main_scroll_target());
                     }
                 }
                 true
@@ -2353,14 +2384,16 @@ impl App {
                         self.tree_move(1);
                     }
                     Panel::Main => {
-                        // Main focus: scroll the exchange pane down.
+                        // Main focus: scroll the active tab's pane down, clamped to
+                        // the per-panel scroll max recorded by the last render pass.
+                        let target = self.main_scroll_target();
                         let max = self
                             .last_scroll_maxes
                             .borrow()
-                            .get(&ScrollablePanel::Exchange)
+                            .get(&target)
                             .copied()
                             .unwrap_or(0);
-                        self.scroll_down(ScrollablePanel::Exchange, max);
+                        self.scroll_down(target, max);
                     }
                 }
                 true
@@ -2434,21 +2467,24 @@ impl App {
             // the render pass re-clamps the offset to the current
             // `total_lines - pane_height` via `effective_offset`.
             AppEvent::ScrollUp => {
-                self.scroll_up(ScrollablePanel::Exchange);
+                self.scroll_up(self.main_scroll_target());
                 true
             }
             AppEvent::ScrollDown => {
-                // Use the last rendered bottom as the clamp bound (not
-                // `u16::MAX`) so reaching the real bottom re-engages auto-follow
-                // in `scroll_down`; otherwise `exchange_scroll == scroll_max`
-                // could never hold and auto-follow would never re-engage.
+                // Use the active tab's pane as the scroll target (so a task tab
+                // scrolls its task entry, a plan tab scrolls the accordion, and the
+                // bare run view scrolls the exchange pane). The clamp bound is the
+                // last rendered scroll max for that panel — using `u16::MAX` would
+                // prevent the bound check from ever saturating on panels without
+                // auto-follow.
+                let target = self.main_scroll_target();
                 let max = self
                     .last_scroll_maxes
                     .borrow()
-                    .get(&ScrollablePanel::Exchange)
+                    .get(&target)
                     .copied()
                     .unwrap_or(0);
-                self.scroll_down(ScrollablePanel::Exchange, max);
+                self.scroll_down(target, max);
                 true
             }
             AppEvent::ScrollUpAt(col, row) => {
@@ -9606,6 +9642,166 @@ mod tests {
                 .unwrap_or(0),
             3,
             "Exchange should have scrolled down three times"
+        );
+    }
+
+    // ── main_scroll_target routing (plan 0042 WS6 task-tab scroll fix) ──────────
+
+    /// `main_scroll_target` resolves to [`ScrollablePanel::TaskEntry`] when a
+    /// `TabContent::Task` tab is active — so keyboard Up/Down scrolls the task
+    /// entry pane rather than the (invisible) exchange pane.
+    #[test]
+    fn main_scroll_target_task_tab_routes_to_task_entry() {
+        let mut app = make_app();
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "p".to_string(),
+            task_id: TaskId::new("t-1"),
+        });
+        assert_eq!(
+            app.main_scroll_target(),
+            ScrollablePanel::TaskEntry,
+            "a Task tab must route keyboard scrolls to the TaskEntry pane"
+        );
+    }
+
+    /// `main_scroll_target` resolves to [`ScrollablePanel::PlanAccordion`] for
+    /// both `TabContent::Plan` and `TabContent::PlanTask` tabs.
+    #[test]
+    fn main_scroll_target_plan_tabs_route_to_plan_accordion() {
+        let mut app = make_app();
+        app.tabs.open_tab(crate::app::TabContent::Plan {
+            plan_slug: "p".to_string(),
+        });
+        assert_eq!(
+            app.main_scroll_target(),
+            ScrollablePanel::PlanAccordion,
+            "a Plan tab must route keyboard scrolls to the PlanAccordion pane"
+        );
+
+        let mut app2 = make_app();
+        app2.tabs.open_tab(crate::app::TabContent::PlanTask {
+            plan_slug: "p".to_string(),
+            task_id: "t-1".to_string(),
+        });
+        assert_eq!(
+            app2.main_scroll_target(),
+            ScrollablePanel::PlanAccordion,
+            "a PlanTask tab must route keyboard scrolls to the PlanAccordion pane"
+        );
+    }
+
+    /// `main_scroll_target` falls back to [`ScrollablePanel::Exchange`] when no
+    /// tab is active (the bare selected-run view) — preserving the legacy
+    /// behaviour where Up/Down scrolls the exchange pane.
+    #[test]
+    fn main_scroll_target_no_tab_routes_to_exchange() {
+        let app = make_app();
+        assert_eq!(
+            app.main_scroll_target(),
+            ScrollablePanel::Exchange,
+            "with no active tab, keyboard scrolls should target the Exchange pane"
+        );
+    }
+
+    /// `SelectDown` on the main pane with a Task tab active must scroll the
+    /// `TaskEntry` panel (not the `Exchange` panel). This is the regression that
+    /// motivated the fix: previously the task detail body was taller than the
+    /// viewport but Up/Down scrolled the invisible exchange pane, leaving the
+    /// task entry unscrollable.
+    #[test]
+    fn select_down_with_task_tab_scrolls_task_entry_not_exchange() {
+        let mut app = make_app();
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "p".to_string(),
+            task_id: TaskId::new("t-1"),
+        });
+        app.focused_panel = Panel::Main;
+        // The render pass would normally populate this; set it directly so the
+        // scroll_down clamp has a non-zero ceiling.
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::TaskEntry, 20);
+
+        app.update(AppEvent::SelectDown);
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::TaskEntry)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "SelectDown with a Task tab active must advance the TaskEntry scroll offset"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "SelectDown with a Task tab active must NOT touch the Exchange scroll offset"
+        );
+    }
+
+    /// `SelectUp` on the main pane with a Task tab active must scroll the
+    /// `TaskEntry` panel up, leaving the `Exchange` offset untouched.
+    #[test]
+    fn select_up_with_task_tab_scrolls_task_entry_up() {
+        let mut app = make_app();
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "p".to_string(),
+            task_id: TaskId::new("t-1"),
+        });
+        app.focused_panel = Panel::Main;
+        app.scroll_offsets.insert(ScrollablePanel::TaskEntry, 5);
+
+        app.update(AppEvent::SelectUp);
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::TaskEntry)
+                .copied()
+                .unwrap_or(0),
+            4,
+            "SelectUp with a Task tab active must decrement the TaskEntry scroll offset"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "SelectUp with a Task tab active must NOT touch the Exchange scroll offset"
+        );
+    }
+
+    /// `SelectDown` on the main pane with no active tab must still scroll the
+    /// exchange pane (legacy bare-run-view behaviour preserved).
+    #[test]
+    fn select_down_with_no_tab_still_scrolls_exchange() {
+        let mut app = make_app();
+        app.focused_panel = Panel::Main;
+        app.exchange_auto_follow = false;
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 50);
+
+        app.update(AppEvent::SelectDown);
+
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "SelectDown with no active tab must advance the Exchange scroll offset"
+        );
+        assert_eq!(
+            app.scroll_offsets
+                .get(&ScrollablePanel::TaskEntry)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "SelectDown with no active tab must NOT touch the TaskEntry scroll offset"
         );
     }
 
