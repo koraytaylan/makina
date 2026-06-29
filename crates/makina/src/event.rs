@@ -403,11 +403,9 @@ async fn resolve_io(
         // ── Settings commit (plan 0070) ──────────────────────────────────────
         // Write the edited caps, concurrency, and finalization mode back to the config file
         // (`{repo_root}/.makina/config.toml`). Validates all fields first;
-        // on any error, returns the reason without writing. Like
-        // commit_provider_config, this round-trips through GlobalConfig (which
-        // has no gates/base_branch field), so ProjectConfig entries are NOT
-        // preserved. The actual state update (closing the modal, applying values
-        // to app.caps/concurrency/final_merge) is handled by App::update after this returns.
+        // on any error, returns the reason without writing. The writer preserves
+        // project fields and updates CoreApi's live runtime settings; App::update
+        // then closes the modal and applies the same values to local TUI state.
         AppEvent::SettingsCommit => {
             let status = commit_settings(app).await;
             (AppEvent::SettingsCommit, status)
@@ -642,21 +640,16 @@ async fn commit_provider_config(app: &App) -> Option<String> {
     }
 }
 
-/// Commit edited settings (caps, concurrency, and final merge mode) to the config file.
+/// Commit edited settings (caps, concurrency, and final merge mode) to the project config file.
 ///
-/// Follows the same pattern as `commit_provider_config`: read the current
-/// on-disk config (if any), rebuild it with the new caps/concurrency/merge mode while
-/// preserving all other fields, and write it back. Validates all fields
-/// before writing; on any error returns Some(reason) without writing.
-///
-/// Note: this writer round-trips through `GlobalConfig`, which has no
-/// `gates`/`base_branch` field, so the `ProjectConfig` `[[gates]]` /
-/// `base_branch` tables are NOT preserved. The gates-aware project-config
-/// writer lands in plan 0025.
+/// Uses the project-config writer so repository-specific fields (`base_branch`,
+/// `[[gates]]`, discovery stamps, and role prompts) survive the round-trip. On a
+/// successful write it also updates the live CoreApi runtime settings so a
+/// restart is not required before the next scheduler run observes the new mode.
 async fn commit_settings(app: &App) -> Option<String> {
     use crate::settings_validation::validate_settings;
-    use makina_core::config::{CapsConfig, GlobalConfig, MergeConfig};
-    use makina_core::paths::config_file;
+    use makina_core::api::Command;
+    use makina_core::config::{CapsOverride, MergeConfig, write_project_config};
 
     let settings = app.settings.as_ref()?;
 
@@ -666,53 +659,41 @@ async fn commit_settings(app: &App) -> Option<String> {
         Err(reason) => return Some(reason),
     };
 
-    // Read the current on-disk config (if any) so we don't lose fields we
-    // don't manage (e.g. providers, roles, project gates, base_branch).
-    let config_path = config_file(&app.repo_root);
-    let existing_global: GlobalConfig = if config_path.exists() {
-        match tokio::fs::read_to_string(&config_path).await {
-            Ok(s) => toml::from_str::<GlobalConfig>(&s).unwrap_or_default(),
-            Err(_) => GlobalConfig::default(),
-        }
-    } else {
-        GlobalConfig::default()
+    let caps = makina_core::config::CapsConfig {
+        gate_iterations: valid.gate_iterations,
+        reviewer_iterations: valid.reviewer_iterations,
+        wall_clock_secs: valid.wall_clock_secs,
+        idle_secs: valid.idle_secs,
     };
 
-    // Build the updated global config: preserve all existing fields but
-    // replace caps, concurrency, and final merge mode with the new values.
-    let updated = GlobalConfig {
-        caps: CapsConfig {
-            gate_iterations: valid.gate_iterations,
-            reviewer_iterations: valid.reviewer_iterations,
-            wall_clock_secs: valid.wall_clock_secs,
-            idle_secs: valid.idle_secs,
-        },
-        concurrency: valid.concurrency,
-        merge: MergeConfig {
+    if let Err(e) = write_project_config(&app.repo_root, |cfg| {
+        cfg.caps = Some(CapsOverride {
+            gate_iterations: Some(valid.gate_iterations),
+            reviewer_iterations: Some(valid.reviewer_iterations),
+            wall_clock_secs: Some(valid.wall_clock_secs),
+            idle_secs: valid.idle_secs.map(Some),
+        });
+        cfg.concurrency = Some(valid.concurrency);
+        cfg.merge = Some(MergeConfig {
             final_: valid.final_merge,
-        },
-        ..existing_global
-    };
-
-    // Serialise to TOML.
-    let toml_str = match toml::to_string_pretty(&updated) {
-        Ok(s) => s,
-        Err(e) => {
-            return Some(format!("Config serialise error: {e}"));
-        }
-    };
-
-    // Ensure the parent directory exists.
-    if let Some(parent) = config_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
+        });
+    })
+    .await
     {
         return Some(format!("Config write error: {e}"));
     }
 
-    // Write the file.
-    match tokio::fs::write(&config_path, toml_str).await {
-        Ok(()) => Some("Settings saved".to_string()),
-        Err(e) => Some(format!("Config write error: {e}")),
+    match app
+        .api
+        .execute(Command::UpdateRuntimeSettings {
+            caps,
+            concurrency: valid.concurrency,
+            final_merge: valid.final_merge,
+        })
+        .await
+    {
+        Ok(_) => Some("Settings saved".to_string()),
+        Err(e) => Some(format!("Settings saved; runtime update failed: {e}")),
     }
 }
 
@@ -4046,20 +4027,26 @@ A description that is long enough to pass minimums.
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let repo_root = tmpdir.path();
 
-        // Write a pre-existing config with unrelated fields (e.g., [[providers]]).
+        // Write a pre-existing project config with fields Settings does not own.
         let existing_config = r#"
-[[providers]]
-name = "claude"
-command = "claude-acp"
+base_branch = "develop"
+concurrency = 4
 
-[roles]
-developer = { provider = "claude" }
-reviewer = { provider = "claude" }
+[[gates]]
+name = "test"
+command = "cargo test"
+
+[roles.developer]
+system_prompt = "Follow the repository style."
+system_prompt_mode = "append"
 
 [caps]
 gate_iterations = 7
 reviewer_iterations = 3
 wall_clock_secs = 1200
+
+[merge]
+final = "squash"
 "#;
         let config_path = repo_root.join(".makina/config.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).expect("mkdir");
@@ -4114,38 +4101,51 @@ wall_clock_secs = 1200
 
         // Re-read the config file and verify it was updated.
         let new_config_str = std::fs::read_to_string(&config_path).expect("read config");
-        let new_config: makina_core::config::GlobalConfig =
-            toml::from_str(&new_config_str).expect("parse config");
+        let new_config =
+            makina_core::config::ProjectConfig::from_toml_str(&new_config_str, "project")
+                .expect("parse project config");
 
         // Verify the new caps.
+        let caps = new_config.caps.as_ref().expect("caps must be written");
         assert_eq!(
-            new_config.caps.gate_iterations, 10,
+            caps.gate_iterations,
+            Some(10),
             "gate_iterations must be updated"
         );
-        assert_eq!(new_config.concurrency, 8, "concurrency must be updated");
         assert_eq!(
-            new_config.merge.final_,
+            new_config.concurrency,
+            Some(8),
+            "concurrency must be updated"
+        );
+        assert_eq!(
+            new_config.merge.expect("merge must be written").final_,
             makina_core::config::FinalMerge::Stage,
             "final merge mode must be updated"
         );
         assert_eq!(
-            new_config.caps.reviewer_iterations, 3,
+            caps.reviewer_iterations,
+            Some(3),
             "reviewer_iterations must be unchanged"
         );
         assert_eq!(
-            new_config.caps.wall_clock_secs, 1200,
+            caps.wall_clock_secs,
+            Some(1200),
             "wall_clock_secs must be unchanged"
         );
 
-        // Verify unrelated fields are preserved.
-        assert!(
-            !new_config.providers.is_empty(),
-            "providers must be preserved"
-        );
-        assert_eq!(new_config.providers[0].name, "claude");
-        assert!(
-            new_config.roles.developer.is_some(),
-            "roles must be preserved"
+        // Verify project-owned fields are preserved.
+        assert_eq!(new_config.base_branch, "develop");
+        assert_eq!(new_config.gates.len(), 1);
+        assert_eq!(new_config.gates[0].name, "test");
+        assert_eq!(new_config.gates[0].command, "cargo test");
+        assert_eq!(
+            new_config
+                .roles
+                .developer
+                .as_ref()
+                .and_then(|role| role.system_prompt.as_deref()),
+            Some("Follow the repository style."),
+            "project role prompt must be preserved"
         );
     }
 

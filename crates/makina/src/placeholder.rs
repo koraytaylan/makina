@@ -263,6 +263,7 @@ impl Api for PlaceholderApi {
             }
             // Plan 0025: force-re-run project discovery. In the placeholder, just
             // acknowledge; the real implementation is in the orchestrator.
+            Command::UpdateRuntimeSettings { .. } => Ok(CommandOutcome::Acknowledged),
             Command::DiscoverProject => Ok(CommandOutcome::Acknowledged),
             Command::PurgeWorktrees => Ok(CommandOutcome::Acknowledged),
         }

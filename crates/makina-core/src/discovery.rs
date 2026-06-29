@@ -786,6 +786,7 @@ scanned_files = ["old.toml"]
             concurrency: None,
             discovery: None,
             roles: RolesConfig::default(),
+            merge: None,
         };
         let mut roles = RolesConfig::default();
 

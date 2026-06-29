@@ -38,6 +38,8 @@ use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{CapsConfig, FinalMerge};
+
 // Re-export ingestion report types so TUI (and other consumers) can import them
 // from `makina_core::api` alongside the other view types (RunView, TaskView, …).
 pub use crate::ingestion::{IngestionIssue, IngestionReport, IssueSeverity, IssueSource};
@@ -464,6 +466,22 @@ pub enum Command {
     ResetRun {
         /// The Run to reset.
         run: RunId,
+    },
+
+    /// Update the runtime settings used by newly spawned schedulers.
+    ///
+    /// The TUI settings screen persists these values to `.makina/config.toml`
+    /// and then sends this command so the current process does not require a
+    /// restart before subsequent starts/retries use the new limits and final
+    /// merge mode. In-flight task drivers keep the config snapshot they were
+    /// started with.
+    UpdateRuntimeSettings {
+        /// Updated termination caps.
+        caps: CapsConfig,
+        /// Updated maximum scheduler concurrency.
+        concurrency: usize,
+        /// Updated completed-run finalization mode.
+        final_merge: FinalMerge,
     },
 
     /// Force-re-run project discovery regardless of any existing `[discovery]` stamp.
@@ -1194,6 +1212,7 @@ mod tests {
                     // Stub: acknowledge without doing real discovery.
                     Ok(CommandOutcome::Acknowledged)
                 }
+                Command::UpdateRuntimeSettings { .. } => Ok(CommandOutcome::Acknowledged),
                 Command::PurgeWorktrees => Ok(CommandOutcome::Acknowledged),
             }
         }

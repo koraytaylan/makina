@@ -611,6 +611,10 @@ pub struct ProjectConfigWrite {
     /// Roles and their per-role configuration (with optional `system_prompt`s).
     #[serde(default)]
     pub roles: RolesConfig,
+
+    /// Optional project override for completed-run final merge behavior.
+    #[serde(default)]
+    pub merge: Option<MergeConfig>,
 }
 
 impl ProjectConfigWrite {
@@ -623,6 +627,7 @@ impl ProjectConfigWrite {
             concurrency: project.concurrency,
             discovery: project.discovery,
             roles,
+            merge: project.merge,
         }
     }
 }

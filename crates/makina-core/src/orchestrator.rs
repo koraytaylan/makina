@@ -86,7 +86,7 @@ use crate::api::{
 };
 use crate::audit::{AuditRegistry, NoopAuditRegistry};
 use crate::backend::AgentBackend;
-use crate::config::Config;
+use crate::config::{CapsConfig, Config, FinalMerge};
 use crate::interpreter::TaskListInterpreter;
 use crate::paths;
 use crate::run_metadata::{
@@ -485,6 +485,28 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 // ── Run handle (task 31) ──────────────────────────────────────────────────────
 
+/// Settings that may be changed from the TUI while the process is running.
+///
+/// These are overlaid onto the startup [`Config`] every time CoreApi spawns a
+/// scheduler. A running scheduler still owns its config snapshot; the next
+/// Start/Retry observes the latest values.
+#[derive(Debug, Clone)]
+struct RuntimeSettings {
+    caps: CapsConfig,
+    concurrency: usize,
+    final_merge: FinalMerge,
+}
+
+impl RuntimeSettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            caps: config.caps.clone(),
+            concurrency: config.concurrency,
+            final_merge: config.merge.final_,
+        }
+    }
+}
+
 /// The control handles for a background-executing Run.
 ///
 /// Stored in the [`RunEntry`] once `StartRun` spawns the scheduler so that
@@ -650,6 +672,9 @@ struct CoreState {
     /// Resolved runtime config (gates, caps, concurrency, base branch).
     config: Config,
 
+    /// Live-editable settings saved from the TUI during this process.
+    runtime_settings: Mutex<RuntimeSettings>,
+
     /// The Runs registry: `RunId` → [`RunEntry`].  A `BTreeMap` keeps iteration
     /// order stable (ascending `RunId`, i.e. insertion order) for [`Api::runs`].
     runs: Mutex<BTreeMap<u64, RunEntry>>,
@@ -673,6 +698,65 @@ impl CoreState {
     /// Allocate the next monotonic [`RunId`].
     fn alloc_id(&self) -> RunId {
         RunId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Clone the startup config and overlay the latest TUI-editable settings.
+    fn scheduler_config(&self) -> Config {
+        let runtime = self
+            .runtime_settings
+            .lock()
+            .expect("runtime settings mutex poisoned")
+            .clone();
+        let mut config = self.config.clone();
+        config.caps = runtime.caps;
+        config.concurrency = runtime.concurrency;
+        config.merge.final_ = runtime.final_merge;
+        config
+    }
+
+    /// Replace the live-editable settings after validating the resulting config.
+    fn update_runtime_settings(
+        &self,
+        caps: CapsConfig,
+        concurrency: usize,
+        final_merge: FinalMerge,
+    ) -> Result<(), ApiError> {
+        if caps.gate_iterations == 0 {
+            return Err(ApiError::InvalidCommand {
+                reason: "caps.gate_iterations must be at least 1".to_string(),
+            });
+        }
+        if caps.reviewer_iterations == 0 {
+            return Err(ApiError::InvalidCommand {
+                reason: "caps.reviewer_iterations must be at least 1".to_string(),
+            });
+        }
+        if caps.wall_clock_secs == 0 {
+            return Err(ApiError::InvalidCommand {
+                reason: "caps.wall_clock_secs must be at least 1".to_string(),
+            });
+        }
+        if matches!(caps.idle_secs, Some(0)) {
+            return Err(ApiError::InvalidCommand {
+                reason: "caps.idle_secs must be at least 1".to_string(),
+            });
+        }
+        if concurrency == 0 {
+            return Err(ApiError::InvalidCommand {
+                reason: "concurrency must be at least 1".to_string(),
+            });
+        }
+
+        let mut runtime = self
+            .runtime_settings
+            .lock()
+            .expect("runtime settings mutex poisoned");
+        *runtime = RuntimeSettings {
+            caps,
+            concurrency,
+            final_merge,
+        };
+        Ok(())
     }
 
     /// Build an [`EventSink`] that forwards every engine [`Event`] into the
@@ -919,6 +1003,7 @@ impl CoreApi {
         let normalizer = Arc::new(crate::normalizer::ModelNormalizer::new(Arc::clone(
             &developer_backend,
         )));
+        let runtime_settings = RuntimeSettings::from_config(&config);
         Self {
             state: Arc::new(CoreState {
                 interpreter,
@@ -927,6 +1012,7 @@ impl CoreApi {
                 reviewer_backend,
                 worktree_manager,
                 config,
+                runtime_settings: Mutex::new(runtime_settings),
                 runs: Mutex::new(BTreeMap::new()),
                 next_id: AtomicU64::new(1),
                 event_tx,
@@ -1668,7 +1754,7 @@ impl CoreApi {
         // Clone the static execution deps + the shared state for the background
         // task (so it can finalize the registry status when the scheduler ends).
         let worktree_manager = self.state.worktree_manager.clone();
-        let config = self.state.config.clone();
+        let config = self.state.scheduler_config();
         let developer_backend = Arc::clone(&self.state.developer_backend);
         let reviewer_backend = Arc::clone(&self.state.reviewer_backend);
         let audit_registry = Arc::clone(&self.state.audit_registry);
@@ -1709,6 +1795,18 @@ impl CoreApi {
             }
             state.finalize_run_status(run).await;
         });
+    }
+
+    /// Update settings that the next spawned scheduler should use.
+    fn update_runtime_settings(
+        &self,
+        caps: CapsConfig,
+        concurrency: usize,
+        final_merge: FinalMerge,
+    ) -> Result<CommandOutcome, ApiError> {
+        self.state
+            .update_runtime_settings(caps, concurrency, final_merge)?;
+        Ok(CommandOutcome::Acknowledged)
     }
 
     /// Implement `PauseRun`: stop launching NEW tasks (in-flight finish).
@@ -2344,6 +2442,8 @@ impl Api for CoreApi {
     /// * [`Command::RetryTask`] / [`Command::RetryFailedTasks`] reset the failed
     ///   task(s) + skipped cascade, persist, and re-dispatch (async, plan 0017).
     /// * [`Command::ResetRun`] resets a run to a fresh Pending graph.
+    /// * [`Command::UpdateRuntimeSettings`] updates the config snapshot used by
+    ///   subsequently spawned schedulers.
     /// * [`Command::PurgeWorktrees`] removes Makina-created transient worktrees.
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
@@ -2360,6 +2460,11 @@ impl Api for CoreApi {
             Command::RetryTask { run, task } => self.retry_task(run, task).await,
             Command::RetryFailedTasks { run } => self.retry_failed_tasks(run).await,
             Command::ResetRun { run } => self.reset_run(run).await,
+            Command::UpdateRuntimeSettings {
+                caps,
+                concurrency,
+                final_merge,
+            } => self.update_runtime_settings(caps, concurrency, final_merge),
             Command::DiscoverProject => self.force_discover_project().await,
             Command::PurgeWorktrees => self.purge_worktrees().await,
         }
@@ -2680,6 +2785,27 @@ Do the thing in `lib.rs`.
             .status()
             .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn branch_commit_count(path: &std::path::Path, branch: &str) -> usize {
+        git_stdout(path, &["rev-list", "--count", branch])
+            .parse()
+            .expect("branch commit count must be numeric")
     }
 
     fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
@@ -3572,6 +3698,95 @@ Create beta.
     // tree (Developer/Reviewer per task) AND polls the api concurrently.  A
     // dedicated worker pool keeps it deterministic + fast (no single-thread
     // starvation between the poll loop and the background execution).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_runtime_settings_affects_next_scheduler_run() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let ingestion = Arc::new(EdgeInferrer::new(
+            Arc::new(StructuredTextInterpreter::new()),
+        ));
+        let planner = crate::interpreter::build_planner_interpreter(
+            &crate::config::PlannerMechanism::OneShotAgent,
+            None,
+        )
+        .expect("planner build must succeed with None backend");
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![
+            "Implemented the feature.".into(),
+            r#"{"verdict":"approve"}"#.into(),
+        ]));
+        let repo_dir = setup_temp_repo();
+        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
+        let mut config = no_gate_config();
+        config.merge.final_ = crate::config::FinalMerge::Manual;
+        let caps = config.caps.clone();
+        let concurrency = config.concurrency;
+
+        let api = Arc::new(CoreApi::with_audit_registry(
+            ingestion,
+            planner,
+            Arc::clone(&backend),
+            backend,
+            wm,
+            config,
+            Arc::new(NoopAuditRegistry),
+        ));
+
+        api.execute(Command::UpdateRuntimeSettings {
+            caps,
+            concurrency,
+            final_merge: crate::config::FinalMerge::Squash,
+        })
+        .await
+        .expect("runtime settings update must succeed");
+
+        let develop_before = branch_commit_count(repo_dir.path(), "develop");
+        let (_dir, path) = write_task_list(ONE_TASK_LIST);
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        api.execute(Command::StartRun { run }).await.unwrap();
+        let api_poll = Arc::clone(&api);
+        poll_until(
+            || {
+                let api = Arc::clone(&api_poll);
+                async move {
+                    api.run(run)
+                        .await
+                        .is_some_and(|view| view.status == RunStatus::Completed)
+                }
+            },
+            "run to complete after runtime settings update",
+        )
+        .await;
+
+        let develop_after = branch_commit_count(repo_dir.path(), "develop");
+        assert_eq!(
+            develop_after,
+            develop_before + 1,
+            "updated Squash mode must land the completed plan on develop without restart"
+        );
+
+        // SAFETY: restoring HOME while still holding HOME_ENV_LOCK.
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn start_run_executes_run_and_emits_live_events() {
         // Pin $HOME under HOME_ENV_LOCK: the run writes state (worktrees, run
