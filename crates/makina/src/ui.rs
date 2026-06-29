@@ -791,8 +791,8 @@ pub fn render(app: &App, frame: &mut Frame) {
     render_output_pane(app, frame, error_area);
 
     // ── Status bar ────────────────────────────────────────────────────────────
-    // Key hints reflect the REAL keys: [o] open file browser, [s/p/c] run
-    // control (start/pause/cancel the selected run — task 31), [Tab] switch
+    // Key hints reflect the real keys: [o] open file browser, Ctrl+P opens the
+    // command palette for run control, [Tab] switches
     // focus, [q/Esc/^C] quit.  A transient command-outcome message (set on the
     // most recent `api.execute(...)`) is shown when present; otherwise the focus
     // label + last-event hint are shown.
@@ -818,14 +818,14 @@ pub fn render(app: &App, frame: &mut Frame) {
     };
     // Blocked-start notice (mirrors gr-legend append): only when the selected
     // run's report has blocking issues. Tells user why Start is gated and how
-    // to re-interpret.
+    // to reset/re-interpret.
     let blocked_notice = app
         .selected_run()
         .and_then(|r| {
             if r.report.is_blocked() {
                 let n = r.report.blocking().count();
                 Some(format!(
-                    "  │  ⚠ {} blocking issue(s) — press e to view, r to re-interpret",
+                    "  │  ⚠ {} blocking issue(s) — press e to view, Ctrl+P to reset",
                     n
                 ))
             } else {
@@ -881,7 +881,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!(" [^P] cmds  [o] open  [^S] start  [p/c] pause/cancel  [r] retry  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] logs  [?] help  [wheel] scroll  "),
+            format!(" [^P] cmds/run  [o] open  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] logs  [?] help  [wheel] scroll  "),
             default_style,
         ),
         Span::styled(error_badge_text, error_badge_style),
@@ -1546,7 +1546,7 @@ fn render_dependency_view_plan(
             }
             DependencyViewMode::Timeline => {
                 vec![Line::from(vec![Span::styled(
-                    "  No timing yet — start the plan (Ctrl+S) to see the Gantt.",
+                    "  No timing yet — start the plan from the command palette to see the Gantt.",
                     dim,
                 )])]
             }
@@ -2101,7 +2101,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 /// Gate/review iteration counts are intentionally omitted here — they live in the
 /// always-visible task header (`render_task_entry_pane`) so they show even when the
 /// Execution section is collapsed or there are no exchanges yet.
-/// Falls back to "No execution yet — start the run (Ctrl+S)" when there are no exchanges.
+/// Falls back to a command-palette start hint when there are no exchanges.
 /// Build the Execution accordion section for a task detail tab as styled
 /// [`Line`]s — the header (matching [`render_accordion_section`]'s `[±] Title`
 /// style) followed, when expanded, by the live exchange log rendered in
@@ -2204,7 +2204,7 @@ fn render_task_execution_section(
         let hint = if app.exchange_logs.contains_key(&(run.id, task.id.clone())) {
             "No exchange yet."
         } else {
-            "No execution yet — start the run (Ctrl+S)"
+            "No execution yet — start the run from the command palette"
         };
         result.push(Line::from(vec![Span::styled(
             format!("  {hint}"),
@@ -3914,18 +3914,9 @@ fn render_help_overlay(app: &App, frame: &mut Frame, area: Rect) {
     // Run Control
     lines.push(Line::from(Span::styled("Run Control", section_style)));
     lines.push(Line::from(vec![
-        Span::styled("[o]", key_style),
-        Span::styled(" open browser  ", binding_style),
-        Span::styled("[s]", key_style),
-        Span::styled(" start run  ", binding_style),
-        Span::styled("[p]", key_style),
-        Span::styled(" pause", binding_style),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("[c]", key_style),
-        Span::styled(" cancel  ", binding_style),
-        Span::styled("[r]", key_style),
-        Span::styled(" retry focused", binding_style),
+        Span::styled("[Ctrl+P]", key_style),
+        Span::styled(" command palette  ", binding_style),
+        Span::styled("start / pause / stop / reset", binding_style),
     ]));
     lines.push(Line::from(""));
 
@@ -4800,7 +4791,7 @@ mod tests {
         );
     }
 
-    /// The status bar must show the run-control key hints (`[o]`, `[s/p/c]`).
+    /// The status bar must show the palette run-control hint without old direct shortcuts.
     #[test]
     fn render_status_bar_shows_run_control_hints() {
         let mut terminal = make_terminal(100, 24);
@@ -4812,12 +4803,16 @@ mod tests {
 
         assert!(screen.contains("[o]"), "status bar must show [o] open");
         assert!(
-            screen.contains("[^S] start"),
-            "status bar must show the [^S] start hint"
+            screen.contains("[^P] cmds/run"),
+            "status bar must show the command-palette run-control hint"
         );
         assert!(
-            screen.contains("[p/c] pause/cancel"),
-            "status bar must show the [p/c] pause/cancel hints"
+            !screen.contains("[^S] start"),
+            "status bar must not show the removed [^S] start hint"
+        );
+        assert!(
+            !screen.contains("[p/c] pause/cancel"),
+            "status bar must not show the removed [p/c] pause/cancel hints"
         );
     }
 
@@ -5423,7 +5418,7 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
-            screen.contains("blocking issue(s) — press e to view, r to re-interpret"),
+            screen.contains("blocking issue(s) — press e to view, Ctrl+P to reset"),
             "status bar must show the blocking-count notice when report.is_blocked()"
         );
     }

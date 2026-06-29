@@ -10,7 +10,8 @@ There are two equivalent ways to run it:
 1. **Automated harness** (`crates/makina/tests/e2e.rs`) — drives `CoreApi`
    directly (the exact backend the TUI binds to) and asserts the done-when. This
    is the faithful, repeatable proof.
-2. **Interactive TUI** — `cargo run -p makina`, open the list, press `s`, watch.
+2. **Interactive TUI** — `cargo run -p makina`, open the list, start it from
+   the command palette, watch.
    This is the human-facing equivalent.
 
 > **Done when:** at least one task reaches `done` and lands on `develop`, driven
@@ -175,7 +176,7 @@ Then:
 1. Press **`o`** to open the file browser.
 2. Navigate to `docs/trial/dogfood-tasks.md` and select it — this issues
    `OpenRun`; the run appears in the sidebar with both tasks `New`/`Ready`.
-3. Press **`s`** to start the run (`StartRun`).
+3. Press **`Ctrl-P`**, choose **Start run**, and press Enter.
 4. Watch:
    - the **per-task status** column transition `Ready → InProgress → InReview →
      Done` (and the gate/review iteration counters tick if the agent needs a

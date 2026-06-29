@@ -119,12 +119,13 @@ cargo run -p makina    # requires the two config files above
 Keys:
 
 - **`o`** — open the file browser and pick a task list (starts a Run)
+- **`Ctrl-P`** — open the command palette for start / pause / stop / reset
 - **`↑/↓`** (or `j/k`) — navigate · **`Tab`** or **`→/←`** — switch panel (Runs ↔ Detail) · **wheel** — scroll content · hold **Shift** (or **Option** in iTerm2) and drag to select & copy text
-- **`s` / `p` / `c`** — start / pause / cancel the selected Run
 - **`q`** / `Esc` / `Ctrl-C` — quit
 
-Open a list, press `s`, and watch per-task state, iteration counts, and the live
-prompt/answer stream as the loop runs; approved tasks land on your base branch.
+Open a list, choose **Start run** from the command palette, and watch per-task
+state, iteration counts, and the live prompt/answer stream as the loop runs;
+approved tasks land on your base branch.
 
 ## Caution — running a list mutates the repository
 

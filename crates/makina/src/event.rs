@@ -204,7 +204,7 @@ pub async fn run(
 
             // IO-layer resolution: browser intents (open / enter dir / select
             // file) need filesystem reads or an async `execute`; run controls
-            // (start/pause/cancel) need an async `execute` against the selected
+            // (start/pause/cancel/reset) need an async `execute` against the selected
             // run.  Resolve them here into the concrete state-mutating event
             // `update` consumes — plus an OPTIONAL transient status message to
             // surface the command outcome/error (task 31).  Keeping the async
@@ -268,7 +268,7 @@ async fn resolve_api_event(
 ///   `BrowserActivate` on a dir → spawn the read; on a file → compute transient
 ///   "Interpreting …" status, spawn `execute(OpenRun)`, and close the browser
 ///   immediately; `BrowserParent` → spawn parent read.
-/// - **Run control** (task 31): `StartRun`/`PauseRun`/`CancelRun` →
+/// - **Run control** (task 31): `StartRun`/`PauseRun`/`CancelRun`/`Reinterpret` →
 ///   `execute(...)` for `app.selected_run()` (outcome/error → status message);
 ///   the run-state changes themselves flow back via `api.subscribe()`.
 ///
@@ -402,9 +402,9 @@ async fn resolve_io(
         }
         // ── Command palette execute (task command-palette-keys) ──────────────────
         // Extract the selected action's event from the palette before App::update
-        // clears it. IO-backed events (RetryFocused, DiscoverProject) are re-dispatched
-        // through background_tx so they receive a full resolve_io pass (plan 0041);
-        // non-IO events pass straight to App::update.
+        // clears it. Regular actions are re-dispatched through background_tx so
+        // IO-backed events receive a full resolve_io pass, and the current pass
+        // closes the palette.
         // Theme selector Enter is handled in App::update with mutable access.
         AppEvent::CommandPaletteExecute => {
             if let Some(palette) = app.command_palette.as_ref() {
@@ -418,17 +418,8 @@ async fn resolve_io(
                 if let Some(action) = filtered.get(palette.selected) {
                     return match action {
                         crate::app::PaletteAction::Regular { event, .. } => {
-                            // IO-backed events need a full resolve_io pass to work correctly
-                            // (e.g., RetryFocused → retry_focused, DiscoverProject → discover_project).
-                            // Send them over background_tx and return Tick for this pass;
-                            // the event loop will reprocess them through resolve_io.
-                            match event {
-                                AppEvent::RetryFocused | AppEvent::DiscoverProject => {
-                                    let _ = background_tx.send(event.clone()).await;
-                                    (AppEvent::Tick, None)
-                                }
-                                _ => (event.clone(), None),
-                            }
+                            let _ = background_tx.send(event.clone()).await;
+                            (AppEvent::CloseCommandPalette, None)
                         }
                         crate::app::PaletteAction::NestedThemeSelector { .. } => {
                             // Signal to App::update to enter theme selector mode
@@ -922,8 +913,8 @@ async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
 /// - A focused `Failed` task → [`Command::RetryTask`].
 /// - A focused run with any `Failed` task → [`Command::RetryFailedTasks`].
 /// - Otherwise, if the focused run is still `Pending`, fall back to
-///   [`Command::ReinterpretRun`] (the recover-from-blocking flow that `[r]`
-///   previously served), so a single key still serves both purposes.
+///   [`Command::ReinterpretRun`] (the recover-from-blocking flow), so the
+///   reset/retry action still serves both purposes.
 /// - Otherwise emit `nothing to retry here` and issue no command.
 ///
 /// The actual state changes (task resets, run resuming) flow back through
@@ -973,8 +964,8 @@ async fn retry_focused(app: &App) -> Option<String> {
     }
 
     // Nothing retryable. Fall back to re-interpreting a still-Pending run so the
-    // single `[r]` key still serves the recover-from-blocking flow; otherwise a
-    // no-op message.
+    // reset/retry action still serves the recover-from-blocking flow; otherwise
+    // return a no-op message.
     if app
         .focused_node()
         .and_then(|node| match node {
@@ -1179,30 +1170,16 @@ fn translate_key(
         return AppEvent::Tick;
     }
 
-    // Whether any modal overlay is currently active (determines normal-mode eligibility).
-    let no_modal_active = !command_palette
-        && !browsing
-        && !editing_providers
-        && !settings
-        && !help_mode_active
-        && !viewing_doctor;
-
-    // Ctrl-C: cancel the selected run when in normal mode with a run active;
-    // otherwise quit (the universal escape hatch is preserved in modals and when
-    // no run is selected so the user can always exit the app).
+    // Ctrl-C remains the universal quit chord. Stop/cancel moved to the command
+    // palette so it cannot collide with other control-key input while a run is
+    // active.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if no_modal_active && app.active_run_id().is_some() {
-            return AppEvent::CancelRun;
-        }
         return AppEvent::Quit;
     }
 
-    // Ctrl-P: pause the selected run when in normal mode with a run active;
-    // otherwise open the command palette (consistent with prior behaviour).
+    // Ctrl-P always opens the command palette. Pause moved into the palette so
+    // this chord is stable even during an active run.
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if no_modal_active && app.active_run_id().is_some() {
-            return AppEvent::PauseRun;
-        }
         return AppEvent::OpenCommandPalette;
     }
 
@@ -1306,20 +1283,13 @@ fn translate_key(
             KeyCode::Char('?') => AppEvent::ToggleHelpMode,
             // Open the doctor health-check overlay.
             KeyCode::Char('!') => AppEvent::OpenDoctor,
-            // ── Run control with Ctrl modifiers (plan 0042, WS5) ──────────────────
-            // Ctrl+S starts the run from any normal-mode context (plan tab, task tab,
-            // sidebar). Ctrl+P/Ctrl+C are handled by the early-return guards above
-            // (context-sensitive: pause/cancel when a run is selected, otherwise
-            // open-palette/quit). Only Ctrl+S needs an arm here because the Ctrl+P
-            // and Ctrl+C early returns fire before this match expression.
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                AppEvent::StartRun
-            }
+            // Ctrl+S used to start the run; run controls now live in the command
+            // palette so the control-key surface stays reserved for app commands.
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => AppEvent::Tick,
             // ── Accordion toggles (plan 0032, extended for task tabs in plan 0042 WS6) ────
             // s/a/t/z toggle accordion sections when the main pane is focused.
             // For plan tabs: Scope/Architecture/Tasks/Status
-            // For task tabs: s/z toggle Scope/Execution
-            // Otherwise, falls back to run-control keys.
+            // For task tabs: s/z toggle Scope/Execution.
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 let task_tab_active = app
                     .tabs
@@ -1331,7 +1301,7 @@ fn translate_key(
                 } else if focused_panel == Panel::Main && task_tab_active {
                     AppEvent::ToggleTaskAccordionSection(crate::app::AccordionSection::Scope)
                 } else {
-                    AppEvent::StartRun
+                    AppEvent::Tick
                 }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1375,17 +1345,6 @@ fn translate_key(
                     AppEvent::Tick
                 }
             }
-            // ── Run control (task 31): act on the selected Run ────────────────
-            // p = Pause, c = Cancel.  These are intents; the IO layer resolves
-            // them into the async `api.execute(...)` call.
-            // Note: 's' is handled above as it's overloaded with accordion toggle.
-            KeyCode::Char('p') | KeyCode::Char('P') => AppEvent::PauseRun,
-            KeyCode::Char('c') | KeyCode::Char('C') => AppEvent::CancelRun,
-            // Context-sensitive retry (plan 0017): retry the focused failed task
-            // or the focused run's failures.  Falls back to re-interpreting a
-            // still-Pending run (the recover-from-blocking flow) when nothing is
-            // retryable.
-            KeyCode::Char('r') | KeyCode::Char('R') => AppEvent::RetryFocused,
             // Dismiss the provider-missing warning banner (non-fatal; just hides it).
             KeyCode::Char('d') | KeyCode::Char('D') => AppEvent::DismissProviderWarning,
             // ── Tab navigation (plan 0032) ────────────────────────────────────
@@ -1710,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_with_run_translates_to_cancel_run() {
+    fn ctrl_c_with_run_translates_to_quit() {
         use crate::app::App;
         use crate::placeholder::PlaceholderApi;
         use makina_core::api::{RunId, RunStatus, RunView};
@@ -1742,14 +1701,12 @@ mod tests {
                 false,
                 &app
             ),
-            AppEvent::CancelRun
+            AppEvent::Quit
         ));
     }
 
     #[test]
-    fn ctrl_s_translates_to_start_run() {
-        // Ctrl+S always dispatches StartRun in normal mode (no run check at the
-        // translation layer — the IO layer handles the "no run selected" case).
+    fn ctrl_s_no_longer_translates_to_start_run() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert!(matches!(
             translate_terminal_event(
@@ -1759,12 +1716,12 @@ mod tests {
                 false,
                 &test_app()
             ),
-            AppEvent::StartRun
+            AppEvent::Tick
         ));
     }
 
     #[test]
-    fn ctrl_p_with_run_translates_to_pause_run() {
+    fn ctrl_p_with_run_opens_palette() {
         use crate::app::App;
         use crate::placeholder::PlaceholderApi;
         use makina_core::api::{RunId, RunStatus, RunView};
@@ -1796,7 +1753,7 @@ mod tests {
                 false,
                 &app
             ),
-            AppEvent::PauseRun
+            AppEvent::OpenCommandPalette
         ));
     }
 
@@ -1880,8 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn r_key_translates_to_retry_focused() {
-        // Plan 0017 repurposes `r` from Reinterpret to context-sensitive retry.
+    fn r_key_no_longer_translates_to_retry_focused() {
         let app = test_app();
         assert!(matches!(
             translate_terminal_event(
@@ -1891,7 +1847,7 @@ mod tests {
                 false,
                 &app
             ),
-            AppEvent::RetryFocused
+            AppEvent::Tick
         ));
     }
 
@@ -2039,10 +1995,10 @@ mod tests {
         ));
     }
 
-    // ── Run-control key translation (task 31) ─────────────────────────────────
+    // ── Removed run-control key translation ──────────────────────────────────
 
     #[test]
-    fn s_key_translates_to_start_run() {
+    fn s_key_outside_accordion_is_inert() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -2052,12 +2008,12 @@ mod tests {
                 false,
                 &test_app()
             ),
-            AppEvent::StartRun
+            AppEvent::Tick
         ));
     }
 
     #[test]
-    fn p_key_translates_to_pause_run() {
+    fn p_key_no_longer_translates_to_pause_run() {
         let ev = key_press(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -2067,15 +2023,12 @@ mod tests {
                 false,
                 &test_app()
             ),
-            AppEvent::PauseRun
+            AppEvent::Tick
         ));
     }
 
     #[test]
-    fn c_key_translates_to_cancel_run() {
-        // Plain `c` (no modifier) always cancels. Ctrl-C is context-sensitive:
-        // it cancels when a run is selected (see ctrl_c_with_run_translates_to_cancel_run),
-        // and quits otherwise (see ctrl_c_translates_to_quit).
+    fn c_key_no_longer_translates_to_cancel_run() {
         let ev = key_press(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -2085,13 +2038,13 @@ mod tests {
                 false,
                 &test_app()
             ),
-            AppEvent::CancelRun
+            AppEvent::Tick
         ));
     }
 
     #[test]
     fn control_keys_do_nothing_in_browser_mode() {
-        // s/p/c are normal-mode keys; inside the browser they fall through to a
+        // s/p/c are not browser keys; inside the browser they fall through to a
         // harmless Tick (the browser keymap owns navigation).
         let app = test_app();
         for ch in ['s', 'p', 'c'] {
@@ -2299,7 +2252,7 @@ mod tests {
     /// `app.status_message`.  Uses a recording stub api to assert the exact
     /// command issued.
     #[tokio::test]
-    async fn control_keys_issue_commands_and_set_status_message() {
+    async fn control_actions_issue_commands_and_set_status_message() {
         use crate::app::{App, AppEvent};
         use async_trait::async_trait;
         use makina_core::api::{
@@ -2383,10 +2336,10 @@ mod tests {
         assert!(matches!(cmds[2], Command::CancelRun { run: RunId(7) }));
     }
 
-    /// With NO run selected, a control key surfaces a "No run selected" message
+    /// With NO run selected, a control action surfaces a "No run selected" message
     /// and issues no command.
     #[tokio::test]
-    async fn control_key_with_no_selection_reports_and_issues_nothing() {
+    async fn control_action_with_no_selection_reports_and_issues_nothing() {
         use crate::app::{App, AppEvent};
         use crate::placeholder::PlaceholderApi;
         use std::sync::Arc;
@@ -3296,7 +3249,7 @@ A description that is long enough to pass minimums.
             toml::from_str(&project_contents).expect("scaffold project config must be valid TOML");
     }
 
-    // ── Context-sensitive retry key (plan 0017) ───────────────────────────────
+    // ── Context-sensitive retry/reset action (plan 0017) ─────────────────────
 
     use async_trait::async_trait;
     use makina_core::api::{
@@ -3306,7 +3259,7 @@ A description that is long enough to pass minimums.
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
-    /// A stub api that records every `Command` it executes (for retry-key tests).
+    /// A stub api that records every `Command` it executes (for retry/reset tests).
     struct RetryRecordingApi {
         commands: StdMutex<Vec<Command>>,
     }
@@ -3379,10 +3332,10 @@ A description that is long enough to pass minimums.
         (app, api)
     }
 
-    /// Focusing a `Failed` task and pressing `[r]` issues `RetryTask` with the
+    /// Resolving retry/reset on a focused `Failed` task issues `RetryTask` with the
     /// focused run + task.
     #[tokio::test]
-    async fn retry_key_on_failed_task_issues_retry_task() {
+    async fn retry_action_on_failed_task_issues_retry_task() {
         use crate::app::{AppEvent, TreeNode};
         let (mut app, api) = retry_app(vec![task_view("a", TaskState::Failed)], RunStatus::Failed);
         // tree_cursor starts on the Run node; move down to the (Failed) task node.
@@ -3407,10 +3360,10 @@ A description that is long enough to pass minimums.
         );
     }
 
-    /// Focusing a run node with at least one `Failed` task and pressing `[r]`
+    /// Resolving retry/reset on a run node with at least one `Failed` task
     /// issues `RetryFailedTasks`.
     #[tokio::test]
-    async fn retry_key_on_run_node_issues_retry_failed() {
+    async fn retry_action_on_run_node_issues_retry_failed() {
         use crate::app::{AppEvent, TreeNode};
         let (app, api) = retry_app(
             vec![
@@ -3440,7 +3393,7 @@ A description that is long enough to pass minimums.
     /// Focusing a `Done` task (nothing retryable, run not Pending) issues no
     /// command and sets the `nothing to retry here` status message.
     #[tokio::test]
-    async fn retry_key_noop_when_nothing_failed() {
+    async fn retry_action_noop_when_nothing_failed() {
         use crate::app::{AppEvent, TreeNode};
         let (mut app, api) = retry_app(vec![task_view("a", TaskState::Done)], RunStatus::Completed);
         app.tree_move(1); // focus the Done task.
@@ -3461,7 +3414,7 @@ A description that is long enough to pass minimums.
         );
     }
 
-    /// Palette "Retry failed task" action re-dispatches through resolve_io and
+    /// Palette "Reset/retry focused task" action re-dispatches through resolve_io and
     /// issues `Command::RetryTask` / `Command::RetryFailedTasks` (plan 0041).
     #[tokio::test]
     async fn palette_retry_action_issues_retry_command() {
@@ -3481,37 +3434,37 @@ A description that is long enough to pass minimums.
         assert!(app.is_command_palette());
         let palette = app.command_palette.as_ref().expect("palette must be open");
 
-        // Find the "Retry failed task" action. The default actions are:
-        // 0: Open task list
-        // 1: Configure providers & roles
-        // 2: Settings
-        // 3: Doctor
-        // 4: Retry failed task
-        // 5: Discover project
-        // 6: Quit
+        // Find the reset/retry action by label rather than depending on display order.
         let retry_index = palette
             .actions
             .iter()
             .position(|a| match a {
-                crate::app::PaletteAction::Regular { label, .. } => *label == "Retry failed task",
+                crate::app::PaletteAction::Regular { label, .. } => {
+                    *label == "Reset/retry focused task"
+                }
                 _ => false,
             })
-            .expect("Retry failed task action must exist");
+            .expect("Reset/retry focused task action must exist");
 
         // Set selected to point to the Retry action.
         app.command_palette.as_mut().unwrap().selected = retry_index;
 
         // Resolve CommandPaletteExecute; it should re-dispatch RetryFocused over
-        // background_tx and return Tick.
-        let (ev1, status1) = resolve_io_for_test(&app, AppEvent::CommandPaletteExecute).await;
+        // background_tx and close the palette for this pass.
+        let (tx, mut rx) = background_events();
+        let (ev1, status1) = resolve_io(&app, AppEvent::CommandPaletteExecute, &tx).await;
         assert!(
-            matches!(ev1, AppEvent::Tick),
-            "CommandPaletteExecute with an IO-backed event must return Tick for re-dispatch; got {:?}",
+            matches!(ev1, AppEvent::CloseCommandPalette),
+            "CommandPaletteExecute must close the palette after re-dispatch; got {:?}",
             ev1
         );
         assert!(
             status1.is_none(),
             "no immediate status message; the re-dispatched event will produce one"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::RetryFocused)),
+            "palette action must enqueue RetryFocused for a resolve_io pass"
         );
 
         // Manually simulate the re-dispatch: resolve RetryFocused through resolve_io,
@@ -3537,9 +3490,9 @@ A description that is long enough to pass minimums.
         );
     }
 
-    /// The status bar advertises the `[r]` retry key.
+    /// The status bar advertises the command palette, not removed run-control keys.
     #[test]
-    fn status_bar_advertises_retry_key() {
+    fn status_bar_advertises_palette_for_run_controls() {
         use crate::app::App;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -3569,8 +3522,12 @@ A description that is long enough to pass minimums.
         let buffer = terminal.backend().buffer().clone();
         let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(
-            rendered.contains("[r]"),
-            "the status bar must advertise the [r] retry key; rendered: {rendered}"
+            rendered.contains("[^P] cmds/run"),
+            "the status bar must advertise palette-run controls; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("[r] retry"),
+            "the status bar must not advertise the removed [r] retry key; rendered: {rendered}"
         );
     }
 
@@ -3623,19 +3580,28 @@ A description that is long enough to pass minimums.
         assert!(app.is_command_palette());
         assert!(app.command_palette.is_some());
 
-        // The default palette has multiple actions. Manually set selected to point
-        // to the "Settings" action (which is at index 2 in default_actions).
+        // Select Settings by label rather than depending on display order.
         if let Some(ref mut palette) = app.command_palette {
-            palette.selected = 2; // Settings
+            palette.selected = palette
+                .actions
+                .iter()
+                .position(|action| action.label() == "Settings")
+                .expect("Settings action must exist");
         }
 
-        // Resolve CommandPaletteExecute; it should extract the Settings event.
-        let (resolved_event, _) = resolve_io_for_test(&app, AppEvent::CommandPaletteExecute).await;
+        // Resolve CommandPaletteExecute; it should enqueue Settings for a fresh
+        // resolve_io pass and close the palette for this pass.
+        let (tx, mut rx) = background_events();
+        let (resolved_event, status) = resolve_io(&app, AppEvent::CommandPaletteExecute, &tx).await;
 
-        // The resolved event should be OpenSettings.
+        assert!(status.is_none(), "palette dispatch should not emit status");
         assert!(
-            matches!(resolved_event, AppEvent::OpenSettings),
-            "palette execute with Settings selected must resolve to OpenSettings"
+            matches!(resolved_event, AppEvent::CloseCommandPalette),
+            "palette execute with Settings selected must close the palette"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::OpenSettings)),
+            "palette execute with Settings selected must enqueue OpenSettings"
         );
     }
 
@@ -4137,7 +4103,7 @@ wall_clock_secs = 1200
     }
 
     #[test]
-    fn s_key_in_main_without_plan_tab_is_start_run() {
+    fn s_key_in_main_without_plan_tab_is_tick() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -4147,12 +4113,12 @@ wall_clock_secs = 1200
                 false,
                 &test_app()
             ),
-            AppEvent::StartRun
+            AppEvent::Tick
         ));
     }
 
     #[test]
-    fn s_key_in_sidebar_with_plan_tab_is_start_run() {
+    fn s_key_in_sidebar_with_plan_tab_is_tick() {
         let ev = key_press(KeyCode::Char('s'), KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -4162,7 +4128,7 @@ wall_clock_secs = 1200
                 true,
                 &test_app()
             ),
-            AppEvent::StartRun
+            AppEvent::Tick
         ));
     }
 

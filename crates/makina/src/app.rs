@@ -455,17 +455,31 @@ pub struct CommandPalette {
 }
 
 impl CommandPalette {
-    /// The default action set. Most entries carry an existing intent
-    /// (`OpenBrowser`, `OpenDoctor`, `OpenProviderEditor`, `OpenSettings`,
-    /// `Quit`, `RetryFocused`, `DiscoverProject`). The palette dispatches IO-backed
-    /// events, which are re-dispatched through `resolve_io` (so "Retry failed task"
-    /// reaches `retry_focused`, plan 0017; "Discover project" reaches `discover_project`,
-    /// plan 0025).
+    /// The default action set. Regular actions carry existing intents and are
+    /// re-dispatched through `resolve_io` so IO-backed commands such as run
+    /// controls, retry/reset, project discovery, and opening a task list reach
+    /// their async handlers.
     pub fn default_actions() -> Vec<PaletteAction> {
         vec![
             PaletteAction::Regular {
                 label: "Open task list",
                 event: AppEvent::OpenBrowser,
+            },
+            PaletteAction::Regular {
+                label: "Start run",
+                event: AppEvent::StartRun,
+            },
+            PaletteAction::Regular {
+                label: "Pause run",
+                event: AppEvent::PauseRun,
+            },
+            PaletteAction::Regular {
+                label: "Stop run",
+                event: AppEvent::CancelRun,
+            },
+            PaletteAction::Regular {
+                label: "Reset/retry focused task",
+                event: AppEvent::RetryFocused,
             },
             PaletteAction::Regular {
                 label: "Configure providers & roles",
@@ -478,10 +492,6 @@ impl CommandPalette {
             PaletteAction::Regular {
                 label: "Doctor",
                 event: AppEvent::OpenDoctor,
-            },
-            PaletteAction::Regular {
-                label: "Retry failed task",
-                event: AppEvent::RetryFocused,
             },
             PaletteAction::Regular {
                 label: "Discover project",
@@ -793,18 +803,17 @@ pub enum AppEvent {
     // `app.selected_run()`'s `RunId` and feeds the result back as a
     // [`AppEvent::StatusMessage`].  `update` itself does nothing for these
     // variants (it cannot issue the async command), keeping `update` pure.
-    /// User pressed `s` — start (or resume) the selected Run.
+    /// Start (or resume) the selected Run.
     StartRun,
-    /// User pressed `p` — pause the selected Run.
+    /// Pause the selected Run.
     PauseRun,
-    /// User pressed `c` — cancel the selected Run.
+    /// Cancel the selected Run.
     CancelRun,
-    /// User pressed `r` / `R` — re-interpret the selected Run (bypass artifact,
-    /// re-ingest source to recompute report and graph).
+    /// Re-interpret the selected Run (bypass artifact, re-ingest source to
+    /// recompute report and graph).
     Reinterpret,
 
-    /// User pressed `r` / `R` — context-sensitive retry on the focused tree node
-    /// (plan 0017).
+    /// Context-sensitive retry/reset on the focused tree node (plan 0017).
     ///
     /// Resolved by the IO layer via [`App::focused_node`]: a focused `Failed`
     /// task dispatches [`makina_core::api::Command::RetryTask`]; a focused run
@@ -1571,9 +1580,8 @@ impl App {
     /// click or Next/Prev) while the cursor sits on a plan node leaves
     /// `selected_run = None`, so the task tab renders a blank pane.
     ///
-    /// For plan tabs, sync to the run corresponding to that plan (plan 0042, WS5)
-    /// so `Ctrl+S` can start/pause/cancel from a plan tab without manually
-    /// selecting the run in the sidebar.
+    /// For plan tabs, sync to the run corresponding to that plan so palette run
+    /// controls can target it without manually selecting the run in the sidebar.
     fn sync_selected_run_to_active_tab(&mut self) {
         let Some(active) = self.tabs.active_tab else {
             return;
@@ -2001,8 +2009,8 @@ impl App {
     /// tab's slug (a plan or plan-task preview tab), falling back to the focused
     /// sidebar node (a plan or plan-task node).
     ///
-    /// This lets the run-control keys act on a discovered plan that has **no open
-    /// Run yet**: `Start` resolves the plan here and opens + runs its `TASKS.md`
+    /// This lets run-control actions act on a discovered plan that has **no open
+    /// Run yet**: `Start run` resolves the plan here and opens + runs its `TASKS.md`
     /// (see `crate::event`), instead of forcing the user through the `[o]` file
     /// browser. Returns `None` when the context is a run/run-task or nothing.
     pub fn context_plan(&self) -> Option<&makina_core::orchestrator::PlanEntry> {
@@ -2029,12 +2037,12 @@ impl App {
         }
     }
 
-    /// The [`RunId`] a run-control key (start/pause/cancel/resume) should act on:
+    /// The [`RunId`] a run-control action should act on:
     /// the explicitly selected run, or — when none is selected — the run that
     /// matches the [`context_plan`](Self::context_plan), if one is already open.
     ///
     /// Returning the context plan's run here means that once a plan has been
-    /// started, Pause/Cancel/resume keep working from the plan tab even if the
+    /// started, pause/stop/resume keep working from the plan tab even if the
     /// sidebar cursor has moved off the run. Returns `None` when no run exists
     /// Return the most recent run (by `run_uid` ULID, i.e. newest) matching the
     /// given plan slug, if any. Used to deduplicate multiple historical runs for
@@ -4719,7 +4727,7 @@ mod tests {
     }
 
     /// `active_run_id` falls back to the run matching the active plan tab when
-    /// nothing is explicitly selected — so run-control keys (pause/cancel/resume)
+    /// nothing is explicitly selected — so run-control actions (pause/stop/resume)
     /// keep targeting a plan's run after it has been started, even if the sidebar
     /// cursor has moved off it.
     #[test]
@@ -7392,9 +7400,24 @@ mod tests {
         let mut app = make_app();
         app.update(AppEvent::OpenCommandPalette);
 
-        // Palette has all 8 default actions.
+        // Palette has all default actions, including run controls.
         let palette = app.command_palette.as_ref().unwrap();
-        assert_eq!(palette.filtered().len(), 8, "full list must have 8 actions");
+        assert_eq!(
+            palette.filtered().len(),
+            11,
+            "full list must have 11 actions"
+        );
+        for label in [
+            "Start run",
+            "Pause run",
+            "Stop run",
+            "Reset/retry focused task",
+        ] {
+            assert!(
+                palette.actions.iter().any(|action| action.label() == label),
+                "default palette actions must include {label:?}"
+            );
+        }
 
         // Type "doc" (case-insensitive).
         app.update(AppEvent::CommandPaletteInput('d'));
@@ -7431,7 +7454,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            8,
+            11,
             "full list restored after filter cleared"
         );
     }
@@ -7490,24 +7513,36 @@ mod tests {
         let mut app = make_app();
         app.update(AppEvent::OpenCommandPalette);
 
-        // Navigate to the "Switch theme" action (should be at index 7, the last one).
+        // Navigate to the "Switch theme" action (the last one).
         let palette = app.command_palette.as_ref().unwrap();
-        assert_eq!(palette.actions.len(), 8, "should have 8 actions");
+        let switch_theme_index = palette
+            .actions
+            .iter()
+            .position(|action| action.label() == "Switch theme")
+            .expect("Switch theme action must exist");
+        assert_eq!(
+            switch_theme_index,
+            palette.actions.len() - 1,
+            "Switch theme should stay last"
+        );
         assert!(
             matches!(
-                palette.actions[7],
+                palette.actions[switch_theme_index],
                 crate::app::PaletteAction::NestedThemeSelector { .. }
             ),
             "last action should be NestedThemeSelector"
         );
 
-        // Select it by moving down 7 times from index 0.
-        for _ in 0..7 {
+        // Select it by moving down from index 0.
+        for _ in 0..switch_theme_index {
             app.update(AppEvent::CommandPaletteDown);
         }
 
         let palette = app.command_palette.as_ref().unwrap();
-        assert_eq!(palette.selected, 7, "should be at index 7");
+        assert_eq!(
+            palette.selected, switch_theme_index,
+            "should be at Switch theme"
+        );
         assert!(
             palette.theme_selector.is_none(),
             "theme_selector should still be None"
@@ -7552,7 +7587,15 @@ mod tests {
         app.update(AppEvent::OpenCommandPalette);
 
         // Navigate to and enter the theme selector.
-        for _ in 0..7 {
+        let switch_theme_index = app
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .position(|action| action.label() == "Switch theme")
+            .expect("Switch theme action must exist");
+        for _ in 0..switch_theme_index {
             app.update(AppEvent::CommandPaletteDown);
         }
         app.update(AppEvent::CommandPaletteExecute);
@@ -7595,7 +7638,15 @@ mod tests {
         app.update(AppEvent::OpenCommandPalette);
 
         // Enter theme selector.
-        for _ in 0..7 {
+        let switch_theme_index = app
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .position(|action| action.label() == "Switch theme")
+            .expect("Switch theme action must exist");
+        for _ in 0..switch_theme_index {
             app.update(AppEvent::CommandPaletteDown);
         }
         app.update(AppEvent::CommandPaletteExecute);
@@ -7645,7 +7696,15 @@ mod tests {
         app.update(AppEvent::OpenCommandPalette);
 
         // Enter theme selector.
-        for _ in 0..7 {
+        let switch_theme_index = app
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .position(|action| action.label() == "Switch theme")
+            .expect("Switch theme action must exist");
+        for _ in 0..switch_theme_index {
             app.update(AppEvent::CommandPaletteDown);
         }
         app.update(AppEvent::CommandPaletteExecute);
@@ -7659,9 +7718,8 @@ mod tests {
         }
 
         // Type 'd' to filter — only "Ayu Dark" matches (1 result).
-        // Actions matching 'd' include "Doctor" and "Discover project" (2 results),
-        // so if filtering incorrectly used palette.filtered().len() it would clamp
-        // selected to min(2, 2-1)=1 instead of the correct min(2, 1-1)=0.
+        // Several action labels also match 'd', so if filtering incorrectly used
+        // palette.filtered().len() it would not clamp selected to the only theme.
         app.update(AppEvent::CommandPaletteInput('d'));
 
         {
@@ -10589,9 +10647,8 @@ mod tests {
         );
     }
 
-    /// Plan tabs should also sync selected_run to the run for that plan
-    /// (plan 0042, WS5), so Ctrl+S can start/pause/cancel from a plan tab
-    /// without manually selecting the run in the sidebar.
+    /// Plan tabs should also sync selected_run to the run for that plan so
+    /// palette run controls work without manually selecting the run in the sidebar.
     #[test]
     fn switching_to_plan_tab_syncs_selected_run() {
         use makina_core::api::{RunId, RunStatus, RunView};
