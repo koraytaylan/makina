@@ -55,7 +55,7 @@ use crate::app::{
     AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
     ScrollablePanel, TabContent, ToolDiffKey, TreeNode,
 };
-use makina_core::api::{FailureKind, RunView, TaskId};
+use makina_core::api::{AgentRole, FailureKind, RunId, RunView, TaskId};
 
 /// Render markdown with caching by (text_hash, width, style/theme context).
 /// Subsequent calls with identical inputs return the cached result without re-parsing.
@@ -89,6 +89,87 @@ fn markdown_context_hash(base: Style, theme: &crate::theme::Theme) -> u64 {
 
 fn indent_line(mut line: Line<'static>, indent: &'static str) -> Line<'static> {
     line.spans.insert(0, Span::styled(indent, line.style));
+    line
+}
+
+const EXCHANGE_ROLE_RAIL_WIDTH: u16 = 2;
+
+#[derive(Clone, Copy)]
+enum ExchangeEntryLabelMode {
+    Full,
+    Compact,
+}
+
+#[derive(Clone, Copy)]
+enum ExchangeEntryLabelKind {
+    Prompt,
+    Response,
+    Thought,
+}
+
+#[derive(Default)]
+struct ExchangeRoleLabelSeen {
+    prompt: bool,
+    response: bool,
+    thought: bool,
+}
+
+impl ExchangeRoleLabelSeen {
+    fn contains(&self, kind: ExchangeEntryLabelKind) -> bool {
+        match kind {
+            ExchangeEntryLabelKind::Prompt => self.prompt,
+            ExchangeEntryLabelKind::Response => self.response,
+            ExchangeEntryLabelKind::Thought => self.thought,
+        }
+    }
+
+    fn insert(&mut self, kind: ExchangeEntryLabelKind) {
+        match kind {
+            ExchangeEntryLabelKind::Prompt => self.prompt = true,
+            ExchangeEntryLabelKind::Response => self.response = true,
+            ExchangeEntryLabelKind::Thought => self.thought = true,
+        }
+    }
+}
+
+struct ExchangeGroupedLines {
+    lines: Vec<Line<'static>>,
+    tool_diff_line_keys: Vec<(usize, ToolDiffKey)>,
+}
+
+fn exchange_role_name(role: &AgentRole) -> &'static str {
+    match role {
+        AgentRole::Developer => "Developer",
+        AgentRole::Reviewer => "Reviewer",
+    }
+}
+
+fn exchange_role_color(app: &App, role: &AgentRole) -> Color {
+    match role {
+        AgentRole::Developer => app.active_theme.get(crate::theme::ThemeRole::Success),
+        AgentRole::Reviewer => app.active_theme.get(crate::theme::ThemeRole::Warning),
+    }
+}
+
+fn exchange_entry_label_kind(entry: &ExchangeEntry) -> Option<ExchangeEntryLabelKind> {
+    match &entry.content {
+        crate::app::ExchangeContent::Prompt { .. } => Some(ExchangeEntryLabelKind::Prompt),
+        crate::app::ExchangeContent::Response { .. } => Some(ExchangeEntryLabelKind::Response),
+        crate::app::ExchangeContent::Thought { .. } => Some(ExchangeEntryLabelKind::Thought),
+        crate::app::ExchangeContent::Tool { .. } => None,
+    }
+}
+
+fn exchange_role_rail_line(mut line: Line<'static>, app: &App, role: &AgentRole) -> Line<'static> {
+    line.spans.insert(
+        0,
+        Span::styled(
+            "│ ",
+            Style::default()
+                .fg(exchange_role_color(app, role))
+                .add_modifier(Modifier::BOLD),
+        ),
+    );
     line
 }
 
@@ -2089,9 +2170,9 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
             }
 
             let content_width = inner.width;
-            for entry in &log.entries {
-                lines.extend(exchange_entry_lines(entry, app, content_width));
-            }
+            lines.extend(
+                exchange_entries_grouped_lines(&log.entries, app, content_width, None).lines,
+            );
 
             // Scroll: `scroll_max` pins the bottom-most visible offset (as the
             // old auto-scroll did); `effective_offset` honours the user's manual
@@ -2145,18 +2226,18 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 /// This is a dedicated renderer (instead of routing through
 /// [`render_accordion_section`]) because the Execution body is not a plain
 /// string: it is a sequence of styled [`ExchangeEntry`] turns (prompts,
-/// thoughts, tool calls, responses) produced by [`exchange_entry_lines`].
+/// thoughts, tool calls, responses) produced by [`exchange_entries_grouped_lines`].
 /// `render_accordion_section` only takes a `&str`, so it would flatten the
 /// rich styling into raw text.  Here we mirror its header logic and then
 /// append:
 ///
 /// 1. The metrics/activity/failure summary (so the at-a-glance status the
 ///    Execution section already showed stays at the top).
-/// 2. Every exchange entry for `(run.id, task.id)` in arrival order —
-///    prompts (`▶ Developer prompt`), streaming responses (`◀ … response`),
-///    thought bursts (`💭 … thought`), and tool invocations
-///    (`⚙ <title> [<status>]`) — each rendered by [`exchange_entry_lines`]
-///    with its own styling, indented 2 spaces so it nests under the header.
+/// 2. Every exchange entry for `(run.id, task.id)` in arrival order, grouped by
+///    contiguous role with a Developer/Reviewer-coloured rail. Repeated prompt /
+///    response / thought labels in the same role group use compact labels so the
+///    role name does not visually stutter. Lines are indented 2 spaces so they
+///    nest under the header.
 ///
 /// When there is no exchange yet (the run hasn't started, or the task hasn't
 /// been picked up), the empty-state hint is shown instead.
@@ -2236,38 +2317,19 @@ fn render_task_execution_section(
         // minus the 2-space indent so wrapping matches the indented body.
         let body_width = content_width.saturating_sub(2);
         let log = log_opt.expect("checked above");
-        for entry in &log.entries {
-            let maybe_tool_diff_key = match &entry.content {
-                crate::app::ExchangeContent::Tool {
-                    id,
-                    title,
-                    kind,
-                    content,
-                    ..
-                } if tool_content_is_expandable_diff(title, kind, content) => Some(ToolDiffKey {
-                    run: run.id,
-                    task: task.id.clone(),
-                    tool_id: id.clone(),
-                }),
-                _ => None,
-            };
-            let expanded_tool_diff = maybe_tool_diff_key
-                .as_ref()
-                .is_some_and(|key| app.expanded_tool_diffs.contains(key));
-            for (entry_line_idx, entry_line) in
-                exchange_entry_lines_with_tool_diff(entry, app, body_width, expanded_tool_diff)
-                    .into_iter()
-                    .enumerate()
-            {
-                if entry_line_idx == 0
-                    && let Some(key) = maybe_tool_diff_key.as_ref()
-                {
-                    tool_diff_line_keys.push((result.len(), key.clone()));
-                }
-                // Indent each rendered line by 2 spaces so the body nests
-                // under the "Execution" header, matching the SCOPE section.
-                result.push(indent_line(entry_line, "  "));
-            }
+        let grouped =
+            exchange_entries_grouped_lines(&log.entries, app, body_width, Some((run.id, &task.id)));
+        let grouped_start_line = result.len();
+        tool_diff_line_keys.extend(
+            grouped
+                .tool_diff_line_keys
+                .into_iter()
+                .map(|(line, key)| (grouped_start_line + line, key)),
+        );
+        for entry_line in grouped.lines {
+            // Indent each rendered line by 2 spaces so the body nests under the
+            // "Execution" header, matching the SCOPE section.
+            result.push(indent_line(entry_line, "  "));
         }
     } else {
         let hint = if app.exchange_logs.contains_key(&(run.id, task.id.clone())) {
@@ -3565,24 +3627,106 @@ fn exchange_entry_lines_with_tool_diff(
     width: u16,
     expanded_tool_diff: bool,
 ) -> Vec<Line<'static>> {
+    exchange_entry_lines_with_options(
+        entry,
+        app,
+        width,
+        expanded_tool_diff,
+        ExchangeEntryLabelMode::Full,
+    )
+}
+
+fn exchange_entries_grouped_lines(
+    entries: &[ExchangeEntry],
+    app: &App,
+    width: u16,
+    tool_diff_context: Option<(RunId, &TaskId)>,
+) -> ExchangeGroupedLines {
+    let entry_width = width.saturating_sub(EXCHANGE_ROLE_RAIL_WIDTH);
+    let mut lines = Vec::new();
+    let mut tool_diff_line_keys = Vec::new();
+    let mut previous_role: Option<&AgentRole> = None;
+    let mut seen_role_labels = ExchangeRoleLabelSeen::default();
+
+    for entry in entries {
+        let starts_role_group = previous_role != Some(&entry.role);
+        if starts_role_group {
+            seen_role_labels = ExchangeRoleLabelSeen::default();
+        }
+        let label_kind = exchange_entry_label_kind(entry);
+        let label_mode = match label_kind {
+            Some(kind) if !seen_role_labels.contains(kind) => ExchangeEntryLabelMode::Full,
+            _ => ExchangeEntryLabelMode::Compact,
+        };
+        let maybe_tool_diff_key = tool_diff_context.and_then(|(run, task)| match &entry.content {
+            crate::app::ExchangeContent::Tool {
+                id,
+                title,
+                kind,
+                content,
+                ..
+            } if tool_content_is_expandable_diff(title, kind, content) => Some(ToolDiffKey {
+                run,
+                task: task.clone(),
+                tool_id: id.clone(),
+            }),
+            _ => None,
+        });
+        let expanded_tool_diff = maybe_tool_diff_key
+            .as_ref()
+            .is_some_and(|key| app.expanded_tool_diffs.contains(key));
+
+        for (entry_line_idx, entry_line) in exchange_entry_lines_with_options(
+            entry,
+            app,
+            entry_width,
+            expanded_tool_diff,
+            label_mode,
+        )
+        .into_iter()
+        .enumerate()
+        {
+            if entry_line_idx == 0
+                && let Some(key) = maybe_tool_diff_key.as_ref()
+            {
+                tool_diff_line_keys.push((lines.len(), key.clone()));
+            }
+            lines.push(exchange_role_rail_line(entry_line, app, &entry.role));
+        }
+
+        previous_role = Some(&entry.role);
+        if let Some(kind) = label_kind {
+            seen_role_labels.insert(kind);
+        }
+    }
+
+    ExchangeGroupedLines {
+        lines,
+        tool_diff_line_keys,
+    }
+}
+
+fn exchange_entry_lines_with_options(
+    entry: &ExchangeEntry,
+    app: &App,
+    width: u16,
+    expanded_tool_diff: bool,
+    label_mode: ExchangeEntryLabelMode,
+) -> Vec<Line<'static>> {
     use crate::app::ExchangeContent;
-    use makina_core::api::AgentRole;
 
     let mut lines = Vec::new();
 
     match &entry.content {
         ExchangeContent::Prompt { text } => {
             // Role label + prompt Markdown on separate lines.
-            let (label, label_color) = match entry.role {
-                AgentRole::Developer => (
-                    "▶ Developer prompt",
-                    app.active_theme.get(crate::theme::ThemeRole::Success),
-                ),
-                AgentRole::Reviewer => (
-                    "▶ Reviewer prompt",
-                    app.active_theme.get(crate::theme::ThemeRole::Warning),
-                ),
+            let label = match label_mode {
+                ExchangeEntryLabelMode::Full => {
+                    format!("▶ {} prompt", exchange_role_name(&entry.role))
+                }
+                ExchangeEntryLabelMode::Compact => "▶ prompt".to_string(),
             };
+            let label_color = exchange_role_color(app, &entry.role);
             lines.push(Line::from(vec![Span::styled(
                 label,
                 Style::default()
@@ -3602,16 +3746,13 @@ fn exchange_entry_lines_with_tool_diff(
         }
         ExchangeContent::Response { text, complete } => {
             // Response entry.
-            let (resp_label, resp_color) = match entry.role {
-                AgentRole::Developer => (
-                    "◀ Developer response",
-                    app.active_theme.get(crate::theme::ThemeRole::Accent),
-                ),
-                AgentRole::Reviewer => (
-                    "◀ Reviewer response",
-                    app.active_theme.get(crate::theme::ThemeRole::Accent),
-                ),
+            let resp_label = match label_mode {
+                ExchangeEntryLabelMode::Full => {
+                    format!("◀ {} response", exchange_role_name(&entry.role))
+                }
+                ExchangeEntryLabelMode::Compact => "◀ response".to_string(),
             };
+            let resp_color = app.active_theme.get(crate::theme::ThemeRole::Accent);
             lines.push(Line::from(vec![Span::styled(
                 resp_label,
                 Style::default().fg(resp_color).add_modifier(Modifier::BOLD),
@@ -3649,18 +3790,15 @@ fn exchange_entry_lines_with_tool_diff(
         // rendered so the user can see reasoning happened. Compact mode includes
         // a short inline preview; verbose mode renders the full text below.
         ExchangeContent::Thought { text } => {
-            let (label, label_color) = match entry.role {
-                AgentRole::Developer => (
-                    "💭 Developer thought",
-                    app.active_theme.get(crate::theme::ThemeRole::Success),
-                ),
-                AgentRole::Reviewer => (
-                    "💭 Reviewer thought",
-                    app.active_theme.get(crate::theme::ThemeRole::Warning),
-                ),
+            let label = match label_mode {
+                ExchangeEntryLabelMode::Full => {
+                    format!("💭 {} thought", exchange_role_name(&entry.role))
+                }
+                ExchangeEntryLabelMode::Compact => "💭 thought".to_string(),
             };
+            let label_color = exchange_role_color(app, &entry.role);
             let mut spans = vec![Span::styled(
-                label.to_string(),
+                label,
                 Style::default()
                     .fg(label_color)
                     .add_modifier(Modifier::BOLD),
@@ -9716,6 +9854,71 @@ mod tests {
     }
 
     #[test]
+    fn grouped_exchange_rows_compact_repeated_role_thought_labels() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let entries = vec![
+            ExchangeEntry {
+                role: AgentRole::Reviewer,
+                content: ExchangeContent::Thought {
+                    text: "first reviewer pass".to_string(),
+                },
+            },
+            ExchangeEntry {
+                role: AgentRole::Reviewer,
+                content: ExchangeContent::Tool {
+                    id: "read-1".to_string(),
+                    title: "Read src/lib.rs".to_string(),
+                    kind: Some("read".to_string()),
+                    status: "completed".to_string(),
+                    content: "pub fn lib() {}".to_string(),
+                },
+            },
+            ExchangeEntry {
+                role: AgentRole::Reviewer,
+                content: ExchangeContent::Thought {
+                    text: "second reviewer pass".to_string(),
+                },
+            },
+        ];
+
+        let lines = exchange_entries_grouped_lines(&entries, &app, 120, None).lines;
+        let flattened = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            flattened.matches("Reviewer thought").count(),
+            1,
+            "only the first repeated Reviewer thought in a role block should carry the role label; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("💭 thought: second reviewer pass"),
+            "later Reviewer thoughts should keep the kind label and preview without repeating the role; got:\n{flattened}"
+        );
+        let reviewer_color = app.active_theme.get(crate::theme::ThemeRole::Warning);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.spans.first().is_some_and(|span| {
+                    span.content.as_ref() == "│ " && span.style.fg == Some(reviewer_color)
+                })),
+            "every grouped Reviewer line should keep the colored role rail"
+        );
+    }
+
+    #[test]
     fn expandable_tool_diff_shows_full_body_when_open() {
         use crate::app::{ExchangeContent, ExchangeEntry};
         use makina_core::api::AgentRole;
@@ -11593,7 +11796,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_task_tab_uses_same_markdown_detail_before_and_after_start() {
+    fn plan_task_tab_uses_same_markdown_detail_before_and_after_start_repeat() {
         use crate::app::{AppEvent, TabContent};
         use makina_core::api::{AgentRole, Event, ExchangeEvent};
         use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
