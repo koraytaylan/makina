@@ -616,6 +616,30 @@ mod tests {
     }
 
     #[test]
+    fn renders_fenced_code_block_with_language_metadata_highlighting() {
+        let text = "```rust,no_run\nlet x = 1;\n```";
+        let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "Expected exactly 1 line for single-line code block, got {}",
+            lines.len()
+        );
+
+        let code_line = &lines[0];
+        let highlighted_spans = code_line
+            .spans
+            .iter()
+            .filter(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(_, _, _))))
+            .count();
+        assert!(
+            highlighted_spans > 1,
+            "Rust fence metadata should still produce syntax-highlighted spans"
+        );
+    }
+
+    #[test]
     fn renders_fenced_code_block_unknown_language_monochrome() {
         let text = "```unknown_lang\nsome code here\n```";
         let lines = super::render_markdown(text, Style::default(), 80, &theme::ayu_dark());

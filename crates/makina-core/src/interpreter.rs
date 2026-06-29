@@ -485,13 +485,7 @@ pub(crate) fn parse_structured_text(
         {
             desc_lines.pop();
         }
-        let description = desc_lines
-            .iter()
-            .map(|l| l.trim())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_string();
+        let description = desc_lines.join("\n").trim().to_string();
 
         if description.is_empty() {
             return Err(InterpretError::ParseError {
@@ -1259,6 +1253,40 @@ Does foo.
         assert!(
             task.done_when.contains("accessibility"),
             "done_when should contain continued text"
+        );
+    }
+
+    #[test]
+    fn task_description_preserves_markdown_blocks() {
+        let source = r#"# T
+
+Preamble.
+
+---
+
+## 0001 — X
+
+### foo — Foo task
+Intro with **bold**.
+
+1. Add the helper:
+   ```rust,no_run
+   fn main() {
+       println!("hi");
+   }
+   ```
+
+Then wire it into the caller.
+- **Depends on:** —
+- **Done when:** the helper code block is still visible in task details.
+"#;
+
+        let graph = parse_structured_text("t", source).unwrap();
+        let task = graph.tasks.iter().find(|t| t.id.0 == "foo").unwrap();
+
+        assert_eq!(
+            task.description,
+            "Intro with **bold**.\n\n1. Add the helper:\n   ```rust,no_run\n   fn main() {\n       println!(\"hi\");\n   }\n   ```\n\nThen wire it into the caller."
         );
     }
 

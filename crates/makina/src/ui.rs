@@ -6231,6 +6231,23 @@ mod tests {
         })
     }
 
+    fn row_with_text_has_multiple_fg(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+        (0..buf.area.height).any(|row| {
+            let row_text = (0..buf.area.width)
+                .map(|col| buf[(col, row)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>();
+            let Some(start) = row_text.find(needle) else {
+                return false;
+            };
+            let end = start + needle.chars().count();
+            let colors = (start as u16..end as u16)
+                .map(|col| buf[(col, row)].fg)
+                .filter(|color| *color != ratatui::style::Color::Reset)
+                .collect::<std::collections::HashSet<_>>();
+            colors.len() > 1
+        })
+    }
+
     fn col_has_scrollbar(buf: &ratatui::buffer::Buffer, x: u16, y0: u16, y1: u16) -> bool {
         (y0..y1).any(|y| {
             let s = buf[(x, y)].symbol();
@@ -11340,7 +11357,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 failure_reason: None,
-                entry_text: "Scope has **bold** text.\n\n- Scope item one\n- Scope item two\n\n```rust\nlet scope_code = true;\n```"
+                entry_text: "Scope has **bold** text.\n\n- Scope item one\n- Scope item two\n\n1. Scope example:\n   ```rust,no_run\n   let scope_code = true;\n   ```"
                     .to_string(),
             }],
             report: makina_core::api::IngestionReport::default(),
@@ -11417,6 +11434,159 @@ mod tests {
         ] {
             assert!(
                 row_with_text_has_bg(buf, needle, code_bg),
+                "code row {needle:?} must carry the CodeBlockBg background"
+            );
+        }
+        assert!(
+            row_with_text_has_multiple_fg(buf, "let scope_code = true;"),
+            "Scope code row must be syntax-highlighted even when the fence is indented and carries metadata"
+        );
+    }
+
+    #[test]
+    fn plan_task_tab_uses_same_markdown_detail_before_and_after_start() {
+        use crate::app::{AppEvent, TabContent};
+        use makina_core::api::{AgentRole, Event, ExchangeEvent};
+        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
+
+        let mut terminal = make_terminal(150, 80);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.verbose_mode = true;
+        app.discovered_plans = vec![PlanEntry {
+            dir: PathBuf::from("docs/plans/0004-markdown-plan"),
+            slug: "0004-markdown-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![PlanTaskPreview {
+                id: "render-markdown".to_string(),
+                title: "Render Markdown".to_string(),
+                gated: false,
+                depends_on: vec!["setup-task".to_string()],
+                body: "Scope has **bold** preview.\n\n```rust\nlet preview_code = true;\n```\n\n- **Depends on:** setup-task\n- **Done when:** preview passes."
+                    .to_string(),
+            }],
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        }];
+        app.tabs.open_tab(TabContent::PlanTask {
+            plan_slug: "0004-markdown-plan".to_string(),
+            task_id: "render-markdown".to_string(),
+        });
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let preview_screen = screen_of(&terminal);
+        assert!(
+            preview_screen.contains("Scope has bold preview."),
+            "preview Scope must render inline markdown; screen:\n{preview_screen}"
+        );
+        assert!(
+            preview_screen.contains("let preview_code = true;"),
+            "preview Scope must render fenced-code contents; screen:\n{preview_screen}"
+        );
+        assert!(
+            preview_screen.contains("Done when") && preview_screen.contains("preview passes."),
+            "preview Scope must render the same Done when section as a live task; screen:\n{preview_screen}"
+        );
+        assert!(
+            preview_screen.contains("Depends on: setup-task"),
+            "preview dependencies must stay in metadata; screen:\n{preview_screen}"
+        );
+        assert!(
+            !preview_screen.contains("**bold**")
+                && !preview_screen.contains("```")
+                && !preview_screen.contains("**Depends on:**")
+                && !preview_screen.contains("**Done when:**"),
+            "preview Scope must not leak raw task-list markdown fields; screen:\n{preview_screen}"
+        );
+        assert!(
+            row_with_text_has_bg(
+                terminal.backend().buffer(),
+                "let preview_code = true;",
+                app.active_theme.get(crate::theme::ThemeRole::CodeBlockBg),
+            ),
+            "preview code row must carry the CodeBlockBg background"
+        );
+
+        app.runs.push(RunView {
+            id: RunId(7),
+            run_uid: "run-live".to_string(),
+            task_list_path: PathBuf::from("docs/plans/0004-markdown-plan/TASKS.md"),
+            status: RunStatus::Running,
+            project: "test".to_string(),
+            tasks: vec![TaskView {
+                id: TaskId::new("render-markdown"),
+                title: "Render Markdown".to_string(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![TaskId::new("setup-task")],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "Scope has **bold** preview.\n\n```rust\nlet preview_code = true;\n```\n\n### Done when\n\npreview passes."
+                    .to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        });
+        app.selected_run = None;
+        app.selected_task = None;
+
+        let mk = |event: ExchangeEvent| {
+            AppEvent::ApiEvent(Event::AgentExchange {
+                run: RunId(7),
+                task: TaskId::new("render-markdown"),
+                role: AgentRole::Developer,
+                event,
+            })
+        };
+        app.update(mk(ExchangeEvent::PromptSent {
+            text: "Prompt has **bold** live text.\n\n```rust\nlet live_prompt = true;\n```".into(),
+        }));
+        app.update(mk(ExchangeEvent::ThoughtChunk {
+            text: "Thought has **bold** live text.\n\n```text\nlive-thought\n```".into(),
+        }));
+        app.update(mk(ExchangeEvent::ResponseChunk {
+            text: "Response has **bold** live text.\n\n```rust\nlet live_response = true;\n```"
+                .into(),
+        }));
+        app.update(mk(ExchangeEvent::TurnComplete));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let live_screen = screen_of(&terminal);
+        assert!(
+            live_screen.contains("Developer prompt")
+                && live_screen.contains("Prompt has bold live text.")
+                && live_screen.contains("let live_prompt = true;"),
+            "live PlanTask tab must render prompt markdown through Execution; screen:\n{live_screen}"
+        );
+        assert!(
+            live_screen.contains("Developer thought")
+                && live_screen.contains("Thought has bold live text.")
+                && live_screen.contains("live-thought"),
+            "live PlanTask tab must render thought markdown through Execution; screen:\n{live_screen}"
+        );
+        assert!(
+            live_screen.contains("Developer response")
+                && live_screen.contains("Response has bold live text.")
+                && live_screen.contains("let live_response = true;"),
+            "live PlanTask tab must render response markdown through Execution; screen:\n{live_screen}"
+        );
+        assert!(
+            !live_screen.contains("No execution yet")
+                && !live_screen.contains("**bold**")
+                && !live_screen.contains("```"),
+            "live PlanTask tab must use live execution rendering, not preview/raw markdown; screen:\n{live_screen}"
+        );
+        let code_bg = app.active_theme.get(crate::theme::ThemeRole::CodeBlockBg);
+        for needle in [
+            "let preview_code = true;",
+            "let live_prompt = true;",
+            "live-thought",
+            "let live_response = true;",
+        ] {
+            assert!(
+                row_with_text_has_bg(terminal.backend().buffer(), needle, code_bg),
                 "code row {needle:?} must carry the CodeBlockBg background"
             );
         }

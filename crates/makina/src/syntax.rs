@@ -26,6 +26,36 @@ fn get_lazy_theme_set() -> &'static two_face::theme::EmbeddedLazyThemeSet {
     LAZY_THEME_SET.get_or_init(two_face::theme::extra)
 }
 
+fn normalize_language_token(lang: &str) -> Option<String> {
+    let token = lang
+        .trim()
+        .trim_start_matches('{')
+        .trim_start_matches('.')
+        .split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ';' | '}'))
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("language-")
+        .trim_start_matches('.');
+
+    if token.is_empty() {
+        return None;
+    }
+
+    let lower = token.to_ascii_lowercase();
+    let normalized = match lower.as_str() {
+        "rs" => "rust",
+        "sh" | "shell" => "bash",
+        "js" => "javascript",
+        "ts" => "typescript",
+        "py" => "python",
+        "md" => "markdown",
+        "yml" => "yaml",
+        other => other,
+    };
+    Some(normalized.to_string())
+}
+
 /// Calculate the relative luminance of an RGB color using the standard WCAG formula.
 /// Returns a value in [0.0, 1.0] where 0 = black, 1 = white.
 fn luminance(r: u8, g: u8, b: u8) -> f64 {
@@ -81,8 +111,8 @@ pub fn highlight_code_line(
     let syntect_theme = lazy_theme_set.get(theme_name);
 
     // Try to find the syntax definition by language token (only if lang was provided)
-    let syntax = if let Some(l) = lang {
-        match syntax_set.find_syntax_by_token(l) {
+    let syntax = if let Some(l) = lang.and_then(normalize_language_token) {
+        match syntax_set.find_syntax_by_token(&l) {
             Some(s) => s,
             None => {
                 // Unknown language: return monochrome fallback
@@ -186,6 +216,17 @@ mod tests {
             spans[0].style.fg,
             Some(expected_color),
             "Unknown language fallback should use CodeBlock color"
+        );
+    }
+
+    #[test]
+    fn test_fence_info_metadata_still_highlights_language() {
+        let theme = crate::theme::ayu_dark();
+        let spans = highlight_code_line("let x = 1;", Some("rust,no_run"), &theme);
+
+        assert!(
+            spans.len() > 1,
+            "rust fence metadata should resolve to the Rust syntax highlighter"
         );
     }
 
