@@ -3153,6 +3153,77 @@ fn diff_overlaid_content_line(text_line: &str, theme: &crate::theme::Theme) -> L
     Line::from(spans)
 }
 
+const COMPACT_EXCHANGE_PREVIEW_CHARS: usize = 120;
+
+fn compact_exchange_preview(text: &str, max_chars: usize) -> Option<String> {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        let separator = if out.is_empty() { 0 } else { 1 };
+        let next_len = out.chars().count() + separator + word.chars().count();
+        if next_len > max_chars {
+            if out.is_empty() {
+                out.extend(word.chars().take(max_chars.saturating_sub(3)));
+            }
+            out.push_str("...");
+            return Some(out);
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn compact_tool_content_preview(content: &str, app: &App) -> Option<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut first_added: Option<String> = None;
+    let mut first_removed: Option<String> = None;
+
+    for line in content.lines() {
+        if let Some(path) = line.strip_prefix("--- ") {
+            let path = crate::markup::compact_paths(path.trim(), &app.repo_root);
+            if !path.is_empty() && !files.iter().any(|existing| existing == &path) {
+                files.push(path);
+            }
+            continue;
+        }
+        if line.starts_with("@@") || line.starts_with("+++") {
+            continue;
+        }
+        if let Some(text) = line.strip_prefix('+') {
+            added += 1;
+            if first_added.is_none() {
+                first_added = compact_exchange_preview(text.trim(), 64);
+            }
+            continue;
+        }
+        if let Some(text) = line.strip_prefix('-') {
+            removed += 1;
+            if first_removed.is_none() {
+                first_removed = compact_exchange_preview(text.trim(), 64);
+            }
+        }
+    }
+
+    if added > 0 || removed > 0 {
+        let mut summary = format!("+{added} -{removed}");
+        if !files.is_empty() {
+            summary.push_str(" in ");
+            summary.push_str(&files.join(", "));
+        }
+        if let Some(change) = first_added.or(first_removed) {
+            summary.push_str(": ");
+            summary.push_str(&change);
+        }
+        return Some(summary);
+    }
+
+    compact_exchange_preview(content, COMPACT_EXCHANGE_PREVIEW_CHARS)
+}
+
 fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Line<'static>> {
     use crate::app::ExchangeContent;
     use makina_core::api::AgentRole;
@@ -3237,12 +3308,9 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             }
         }
         // ── Thought (agent internal reasoning) ────────────────────────────
-        // Observability-only side channel.  Bold, role-coloured header
-        // ("💭 Developer thought" green / "💭 Reviewer thought" yellow) is
-        // ALWAYS rendered so the user can see reasoning happened.  In verbose
-        // mode the reasoning text is additionally shown dimmed (DarkGray) at
-        // a 2-space indent so it reads as a quiet aside rather than part of
-        // the answer.  In compact mode only the header line is shown.
+        // Observability-only side channel. The role-coloured header is always
+        // rendered so the user can see reasoning happened. Compact mode includes
+        // a short inline preview; verbose mode renders the full text below.
         ExchangeContent::Thought { text } => {
             let (label, label_color) = match entry.role {
                 AgentRole::Developer => (
@@ -3254,12 +3322,22 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                     app.active_theme.get(crate::theme::ThemeRole::Warning),
                 ),
             };
-            lines.push(Line::from(vec![Span::styled(
-                label,
+            let mut spans = vec![Span::styled(
+                label.to_string(),
                 Style::default()
                     .fg(label_color)
                     .add_modifier(Modifier::BOLD),
-            )]));
+            )];
+            if !app.verbose_mode
+                && let Some(preview) =
+                    compact_exchange_preview(text, COMPACT_EXCHANGE_PREVIEW_CHARS)
+            {
+                spans.push(Span::styled(
+                    format!(": {preview}"),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                ));
+            }
+            lines.push(Line::from(spans));
             // Thought body only in verbose mode.
             if app.verbose_mode {
                 let base_style =
@@ -3274,11 +3352,9 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
             }
         }
         // ── Tool (agent tool invocation) ──────────────────────────────────
-        // Header "⚙ <title> [<status>]" coloured by lifecycle status is
-        // ALWAYS rendered.  In verbose mode the captured content lines are
-        // additionally rendered via `diff_overlaid_content_line` so the user
-        // sees exactly what was added/updated; in compact mode only the header
-        // is shown.  Empty content renders nothing extra in either mode.
+        // Header "⚙ <title> [<status>]" coloured by lifecycle status is always
+        // rendered. Compact mode adds an inline preview of captured content;
+        // verbose mode renders the full content below with diff styling.
         ExchangeContent::Tool {
             title,
             status,
@@ -3293,12 +3369,21 @@ fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Lin
                 _ => app.active_theme.get(crate::theme::ThemeRole::Foreground),
             };
             let compacted_title = crate::markup::compact_paths(title, &app.repo_root);
-            lines.push(Line::from(vec![Span::styled(
+            let mut spans = vec![Span::styled(
                 format!("⚙ {compacted_title} [{status}]"),
                 Style::default()
                     .fg(status_color)
                     .add_modifier(Modifier::BOLD),
-            )]));
+            )];
+            if !app.verbose_mode
+                && let Some(preview) = compact_tool_content_preview(content, app)
+            {
+                spans.push(Span::styled(
+                    format!(": {preview}"),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                ));
+            }
+            lines.push(Line::from(spans));
             // Tool content only in verbose mode.
             if app.verbose_mode {
                 for text_line in content.lines() {
@@ -8936,10 +9021,11 @@ mod tests {
         (thought, tool)
     }
 
-    /// In compact mode (`verbose_mode = false`) the thought header and tool header
-    /// are present but the thought body text and tool content lines are ABSENT.
+    /// In compact mode (`verbose_mode = false`) the thought and tool rows stay
+    /// compact but include inline previews so the execution log is useful
+    /// without switching to verbose mode.
     #[test]
-    fn verbose_off_hides_thought_and_tool_content() {
+    fn verbose_off_shows_inline_thought_and_tool_previews() {
         use ratatui::buffer::Buffer;
         use ratatui::widgets::Widget;
         use std::sync::Arc;
@@ -8953,6 +9039,11 @@ mod tests {
         let mut lines: Vec<Line> = Vec::new();
         lines.extend(exchange_entry_lines(&thought, &app, 80));
         lines.extend(exchange_entry_lines(&tool, &app, 80));
+        assert_eq!(
+            lines.len(),
+            4,
+            "compact mode should keep each entry to one content row plus a blank separator"
+        );
 
         let area = Rect::new(0, 0, 80, 10);
         let mut buf = Buffer::empty(area);
@@ -8977,14 +9068,89 @@ mod tests {
             "compact: tool header must be visible; got:\n{flattened}"
         );
 
-        // Body / content are suppressed in compact mode.
+        // Body / content are summarized inline in compact mode.
         assert!(
-            !flattened.contains("verbose thought body here"),
-            "compact: thought body must NOT appear; got:\n{flattened}"
+            flattened.contains("verbose thought body here"),
+            "compact: thought preview must be visible inline; got:\n{flattened}"
         );
         assert!(
-            !flattened.contains("verbose tool content line"),
-            "compact: tool content must NOT appear; got:\n{flattened}"
+            flattened.contains("+1 -0"),
+            "compact: tool diff summary must include added/removed counts; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("verbose tool content line"),
+            "compact: tool preview must be visible inline; got:\n{flattened}"
+        );
+    }
+
+    #[test]
+    fn compact_exchange_rows_explain_plan_and_file_write_tools() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        let thought = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Thought {
+                text: "I need to inspect the exchange row renderer before patching it.".to_string(),
+            },
+        };
+        let plan_tool = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "plan-tool".to_string(),
+                title: "Updating plan".to_string(),
+                kind: Some("plan".to_string()),
+                status: "completed".to_string(),
+                content: "step: Inspect exchange rendering\nstatus: completed".to_string(),
+            },
+        };
+        let write_tool = ExchangeEntry {
+            role: AgentRole::Developer,
+            content: ExchangeContent::Tool {
+                id: "write-tool".to_string(),
+                title: "Write `src/model.rs`".to_string(),
+                kind: Some("edit".to_string()),
+                status: "completed".to_string(),
+                content: "--- src/model.rs\n-old model field\n+new model field\n+render preview"
+                    .to_string(),
+            },
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.extend(exchange_entry_lines(&thought, &app, 120));
+        lines.extend(exchange_entry_lines(&plan_tool, &app, 120));
+        lines.extend(exchange_entry_lines(&write_tool, &app, 120));
+
+        let flattened = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            flattened.contains("Developer thought: I need to inspect the exchange row renderer"),
+            "compact thought rows must include a useful preview; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("Updating plan [completed]: step: Inspect exchange rendering"),
+            "compact plan tool rows must include captured plan details; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("Write `src/model.rs` [completed]: +2 -1 in src/model.rs"),
+            "compact write-tool rows must summarize changed lines and file path; got:\n{flattened}"
+        );
+        assert!(
+            flattened.contains("new model field"),
+            "compact write-tool rows must include the first changed line; got:\n{flattened}"
         );
     }
 
