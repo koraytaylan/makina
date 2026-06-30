@@ -251,7 +251,7 @@ impl ExchangeLog {
         });
     }
 
-    /// Upsert a tool call by `id`.
+    /// Upsert a tool call by `(role, id)`.
     ///
     /// Updates an existing [`ExchangeContent::Tool`] entry with the same `id`
     /// (overwriting title/kind/status, and setting `content` when
@@ -266,7 +266,7 @@ impl ExchangeLog {
         status: String,
         incoming_content: Option<String>,
     ) {
-        if let Some(entry) = self.find_tool_mut(&id) {
+        if let Some(entry) = self.find_tool_mut(&role, &id) {
             if let ExchangeContent::Tool {
                 title: t,
                 kind: k,
@@ -300,7 +300,7 @@ impl ExchangeLog {
         });
     }
 
-    /// Apply a status/title/content update to an existing tool entry by `id`.
+    /// Apply a status/title/content update to an existing tool entry by `(role, id)`.
     ///
     /// Finds the [`ExchangeContent::Tool`] entry with the matching `id` and
     /// updates `status`/`title`/`content` when present; `content` is only
@@ -308,12 +308,13 @@ impl ExchangeLog {
     /// entry matches (live updates always follow a `start_tool`).
     pub fn update_tool(
         &mut self,
+        role: AgentRole,
         id: &str,
         status: Option<String>,
         title: Option<String>,
         incoming_content: Option<String>,
     ) {
-        if let Some(entry) = self.find_tool_mut(id)
+        if let Some(entry) = self.find_tool_mut(&role, id)
             && let ExchangeContent::Tool {
                 title: t,
                 status: s,
@@ -335,11 +336,15 @@ impl ExchangeLog {
         }
     }
 
-    /// Find the tool entry with the given `id`, if any.
-    fn find_tool_mut(&mut self, id: &str) -> Option<&mut ExchangeEntry> {
-        self.entries
-            .iter_mut()
-            .find(|e| matches!(&e.content, ExchangeContent::Tool { id: eid, .. } if eid == id))
+    /// Find the tool entry with the given `(role, id)`, if any.
+    fn find_tool_mut(&mut self, role: &AgentRole, id: &str) -> Option<&mut ExchangeEntry> {
+        self.entries.iter_mut().find(|entry| {
+            entry.role == *role
+                && matches!(
+                    &entry.content,
+                    ExchangeContent::Tool { id: existing_id, .. } if existing_id == id
+                )
+        })
     }
 }
 
@@ -385,7 +390,7 @@ pub fn apply_exchange_event(log: &mut ExchangeLog, role: AgentRole, event: &Exch
             title,
             content,
         } => {
-            log.update_tool(id, status.clone(), title.clone(), content.clone());
+            log.update_tool(role, id, status.clone(), title.clone(), content.clone());
         }
         ExchangeEvent::TurnComplete => {
             log.complete_turn();
@@ -7223,9 +7228,16 @@ mod tests {
         assert_eq!(log.entries.len(), 1, "one tool entry after start_tool");
 
         // First update.
-        log.update_tool("tc-1", Some("in_progress".into()), None, None);
+        log.update_tool(
+            AgentRole::Developer,
+            "tc-1",
+            Some("in_progress".into()),
+            None,
+            None,
+        );
         // Second update — title change too.
         log.update_tool(
+            AgentRole::Developer,
             "tc-1",
             Some("completed".into()),
             Some("edit file (done)".into()),
@@ -7261,6 +7273,80 @@ mod tests {
                 assert!(content.is_empty(), "no content carried on the update path");
             }
             other => panic!("entry must be a Tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_updates_are_scoped_to_role_and_id() {
+        use crate::app::ExchangeLog;
+        use makina_core::api::AgentRole;
+
+        let mut log = ExchangeLog::default();
+
+        log.start_tool(
+            AgentRole::Developer,
+            "tc-shared".into(),
+            "developer edit".into(),
+            Some("edit".into()),
+            "pending".into(),
+            Some("+dev line".into()),
+        );
+        log.start_tool(
+            AgentRole::Reviewer,
+            "tc-shared".into(),
+            "reviewer read".into(),
+            Some("read".into()),
+            "pending".into(),
+            Some("review payload".into()),
+        );
+        log.update_tool(
+            AgentRole::Reviewer,
+            "tc-shared",
+            Some("completed".into()),
+            Some("reviewer read (done)".into()),
+            Some("review result".into()),
+        );
+
+        assert_eq!(
+            log.entries.len(),
+            2,
+            "shared tool ids across roles must stay as distinct exchange entries"
+        );
+
+        match &log.entries[0] {
+            ExchangeEntry {
+                role: AgentRole::Developer,
+                content:
+                    ExchangeContent::Tool {
+                        title,
+                        status,
+                        content,
+                        ..
+                    },
+            } => {
+                assert_eq!(title, "developer edit");
+                assert_eq!(status, "pending");
+                assert_eq!(content, "+dev line");
+            }
+            other => panic!("first entry must remain the developer tool, got {other:?}"),
+        }
+
+        match &log.entries[1] {
+            ExchangeEntry {
+                role: AgentRole::Reviewer,
+                content:
+                    ExchangeContent::Tool {
+                        title,
+                        status,
+                        content,
+                        ..
+                    },
+            } => {
+                assert_eq!(title, "reviewer read (done)");
+                assert_eq!(status, "completed");
+                assert_eq!(content, "review result");
+            }
+            other => panic!("second entry must be the reviewer tool, got {other:?}"),
         }
     }
 

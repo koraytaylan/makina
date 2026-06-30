@@ -132,9 +132,27 @@ impl ExchangeRoleLabelSeen {
     }
 }
 
+#[cfg(test)]
 struct ExchangeGroupedLines {
     lines: Vec<Line<'static>>,
-    tool_diff_line_keys: Vec<(usize, ToolDiffKey)>,
+}
+
+struct ExchangeRoleGroup {
+    role: AgentRole,
+    lines: Vec<Line<'static>>,
+    rendered_rows: u16,
+    tool_diff_header_rows: Vec<(u16, ToolDiffKey)>,
+}
+
+struct ExchangeGroupedBlocks {
+    groups: Vec<ExchangeRoleGroup>,
+}
+
+struct ExchangeGroupOverlay {
+    start_row: u16,
+    indent_x: u16,
+    width: u16,
+    group: ExchangeRoleGroup,
 }
 
 fn exchange_role_name(role: &AgentRole) -> &'static str {
@@ -160,6 +178,7 @@ fn exchange_entry_label_kind(entry: &ExchangeEntry) -> Option<ExchangeEntryLabel
     }
 }
 
+#[cfg(test)]
 fn exchange_role_rail_line(mut line: Line<'static>, app: &App, role: &AgentRole) -> Line<'static> {
     line.spans.insert(
         0,
@@ -171,6 +190,93 @@ fn exchange_role_rail_line(mut line: Line<'static>, app: &App, role: &AgentRole)
         ),
     );
     line
+}
+
+fn paragraph_line_count(lines: &[Line<'static>], width: u16) -> u16 {
+    if width == 0 || lines.is_empty() {
+        return 0;
+    }
+    lines.iter().fold(0u16, |total, line| {
+        let row_count = if line.width() == 0 {
+            1
+        } else {
+            (line.width() as u32)
+                .div_ceil(width as u32)
+                .min(u16::MAX as u32) as u16
+        };
+        total.saturating_add(row_count)
+    })
+}
+
+fn single_line_rendered_rows(line: &Line<'static>, width: u16) -> u16 {
+    paragraph_line_count(std::slice::from_ref(line), width).max(1)
+}
+
+fn render_exchange_role_group(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    group: &ExchangeRoleGroup,
+    scroll_offset: u16,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(
+            Style::default()
+                .fg(exchange_role_color(app, &group.role))
+                .add_modifier(Modifier::BOLD),
+        )
+        .padding(Padding::left(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let para = Paragraph::new(group.lines.clone())
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0));
+    frame.render_widget(para, inner);
+}
+
+fn render_exchange_group_overlays(
+    frame: &mut Frame,
+    app: &App,
+    viewport: Rect,
+    scroll_offset: u16,
+    overlays: &[ExchangeGroupOverlay],
+) {
+    let viewport_end = scroll_offset.saturating_add(viewport.height);
+    for overlay in overlays {
+        let group_start = overlay.start_row;
+        let group_end = group_start.saturating_add(overlay.group.rendered_rows);
+        if group_end <= scroll_offset || group_start >= viewport_end {
+            continue;
+        }
+
+        let clipped_start = group_start.max(scroll_offset);
+        let clipped_end = group_end.min(viewport_end);
+        let visible_height = clipped_end.saturating_sub(clipped_start);
+        let width = overlay
+            .width
+            .min(viewport.width.saturating_sub(overlay.indent_x));
+        if visible_height == 0 || width == 0 {
+            continue;
+        }
+
+        let scroll_within_group = scroll_offset.saturating_sub(group_start);
+        let area = Rect {
+            x: viewport.x.saturating_add(overlay.indent_x),
+            y: viewport.y + clipped_start.saturating_sub(scroll_offset),
+            width,
+            height: visible_height,
+        };
+        render_exchange_role_group(frame, area, app, &overlay.group, scroll_within_group);
+    }
 }
 
 fn render_indented_markdown(
@@ -2128,6 +2234,17 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
         Some(log) => {
             // Build the exchange lines.
             let mut lines: Vec<Line> = Vec::new();
+            let mut overlays: Vec<ExchangeGroupOverlay> = Vec::new();
+            let mut rendered_rows = 0u16;
+            let rendered_rows_for_line =
+                |line: &Line<'static>| single_line_rendered_rows(line, inner.width);
+            macro_rules! push_line {
+                ($line:expr) => {{
+                    let line: Line<'static> = $line;
+                    rendered_rows = rendered_rows.saturating_add(rendered_rows_for_line(&line));
+                    lines.push(line);
+                }};
+            }
 
             // Add task detail with iteration counts if a task is selected.
             if let Some(task) = app
@@ -2143,44 +2260,57 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 } else {
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
                 };
-                lines.push(Line::from(Span::styled(counts, style)));
+                push_line!(Line::from(Span::styled(counts, style)));
 
                 // Add idle time and wall-clock countdown for in-progress tasks.
                 let activity_indicators = task_activity_indicators(app, task);
                 if !activity_indicators.is_empty() {
-                    lines.push(Line::from(activity_indicators));
+                    push_line!(Line::from(activity_indicators));
                 }
 
                 // Add per-role metrics (plan 0024).
                 let metrics = role_metric_lines(app, task);
-                lines.extend(metrics);
+                for metric in metrics {
+                    push_line!(metric);
+                }
 
-                lines.push(Line::from(""));
+                push_line!(Line::from(""));
 
                 // Add failure reason if the task is failed.
                 if let Some(reason) = &task.failure_reason {
                     let label = failure_kind_label(&reason.kind);
                     let reason_text = format!("failed: {} — {}", label, reason.message);
-                    lines.push(Line::from(Span::styled(
+                    push_line!(Line::from(Span::styled(
                         reason_text,
                         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)),
                     )));
-                    lines.push(Line::from(""));
+                    push_line!(Line::from(""));
                 }
             }
 
             let content_width = inner.width;
-            lines.extend(
-                exchange_entries_grouped_lines(&log.entries, app, content_width, None).lines,
-            );
+            for group in
+                exchange_entries_grouped_blocks(&log.entries, app, content_width, None).groups
+            {
+                let start_row = rendered_rows;
+                for _ in 0..group.rendered_rows {
+                    push_line!(Line::from(""));
+                }
+                overlays.push(ExchangeGroupOverlay {
+                    start_row,
+                    indent_x: 0,
+                    width: content_width,
+                    group,
+                });
+            }
 
             // Scroll: `scroll_max` pins the bottom-most visible offset (as the
             // old auto-scroll did); `effective_offset` honours the user's manual
             // wheel offset (task `tui-mouse-scroll`) or stays pinned to the
             // bottom while auto-following.
-            let pane_height = inner.height as usize;
-            let total_lines = lines.len();
-            let scroll_max = total_lines.saturating_sub(pane_height) as u16;
+            let pane_height = inner.height;
+            let total_rows = rendered_rows;
+            let scroll_max = total_rows.saturating_sub(pane_height);
             // Record the rendered bottom so the (geometry-free) `App::update`
             // scroll path can anchor `scroll_up` and bound `scroll_down` to the
             // real bottom (interior mutability keeps the `&App` render signature).
@@ -2193,6 +2323,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
                 .wrap(Wrap { trim: false })
                 .scroll((scroll_offset, 0));
             frame.render_widget(para, inner);
+            render_exchange_group_overlays(frame, app, inner, scroll_offset, &overlays);
 
             // Render scrollbar only when content exceeds the viewport.
             if scroll_max > 0 {
@@ -2226,7 +2357,7 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 /// This is a dedicated renderer (instead of routing through
 /// [`render_accordion_section`]) because the Execution body is not a plain
 /// string: it is a sequence of styled [`ExchangeEntry`] turns (prompts,
-/// thoughts, tool calls, responses) produced by [`exchange_entries_grouped_lines`].
+/// thoughts, tool calls, responses) produced by the exchange-group renderers.
 /// `render_accordion_section` only takes a `&str`, so it would flatten the
 /// rich styling into raw text.  Here we mirror its header logic and then
 /// append:
@@ -2234,16 +2365,16 @@ fn render_exchange_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool)
 /// 1. The metrics/activity/failure summary (so the at-a-glance status the
 ///    Execution section already showed stays at the top).
 /// 2. Every exchange entry for `(run.id, task.id)` in arrival order, grouped by
-///    contiguous role with a Developer/Reviewer-coloured rail. Repeated prompt /
-///    response / thought labels in the same role group use compact labels so the
-///    role name does not visually stutter. Lines are indented 2 spaces so they
-///    nest under the header.
+///    contiguous role with a Developer/Reviewer-coloured left border. Repeated
+///    prompt / response / thought labels in the same role group use compact
+///    labels so the role name does not visually stutter. Groups are indented 2
+///    spaces so they nest under the header.
 ///
 /// When there is no exchange yet (the run hasn't started, or the task hasn't
 /// been picked up), the empty-state hint is shown instead.
 struct TaskExecutionSectionRender {
     lines: Vec<Line<'static>>,
-    tool_diff_line_keys: Vec<(usize, ToolDiffKey)>,
+    group_overlays: Vec<ExchangeGroupOverlay>,
 }
 
 fn render_task_execution_section(
@@ -2254,7 +2385,17 @@ fn render_task_execution_section(
     content_width: u16,
 ) -> TaskExecutionSectionRender {
     let mut result = Vec::new();
-    let mut tool_diff_line_keys = Vec::new();
+    let mut group_overlays = Vec::new();
+    let mut rendered_rows = 0u16;
+    let rendered_rows_for_line =
+        |line: &Line<'static>| single_line_rendered_rows(line, content_width);
+    macro_rules! push_line {
+        ($line:expr) => {{
+            let line: Line<'static> = $line;
+            rendered_rows = rendered_rows.saturating_add(rendered_rows_for_line(&line));
+            result.push(line);
+        }};
+    }
     let is_expanded = expanded.contains(&AccordionSection::Execution);
     let marker = if is_expanded { "[-]" } else { "[+]" };
 
@@ -2271,15 +2412,16 @@ fn render_task_execution_section(
         Span::raw(" "),
         Span::styled("Execution", title_style),
     ]));
+    rendered_rows = rendered_rows.saturating_add(1);
 
     if !is_expanded {
         return TaskExecutionSectionRender {
             lines: result,
-            tool_diff_line_keys,
+            group_overlays,
         };
     }
 
-    result.push(Line::from(""));
+    push_line!(Line::from(""));
 
     let log_opt = app.exchange_logs.get(&(run.id, task.id.clone()));
     let has_exchange = log_opt.is_some_and(|log| !log.entries.is_empty());
@@ -2290,46 +2432,45 @@ fn render_task_execution_section(
     if !activity_indicators.is_empty() {
         let mut line_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
         line_spans.extend(activity_indicators);
-        result.push(Line::from(line_spans));
+        push_line!(Line::from(line_spans));
         had_summary = true;
     }
     for metric_line in role_metric_lines(app, task) {
         let mut indented = metric_line;
         indented.spans.insert(0, Span::raw("  "));
-        result.push(indented);
+        push_line!(indented);
         had_summary = true;
     }
     if let Some(reason) = &task.failure_reason {
         let label = failure_kind_label(&reason.kind);
-        result.push(Line::from(vec![Span::styled(
+        push_line!(Line::from(vec![Span::styled(
             format!("  failed: {} — {}", label, reason.message),
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)),
         )]));
         had_summary = true;
     }
     if had_summary {
-        result.push(Line::from(""));
+        push_line!(Line::from(""));
     }
 
     // 2. Live exchange entries in chronological order, or the empty-state hint.
     if has_exchange {
-        // The exchange entries are rendered against the full content width
-        // minus the 2-space indent so wrapping matches the indented body.
         let body_width = content_width.saturating_sub(2);
         let log = log_opt.expect("checked above");
-        let grouped =
-            exchange_entries_grouped_lines(&log.entries, app, body_width, Some((run.id, &task.id)));
-        let grouped_start_line = result.len();
-        tool_diff_line_keys.extend(
-            grouped
-                .tool_diff_line_keys
-                .into_iter()
-                .map(|(line, key)| (grouped_start_line + line, key)),
-        );
-        for entry_line in grouped.lines {
-            // Indent each rendered line by 2 spaces so the body nests under the
-            // "Execution" header, matching the SCOPE section.
-            result.push(indent_line(entry_line, "  "));
+        for group in
+            exchange_entries_grouped_blocks(&log.entries, app, body_width, Some((run.id, &task.id)))
+                .groups
+        {
+            let start_row = rendered_rows;
+            for _ in 0..group.rendered_rows {
+                push_line!(Line::from(""));
+            }
+            group_overlays.push(ExchangeGroupOverlay {
+                start_row,
+                indent_x: 2,
+                width: body_width,
+                group,
+            });
         }
     } else {
         let hint = if app.exchange_logs.contains_key(&(run.id, task.id.clone())) {
@@ -2345,7 +2486,7 @@ fn render_task_execution_section(
 
     TaskExecutionSectionRender {
         lines: result,
-        tool_diff_line_keys,
+        group_overlays,
     }
 }
 
@@ -2500,7 +2641,7 @@ fn render_task_execution_empty_section(
 
     TaskExecutionSectionRender {
         lines: result,
-        tool_diff_line_keys: Vec::new(),
+        group_overlays: Vec::new(),
     }
 }
 
@@ -2542,6 +2683,7 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
     let mut rendered_row: u16 = 0;
     let mut accordion_header_rows: Vec<(AccordionSection, u16)> = Vec::new();
     let mut tool_diff_header_rows: Vec<(ToolDiffKey, u16)> = Vec::new();
+    let mut execution_group_overlays: Vec<ExchangeGroupOverlay> = Vec::new();
     let mut lines: Vec<Line<'static>> = Vec::new();
     macro_rules! push_line {
         ($l:expr) => {{
@@ -2681,20 +2823,32 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
     accordion_header_rows.push((AccordionSection::Execution, rendered_row));
     let TaskExecutionSectionRender {
         lines: execution_lines,
-        tool_diff_line_keys,
+        group_overlays,
     } = match source {
         TaskDetailSource::Live { run, task } => {
             render_task_execution_section(app, run, task, &expanded, content_width)
         }
         TaskDetailSource::PlanPreview { .. } => render_task_execution_empty_section(app, &expanded),
     };
-    for (line_idx, l) in execution_lines.into_iter().enumerate() {
-        for (diff_line_idx, key) in &tool_diff_line_keys {
-            if *diff_line_idx == line_idx {
-                tool_diff_header_rows.push((key.clone(), rendered_row));
-            }
-        }
+    let execution_start_row = rendered_row;
+    for l in execution_lines {
         push_line!(l);
+    }
+    for overlay in group_overlays {
+        for (local_row, key) in &overlay.group.tool_diff_header_rows {
+            tool_diff_header_rows.push((
+                key.clone(),
+                execution_start_row
+                    .saturating_add(overlay.start_row)
+                    .saturating_add(*local_row),
+            ));
+        }
+        execution_group_overlays.push(ExchangeGroupOverlay {
+            start_row: execution_start_row.saturating_add(overlay.start_row),
+            indent_x: overlay.indent_x,
+            width: overlay.width,
+            group: overlay.group,
+        });
     }
     push_line!(Line::from(""));
 
@@ -2746,6 +2900,13 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
         .wrap(Wrap { trim: false })
         .scroll((task_scroll_offset, 0));
     frame.render_widget(para, content_area);
+    render_exchange_group_overlays(
+        frame,
+        app,
+        content_area,
+        task_scroll_offset,
+        &execution_group_overlays,
+    );
 
     if task_scroll_max > 0 {
         let mut scrollbar_state =
@@ -3636,21 +3797,60 @@ fn exchange_entry_lines_with_tool_diff(
     )
 }
 
-fn exchange_entries_grouped_lines(
+fn exchange_entries_grouped_blocks(
     entries: &[ExchangeEntry],
     app: &App,
     width: u16,
     tool_diff_context: Option<(RunId, &TaskId)>,
-) -> ExchangeGroupedLines {
+) -> ExchangeGroupedBlocks {
     let entry_width = width.saturating_sub(EXCHANGE_ROLE_RAIL_WIDTH);
-    let mut lines = Vec::new();
-    let mut tool_diff_line_keys = Vec::new();
+    let mut groups = Vec::new();
     let mut previous_role: Option<&AgentRole> = None;
     let mut seen_role_labels = ExchangeRoleLabelSeen::default();
+    let mut current_role: Option<AgentRole> = None;
+    let mut current_lines: Vec<Line<'static>> = Vec::new();
+    let mut current_tool_diff_lines: Vec<(usize, ToolDiffKey)> = Vec::new();
+
+    let finalize_group =
+        |groups: &mut Vec<ExchangeRoleGroup>,
+         role: Option<AgentRole>,
+         lines: &mut Vec<Line<'static>>,
+         tool_diff_lines: &mut Vec<(usize, ToolDiffKey)>| {
+            let Some(role) = role else {
+                return;
+            };
+            let mut rendered_rows = 0u16;
+            let mut tool_diff_header_rows = Vec::new();
+            let mut tool_diff_iter = tool_diff_lines.drain(..).peekable();
+            for (line_idx, line) in lines.iter().enumerate() {
+                while let Some((diff_line_idx, key)) = tool_diff_iter.peek() {
+                    if *diff_line_idx != line_idx {
+                        break;
+                    }
+                    tool_diff_header_rows.push((rendered_rows, key.clone()));
+                    tool_diff_iter.next();
+                }
+                rendered_rows =
+                    rendered_rows.saturating_add(single_line_rendered_rows(line, entry_width));
+            }
+            groups.push(ExchangeRoleGroup {
+                role,
+                lines: std::mem::take(lines),
+                rendered_rows,
+                tool_diff_header_rows,
+            });
+        };
 
     for entry in entries {
         let starts_role_group = previous_role != Some(&entry.role);
         if starts_role_group {
+            finalize_group(
+                &mut groups,
+                current_role.take(),
+                &mut current_lines,
+                &mut current_tool_diff_lines,
+            );
+            current_role = Some(entry.role.clone());
             seen_role_labels = ExchangeRoleLabelSeen::default();
         }
         let label_kind = exchange_entry_label_kind(entry);
@@ -3689,8 +3889,74 @@ fn exchange_entries_grouped_lines(
             if entry_line_idx == 0
                 && let Some(key) = maybe_tool_diff_key.as_ref()
             {
-                tool_diff_line_keys.push((lines.len(), key.clone()));
+                current_tool_diff_lines.push((current_lines.len(), key.clone()));
             }
+            current_lines.push(entry_line);
+        }
+
+        previous_role = Some(&entry.role);
+        if let Some(kind) = label_kind {
+            seen_role_labels.insert(kind);
+        }
+    }
+
+    finalize_group(
+        &mut groups,
+        current_role.take(),
+        &mut current_lines,
+        &mut current_tool_diff_lines,
+    );
+
+    ExchangeGroupedBlocks { groups }
+}
+
+#[cfg(test)]
+fn exchange_entries_grouped_lines(
+    entries: &[ExchangeEntry],
+    app: &App,
+    width: u16,
+    tool_diff_context: Option<(RunId, &TaskId)>,
+) -> ExchangeGroupedLines {
+    let entry_width = width.saturating_sub(EXCHANGE_ROLE_RAIL_WIDTH);
+    let mut lines = Vec::new();
+    let mut previous_role: Option<&AgentRole> = None;
+    let mut seen_role_labels = ExchangeRoleLabelSeen::default();
+
+    for entry in entries {
+        let starts_role_group = previous_role != Some(&entry.role);
+        if starts_role_group {
+            seen_role_labels = ExchangeRoleLabelSeen::default();
+        }
+        let label_kind = exchange_entry_label_kind(entry);
+        let label_mode = match label_kind {
+            Some(kind) if !seen_role_labels.contains(kind) => ExchangeEntryLabelMode::Full,
+            _ => ExchangeEntryLabelMode::Compact,
+        };
+        let maybe_tool_diff_key = tool_diff_context.and_then(|(run, task)| match &entry.content {
+            crate::app::ExchangeContent::Tool {
+                id,
+                title,
+                kind,
+                content,
+                ..
+            } if tool_content_is_expandable_diff(title, kind, content) => Some(ToolDiffKey {
+                run,
+                task: task.clone(),
+                tool_id: id.clone(),
+            }),
+            _ => None,
+        });
+        let expanded_tool_diff = maybe_tool_diff_key
+            .as_ref()
+            .is_some_and(|key| app.expanded_tool_diffs.contains(key));
+
+        for entry_line in exchange_entry_lines_with_options(
+            entry,
+            app,
+            entry_width,
+            expanded_tool_diff,
+            label_mode,
+        ) {
             lines.push(exchange_role_rail_line(entry_line, app, &entry.role));
         }
 
@@ -3700,10 +3966,7 @@ fn exchange_entries_grouped_lines(
         }
     }
 
-    ExchangeGroupedLines {
-        lines,
-        tool_diff_line_keys,
-    }
+    ExchangeGroupedLines { lines }
 }
 
 fn exchange_entry_lines_with_options(
@@ -11532,6 +11795,119 @@ mod tests {
             prompt < thought && thought < tool && tool < response,
             "exchange entries must render in chronological order \
              (prompt@{prompt} < thought@{thought} < tool@{tool} < response@{response})"
+        );
+    }
+
+    #[test]
+    fn task_execution_role_rails_wrap_cleanly_and_switch_colors() {
+        use crate::app::{ExchangeContent, ExchangeEntry, ExchangeLog};
+        use makina_core::api::{AgentRole, RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+
+        let mut terminal = make_terminal(80, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let task_id = TaskId::new("rail-task");
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            task_list_path: PathBuf::from(".tasks/rail-test.json"),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![TaskView {
+                id: task_id.clone(),
+                title: "Rail Test".into(),
+                state: TaskState::InReview,
+                gate_iterations: 0,
+                review_iterations: 0,
+                depends_on: vec![],
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+                entry_text: "Execution rail test.".to_string(),
+            }],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        app.selected_task = Some(0);
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan_slug: "rail-test".to_string(),
+            task_id: task_id.clone(),
+        });
+        app.exchange_logs.insert(
+            (RunId(1), task_id),
+            ExchangeLog {
+                entries: vec![
+                    ExchangeEntry {
+                        role: AgentRole::Developer,
+                        content: ExchangeContent::Response {
+                            text: "This developer response is intentionally long so it wraps across multiple terminal rows before the reviewer section begins.".to_string(),
+                            complete: true,
+                        },
+                    },
+                    ExchangeEntry {
+                        role: AgentRole::Reviewer,
+                        content: ExchangeContent::Thought {
+                            text: "Reviewer starts here.".to_string(),
+                        },
+                    },
+                ],
+            },
+        );
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rows = (0..buf.area.height)
+            .map(|row| {
+                (0..buf.area.width)
+                    .map(|col| buf[(col, row)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        let developer_row = rows
+            .iter()
+            .position(|row| row.contains("Developer response"))
+            .expect("developer group label must render") as u16;
+        let reviewer_row = rows
+            .iter()
+            .position(|row| row.contains("Reviewer thought"))
+            .expect("reviewer group label must render") as u16;
+        assert!(
+            reviewer_row > developer_row + 1,
+            "developer content should wrap onto at least one row before the reviewer group starts"
+        );
+
+        let developer_label_x = rows[developer_row as usize]
+            .find("Developer response")
+            .expect("developer label must be present on its row")
+            as u16;
+        let rail_x = (0..developer_label_x)
+            .rev()
+            .find(|&col| buf[(col, developer_row)].symbol() == "│")
+            .expect("developer row must include a left rail");
+        let developer_rail_color = app.active_theme.get(crate::theme::ThemeRole::Success);
+        for row in developer_row..reviewer_row {
+            assert_eq!(
+                buf[(rail_x, row)].symbol(),
+                "│",
+                "developer rail must stay continuous across wrapped rows (row {row})"
+            );
+            assert_eq!(
+                buf[(rail_x, row)].fg,
+                developer_rail_color,
+                "developer rail color must persist through wrapped rows (row {row})"
+            );
+        }
+
+        let reviewer_rail_color = app.active_theme.get(crate::theme::ThemeRole::Warning);
+        assert_eq!(
+            buf[(rail_x, reviewer_row)].symbol(),
+            "│",
+            "reviewer row must start with the same aligned left rail"
+        );
+        assert_eq!(
+            buf[(rail_x, reviewer_row)].fg,
+            reviewer_rail_color,
+            "reviewer row must switch the rail color when the role changes"
         );
     }
 
