@@ -56,6 +56,7 @@ use crate::app::{
     ScrollablePanel, TabContent, ToolDiffKey, TreeNode,
 };
 use makina_core::api::{AgentRole, FailureKind, RunId, RunView, TaskId};
+use makina_core::roles::{ReviewVerdict, parse_review_verdict};
 
 /// Render markdown with caching by (text_hash, width, style/theme context).
 /// Subsequent calls with identical inputs return the cached result without re-parsing.
@@ -176,6 +177,57 @@ fn exchange_entry_label_kind(entry: &ExchangeEntry) -> Option<ExchangeEntryLabel
         crate::app::ExchangeContent::Thought { .. } => Some(ExchangeEntryLabelKind::Thought),
         crate::app::ExchangeContent::Tool { .. } => None,
     }
+}
+
+fn render_reviewer_verdict_lines(
+    app: &App,
+    verdict: ReviewVerdict,
+    width: u16,
+    label_mode: ExchangeEntryLabelMode,
+) -> Vec<Line<'static>> {
+    let label = match label_mode {
+        ExchangeEntryLabelMode::Full => "◀ Reviewer verdict".to_string(),
+        ExchangeEntryLabelMode::Compact => "◀ verdict".to_string(),
+    };
+    let label_color = app.active_theme.get(crate::theme::ThemeRole::Accent);
+    let mut lines = vec![Line::from(vec![Span::styled(
+        label,
+        Style::default()
+            .fg(label_color)
+            .add_modifier(Modifier::BOLD),
+    )])];
+
+    match verdict {
+        ReviewVerdict::Approve => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Approved",
+                    Style::default()
+                        .fg(app.active_theme.get(crate::theme::ThemeRole::Success))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        ReviewVerdict::Reject { feedback } => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Rejected",
+                    Style::default()
+                        .fg(app.active_theme.get(crate::theme::ThemeRole::Error))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let base_style =
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
+            lines.extend(render_indented_markdown(
+                app, &feedback, base_style, width, 2,
+            ));
+        }
+    }
+
+    lines
 }
 
 #[cfg(test)]
@@ -4008,6 +4060,13 @@ fn exchange_entry_lines_with_options(
             }
         }
         ExchangeContent::Response { text, complete } => {
+            if entry.role == AgentRole::Reviewer
+                && *complete
+                && let Ok(verdict) = parse_review_verdict(text)
+            {
+                return render_reviewer_verdict_lines(app, verdict, width, label_mode);
+            }
+
             // Response entry.
             let resp_label = match label_mode {
                 ExchangeEntryLabelMode::Full => {
@@ -8058,6 +8117,96 @@ mod tests {
         assert!(
             !rendered.contains("**review**") && !rendered.contains("```"),
             "prompt body must not leak raw markdown markers; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn reviewer_approve_response_renders_verdict_summary() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let entry = ExchangeEntry {
+            role: AgentRole::Reviewer,
+            content: ExchangeContent::Response {
+                text: r#"{"verdict":"approve"}"#.to_string(),
+                complete: true,
+            },
+        };
+
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let rendered = exchange_entry_lines(&entry, &app, 100)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Reviewer verdict"),
+            "reviewer approval must render as a verdict block; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Approved"),
+            "reviewer approval must render the approved state; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"{"verdict":"approve"}"#)
+                && !rendered.contains("Reviewer response"),
+            "reviewer approval must not leak raw verdict JSON or the generic response label; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn reviewer_reject_response_renders_feedback_summary() {
+        use crate::app::{ExchangeContent, ExchangeEntry};
+        use makina_core::api::AgentRole;
+        use std::sync::Arc;
+
+        let entry = ExchangeEntry {
+            role: AgentRole::Reviewer,
+            content: ExchangeContent::Response {
+                text: r#"{"verdict":"reject","feedback":"Add **coverage** for the empty-input case."}"#
+                    .to_string(),
+                complete: true,
+            },
+        };
+
+        let api = Arc::new(PlaceholderApi::new());
+        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let rendered = exchange_entry_lines(&entry, &app, 100)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Reviewer verdict"),
+            "reviewer rejection must render as a verdict block; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Rejected"),
+            "reviewer rejection must render the rejected state; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Add coverage for the empty-input case."),
+            "reviewer feedback must render as readable text; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("**coverage**")
+                && !rendered.contains(r#""verdict":"reject""#)
+                && !rendered.contains("Reviewer response"),
+            "reviewer rejection must not leak raw markdown or raw verdict JSON; got:\n{rendered}"
         );
     }
 
