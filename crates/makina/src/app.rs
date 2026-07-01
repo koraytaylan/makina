@@ -1716,7 +1716,7 @@ impl App {
     ///
     /// For plan tabs, sync to the run corresponding to that plan so palette run
     /// controls can target it without manually selecting the run in the sidebar.
-    fn sync_selected_run_to_active_tab(&mut self) {
+    pub(crate) fn sync_selected_run_to_active_tab(&mut self) {
         let Some(active) = self.tabs.active_tab else {
             return;
         };
@@ -1939,6 +1939,11 @@ impl App {
                     if self.discovered_plans.iter().any(|p| p.slug == slug) {
                         self.tabs.open_tab(TabContent::Plan { plan_slug: slug });
                     }
+                    // Expand the run so its tasks become visible in the sidebar
+                    // (mirrors the Plan node path in activate_plan_node).
+                    self.collapsed_runs.remove(&run_view.id);
+                    self.move_cursor_to_run_header(run);
+                    self.sync_selection_from_cursor();
                 }
             }
             _ => {}
@@ -1963,6 +1968,12 @@ impl App {
         } else {
             Some(0)
         };
+        // Runs start collapsed: seed `collapsed_runs` with every initial run's
+        // id so the sidebar opens tidy (mirroring `collapsed_plans` in
+        // PlansDiscovered). Without this, historical disk runs loaded at
+        // launch render expanded with their tasks visible, which makes the
+        // first plan appear "already expanded" on startup.
+        let collapsed_runs: HashSet<RunId> = initial_runs.iter().map(|r| r.id).collect();
         Self {
             should_quit: false,
             api,
@@ -1978,7 +1989,7 @@ impl App {
             runs: initial_runs,
             selected_run,
             selected_task,
-            collapsed_runs: HashSet::new(),
+            collapsed_runs,
             collapsed_plans: HashSet::new(),
             tree_cursor,
             exchange_logs: HashMap::new(),
@@ -3791,6 +3802,10 @@ impl App {
                             if self.discovered_plans.iter().any(|p| p.slug == slug) {
                                 self.tabs.open_tab(TabContent::Plan { plan_slug: slug });
                             }
+                            // Expand the run so its tasks become visible in the sidebar.
+                            self.collapsed_runs.remove(&run_view.id);
+                            self.move_cursor_to_run_header(run);
+                            self.sync_selection_from_cursor();
                         }
                     }
                 }
@@ -4513,7 +4528,12 @@ mod tests {
             report: makina_core::api::IngestionReport::default(),
         };
 
-        App::new(api, vec![run0, run1], PathBuf::from("."))
+        let mut app = App::new(api, vec![run0, run1], PathBuf::from("."));
+        // Tests using this helper expect runs to be expanded (the historical
+        // default before runs started collapsed at launch). Clear the
+        // launch-seeded collapsed set so task nodes are visible by default.
+        app.collapsed_runs.clear();
+        app
     }
 
     #[test]
@@ -6073,7 +6093,10 @@ mod tests {
             ],
             report: makina_core::api::IngestionReport::default(),
         };
-        App::new(api, vec![run], PathBuf::from("."))
+        let mut app = App::new(api, vec![run], PathBuf::from("."));
+        // Tests using this helper expect the run expanded (tasks visible).
+        app.collapsed_runs.clear();
+        app
     }
 
     /// **Live streaming (the done-when):** Feed PromptSent, several
@@ -6839,6 +6862,9 @@ mod tests {
             report: makina_core::api::IngestionReport::default(),
         };
         let mut app = App::new(api, vec![run1, run2], PathBuf::from("."));
+        // This test exercises tree navigation across expanded runs; clear the
+        // launch-seeded collapsed set so task nodes are visible.
+        app.collapsed_runs.clear();
 
         // Initially: sidebar focused, cursor at 0 (Run0), run=0.
         assert_eq!(app.focused_panel, Panel::Sidebar);
@@ -8978,6 +9004,30 @@ mod tests {
         // Both plans collapsed → only the two headers are visible (alpha's 2
         // tasks stay hidden until expanded).
         assert_eq!(app.visible_tree_nodes().len(), 2);
+    }
+
+    /// Enter (`OpenFocusedNode`) on a collapsed plan with tasks must open the
+    /// plan details tab AND expand the plan in the sidebar so its task previews
+    /// become visible.
+    #[test]
+    fn enter_on_collapsed_plan_expands_it() {
+        let mut app = make_app();
+        app.update(AppEvent::PlansDiscovered {
+            plans: make_plan_entries(),
+        });
+        // alpha (index 0) has 2 tasks and starts collapsed.
+        assert!(app.collapsed_plans.contains(&0));
+        assert_eq!(app.visible_tree_nodes().len(), 2, "only 2 plan headers");
+
+        app.update(AppEvent::OpenFocusedNode);
+
+        assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab opened");
+        assert!(!app.collapsed_plans.contains(&0), "alpha must be expanded");
+        assert_eq!(
+            app.visible_tree_nodes().len(),
+            4,
+            "2 headers + alpha's 2 tasks"
+        );
     }
 
     /// First `Right` on a collapsed plan reveals its tasks; a second `Right`

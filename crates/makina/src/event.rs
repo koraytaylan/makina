@@ -3720,11 +3720,13 @@ A description that is long enough to pass minimums.
             tasks,
             report: makina_core::api::IngestionReport::default(),
         };
-        let app = App::new(
+        let mut app = App::new(
             Arc::clone(&api) as Arc<dyn Api>,
             vec![run],
             std::path::PathBuf::from("."),
         );
+        // Retry tests navigate to a task node, which requires the run expanded.
+        app.collapsed_runs.clear();
         (app, api)
     }
 
