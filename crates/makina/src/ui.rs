@@ -657,6 +657,169 @@ pub fn render(app: &App, frame: &mut Frame) {
                         }
                         ListItem::new(Line::from(spans))
                     }
+                    TreeNode::Folder { folder_idx } => {
+                        // Folder node: level 0 with [+]/[-] disclosure glyph.
+                        let folder_path = &app.opened_folders[*folder_idx];
+                        let folder_name = folder_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?");
+
+                        // Check if this folder has any plans.
+                        let has_plans = app
+                            .plans_by_folder
+                            .get(folder_idx)
+                            .map(|plans| !plans.is_empty())
+                            .unwrap_or(false);
+
+                        if !has_plans {
+                            // Empty folder: render in distinct style with hint.
+                            let spans = vec![
+                                Span::styled(
+                                    "  ",
+                                    Style::default()
+                                        .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                                ),
+                                Span::styled(
+                                    folder_name,
+                                    Style::default()
+                                        .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                                ),
+                                Span::styled(
+                                    "  (empty — Initialize Folder)",
+                                    Style::default()
+                                        .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                                ),
+                            ];
+                            ListItem::new(Line::from(spans))
+                        } else {
+                            // Folder with plans: disclosure glyph + folder name.
+                            let disclosure = if app.collapsed_folders.contains(folder_idx) {
+                                "▸ "
+                            } else {
+                                "▾ "
+                            };
+                            let mut spans = vec![
+                                Span::raw(disclosure),
+                                Span::styled(
+                                    folder_name,
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                            ];
+                            // Show plan count when expanded for readability.
+                            if !app.collapsed_folders.contains(folder_idx) {
+                                let plan_count = app
+                                    .plans_by_folder
+                                    .get(folder_idx)
+                                    .map(|p| p.len())
+                                    .unwrap_or(0);
+                                spans.push(Span::styled(
+                                    format!(
+                                        "  · {plan_count} plan{}",
+                                        if plan_count == 1 { "" } else { "s" }
+                                    ),
+                                    Style::default()
+                                        .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                                ));
+                            }
+                            ListItem::new(Line::from(spans))
+                        }
+                    }
+                    TreeNode::PlanInFolder {
+                        folder_idx,
+                        plan_idx,
+                    } => {
+                        // Plan node in folder: level 1 (indented) with [+]/[-] disclosure glyph.
+                        let plan_entry = &app.plans_by_folder[folder_idx][*plan_idx];
+                        let n_tasks = plan_entry.tasks.len();
+
+                        // Use folder_idx * 1000 + plan_idx as the collapse key, matching visible_tree_nodes().
+                        let collapse_key = folder_idx * 1000 + plan_idx;
+
+                        let disclosure = if n_tasks == 0 {
+                            "    "
+                        } else if app.collapsed_plans.contains(&collapse_key) {
+                            "  ▸ "
+                        } else {
+                            "  ▾ "
+                        };
+
+                        let mut line_spans = vec![
+                            Span::raw(disclosure),
+                            Span::styled(
+                                &plan_entry.slug,
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                        ];
+
+                        if !plan_entry.has_tasks {
+                            // No TASKS.md: this plan still needs a task list.
+                            line_spans.push(Span::styled(
+                                " (no tasks — will plan)",
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                            ));
+                        } else {
+                            // Show the task count so the plan reads as a container.
+                            line_spans.push(Span::styled(
+                                format!(
+                                    "  · {n_tasks} task{}",
+                                    if n_tasks == 1 { "" } else { "s" }
+                                ),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                            ));
+                        }
+
+                        // Check for resetting status via plan slug.
+                        if app.resetting_label(&plan_entry.slug).is_some() {
+                            line_spans.push(Span::styled(
+                                format!("  {} resetting", spinner_frame(app.tick)),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
+                            ));
+                        }
+
+                        ListItem::new(Line::from(line_spans))
+                    }
+                    TreeNode::PlanTaskInFolder {
+                        folder_idx,
+                        plan_idx,
+                        task_idx,
+                    } => {
+                        // Task preview under a folder-scoped plan: level 2 (further indented)
+                        // with tree connector + id — title, and optional GATED marker.
+                        let task = &app.plans_by_folder[folder_idx][*plan_idx].tasks[*task_idx];
+                        let plan_tasks = &app.plans_by_folder[folder_idx][*plan_idx].tasks;
+                        let last = *task_idx + 1 == plan_tasks.len();
+                        let connector = if last { "    └ " } else { "    ├ " };
+
+                        let mut spans = vec![
+                            Span::styled(
+                                connector,
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                            ),
+                            Span::styled(
+                                &task.id,
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
+                            ),
+                            Span::styled(
+                                format!(" — {}", task.title),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                            ),
+                        ];
+                        if task.gated {
+                            spans.push(Span::styled(
+                                "  GATED",
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
+                            ));
+                        }
+                        ListItem::new(Line::from(spans))
+                    }
                 }
             })
             .collect();
@@ -3780,7 +3943,17 @@ fn render_file_browser(
     // Clear the region first so the popup is opaque.
     frame.render_widget(Clear, popup);
 
-    let title = format!(" Open task list — {} ", browser.cwd.display());
+    // Folder-browser mode (plan 0043) reuses this same modal to pick a
+    // directory rather than a task-list file; distinguish the title so the
+    // purpose (open vs. initialize a folder) is clear instead of the
+    // file-browser's "Open task list" wording bleeding through.
+    let title_verb = match app.folder_browser_purpose() {
+        Some(crate::app::FolderBrowserPurpose::OpenFolder) => "Open folder",
+        Some(crate::app::FolderBrowserPurpose::InitializeFolder) => "Initialize folder",
+        Some(crate::app::FolderBrowserPurpose::CloseFolders) => "Close folder",
+        None => "Open task list",
+    };
+    let title = format!(" {title_verb} — {} ", browser.cwd.display());
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -6355,6 +6528,63 @@ mod tests {
         assert!(
             screen.contains("empty directory"),
             "empty browser must show an '(empty directory)' hint"
+        );
+    }
+
+    /// The modal reuses `render_file_browser` for folder selection (plan 0043),
+    /// but its title must reflect the folder-browser purpose instead of the
+    /// file-browser's "Open task list" wording.
+    #[test]
+    fn render_folder_browser_open_folder_shows_open_folder_title() {
+        use crate::app::FolderBrowserPurpose;
+
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.mode = Mode::FolderBrowser {
+            purpose: FolderBrowserPurpose::OpenFolder,
+        };
+        let mut browser = FileBrowser::new(
+            PathBuf::from("/home/user"),
+            vec![DirEntry {
+                name: "projects".into(),
+                path: PathBuf::from("/home/user/projects"),
+                is_dir: true,
+            }],
+        );
+        browser.selected = 0;
+        app.browser = Some(browser);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("Open folder"),
+            "folder browser (OpenFolder purpose) must show an 'Open folder' title, not 'Open task list'"
+        );
+        assert!(
+            !screen.contains("Open task list"),
+            "folder browser must not show the file-browser's 'Open task list' title"
+        );
+    }
+
+    /// Same as above but for the `InitializeFolder` purpose.
+    #[test]
+    fn render_folder_browser_initialize_folder_shows_initialize_title() {
+        use crate::app::FolderBrowserPurpose;
+
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.mode = Mode::FolderBrowser {
+            purpose: FolderBrowserPurpose::InitializeFolder,
+        };
+        app.browser = Some(FileBrowser::new(PathBuf::from("/home/user"), vec![]));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("Initialize folder"),
+            "folder browser (InitializeFolder purpose) must show an 'Initialize folder' title"
         );
     }
 

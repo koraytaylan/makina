@@ -411,6 +411,8 @@ pub enum Mode {
     Normal,
     /// The modal file browser for picking a task-list file to open.
     FileBrowser,
+    /// The modal directory browser for picking a folder to open or initialize.
+    FolderBrowser { purpose: FolderBrowserPurpose },
     /// The modal provider/role configuration editor.
     ProviderConfig,
     /// The modal doctor health-check overlay.
@@ -423,6 +425,17 @@ pub enum Mode {
     ResetConfirm,
     /// Modal explaining why an operation-gated command is unavailable.
     OperationNotice,
+}
+
+/// The purpose of the folder browser modal — determines which event is emitted on selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderBrowserPurpose {
+    /// User is selecting a folder to open and add to the workspace.
+    OpenFolder,
+    /// User is selecting a folder to initialize with git and a plan template.
+    InitializeFolder,
+    /// User is selecting a folder to close and remove from the workspace.
+    CloseFolders,
 }
 
 // ── Command palette ──────────────────────────────────────────────────────────
@@ -473,6 +486,18 @@ impl CommandPalette {
             PaletteAction::Regular {
                 label: "Open task list",
                 event: AppEvent::OpenBrowser,
+            },
+            PaletteAction::Regular {
+                label: "Open Folder",
+                event: AppEvent::OpenFolder,
+            },
+            PaletteAction::Regular {
+                label: "Close Folder",
+                event: AppEvent::CloseFolderRequested,
+            },
+            PaletteAction::Regular {
+                label: "Initialize Folder",
+                event: AppEvent::InitializeFolderRequested,
             },
             PaletteAction::Regular {
                 label: "Start run",
@@ -722,14 +747,23 @@ pub enum FocusState {
 /// hierarchy into a single linear list for cursor-based navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeNode {
+    /// A folder at the top level (index into App::opened_folders).
+    Folder { folder_idx: usize },
+    /// A plan discovered under opened_folders[folder_idx].
+    PlanInFolder { folder_idx: usize, plan_idx: usize },
+    /// A task preview under an expanded plan in a folder.
+    PlanTaskInFolder {
+        folder_idx: usize,
+        plan_idx: usize,
+        task_idx: usize,
+    },
     /// The run at `runs[run]`.
     Run { run: usize },
     /// Task at `runs[run].tasks[task]`.
     Task { run: usize, task: usize },
-    /// A discovered plan at `discovered_plans[plan_idx]`.
+    /// Legacy: a discovered plan (for backward compat).
     Plan { plan_idx: usize },
-    /// A read-only task preview under an *expanded* plan:
-    /// `discovered_plans[plan_idx].tasks[task_idx]`.
+    /// Legacy: a task preview under an expanded plan.
     PlanTask { plan_idx: usize, task_idx: usize },
 }
 
@@ -852,6 +886,11 @@ pub enum AppEvent {
         /// The plans discovered under `docs/plans/` by
         /// [`makina_core::orchestrator::discover_plans`].
         plans: Vec<makina_core::orchestrator::PlanEntry>,
+    },
+    /// Per-folder discovery result arrived: store discovered plans by folder.
+    PlansDiscoveredPerFolder {
+        /// The plans discovered per folder: folder_idx → list of PlanEntry.
+        plans_map: std::collections::HashMap<usize, Vec<makina_core::orchestrator::PlanEntry>>,
     },
     /// Open the focused node in the sidebar (Enter).
     ///
@@ -998,6 +1037,36 @@ pub enum AppEvent {
     SettingsCommit,
     /// Close the settings screen without saving.
     CloseSettings,
+
+    // ── Folder operations (plan 0043) ────────────────────────────────────────
+    /// User requested to open a folder via palette action.
+    OpenFolder,
+
+    /// User selected a folder path to open (from file picker).
+    OpenFolderSelected { path: std::path::PathBuf },
+
+    /// User requested to close a folder via palette action.
+    CloseFolderRequested,
+
+    /// User selected a folder path to close (from list).
+    CloseFolderConfirmed { path: std::path::PathBuf },
+
+    /// User requested to initialize a folder via palette action.
+    InitializeFolderRequested,
+
+    /// User selected a folder path to initialize (from file picker).
+    InitializeFolderSelected { path: std::path::PathBuf },
+
+    /// Move the folder browser selection one row up.
+    FolderBrowserUp,
+    /// Move the folder browser selection one row down.
+    FolderBrowserDown,
+    /// Go up to the parent directory in the folder browser (Backspace).
+    FolderBrowserParent,
+    /// Activate the highlighted folder browser entry (Enter).
+    FolderBrowserActivate {
+        purpose: crate::app::FolderBrowserPurpose,
+    },
 
     // ── Tabbed content pane (plan 0031) ──────────────────────────────────────
     /// Open a new tab with the given content (or switch to it if already open).
@@ -1272,6 +1341,10 @@ pub struct App {
     /// [`AppEvent::BrowserOpened`].
     pub browser: Option<FileBrowser>,
 
+    /// The purpose of the current folder browser, if one is active.
+    /// Set when opening a folder browser; cleared when closing.
+    pub folder_browser_purpose: Option<FolderBrowserPurpose>,
+
     /// Provider/role configuration editor state.  `Some` only while
     /// [`App::mode`] is [`Mode::ProviderConfig`].
     pub provider_editor: Option<ProviderEditor>,
@@ -1312,6 +1385,12 @@ pub struct App {
     /// Plans start collapsed: every discovered index is inserted on
     /// [`AppEvent::PlansDiscovered`].
     pub collapsed_plans: HashSet<usize>,
+
+    /// Folder indices currently collapsed in the sidebar tree.
+    pub collapsed_folders: HashSet<usize>,
+
+    /// Plans scoped to each folder: folder_idx → list of PlanEntry.
+    pub plans_by_folder: HashMap<usize, Vec<makina_core::orchestrator::PlanEntry>>,
 
     /// Index into `visible_tree_nodes()` of the focused sidebar node.
     /// `None` when no runs are open.
@@ -1583,6 +1662,20 @@ pub struct App {
     /// click can open/focus that node's tab (mirrors keyboard Enter). Cleared
     /// and repopulated every frame, so scrolling and resizes self-correct.
     pub sidebar_node_bounds: std::cell::RefCell<Vec<(usize, Rect)>>,
+
+    /// Opened folders persisted in workspace.
+    pub opened_folders: Vec<PathBuf>,
+
+    /// Workspace state for save/load.
+    pub workspace: crate::workspace::Workspace,
+
+    /// Explicit override for the workspace persistence file, used by tests so
+    /// they never touch the operator's real `$HOME/.makina/workspace.toml`.
+    /// When `None` (the production default), workspace-saving event handlers
+    /// call [`crate::workspace::Workspace::save`], which resolves the real
+    /// home directory; when `Some(path)`, they call
+    /// [`crate::workspace::Workspace::save_to`] with this path instead.
+    pub workspace_path_override: Option<PathBuf>,
 }
 
 /// Compute a hash of the input text for cache key generation.
@@ -1608,6 +1701,7 @@ impl App {
     /// order shown in the sidebar (plans first, then runs and their tasks if expanded, repeat).
     pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
+
         // Slugs of plans that already have an open Run (any status, deduped to
         // latest below). Such a plan is rendered as its Run node — NOT also as
         // static plan — otherwise starting would duplicate.
@@ -1616,7 +1710,45 @@ impl App {
             .iter()
             .map(|r| makina_core::orchestrator::plan_slug(&r.task_list_path))
             .collect();
-        // Add discovered plans at the top (skipping any that now have a Run).
+
+        // Step 1: Add discovered folders and their plans.
+        // These use the new PlanInFolder/PlanTaskInFolder variants.
+        for folder_idx in 0..self.opened_folders.len() {
+            nodes.push(TreeNode::Folder { folder_idx });
+
+            // Only expand this folder if not collapsed.
+            if !self.collapsed_folders.contains(&folder_idx)
+                && let Some(plans) = self.plans_by_folder.get(&folder_idx)
+            {
+                for (local_plan_idx, plan) in plans.iter().enumerate() {
+                    // Skip if this plan has an open Run (same dedup as before).
+                    if run_slugs.contains(&plan.slug) {
+                        continue;
+                    }
+                    nodes.push(TreeNode::PlanInFolder {
+                        folder_idx,
+                        plan_idx: local_plan_idx,
+                    });
+
+                    // Expand plan tasks if not collapsed.
+                    if !self
+                        .collapsed_plans
+                        .contains(&(folder_idx * 1000 + local_plan_idx))
+                    {
+                        for task_idx in 0..plan.tasks.len() {
+                            nodes.push(TreeNode::PlanTaskInFolder {
+                                folder_idx,
+                                plan_idx: local_plan_idx,
+                                task_idx,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2: Add legacy discovered plans (for backward compat).
+        // These use the legacy Plan/PlanTask variants.
         for (plan_idx, plan) in self.discovered_plans.iter().enumerate() {
             if run_slugs.contains(&plan.slug) {
                 continue;
@@ -1628,12 +1760,8 @@ impl App {
                 }
             }
         }
-        // Add open runs and their expanded tasks, but deduplicated by plan slug
-        // (only for actual plan-style TASKS.md runs): keep only the most recent
-        // (highest run_uid) per plan. This detects and suppresses duplicate
-        // "same plan" entries when a plan has multiple previous (disk) runs.
-        // Non-plan runs (e.g. direct .md opens or test fixtures using .tasks/*.json)
-        // are never deduped by this.
+
+        // Step 3: Add open runs and their expanded tasks (unchanged).
         let is_plan_style = |p: &std::path::Path| -> bool {
             p.file_name()
                 .and_then(|s| s.to_str())
@@ -1660,6 +1788,7 @@ impl App {
                 }
             }
         }
+
         nodes
     }
 
@@ -1693,8 +1822,12 @@ impl App {
                 self.selected_run = Some(run);
                 // Tab state is independent from sidebar navigation (plan 0031).
             }
-            Some(TreeNode::Plan { plan_idx: _ }) | Some(TreeNode::PlanTask { plan_idx: _, .. }) => {
-                // Plan / plan-task nodes have no associated run.
+            Some(TreeNode::Plan { plan_idx: _ })
+            | Some(TreeNode::PlanTask { plan_idx: _, .. })
+            | Some(TreeNode::Folder { .. })
+            | Some(TreeNode::PlanInFolder { .. })
+            | Some(TreeNode::PlanTaskInFolder { .. }) => {
+                // Plan / plan-task nodes and folder nodes have no associated run.
                 self.selected_run = None;
                 // Tab state is independent from sidebar navigation (plan 0031).
             }
@@ -1758,13 +1891,20 @@ impl App {
         }
     }
 
-    /// Close plan tabs whose slug is no longer in `discovered_plans` (plan 0032).
-    /// Called when plans are re-discovered and the list changes.
+    /// Close plan tabs whose slug is no longer in `discovered_plans` or
+    /// `plans_by_folder` (plan 0032; extended for per-folder discovery in
+    /// plan 0043). Called when plans are re-discovered and the list changes.
     fn close_tabs_for_missing_plans(&mut self) {
         let valid_plans: std::collections::HashSet<_> = self
             .discovered_plans
             .iter()
             .map(|p| p.slug.clone())
+            .chain(
+                self.plans_by_folder
+                    .values()
+                    .flatten()
+                    .map(|p| p.slug.clone()),
+            )
             .collect();
         let mut indices_to_close = Vec::new();
         let mut slugs_to_remove = Vec::new();
@@ -1857,6 +1997,52 @@ impl App {
                 self.sync_selection_from_cursor();
                 true
             }
+            Some(TreeNode::Folder { folder_idx }) => {
+                // Toggle folder expansion: if collapsed, expand it (remove from collapsed_folders);
+                // otherwise collapse it (add to collapsed_folders).
+                if self.collapsed_folders.contains(&folder_idx) {
+                    self.collapsed_folders.remove(&folder_idx);
+                } else {
+                    self.collapsed_folders.insert(folder_idx);
+                }
+                self.move_cursor_to_folder_header(folder_idx);
+                self.sync_selection_from_cursor();
+                true
+            }
+            Some(TreeNode::PlanInFolder {
+                folder_idx,
+                plan_idx,
+            }) => {
+                // Check if the plan has tasks before allowing expand/collapse.
+                if let Some(plans) = self.plans_by_folder.get(&folder_idx)
+                    && let Some(plan) = plans.get(plan_idx)
+                    && plan.tasks.is_empty()
+                {
+                    return false;
+                }
+                // Use the same collapse key as visible_tree_nodes() uses.
+                let collapse_key = folder_idx * 1000 + plan_idx;
+                if self.collapsed_plans.contains(&collapse_key) {
+                    self.collapsed_plans.remove(&collapse_key);
+                } else {
+                    self.collapsed_plans.insert(collapse_key);
+                }
+                self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
+                self.sync_selection_from_cursor();
+                true
+            }
+            Some(TreeNode::PlanTaskInFolder {
+                folder_idx,
+                plan_idx,
+                ..
+            }) => {
+                // On a task leaf, collapse its parent plan and park the cursor on the plan header.
+                let collapse_key = folder_idx * 1000 + plan_idx;
+                self.collapsed_plans.insert(collapse_key);
+                self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
+                self.sync_selection_from_cursor();
+                true
+            }
         }
     }
 
@@ -1879,6 +2065,49 @@ impl App {
             .position(|node| matches!(node, TreeNode::Plan { plan_idx: p } if *p == plan_idx))
         {
             self.tree_cursor = Some(idx);
+        }
+    }
+
+    /// Park the tree cursor on the given folder's header node.
+    fn move_cursor_to_folder_header(&mut self, folder_idx: usize) {
+        if let Some(idx) = self
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, TreeNode::Folder { folder_idx: f } if *f == folder_idx))
+        {
+            self.tree_cursor = Some(idx);
+        }
+    }
+
+    /// Park the tree cursor on the given plan-in-folder's header node.
+    fn move_cursor_to_plan_in_folder_header(&mut self, folder_idx: usize, plan_idx: usize) {
+        if let Some(idx) = self.visible_tree_nodes().iter().position(|node| {
+            matches!(
+                node,
+                TreeNode::PlanInFolder {
+                    folder_idx: f,
+                    plan_idx: p
+                } if *f == folder_idx && *p == plan_idx
+            )
+        }) {
+            self.tree_cursor = Some(idx);
+        }
+    }
+
+    /// Open/focus the plan-details tab for a plan in a folder, and
+    /// ensure the plan is expanded in the sidebar (revealing its task previews).
+    fn activate_plan_in_folder(&mut self, folder_idx: usize, plan_idx: usize) {
+        if let Some(plans) = self.plans_by_folder.get(&folder_idx)
+            && let Some(plan) = plans.get(plan_idx)
+        {
+            let plan_slug = plan.slug.clone();
+            self.tabs.open_tab(TabContent::Plan { plan_slug });
+            if !plan.tasks.is_empty() {
+                let collapse_key = folder_idx * 1000 + plan_idx;
+                self.collapsed_plans.remove(&collapse_key);
+                self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
+                self.sync_selection_from_cursor();
+            }
         }
     }
 
@@ -1919,6 +2148,32 @@ impl App {
                     };
                     self.tabs.open_tab(tab_content);
                 }
+            }
+            Some(TreeNode::PlanInFolder {
+                folder_idx,
+                plan_idx,
+            }) => {
+                self.activate_plan_in_folder(folder_idx, plan_idx);
+            }
+            Some(TreeNode::PlanTaskInFolder {
+                folder_idx,
+                plan_idx,
+                task_idx,
+            }) => {
+                if let Some(plans) = self.plans_by_folder.get(&folder_idx)
+                    && let Some(plan) = plans.get(plan_idx)
+                    && let Some(preview) = plan.tasks.get(task_idx)
+                {
+                    let tab_content = TabContent::PlanTask {
+                        plan_slug: plan.slug.clone(),
+                        task_id: preview.id.clone(),
+                    };
+                    self.tabs.open_tab(tab_content);
+                }
+            }
+            Some(TreeNode::Folder { .. }) => {
+                // Enter on a Folder expands/collapses it (like Space)
+                self.tree_toggle_expand();
             }
             Some(TreeNode::Task { run, task }) => {
                 if let Some(run_view) = self.runs.get(run)
@@ -1982,6 +2237,7 @@ impl App {
             mode: Mode::Normal,
             dependency_view: DependencyViewMode::Off,
             browser: None,
+            folder_browser_purpose: None,
             provider_editor: None,
             discovered_capabilities: None,
             providers: Vec::new(),
@@ -1991,6 +2247,8 @@ impl App {
             selected_task,
             collapsed_runs,
             collapsed_plans: HashSet::new(),
+            collapsed_folders: HashSet::new(),
+            plans_by_folder: HashMap::new(),
             tree_cursor,
             exchange_logs: HashMap::new(),
             task_last_activity_tick: HashMap::new(),
@@ -2044,6 +2302,9 @@ impl App {
             tab_bounds: std::cell::RefCell::new(Vec::new()),
             tab_close_bounds: std::cell::RefCell::new(Vec::new()),
             sidebar_node_bounds: std::cell::RefCell::new(Vec::new()),
+            opened_folders: Vec::new(),
+            workspace: crate::workspace::Workspace::new(),
+            workspace_path_override: None,
         }
     }
 
@@ -2065,6 +2326,8 @@ impl App {
         caps: makina_core::config::CapsConfig,
         concurrency: usize,
         final_merge: FinalMerge,
+        opened_folders: Vec<PathBuf>,
+        workspace: crate::workspace::Workspace,
     ) -> Self {
         let mut app = Self::new(api, initial_runs, repo_root);
         app.providers = providers;
@@ -2075,6 +2338,8 @@ impl App {
         app.caps = caps;
         app.concurrency = concurrency;
         app.final_merge = final_merge;
+        app.opened_folders = opened_folders;
+        app.workspace = workspace;
         app
     }
 
@@ -2122,7 +2387,34 @@ impl App {
 
     /// Whether the modal file browser is currently active.
     pub fn is_browsing(&self) -> bool {
-        self.mode == Mode::FileBrowser
+        matches!(self.mode, Mode::FileBrowser | Mode::FolderBrowser { .. })
+    }
+
+    /// Whether the folder browser modal is currently active.
+    pub fn is_folder_browsing(&self) -> bool {
+        matches!(self.mode, Mode::FolderBrowser { .. })
+    }
+
+    /// Persist `self.workspace`, honoring [`App::workspace_path_override`].
+    ///
+    /// Production callers leave `workspace_path_override` as `None`, so this
+    /// resolves the real `$HOME/.makina/workspace.toml`
+    /// ([`crate::workspace::Workspace::save`]). Tests set the override to a
+    /// tempdir path so the folder open/close handlers never write to the
+    /// operator's actual home directory.
+    pub fn save_workspace(&self) -> Result<(), String> {
+        match &self.workspace_path_override {
+            Some(path) => self.workspace.save_to(path),
+            None => self.workspace.save(),
+        }
+    }
+
+    /// Get the folder browser purpose if currently in folder browser mode.
+    pub fn folder_browser_purpose(&self) -> Option<FolderBrowserPurpose> {
+        match self.mode {
+            Mode::FolderBrowser { purpose } => Some(purpose),
+            _ => None,
+        }
     }
 
     /// Whether the provider configuration editor is currently active.
@@ -2755,9 +3047,8 @@ impl App {
                 true
             }
             AppEvent::FocusRightOrExpand => {
-                // On a *collapsed* run or plan, the first `Right` expands it; on an
-                // already-expanded node or a leaf, `Right` crosses into the content
-                // pane.
+                // On a *collapsed* run, plan, or folder, the first `Right` expands it; on an
+                // already-expanded node or a leaf, `Right` crosses into the content pane.
                 let collapsed_expandable = match self.focused_node() {
                     Some(TreeNode::Run { run }) => self
                         .runs
@@ -2770,6 +3061,21 @@ impl App {
                                 .get(plan_idx)
                                 .is_some_and(|p| !p.tasks.is_empty())
                     }
+                    Some(TreeNode::Folder { folder_idx }) => {
+                        self.collapsed_folders.contains(&folder_idx)
+                    }
+                    Some(TreeNode::PlanInFolder {
+                        folder_idx,
+                        plan_idx,
+                    }) => {
+                        let collapse_key = folder_idx * 1000 + plan_idx;
+                        self.collapsed_plans.contains(&collapse_key)
+                            && self
+                                .plans_by_folder
+                                .get(&folder_idx)
+                                .and_then(|plans| plans.get(plan_idx))
+                                .is_some_and(|p| !p.tasks.is_empty())
+                    }
                     _ => false,
                 };
                 if collapsed_expandable {
@@ -2779,8 +3085,17 @@ impl App {
                     // pane, open its details tab so the content pane shows the plan
                     // (SCOPE/ARCH/TASKS/STATUS). This makes arrow navigation into
                     // a plan behave like Enter (open details) + Right (cross).
-                    if let Some(TreeNode::Plan { plan_idx }) = self.focused_node() {
-                        self.activate_plan_node(plan_idx);
+                    match self.focused_node() {
+                        Some(TreeNode::Plan { plan_idx }) => {
+                            self.activate_plan_node(plan_idx);
+                        }
+                        Some(TreeNode::PlanInFolder {
+                            folder_idx,
+                            plan_idx,
+                        }) => {
+                            self.activate_plan_in_folder(folder_idx, plan_idx);
+                        }
+                        _ => {}
                     }
                     self.focused_panel = Panel::Main;
                 }
@@ -2790,7 +3105,7 @@ impl App {
                 match self.focused_panel {
                     // From the content pane, `Left` steps back to the sidebar (no collapse).
                     Panel::Main => self.focused_panel = Panel::Sidebar,
-                    // In the sidebar, `Left` collapses an *expanded* run/plan. On a
+                    // In the sidebar, `Left` collapses an *expanded* run/plan/folder. On a
                     // plan-task preview leaf, `Left` collapses its parent plan and
                     // parks the cursor on it.
                     Panel::Sidebar => match self.focused_node() {
@@ -2815,6 +3130,37 @@ impl App {
                             // Collapse the parent plan and move the cursor up to it.
                             self.collapsed_plans.insert(plan_idx);
                             self.move_cursor_to_plan_header(plan_idx);
+                            self.sync_selection_from_cursor();
+                        }
+                        Some(TreeNode::Folder { folder_idx })
+                            if !self.collapsed_folders.contains(&folder_idx) =>
+                        {
+                            self.tree_toggle_expand(); // collapse it
+                        }
+                        Some(TreeNode::PlanInFolder {
+                            folder_idx,
+                            plan_idx,
+                        }) if {
+                            let collapse_key = folder_idx * 1000 + plan_idx;
+                            !self.collapsed_plans.contains(&collapse_key)
+                                && self
+                                    .plans_by_folder
+                                    .get(&folder_idx)
+                                    .and_then(|plans| plans.get(plan_idx))
+                                    .is_some_and(|p| !p.tasks.is_empty())
+                        } =>
+                        {
+                            self.tree_toggle_expand(); // collapse it
+                        }
+                        Some(TreeNode::PlanTaskInFolder {
+                            folder_idx,
+                            plan_idx,
+                            ..
+                        }) => {
+                            // Collapse the parent plan and move the cursor up to it.
+                            let collapse_key = folder_idx * 1000 + plan_idx;
+                            self.collapsed_plans.insert(collapse_key);
+                            self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
                             self.sync_selection_from_cursor();
                         }
                         _ => {}
@@ -3030,7 +3376,12 @@ impl App {
             }
             AppEvent::BrowserOpened { dir, entries } => {
                 // A directory listing arrived: enter (or refresh) the browser.
-                self.mode = Mode::FileBrowser;
+                // Set the mode based on whether we're in folder browser mode.
+                if let Some(purpose) = self.folder_browser_purpose {
+                    self.mode = Mode::FolderBrowser { purpose };
+                } else {
+                    self.mode = Mode::FileBrowser;
+                }
                 self.browser = Some(FileBrowser::new(dir, entries));
                 self.status_message = None;
                 self.busy = None;
@@ -3059,6 +3410,32 @@ impl App {
             AppEvent::CloseBrowser => {
                 self.mode = Mode::Normal;
                 self.browser = None;
+                self.folder_browser_purpose = None;
+                true
+            }
+
+            // ── Folder browser navigation (plan 0043) ──────────────────────────
+            // These events update the browser state for folder selection.
+            // They are handled in resolve_io for the directory reads (IO), but
+            // the navigation state updates happen here.
+            AppEvent::FolderBrowserUp => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.select_up();
+                }
+                true
+            }
+            AppEvent::FolderBrowserDown => {
+                if let Some(browser) = self.browser.as_mut() {
+                    browser.select_down();
+                }
+                true
+            }
+            AppEvent::FolderBrowserParent => {
+                // Handled in resolve_io; just redraw here.
+                true
+            }
+            AppEvent::FolderBrowserActivate { .. } => {
+                // Handled in resolve_io; just redraw here.
                 true
             }
 
@@ -3079,6 +3456,36 @@ impl App {
                 // (`cursor_survives_runs_update`). On the common first-discovery path
                 // (no prior cursor) this parks it on the first plan so Right/Enter
                 // act on the plan instead of falling through to the content pane.
+                let node_count = self.visible_tree_nodes().len();
+                self.tree_cursor = match (self.tree_cursor, node_count) {
+                    (_, 0) => None,
+                    (None, _) => Some(0),
+                    (Some(c), n) => Some(c.min(n - 1)),
+                };
+                self.sync_selection_from_cursor();
+                self.status_message = None;
+                self.busy = None;
+                true
+            }
+
+            AppEvent::PlansDiscoveredPerFolder { plans_map } => {
+                // Store per-folder discovered plans for sidebar tree integration.
+                self.plans_by_folder = plans_map;
+                // Start every folder collapsed EXCEPT the first (folder_idx 0).
+                // The auto-discovered launch folder / sole opened folder stays expanded
+                // so the single-folder launch case keeps its plans immediately visible —
+                // matching today's behavior and preserving the "run inside a repo" experience.
+                self.collapsed_folders.clear();
+                for folder_idx in self.plans_by_folder.keys().copied() {
+                    if folder_idx != 0 {
+                        self.collapsed_folders.insert(folder_idx);
+                    }
+                }
+                // Close plan tabs whose slug is no longer in `plans_by_folder`
+                // (plan 0032: close_tabs_for_missing_plans).
+                self.close_tabs_for_missing_plans();
+                // Keep the tree cursor valid against the freshly rebuilt node list
+                // and resync the derived selection — mirrors the RunLoaded invariant.
                 let node_count = self.visible_tree_nodes().len();
                 self.tree_cursor = match (self.tree_cursor, node_count) {
                     (_, 0) => None,
@@ -3808,6 +4215,40 @@ impl App {
                             self.sync_selection_from_cursor();
                         }
                     }
+                    TreeNode::Folder { folder_idx } => {
+                        // Clicking a folder row toggles its expansion, mirroring
+                        // Enter (activate_focused_tree_node) on a Folder node.
+                        if self.collapsed_folders.contains(&folder_idx) {
+                            self.collapsed_folders.remove(&folder_idx);
+                        } else {
+                            self.collapsed_folders.insert(folder_idx);
+                        }
+                        self.move_cursor_to_folder_header(folder_idx);
+                        self.sync_selection_from_cursor();
+                    }
+                    TreeNode::PlanInFolder {
+                        folder_idx,
+                        plan_idx,
+                    } => {
+                        self.activate_plan_in_folder(folder_idx, plan_idx);
+                    }
+                    TreeNode::PlanTaskInFolder {
+                        folder_idx,
+                        plan_idx,
+                        task_idx,
+                    } => {
+                        // A plan's task preview opens its own task tab (distinct
+                        // from the plan tab), matching the legacy PlanTask arm above.
+                        if let Some(plans) = self.plans_by_folder.get(&folder_idx)
+                            && let Some(plan) = plans.get(plan_idx)
+                            && let Some(preview) = plan.tasks.get(task_idx)
+                        {
+                            let plan_slug = plan.slug.clone();
+                            let task_id = preview.id.clone();
+                            self.tabs
+                                .open_tab(TabContent::PlanTask { plan_slug, task_id });
+                        }
+                    }
                 }
                 true
             }
@@ -3877,6 +4318,50 @@ impl App {
             AppEvent::ResizeSidebarRight => {
                 self.sidebar_width_percent = (self.sidebar_width_percent + 2).min(50);
                 true
+            }
+
+            // ── Folder operations (plan 0043) ───────────────────────────────────────
+            // Set the folder browser purpose before resolve_io spawns the directory read.
+            AppEvent::OpenFolder => {
+                self.folder_browser_purpose = Some(FolderBrowserPurpose::OpenFolder);
+                self.busy = Some("Opening folder browser…".to_string());
+                true
+            }
+            AppEvent::InitializeFolderRequested => {
+                self.folder_browser_purpose = Some(FolderBrowserPurpose::InitializeFolder);
+                self.busy = Some("Opening folder browser…".to_string());
+                true
+            }
+            // `resolve_io` has a dedicated arm for `OpenFolderSelected` /
+            // `InitializeFolderSelected` (it resolves them to `Tick` — the modal
+            // is already closed by `FolderBrowserActivate`'s `CloseBrowser`
+            // resolution in the same pass), so `update` never sees the original
+            // event. Persisting the folder + triggering discovery is
+            // `handle-folder-open-close-events` / `handle-initialize-folder-event`
+            // (later tasks in plan 0043).
+            AppEvent::OpenFolderSelected { .. } => {
+                unreachable!(
+                    "OpenFolderSelected should be handled in resolve_io; \
+                    if this fires, the event loop logic (plan 0043) is broken"
+                )
+            }
+            AppEvent::CloseFolderRequested => {
+                unreachable!(
+                    "CloseFolderRequested should be handled in resolve_io; \
+                    if this fires, the event loop logic (plan 0043) is broken"
+                )
+            }
+            AppEvent::CloseFolderConfirmed { .. } => {
+                unreachable!(
+                    "CloseFolderConfirmed should be handled in resolve_io; \
+                    if this fires, the event loop logic (plan 0043) is broken"
+                )
+            }
+            AppEvent::InitializeFolderSelected { .. } => {
+                unreachable!(
+                    "InitializeFolderSelected should be resolved to Tick in resolve_io; \
+                    if this fires, the event loop logic (plan 0043) is broken"
+                )
             }
 
             // ── Project discovery (plan 0025) ─────────────────────────────────────
@@ -5967,6 +6452,120 @@ mod tests {
         assert!(app.browser.is_none());
     }
 
+    // ── Folder browser (plan 0043) ──────────────────────────────────────────────
+
+    /// `OpenFolder` sets the PENDING `folder_browser_purpose` field to
+    /// `OpenFolder` and marks the app busy, so the follow-up `BrowserOpened`
+    /// (below) knows to enter `Mode::FolderBrowser` rather than
+    /// `Mode::FileBrowser`. Note: `App::folder_browser_purpose()` (the accessor)
+    /// reads `self.mode`, not this pending field, so it still returns `None`
+    /// here — mode only flips once `BrowserOpened` arrives.
+    #[test]
+    fn open_folder_sets_purpose_and_busy() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenFolder);
+        assert_eq!(
+            app.folder_browser_purpose,
+            Some(FolderBrowserPurpose::OpenFolder)
+        );
+        assert!(app.busy.is_some());
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "mode flips only once BrowserOpened arrives"
+        );
+    }
+
+    /// `InitializeFolderRequested` sets the pending `folder_browser_purpose`
+    /// field to `InitializeFolder` (distinct from `OpenFolder`) and marks the
+    /// app busy.
+    #[test]
+    fn initialize_folder_requested_sets_purpose_and_busy() {
+        let mut app = make_app();
+        app.update(AppEvent::InitializeFolderRequested);
+        assert_eq!(
+            app.folder_browser_purpose,
+            Some(FolderBrowserPurpose::InitializeFolder)
+        );
+        assert!(app.busy.is_some());
+    }
+
+    /// Once a folder-browser purpose is set, `BrowserOpened` must enter
+    /// `Mode::FolderBrowser { purpose }` (not `Mode::FileBrowser`), and
+    /// `is_folder_browsing()` must report true.
+    #[test]
+    fn browser_opened_enters_folder_browser_mode_when_purpose_set() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenFolder);
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/home/user"),
+            entries: vec![DirEntry {
+                name: "projects".into(),
+                path: PathBuf::from("/home/user/projects"),
+                is_dir: true,
+            }],
+        });
+        assert!(app.is_browsing());
+        assert!(app.is_folder_browsing());
+        assert_eq!(
+            app.mode,
+            Mode::FolderBrowser {
+                purpose: FolderBrowserPurpose::OpenFolder
+            }
+        );
+        assert_eq!(
+            app.folder_browser_purpose(),
+            Some(FolderBrowserPurpose::OpenFolder)
+        );
+    }
+
+    /// Arrow-key navigation events (`FolderBrowserUp`/`FolderBrowserDown`) move
+    /// the shared `browser` selection exactly like the file-browser equivalents.
+    #[test]
+    fn folder_browser_up_down_move_selection() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenFolder);
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/home/user"),
+            entries: vec![
+                DirEntry {
+                    name: "a".into(),
+                    path: PathBuf::from("/home/user/a"),
+                    is_dir: true,
+                },
+                DirEntry {
+                    name: "b".into(),
+                    path: PathBuf::from("/home/user/b"),
+                    is_dir: true,
+                },
+            ],
+        });
+        assert_eq!(app.browser.as_ref().unwrap().selected, 0);
+        app.update(AppEvent::FolderBrowserDown);
+        assert_eq!(app.browser.as_ref().unwrap().selected, 1);
+        app.update(AppEvent::FolderBrowserUp);
+        assert_eq!(app.browser.as_ref().unwrap().selected, 0);
+    }
+
+    /// `CloseBrowser` from a folder-browser session returns to `Mode::Normal`
+    /// and clears `folder_browser_purpose` (so a subsequent plain `[o]` open
+    /// does not accidentally re-enter folder-browser mode).
+    #[test]
+    fn close_browser_from_folder_mode_clears_purpose() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenFolder);
+        app.update(AppEvent::BrowserOpened {
+            dir: PathBuf::from("/home/user"),
+            entries: vec![],
+        });
+        assert!(app.is_folder_browsing());
+
+        app.update(AppEvent::CloseBrowser);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.browser.is_none());
+        assert_eq!(app.folder_browser_purpose(), None);
+    }
+
     // ── Provider configuration editor (task 0041) ──────────────────────────────
 
     /// Pressing `g` dispatches `OpenProviderEditor`, which must set
@@ -6019,6 +6618,8 @@ mod tests {
             makina_core::config::CapsConfig::default(),
             3,
             FinalMerge::Squash,
+            vec![],
+            crate::workspace::Workspace::new(),
         );
 
         // Sanity: starts in Normal mode with no editor open.
@@ -7882,8 +8483,8 @@ mod tests {
         let palette = app.command_palette.as_ref().unwrap();
         assert_eq!(
             palette.filtered().len(),
-            13,
-            "full list must have 13 actions"
+            16,
+            "full list must have 16 actions"
         );
         for label in [
             "Start run",
@@ -7934,7 +8535,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            13,
+            16,
             "full list restored after filter cleared"
         );
     }
@@ -11556,5 +12157,935 @@ mod tests {
 
         // Should clamp to 50% (maximum).
         assert_eq!(app.sidebar_width_percent, 50);
+    }
+
+    // ── Folder-scoped tree navigation (plan 0043, workstream 0002) ─────────────
+
+    #[test]
+    fn test_folder_node_space_toggles_expansion() {
+        let mut app = make_app();
+
+        // Add a folder with a mock plan entry
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+
+        // Folder starts collapsed (seeds in PlansDiscoveredPerFolder event handler)
+        // In tests we manually seed this
+        app.collapsed_folders.insert(0);
+        assert!(
+            app.collapsed_folders.contains(&0),
+            "folder should be collapsed initially"
+        );
+
+        // Move cursor to the folder node
+        let nodes = app.visible_tree_nodes();
+        if let Some(idx) = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+        {
+            app.tree_cursor = Some(idx);
+        }
+
+        // Space should expand the folder
+        app.update(AppEvent::ToggleTreeNode);
+        assert!(
+            !app.collapsed_folders.contains(&0),
+            "folder should be expanded after Space"
+        );
+
+        // Space again should collapse it
+        app.update(AppEvent::ToggleTreeNode);
+        assert!(
+            app.collapsed_folders.contains(&0),
+            "folder should be collapsed after second ToggleTreeNode"
+        );
+
+        // Verify the cursor is still on the folder header after toggle
+        if let Some(TreeNode::Folder { folder_idx: 0 }) = app.focused_node() {
+            // Good, cursor is on the folder node
+        } else {
+            panic!("cursor should be on folder node after toggle");
+        }
+    }
+
+    #[test]
+    fn test_plan_in_folder_space_toggles_task_expansion() {
+        let mut app = make_app();
+
+        // Add a folder with a plan that has tasks
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![
+                makina_core::orchestrator::PlanTaskPreview {
+                    id: "task-1".to_string(),
+                    title: "Task 1".to_string(),
+                    gated: false,
+                    depends_on: vec![],
+                    body: String::new(),
+                },
+                makina_core::orchestrator::PlanTaskPreview {
+                    id: "task-2".to_string(),
+                    title: "Task 2".to_string(),
+                    gated: false,
+                    depends_on: vec![],
+                    body: String::new(),
+                },
+            ],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+
+        // Expand the folder first
+        app.collapsed_folders.clear();
+
+        // Get the PlanInFolder node
+        let nodes = app.visible_tree_nodes();
+        let has_tasks = nodes.iter().any(|n| {
+            matches!(
+                n,
+                TreeNode::PlanTaskInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0,
+                    ..
+                }
+            )
+        });
+
+        // Tasks should be visible initially (plan not in collapsed_plans with key 0*1000+0)
+        assert!(has_tasks, "tasks should be visible initially");
+
+        // Find and move cursor to the PlanInFolder node
+        if let Some(idx) = nodes.iter().position(|n| {
+            matches!(
+                n,
+                TreeNode::PlanInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0
+                }
+            )
+        }) {
+            app.tree_cursor = Some(idx);
+        }
+
+        // Space should collapse the plan's tasks
+        app.update(AppEvent::ToggleTreeNode);
+        let collapse_key = 0; // folder_idx=0 * 1000 + plan_idx=0
+        assert!(
+            app.collapsed_plans.contains(&collapse_key),
+            "plan should be collapsed after ToggleTreeNode"
+        );
+
+        // Verify tasks are now hidden
+        let nodes = app.visible_tree_nodes();
+        let has_tasks = nodes.iter().any(|n| {
+            matches!(
+                n,
+                TreeNode::PlanTaskInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0,
+                    ..
+                }
+            )
+        });
+        assert!(!has_tasks, "tasks should be hidden after collapse");
+
+        // Space again should expand it
+        app.update(AppEvent::ToggleTreeNode);
+        assert!(
+            !app.collapsed_plans.contains(&0), // collapse_key for folder_idx=0, plan_idx=0
+            "plan should be expanded after second ToggleTreeNode"
+        );
+
+        // Verify tasks are visible again
+        let nodes = app.visible_tree_nodes();
+        let has_tasks = nodes.iter().any(|n| {
+            matches!(
+                n,
+                TreeNode::PlanTaskInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0,
+                    ..
+                }
+            )
+        });
+        assert!(has_tasks, "tasks should be visible after re-expand");
+    }
+
+    #[test]
+    fn test_plan_in_folder_enter_opens_plan_detail() {
+        let mut app = make_app();
+
+        // Add a folder with a plan
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+        app.collapsed_folders.clear();
+
+        // Move cursor to the PlanInFolder node
+        let nodes = app.visible_tree_nodes();
+        if let Some(idx) = nodes.iter().position(|n| {
+            matches!(
+                n,
+                TreeNode::PlanInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0
+                }
+            )
+        }) {
+            app.tree_cursor = Some(idx);
+        }
+
+        // Verify no tabs are open initially
+        assert_eq!(app.tabs.open_tabs.len(), 0, "no tabs open initially");
+
+        // Press Enter to activate the plan
+        app.update(AppEvent::OpenFocusedNode);
+
+        // Verify a plan tab was opened
+        assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab should be opened");
+        if let Some(active_idx) = app.tabs.active_tab {
+            if let TabContent::Plan { plan_slug } = &app.tabs.open_tabs[active_idx] {
+                assert_eq!(plan_slug, "test-plan", "correct plan should be in the tab");
+            } else {
+                panic!("active tab should contain a plan");
+            }
+        } else {
+            panic!("a tab should be active");
+        }
+    }
+
+    #[test]
+    fn test_focus_right_expands_collapsed_folder() {
+        let mut app = make_app();
+
+        // Add a folder with a plan
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+
+        // Folder is collapsed initially (seed for testing)
+        app.collapsed_folders.insert(0);
+        assert!(
+            app.collapsed_folders.contains(&0),
+            "folder should be collapsed"
+        );
+
+        // Move cursor to the folder node
+        let nodes = app.visible_tree_nodes();
+        if let Some(idx) = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+        {
+            app.tree_cursor = Some(idx);
+        }
+
+        // Focus-right should expand the folder
+        app.update(AppEvent::FocusRightOrExpand);
+        assert!(
+            !app.collapsed_folders.contains(&0),
+            "folder should be expanded after FocusRight"
+        );
+
+        // Verify cursor is still on folder
+        if let Some(TreeNode::Folder { folder_idx: 0 }) = app.focused_node() {
+            // Good
+        } else {
+            panic!("cursor should remain on folder");
+        }
+    }
+
+    #[test]
+    fn test_focus_left_collapses_expanded_folder() {
+        let mut app = make_app();
+
+        // Add a folder with a plan
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+
+        // Expand the folder
+        app.collapsed_folders.clear();
+
+        // Move cursor to the folder node
+        let nodes = app.visible_tree_nodes();
+        if let Some(idx) = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+        {
+            app.tree_cursor = Some(idx);
+        }
+
+        // Ensure we're in sidebar focus
+        app.focused_panel = Panel::Sidebar;
+
+        // Focus-left should collapse the folder
+        app.update(AppEvent::FocusLeftOrCollapse);
+        assert!(
+            app.collapsed_folders.contains(&0),
+            "folder should be collapsed after FocusLeft"
+        );
+    }
+
+    #[test]
+    fn test_focus_left_on_plan_task_collapses_parent_plan_in_folder() {
+        let mut app = make_app();
+
+        // Add a folder with a plan that has tasks
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+
+        // Expand folder and plan so tasks are visible
+        app.collapsed_folders.clear();
+        assert!(
+            !app.collapsed_plans.contains(&0),
+            "plan should start expanded"
+        );
+
+        // Move cursor to a task node
+        let nodes = app.visible_tree_nodes();
+        if let Some(idx) = nodes.iter().position(|n| {
+            matches!(
+                n,
+                TreeNode::PlanTaskInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0,
+                    ..
+                }
+            )
+        }) {
+            app.tree_cursor = Some(idx);
+        }
+
+        // Ensure we're in sidebar focus
+        app.focused_panel = Panel::Sidebar;
+
+        // Focus-left should collapse the parent plan
+        app.update(AppEvent::FocusLeftOrCollapse);
+        let collapse_key = 0; // folder_idx=0 * 1000 + plan_idx=0
+        assert!(
+            app.collapsed_plans.contains(&collapse_key),
+            "parent plan should be collapsed"
+        );
+
+        // Cursor should move to the plan header
+        if let Some(TreeNode::PlanInFolder {
+            folder_idx: 0,
+            plan_idx: 0,
+        }) = app.focused_node()
+        {
+            // Good
+        } else {
+            panic!("cursor should be on plan header");
+        }
+    }
+
+    #[test]
+    fn test_visible_tree_nodes_shows_correct_folder_structure() {
+        let mut app = make_app();
+
+        // Add two folders, each with different numbers of plans
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder1"));
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder2"));
+
+        let plan_1_1 = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder1/docs/plans/plan-1-1"),
+            slug: "plan-1-1".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task".to_string(),
+                title: "Task".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+
+        let plan_2_1 = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder2/docs/plans/plan-2-1"),
+            slug: "plan-2-1".to_string(),
+            has_tasks: false,
+            tasks: vec![],
+            scope_text: Some("scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+
+        let plan_2_2 = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder2/docs/plans/plan-2-2"),
+            slug: "plan-2-2".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task".to_string(),
+                title: "Task".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+
+        app.plans_by_folder.insert(0, vec![plan_1_1]);
+        app.plans_by_folder.insert(1, vec![plan_2_1, plan_2_2]);
+
+        // Expand both folders
+        app.collapsed_folders.clear();
+
+        // Expand plan 2-2 for its tasks (folder_idx=1, plan_idx=1)
+        assert!(!app.collapsed_plans.contains(&1001));
+
+        let nodes = app.visible_tree_nodes();
+
+        // Verify folder 0 and its plan are present
+        assert!(
+            nodes
+                .iter()
+                .any(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+        );
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0
+            }
+        )));
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            TreeNode::PlanTaskInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+                ..
+            }
+        )));
+
+        // Verify folder 1 and its plans are present
+        assert!(
+            nodes
+                .iter()
+                .any(|n| matches!(n, TreeNode::Folder { folder_idx: 1 }))
+        );
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            TreeNode::PlanInFolder {
+                folder_idx: 1,
+                plan_idx: 0
+            }
+        )));
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            TreeNode::PlanInFolder {
+                folder_idx: 1,
+                plan_idx: 1
+            }
+        )));
+        // Plan 2-2 has a task, so it should be visible
+        assert!(nodes.iter().any(|n| matches!(
+            n,
+            TreeNode::PlanTaskInFolder {
+                folder_idx: 1,
+                plan_idx: 1,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_focused_node_returns_correct_folder_variant() {
+        let mut app = make_app();
+
+        // Add a folder with a plan
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+        app.collapsed_folders.clear();
+
+        // Move cursor to folder node
+        let nodes = app.visible_tree_nodes();
+        if let Some(idx) = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+        {
+            app.tree_cursor = Some(idx);
+            if let Some(TreeNode::Folder { folder_idx: 0 }) = app.focused_node() {
+                // Good
+            } else {
+                panic!("focused_node should return Folder variant");
+            }
+        }
+
+        // Move cursor to plan node
+        if let Some(idx) = nodes.iter().position(|n| {
+            matches!(
+                n,
+                TreeNode::PlanInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0
+                }
+            )
+        }) {
+            app.tree_cursor = Some(idx);
+            if let Some(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            }) = app.focused_node()
+            {
+                // Good
+            } else {
+                panic!("focused_node should return PlanInFolder variant");
+            }
+        }
+
+        // Move cursor to task node
+        if let Some(idx) = nodes.iter().position(|n| {
+            matches!(
+                n,
+                TreeNode::PlanTaskInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0,
+                    ..
+                }
+            )
+        }) {
+            app.tree_cursor = Some(idx);
+            if let Some(TreeNode::PlanTaskInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+                task_idx: 0,
+            }) = app.focused_node()
+            {
+                // Good
+            } else {
+                panic!("focused_node should return PlanTaskInFolder variant");
+            }
+        }
+    }
+
+    /// A mouse click (`OpenTreeRow`) on a `Folder` row toggles its expansion,
+    /// mirroring the keyboard Space/Enter path (`tree_toggle_expand` /
+    /// `activate_focused_tree_node`).
+    #[test]
+    fn open_tree_row_toggles_folder_expansion() {
+        let mut app = make_app();
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+        app.collapsed_folders.insert(0);
+
+        let nodes = app.visible_tree_nodes();
+        let folder_row = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+            .expect("a folder node should be visible");
+
+        // Clicking the collapsed folder row expands it.
+        app.update(AppEvent::OpenTreeRow(folder_row));
+        assert!(
+            !app.collapsed_folders.contains(&0),
+            "folder should expand after mouse click"
+        );
+        assert_eq!(
+            app.tree_cursor,
+            Some(folder_row),
+            "cursor moves to clicked folder row"
+        );
+        assert!(
+            app.visible_tree_nodes().iter().any(|n| matches!(
+                n,
+                TreeNode::PlanInFolder {
+                    folder_idx: 0,
+                    plan_idx: 0
+                }
+            )),
+            "plan should now be visible after expanding via mouse click"
+        );
+
+        // Clicking it again collapses it.
+        let nodes = app.visible_tree_nodes();
+        let folder_row = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+            .expect("folder node should still be visible");
+        app.update(AppEvent::OpenTreeRow(folder_row));
+        assert!(
+            app.collapsed_folders.contains(&0),
+            "folder should collapse after second mouse click"
+        );
+    }
+
+    /// A mouse click (`OpenTreeRow`) on a `PlanInFolder` row opens the plan
+    /// detail tab sourced from `plans_by_folder`, mirroring keyboard Enter.
+    #[test]
+    fn open_tree_row_opens_plan_in_folder_tab() {
+        let mut app = make_app();
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+        app.collapsed_folders.clear();
+
+        let nodes = app.visible_tree_nodes();
+        let plan_row = nodes
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    TreeNode::PlanInFolder {
+                        folder_idx: 0,
+                        plan_idx: 0
+                    }
+                )
+            })
+            .expect("a PlanInFolder node should be visible");
+
+        assert_eq!(app.tabs.open_tabs.len(), 0, "no tabs open initially");
+
+        app.update(AppEvent::OpenTreeRow(plan_row));
+
+        assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab should be opened");
+        let active_idx = app.tabs.active_tab.expect("a tab should be active");
+        assert!(
+            matches!(
+                &app.tabs.open_tabs[active_idx],
+                TabContent::Plan { plan_slug } if plan_slug == "test-plan"
+            ),
+            "active tab should be the folder-scoped plan"
+        );
+    }
+
+    /// A mouse click (`OpenTreeRow`) on a `PlanTaskInFolder` row opens that
+    /// task's own preview tab, mirroring keyboard Enter.
+    #[test]
+    fn open_tree_row_opens_plan_task_in_folder_tab() {
+        let mut app = make_app();
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+        app.collapsed_folders.clear();
+
+        let nodes = app.visible_tree_nodes();
+        let task_row = nodes
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    TreeNode::PlanTaskInFolder {
+                        folder_idx: 0,
+                        plan_idx: 0,
+                        task_idx: 0
+                    }
+                )
+            })
+            .expect("a PlanTaskInFolder node should be visible");
+
+        app.update(AppEvent::OpenTreeRow(task_row));
+
+        assert_eq!(app.tabs.open_tabs.len(), 1, "task tab should be opened");
+        let active_idx = app.tabs.active_tab.expect("a tab should be active");
+        assert!(
+            matches!(
+                &app.tabs.open_tabs[active_idx],
+                TabContent::PlanTask { plan_slug, task_id }
+                    if plan_slug == "test-plan" && task_id == "task-1"
+            ),
+            "active tab should be the folder-scoped task preview"
+        );
+    }
+
+    #[test]
+    fn test_startup_auto_discovery_emits_plans_discovered_per_folder_and_shows_folder_plans() {
+        use crate::app::{App, AppEvent};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        // Create app with an opened_folders list (simulating startup).
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("/test"));
+        app.opened_folders = vec![std::path::PathBuf::from("/test/folder1")];
+
+        // Simulate PlansDiscoveredPerFolder event with a plan in folder 0.
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder1/docs/plans/0001-test"),
+            slug: "0001-test".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+
+        let mut plans_map = std::collections::HashMap::new();
+        plans_map.insert(0, vec![plan_entry]);
+
+        // Update app with the discovery event.
+        app.update(AppEvent::PlansDiscoveredPerFolder { plans_map });
+
+        // Verify that the app now has plans_by_folder populated.
+        assert!(
+            app.plans_by_folder.contains_key(&0),
+            "folder 0 should have plans after discovery"
+        );
+        assert_eq!(
+            app.plans_by_folder[&0].len(),
+            1,
+            "folder 0 should have exactly 1 plan"
+        );
+        assert_eq!(
+            app.plans_by_folder[&0][0].slug, "0001-test",
+            "plan slug should match"
+        );
+
+        // Verify that folder 0 is NOT in collapsed_folders (it should be expanded).
+        assert!(
+            !app.collapsed_folders.contains(&0),
+            "folder 0 should be expanded (not in collapsed_folders)"
+        );
+
+        // Verify that visible_tree_nodes contains Folder, PlanInFolder, and PlanTaskInFolder.
+        let nodes = app.visible_tree_nodes();
+
+        // Find the Folder node for folder 0.
+        let folder_node = nodes
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+            .expect("Folder node for folder_idx 0 should be visible");
+
+        // Find the PlanInFolder node for folder 0, plan 0.
+        let plan_in_folder_node = nodes
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    TreeNode::PlanInFolder {
+                        folder_idx: 0,
+                        plan_idx: 0
+                    }
+                )
+            })
+            .expect("PlanInFolder node for folder_idx 0, plan_idx 0 should be visible");
+
+        // Find the PlanTaskInFolder node for folder 0, plan 0, task 0.
+        let task_node = nodes
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    TreeNode::PlanTaskInFolder {
+                        folder_idx: 0,
+                        plan_idx: 0,
+                        task_idx: 0
+                    }
+                )
+            })
+            .expect("PlanTaskInFolder node should be visible");
+
+        // Verify the order: Folder < PlanInFolder < PlanTaskInFolder.
+        assert!(
+            folder_node < plan_in_folder_node && plan_in_folder_node < task_node,
+            "nodes should appear in hierarchical order"
+        );
+    }
+
+    /// **Regression:** `PlansDiscoveredPerFolder`'s handler must NOT close an
+    /// open plan tab whose plan is still present in `plans_by_folder` on
+    /// re-discovery. Previously `close_tabs_for_missing_plans()` only checked
+    /// the legacy flat `discovered_plans` list (which this event never
+    /// populates), so every plan/plan-task tab sourced from `plans_by_folder`
+    /// was incorrectly closed on every re-discovery.
+    #[test]
+    fn plans_discovered_per_folder_keeps_open_tab_for_still_present_plan() {
+        use crate::app::{App, AppEvent, TabContent};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("/test"));
+        app.opened_folders = vec![std::path::PathBuf::from("/test/folder1")];
+
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder1/docs/plans/0001-test"),
+            slug: "0001-test".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        };
+        let mut plans_map = std::collections::HashMap::new();
+        plans_map.insert(0, vec![plan_entry.clone()]);
+
+        // Seed plans_by_folder and open a plan tab for it (as if the plan was
+        // opened from the sidebar after a previous discovery).
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+        app.tabs.open_tab(TabContent::Plan {
+            plan_slug: "0001-test".to_string(),
+        });
+        assert_eq!(
+            app.tabs.open_tabs.len(),
+            1,
+            "tab should be open before re-discovery"
+        );
+
+        // Re-fire discovery with the SAME plan still present.
+        app.update(AppEvent::PlansDiscoveredPerFolder { plans_map });
+
+        assert_eq!(
+            app.tabs.open_tabs.len(),
+            1,
+            "tab for a plan still present in plans_by_folder must NOT be closed"
+        );
     }
 }

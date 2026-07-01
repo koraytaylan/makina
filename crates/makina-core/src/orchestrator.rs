@@ -448,6 +448,81 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
     entries
 }
 
+/// Discover plans in multiple folders, returning a HashMap mapping folder_idx to
+/// the plans discovered in each folder.
+///
+/// For each folder in `opened_folders`, this function searches `docs/plans/` and
+/// applies the same convention gate as [`discover_plans`]: a directory is a plan iff
+/// it contains **both** `SCOPE.md` and `ARCHITECTURE.md`. The returned HashMap has
+/// an entry for every folder_idx, even if no plans are discovered in that folder.
+///
+/// # Arguments
+/// * `opened_folders` - A slice of folder paths to search for plans.
+///
+/// # Returns
+/// A HashMap where keys are folder indices (0..opened_folders.len()) and values are
+/// vectors of PlanEntry sorted by directory name within each folder.
+pub fn discover_plans_per_folder(
+    opened_folders: &[PathBuf],
+) -> std::collections::HashMap<usize, Vec<PlanEntry>> {
+    let mut result = std::collections::HashMap::new();
+
+    for (folder_idx, folder) in opened_folders.iter().enumerate() {
+        let plans_root = folder.join("docs").join("plans");
+        let mut entries = Vec::new();
+
+        let Ok(rd) = std::fs::read_dir(&plans_root) else {
+            // No docs/plans in this folder; insert empty entries and continue.
+            result.insert(folder_idx, entries);
+            continue;
+        };
+
+        for ent in rd.flatten() {
+            let dir = ent.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            // Convention gate: SCOPE.md AND ARCHITECTURE.md must both exist.
+            if !dir.join("SCOPE.md").is_file() || !dir.join("ARCHITECTURE.md").is_file() {
+                continue; // non-plan dirs (assets/, etc.) are ignored
+            }
+            let tasks_path = dir.join("TASKS.md");
+            let has_tasks = tasks_path.is_file();
+            // Parse the task preview (id/title/gated/deps) once, off the render
+            // thread, so the sidebar tree + plan-detail pane never touch the FS.
+            let tasks = if has_tasks {
+                std::fs::read_to_string(&tasks_path)
+                    .map(|s| parse_plan_tasks(&s))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            // Read the three spec files (SCOPE.md, ARCHITECTURE.md, STATUS.md),
+            // converting read errors to None.
+            let scope_text = std::fs::read_to_string(dir.join("SCOPE.md")).ok();
+            let architecture_text = std::fs::read_to_string(dir.join("ARCHITECTURE.md")).ok();
+            let status_text = std::fs::read_to_string(dir.join("STATUS.md")).ok();
+            // Slug is exactly what plan_slug derives from this dir's TASKS.md path,
+            // whether or not the file exists (plan_slug keys off the parent dir name).
+            let slug = plan_slug(&tasks_path);
+            entries.push(PlanEntry {
+                dir,
+                slug,
+                has_tasks,
+                tasks,
+                scope_text,
+                architecture_text,
+                status_text,
+            });
+        }
+
+        entries.sort_by(|a, b| a.dir.file_name().cmp(&b.dir.file_name()));
+        result.insert(folder_idx, entries);
+    }
+
+    result
+}
+
 /// Sanitize `input` into a valid kebab id per `runtime-artifact-schema.md`
 /// §4.1: lowercase; map every maximal run of non-`[a-z0-9]` chars to a single
 /// `-`; trim leading/trailing `-`. The caller enforces the §4.1 length minimum.
@@ -5438,6 +5513,94 @@ Description text that is long enough for parser.
             entries[0].status_text, None,
             "status_text should be None when STATUS.md is missing"
         );
+    }
+
+    #[test]
+    fn discover_plans_per_folder_discovers_plans_in_each_folder() {
+        let tmp1 = tempfile::TempDir::new().expect("create temp dir 1");
+        let plans_dir1 = tmp1.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir1).expect("create docs/plans in folder 1");
+
+        // Create two plans in folder 1
+        let plan_0001 = plans_dir1.join("0001-a");
+        std::fs::create_dir(&plan_0001).expect("create 0001-a");
+        std::fs::write(plan_0001.join("SCOPE.md"), "scope 1a").expect("write SCOPE.md");
+        std::fs::write(plan_0001.join("ARCHITECTURE.md"), "arch 1a")
+            .expect("write ARCHITECTURE.md");
+
+        let plan_0002 = plans_dir1.join("0002-b");
+        std::fs::create_dir(&plan_0002).expect("create 0002-b");
+        std::fs::write(plan_0002.join("SCOPE.md"), "scope 1b").expect("write SCOPE.md");
+        std::fs::write(plan_0002.join("ARCHITECTURE.md"), "arch 1b")
+            .expect("write ARCHITECTURE.md");
+
+        // Create a second folder with one plan
+        let tmp2 = tempfile::TempDir::new().expect("create temp dir 2");
+        let plans_dir2 = tmp2.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir2).expect("create docs/plans in folder 2");
+
+        let plan_0001_f2 = plans_dir2.join("0001-x");
+        std::fs::create_dir(&plan_0001_f2).expect("create 0001-x");
+        std::fs::write(plan_0001_f2.join("SCOPE.md"), "scope 2x").expect("write SCOPE.md");
+        std::fs::write(plan_0001_f2.join("ARCHITECTURE.md"), "arch 2x")
+            .expect("write ARCHITECTURE.md");
+
+        // Call discover_plans_per_folder with both folders
+        let opened_folders = vec![tmp1.path().to_path_buf(), tmp2.path().to_path_buf()];
+        let result = discover_plans_per_folder(&opened_folders);
+
+        // Verify the result has entries for both folders
+        assert_eq!(result.len(), 2, "should have 2 entries in the HashMap");
+
+        // Verify folder 0 has 2 plans
+        assert!(
+            result.contains_key(&0),
+            "should have entry for folder_idx 0"
+        );
+        let plans_folder0 = &result[&0];
+        assert_eq!(plans_folder0.len(), 2, "folder 0 should have 2 plans");
+        assert_eq!(plans_folder0[0].slug, "0001-a", "first plan in folder 0");
+        assert_eq!(plans_folder0[1].slug, "0002-b", "second plan in folder 0");
+
+        // Verify folder 1 has 1 plan
+        assert!(
+            result.contains_key(&1),
+            "should have entry for folder_idx 1"
+        );
+        let plans_folder1 = &result[&1];
+        assert_eq!(plans_folder1.len(), 1, "folder 1 should have 1 plan");
+        assert_eq!(plans_folder1[0].slug, "0001-x", "plan in folder 1");
+    }
+
+    #[test]
+    fn discover_plans_per_folder_includes_empty_folders() {
+        let tmp1 = tempfile::TempDir::new().expect("create temp dir 1");
+        let plans_dir1 = tmp1.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir1).expect("create docs/plans in folder 1");
+
+        // Create a plan in folder 1
+        let plan = plans_dir1.join("0001-a");
+        std::fs::create_dir(&plan).expect("create 0001-a");
+        std::fs::write(plan.join("SCOPE.md"), "scope").expect("write SCOPE.md");
+        std::fs::write(plan.join("ARCHITECTURE.md"), "arch").expect("write ARCHITECTURE.md");
+
+        // Create a second folder with NO plans
+        let tmp2 = tempfile::TempDir::new().expect("create temp dir 2");
+        // Note: no docs/plans directory in tmp2
+
+        // Call discover_plans_per_folder with both folders
+        let opened_folders = vec![tmp1.path().to_path_buf(), tmp2.path().to_path_buf()];
+        let result = discover_plans_per_folder(&opened_folders);
+
+        // Verify both folders have entries
+        assert_eq!(result.len(), 2, "should have 2 entries in the HashMap");
+
+        // Verify folder 0 has the plan
+        assert_eq!(result[&0].len(), 1, "folder 0 should have 1 plan");
+        assert_eq!(result[&0][0].slug, "0001-a");
+
+        // Verify folder 1 has an empty vector
+        assert_eq!(result[&1].len(), 0, "folder 1 should have 0 plans");
     }
 
     // ── planner-generate-on-open tests ───────────────────────────────────────

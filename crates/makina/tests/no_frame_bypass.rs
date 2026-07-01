@@ -8,14 +8,13 @@
 //! (`tui-error-pane-channel-wire`), so nothing writes outside the frame and
 //! corrupts the alternate screen.
 //!
-//! `main.rs` is handled separately: it is allowed to contain EXACTLY the three
+//! `main.rs` is handled separately: it is allowed to contain EXACTLY five
 //! fatal `eprintln!` sites that are intentionally exempt because none runs while
 //! a live ratatui frame exists — the config-load failure (pre-`Tui::init()`),
-//! the terminal-init failure itself, and the post-`tui.restore()` error print.
-//! (The previous planner-mechanism fallback eprintln! was removed when TUI
-//! ingestion was forced to the deterministic path.) The test pins the count to
-//! three so a NEW in-frame `eprintln!` added to `main.rs` (e.g. between
-//! `Tui::init()` and `tui.restore()`) trips the guard.
+//! the terminal-init failure itself, the post-`tui.restore()` error print,
+//! the planner-mechanism fallback, and the workspace-load failure (pre-`Tui::init()`).
+//! The test pins the count to five so a NEW in-frame `eprintln!` added to `main.rs`
+//! (e.g. between `Tui::init()` and `tui.restore()`) trips the guard.
 
 use std::path::PathBuf;
 
@@ -24,9 +23,10 @@ use std::path::PathBuf;
 /// the alternate screen, so none may contain `eprintln!`/`println!`.
 const LIVE_FRAME_REGION: &[&str] = &["event.rs", "app.rs", "ui.rs", "tui.rs", "browser.rs"];
 
-/// `main.rs` is exempt but pinned: exactly these three FATAL sites may print,
+/// `main.rs` is exempt but pinned: exactly these FATAL sites may print,
 /// and only because each runs with NO live ratatui frame.
-const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 4;
+/// Updated to 5 to include workspace load error (pre-Tui::init()).
+const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 5;
 
 fn src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")

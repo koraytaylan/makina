@@ -10,6 +10,16 @@ description = "Makina — multi-agent software-factory orchestrator (ratatui TUI
 name = "makina"
 path = "src/main.rs"
 
+[features]
+# Exposes the event loop's private `resolve_io` IO-resolution step as
+# `event::resolve_io_for_test` so integration tests under `tests/` (which
+# compile as a separate crate, without `cfg(test)`) can drive real
+# `AppEvent`s (`OpenFolderSelected`, `CloseFolderConfirmed`,
+# `InitializeFolderSelected`, …) through the actual wiring instead of
+# mutating `App` fields directly. Off by default; production builds never
+# compile the seam.
+test-util = []
+
 [dependencies]
 makina-core = { workspace = true }
 makina-acp = { workspace = true }
@@ -39,6 +49,8 @@ chrono = { workspace = true }
 # TOML serialization for writing provider/role config back to disk (task 0041)
 toml = { workspace = true }
 serde = { workspace = true }
+# Home directory resolution for workspace persistence
+dirs = { workspace = true }
 
 [dev-dependencies]
 # Temporary files/dirs for the file-browser IO + TUI↔CoreApi flow tests.
@@ -47,3 +59,8 @@ tempfile = "3"
 # (`exit.rs`, `tests/`) can register a fake agent pgid, install a recording kill
 # stub, and assert the registry is drained — without signalling real processes.
 makina-acp = { workspace = true, features = ["test-util"] }
+# Self-referential dev-dependency: enables this crate's own `test-util`
+# feature (exposing `event::resolve_io_for_test`) for the `tests/` integration
+# binaries, which compile against `makina` as an external dependency and so
+# never see `#[cfg(test)]`-gated items.
+makina = { path = ".", features = ["test-util"] }

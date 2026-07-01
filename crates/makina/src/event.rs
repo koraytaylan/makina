@@ -122,10 +122,10 @@ pub async fn run(
     // Auto-discover plans under the repo on startup so the plan picker populates
     // without the user pressing `[o]`. The scan runs in the background; the
     // OpenBrowser arm sets `app.busy`, which renders a spinner until
-    // PlansDiscovered arrives. `fallback_to_browser = false` keeps startup
+    // PlansDiscoveredPerFolder arrives. `fallback_to_browser = false` keeps startup
     // unobtrusive: a repo with no `docs/plans/` just stays on the normal view.
     app.update(AppEvent::OpenBrowser);
-    spawn_discover_plans(app.repo_root.clone(), background_tx.clone(), false);
+    spawn_discover_plans(app.opened_folders.clone(), background_tx.clone(), false);
 
     // Initial render.
     tui.draw(|frame| ui::render(app, frame))?;
@@ -276,7 +276,7 @@ async fn resolve_api_event(
 ///
 /// Non-IO events pass straight through with no status message.
 async fn resolve_io(
-    app: &App,
+    app: &mut App,
     event: AppEvent,
     background_tx: &mpsc::Sender<AppEvent>,
 ) -> (AppEvent, Option<String>) {
@@ -285,7 +285,7 @@ async fn resolve_io(
             // Manual `[o]`: discover plans, falling back to the file browser when
             // none are found. The OpenBrowser update arm sets the busy spinner;
             // no separate status message is needed.
-            spawn_discover_plans(app.repo_root.clone(), background_tx.clone(), true);
+            spawn_discover_plans(app.opened_folders.clone(), background_tx.clone(), true);
             (AppEvent::OpenBrowser, None)
         }
         AppEvent::BrowserParent => match app.browser.as_ref().and_then(|b| b.parent()) {
@@ -324,6 +324,196 @@ async fn resolve_io(
                 // No selection (empty dir) — ignore.
                 None => (AppEvent::Tick, None),
             }
+        }
+        // ── Folder browser (plan 0043) ──────────────────────────────────────────
+        // Open the folder browser modal at $HOME to let the user pick a folder.
+        AppEvent::OpenFolder => {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            spawn_read_dir_folders_only(home, background_tx.clone());
+            (AppEvent::OpenFolder, None)
+        }
+        // Same directory-read spawn as `OpenFolder`, but for the "Initialize
+        // Folder" palette action; `App::update`'s `InitializeFolderRequested`
+        // arm sets `folder_browser_purpose` so `BrowserOpened` (below) lands in
+        // `Mode::FolderBrowser { purpose: InitializeFolder }` instead of `OpenFolder`.
+        AppEvent::InitializeFolderRequested => {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            spawn_read_dir_folders_only(home, background_tx.clone());
+            (AppEvent::InitializeFolderRequested, None)
+        }
+        // ── Folder browser activation (plan 0043) ────────────────────────────────
+        // When the user presses Enter on a folder in the FolderBrowser modal,
+        // emit the appropriate event based on the browser's purpose.
+        AppEvent::FolderBrowserActivate { purpose } => {
+            use crate::app::FolderBrowserPurpose;
+            match app.browser.as_ref().and_then(|b| b.selected_entry()) {
+                Some(entry) if entry.is_dir => {
+                    let event = match purpose {
+                        FolderBrowserPurpose::OpenFolder => AppEvent::OpenFolderSelected {
+                            path: entry.path.clone(),
+                        },
+                        FolderBrowserPurpose::InitializeFolder => {
+                            AppEvent::InitializeFolderSelected {
+                                path: entry.path.clone(),
+                            }
+                        }
+                        FolderBrowserPurpose::CloseFolders => AppEvent::CloseFolderConfirmed {
+                            path: entry.path.clone(),
+                        },
+                    };
+                    let _ = background_tx.send(event).await;
+                    (AppEvent::CloseBrowser, None)
+                }
+                // Entry is not a directory, or no selection — ignore.
+                _ => (AppEvent::Tick, None),
+            }
+        }
+        // ── Folder browser navigation (plan 0043) ────────────────────────────────
+        // These are handled in app.update (for navigation) or spawned in resolve_io
+        // (for parent reads). They pass through here without special handling.
+        AppEvent::FolderBrowserUp | AppEvent::FolderBrowserDown => (event, None),
+        AppEvent::FolderBrowserParent => match app.browser.as_ref().and_then(|b| b.parent()) {
+            Some(parent) => {
+                spawn_read_dir_folders_only(parent.to_path_buf(), background_tx.clone());
+                (AppEvent::Tick, None)
+            }
+            None => (AppEvent::Tick, None),
+        },
+        // ── Folder selection (plan 0043) ────────────────────────────────────────
+        // `FolderBrowserActivate` above already closes the modal (→ Mode::Normal)
+        // in the SAME resolve_io pass and re-dispatches the selected path via
+        // `background_tx`, so these arrive here on the NEXT loop iteration.
+        AppEvent::OpenFolderSelected { path } => {
+            // Verify it's a valid directory.
+            if !path.is_dir() {
+                app.push_error(ErrorMessage {
+                    timestamp: std::time::SystemTime::now(),
+                    level: ErrorLevel::Error,
+                    text: format!("Selected path is not a directory: {}", path.display()),
+                });
+                app.mode = crate::app::Mode::Normal;
+                return (AppEvent::Tick, None);
+            }
+
+            // Add to opened_folders if not already present.
+            if !app.opened_folders.contains(&path) {
+                app.opened_folders.push(path.clone());
+            }
+
+            // Update workspace and save.
+            app.workspace.add_folder(path.clone());
+            if let Err(e) = app.save_workspace() {
+                app.push_error(ErrorMessage {
+                    timestamp: std::time::SystemTime::now(),
+                    level: ErrorLevel::Error,
+                    text: format!("Failed to save workspace: {e}"),
+                });
+            }
+
+            // Trigger plan discovery for all opened folders.
+            spawn_discover_plans(app.opened_folders.clone(), background_tx.clone(), false);
+
+            // Return to Normal mode and set status message.
+            app.mode = crate::app::Mode::Normal;
+            (
+                AppEvent::Tick,
+                Some(format!("Folder opened: {}", path.display())),
+            )
+        }
+        AppEvent::InitializeFolderSelected { path } => {
+            // Call folder_init::initialize_folder() to set up git, branches, and docs/plans.
+            match crate::folder_init::initialize_folder(&path) {
+                Ok(_) => {
+                    // Add to opened_folders if not already present.
+                    if !app.opened_folders.contains(&path) {
+                        app.opened_folders.push(path.clone());
+                    }
+
+                    // Update workspace and save.
+                    app.workspace.add_folder(path.clone());
+                    if let Err(e) = app.save_workspace() {
+                        app.push_error(ErrorMessage {
+                            timestamp: std::time::SystemTime::now(),
+                            level: ErrorLevel::Error,
+                            text: format!("Failed to save workspace: {e}"),
+                        });
+                    }
+
+                    // Trigger plan discovery for all opened folders.
+                    spawn_discover_plans(app.opened_folders.clone(), background_tx.clone(), false);
+
+                    // Return to Normal mode and set status message.
+                    app.mode = crate::app::Mode::Normal;
+                    (
+                        AppEvent::Tick,
+                        Some(format!("Folder initialized: {}", path.display())),
+                    )
+                }
+                Err(e) => {
+                    // Return to Normal mode and push an error message.
+                    app.push_error(ErrorMessage {
+                        timestamp: std::time::SystemTime::now(),
+                        level: ErrorLevel::Error,
+                        text: format!("Failed to initialize folder: {e}"),
+                    });
+                    app.mode = crate::app::Mode::Normal;
+                    (AppEvent::Tick, None)
+                }
+            }
+        }
+        // Show the opened folders as a selectable list in the folder-browser
+        // modal (purpose `CloseFolders`), so the user can pick which one to
+        // close. Unlike `OpenFolder` / `InitializeFolderRequested`, there is no
+        // directory read here — the list IS `app.opened_folders`, already in
+        // memory — so we build the `FileBrowser` and flip the mode directly
+        // instead of round-tripping through `BrowserOpened`.
+        AppEvent::CloseFolderRequested => {
+            let entries: Vec<crate::browser::DirEntry> = app
+                .opened_folders
+                .iter()
+                .map(|p| crate::browser::DirEntry {
+                    name: p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| p.display().to_string()),
+                    path: p.clone(),
+                    is_dir: true,
+                })
+                .collect();
+            app.browser = Some(crate::browser::FileBrowser::new(
+                app.repo_root.clone(),
+                entries,
+            ));
+            app.folder_browser_purpose = Some(crate::app::FolderBrowserPurpose::CloseFolders);
+            app.mode = crate::app::Mode::FolderBrowser {
+                purpose: crate::app::FolderBrowserPurpose::CloseFolders,
+            };
+            (AppEvent::Tick, None)
+        }
+        AppEvent::CloseFolderConfirmed { path } => {
+            // Remove the folder from opened_folders.
+            app.opened_folders.retain(|p| p != &path);
+
+            // Update workspace and save.
+            app.workspace.remove_folder(&path);
+            if let Err(e) = app.save_workspace() {
+                app.push_error(ErrorMessage {
+                    timestamp: std::time::SystemTime::now(),
+                    level: ErrorLevel::Error,
+                    text: format!("Failed to save workspace: {e}"),
+                });
+            }
+
+            // Trigger plan discovery to refresh the sidebar.
+            spawn_discover_plans(app.opened_folders.clone(), background_tx.clone(), false);
+
+            // Return to Normal mode and set status message.
+            app.mode = crate::app::Mode::Normal;
+            (
+                AppEvent::Tick,
+                Some(format!("Folder closed: {}", path.display())),
+            )
         }
         // ── Run control (task 31) ─────────────────────────────────────────────
         // Start has an extra responsibility (plan 0042 follow-up): when there is
@@ -482,36 +672,60 @@ async fn resolve_io(
     }
 }
 
-/// Scan `repo_root` for plans off the render loop and feed the result back as
-/// an [`AppEvent`].
+/// Test seam: exposes the private [`resolve_io`] to downstream integration
+/// tests (e.g. `crates/makina/tests/multi_folder_integration_test.rs`) so they
+/// can drive real `AppEvent`s (`OpenFolderSelected`, `CloseFolderConfirmed`,
+/// `InitializeFolderSelected`, …) through the *actual* IO-resolution +
+/// `App::update` wiring instead of mutating `App` fields directly.
+///
+/// Gated behind the `test-util` feature (off by default; production builds
+/// never compile this). A throwaway `mpsc` channel stands in for the real
+/// event loop's `background_tx` — fine for tests that don't assert on
+/// background-spawned follow-up events themselves (those are covered by the
+/// `resolve_io_*` unit tests in this module's own `#[cfg(test)]` block).
+#[cfg(any(test, feature = "test-util"))]
+pub async fn resolve_io_for_test(app: &mut App, event: AppEvent) -> (AppEvent, Option<String>) {
+    let (tx, _rx) = mpsc::channel(64);
+    resolve_io(app, event, &tx).await
+}
+
+/// Scan every folder in `opened_folders` for plans off the render loop and
+/// feed the result back as an [`AppEvent`].
 ///
 /// The blocking directory walk runs on `spawn_blocking` so the UI stays
-/// responsive (and a spinner can animate) while it runs. When plans are found
-/// the result is an [`AppEvent::PlansDiscovered`] that opens the picker.
+/// responsive (and a spinner can animate) while it runs. The result is an
+/// [`AppEvent::PlansDiscoveredPerFolder`] mapping each folder's index to its
+/// discovered plans.
 ///
-/// `fallback_to_browser` controls the *no plans found* case:
+/// `fallback_to_browser` controls the *no plans found anywhere* case (i.e.
+/// every opened folder's plan list is empty, or no folders are opened):
 /// - `true` (the `[o]` keypress): fall back to the CWD file browser so the user
 ///   can still navigate to an arbitrary task-list file.
-/// - `false` (startup auto-discovery): emit an empty `PlansDiscovered` so the
-///   busy state clears and the app stays on the normal view — no popup.
+/// - `false` (startup auto-discovery, and the open/close/initialize folder
+///   handlers): emit `PlansDiscoveredPerFolder` regardless so the busy state
+///   clears and the sidebar reflects the (possibly empty) result — no popup.
 fn spawn_discover_plans(
-    repo_root: std::path::PathBuf,
+    opened_folders: Vec<std::path::PathBuf>,
     background_tx: mpsc::Sender<AppEvent>,
     fallback_to_browser: bool,
 ) {
     tokio::spawn(async move {
-        let discovery_root = repo_root.clone();
-        let plans = tokio::task::spawn_blocking(move || {
-            makina_core::orchestrator::discover_plans(&discovery_root)
+        let plans_map = tokio::task::spawn_blocking(move || {
+            makina_core::orchestrator::discover_plans_per_folder(&opened_folders)
         })
         .await
         .unwrap_or_default();
 
-        let event = if plans.is_empty() && fallback_to_browser {
+        // `plans_map` always has one entry per opened folder (even an empty
+        // Vec when that folder has no plans), so checking `plans_map.is_empty()`
+        // only catches the zero-folders-opened case. Fall back to the browser
+        // when every folder's plan list is empty too.
+        let no_plans_found = plans_map.values().all(|plans| plans.is_empty());
+        let event = if no_plans_found && fallback_to_browser {
             let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             read_dir_event(&start).await
         } else {
-            AppEvent::PlansDiscovered { plans }
+            AppEvent::PlansDiscoveredPerFolder { plans_map }
         };
         let _ = background_tx.send(event).await;
     });
@@ -955,7 +1169,11 @@ async fn retry_focused(app: &App) -> Option<String> {
                 None
             }
         }
-        Some(TreeNode::Plan { .. }) | Some(TreeNode::PlanTask { .. }) => None,
+        Some(TreeNode::Plan { .. })
+        | Some(TreeNode::PlanTask { .. })
+        | Some(TreeNode::Folder { .. })
+        | Some(TreeNode::PlanInFolder { .. })
+        | Some(TreeNode::PlanTaskInFolder { .. }) => None,
         None => None,
     };
 
@@ -973,7 +1191,11 @@ async fn retry_focused(app: &App) -> Option<String> {
         .focused_node()
         .and_then(|node| match node {
             TreeNode::Run { run } | TreeNode::Task { run, .. } => app.runs.get(run),
-            TreeNode::Plan { .. } | TreeNode::PlanTask { .. } => None,
+            TreeNode::Plan { .. }
+            | TreeNode::PlanTask { .. }
+            | TreeNode::Folder { .. }
+            | TreeNode::PlanInFolder { .. }
+            | TreeNode::PlanTaskInFolder { .. } => None,
         })
         .map(|rv| rv.status == RunStatus::Pending)
         .unwrap_or(false)
@@ -1193,6 +1415,60 @@ async fn read_dir_event(dir: &std::path::Path) -> AppEvent {
     }
 }
 
+/// Read `dir` and build a [`AppEvent::BrowserOpened`] event from its directories only.
+///
+/// Like [`read_dir_event`], but filters entries to include only directories (plus the
+/// `..` parent entry). Used by the folder browser modal for selecting folders.
+///
+/// Files are skipped entirely, and entries are sorted alphabetically (case-insensitive).
+async fn read_dir_event_folders_only(dir: &std::path::Path) -> AppEvent {
+    use crate::browser::DirEntry;
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+
+    // Prepend a ".." entry when a parent exists.
+    if let Some(parent) = dir.parent() {
+        entries.push(DirEntry {
+            name: "..".to_string(),
+            path: parent.to_path_buf(),
+            is_dir: true,
+        });
+    }
+
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        let mut items: Vec<DirEntry> = Vec::new();
+        while let Ok(Some(de)) = rd.next_entry().await {
+            let path = de.path();
+            let name = de.file_name().to_string_lossy().to_string();
+            // Skip hidden dotfiles to keep the listing focused.
+            if name.starts_with('.') {
+                continue;
+            }
+            let is_dir = de.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
+            // Only include directories in the folder browser.
+            if is_dir {
+                items.push(DirEntry { name, path, is_dir });
+            }
+        }
+        // Sort alphabetically (case-insensitive).
+        items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        entries.extend(items);
+    }
+
+    AppEvent::BrowserOpened {
+        dir: dir.to_path_buf(),
+        entries,
+    }
+}
+
+/// Spawn a background task to read a directory (folders only) and emit the result.
+fn spawn_read_dir_folders_only(dir: std::path::PathBuf, background_tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let event = read_dir_event_folders_only(&dir).await;
+        let _ = background_tx.send(event).await;
+    });
+}
+
 // ── Translation helpers ───────────────────────────────────────────────────────
 
 /// Snapshot of which modal overlay is currently active.
@@ -1384,16 +1660,37 @@ fn translate_key(
             _ => AppEvent::Tick,
         }
     } else if browsing {
-        // ── File-browser keymap ──────────────────────────────────────────────
-        // Esc closes the browser (does NOT quit the app); Enter activates the
-        // selection; Backspace goes to the parent dir; j/k/arrows navigate.
-        match key.code {
-            KeyCode::Esc => AppEvent::CloseBrowser,
-            KeyCode::Enter => AppEvent::BrowserActivate,
-            KeyCode::Backspace => AppEvent::BrowserParent,
-            KeyCode::Up | KeyCode::Char('k') => AppEvent::BrowserUp,
-            KeyCode::Down | KeyCode::Char('j') => AppEvent::BrowserDown,
-            _ => AppEvent::Tick,
+        // ── Browser keymap (file or folder) ───────────────────────────────────
+        // Both file browser and folder browser share the same keybindings:
+        // Esc closes; Enter activates; Backspace goes to parent; j/k/arrows navigate.
+        // The difference is in what event is dispatched on Enter — for folder browser
+        // we dispatch FolderBrowserActivate with the purpose, for file browser we
+        // dispatch BrowserActivate.
+        if app.is_folder_browsing() {
+            // Folder browser keymap (plan 0043)
+            if let Some(purpose) = app.folder_browser_purpose() {
+                match key.code {
+                    KeyCode::Esc => AppEvent::CloseBrowser,
+                    KeyCode::Enter => AppEvent::FolderBrowserActivate { purpose },
+                    KeyCode::Backspace => AppEvent::FolderBrowserParent,
+                    KeyCode::Up | KeyCode::Char('k') => AppEvent::FolderBrowserUp,
+                    KeyCode::Down | KeyCode::Char('j') => AppEvent::FolderBrowserDown,
+                    _ => AppEvent::Tick,
+                }
+            } else {
+                // Should not happen, but default to closing
+                AppEvent::CloseBrowser
+            }
+        } else {
+            // File browser keymap
+            match key.code {
+                KeyCode::Esc => AppEvent::CloseBrowser,
+                KeyCode::Enter => AppEvent::BrowserActivate,
+                KeyCode::Backspace => AppEvent::BrowserParent,
+                KeyCode::Up | KeyCode::Char('k') => AppEvent::BrowserUp,
+                KeyCode::Down | KeyCode::Char('j') => AppEvent::BrowserDown,
+                _ => AppEvent::Tick,
+            }
         }
     } else if editing_providers {
         // ── Provider editor keymap ────────────────────────────────────────────
@@ -1638,11 +1935,6 @@ mod tests {
 
         let api = Arc::new(PlaceholderApi::empty());
         App::new(api, vec![], PathBuf::from("/"))
-    }
-
-    async fn resolve_io_for_test(app: &App, event: AppEvent) -> (AppEvent, Option<String>) {
-        let (tx, _rx) = background_events();
-        resolve_io(app, event, &tx).await
     }
 
     /// Build a crossterm mouse-wheel event of the given `kind`
@@ -2525,7 +2817,7 @@ mod tests {
         assert_eq!(app.selected_run().unwrap().id, RunId(7));
 
         // Start.
-        let (ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
+        let (ev, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
         assert!(
             matches!(ev, AppEvent::Tick),
             "control resolves to a no-op event"
@@ -2539,11 +2831,11 @@ mod tests {
         assert_eq!(app.status_message.as_deref(), Some(msg.as_str()));
 
         // Pause.
-        let (_ev, status) = resolve_io_for_test(&app, AppEvent::PauseRun).await;
+        let (_ev, status) = resolve_io_for_test(&mut app, AppEvent::PauseRun).await;
         assert!(status.unwrap().contains("Pause"));
 
         // Cancel.
-        let (_ev, status) = resolve_io_for_test(&app, AppEvent::CancelRun).await;
+        let (_ev, status) = resolve_io_for_test(&mut app, AppEvent::CancelRun).await;
         assert!(status.unwrap().contains("Cancel"));
 
         // The exact commands were issued against the api, all targeting run 7.
@@ -2566,10 +2858,10 @@ mod tests {
         use std::sync::Arc;
 
         let api = Arc::new(PlaceholderApi::empty());
-        let app = App::new(api, vec![], std::path::PathBuf::from("."));
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
         assert!(app.selected_run().is_none());
 
-        let (ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
+        let (ev, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
         assert!(matches!(ev, AppEvent::Tick));
         let msg = status.expect("must produce a status message");
         assert!(msg.contains("No run selected"));
@@ -2644,7 +2936,7 @@ mod tests {
         // Start on the plan tab spawns the open+auto-start in the background and
         // returns an immediate "Starting …" status.
         let (tx, _rx) = background_events();
-        let (ev, status) = resolve_io(&app, AppEvent::StartRun, &tx).await;
+        let (ev, status) = resolve_io(&mut app, AppEvent::StartRun, &tx).await;
         assert!(matches!(ev, AppEvent::Tick));
         assert!(
             status
@@ -2737,7 +3029,7 @@ mod tests {
         });
 
         let (tx, mut rx) = background_events();
-        let (ev, status) = resolve_io(&app, AppEvent::ResetRun, &tx).await;
+        let (ev, status) = resolve_io(&mut app, AppEvent::ResetRun, &tx).await;
         assert!(status.is_none());
         assert!(
             matches!(
@@ -2839,7 +3131,7 @@ mod tests {
         });
 
         let (tx, _rx) = background_events();
-        let (ev, status) = resolve_io(&app, AppEvent::StartRun, &tx).await;
+        let (ev, status) = resolve_io(&mut app, AppEvent::StartRun, &tx).await;
 
         assert!(
             matches!(
@@ -2908,7 +3200,7 @@ mod tests {
             plan_slug: "0100-empty".to_string(),
         });
 
-        let (ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
+        let (ev, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
         assert!(matches!(ev, AppEvent::Tick));
         assert!(
             status.as_deref().is_some_and(|m| m.contains("no TASKS.md")),
@@ -2942,9 +3234,9 @@ mod tests {
             tasks: vec![],
             report: makina_core::api::IngestionReport::default(),
         };
-        let app = App::new(api, vec![run], std::path::PathBuf::from("."));
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
 
-        let (_ev, status) = resolve_io_for_test(&app, AppEvent::StartRun).await;
+        let (_ev, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
         let msg = status.expect("an error must still produce a status message");
         assert!(
             msg.contains("failed"),
@@ -2965,10 +3257,10 @@ mod tests {
 
         let tmpdir = tempfile::tempdir().unwrap();
         let api = Arc::new(PlaceholderApi::empty());
-        let app = App::new(api, vec![], tmpdir.path().to_path_buf());
+        let mut app = App::new(api, vec![], tmpdir.path().to_path_buf());
         let (tx, mut rx) = background_events();
 
-        let (resolved, status) = resolve_io(&app, AppEvent::OpenBrowser, &tx).await;
+        let (resolved, status) = resolve_io(&mut app, AppEvent::OpenBrowser, &tx).await;
         assert!(
             matches!(resolved, AppEvent::OpenBrowser),
             "OpenBrowser must return immediately"
@@ -3015,7 +3307,7 @@ mod tests {
             }],
         ));
 
-        let (resolved, status) = resolve_io_for_test(&app, AppEvent::BrowserActivate).await;
+        let (resolved, status) = resolve_io_for_test(&mut app, AppEvent::BrowserActivate).await;
         assert!(
             matches!(resolved, AppEvent::CloseBrowser),
             "file activate must resolve to CloseBrowser"
@@ -3029,6 +3321,682 @@ mod tests {
             msg.contains("example-task-list"),
             "status must contain the file stem; got {msg:?}"
         );
+    }
+
+    // ── Folder browser IO resolution (plan 0043) ──────────────────────────────
+
+    /// `read_dir_event_folders_only` must include the `..` parent entry and
+    /// subdirectories, but skip regular files and dotfiles entirely — the
+    /// folder browser only ever lets the user pick a directory.
+    #[tokio::test]
+    async fn read_dir_event_folders_only_filters_to_directories() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmpdir.path().join("subdir")).unwrap();
+        std::fs::write(tmpdir.path().join("file.txt"), b"x").unwrap();
+        std::fs::write(tmpdir.path().join(".hidden-file"), b"x").unwrap();
+        std::fs::create_dir(tmpdir.path().join(".hidden-dir")).unwrap();
+
+        let event = read_dir_event_folders_only(tmpdir.path()).await;
+        match event {
+            AppEvent::BrowserOpened { dir, entries } => {
+                assert_eq!(dir, tmpdir.path());
+                assert!(
+                    entries.iter().any(|e| e.name == ".."),
+                    "must include the '..' parent entry"
+                );
+                assert!(
+                    entries.iter().any(|e| e.name == "subdir" && e.is_dir),
+                    "must include the visible subdirectory"
+                );
+                assert!(
+                    !entries.iter().any(|e| e.name == "file.txt"),
+                    "must NOT include regular files: {entries:?}"
+                );
+                assert!(
+                    !entries.iter().any(|e| e.name == ".hidden-file"),
+                    "must NOT include hidden files: {entries:?}"
+                );
+                assert!(
+                    !entries.iter().any(|e| e.name == ".hidden-dir"),
+                    "must NOT include hidden directories: {entries:?}"
+                );
+            }
+            other => panic!("expected BrowserOpened, got {other:?}"),
+        }
+    }
+
+    /// `resolve_io(OpenFolder)` must pass the event straight through (so
+    /// `App::update`'s `OpenFolder` arm can set `folder_browser_purpose` and the
+    /// busy spinner) while spawning a background folders-only read of
+    /// `dirs::home_dir()` that eventually yields `BrowserOpened`.
+    #[tokio::test]
+    async fn open_folder_io_reads_home_dir_and_filters_to_directories() {
+        use std::path::PathBuf;
+
+        let mut app = test_app();
+        let (tx, mut rx) = background_events();
+
+        let (resolved, status) = resolve_io(&mut app, AppEvent::OpenFolder, &tx).await;
+        assert!(
+            matches!(resolved, AppEvent::OpenFolder),
+            "OpenFolder must return immediately so update() can set the purpose"
+        );
+        assert_eq!(status, None);
+
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for BrowserOpened")
+            .expect("background channel closed");
+        match opened {
+            AppEvent::BrowserOpened { dir, entries } => {
+                assert_eq!(dir, dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
+                assert!(
+                    entries.iter().all(|e| e.is_dir),
+                    "folder browser listing must contain only directories: {entries:?}"
+                );
+            }
+            other => panic!("expected BrowserOpened, got {other:?}"),
+        }
+    }
+
+    /// `resolve_io(InitializeFolderRequested)` mirrors `OpenFolder`: it must
+    /// pass through unchanged (letting `update()` set the `InitializeFolder`
+    /// purpose) and spawn the same folders-only read of `$HOME`. Before this
+    /// fix, `InitializeFolderRequested` had NO resolve_io arm, so no
+    /// `BrowserOpened` was ever produced and the app got stuck showing "Opening
+    /// folder browser…" forever.
+    #[tokio::test]
+    async fn initialize_folder_requested_io_reads_home_dir() {
+        let mut app = test_app();
+        let (tx, mut rx) = background_events();
+
+        let (resolved, status) =
+            resolve_io(&mut app, AppEvent::InitializeFolderRequested, &tx).await;
+        assert!(
+            matches!(resolved, AppEvent::InitializeFolderRequested),
+            "InitializeFolderRequested must return immediately so update() can set the purpose"
+        );
+        assert_eq!(status, None);
+
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for BrowserOpened — InitializeFolderRequested must spawn a directory read")
+            .expect("background channel closed");
+        assert!(matches!(opened, AppEvent::BrowserOpened { .. }));
+    }
+
+    /// `resolve_io(FolderBrowserActivate { purpose: OpenFolder })` on a
+    /// directory entry must resolve to `CloseBrowser` immediately (closing the
+    /// modal in this same pass) and send `OpenFolderSelected { path }` on
+    /// `background_tx` for the next loop iteration.
+    #[tokio::test]
+    async fn folder_browser_activate_open_folder_sends_selected_and_closes() {
+        use crate::app::{FolderBrowserPurpose, Mode};
+        use crate::browser::{DirEntry, FileBrowser};
+        use std::path::PathBuf;
+
+        let mut app = test_app();
+        app.mode = Mode::FolderBrowser {
+            purpose: FolderBrowserPurpose::OpenFolder,
+        };
+        let folder_path = PathBuf::from("/home/user/projects/widgets");
+        app.browser = Some(FileBrowser::new(
+            PathBuf::from("/home/user/projects"),
+            vec![DirEntry {
+                name: "widgets".to_string(),
+                path: folder_path.clone(),
+                is_dir: true,
+            }],
+        ));
+        let (tx, mut rx) = background_events();
+
+        let (resolved, status) = resolve_io(
+            &mut app,
+            AppEvent::FolderBrowserActivate {
+                purpose: FolderBrowserPurpose::OpenFolder,
+            },
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(resolved, AppEvent::CloseBrowser),
+            "activating a folder must resolve to CloseBrowser immediately"
+        );
+        assert_eq!(status, None);
+
+        let selected = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for OpenFolderSelected")
+            .expect("background channel closed");
+        match selected {
+            AppEvent::OpenFolderSelected { path } => assert_eq!(path, folder_path),
+            other => panic!("expected OpenFolderSelected, got {other:?}"),
+        }
+    }
+
+    /// Same as above but for the `InitializeFolder` purpose: the emitted event
+    /// must be `InitializeFolderSelected`, not `OpenFolderSelected`.
+    #[tokio::test]
+    async fn folder_browser_activate_initialize_folder_sends_selected() {
+        use crate::app::{FolderBrowserPurpose, Mode};
+        use crate::browser::{DirEntry, FileBrowser};
+        use std::path::PathBuf;
+
+        let mut app = test_app();
+        app.mode = Mode::FolderBrowser {
+            purpose: FolderBrowserPurpose::InitializeFolder,
+        };
+        let folder_path = PathBuf::from("/home/user/scratch");
+        app.browser = Some(FileBrowser::new(
+            PathBuf::from("/home/user"),
+            vec![DirEntry {
+                name: "scratch".to_string(),
+                path: folder_path.clone(),
+                is_dir: true,
+            }],
+        ));
+        let (tx, mut rx) = background_events();
+
+        let (resolved, _status) = resolve_io(
+            &mut app,
+            AppEvent::FolderBrowserActivate {
+                purpose: FolderBrowserPurpose::InitializeFolder,
+            },
+            &tx,
+        )
+        .await;
+        assert!(matches!(resolved, AppEvent::CloseBrowser));
+
+        let selected = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for InitializeFolderSelected")
+            .expect("background channel closed");
+        match selected {
+            AppEvent::InitializeFolderSelected { path } => assert_eq!(path, folder_path),
+            other => panic!("expected InitializeFolderSelected, got {other:?}"),
+        }
+    }
+
+    /// **Regression test for the Enter-on-folder panic, for a path that does
+    /// NOT exist on disk.** Pressing Enter on a folder dispatches
+    /// `FolderBrowserActivate`, which sends `OpenFolderSelected` via
+    /// `background_tx`; that event loops back through `resolve_io` on the NEXT
+    /// iteration (see `run()`'s `background_rx.recv()` arm). Before this fix,
+    /// `resolve_io` had no arm for `OpenFolderSelected` (or
+    /// `InitializeFolderSelected`), so it fell through the wildcard `other =>
+    /// (other, None)` straight into `App::update`'s `unreachable!()` arm and
+    /// panicked.
+    ///
+    /// This nonexistent path takes `resolve_io`'s `!path.is_dir()` error
+    /// branch (see `resolve_io_open_folder_selected_persists_and_discovers`
+    /// below for the real-directory success path with full persistence
+    /// assertions), so it must still resolve to `Tick` — but for a different
+    /// reason than a no-op: the path is rejected and an error is pushed.
+    #[tokio::test]
+    async fn resolve_io_does_not_panic_on_open_folder_selected_roundtrip() {
+        use std::path::PathBuf;
+
+        let mut app = test_app();
+        let (tx, _rx) = background_events();
+
+        let (resolved, status) = resolve_io(
+            &mut app,
+            AppEvent::OpenFolderSelected {
+                path: PathBuf::from("/home/user/projects/widgets"),
+            },
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(resolved, AppEvent::Tick),
+            "OpenFolderSelected must resolve to Tick, not pass through to update()'s unreachable! arm"
+        );
+        assert_eq!(status, None);
+        assert!(
+            app.error_messages
+                .iter()
+                .any(|m| m.text.contains("not a directory")),
+            "a nonexistent path must push an error, not silently succeed"
+        );
+        assert!(
+            app.opened_folders.is_empty(),
+            "a rejected path must not be added to opened_folders"
+        );
+        // Feed the resolved event through App::update too — this is exactly the
+        // step that panicked before the fix (resolve_io's fallthrough handed the
+        // ORIGINAL OpenFolderSelected straight to update()'s unreachable! arm).
+        app.update(resolved);
+    }
+
+    /// Same regression coverage for `InitializeFolderSelected`, on a path
+    /// where `folder_init::initialize_folder` fails (no such directory, so
+    /// `git init` errors) — the error path must push an error message into
+    /// the error pane rather than panic, and return to `Mode::Normal` with no
+    /// status message.
+    #[tokio::test]
+    async fn resolve_io_does_not_panic_on_initialize_folder_selected_roundtrip() {
+        use std::path::PathBuf;
+
+        let mut app = test_app();
+        app.mode = crate::app::Mode::FolderBrowser {
+            purpose: crate::app::FolderBrowserPurpose::InitializeFolder,
+        };
+        let (tx, _rx) = background_events();
+
+        let (resolved, status) = resolve_io(
+            &mut app,
+            AppEvent::InitializeFolderSelected {
+                path: PathBuf::from("/nonexistent/path/for/makina/tests/scratch"),
+            },
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(resolved, AppEvent::Tick),
+            "InitializeFolderSelected must resolve to Tick, not pass through to update()'s unreachable! arm"
+        );
+        assert_eq!(status, None, "the error path must not set a status message");
+        assert!(
+            !app.error_messages.is_empty(),
+            "a failed initialize_folder() must push an error message into the error pane"
+        );
+        assert!(
+            app.error_messages
+                .iter()
+                .any(|m| m.text.contains("Failed to initialize folder")),
+            "the error pane message must explain the initialize_folder failure"
+        );
+        assert_eq!(
+            app.mode,
+            crate::app::Mode::Normal,
+            "must return to Normal mode even when initialize_folder fails"
+        );
+        app.update(resolved);
+    }
+
+    /// **`InitializeFolderSelected` success path (task
+    /// `handle-initialize-folder-event`).** Selecting a real, writable
+    /// directory must: call `folder_init::initialize_folder()` to bootstrap
+    /// git + docs/plans, add it to `app.opened_folders`, persist the
+    /// workspace (via the test-injected `workspace_path_override`), and
+    /// return to `Mode::Normal` with a "Folder initialized" status message.
+    #[tokio::test]
+    async fn resolve_io_initialize_folder_selected_success_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("new-project");
+        std::fs::create_dir_all(&folder).expect("create folder");
+
+        let workspace_file = tmp.path().join("workspace.toml");
+
+        let mut app = test_app();
+        app.workspace_path_override = Some(workspace_file.clone());
+        app.mode = crate::app::Mode::FolderBrowser {
+            purpose: crate::app::FolderBrowserPurpose::InitializeFolder,
+        };
+        let (tx, _rx) = background_events();
+
+        let (resolved, status) = resolve_io(
+            &mut app,
+            AppEvent::InitializeFolderSelected {
+                path: folder.clone(),
+            },
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(resolved, AppEvent::Tick));
+        assert_eq!(
+            status,
+            Some(format!("Folder initialized: {}", folder.display()))
+        );
+        assert!(
+            folder.join(".git").exists(),
+            "initialize_folder must bootstrap a git repo in the selected folder"
+        );
+        assert!(
+            folder.join("docs").join("plans").join("README.md").exists(),
+            "initialize_folder must write docs/plans/README.md"
+        );
+        assert!(
+            app.opened_folders.contains(&folder),
+            "InitializeFolderSelected must push the initialized folder into opened_folders"
+        );
+        assert!(
+            app.workspace.opened_folders.contains(&folder),
+            "the in-memory Workspace must also track the newly initialized folder"
+        );
+        assert_eq!(
+            app.mode,
+            crate::app::Mode::Normal,
+            "must return to Normal mode after initializing a folder"
+        );
+        assert!(
+            workspace_file.exists(),
+            "InitializeFolderSelected must persist the workspace to the injected path, \
+            not the operator's real $HOME/.makina/workspace.toml"
+        );
+        let saved = crate::workspace::Workspace::load_from(&workspace_file)
+            .expect("saved workspace must parse");
+        assert!(saved.opened_folders.contains(&folder));
+        assert!(
+            app.error_messages.is_empty(),
+            "success path must not push errors"
+        );
+    }
+
+    /// **`OpenFolderSelected` success path (task `handle-folder-open-close-events`).**
+    /// Selecting a *real* directory must: add it to `app.opened_folders`,
+    /// persist the workspace to disk (via the test-injected
+    /// `workspace_path_override`, never the operator's real `$HOME`), and
+    /// return to `Mode::Normal` with a "Folder opened" status message.
+    #[tokio::test]
+    async fn resolve_io_open_folder_selected_persists_and_discovers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("my-project");
+        std::fs::create_dir_all(&folder).expect("create folder");
+
+        let workspace_file = tmp.path().join("workspace.toml");
+
+        let mut app = test_app();
+        app.workspace_path_override = Some(workspace_file.clone());
+        app.mode = crate::app::Mode::FolderBrowser {
+            purpose: crate::app::FolderBrowserPurpose::OpenFolder,
+        };
+        let (tx, _rx) = background_events();
+
+        let (resolved, status) = resolve_io(
+            &mut app,
+            AppEvent::OpenFolderSelected {
+                path: folder.clone(),
+            },
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(resolved, AppEvent::Tick));
+        assert_eq!(status, Some(format!("Folder opened: {}", folder.display())));
+        assert!(
+            app.opened_folders.contains(&folder),
+            "OpenFolderSelected must push the selected folder into opened_folders"
+        );
+        assert!(
+            app.workspace.opened_folders.contains(&folder),
+            "the in-memory Workspace must also track the newly opened folder"
+        );
+        assert_eq!(
+            app.mode,
+            crate::app::Mode::Normal,
+            "must return to Normal mode after opening a folder"
+        );
+        assert!(
+            workspace_file.exists(),
+            "OpenFolderSelected must persist the workspace to the injected path, \
+            not the operator's real $HOME/.makina/workspace.toml"
+        );
+        let saved = crate::workspace::Workspace::load_from(&workspace_file)
+            .expect("saved workspace must parse");
+        assert!(saved.opened_folders.contains(&folder));
+    }
+
+    /// **`OpenFolderSelected` re-opening an already-opened folder is
+    /// idempotent** — no duplicate entries in `opened_folders`.
+    #[tokio::test]
+    async fn resolve_io_open_folder_selected_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("my-project");
+        std::fs::create_dir_all(&folder).expect("create folder");
+        let workspace_file = tmp.path().join("workspace.toml");
+
+        let mut app = test_app();
+        app.workspace_path_override = Some(workspace_file);
+        app.opened_folders.push(folder.clone());
+        app.workspace.add_folder(folder.clone());
+        let (tx, _rx) = background_events();
+
+        let _ = resolve_io(
+            &mut app,
+            AppEvent::OpenFolderSelected {
+                path: folder.clone(),
+            },
+            &tx,
+        )
+        .await;
+
+        assert_eq!(
+            app.opened_folders.iter().filter(|p| **p == folder).count(),
+            1,
+            "re-selecting an already-opened folder must not duplicate it"
+        );
+    }
+
+    /// **`CloseFolderRequested` shows a selectable list of opened folders
+    /// (task `handle-folder-open-close-events`).** Before this fix this arm
+    /// was a bare no-op, so pressing "Close Folder" in the palette did
+    /// nothing visible. It must populate `app.browser` with one entry per
+    /// `app.opened_folders`, and enter `Mode::FolderBrowser { purpose:
+    /// CloseFolders }`.
+    #[tokio::test]
+    async fn resolve_io_close_folder_requested_lists_opened_folders() {
+        use crate::app::{FolderBrowserPurpose, Mode};
+        use std::path::PathBuf;
+
+        let mut app = test_app();
+        let folder_a = PathBuf::from("/home/user/project-a");
+        let folder_b = PathBuf::from("/home/user/project-b");
+        app.opened_folders.push(folder_a.clone());
+        app.opened_folders.push(folder_b.clone());
+        let (tx, _rx) = background_events();
+
+        let (resolved, _status) = resolve_io(&mut app, AppEvent::CloseFolderRequested, &tx).await;
+        assert!(matches!(resolved, AppEvent::Tick));
+
+        assert_eq!(
+            app.mode,
+            Mode::FolderBrowser {
+                purpose: FolderBrowserPurpose::CloseFolders
+            },
+            "CloseFolderRequested must open the folder browser with the CloseFolders purpose"
+        );
+        let browser = app.browser.as_ref().expect("browser must be populated");
+        let paths: Vec<_> = browser.entries.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![folder_a, folder_b],
+            "the browser must list every opened folder as a selectable entry"
+        );
+        assert!(browser.entries.iter().all(|e| e.is_dir));
+    }
+
+    /// `CloseFolderRequested` with no opened folders must still open an
+    /// (empty) browser rather than panic or silently no-op.
+    #[tokio::test]
+    async fn resolve_io_close_folder_requested_with_no_folders_shows_empty_list() {
+        use crate::app::{FolderBrowserPurpose, Mode};
+
+        let mut app = test_app();
+        let (tx, _rx) = background_events();
+
+        let _ = resolve_io(&mut app, AppEvent::CloseFolderRequested, &tx).await;
+
+        assert_eq!(
+            app.mode,
+            Mode::FolderBrowser {
+                purpose: FolderBrowserPurpose::CloseFolders
+            }
+        );
+        assert!(
+            app.browser
+                .as_ref()
+                .expect("browser set")
+                .entries
+                .is_empty()
+        );
+    }
+
+    /// **`CloseFolderConfirmed` success path (task
+    /// `handle-folder-open-close-events`).** Confirming removal of a folder
+    /// must: remove it from `app.opened_folders`, persist the workspace (via
+    /// the injected path, never the real `$HOME`), return to `Mode::Normal`,
+    /// and set a "Folder closed" status message.
+    #[tokio::test]
+    async fn resolve_io_close_folder_confirmed_removes_and_persists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder_a = tmp.path().join("project-a");
+        let folder_b = tmp.path().join("project-b");
+        let workspace_file = tmp.path().join("workspace.toml");
+
+        let mut app = test_app();
+        app.workspace_path_override = Some(workspace_file.clone());
+        app.opened_folders.push(folder_a.clone());
+        app.opened_folders.push(folder_b.clone());
+        app.workspace.add_folder(folder_a.clone());
+        app.workspace.add_folder(folder_b.clone());
+        app.mode = crate::app::Mode::FolderBrowser {
+            purpose: crate::app::FolderBrowserPurpose::CloseFolders,
+        };
+        let (tx, _rx) = background_events();
+
+        let (resolved, status) = resolve_io(
+            &mut app,
+            AppEvent::CloseFolderConfirmed {
+                path: folder_a.clone(),
+            },
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(resolved, AppEvent::Tick));
+        assert_eq!(
+            status,
+            Some(format!("Folder closed: {}", folder_a.display()))
+        );
+        assert!(
+            !app.opened_folders.contains(&folder_a),
+            "CloseFolderConfirmed must remove the folder from opened_folders"
+        );
+        assert!(
+            app.opened_folders.contains(&folder_b),
+            "closing one folder must not remove others"
+        );
+        assert!(!app.workspace.opened_folders.contains(&folder_a));
+        assert_eq!(
+            app.mode,
+            crate::app::Mode::Normal,
+            "must return to Normal mode after closing a folder"
+        );
+        assert!(
+            workspace_file.exists(),
+            "CloseFolderConfirmed must persist the workspace to the injected path"
+        );
+        let saved = crate::workspace::Workspace::load_from(&workspace_file)
+            .expect("saved workspace must parse");
+        assert!(!saved.opened_folders.contains(&folder_a));
+        assert!(saved.opened_folders.contains(&folder_b));
+    }
+
+    /// The folder-browser key-translation branch (`translate_key` under
+    /// `browsing` when `app.is_folder_browsing()`) must dispatch
+    /// `FolderBrowserActivate` on Enter (carrying the current purpose),
+    /// `CloseBrowser` on Esc, `FolderBrowserParent` on Backspace, and
+    /// `FolderBrowserUp`/`FolderBrowserDown` on Up/Down — distinct from the
+    /// plain file-browser keymap (`BrowserActivate`/`BrowserParent`/etc).
+    #[test]
+    fn translate_key_folder_browser_keymap() {
+        use crate::app::{FolderBrowserPurpose, Mode};
+        use crate::browser::FileBrowser;
+        use std::path::PathBuf;
+
+        let mut app = test_app();
+        app.mode = Mode::FolderBrowser {
+            purpose: FolderBrowserPurpose::OpenFolder,
+        };
+        app.browser = Some(FileBrowser::new(PathBuf::from("/home/user"), vec![]));
+        let modal = ModalState {
+            browsing: true,
+            ..ModalState::default()
+        };
+
+        assert!(matches!(
+            translate_key(
+                crossterm::event::KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press,
+                    state: KeyEventState::NONE,
+                },
+                modal,
+                crate::app::Panel::Sidebar,
+                false,
+                &app,
+            ),
+            AppEvent::FolderBrowserActivate {
+                purpose: FolderBrowserPurpose::OpenFolder
+            }
+        ));
+
+        assert!(matches!(
+            translate_key(
+                crossterm::event::KeyEvent {
+                    code: KeyCode::Esc,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press,
+                    state: KeyEventState::NONE,
+                },
+                modal,
+                crate::app::Panel::Sidebar,
+                false,
+                &app,
+            ),
+            AppEvent::CloseBrowser
+        ));
+
+        assert!(matches!(
+            translate_key(
+                crossterm::event::KeyEvent {
+                    code: KeyCode::Down,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press,
+                    state: KeyEventState::NONE,
+                },
+                modal,
+                crate::app::Panel::Sidebar,
+                false,
+                &app,
+            ),
+            AppEvent::FolderBrowserDown
+        ));
+
+        assert!(matches!(
+            translate_key(
+                crossterm::event::KeyEvent {
+                    code: KeyCode::Up,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press,
+                    state: KeyEventState::NONE,
+                },
+                modal,
+                crate::app::Panel::Sidebar,
+                false,
+                &app,
+            ),
+            AppEvent::FolderBrowserUp
+        ));
+
+        assert!(matches!(
+            translate_key(
+                crossterm::event::KeyEvent {
+                    code: KeyCode::Backspace,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press,
+                    state: KeyEventState::NONE,
+                },
+                modal,
+                crate::app::Panel::Sidebar,
+                false,
+                &app,
+            ),
+            AppEvent::FolderBrowserParent
+        ));
     }
 
     /// **TUI ↔ CoreApi flow (the done-when through the event layer).**
@@ -3095,7 +4063,7 @@ mod tests {
         // OpenRun against CoreApi and returns CloseBrowser + a status message
         // (now the transient "Interpreting …" one).
         let (tx, _rx) = background_events();
-        let (resolved, status) = resolve_io(&app, AppEvent::BrowserActivate, &tx).await;
+        let (resolved, status) = resolve_io(&mut app, AppEvent::BrowserActivate, &tx).await;
         assert!(
             matches!(resolved, AppEvent::CloseBrowser),
             "selecting a file must resolve to CloseBrowser"
@@ -3355,7 +4323,7 @@ mod tests {
 
         // Run the IO layer commit.
         let (resolved_event, status) =
-            resolve_io_for_test(&app, AppEvent::ProviderEditorCommit).await;
+            resolve_io_for_test(&mut app, AppEvent::ProviderEditorCommit).await;
         assert!(
             matches!(resolved_event, AppEvent::ProviderEditorCommit),
             "commit must return ProviderEditorCommit for App::update to close the editor"
@@ -3743,7 +4711,7 @@ A description that is long enough to pass minimums.
             "the focused node must be the failed task"
         );
 
-        let (_ev, status) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
+        let (_ev, status) = resolve_io_for_test(&mut app, AppEvent::RetryFocused).await;
         assert!(status.is_some(), "retry must surface a status message");
 
         let cmds = api.commands.lock().unwrap().clone();
@@ -3763,7 +4731,7 @@ A description that is long enough to pass minimums.
     #[tokio::test]
     async fn retry_action_on_run_node_issues_retry_failed() {
         use crate::app::{AppEvent, TreeNode};
-        let (app, api) = retry_app(
+        let (mut app, api) = retry_app(
             vec![
                 task_view("a", TaskState::Done),
                 task_view("b", TaskState::Failed),
@@ -3776,7 +4744,7 @@ A description that is long enough to pass minimums.
             "the focused node must be the run header"
         );
 
-        let (_ev, status) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
+        let (_ev, status) = resolve_io_for_test(&mut app, AppEvent::RetryFocused).await;
         assert!(status.is_some());
 
         let cmds = api.commands.lock().unwrap().clone();
@@ -3800,7 +4768,7 @@ A description that is long enough to pass minimums.
             Some(TreeNode::Task { task: 0, .. })
         ));
 
-        let (_ev, status) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
+        let (_ev, status) = resolve_io_for_test(&mut app, AppEvent::RetryFocused).await;
         assert_eq!(
             status.as_deref(),
             Some("nothing to retry here"),
@@ -3850,7 +4818,7 @@ A description that is long enough to pass minimums.
         // Resolve CommandPaletteExecute; it should re-dispatch RetryFocused over
         // background_tx and close the palette for this pass.
         let (tx, mut rx) = background_events();
-        let (ev1, status1) = resolve_io(&app, AppEvent::CommandPaletteExecute, &tx).await;
+        let (ev1, status1) = resolve_io(&mut app, AppEvent::CommandPaletteExecute, &tx).await;
         assert!(
             matches!(ev1, AppEvent::CloseCommandPalette),
             "CommandPaletteExecute must close the palette after re-dispatch; got {:?}",
@@ -3867,7 +4835,7 @@ A description that is long enough to pass minimums.
 
         // Manually simulate the re-dispatch: resolve RetryFocused through resolve_io,
         // which calls retry_focused and issues the command.
-        let (ev2, status2) = resolve_io_for_test(&app, AppEvent::RetryFocused).await;
+        let (ev2, status2) = resolve_io_for_test(&mut app, AppEvent::RetryFocused).await;
         assert!(
             matches!(ev2, AppEvent::Tick),
             "RetryFocused resolves to Tick; got {:?}",
@@ -3990,7 +4958,8 @@ A description that is long enough to pass minimums.
         // Resolve CommandPaletteExecute; it should enqueue Settings for a fresh
         // resolve_io pass and close the palette for this pass.
         let (tx, mut rx) = background_events();
-        let (resolved_event, status) = resolve_io(&app, AppEvent::CommandPaletteExecute, &tx).await;
+        let (resolved_event, status) =
+            resolve_io(&mut app, AppEvent::CommandPaletteExecute, &tx).await;
 
         assert!(status.is_none(), "palette dispatch should not emit status");
         assert!(
@@ -4091,7 +5060,8 @@ final = "squash"
         app.update(AppEvent::SettingsNextOption);
 
         // Commit settings via resolve_io.
-        let (_resolved_event, status) = resolve_io_for_test(&app, AppEvent::SettingsCommit).await;
+        let (_resolved_event, status) =
+            resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
 
         // Status should be "Settings saved".
         assert_eq!(status, Some("Settings saved".to_string()));
@@ -4339,12 +5309,14 @@ final = "squash"
         std::fs::write(plans_dir.join("TASKS.md"), "Tasks").unwrap();
 
         let api = Arc::new(PlaceholderApi::empty());
-        let app = App::new(api, vec![], repo_root.to_path_buf());
+        let mut app = App::new(api, vec![], repo_root.to_path_buf());
+        // Set opened_folders to include the repo_root for discovery.
+        app.opened_folders = vec![repo_root.to_path_buf()];
 
         // Resolve OpenBrowser: should return immediately, then discover the plan
         // on the background channel.
         let (tx, mut rx) = background_events();
-        let (resolved, status) = resolve_io(&app, AppEvent::OpenBrowser, &tx).await;
+        let (resolved, status) = resolve_io(&mut app, AppEvent::OpenBrowser, &tx).await;
         assert!(
             matches!(resolved, AppEvent::OpenBrowser),
             "OpenBrowser must return immediately"
@@ -4354,16 +5326,56 @@ final = "squash"
         assert_eq!(status, None);
         let discovered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
-            .expect("timed out waiting for PlansDiscovered")
+            .expect("timed out waiting for PlansDiscoveredPerFolder")
             .expect("background channel closed");
         match &discovered {
-            AppEvent::PlansDiscovered { plans } => {
+            AppEvent::PlansDiscoveredPerFolder { plans_map } => {
+                assert_eq!(
+                    plans_map.len(),
+                    1,
+                    "should discover plans in exactly one folder"
+                );
+                let plans = plans_map.get(&0).expect("should have folder_idx 0");
                 assert_eq!(plans.len(), 1, "should discover exactly one plan");
                 assert_eq!(plans[0].slug, "0001-x");
                 assert!(plans[0].has_tasks);
             }
-            _ => panic!("OpenBrowser must emit PlansDiscovered, got {discovered:?}"),
+            _ => panic!("OpenBrowser must emit PlansDiscoveredPerFolder, got {discovered:?}"),
         }
+    }
+
+    /// **Fallback-to-browser with an opened-but-empty folder:** `discover_plans_per_folder`
+    /// always inserts one `HashMap` entry per opened folder — even an empty
+    /// `Vec` when that folder has no `docs/plans/` — so `plans_map.is_empty()`
+    /// alone cannot detect the "no plans anywhere" case. With one folder opened
+    /// that has no `docs/plans/`, `[o]` (`fallback_to_browser = true`) must still
+    /// fall back to the file browser instead of emitting an empty per-folder map.
+    #[tokio::test]
+    async fn open_browser_falls_back_when_opened_folder_has_no_plans() {
+        use crate::app::{App, AppEvent};
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let repo_root = tmpdir.path();
+        // No docs/plans/ directory created: this folder has zero plans.
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], repo_root.to_path_buf());
+        app.opened_folders = vec![repo_root.to_path_buf()];
+
+        let (tx, mut rx) = background_events();
+        let (resolved, _status) = resolve_io(&mut app, AppEvent::OpenBrowser, &tx).await;
+        assert!(matches!(resolved, AppEvent::OpenBrowser));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for background event")
+            .expect("background channel closed");
+        assert!(
+            matches!(event, AppEvent::BrowserOpened { .. }),
+            "an opened folder with no plans must fall back to the file browser, got {event:?}"
+        );
     }
 
     #[tokio::test]
@@ -4412,7 +5424,7 @@ final = "squash"
 
         // Resolve OpenFocusedNode (now passes through; handling + expand is in update).
         let (tx, _rx) = background_events();
-        let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
+        let (resolved, status) = resolve_io(&mut app, AppEvent::OpenFocusedNode, &tx).await;
 
         assert!(
             matches!(resolved, AppEvent::OpenFocusedNode),
@@ -4471,7 +5483,7 @@ final = "squash"
         ));
 
         let (tx, _rx) = background_events();
-        let (resolved, status) = resolve_io(&app, AppEvent::OpenFocusedNode, &tx).await;
+        let (resolved, status) = resolve_io(&mut app, AppEvent::OpenFocusedNode, &tx).await;
         assert!(
             matches!(resolved, AppEvent::OpenFocusedNode),
             "OpenFocusedNode passes through, got {resolved:?}"

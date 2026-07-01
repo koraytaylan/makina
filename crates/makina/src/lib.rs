@@ -28,6 +28,7 @@ pub mod app;
 pub mod browser;
 pub mod event;
 pub mod exit;
+pub mod folder_init;
 pub mod log;
 pub mod markup;
 #[cfg(test)]
@@ -39,3 +40,4 @@ pub mod syntax;
 pub mod theme;
 pub mod tui;
 pub mod ui;
+pub mod workspace;

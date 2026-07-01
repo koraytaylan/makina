@@ -94,6 +94,22 @@ async fn main() {
     //  - the resolved CONFIG (gates, caps, concurrency).
     let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
+    // ── Workspace Persistence ───────────────────────────────────────────────
+    // Load the workspace from $HOME/.makina/workspace.toml. Auto-discover the
+    // launch CWD if it is a Makina-ready git repo (has .git and docs/plans),
+    // and add it to opened_folders for multi-folder support.
+    let mut workspace = makina::workspace::Workspace::load().unwrap_or_else(|e| {
+        eprintln!("failed to load workspace: {e}");
+        makina::workspace::Workspace::new()
+    });
+
+    // Auto-discover: if CWD is a git repo with docs/plans, add it to opened_folders.
+    if repo_root.join(".git").exists() && repo_root.join("docs/plans").exists() {
+        workspace.add_folder(repo_root.clone());
+    }
+    let opened_folders: Vec<std::path::PathBuf> =
+        workspace.opened_folders.iter().cloned().collect();
+
     // ── Audit sink (task supervisor-audit-writer) ─────────────────────────────
     // The `JsonlAuditSink` is the Supervisor-owned ledger writer.  A single
     // `Arc` is shared as both:
@@ -295,6 +311,8 @@ async fn main() {
         caps_for_app,
         concurrency_for_app,
         final_merge_for_app,
+        opened_folders,
+        workspace,
     );
 
     // Restore theme from GlobalConfig; unknown/absent names fall back to Ayu Dark with no panic.
