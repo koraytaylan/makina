@@ -44,6 +44,9 @@ tokio-stream = "0.1"
 # to signal a background Supervisor scheduler to abort (cancel) a Run.
 tokio-util = "0.7"
 
+# Platform-specific directories (home dir, config dirs, etc)
+dirs = "5.0"
+
 # Derive-based error types
 thiserror = "2.0"
 
