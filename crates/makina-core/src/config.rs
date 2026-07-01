@@ -158,6 +158,14 @@ pub struct RoleAssignment {
     /// The name of the provider this role is assigned to.
     ///
     /// Must reference a declared provider in `GlobalConfig::providers`.
+    ///
+    /// Defaults to empty when omitted so a project config may override only a
+    /// role's `system_prompt` (or other fields) without redeclaring `provider`;
+    /// otherwise a provider-less `[roles.*]` table fails to deserialize and
+    /// silently wipes the whole config on the read-modify-write path
+    /// ([`write_project_config`]). Provider resolution/validation happens on the
+    /// global layer, not here.
+    #[serde(default)]
     pub provider: String,
 
     /// Optional default mode ID to apply when opening a session.
