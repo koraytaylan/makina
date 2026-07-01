@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete.
 
 _Last updated: 2026-07-01, against develop._
 
@@ -12,10 +12,10 @@ _Last updated: 2026-07-01, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Workspace Persistence and Multi-Folder State | `add-workspace-persistence` | 📋 Planned |
-| 0002 | Sidebar Tree Refactor to 3-Level Hierarchy | `extend-treenode-enum`, `refactor-visible-tree-nodes`, `rewire-tree-navigation-for-folders` | 📋 Planned |
-| 0003 | Command Palette Extensions | `extend-appevent-for-folders`, `add-palette-actions` | 📋 Planned |
-| 0004 | Folder Browser and File-Picker UI | `implement-folder-browser-mode`, `handle-folder-open-close-events` | 📋 Planned |
-| 0005 | Folder Initialization Flow | `create-folder-init-module`, `handle-initialize-folder-event` | 📋 Planned |
-| 0006 | Plan Auto-Discovery Per Folder | `add-discover-plans-per-folder`, `update-discovery-event-and-handler`, `update-sidebar-rendering-for-folders` | 📋 Planned |
-| 0007 | Multi-Folder Workflow Integration Verification | `verify-multi-folder-integration` | 📋 Planned |
+| 0001 | Workspace Persistence and Multi-Folder State | `add-workspace-persistence` | ✅ Done |
+| 0002 | Sidebar Tree Refactor to 3-Level Hierarchy | `extend-treenode-enum`, `refactor-visible-tree-nodes`, `rewire-tree-navigation-for-folders` | ✅ Done |
+| 0003 | Command Palette Extensions | `extend-appevent-for-folders`, `add-palette-actions` | ✅ Done |
+| 0004 | Folder Browser and File-Picker UI | `implement-folder-browser-mode`, `handle-folder-open-close-events` | ✅ Done |
+| 0005 | Folder Initialization Flow | `create-folder-init-module`, `handle-initialize-folder-event` | ✅ Done |
+| 0006 | Plan Auto-Discovery Per Folder | `add-discover-plans-per-folder`, `update-discovery-event-and-handler`, `update-sidebar-rendering-for-folders` | ✅ Done |
+| 0007 | Multi-Folder Workflow Integration Verification | `verify-multi-folder-integration` | ✅ Done |
