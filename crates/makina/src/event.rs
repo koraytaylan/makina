@@ -461,13 +461,28 @@ async fn resolve_io(
                 }
             }
         }
-        // Show the opened folders as a selectable list in the folder-browser
-        // modal (purpose `CloseFolders`), so the user can pick which one to
-        // close. Unlike `OpenFolder` / `InitializeFolderRequested`, there is no
-        // directory read here — the list IS `app.opened_folders`, already in
-        // memory — so we build the `FileBrowser` and flip the mode directly
-        // instead of round-tripping through `BrowserOpened`.
+        // Close the folder highlighted in the sidebar tree. `focused_node()`
+        // resolves the folder for a folder header or any plan/task under one,
+        // so "Close Folder" acts on wherever the cursor is without a prompt.
+        //
+        // Only when the cursor isn't on a folder-scoped node do we fall back to
+        // the selectable list: the opened folders are shown in the folder-browser
+        // modal (purpose `CloseFolders`) so the user can pick one. Unlike
+        // `OpenFolder` / `InitializeFolderRequested` there is no directory read
+        // here — the list IS `app.opened_folders`, already in memory — so we
+        // build the `FileBrowser` and flip the mode directly instead of
+        // round-tripping through `BrowserOpened`.
         AppEvent::CloseFolderRequested => {
+            if let Some(folder_idx) = app.focused_node().and_then(|n| n.folder_idx())
+                && let Some(path) = app.opened_folders.get(folder_idx).cloned()
+            {
+                return Box::pin(resolve_io(
+                    app,
+                    AppEvent::CloseFolderConfirmed { path },
+                    background_tx,
+                ))
+                .await;
+            }
             let entries: Vec<crate::browser::DirEntry> = app
                 .opened_folders
                 .iter()
@@ -3770,12 +3785,11 @@ mod tests {
         );
     }
 
-    /// **`CloseFolderRequested` shows a selectable list of opened folders
-    /// (task `handle-folder-open-close-events`).** Before this fix this arm
-    /// was a bare no-op, so pressing "Close Folder" in the palette did
-    /// nothing visible. It must populate `app.browser` with one entry per
-    /// `app.opened_folders`, and enter `Mode::FolderBrowser { purpose:
-    /// CloseFolders }`.
+    /// **`CloseFolderRequested` fallback: with no folder highlighted in the
+    /// sidebar it shows a selectable list of opened folders.** (`test_app`
+    /// leaves `tree_cursor` at `None`, so no folder is focused here.) It must
+    /// populate `app.browser` with one entry per `app.opened_folders` and enter
+    /// `Mode::FolderBrowser { purpose: CloseFolders }`.
     #[tokio::test]
     async fn resolve_io_close_folder_requested_lists_opened_folders() {
         use crate::app::{FolderBrowserPurpose, Mode};
@@ -3808,8 +3822,56 @@ mod tests {
         assert!(browser.entries.iter().all(|e| e.is_dir));
     }
 
-    /// `CloseFolderRequested` with no opened folders must still open an
-    /// (empty) browser rather than panic or silently no-op.
+    /// When the sidebar highlights a folder (or a plan/task under one),
+    /// `CloseFolderRequested` closes *that* folder directly — no picker modal.
+    #[tokio::test]
+    async fn resolve_io_close_folder_requested_closes_highlighted_folder() {
+        use crate::app::{Mode, TreeNode};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder_a = tmp.path().join("project-a");
+        let folder_b = tmp.path().join("project-b");
+
+        let mut app = test_app();
+        app.workspace_path_override = Some(tmp.path().join("workspace.toml"));
+        app.opened_folders.push(folder_a.clone());
+        app.opened_folders.push(folder_b.clone());
+        app.workspace.opened_folders = app.opened_folders.iter().cloned().collect();
+
+        // Collapsed, plan-less folders flatten to [Folder{0}, Folder{1}].
+        assert_eq!(
+            app.visible_tree_nodes(),
+            vec![
+                TreeNode::Folder { folder_idx: 0 },
+                TreeNode::Folder { folder_idx: 1 },
+            ]
+        );
+        // Highlight the second folder (project-b).
+        app.tree_cursor = Some(1);
+
+        let (tx, _rx) = background_events();
+        let (resolved, status) = resolve_io(&mut app, AppEvent::CloseFolderRequested, &tx).await;
+
+        assert!(matches!(resolved, AppEvent::Tick));
+        assert_eq!(
+            app.opened_folders,
+            vec![folder_a],
+            "only the highlighted folder (project-b) must be closed"
+        );
+        assert_eq!(app.mode, Mode::Normal, "must not enter the picker modal");
+        assert!(
+            app.browser.is_none(),
+            "highlighted-folder close must not open the folder browser"
+        );
+        assert_eq!(
+            status,
+            Some(format!("Folder closed: {}", folder_b.display())),
+        );
+    }
+
+    /// `CloseFolderRequested` with no folder highlighted falls back to the
+    /// selectable list. With no opened folders it must still open an (empty)
+    /// browser rather than panic or silently no-op.
     #[tokio::test]
     async fn resolve_io_close_folder_requested_with_no_folders_shows_empty_list() {
         use crate::app::{FolderBrowserPurpose, Mode};

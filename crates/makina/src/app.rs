@@ -767,6 +767,25 @@ pub enum TreeNode {
     PlanTask { plan_idx: usize, task_idx: usize },
 }
 
+impl TreeNode {
+    /// The `opened_folders` index of the folder this node belongs to, if any.
+    ///
+    /// Returns `Some` for the folder-scoped variants (a folder header or a
+    /// plan/task under one) and `None` for the folder-less variants (runs,
+    /// tasks, and the legacy discovered-plan nodes).
+    pub fn folder_idx(&self) -> Option<usize> {
+        match *self {
+            TreeNode::Folder { folder_idx }
+            | TreeNode::PlanInFolder { folder_idx, .. }
+            | TreeNode::PlanTaskInFolder { folder_idx, .. } => Some(folder_idx),
+            TreeNode::Run { .. }
+            | TreeNode::Task { .. }
+            | TreeNode::Plan { .. }
+            | TreeNode::PlanTask { .. } => None,
+        }
+    }
+}
+
 /// Namespaced key for [`App::collapsed_plans`].
 ///
 /// Collapse state must be tracked for two independent plan-discovery paths
