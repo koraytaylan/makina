@@ -767,6 +767,25 @@ pub enum TreeNode {
     PlanTask { plan_idx: usize, task_idx: usize },
 }
 
+/// Namespaced key for [`App::collapsed_plans`].
+///
+/// Collapse state must be tracked for two independent plan-discovery paths
+/// whose indices would otherwise collide: the legacy single-folder path (keyed
+/// by index into `discovered_plans`) and the multi-folder path (keyed by folder
+/// index + the plan's index within that folder). Encoding the discriminant in
+/// the key type — instead of the old `folder_idx * 1000 + plan_idx` arithmetic —
+/// makes a legacy plan and a folder-scoped plan structurally distinct, so their
+/// collapse state can never alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CollapseKey {
+    /// A plan discovered via the legacy single-folder path, keyed by index into
+    /// `discovered_plans`.
+    LegacyPlan(usize),
+    /// A folder-scoped plan (multi-folder path), keyed by folder index and the
+    /// plan's index within that folder's plan list.
+    FolderPlan { folder: usize, plan: usize },
+}
+
 // ── App input event ───────────────────────────────────────────────────────────
 
 /// An event consumed by [`App::update`].
@@ -1380,11 +1399,12 @@ pub struct App {
     /// Absent ⇒ expanded (runs default to expanded).
     pub collapsed_runs: HashSet<RunId>,
 
-    /// Plan indices currently collapsed in the sidebar tree (excludes expanded plans).
-    /// Parallel to `collapsed_runs` but keyed by index into `discovered_plans`.
-    /// Plans start collapsed: every discovered index is inserted on
+    /// Plans currently collapsed in the sidebar tree (excludes expanded plans).
+    /// Parallel to `collapsed_runs` but keyed by [`CollapseKey`], which namespaces
+    /// legacy discovered plans against folder-scoped plans so the two paths can't
+    /// alias. Legacy plans start collapsed: every discovered index is inserted on
     /// [`AppEvent::PlansDiscovered`].
-    pub collapsed_plans: HashSet<usize>,
+    pub collapsed_plans: HashSet<CollapseKey>,
 
     /// Folder indices currently collapsed in the sidebar tree.
     pub collapsed_folders: HashSet<usize>,
@@ -1731,10 +1751,10 @@ impl App {
                     });
 
                     // Expand plan tasks if not collapsed.
-                    if !self
-                        .collapsed_plans
-                        .contains(&(folder_idx * 1000 + local_plan_idx))
-                    {
+                    if !self.collapsed_plans.contains(&CollapseKey::FolderPlan {
+                        folder: folder_idx,
+                        plan: local_plan_idx,
+                    }) {
                         for task_idx in 0..plan.tasks.len() {
                             nodes.push(TreeNode::PlanTaskInFolder {
                                 folder_idx,
@@ -1754,7 +1774,10 @@ impl App {
                 continue;
             }
             nodes.push(TreeNode::Plan { plan_idx });
-            if !self.collapsed_plans.contains(&plan_idx) {
+            if !self
+                .collapsed_plans
+                .contains(&CollapseKey::LegacyPlan(plan_idx))
+            {
                 for task_idx in 0..plan.tasks.len() {
                     nodes.push(TreeNode::PlanTask { plan_idx, task_idx });
                 }
@@ -1988,10 +2011,11 @@ impl App {
                 {
                     return false;
                 }
-                if self.collapsed_plans.contains(&plan_idx) {
-                    self.collapsed_plans.remove(&plan_idx);
+                let key = CollapseKey::LegacyPlan(plan_idx);
+                if self.collapsed_plans.contains(&key) {
+                    self.collapsed_plans.remove(&key);
                 } else {
-                    self.collapsed_plans.insert(plan_idx);
+                    self.collapsed_plans.insert(key);
                 }
                 self.move_cursor_to_plan_header(plan_idx);
                 self.sync_selection_from_cursor();
@@ -2021,7 +2045,10 @@ impl App {
                     return false;
                 }
                 // Use the same collapse key as visible_tree_nodes() uses.
-                let collapse_key = folder_idx * 1000 + plan_idx;
+                let collapse_key = CollapseKey::FolderPlan {
+                    folder: folder_idx,
+                    plan: plan_idx,
+                };
                 if self.collapsed_plans.contains(&collapse_key) {
                     self.collapsed_plans.remove(&collapse_key);
                 } else {
@@ -2037,7 +2064,10 @@ impl App {
                 ..
             }) => {
                 // On a task leaf, collapse its parent plan and park the cursor on the plan header.
-                let collapse_key = folder_idx * 1000 + plan_idx;
+                let collapse_key = CollapseKey::FolderPlan {
+                    folder: folder_idx,
+                    plan: plan_idx,
+                };
                 self.collapsed_plans.insert(collapse_key);
                 self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
                 self.sync_selection_from_cursor();
@@ -2103,7 +2133,10 @@ impl App {
             let plan_slug = plan.slug.clone();
             self.tabs.open_tab(TabContent::Plan { plan_slug });
             if !plan.tasks.is_empty() {
-                let collapse_key = folder_idx * 1000 + plan_idx;
+                let collapse_key = CollapseKey::FolderPlan {
+                    folder: folder_idx,
+                    plan: plan_idx,
+                };
                 self.collapsed_plans.remove(&collapse_key);
                 self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
                 self.sync_selection_from_cursor();
@@ -2120,7 +2153,8 @@ impl App {
             let plan_slug = plan.slug.clone();
             self.tabs.open_tab(TabContent::Plan { plan_slug });
             if !plan.tasks.is_empty() {
-                self.collapsed_plans.remove(&plan_idx);
+                self.collapsed_plans
+                    .remove(&CollapseKey::LegacyPlan(plan_idx));
                 self.move_cursor_to_plan_header(plan_idx);
                 self.sync_selection_from_cursor();
             }
@@ -3055,7 +3089,8 @@ impl App {
                         .get(run)
                         .is_some_and(|r| self.collapsed_runs.contains(&r.id)),
                     Some(TreeNode::Plan { plan_idx }) => {
-                        self.collapsed_plans.contains(&plan_idx)
+                        self.collapsed_plans
+                            .contains(&CollapseKey::LegacyPlan(plan_idx))
                             && self
                                 .discovered_plans
                                 .get(plan_idx)
@@ -3068,7 +3103,10 @@ impl App {
                         folder_idx,
                         plan_idx,
                     }) => {
-                        let collapse_key = folder_idx * 1000 + plan_idx;
+                        let collapse_key = CollapseKey::FolderPlan {
+                            folder: folder_idx,
+                            plan: plan_idx,
+                        };
                         self.collapsed_plans.contains(&collapse_key)
                             && self
                                 .plans_by_folder
@@ -3118,7 +3156,9 @@ impl App {
                             self.tree_toggle_expand(); // collapse it
                         }
                         Some(TreeNode::Plan { plan_idx })
-                            if !self.collapsed_plans.contains(&plan_idx)
+                            if !self
+                                .collapsed_plans
+                                .contains(&CollapseKey::LegacyPlan(plan_idx))
                                 && self
                                     .discovered_plans
                                     .get(plan_idx)
@@ -3128,7 +3168,8 @@ impl App {
                         }
                         Some(TreeNode::PlanTask { plan_idx, .. }) => {
                             // Collapse the parent plan and move the cursor up to it.
-                            self.collapsed_plans.insert(plan_idx);
+                            self.collapsed_plans
+                                .insert(CollapseKey::LegacyPlan(plan_idx));
                             self.move_cursor_to_plan_header(plan_idx);
                             self.sync_selection_from_cursor();
                         }
@@ -3141,7 +3182,10 @@ impl App {
                             folder_idx,
                             plan_idx,
                         }) if {
-                            let collapse_key = folder_idx * 1000 + plan_idx;
+                            let collapse_key = CollapseKey::FolderPlan {
+                                folder: folder_idx,
+                                plan: plan_idx,
+                            };
                             !self.collapsed_plans.contains(&collapse_key)
                                 && self
                                     .plans_by_folder
@@ -3158,7 +3202,10 @@ impl App {
                             ..
                         }) => {
                             // Collapse the parent plan and move the cursor up to it.
-                            let collapse_key = folder_idx * 1000 + plan_idx;
+                            let collapse_key = CollapseKey::FolderPlan {
+                                folder: folder_idx,
+                                plan: plan_idx,
+                            };
                             self.collapsed_plans.insert(collapse_key);
                             self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
                             self.sync_selection_from_cursor();
@@ -3444,10 +3491,13 @@ impl App {
                 // Store discovered plans for sidebar tree integration (task 0031).
                 // Plans are now navigated via the unified sidebar tree, not a modal.
                 self.discovered_plans = plans;
-                // Plans start collapsed: seed `collapsed_plans` with every index
-                // so the tree opens tidy and Right/Space/Enter reveal the tasks.
-                // (This also resets any prior expand state on a re-discovery.)
-                self.collapsed_plans = (0..self.discovered_plans.len()).collect();
+                // Plans start collapsed: seed `collapsed_plans` with every legacy
+                // index so the tree opens tidy and Right/Space/Enter reveal the
+                // tasks. (This also resets any prior expand state on a
+                // re-discovery.)
+                self.collapsed_plans = (0..self.discovered_plans.len())
+                    .map(CollapseKey::LegacyPlan)
+                    .collect();
                 // Close plan tabs whose slug is no longer in `discovered_plans`
                 // (plan 0032: close_tabs_for_missing_plans).
                 self.close_tabs_for_missing_plans();
@@ -9617,18 +9667,47 @@ mod tests {
             plans: make_plan_entries(),
         });
         // alpha (index 0) has 2 tasks and starts collapsed.
-        assert!(app.collapsed_plans.contains(&0));
+        assert!(app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)));
         assert_eq!(app.visible_tree_nodes().len(), 2, "only 2 plan headers");
 
         app.update(AppEvent::OpenFocusedNode);
 
         assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab opened");
-        assert!(!app.collapsed_plans.contains(&0), "alpha must be expanded");
+        assert!(
+            !app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)),
+            "alpha must be expanded"
+        );
         assert_eq!(
             app.visible_tree_nodes().len(),
             4,
             "2 headers + alpha's 2 tasks"
         );
+    }
+
+    /// Regression: legacy and folder-scoped collapse keys must live in separate
+    /// namespaces. The old `folder_idx * 1000 + plan_idx` scheme aliased
+    /// folder 0 / plan 0 onto legacy plan index 0 (both → key `0`); the
+    /// [`CollapseKey`] discriminant makes them structurally distinct so
+    /// collapsing one never toggles the other.
+    #[test]
+    fn collapse_keys_are_namespaced_across_paths() {
+        let mut collapsed = HashSet::new();
+        // Collapse the legacy plan at index 0.
+        collapsed.insert(CollapseKey::LegacyPlan(0));
+        // The folder-scoped plan (folder 0, plan 0) — the old collision — is
+        // unaffected.
+        assert!(collapsed.contains(&CollapseKey::LegacyPlan(0)));
+        assert!(!collapsed.contains(&CollapseKey::FolderPlan { folder: 0, plan: 0 }));
+
+        // Now collapse the folder-scoped plan too; both coexist independently.
+        collapsed.insert(CollapseKey::FolderPlan { folder: 0, plan: 0 });
+        assert!(collapsed.contains(&CollapseKey::LegacyPlan(0)));
+        assert!(collapsed.contains(&CollapseKey::FolderPlan { folder: 0, plan: 0 }));
+
+        // Removing one leaves the other intact.
+        collapsed.remove(&CollapseKey::LegacyPlan(0));
+        assert!(!collapsed.contains(&CollapseKey::LegacyPlan(0)));
+        assert!(collapsed.contains(&CollapseKey::FolderPlan { folder: 0, plan: 0 }));
     }
 
     /// First `Right` on a collapsed plan reveals its tasks; a second `Right`
@@ -12273,7 +12352,8 @@ mod tests {
             )
         });
 
-        // Tasks should be visible initially (plan not in collapsed_plans with key 0*1000+0)
+        // Tasks should be visible initially (plan not in collapsed_plans for
+        // folder 0 / plan 0).
         assert!(has_tasks, "tasks should be visible initially");
 
         // Find and move cursor to the PlanInFolder node
@@ -12291,7 +12371,7 @@ mod tests {
 
         // Space should collapse the plan's tasks
         app.update(AppEvent::ToggleTreeNode);
-        let collapse_key = 0; // folder_idx=0 * 1000 + plan_idx=0
+        let collapse_key = CollapseKey::FolderPlan { folder: 0, plan: 0 };
         assert!(
             app.collapsed_plans.contains(&collapse_key),
             "plan should be collapsed after ToggleTreeNode"
@@ -12314,7 +12394,7 @@ mod tests {
         // Space again should expand it
         app.update(AppEvent::ToggleTreeNode);
         assert!(
-            !app.collapsed_plans.contains(&0), // collapse_key for folder_idx=0, plan_idx=0
+            !app.collapsed_plans.contains(&collapse_key),
             "plan should be expanded after second ToggleTreeNode"
         );
 
@@ -12520,7 +12600,8 @@ mod tests {
         // Expand folder and plan so tasks are visible
         app.collapsed_folders.clear();
         assert!(
-            !app.collapsed_plans.contains(&0),
+            !app.collapsed_plans
+                .contains(&CollapseKey::FolderPlan { folder: 0, plan: 0 }),
             "plan should start expanded"
         );
 
@@ -12544,7 +12625,7 @@ mod tests {
 
         // Focus-left should collapse the parent plan
         app.update(AppEvent::FocusLeftOrCollapse);
-        let collapse_key = 0; // folder_idx=0 * 1000 + plan_idx=0
+        let collapse_key = CollapseKey::FolderPlan { folder: 0, plan: 0 };
         assert!(
             app.collapsed_plans.contains(&collapse_key),
             "parent plan should be collapsed"
@@ -12621,7 +12702,10 @@ mod tests {
         app.collapsed_folders.clear();
 
         // Expand plan 2-2 for its tasks (folder_idx=1, plan_idx=1)
-        assert!(!app.collapsed_plans.contains(&1001));
+        assert!(
+            !app.collapsed_plans
+                .contains(&CollapseKey::FolderPlan { folder: 1, plan: 1 })
+        );
 
         let nodes = app.visible_tree_nodes();
 

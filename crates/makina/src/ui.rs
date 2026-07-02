@@ -52,7 +52,7 @@ use std::{
 };
 
 use crate::app::{
-    AccordionSection, App, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
+    AccordionSection, App, CollapseKey, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
     ScrollablePanel, TabContent, ToolDiffKey, TreeNode,
 };
 use makina_core::api::{AgentRole, FailureKind, RunId, RunView, TaskId};
@@ -586,7 +586,10 @@ pub fn render(app: &App, frame: &mut Frame) {
                         // no tasks is a leaf (no triangle).
                         let disclosure = if n_tasks == 0 {
                             "  "
-                        } else if app.collapsed_plans.contains(plan_idx) {
+                        } else if app
+                            .collapsed_plans
+                            .contains(&CollapseKey::LegacyPlan(*plan_idx))
+                        {
                             "▸ "
                         } else {
                             "▾ "
@@ -733,8 +736,11 @@ pub fn render(app: &App, frame: &mut Frame) {
                         let plan_entry = &app.plans_by_folder[folder_idx][*plan_idx];
                         let n_tasks = plan_entry.tasks.len();
 
-                        // Use folder_idx * 1000 + plan_idx as the collapse key, matching visible_tree_nodes().
-                        let collapse_key = folder_idx * 1000 + plan_idx;
+                        // Namespaced collapse key, matching visible_tree_nodes().
+                        let collapse_key = CollapseKey::FolderPlan {
+                            folder: *folder_idx,
+                            plan: *plan_idx,
+                        };
 
                         let disclosure = if n_tasks == 0 {
                             "    "
@@ -5259,7 +5265,7 @@ mod tests {
             status_text: None,
         }];
         app.tree_cursor = Some(0);
-        app.collapsed_plans.insert(0); // PlansDiscovered seeds this in the real flow
+        app.collapsed_plans.insert(CollapseKey::LegacyPlan(0)); // PlansDiscovered seeds this in the real flow
         // Plan starts collapsed (children hidden) until expanded.
         terminal.draw(|f| render(&app, f)).unwrap();
         assert!(

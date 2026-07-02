@@ -1911,6 +1911,7 @@ fn translate_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::CollapseKey;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     };
@@ -5410,9 +5411,11 @@ final = "squash"
         app.tree_cursor = Some(0);
 
         // Simulate initial collapsed state (as PlansDiscovered would seed).
-        app.collapsed_plans = (0..app.discovered_plans.len()).collect();
+        app.collapsed_plans = (0..app.discovered_plans.len())
+            .map(CollapseKey::LegacyPlan)
+            .collect();
         assert!(
-            app.collapsed_plans.contains(&0),
+            app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)),
             "plan should start collapsed"
         );
 
@@ -5440,7 +5443,7 @@ final = "squash"
             crate::app::TabContent::Plan { plan_slug } if plan_slug == "0001-test"
         ));
         assert!(
-            !app.collapsed_plans.contains(&0),
+            !app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)),
             "Enter on plan node must expand it in the sidebar"
         );
     }
