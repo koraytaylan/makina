@@ -41,8 +41,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph,
-        Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Padding,
+        Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
 use std::{
@@ -845,20 +845,76 @@ pub fn render(app: &App, frame: &mut Frame) {
         let sidebar_list = List::new(items)
             .block(sidebar_block)
             .highlight_style(highlight_style)
-            .highlight_symbol("▶ ");
+            .highlight_symbol("▶ ")
+            // Always reserve the 2-cell highlight gutter so the item layout is
+            // identical whether or not a row is selected. We render the list
+            // with `selected: None` (below) so ratatui's `List` honors the
+            // manual scroll offset instead of auto-correcting it to keep the
+            // selected item visible — that auto-correction is what made mouse
+            // wheel scrolling feel broken (the stored offset moved but the
+            // visible content stayed pinned to the cursor). We then manually
+            // repaint the highlight on the cursor's row when it is in view.
+            .highlight_spacing(HighlightSpacing::Always);
 
-        // ListState carries the selected index so ratatui knows which node to
-        // highlight.  Use tree_cursor instead of selected_run.
+        // Manual scroll offset for the sidebar, clamped to the rendered max.
         let sidebar_scroll_offset = app
             .scroll_offsets
             .get(&ScrollablePanel::Sidebar)
             .copied()
-            .unwrap_or(0) as usize;
+            .unwrap_or(0)
+            .min(sidebar_scroll_max) as usize;
+
+        // Render with `selected: None` so ratatui's `List` does NOT nudge the
+        // offset to keep the selected item visible — the manual offset is the
+        // source of truth for what is on screen.
         let mut list_state = ListState::default()
-            .with_selected(app.tree_cursor)
+            .with_selected(None)
             .with_offset(sidebar_scroll_offset);
 
         frame.render_stateful_widget(sidebar_list, sidebar_area, &mut list_state);
+
+        // The offset the list actually rendered with. With `selected: None`
+        // ratatui honors the offset we passed (it only clamps it to the last
+        // item), so this is the same value — but read it back to be safe and
+        // to keep the click-bound and scrollbar math tied to what was drawn.
+        let rendered_offset = list_state.offset();
+
+        // Manually repaint the highlight on the cursor's row when it falls
+        // inside the visible window. The list drew the empty highlight gutter
+        // (`  `) for every row because of `HighlightSpacing::Always`; we
+        // overwrite the gutter cells and the row style for the selected row
+        // only, mirroring exactly what `List` would have drawn for a selected
+        // item.
+        if let Some(cursor) = app.tree_cursor
+            && cursor >= rendered_offset
+            && cursor < rendered_offset + sidebar_visible
+        {
+            let row = cursor - rendered_offset;
+            let row_y = sidebar_inner.y + row as u16;
+            // The highlight spans the gutter + content but EXCLUDES the
+            // rightmost column, which is reserved for the scrollbar — painting
+            // the accent background over the scrollbar's `║` / `█` glyph makes
+            // that cell read as a wrong-colored "white" notch in the rail. The
+            // sidebar only renders a scrollbar when content overflows, so we
+            // trim exactly one cell when one is present.
+            let scrollbar_reserved: u16 = if total_items > sidebar_visible { 1 } else { 0 };
+            let row_rect = Rect {
+                x: sidebar_inner.x,
+                y: row_y,
+                width: sidebar_inner.width.saturating_sub(scrollbar_reserved),
+                height: 1,
+            };
+            let buf = frame.buffer_mut();
+            // Highlight style across the whole row (gutter + content).
+            buf.set_style(row_rect, highlight_style);
+            // The `▶ ` highlight symbol in the gutter (first 2 cells).
+            buf.set_span(
+                sidebar_inner.x,
+                row_y,
+                &Span::styled("▶ ", highlight_style),
+                2,
+            );
+        }
 
         // Record one clickable bound per visible row so a mouse click can
         // open/focus that node's tab (mirrors keyboard Enter). Every tree node
@@ -866,10 +922,9 @@ pub fn render(app: &App, frame: &mut Frame) {
         // offset. See the `Down(Left)` hit-test in `event::translate_terminal_event`.
         {
             let mut node_bounds = app.sidebar_node_bounds.borrow_mut();
-            let visible_rows =
-                sidebar_visible.min(total_items.saturating_sub(sidebar_scroll_offset));
+            let visible_rows = sidebar_visible.min(total_items.saturating_sub(rendered_offset));
             for row in 0..visible_rows {
-                let node_idx = sidebar_scroll_offset + row;
+                let node_idx = rendered_offset + row;
                 node_bounds.push((
                     node_idx,
                     Rect {
@@ -888,17 +943,21 @@ pub fn render(app: &App, frame: &mut Frame) {
             .insert(ScrollablePanel::Sidebar, sidebar_scroll_max);
 
         if total_items > sidebar_visible {
-            let sidebar_scroll_offset = app
-                .scroll_offsets
-                .get(&ScrollablePanel::Sidebar)
-                .copied()
-                .unwrap_or(0);
-            let mut scrollbar_state = ScrollbarState::new(sidebar_scroll_max as usize)
-                .position(sidebar_scroll_offset as usize);
+            let mut scrollbar_state =
+                ScrollbarState::new(sidebar_scroll_max as usize).position(rendered_offset);
+            // Use an explicit themed foreground for the track and thumb so the
+            // `║`/`█` glyphs render with the dim theme color instead of
+            // `Color::Reset` (the terminal's default foreground), which on many
+            // terminals/themes is white/light and makes the scrollbar read as a
+            // row of bright "white" cells against the dark pane.
+            let scrollbar_fg = app.active_theme.get(crate::theme::ThemeRole::Dim);
+            let scrollbar_style = Style::default().fg(scrollbar_fg);
             let scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
-                .end_symbol(None);
+                .end_symbol(None)
+                .track_style(scrollbar_style)
+                .thumb_style(scrollbar_style);
             frame.render_stateful_widget(scrollbar, sidebar_inner, &mut scrollbar_state);
         }
     }
@@ -10882,6 +10941,306 @@ mod tests {
             !has_scrollbar,
             "sidebar must not show any scrollbar glyphs when content fits (checked col x={sidebar_scrollbar_col})"
         );
+    }
+
+    /// **Sidebar manual scroll offset actually shifts the visible content** —
+    /// the cursor stays put and is NOT force-kept visible. ratatui's `List`
+    /// widget auto-adjusts `ListState::offset` to keep the selected item
+    /// visible, which made mouse-wheel scrolling feel broken: the stored
+    /// `scroll_offsets[Sidebar]` moved but the rendered content stayed pinned
+    /// to the cursor. We now render the list with `selected: None` so the
+    /// manual offset is honored, and manually repaint the highlight on the
+    /// cursor's row only when it falls inside the visible window.
+    ///
+    /// Setup: 50 runs (taller than the sidebar); `tree_cursor = Some(0)` (the
+    /// default — top of the list); `scroll_offsets[Sidebar] = 20` (a manual
+    /// mid-list scroll, as a mouse wheel would produce). The visible content
+    /// must be items 20..25 (NOT 0..5), the scrollbar thumb must sit in the
+    /// middle of the track (offset 20 of ~44), and the highlight must NOT
+    /// appear because the cursor (index 0) is scrolled out of view.
+    #[test]
+    fn sidebar_manual_scroll_shifts_content_without_moving_cursor() {
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        let runs = (0..50)
+            .map(|i| RunView {
+                id: RunId(i as u64),
+                run_uid: format!("run-{}", i),
+                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                status: RunStatus::Running,
+                project: "test-project".to_string(),
+                tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
+            })
+            .collect();
+        let mut app = App::new(api, runs, std::path::PathBuf::from("."));
+        // Cursor stays at the default (Some(0)) — the top of the list.
+        app.scroll_offsets.insert(ScrollablePanel::Sidebar, 20);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // The visible content must be items 20..25 — the manual offset of 20
+        // must actually shift the viewport, NOT be pulled back to 0 to keep
+        // the cursor (item 0) visible.
+        let sidebar_content = extract_buffer_region(&buffer, 1, 21, 2, 8);
+        assert!(
+            sidebar_content.contains("run-20"),
+            "sidebar must show item 20 (the manual offset) when scrolled; was:\n{sidebar_content}"
+        );
+        assert!(
+            !sidebar_content.contains("run-0"),
+            "sidebar must NOT show the top item (run-0) after scrolling past it; was:\n{sidebar_content}"
+        );
+
+        // The scrollbar thumb (█) must NOT be at the top (y=2): offset 20 of
+        // ~44 is past the middle of the track.
+        let sidebar_scrollbar_col: u16 = 21;
+        assert_ne!(
+            buffer[(sidebar_scrollbar_col, 2)].symbol(),
+            "█",
+            "scrollbar thumb must not sit at the top row when the offset is 20 of ~44"
+        );
+        // And the track must be present (║) at the top, confirming a scrollbar
+        // is rendered (content is tall).
+        assert_eq!(
+            buffer[(sidebar_scrollbar_col, 2)].symbol(),
+            "║",
+            "scrollbar track must appear at the top row when content is tall and offset is non-zero"
+        );
+
+        // The highlight symbol (▶) must NOT appear in the gutter because the
+        // cursor (item 0) is scrolled out of view. The gutter starts at
+        // sidebar_inner.x = 2 (after the left border at x=0 and 1-cell padding
+        // at x=1).
+        let gutter_col: u16 = 2;
+        for y in 2u16..8u16 {
+            assert_ne!(
+                buffer[(gutter_col, y)].symbol(),
+                "▶",
+                "highlight symbol must not appear on any visible row when the cursor is scrolled out of view (row y={y})"
+            );
+        }
+    }
+
+    /// **Sidebar highlight is manually painted on the cursor's row when it is
+    /// in view.** Because we render the list with `selected: None` (so the
+    /// manual offset is honored), the highlight no longer comes from ratatui's
+    /// `List` — we repaint it ourselves. When the cursor is inside the visible
+    /// window, the `▶ ` symbol and the accent-background highlight style must
+    /// appear on exactly that row.
+    #[test]
+    fn sidebar_highlight_painted_on_cursor_row_when_visible() {
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        let runs = (0..50)
+            .map(|i| RunView {
+                id: RunId(i as u64),
+                run_uid: format!("run-{}", i),
+                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                status: RunStatus::Running,
+                project: "test-project".to_string(),
+                tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
+            })
+            .collect();
+        let mut app = App::new(api, runs, std::path::PathBuf::from("."));
+        // Cursor on item 3, which is inside the default top viewport (offset 0).
+        app.tree_cursor = Some(3);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // The gutter starts at sidebar_inner.x = 2 (left border at x=0, then
+        // 1-cell horizontal padding at x=1, then the inner area at x=2). The
+        // highlight symbol `▶` occupies the first gutter cell.
+        let gutter_col: u16 = 2;
+        // The cursor's row: y = sidebar_inner.y + cursor = 2 + 3 = 5.
+        let cursor_row: u16 = 5;
+
+        // The gutter cell on the cursor's row must contain the `▶` highlight
+        // symbol.
+        assert_eq!(
+            buffer[(gutter_col, cursor_row)].symbol(),
+            "▶",
+            "highlight symbol must appear in the gutter on the cursor's row when the cursor is visible"
+        );
+        // The cell must carry the accent background (the highlight style).
+        let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
+        assert_eq!(
+            buffer[(gutter_col, cursor_row)].bg,
+            accent,
+            "highlight style (accent bg) must be painted on the cursor's gutter cell"
+        );
+
+        // No other visible row should carry the highlight symbol.
+        for y in 2u16..8u16 {
+            if y == cursor_row {
+                continue;
+            }
+            assert_ne!(
+                buffer[(gutter_col, y)].symbol(),
+                "▶",
+                "highlight symbol must not appear on non-cursor rows (y={y})"
+            );
+        }
+    }
+
+    /// **Mouse-wheel scrolling over the sidebar actually shifts the visible
+    /// content** (end-to-end). A `ScrollDownAt` inside the sidebar increments
+    /// `scroll_offsets[Sidebar]`; the next render must show later items (not
+    /// the top items the cursor would otherwise pin to). This is the direct
+    /// regression test for the user-visible bug where the wheel moved the
+    /// stored offset but the visible content did not change.
+    #[test]
+    fn sidebar_mouse_wheel_scroll_shifts_visible_content() {
+        use crate::app::AppEvent;
+
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        let runs = (0..50)
+            .map(|i| RunView {
+                id: RunId(i as u64),
+                run_uid: format!("run-{}", i),
+                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                status: RunStatus::Running,
+                project: "test-project".to_string(),
+                tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
+            })
+            .collect();
+        let mut app = App::new(api, runs, std::path::PathBuf::from("."));
+
+        // Record the sidebar geometry so ScrollDownAt routes to the sidebar.
+        // Sidebar occupies x=0..24, y=1..9 in an 80×10 terminal.
+        app.set_panel_geometries(vec![PanelGeometry {
+            panel: ScrollablePanel::Sidebar,
+            rect: ratatui::layout::Rect::new(0, 1, 24, 8),
+        }]);
+
+        // Initial render: offset 0, cursor at item 0 → items run-0..run-5 visible.
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf_before = terminal.backend().buffer().clone();
+        let sidebar_before = extract_buffer_region(&buf_before, 4, 21, 2, 8);
+        assert!(
+            sidebar_before.contains("run-0"),
+            "initial render must show the top item; was:\n{sidebar_before}"
+        );
+
+        // Simulate five mouse-wheel-down clicks inside the sidebar.
+        for _ in 0..5 {
+            app.update(AppEvent::ScrollDownAt(10, 5));
+        }
+
+        // Re-render and assert the visible content has shifted.
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buf_after = terminal.backend().buffer().clone();
+        let sidebar_after = extract_buffer_region(&buf_after, 4, 21, 2, 8);
+        assert!(
+            sidebar_after.contains("run-5"),
+            "after 5 wheel-down clicks the sidebar must show item 5 (offset 5); was:\n{sidebar_after}"
+        );
+        assert!(
+            !sidebar_after.contains("run-0"),
+            "after 5 wheel-down clicks the top item (run-0) must be scrolled out of view; was:\n{sidebar_after}"
+        );
+    }
+
+    /// **Sidebar highlight does not bleed into the scrollbar column.** The
+    /// manually-painted highlight row initially spanned the full inner width,
+    /// which overpainted the scrollbar's rightmost column on the cursor's row
+    /// — the `║` track / `█` thumb cell got the accent background and read as
+    /// a wrong-colored "white" notch in the rail. The highlight rect must
+    /// exclude the scrollbar column so the rail renders with its own style.
+    #[test]
+    fn sidebar_highlight_does_not_paint_scrollbar_column() {
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        let runs = (0..50)
+            .map(|i| RunView {
+                id: RunId(i as u64),
+                run_uid: format!("run-{}", i),
+                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                status: RunStatus::Running,
+                project: "test-project".to_string(),
+                tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
+            })
+            .collect();
+        let mut app = App::new(api, runs, std::path::PathBuf::from("."));
+        // Cursor on item 2 — its row (y=4) overlaps the scrollbar track/thumb.
+        app.tree_cursor = Some(2);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
+        // Sidebar inner rightmost column = x=21 (see sidebar_scrollbar_renders_when_tall).
+        // On EVERY visible row the scrollbar cell must NOT carry the accent
+        // background — including the cursor's row (y=4), which is where the
+        // highlight used to bleed into the rail.
+        for y in 2u16..8u16 {
+            assert_ne!(
+                buffer[(21, y)].bg,
+                accent,
+                "scrollbar cell (x=21, y={y}) must not carry the accent background (the highlight must not bleed into the rail)"
+            );
+        }
+        // Sanity: the cursor's row still gets the highlight on the gutter
+        // (x=2), proving the highlight was painted — just not on the scrollbar.
+        assert_eq!(
+            buffer[(2, 4)].bg,
+            accent,
+            "highlight style must still be painted on the cursor's gutter cell (x=2, y=4)"
+        );
+    }
+
+    /// **Sidebar scrollbar glyphs render with an explicit themed foreground,
+    /// not `Color::Reset`.** `Scrollbar::default()` leaves the track/thumb
+    /// style as `Style::new()` (`fg = Reset`), so the `║`/`█` glyphs render
+    /// with the terminal's default foreground — which on many terminals/themes
+    /// is white/light and makes the scrollbar read as a row of bright "white"
+    /// cells against the dark pane. The sidebar scrollbar sets an explicit
+    /// `Dim`-themed foreground so the rail always renders with the theme's dim
+    /// color regardless of the terminal's default fg.
+    #[test]
+    fn sidebar_scrollbar_uses_themed_foreground_not_reset() {
+        let mut terminal = make_terminal(80, 10);
+        let api = Arc::new(PlaceholderApi::empty());
+
+        let runs = (0..50)
+            .map(|i| RunView {
+                id: RunId(i as u64),
+                run_uid: format!("run-{}", i),
+                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                status: RunStatus::Running,
+                project: "test-project".to_string(),
+                tasks: vec![],
+                report: makina_core::api::IngestionReport::default(),
+            })
+            .collect();
+        let app = App::new(api, runs, std::path::PathBuf::from("."));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
+        // Sidebar inner rightmost column = x=21 (see sidebar_scrollbar_renders_when_tall).
+        // Every scrollbar cell on a content row must carry the Dim theme
+        // foreground — never Reset (which renders as the terminal default,
+        // often white).
+        for y in 2u16..8u16 {
+            assert_eq!(
+                buffer[(21, y)].fg,
+                dim,
+                "scrollbar cell (x=21, y={y}) must use the Dim theme foreground, not Reset; got {:?}",
+                buffer[(21, y)].fg
+            );
+        }
     }
 
     /// Extract a text string from a buffer rectangle (rows y0..y1, cols x0..x1).
