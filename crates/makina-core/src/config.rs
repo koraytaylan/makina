@@ -795,6 +795,42 @@ impl Config {
         }
     }
 
+    /// When NO backend is configured, synthesize one from the first supported agent CLI
+    /// found on `path_env`. Mirrors resolve()'s legacy back-compat block: sets `backend`,
+    /// pushes a `"default"` provider, and assigns it to any unset role. No-op (returns None)
+    /// if a backend command or any provider is already present. Returns the detection for diagnostics.
+    pub fn apply_detected_backend(
+        &mut self,
+        path_env: &str,
+    ) -> Option<crate::preflight::DetectedBackend> {
+        if !self.providers.is_empty() || !self.backend.command.is_empty() {
+            return None;
+        }
+        let detected = crate::preflight::detect_backend_in_path(path_env)?;
+        self.backend.command = detected.command.clone();
+        self.backend.args = detected.args.clone();
+        self.providers.push(ProviderConfig {
+            name: "default".to_string(),
+            command: detected.command.clone(),
+            args: detected.args.clone(),
+            env: BTreeMap::new(),
+        });
+        let assign = || RoleAssignment {
+            provider: "default".to_string(),
+            ..RoleAssignment::default()
+        };
+        if self.roles.planner.is_none() {
+            self.roles.planner = Some(assign());
+        }
+        if self.roles.developer.is_none() {
+            self.roles.developer = Some(assign());
+        }
+        if self.roles.reviewer.is_none() {
+            self.roles.reviewer = Some(assign());
+        }
+        Some(detected)
+    }
+
     /// Validate the resolved config for semantic correctness.
     ///
     /// Checks performed:
@@ -867,7 +903,17 @@ impl Config {
         // Legacy backend.command check (kept for back-compat).
         if self.backend.command.is_empty() && self.providers.is_empty() {
             return Err(ConfigError::Validation {
-                reason: "backend.command must not be empty".to_string(),
+                reason: format!(
+                    "backend.command must not be empty — no agent backend is configured. \
+                     Set [backend].command in ~/.makina/config.toml (machine-specific, NOT committed), \
+                     or install a supported agent CLI on PATH for auto-detection ({}). \
+                     The project .makina/config.toml must NOT set a backend.",
+                    crate::preflight::KNOWN_AGENTS
+                        .iter()
+                        .map(|a| a.command)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
             });
         }
 
@@ -955,7 +1001,7 @@ impl Config {
         global_path: Option<&Path>,
         project_path: Option<&Path>,
     ) -> Result<Config, ConfigError> {
-        Config::load_with_labels(global_path, None, project_path, None)
+        Config::load_with_labels(global_path, None, project_path, None, None)
     }
 
     /// Load config with explicit source labels for error messages.
@@ -970,6 +1016,7 @@ impl Config {
         global_label: Option<&str>,
         project_path: Option<&Path>,
         project_label: Option<&str>,
+        detect_path_env: Option<&str>,
     ) -> Result<Config, ConfigError> {
         let global = match global_path {
             None => GlobalConfig::default(),
@@ -1015,7 +1062,10 @@ impl Config {
             }
         };
 
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
+        if let Some(pe) = detect_path_env {
+            config.apply_detected_backend(pe);
+        }
         config.validate()?;
         Ok(config)
     }
@@ -1066,6 +1116,7 @@ impl Config {
             Some("global (~/.makina/config.toml)"),
             project_path.as_deref(),
             Some("project (.makina/config.toml)"),
+            Some(&std::env::var("PATH").unwrap_or_default()),
         );
 
         (result, paths)
@@ -1618,6 +1669,78 @@ mod tests {
         match result {
             Err(ConfigError::Validation { reason }) => {
                 assert!(reason.contains("backend.command"), "{reason}");
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    /// Empty-backend error message contains the file name, supported agents, and remediation guidance.
+    #[test]
+    fn empty_backend_error_lists_supported_agents_and_file() {
+        let no_global = std::path::Path::new("/tmp/__makina_msg_g.toml");
+        let no_project = std::path::Path::new("/tmp/__makina_msg_p.toml");
+        match Config::load_with_labels(Some(no_global), None, Some(no_project), None, Some("")) {
+            Err(ConfigError::Validation { reason }) => {
+                assert!(reason.contains("backend.command"));
+                assert!(reason.contains("~/.makina/config.toml"));
+                assert!(reason.contains("gemini"));
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    /// **Acceptance criterion — auto-detection during load**
+    /// `Config::load_with_labels` with detection enabled synthesizes a default
+    /// provider from a supported CLI on `path_env`, making a fresh clone validate.
+    #[cfg(unix)]
+    #[test]
+    fn load_autodetects_backend_when_supported_agent_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bindir = tempfile::tempdir().expect("should create temp dir");
+        let bin = bindir.path().join("gemini");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("write fake gemini");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("set executable");
+
+        let no_global = std::path::Path::new("/tmp/__makina_no_global_detect.toml");
+        let no_project = std::path::Path::new("/tmp/__makina_no_project_detect.toml");
+
+        let cfg = Config::load_with_labels(
+            Some(no_global),
+            None,
+            Some(no_project),
+            None,
+            Some(bindir.path().to_str().expect("valid path")),
+        )
+        .expect("detection should make a fresh clone validate");
+
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].name, "default");
+        assert_eq!(cfg.providers[0].command, "gemini");
+        assert_eq!(cfg.backend.command, "gemini");
+        assert_eq!(
+            cfg.roles
+                .developer
+                .as_ref()
+                .expect("developer role should be set")
+                .provider,
+            "default"
+        );
+    }
+
+    /// **Acceptance criterion — detection is optional**
+    /// `Config::load_with_labels` with empty `detect_path_env` (or `None`) still fails
+    /// on an empty backend with the same validation error as before.
+    #[test]
+    fn load_without_detection_still_fails_on_empty_backend() {
+        let no_global = std::path::Path::new("/tmp/__makina_no_global_x.toml");
+        let no_project = std::path::Path::new("/tmp/__makina_no_project_x.toml");
+
+        // Empty path_env => no detection => same validation error as before.
+        match Config::load_with_labels(Some(no_global), None, Some(no_project), None, Some("")) {
+            Err(ConfigError::Validation { reason }) => {
+                assert!(reason.contains("backend.command"));
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }

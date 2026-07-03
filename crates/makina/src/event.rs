@@ -985,6 +985,44 @@ async fn commit_theme_selection(app: &App, theme_name: &str) -> Option<String> {
     }
 }
 
+/// Build the `~/.makina/config.toml` starter template text from a detection
+/// result. When `detected` is `Some`, the template contains an uncommented
+/// `[backend]` section whose `command` is the detected CLI (a config that
+/// validates immediately). When `detected` is `None`, `command` stays
+/// commented out and every `KNOWN_AGENTS` CLI is named in a comment so the
+/// user can pick one after installing it.
+///
+/// Pure (no IO) so it can be exercised deterministically in tests without
+/// controlling the process `$PATH`.
+fn build_global_template(detected: &Option<makina_core::preflight::DetectedBackend>) -> String {
+    match detected {
+        Some(d) => format!(
+            "# Makina global configuration — machine-specific, not committed.\n\
+             # Auto-detected backend: {} (found at {}).\n\n\
+             [backend]\ncommand = \"{}\"\nargs = {:?}\n\n\
+             [planner]\nmechanism = \"one-shot-agent\"\n",
+            d.agent,
+            d.resolved.display(),
+            d.command,
+            d.args,
+        ),
+        None => {
+            let supported: Vec<&str> = makina_core::preflight::KNOWN_AGENTS
+                .iter()
+                .map(|a| a.command)
+                .collect();
+            format!(
+                "# Makina global configuration — machine-specific, not committed.\n\
+                 # No supported agent CLI was found on PATH. Install one of: {}\n\
+                 # then set [backend].command below (see docs/trial/e2e-run.md).\n\n\
+                 [backend]\n# command = \"gemini\"\n# args = [\"--acp\", \"--yolo\"]\n\n\
+                 [planner]\nmechanism = \"one-shot-agent\"\n",
+                supported.join(", "),
+            )
+        }
+    }
+}
+
 /// Write starter config templates when no config files exist.
 ///
 /// Writes commented template files to both ~/.makina/config.toml (global)
@@ -1006,21 +1044,12 @@ async fn write_doctor_scaffold(app: &App) -> Option<String> {
         );
     }
 
+    // Detect a supported CLI on $PATH
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let detected = makina_core::preflight::detect_backend_in_path(&path_env);
+
     // Global config template (~/.makina/config.toml)
-    let global_template = r#"# Makina global configuration — machine-specific, not committed.
-# Place at ~/.makina/config.toml
-
-[backend]
-# The command to invoke your agent (must support ACP --acp flag).
-# Examples: "gemini", "grok", or "claude-acp"
-command = "gemini"
-# Optional arguments passed to the agent CLI.
-args = ["--acp", "--yolo"]
-
-[planner]
-# The planner mechanism: one-shot-agent or persistent-session.
-mechanism = "one-shot-agent"
-"#;
+    let global_template = build_global_template(&detected);
 
     // Project config template (.makina/config.toml)
     let project_template = r#"# Makina project configuration — committed with the repository.
@@ -1094,9 +1123,14 @@ command = "cargo fmt --check"
     if written_paths.is_empty() {
         Some("No valid config path to write to.".to_string())
     } else {
+        let backend_info = detected
+            .as_ref()
+            .map(|d| d.agent)
+            .unwrap_or("none detected — edit [backend] before running");
         Some(format!(
-            "Starter configs written to: {}",
-            written_paths.join(", ")
+            "Starter configs written to: {} (backend: {})",
+            written_paths.join(", "),
+            backend_info
         ))
     }
 }
@@ -4671,9 +4705,123 @@ A description that is long enough to pass minimums.
         // Both files must now exist with non-empty, parseable contents.
         assert!(global_path.exists(), "global config must be written");
         assert!(project_path.exists(), "project config must be written");
+
+        // Project config must always be valid TOML.
         let project_contents = std::fs::read_to_string(&project_path).expect("read project config");
         let _: toml::Value =
             toml::from_str(&project_contents).expect("scaffold project config must be valid TOML");
+
+        // Global config must be valid TOML and either:
+        // (a) Contains an uncommented [backend] with a detected command, OR
+        // (b) Lists the supported CLIs in a comment (no-detection case).
+        //
+        // The process $PATH during a test run is not controllable, so this
+        // integration test cannot force which branch `write_doctor_scaffold`
+        // takes; instead it detects which branch actually ran (by looking
+        // for a genuinely uncommented `command = "..."` LINE, not merely the
+        // substring, since the no-detection template's `# command = "gemini"`
+        // also contains that substring) and asserts that branch's shape.
+        // The branch logic itself is covered deterministically below by
+        // `build_global_template_*` unit tests that call the pure builder
+        // directly with constructed `Some`/`None` inputs.
+        let global_contents = std::fs::read_to_string(&global_path).expect("read global config");
+        let _: toml::Value =
+            toml::from_str(&global_contents).expect("scaffold global config must be valid TOML");
+
+        let has_uncommented_command_line = global_contents
+            .lines()
+            .any(|line| line.trim_start().starts_with("command = \""));
+
+        if has_uncommented_command_line {
+            // Detected branch: the uncommented command must name a real
+            // KNOWN_AGENTS entry (not an arbitrary value).
+            let names_known_agent = makina_core::preflight::KNOWN_AGENTS
+                .iter()
+                .any(|agent| global_contents.contains(&format!("command = \"{}\"", agent.command)));
+            assert!(
+                names_known_agent,
+                "detected branch's uncommented command must name a KNOWN_AGENTS entry; got:\n{}",
+                global_contents
+            );
+        } else {
+            // No-detection branch: command must stay commented and every
+            // KNOWN_AGENTS CLI must be named for the user to pick from.
+            assert!(
+                global_contents.contains("# command = "),
+                "no-detection branch must leave command commented out; got:\n{}",
+                global_contents
+            );
+            for agent in makina_core::preflight::KNOWN_AGENTS {
+                assert!(
+                    global_contents.contains(agent.command),
+                    "no-detection branch must list KNOWN_AGENTS entry {:?}; got:\n{}",
+                    agent.command,
+                    global_contents
+                );
+            }
+        }
+    }
+
+    /// `build_global_template` is pure, so the detected branch is covered
+    /// deterministically here (independent of the process `$PATH`): given a
+    /// constructed `Some(DetectedBackend)`, the template must contain a real
+    /// uncommented `command = "..."` line for that backend and must NOT also
+    /// emit the commented placeholder line from the no-detection template.
+    #[test]
+    fn build_global_template_some_writes_uncommented_backend_line() {
+        let detected = Some(makina_core::preflight::DetectedBackend {
+            agent: "gemini",
+            command: "gemini".to_string(),
+            args: vec!["--acp".to_string(), "--yolo".to_string()],
+            resolved: std::path::PathBuf::from("/usr/local/bin/gemini"),
+        });
+
+        let template = build_global_template(&detected);
+
+        let _: toml::Value =
+            toml::from_str(&template).expect("detected-branch template must be valid TOML");
+
+        let has_uncommented_command_line = template
+            .lines()
+            .any(|line| line.trim_start() == "command = \"gemini\"");
+        assert!(
+            has_uncommented_command_line,
+            "detected branch must contain an uncommented `command = \"gemini\"` line; got:\n{template}"
+        );
+        assert!(
+            !template.contains("# command = "),
+            "detected branch must not also emit a commented command line; got:\n{template}"
+        );
+    }
+
+    /// Given `None` (no agent found on PATH), the template must leave
+    /// `command` commented out — no uncommented `command = "..."` line
+    /// anywhere — and must name every `KNOWN_AGENTS` CLI in a comment.
+    #[test]
+    fn build_global_template_none_leaves_backend_commented() {
+        let template = build_global_template(&None);
+
+        let _: toml::Value =
+            toml::from_str(&template).expect("no-detection template must be valid TOML");
+
+        let has_uncommented_command_line = template
+            .lines()
+            .any(|line| line.trim_start().starts_with("command = \""));
+        assert!(
+            !has_uncommented_command_line,
+            "no-detection branch must not contain an uncommented command line; got:\n{template}"
+        );
+        assert!(
+            template.contains("# command = "),
+            "no-detection branch must contain a commented command line; got:\n{template}"
+        );
+        for agent in makina_core::preflight::KNOWN_AGENTS {
+            assert!(
+                template.contains(agent.command),
+                "no-detection branch must list KNOWN_AGENTS entry {:?}; got:\n{template}",
+                agent.command
+            );
+        }
     }
 
     // ── Context-sensitive retry/reset action (plan 0017) ─────────────────────

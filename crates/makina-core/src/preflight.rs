@@ -10,6 +10,45 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
+/// A first-party agent CLI Makina can auto-detect on `$PATH` and drive over ACP.
+/// `command` is the binary name searched on PATH; `args` are the ACP flags to pass.
+pub struct KnownAgent {
+    pub name: &'static str,
+    pub command: &'static str,
+    pub args: &'static [&'static str],
+}
+
+/// Supported agents in detection-priority order. `gemini --acp --yolo` is the
+/// e2e-proven path (see docs/trial/e2e-run.md:100-101,272-273); `claude-code-acp`
+/// is the Zed-compatible Claude CLI named in makina-acp's docs (crates/makina-acp/src/lib.rs:4).
+pub const KNOWN_AGENTS: &[KnownAgent] = &[
+    KnownAgent {
+        name: "gemini",
+        command: "gemini",
+        args: &["--acp", "--yolo"],
+    },
+    KnownAgent {
+        name: "claude-code-acp",
+        command: "claude-code-acp",
+        args: &["--acp"],
+    },
+    KnownAgent {
+        name: "grok",
+        command: "grok",
+        args: &["--acp"],
+    },
+];
+
+/// A backend auto-detected on `$PATH`. `command`/`args` are ready to drop into a
+/// synthesized provider; `agent` is the matched KNOWN_AGENTS name; `resolved` is the binary path.
+#[derive(Debug, Clone)]
+pub struct DetectedBackend {
+    pub agent: &'static str,
+    pub command: String,
+    pub args: Vec<String>,
+    pub resolved: PathBuf,
+}
+
 /// Result of probing a provider's command for presence on the system.
 ///
 /// Each probe resolves the provider's command name against `$PATH` (or validates
@@ -120,6 +159,32 @@ pub fn probe_providers_with_path(cfg: &Config, path_env: &str) -> Vec<ProviderPr
             }
         })
         .collect()
+}
+
+/// Return the first KNOWN_AGENTS entry whose `command` resolves to an executable on
+/// `path_env`, or `None`. Pure: stats files via `is_executable`, spawns nothing.
+pub fn detect_backend_in_path(path_env: &str) -> Option<DetectedBackend> {
+    if path_env.is_empty() {
+        return None;
+    }
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    for agent in KNOWN_AGENTS {
+        for dir in path_env.split(separator) {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = PathBuf::from(dir).join(agent.command);
+            if is_executable(&candidate) {
+                return Some(DetectedBackend {
+                    agent: agent.name,
+                    command: agent.command.to_string(),
+                    args: agent.args.iter().map(|s| s.to_string()).collect(),
+                    resolved: candidate,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a command name against the given `path_env` string.
@@ -377,5 +442,33 @@ mod tests {
         assert_eq!(probes[0].provider, "test");
         assert_eq!(probes[0].command, "myagent");
         assert!(probes[0].resolved.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_backend_in_path_finds_first_supported_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("gemini");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = detect_backend_in_path(dir.path().to_str().unwrap())
+            .expect("gemini should be detected");
+        assert_eq!(d.agent, "gemini");
+        assert_eq!(d.command, "gemini");
+        assert_eq!(d.args, vec!["--acp".to_string(), "--yolo".to_string()]);
+    }
+
+    #[test]
+    fn detect_backend_in_path_returns_none_on_empty_path() {
+        assert!(detect_backend_in_path("").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_backend_in_path_ignores_non_executable_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gemini"), "x").unwrap(); // no exec bit
+        assert!(detect_backend_in_path(dir.path().to_str().unwrap()).is_none());
     }
 }
