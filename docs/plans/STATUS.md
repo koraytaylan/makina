@@ -1,0 +1,9 @@
+# Plans — roll-up board
+
+One row per plan, no per-task detail; task-level status lives in each plan's own STATUS.md.
+
+_Last updated: 2026-07-03, against develop._
+
+| Plan | Title | Status | Tasks | Outcome | Status doc |
+|---|---|---|---|---|---|
+| 0043 | First-Run Config UX: Auto-Detected Backend Defaults and Guided Setup | 📋 Planned | 0/6 | A fresh clone with a supported agent CLI on PATH runs `cargo run --release` successfully via auto-detected backend defaults, and users without one get a guided detect→confirm→persist scaffold plus precise hard-fail diagnostics. | [status](0043-First-Run-Config-UX-Auto-Detected-Defaults-And-Guided-Setup/STATUS.md) |
