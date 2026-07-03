@@ -204,6 +204,63 @@ const BLUEPRINT_SCHEMA = {
   },
 }
 
+// The blueprint is too large to enforce as structured output (the platform's safety classifier
+// rejects oversized schemas with "output schema too large to classify safely"), so the blueprint
+// agent returns RAW JSON TEXT conforming to BLUEPRINT_SCHEMA and the script parses + structurally
+// validates it here, retrying with the concrete error folded into the prompt.
+function blueprintJsonInstructions() {
+  return `\n\nOUTPUT FORMAT (critical): your FINAL message must be ONLY one raw JSON object — no markdown fences, no prose before or after it, no comments inside. It must conform to this JSON Schema (every "required" field present, correct types, no extra top-level fields):\n${JSON.stringify(BLUEPRINT_SCHEMA)}\n`
+}
+
+function extractJsonObject(text) {
+  let t = String(text == null ? '' : text).trim()
+  // Strip an outer code fence ONLY when the whole reply is fenced (anchored ^…$). The blueprint's
+  // string values legitimately contain ``` sequences (embedded verbatim code snippets), so an
+  // unanchored fence match would slice a fragment out of the middle of the object.
+  const fenced = t.match(/^```[A-Za-z]*[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/)
+  if (fenced) t = fenced[1].trim()
+  const start = t.indexOf('{')
+  if (start < 0) return { error: 'no JSON object found in the reply' }
+  // Balanced-brace scan (string/escape aware) to find the object's true end: trailing prose after
+  // the JSON — or braces inside that prose — must not widen the slice (first-{ to last-} does).
+  let depth = 0, inStr = false, esc = false, end = -1
+  for (let i = start; i < t.length; i++) {
+    const ch = t[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') inStr = true
+    else if (ch === '{') depth++
+    else if (ch === '}') { depth--; if (depth === 0) { end = i; break } }
+  }
+  if (end < 0) return { error: 'unbalanced JSON object — the reply appears truncated before the object closes' }
+  try { return { value: JSON.parse(t.slice(start, end + 1)) } } catch (e) { return { error: `JSON.parse failed: ${String((e && e.message) || e)}` } }
+}
+
+// Minimal structural gate over a parsed blueprint — just the fields the renderers and the graph
+// checks depend on (the adversarial critic covers the subtler content requirements after render).
+function checkBlueprintShape(bp) {
+  if (!bp || typeof bp !== 'object' || Array.isArray(bp)) return ['not a JSON object']
+  const probs = []
+  for (const k of ['mission', 'summaryParagraph', 'whyThisPlan', 'plannedOutcome', 'rootCause', 'approach']) {
+    if (!bp[k] || typeof bp[k] !== 'string') probs.push(`missing/non-string ${k}`)
+  }
+  if (!Array.isArray(bp.workstreams) || !bp.workstreams.length) probs.push('workstreams missing/empty')
+  else for (const w of bp.workstreams) if (!w || !w.id || !w.name || !w.inScope || !w.architecture) { probs.push(`workstream "${w && w.id}" missing id/name/inScope/architecture`); break }
+  if (!Array.isArray(bp.tasks) || !bp.tasks.length) probs.push('tasks missing/empty')
+  else for (const t of bp.tasks) if (!t || !t.id || !t.title || !t.workstream || !t.context || !Array.isArray(t.steps) || !t.steps.length || !Array.isArray(t.dependsOn) || !t.doneWhen || !Array.isArray(t.touches)) { probs.push(`task "${t && t.id}" missing id/title/workstream/context/steps/dependsOn/doneWhen/touches`); break }
+  if (!Array.isArray(bp.findings) || !bp.findings.length) probs.push('findings missing/empty')
+  if (!Array.isArray(bp.originMapping) || !bp.originMapping.length) probs.push('originMapping missing/empty')
+  if (!Array.isArray(bp.fileManifest) || !bp.fileManifest.length) probs.push('fileManifest missing/empty')
+  if (!Array.isArray(bp.gateCommands) || !bp.gateCommands.length) probs.push('gateCommands missing/empty')
+  if (!Array.isArray(bp.lockedDecisions)) probs.push('lockedDecisions missing')
+  if (!Array.isArray(bp.outOfScope)) probs.push('outOfScope missing')
+  return probs
+}
+
 const VERIFY_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -738,13 +795,27 @@ async function validatePlan(plan) {
 
 const authored = await pipeline(
   plans,
-  // Stage 1 — Blueprint (research-backed structured plan).
+  // Stage 1 — Blueprint (research-backed structured plan). Returned as raw JSON TEXT (the full
+  // blueprint schema is too large for the structured-output safety classifier), parsed and
+  // shape-checked in-script with bounded retries that feed the concrete error back to the agent.
   async (plan) => {
-    const bp = await agent(
-      blueprintPrompt(facts, plan),
-      { label: `blueprint:${plan.number}`, phase: 'Blueprint', model: AUTHOR_MODEL, effort: 'high', agentType: 'Explore', schema: BLUEPRINT_SCHEMA }
-    )
-    if (!bp) throw new Error(`blueprint failed for ${plan.number}`)
+    let bp = null
+    let lastErr = ''
+    for (let attempt = 1; attempt <= 3 && !bp; attempt++) {
+      const extra = blueprintJsonInstructions()
+        + (lastErr ? `\nYour previous attempt was rejected: ${lastErr}. Redo the research-backed blueprint and return the corrected COMPLETE JSON object.` : '')
+      const raw = await agent(
+        blueprintPrompt(facts, plan) + extra,
+        { label: `blueprint:${plan.number}#${attempt}`, phase: 'Blueprint', model: AUTHOR_MODEL, effort: 'high', agentType: 'Explore' }
+      )
+      if (raw == null) { lastErr = 'agent returned no result'; log(`blueprint ${plan.number}: attempt ${attempt} returned nothing; retrying.`); continue }
+      const got = extractJsonObject(raw)
+      if (got.error) { lastErr = got.error; log(`blueprint ${plan.number}: attempt ${attempt} unparseable (${got.error}); retrying.`); continue }
+      const probs = checkBlueprintShape(got.value)
+      if (probs.length) { lastErr = `structurally incomplete — ${probs.join('; ')}`; log(`blueprint ${plan.number}: attempt ${attempt} ${lastErr}; retrying.`); continue }
+      bp = got.value
+    }
+    if (!bp) throw new Error(`blueprint failed for ${plan.number}: ${lastErr}`)
     // Pin the folder identity (the agent must not renumber/rename); log any structural issues.
     const merged = { ...bp, number: plan.number, slug: plan.slug, title: plan.title, planDir: plan.planDir, tasksPath: plan.tasksPath, statusPath: plan.statusPath }
     const issues = checkBlueprintGraph(merged)
