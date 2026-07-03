@@ -1022,7 +1022,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let active_plan_tab = app.tabs.active_tab.and_then(|idx| {
         app.tabs.open_tabs.get(idx).and_then(|tab_content| {
             if let crate::app::TabContent::Plan { plan_slug } = tab_content {
-                app.discovered_plans.iter().find(|p| p.slug == *plan_slug)
+                find_plan_entry_by_slug(app, plan_slug)
             } else {
                 None
             }
@@ -1044,15 +1044,12 @@ pub fn render(app: &App, frame: &mut Frame) {
     let active_plan_task_tab = app.tabs.active_tab.and_then(|idx| {
         app.tabs.open_tabs.get(idx).and_then(|tab_content| {
             if let crate::app::TabContent::PlanTask { plan_slug, task_id } = tab_content {
-                app.discovered_plans
-                    .iter()
-                    .find(|p| p.slug == *plan_slug)
-                    .and_then(|plan| {
-                        plan.tasks
-                            .iter()
-                            .find(|t| t.id == *task_id)
-                            .map(|preview| (plan, preview))
-                    })
+                find_plan_entry_by_slug(app, plan_slug).and_then(|plan| {
+                    plan.tasks
+                        .iter()
+                        .find(|t| t.id == *task_id)
+                        .map(|preview| (plan, preview))
+                })
             } else {
                 None
             }
@@ -2880,6 +2877,29 @@ fn render_task_entry_pane(
 fn find_task_idx_in_run(app: &App, task_id: &TaskId) -> Option<usize> {
     app.selected_run()
         .and_then(|run| run.tasks.iter().position(|t| &t.id == task_id))
+}
+
+/// Find a [`PlanEntry`] by slug across BOTH plan stores: the legacy
+/// `discovered_plans` (single-folder) and the multi-folder `plans_by_folder`.
+/// Tab content carries only the slug, so the render path must search both
+/// stores to resolve a plan tab opened from either a legacy `Plan` node or a
+/// folder-scoped `PlanInFolder` node. Without the `plans_by_folder` search,
+/// Enter on a folder-scoped plan opens the tab but the main pane renders the
+/// empty hint instead of the plan accordion (the tab's slug is absent from
+/// `discovered_plans`).
+fn find_plan_entry_by_slug<'a>(
+    app: &'a App,
+    plan_slug: &str,
+) -> Option<&'a makina_core::orchestrator::PlanEntry> {
+    app.discovered_plans
+        .iter()
+        .find(|p| p.slug == plan_slug)
+        .or_else(|| {
+            app.plans_by_folder
+                .values()
+                .flatten()
+                .find(|p| p.slug == plan_slug)
+        })
 }
 
 fn find_live_plan_task_for_preview<'a>(
@@ -5389,6 +5409,63 @@ mod tests {
         assert!(
             screen.contains("depends on: task-model"),
             "plan must show dependencies; screen:\n{screen}"
+        );
+    }
+
+    /// **Folder-scoped plan tab renders the plan accordion**, not the empty hint.
+    /// The plan-lookup for an active `TabContent::Plan` must search
+    /// `plans_by_folder` (the multi-folder store) in addition to
+    /// `discovered_plans` (the legacy single-folder store). Without the
+    /// `plans_by_folder` search, Enter on a `PlanInFolder` node opens a tab but
+    /// the main pane renders the "Select a run..." hint because the plan slug
+    /// is absent from `discovered_plans`.
+    #[test]
+    fn folder_scoped_plan_tab_renders_accordion_not_hint() {
+        let mut terminal = make_terminal(100, 26);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+
+        // Populate plans_by_folder (multi-folder store), NOT discovered_plans.
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        app.plans_by_folder.insert(
+            0,
+            vec![makina_core::orchestrator::PlanEntry {
+                dir: PathBuf::from("/test/folder/docs/plans/0001-Initial"),
+                slug: "0001-initial".to_string(),
+                has_tasks: true,
+                tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                    id: "json-store".to_string(),
+                    title: "JSON Store".to_string(),
+                    gated: true,
+                    body: String::new(),
+                    depends_on: vec!["task-model".to_string()],
+                }],
+                scope_text: Some("scope text".to_string()),
+                architecture_text: None,
+                status_text: None,
+            }],
+        );
+        // Open a plan tab for the folder-scoped plan.
+        app.update(crate::app::AppEvent::OpenTab(
+            crate::app::TabContent::Plan {
+                plan_slug: "0001-initial".to_string(),
+            },
+        ));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        // The plan accordion header must render — proving the plan was found
+        // in plans_by_folder and the main pane is NOT showing the empty hint.
+        assert!(
+            screen.contains("Plan: 0001-initial"),
+            "folder-scoped plan tab must render the plan accordion; screen:\n{screen}"
+        );
+        // The empty hint must NOT be present.
+        assert!(
+            !screen.contains("Select a run, or press Enter on a plan"),
+            "folder-scoped plan tab must not fall through to the empty hint; screen:\n{screen}"
         );
     }
 

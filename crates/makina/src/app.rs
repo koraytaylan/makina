@@ -2187,9 +2187,14 @@ impl App {
     /// (so that "plan highlighted in sidebar + Enter" works even if focus has
     /// moved to main, e.g. after Right-arrow navigation).
     fn activate_focused_tree_node(&mut self) {
+        // `opened_tab` tracks whether Enter opened (or focused) a content tab
+        // so the focus can cross to the main pane — mirroring `FocusRightOrExpand`'s
+        // crossing behavior. Folders only expand/collapse and stay on the sidebar.
+        let mut opened_tab = false;
         match self.focused_node() {
             Some(TreeNode::Plan { plan_idx }) => {
                 self.activate_plan_node(plan_idx);
+                opened_tab = true;
             }
             Some(TreeNode::PlanTask { plan_idx, task_idx }) => {
                 if let Some(plan) = self.discovered_plans.get(plan_idx)
@@ -2200,6 +2205,7 @@ impl App {
                         task_id: preview.id.clone(),
                     };
                     self.tabs.open_tab(tab_content);
+                    opened_tab = true;
                 }
             }
             Some(TreeNode::PlanInFolder {
@@ -2207,6 +2213,7 @@ impl App {
                 plan_idx,
             }) => {
                 self.activate_plan_in_folder(folder_idx, plan_idx);
+                opened_tab = true;
             }
             Some(TreeNode::PlanTaskInFolder {
                 folder_idx,
@@ -2222,10 +2229,12 @@ impl App {
                         task_id: preview.id.clone(),
                     };
                     self.tabs.open_tab(tab_content);
+                    opened_tab = true;
                 }
             }
             Some(TreeNode::Folder { .. }) => {
-                // Enter on a Folder expands/collapses it (like Space)
+                // Enter on a Folder expands/collapses it (like Space). Focus
+                // stays on the sidebar so the user can keep navigating.
                 self.tree_toggle_expand();
             }
             Some(TreeNode::Task { run, task }) => {
@@ -2239,6 +2248,7 @@ impl App {
                     };
                     self.tabs.open_tab(tab_content);
                     self.sync_selected_run_to_active_tab();
+                    opened_tab = true;
                 }
             }
             Some(TreeNode::Run { run }) => {
@@ -2246,6 +2256,7 @@ impl App {
                     let slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
                     if self.discovered_plans.iter().any(|p| p.slug == slug) {
                         self.tabs.open_tab(TabContent::Plan { plan_slug: slug });
+                        opened_tab = true;
                     }
                     // Expand the run so its tasks become visible in the sidebar
                     // (mirrors the Plan node path in activate_plan_node).
@@ -2255,6 +2266,14 @@ impl App {
                 }
             }
             _ => {}
+        }
+        // Cross focus to the main pane when Enter opened a content tab, so the
+        // user immediately sees the detail view rather than having the focus
+        // silently stay on the sidebar (which made Enter feel like a no-op on
+        // plans/tasks even though the tab opened). Matches the Right-arrow
+        // crossing behavior in `FocusRightOrExpand`.
+        if opened_tab {
+            self.focused_panel = Panel::Main;
         }
     }
 
@@ -3550,6 +3569,23 @@ impl App {
                         self.collapsed_folders.insert(folder_idx);
                     }
                 }
+                // Plans start collapsed: seed `collapsed_plans` with every
+                // folder-scoped plan (with tasks) so the tree opens tidy and
+                // Right/Space/Enter reveal the tasks — mirroring the legacy
+                // `PlansDiscovered` seeding above. Plans with no tasks are
+                // leaves (never expandable) so they need no collapse key.
+                self.collapsed_plans = self
+                    .plans_by_folder
+                    .iter()
+                    .flat_map(|(folder_idx, plans)| {
+                        (0..plans.len())
+                            .filter(|&plan_idx| !plans[plan_idx].tasks.is_empty())
+                            .map(|plan_idx| CollapseKey::FolderPlan {
+                                folder: *folder_idx,
+                                plan: plan_idx,
+                            })
+                    })
+                    .collect();
                 // Close plan tabs whose slug is no longer in `plans_by_folder`
                 // (plan 0032: close_tabs_for_missing_plans).
                 self.close_tabs_for_missing_plans();
@@ -12490,6 +12526,116 @@ mod tests {
         }
     }
 
+    /// **Enter on a plan/task node crosses focus to the main pane** so the
+    /// user immediately sees the detail tab content. Previously Enter opened
+    /// the tab but left `focused_panel = Sidebar`, making Enter feel like a
+    /// no-op on plans and tasks (the tab opened invisibly in the main pane
+    /// while focus stayed on the sidebar). Folders keep focus on the sidebar
+    /// because they only expand/collapse.
+    #[test]
+    fn enter_on_plan_crosses_focus_to_main() {
+        let mut app = make_app();
+
+        // Set up a folder with a plan that has a task.
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/folder"));
+        let plan_entry = makina_core::orchestrator::PlanEntry {
+            dir: std::path::PathBuf::from("/test/folder/docs/plans/test-plan"),
+            slug: "test-plan".to_string(),
+            has_tasks: true,
+            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+                id: "task-1".to_string(),
+                title: "Task 1".to_string(),
+                gated: false,
+                depends_on: vec![],
+                body: String::new(),
+            }],
+            scope_text: Some("test scope".to_string()),
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan_entry]);
+        app.collapsed_folders.clear();
+
+        // --- Folder: Enter toggles expansion, focus stays on Sidebar ---
+        // Start with the folder collapsed so Enter expands it.
+        app.collapsed_folders.insert(0);
+        let folder_idx = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|n| matches!(n, TreeNode::Folder { folder_idx: 0 }))
+            .expect("folder node");
+        app.tree_cursor = Some(folder_idx);
+        app.focused_panel = Panel::Sidebar;
+        app.update(AppEvent::OpenFocusedNode);
+        assert!(
+            !app.collapsed_folders.contains(&0),
+            "Enter on a collapsed Folder must expand it"
+        );
+        assert_eq!(
+            app.focused_panel,
+            Panel::Sidebar,
+            "Enter on a Folder must keep focus on the sidebar (it only expands/collapses)"
+        );
+
+        // --- Plan: Enter opens the plan tab and crosses focus to Main ---
+        let plan_idx = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    TreeNode::PlanInFolder {
+                        folder_idx: 0,
+                        plan_idx: 0
+                    }
+                )
+            })
+            .expect("plan node");
+        app.tree_cursor = Some(plan_idx);
+        app.focused_panel = Panel::Sidebar;
+        app.update(AppEvent::OpenFocusedNode);
+        assert_eq!(
+            app.tabs.open_tabs.len(),
+            1,
+            "Enter on a plan must open a plan tab"
+        );
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "Enter on a plan must cross focus to the main pane so the user sees the detail tab"
+        );
+
+        // --- Task: Enter opens the task tab and crosses focus to Main ---
+        let task_idx = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|n| {
+                matches!(
+                    n,
+                    TreeNode::PlanTaskInFolder {
+                        folder_idx: 0,
+                        plan_idx: 0,
+                        task_idx: 0
+                    }
+                )
+            })
+            .expect("task node");
+        app.tree_cursor = Some(task_idx);
+        app.focused_panel = Panel::Sidebar;
+        app.update(AppEvent::OpenFocusedNode);
+        assert_eq!(
+            app.tabs.open_tabs.len(),
+            2,
+            "Enter on a task must open a task tab"
+        );
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "Enter on a task must cross focus to the main pane so the user sees the detail tab"
+        );
+    }
+
     #[test]
     fn test_focus_right_expands_collapsed_folder() {
         let mut app = make_app();
@@ -13097,7 +13243,16 @@ mod tests {
             "folder 0 should be expanded (not in collapsed_folders)"
         );
 
-        // Verify that visible_tree_nodes contains Folder, PlanInFolder, and PlanTaskInFolder.
+        // Plans start collapsed by default (seeds collapsed_plans) so the tree
+        // opens tidy — mirroring the legacy `PlansDiscovered` seeding.
+        assert!(
+            app.collapsed_plans
+                .contains(&CollapseKey::FolderPlan { folder: 0, plan: 0 }),
+            "plan 0 in folder 0 should start collapsed (in collapsed_plans)"
+        );
+
+        // With the plan collapsed, only Folder and PlanInFolder are visible —
+        // the PlanTaskInFolder nodes are hidden until the plan is expanded.
         let nodes = app.visible_tree_nodes();
 
         // Find the Folder node for folder 0.
@@ -13120,7 +13275,31 @@ mod tests {
             })
             .expect("PlanInFolder node for folder_idx 0, plan_idx 0 should be visible");
 
-        // Find the PlanTaskInFolder node for folder 0, plan 0, task 0.
+        // The PlanTaskInFolder node should NOT be visible while the plan is collapsed.
+        assert!(
+            !nodes.iter().any(|n| {
+                matches!(
+                    n,
+                    TreeNode::PlanTaskInFolder {
+                        folder_idx: 0,
+                        plan_idx: 0,
+                        task_idx: 0
+                    }
+                )
+            }),
+            "PlanTaskInFolder node should NOT be visible while the plan is collapsed"
+        );
+
+        // Verify the order: Folder < PlanInFolder.
+        assert!(
+            folder_node < plan_in_folder_node,
+            "Folder should appear before PlanInFolder in the tree"
+        );
+
+        // Expand the plan and verify the task node becomes visible.
+        app.collapsed_plans
+            .remove(&CollapseKey::FolderPlan { folder: 0, plan: 0 });
+        let nodes = app.visible_tree_nodes();
         let task_node = nodes
             .iter()
             .position(|n| {
@@ -13133,12 +13312,10 @@ mod tests {
                     }
                 )
             })
-            .expect("PlanTaskInFolder node should be visible");
-
-        // Verify the order: Folder < PlanInFolder < PlanTaskInFolder.
+            .expect("PlanTaskInFolder node should be visible after expanding the plan");
         assert!(
-            folder_node < plan_in_folder_node && plan_in_folder_node < task_node,
-            "nodes should appear in hierarchical order"
+            plan_in_folder_node < task_node,
+            "PlanInFolder should appear before PlanTaskInFolder after expansion"
         );
     }
 

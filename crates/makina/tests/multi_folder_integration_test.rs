@@ -526,8 +526,9 @@ async fn test_sidebar_tree_three_level_structure() {
 
     open_folder_via_event(&mut app, &folder_a).await;
 
-    // Folder 0 starts expanded (per PlansDiscoveredPerFolder's handler), so
-    // the plan and its task should already be visible without extra toggling.
+    // Folder 0 starts expanded (per PlansDiscoveredPerFolder's handler), and
+    // plans start COLLAPSED by default so the tree opens tidy — the plan and
+    // its task are not visible until the plan is expanded.
     let nodes = app.visible_tree_nodes();
 
     assert!(
@@ -546,6 +547,23 @@ async fn test_sidebar_tree_three_level_structure() {
         )),
         "should have a PlanInFolder node for the discovered plan"
     );
+    // The plan starts collapsed, so the task node is NOT visible yet.
+    assert!(
+        !nodes.iter().any(|n| matches!(
+            n,
+            TreeNode::PlanTaskInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+                task_idx: 0
+            }
+        )),
+        "should NOT have a PlanTaskInFolder node while the plan is collapsed"
+    );
+
+    // Expand the plan so its task becomes visible.
+    app.collapsed_plans
+        .remove(&makina::app::CollapseKey::FolderPlan { folder: 0, plan: 0 });
+    let nodes = app.visible_tree_nodes();
     assert!(
         nodes.iter().any(|n| matches!(
             n,
@@ -555,7 +573,7 @@ async fn test_sidebar_tree_three_level_structure() {
                 task_idx: 0
             }
         )),
-        "should have a PlanTaskInFolder node for the plan's task"
+        "should have a PlanTaskInFolder node after expanding the plan"
     );
 
     let rendered = render_to_string(&app);
