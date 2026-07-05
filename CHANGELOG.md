@@ -21,14 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Plan auto-discovery** — Automatic scanning and surfacing of `docs/plans/NNNN-*/` convention, with sidebar integration and fallback to planner-driven task-list generation for in-flight authoring.
 - **Planner-generated task graphs** — Automatically generate structured task lists from plan SCOPE and ARCHITECTURE markdown via planner-driven LLM summarization.
 - **Ayu theme system** — Built-in Ayu Dark, Ayu Mirage, and Ayu Light themes with semantic theming abstraction, live switching via command palette, and persistent selection.
-- **First-run configuration UX** — Auto-detection of common ACP backends (Claude, Gemini, Ollama) with guided configuration walkthrough, removing friction from initial setup.
+- **First-run configuration UX** — Auto-detection of installed ACP agent CLIs from the supported-agent registry, plus a guided detect→confirm→persist Doctor scaffold, removing friction from initial setup.
 - **Mouse and keyboard navigation** — Arrow key navigation, mouse scroll support with intelligent routing, selection highlighting, and command palette for action discovery.
 - **Markdown rendering** — Hardened Markdown rendering for task descriptions, plan scopes, and agent output with syntax-aware formatting and edge-case resilience.
 - **Exchange pane fidelity** — Real-time streaming of agent thoughts and tool use with structured rendering, JSON object expansion, and diff visualization for code changes.
 - **Settings and configuration UI** — In-app settings editor for provider/role assignment, theme selection, and role-specific defaults with live application and persistence.
 - **Run lifecycle management** — Full control over run state: pause/resume, stop, reset, and historical run replay with task-list recovery from old runs.
 - **Structured logging and observability** — Per-task execution logs, role-tagged output streams, and comprehensive audit trails for compliance and debugging.
-- **Agent coverage improvements** — Enhanced compatibility with Claude, Gemini, and Ollama, including handling of reasoning-effort modes, streaming optimizations, and protocol edge cases.
+- **Agent coverage & compatibility** — Ten verified ACP launch profiles in the supported-agent registry (Gemini CLI, Claude Code via claude-code-acp, grok, GitHub Copilot CLI, opencode, Codex CLI via codex-acp, Qwen Code, Goose, Kilo, Cursor CLI), string or numeric JSON-RPC request ids end-to-end, and a README compatibility matrix kept in sync with the registry.
 
 ### Changed
 
