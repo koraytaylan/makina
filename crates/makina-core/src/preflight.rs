@@ -18,24 +18,65 @@ pub struct KnownAgent {
     pub args: &'static [&'static str],
 }
 
-/// Supported agents in detection-priority order. `gemini --acp --yolo` is the
+/// Supported agents in detection-priority order. `gemini --acp` is the
 /// e2e-proven path (see docs/trial/e2e-run.md:100-101,272-273); `claude-code-acp`
 /// is the Zed-compatible Claude CLI named in makina-acp's docs (crates/makina-acp/src/lib.rs:4).
 pub const KNOWN_AGENTS: &[KnownAgent] = &[
+    // Proven first-tier (gemini is the e2e-proven path, docs/trial/e2e-run.md).
+    // --yolo dropped: WorktreePolicy now answers session/request_permission.
     KnownAgent {
         name: "gemini",
         command: "gemini",
-        args: &["--acp", "--yolo"],
+        args: &["--acp"],
     },
+    // The Zed claude-code-acp adapter speaks ACP on stdio with no launch flag.
     KnownAgent {
         name: "claude-code-acp",
         command: "claude-code-acp",
-        args: &["--acp"],
+        args: &[],
     },
     KnownAgent {
         name: "grok",
         command: "grok",
         args: &["--acp"],
+    },
+    // Additional ACP-capable agents (documented invocations; never spawned to verify).
+    KnownAgent {
+        name: "copilot",
+        command: "copilot",
+        args: &["--acp"],
+    },
+    KnownAgent {
+        name: "opencode",
+        command: "opencode",
+        args: &["acp"],
+    },
+    KnownAgent {
+        name: "codex-acp",
+        command: "codex-acp",
+        args: &[],
+    },
+    KnownAgent {
+        name: "qwen",
+        command: "qwen",
+        args: &["--experimental-acp"],
+    },
+    KnownAgent {
+        name: "goose",
+        command: "goose",
+        args: &["acp"],
+    },
+    KnownAgent {
+        name: "kilo",
+        command: "kilo",
+        args: &["acp"],
+    },
+    // Cursor's CLI binary is the generic name `agent`; kept LAST to minimize
+    // false-positive detection against an unrelated `agent` on PATH.
+    KnownAgent {
+        name: "cursor",
+        command: "agent",
+        args: &["acp"],
     },
 ];
 
@@ -456,7 +497,7 @@ mod tests {
             .expect("gemini should be detected");
         assert_eq!(d.agent, "gemini");
         assert_eq!(d.command, "gemini");
-        assert_eq!(d.args, vec!["--acp".to_string(), "--yolo".to_string()]);
+        assert_eq!(d.args, vec!["--acp".to_string()]);
     }
 
     #[test]
@@ -470,5 +511,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("gemini"), "x").unwrap(); // no exec bit
         assert!(detect_backend_in_path(dir.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn known_agents_registry_has_expected_launch_profiles() {
+        use std::collections::HashMap;
+        let by_name: HashMap<&str, &KnownAgent> =
+            KNOWN_AGENTS.iter().map(|a| (a.name, a)).collect();
+        // gemini drops the obsolete --yolo bypass.
+        let gemini = by_name.get("gemini").expect("gemini present");
+        assert_eq!(gemini.args, &["--acp"]);
+        assert!(
+            !gemini.args.contains(&"--yolo"),
+            "gemini must not pass --yolo"
+        );
+        // The Zed claude-code-acp adapter launches with no args.
+        let claude = by_name
+            .get("claude-code-acp")
+            .expect("claude-code-acp present");
+        assert!(
+            claude.args.is_empty(),
+            "claude-code-acp must launch with no args"
+        );
+        // The seven added agents are all registered.
+        for name in [
+            "copilot",
+            "opencode",
+            "codex-acp",
+            "qwen",
+            "goose",
+            "kilo",
+            "cursor",
+        ] {
+            assert!(by_name.contains_key(name), "missing agent: {name}");
+        }
+        // Cursor's generic `agent` binary must be LAST to reduce false positives.
+        assert_eq!(KNOWN_AGENTS.last().unwrap().command, "agent");
     }
 }

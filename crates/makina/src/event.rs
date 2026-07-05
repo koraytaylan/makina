@@ -1015,7 +1015,7 @@ fn build_global_template(detected: &Option<makina_core::preflight::DetectedBacke
                 "# Makina global configuration — machine-specific, not committed.\n\
                  # No supported agent CLI was found on PATH. Install one of: {}\n\
                  # then set [backend].command below (see docs/trial/e2e-run.md).\n\n\
-                 [backend]\n# command = \"gemini\"\n# args = [\"--acp\", \"--yolo\"]\n\n\
+                 [backend]\n# command = \"gemini\"\n# args = [\"--acp\"]\n\n\
                  [planner]\nmechanism = \"one-shot-agent\"\n",
                 supported.join(", "),
             )

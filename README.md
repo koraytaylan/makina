@@ -41,8 +41,24 @@ discovered gates, loop-back to the Developer, and the shared cap — see
 ## Requirements
 
 - **Rust** (edition 2024; built with 1.94) and **git**.
-- An **ACP-compatible, already-authenticated agent CLI** — e.g.
-  [gemini-cli](https://github.com/google-gemini/gemini-cli) (`gemini --acp`).
+- An **ACP-compatible, already-authenticated agent CLI** from the supported-agent compatibility matrix below.
+
+### Supported agents
+
+Makina auto-detects the first installed agent in detection priority order, so no configuration is needed when one is present. To use a specific agent, configure it in `~/.makina/config.toml` (see Configure section).
+
+| Agent | Install | Launch (`command` + `args`) | Sign-in |
+|-------|---------|------------------------------|---------|
+| Gemini CLI | [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) | `gemini --acp` | run `gemini` once |
+| Claude Code (ACP) | [@zed-industries/claude-code-acp](https://github.com/zed-industries/zed) | `claude-code-acp` | Claude sign-in |
+| Grok | [grok CLI](https://grok.com) | `grok --acp` | grok sign-in |
+| GitHub Copilot CLI | [github/cli](https://github.com/cli/cli) | `copilot --acp` | `gh`/Copilot auth |
+| opencode | [opencode CLI](https://github.com/abi/opencode) | `opencode acp` | opencode auth |
+| Codex (codex-acp) | [zed codex-acp adapter](https://github.com/zed-industries/zed) | `codex-acp` | Codex/OpenAI auth |
+| Qwen Code | [Qwen qwen-cli](https://github.com/QwenLM/qwen-cli) | `qwen --experimental-acp` | qwen auth |
+| Goose | [block/goose](https://github.com/block/goose) | `goose acp` | goose config |
+| Kilo | [@kilocode/cli](https://www.kilocode.ai) | `kilo acp` | kilo auth |
+| Cursor CLI | [cursor](https://www.cursor.com) | `agent acp` | cursor auth |
 
 ## Build
 
@@ -53,15 +69,31 @@ cargo test            # full suite; real-agent tests are #[ignore]d (no agent ne
 
 ## Configure
 
-Makina merges two TOML layers, with the project layer winning on conflict.
+Makina merges two TOML layers, with the project layer winning on conflict. When a supported
+agent is installed on `$PATH`, Makina auto-detects it in registry order — **no global
+configuration is required** when one is present.
 
-**Global** — `~/.makina/config.toml` (machine-specific, not committed): the agent
-backend command and the Planner mechanism.
+**Global** — `~/.makina/config.toml` (machine-specific, not committed): optional agent backend
+override (only needed if you want to use a non-default agent or a custom command path) and
+the Planner mechanism.
+
+Choose one `[backend]` from the supported agents above. If absent, auto-detection applies.
 
 ```toml
+# Example: Gemini CLI
 [backend]
 command = "gemini"
 args    = ["--acp"]
+
+# Example: Claude Code (ACP)
+# [backend]
+# command = "claude-code-acp"
+# args    = []
+
+# Example: Qwen
+# [backend]
+# command = "qwen"
+# args    = ["--experimental-acp"]
 
 [planner]
 mechanism = "one-shot-agent"

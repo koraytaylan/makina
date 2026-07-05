@@ -61,6 +61,18 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 // ── JSON-RPC 2.0 envelope ───────────────────────────────────────────────────────
 
+/// A JSON-RPC 2.0 request/response id: a string OR a number (per the spec).
+/// Untagged so `7` parses as `Number` and `"perm-1"` as `String`. An explicit
+/// JSON `null` id still deserializes to `Option::None` (serde `Option`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RequestId {
+    /// Numeric id (the form Makina issues for its own requests).
+    Number(u64),
+    /// String id (some agents use these for server→client requests).
+    String(String),
+}
+
 /// A single line on the wire, decoded enough to route it.
 ///
 /// ACP multiplexes three JSON-RPC message kinds over one byte stream:
@@ -78,7 +90,7 @@ pub struct IncomingMessage {
     pub jsonrpc: Option<String>,
     /// Request/response correlation id. Absent for notifications.
     #[serde(default)]
-    pub id: Option<u64>,
+    pub id: Option<RequestId>,
     /// Method name. Present for requests and notifications, absent for responses.
     #[serde(default)]
     pub method: Option<String>,
@@ -96,15 +108,15 @@ pub struct IncomingMessage {
 impl IncomingMessage {
     /// Classify this line into the routing categories the client cares about.
     pub fn classify(&self) -> IncomingKind {
-        match (self.id, self.method.as_deref()) {
-            // A response correlates by id and has no method.
-            (Some(id), None) => IncomingKind::Response { id },
+        match (&self.id, self.method.as_deref()) {
+            // Our correlated responses always carry the numeric id we issued.
+            (Some(RequestId::Number(id)), None) => IncomingKind::Response { id: *id },
             // A notification has a method and no id.
             (None, Some(_)) => IncomingKind::Notification,
-            // A server→client request has both an id and a method.
+            // A server→client request has an id (string OR number) and a method.
             (Some(_), Some(_)) => IncomingKind::Request,
-            // Neither id nor method → unintelligible JSON-RPC.
-            (None, None) => IncomingKind::Malformed,
+            // Anything else (incl. a bare string-id "response" we never issued).
+            _ => IncomingKind::Malformed,
         }
     }
 }
@@ -208,14 +220,14 @@ pub struct OutgoingResponse<R: Serialize> {
     /// Always `"2.0"`.
     pub jsonrpc: &'static str,
     /// The id of the request this response answers.
-    pub id: u64,
+    pub id: RequestId,
     /// Success result payload.
     pub result: R,
 }
 
 impl<R: Serialize> OutgoingResponse<R> {
     /// Construct a response with the JSON-RPC `2.0` tag pre-filled.
-    pub fn new(id: u64, result: R) -> Self {
+    pub fn new(id: RequestId, result: R) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
@@ -232,14 +244,14 @@ pub struct OutgoingErrorResponse {
     /// Always `"2.0"`.
     pub jsonrpc: &'static str,
     /// The id of the request this error answers.
-    pub id: u64,
+    pub id: RequestId,
     /// The JSON-RPC error payload.
     pub error: JsonRpcError,
 }
 
 impl OutgoingErrorResponse {
     /// Construct an error response with the JSON-RPC `2.0` tag pre-filled.
-    pub fn new(id: u64, error: JsonRpcError) -> Self {
+    pub fn new(id: RequestId, error: JsonRpcError) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
@@ -1061,7 +1073,7 @@ mod tests {
     fn outgoing_response_envelope_serializes_with_id_and_result() {
         // Sanity that the new envelope produces a well-formed JSON-RPC response.
         let resp = OutgoingResponse::new(
-            42,
+            RequestId::Number(42),
             PermissionResponse {
                 outcome: PermissionOutcome::Selected {
                     option_id: "allow".into(),
@@ -1073,6 +1085,16 @@ mod tests {
         assert_eq!(v["id"], 42);
         assert_eq!(v["result"]["outcome"]["outcome"], "selected");
         assert_eq!(v["result"]["outcome"]["optionId"], "allow");
+    }
+
+    #[test]
+    fn incoming_string_id_request_classifies_as_request() {
+        let msg: IncomingMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission"
+        }))
+        .expect("a string-id request must decode");
+        assert_eq!(msg.id, Some(RequestId::String("perm-1".to_string())));
+        assert_eq!(msg.classify(), IncomingKind::Request);
     }
 
     #[test]

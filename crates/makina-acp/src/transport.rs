@@ -39,7 +39,8 @@ use crate::permission::{PermissionPolicy, PermissionRequestContext};
 use crate::protocol::{
     IncomingKind, IncomingMessage, JsonRpcError, METHOD_SESSION_REQUEST_PERMISSION,
     OutgoingErrorResponse, OutgoingNotification, OutgoingRequest, OutgoingResponse,
-    PermissionOutcome, PermissionResponse, RequestPermissionParams, SessionNotificationParams,
+    PermissionOutcome, PermissionResponse, RequestId, RequestPermissionParams,
+    SessionNotificationParams,
 };
 
 /// Default deadline for a short control RPC (initialize / session_new /
@@ -251,7 +252,7 @@ where
 
     /// Send a JSON-RPC success response to an inbound request (e.g. a
     /// `session/request_permission` we decided via the injected policy).
-    pub async fn send_response<R: Serialize>(&self, id: u64, result: R) -> Result<()> {
+    pub async fn send_response<R: Serialize>(&self, id: RequestId, result: R) -> Result<()> {
         if let Some(err) = self.inner.shared.ended_error() {
             return Err(err);
         }
@@ -261,7 +262,7 @@ where
 
     /// Send a JSON-RPC error response to an inbound request we do not support.
     /// This guarantees the peer never hangs waiting for a reply.
-    pub async fn send_error_response(&self, id: u64, error: JsonRpcError) -> Result<()> {
+    pub async fn send_error_response(&self, id: RequestId, error: JsonRpcError) -> Result<()> {
         if let Some(err) = self.inner.shared.ended_error() {
             return Err(err);
         }
@@ -916,6 +917,149 @@ mod tests {
         let prompt_fut = transport.send_request(
             "session/prompt",
             json!({"sessionId":"sess-perm-test","prompt":[{"type":"text","text":"work"}]}),
+            None,
+        );
+
+        let prompt_res = prompt_fut.await.unwrap();
+        assert_eq!(prompt_res["stopReason"], "end_turn");
+
+        peer.await.unwrap();
+
+        // Exactly one audit entry with an allow decision.
+        let captured = entries.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].decision, AuditDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn permission_request_with_string_id_is_answered() {
+        // In-memory duplex (no subprocess). Scripted peer sends a
+        // session/request_permission with a string id while a prompt turn is in flight.
+        let (client_io, peer_io) = tokio::io::duplex(8 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (mut peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        let worktree = PathBuf::from("/tmp/makina-test-worktree-perm-str");
+        let policy: Arc<dyn PermissionPolicy> = Arc::new(WorktreePolicy::new(worktree.clone()));
+        let sink = Arc::new(TestAuditSink::default());
+        let entries = sink.entries.clone();
+
+        let transport = Transport::new(
+            client_read,
+            client_write,
+            policy,
+            worktree.clone(),
+            sink as Arc<dyn AuditSink>,
+            "test-run".into(),
+            None,
+        );
+
+        // Peer script: handshake, start prompt, inject one permission request,
+        // verify the client replied with the allow-once selection, then finish turn.
+        let peer = tokio::spawn(async move {
+            // initialize
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_u64().unwrap();
+            write_line(
+                &mut peer_write,
+                &json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}}).to_string(),
+            )
+            .await;
+
+            // session/new
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_u64().unwrap();
+            write_line(
+                &mut peer_write,
+                &json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"sess-perm-str-test"}})
+                    .to_string(),
+            )
+            .await;
+
+            // session/prompt (keep pending)
+            let line = read_line(&mut peer_read).await;
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["method"], "session/prompt");
+            let prompt_id = req["id"].as_u64().unwrap();
+
+            // Mid-turn: send inbound permission request with string id
+            let perm_id = "perm-str-1";
+            let perm_req = json!({
+                "jsonrpc": "2.0",
+                "id": perm_id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "sess-perm-str-test",
+                    "options": [
+                        {"optionId": "proceed_always", "name": "Always", "kind": "allow_always"},
+                        {"optionId": "proceed_once",  "name": "Allow",  "kind": "allow_once"}
+                    ],
+                    "toolCall": {
+                        "toolCallId": "write_file__42",
+                        "title": "Writing probe.txt"
+                    }
+                }
+            });
+            write_line(&mut peer_write, &perm_req.to_string()).await;
+
+            // Read the response the client (transport) wrote for the perm request
+            let resp_line = read_line(&mut peer_read).await;
+            let resp: Value = serde_json::from_str(&resp_line).unwrap();
+            assert_eq!(resp["jsonrpc"], "2.0");
+            assert_eq!(resp["id"], "perm-str-1");
+            let outcome = &resp["result"]["outcome"];
+            assert_eq!(outcome["outcome"], "selected");
+            assert_eq!(outcome["optionId"], "proceed_once"); // WorktreePolicy picks allow_once
+
+            // Stream one text chunk (so turn has visible progress)
+            let chunk = json!({
+                "jsonrpc": "2.0",
+                "method": METHOD_SESSION_UPDATE,
+                "params": {
+                    "sessionId": "sess-perm-str-test",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "done" }
+                    }
+                }
+            });
+            write_line(&mut peer_write, &chunk.to_string()).await;
+
+            // Complete the original prompt
+            let done = json!({
+                "jsonrpc": "2.0",
+                "id": prompt_id,
+                "result": { "stopReason": "end_turn" }
+            });
+            write_line(&mut peer_write, &done.to_string()).await;
+        });
+
+        // Drive from client side using the transport directly (handshake + prompt).
+        // The inbound perm request is handled by the background reader while this
+        // prompt request is outstanding.
+        let _init = transport
+            .send_request(
+                "initialize",
+                json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"t","version":"0"}}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let _new = transport
+            .send_request(
+                "session/new",
+                json!({"cwd": worktree, "mcpServers":[]}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let prompt_fut = transport.send_request(
+            "session/prompt",
+            json!({"sessionId":"sess-perm-str-test","prompt":[{"type":"text","text":"work"}]}),
             None,
         );
 

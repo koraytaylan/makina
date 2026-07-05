@@ -10,8 +10,9 @@
 # supplies the agent backend command, the Planner model/mechanism, and the
 # default termination caps. The project layer wins on merge.
 #
-# Makina auto-detects a supported agent CLI on $PATH (gemini, claude-code-acp, grok)
-# and uses it as the default backend — no global config is required if a supported
+# Makina auto-detects a supported agent CLI on $PATH (gemini, claude-code-acp, grok,
+# and others — see the README compatibility matrix) and uses it as the default backend — no
+# global config is required if a supported
 # agent is installed. To override the auto-detected default, or to set up Makina
 # when no supported agent is on PATH, open Makina and press 'w' in the Doctor overlay
 # to write a starter global config for your machine. See `docs/trial/e2e-run.md` for

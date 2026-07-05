@@ -1689,6 +1689,28 @@ mod tests {
         }
     }
 
+    /// **Acceptance criterion — validation message names every agent**
+    /// The empty-backend validation reason must list every agent in KNOWN_AGENTS
+    /// so a reader can see all supported options. This test enforces the coupling
+    /// between the registry and the validation message.
+    #[test]
+    fn empty_backend_error_names_every_known_agent() {
+        let no_global = std::path::Path::new("/tmp/__makina_allagents_g.toml");
+        let no_project = std::path::Path::new("/tmp/__makina_allagents_p.toml");
+        match Config::load_with_labels(Some(no_global), None, Some(no_project), None, Some("")) {
+            Err(ConfigError::Validation { reason }) => {
+                for agent in crate::preflight::KNOWN_AGENTS {
+                    assert!(
+                        reason.contains(agent.command),
+                        "validation message must name supported CLI {:?}; got: {reason}",
+                        agent.command,
+                    );
+                }
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
     /// **Acceptance criterion — auto-detection during load**
     /// `Config::load_with_labels` with detection enabled synthesizes a default
     /// provider from a supported CLI on `path_env`, making a fresh clone validate.
