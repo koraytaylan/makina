@@ -77,6 +77,16 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    /// True iff this is the recoverable "no agent backend configured" case
+    /// (empty `backend.command`, no providers) — the binary can guide the user
+    /// through detect→confirm→persist instead of hard-failing. Every other
+    /// validation/parse/IO error is unrecoverable at startup.
+    pub fn is_recoverable_empty_backend(&self) -> bool {
+        matches!(self, ConfigError::Validation { reason } if reason.starts_with("backend.command"))
+    }
+}
+
 // ── Config load paths ─────────────────────────────────────────────────────────
 
 /// The resolved file-system paths checked by [`Config::load_defaults`].
@@ -1439,6 +1449,29 @@ mod tests {
             err.to_string().contains("backend.command"),
             "error message should mention 'backend.command', got: {err}"
         );
+    }
+
+    /// **Acceptance criterion — empty backend is recoverable but other errors are not**
+    ///
+    /// [`ConfigError::is_recoverable_empty_backend`] returns `true` for the
+    /// empty-backend `Validation` case and `false` for other validation errors
+    /// (e.g. `caps.gate_iterations`) and non-validation error types (`Parse`).
+    #[test]
+    fn empty_backend_is_recoverable_but_other_errors_are_not() {
+        let empty = ConfigError::Validation {
+            reason: "backend.command must not be empty — no agent backend is configured."
+                .to_string(),
+        };
+        assert!(empty.is_recoverable_empty_backend());
+        let caps = ConfigError::Validation {
+            reason: "caps.gate_iterations must be at least 1".to_string(),
+        };
+        assert!(!caps.is_recoverable_empty_backend());
+        let parse = ConfigError::Parse {
+            file: "~/.makina/config.toml".to_string(),
+            message: "expected `=`".to_string(),
+        };
+        assert!(!parse.is_recoverable_empty_backend());
     }
 
     /// **Acceptance criterion — invalid config fails clearly (b): malformed TOML**

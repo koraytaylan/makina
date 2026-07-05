@@ -13,7 +13,8 @@ so Makina never handles model credentials.
 
 > **Status: MVP.** The full loop works end-to-end against a real agent. See
 > [`docs/trial/trial-findings.md`](docs/trial/trial-findings.md) for what's proven
-> and the known gaps, and [`docs/plans/0001-Initial/`](docs/plans/0001-Initial/) for
+> and the known gaps, [`docs/demo/makina.tape`](docs/demo/makina.tape) for a
+> scriptable demo, and [`docs/plans/0001-Initial/`](docs/plans/0001-Initial/) for
 > the vision, architecture, and roadmap.
 
 ## How it works
@@ -126,6 +127,14 @@ Gates are exit-code-zero shell commands run (via `sh -c`) in each task's worktre
 a task must pass all of them before it is reviewed and merged. Sign the agent in
 once (e.g. run `gemini` interactively) — Makina inherits its session.
 
+### Safe defaults
+
+The shipped `.makina/config.toml` uses `concurrency = 2` (a first-timer-safe ceiling:
+each gate pass compiles the full workspace and agent turns drive real model calls, so
+concurrency ≥ 10 raises machine load and merge-lock contention). Raise it once you trust
+the run on your machine. For prebuilt release binaries, toolchain details, and release
+notes, see [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Write a task list
 
 A task list is structured Markdown: numbered sections, and per task a description,
@@ -142,23 +151,6 @@ Add a documented helper function with unit tests to `makina-core`.
 - **Done when:** the function exists with tests; `cargo test` and `cargo clippy -- -D warnings` pass.
 ```
 
-## Run
-
-```bash
-cargo run -p makina    # requires the two config files above
-```
-
-Keys:
-
-- **`o`** — open the file browser and pick a task list (starts a Run)
-- **`Ctrl-P`** — open the command palette for start / pause / stop / reset
-- **`↑/↓`** (or `j/k`) — navigate · **`Tab`** or **`→/←`** — switch panel (Runs ↔ Detail) · **wheel** — scroll content · hold **Shift** (or **Option** in iTerm2) and drag to select & copy text
-- **`q`** / `Esc` / `Ctrl-C` — quit
-
-Open a list, choose **Start run** from the command palette, and watch per-task
-state, iteration counts, and the live prompt/answer stream as the loop runs;
-approved tasks land on your base branch.
-
 ## Caution — running a list mutates the repository
 
 A Run creates `task/{plan_slug}--{task_id}` branches and
@@ -170,6 +162,29 @@ throwaway clone:
 ```bash
 git clone /path/to/repo /tmp/repo-trial && cd /tmp/repo-trial
 ```
+
+## Run
+
+```bash
+cargo run -p makina    # auto-detects an installed agent — no global config required
+```
+
+**CLI flags:**
+- **`makina --help`** — print usage and config file locations
+- **`makina --version`** / **`-V`** — print the version and git sha (when available)
+- **`makina --doctor`** — run a headless preflight check; exits 0 if a backend is configured or detected, non-zero otherwise
+
+**Keys:**
+- **`!`** — open the Doctor overlay for a headless health check
+- **`w`** (in Doctor overlay) — auto-detect an agent and write a starter `~/.makina/config.toml`
+- **`o`** — open the file browser and pick a task list (starts a Run)
+- **`Ctrl-P`** — open the command palette for start / pause / stop / reset
+- **`↑/↓`** (or `j/k`) — navigate · **`Tab`** or **`→/←`** — switch panel (Runs ↔ Detail) · **wheel** — scroll content · hold **Shift** (or **Option** in iTerm2) and drag to select & copy text
+- **`q`** / `Esc` / `Ctrl-C` — quit
+
+Open a list, choose **Start run** from the command palette, and watch per-task
+state, iteration counts, and the live prompt/answer stream as the loop runs;
+approved tasks land on your base branch.
 
 ## Project layout
 

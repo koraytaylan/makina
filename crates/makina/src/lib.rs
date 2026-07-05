@@ -26,6 +26,7 @@
 pub mod ansi;
 pub mod app;
 pub mod browser;
+pub mod cli;
 pub mod event;
 pub mod exit;
 pub mod folder_init;

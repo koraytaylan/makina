@@ -33,8 +33,59 @@ use makina_core::orchestrator::CoreApi;
 use makina_core::preflight::probe_providers;
 use makina_core::worktree::WorktreeManager;
 
+/// Run the headless `--doctor` preflight check.
+///
+/// Reads `$PATH` once, calls `detect_backend_in_path` for the detected agent name,
+/// attempts `Config::load_defaults()` for `config_loaded`, calls
+/// `render_doctor_report` with both, prints the report, and returns its exit code
+/// (0 if a backend is detected or config loads, 1 otherwise).
+fn run_headless_doctor() -> i32 {
+    use makina_core::preflight::detect_backend_in_path;
+
+    // Read PATH once for detected backend lookup
+    let path = std::env::var("PATH").unwrap_or_default();
+    let detected = detect_backend_in_path(&path);
+
+    // Extract agent name if detected
+    let agent_name = detected.as_ref().map(|b| b.agent);
+
+    // Attempt to load config
+    let config_loaded = Config::load_defaults().is_ok();
+
+    // Render the report and get the exit code
+    let (report, exit_code) = makina::cli::render_doctor_report(agent_name, config_loaded);
+    println!("{report}");
+    exit_code
+}
+
 #[tokio::main]
 async fn main() {
+    // ── CLI Dispatch ────────────────────────────────────────────────────────────
+    // Dispatch on command-line arguments before any TUI or config work.  This
+    // ensures --help, --version, and --doctor print and exit without launching
+    // the full TUI stack.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match makina::cli::parse_args(&args) {
+        makina::cli::CliAction::ShowHelp => {
+            println!("{}", makina::cli::help_text());
+            return;
+        }
+        makina::cli::CliAction::ShowVersion => {
+            println!("{}", makina::cli::version_text());
+            return;
+        }
+        makina::cli::CliAction::RunDoctor => {
+            std::process::exit(run_headless_doctor());
+        }
+        makina::cli::CliAction::Unknown(flag) => {
+            eprintln!("unknown flag: {flag}\n\n{}", makina::cli::help_text());
+            std::process::exit(2);
+        }
+        makina::cli::CliAction::LaunchTui => {
+            // Fall through to the existing TUI startup
+        }
+    }
+
     // ── Config ──────────────────────────────────────────────────────────────────
     // Load the resolved two-layer config (global ~/.makina/config.toml + project
     // ./makina.toml).  Supplies the agent backend command, the gates, the caps,
@@ -82,6 +133,16 @@ async fn main() {
                  \n\
                  See README § Configure for a minimal config example."
             );
+
+            // If the error is the recoverable empty-backend case, print the explicit
+            // pointer to the Doctor 'w' scaffold.
+            if e.is_recoverable_empty_backend() {
+                eprintln!(
+                    "\n\
+                     Open Makina and press 'w' in the Doctor overlay to auto-detect and write ~/.makina/config.toml."
+                );
+            }
+
             std::process::exit(1);
         }
     };
