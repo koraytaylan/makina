@@ -18,9 +18,9 @@ See [SCOPE.md](SCOPE.md) for boundaries and [ARCHITECTURE.md](ARCHITECTURE.md) f
 
 ## 0001 — Launch Doctor On Empty Backend
 
-### launch-doctor-on-empty-backend — Guide the User Instead of Exiting on an Empty-Backend Failure (GATED)
+### launch-doctor-on-empty-backend — Guide the User Instead of Exiting on an Empty-Backend Failure
 
-**Gate:** This is the conditional Phase-2 follow-up recorded GATED in plan 0043 (`docs/plans/0043-.../STATUS.md:18`; spec `docs/plans/0043-.../TASKS.md:261-280`). Its upstreams — `synthesize-detected-backend` and `detect-driven-scaffold` — are already merged and green on develop, so it may land now. If constructing a partial-config `App` cleanly is infeasible (the orchestrator's `CoreApi` requires a validated `Config`), the change must fall back to the enriched-message-plus-`exit(1)` form and record that deferral in STATUS — binary land-or-revert-and-record, leaving the enriched hard-fail message in place.
+**Note:** This is the conditional Phase-2 follow-up recorded GATED in plan 0043 (`docs/plans/0043-.../STATUS.md:18`; spec `docs/plans/0043-.../TASKS.md:261-280`); the gate is lifted here — landing it is this plan's commissioned purpose. Its upstreams — `synthesize-detected-backend` and `detect-driven-scaffold` — are already merged and green on develop, so it may land now. If constructing a partial-config `App` cleanly is infeasible (the orchestrator's `CoreApi` requires a validated `Config`), the change must fall back to the enriched-message-plus-`exit(1)` form and record that deferral in STATUS — binary land-or-revert-and-record, leaving the enriched hard-fail message in place.
 
 Today `main`'s `Err(e)` arm (`crates/makina/src/main.rs:52-86`) prints a files-checked block and calls `std::process::exit(1)` (`main.rs:85`) for every `ConfigError`, including the recoverable empty-backend case whose enriched reason begins with `backend.command` (`crates/makina-core/src/config.rs:905-917`). There is no in-app path to the detect→confirm→persist Doctor scaffold (`crates/makina/src/event.rs:1031`) that would fix it.
 
