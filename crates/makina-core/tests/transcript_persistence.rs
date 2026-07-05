@@ -14,7 +14,6 @@
 //! - Every line in the transcript is parsed back into an `ExchangeEvent`.
 
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,49 +27,12 @@ use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::dependency::EdgeInferrer;
 use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::orchestrator::CoreApi;
+use makina_core::test_support::setup_temp_repo;
 use makina_core::worktree::WorktreeManager;
 
 // ── Temp-repo helpers ─────────────────────────────────────────────────────────
 
 /// Create a minimal git repository in a fresh tempdir on a `develop` branch.
-fn setup_temp_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let path = dir.path();
-
-    run_git(path, &["init"]);
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-
-    let branch = String::from_utf8(
-        ProcessCommand::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .expect("git rev-parse HEAD")
-            .stdout,
-    )
-    .expect("utf8")
-    .trim()
-    .to_string();
-
-    if branch != "develop" {
-        run_git(path, &["branch", "-m", &branch, "develop"]);
-    }
-
-    dir
-}
-
-fn run_git(path: &std::path::Path, args: &[&str]) {
-    let status = ProcessCommand::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-    assert!(status.success(), "git {args:?} failed");
-}
-
 /// Build a `CoreApi` over the deterministic interpreter + `NoopBackend` +
 /// a temp-repo `WorktreeManager` + a no-gate `Config`.
 fn build_api(repo_root: PathBuf) -> CoreApi {

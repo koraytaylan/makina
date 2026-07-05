@@ -1,0 +1,6 @@
+# Single source of truth for the toolchain CI (via `rustup show`) and
+# contributors use. 1.96.1 is the current dev toolchain (rustc --version);
+# comfortably above the edition-2024 / MSRV 1.85 floor.
+[toolchain]
+channel    = "1.96.1"
+components = ["rustfmt", "clippy"]

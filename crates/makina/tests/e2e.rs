@@ -98,11 +98,14 @@ const OBSERVE_DEADLINE: Duration = Duration::from_secs(20 * 60);
 // ── git helpers (operate on the temp clone only) ────────────────────────────────
 
 /// Run `git -C {repo} {args}`, asserting it exits 0 (panics with stderr).
+/// Hermetic against global/system git config to shield against host configuration.
 fn git(repo: &Path, args: &[&str]) {
     let output = StdCommand::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
     assert!(
@@ -115,11 +118,14 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 /// Run `git -C {repo} {args}` and return trimmed stdout (asserting exit 0).
+/// Hermetic against global/system git config to shield against host configuration.
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let output = StdCommand::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
     assert!(

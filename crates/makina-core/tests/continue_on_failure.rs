@@ -51,6 +51,7 @@ use makina_core::backend::{
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::paths;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
+use makina_core::test_support::setup_temp_repo;
 
 // ── Task matching ───────────────────────────────────────────────────────────────
 
@@ -229,39 +230,9 @@ impl AgentSession for PanicSession {
 
 /// Create a minimal git repository in a new temporary directory, on a `develop`
 /// branch with one initial commit.  Returns the temp dir (keep it alive).
-fn setup_temp_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("should create temp dir");
-    let path = dir.path();
-
-    run_git(path, &["init"]);
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-
-    let current = git_stdout(path, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    if current != "develop" {
-        run_git(path, &["branch", "-m", &current, "develop"]);
-    }
-
-    dir
-}
-
 /// Run a `git -C {path}` command, asserting it exits 0.
-fn run_git(path: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-    assert!(
-        status.success(),
-        "git {args:?} in {path:?} exited with {:?}",
-        status.code()
-    );
-}
-
 /// Run a `git -C {path}` command, returning trimmed stdout (asserting exit 0).
+#[allow(dead_code)]
 fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")

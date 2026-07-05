@@ -965,6 +965,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "makina-core",
  "serde",
  "serde_json",
  "tempfile",

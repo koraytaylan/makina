@@ -2780,6 +2780,9 @@ mod tests {
     // Use the process-global HOME_ENV_LOCK from lib.rs so all test modules
     // serialize HOME mutations across crate boundaries.
     use crate::HOME_ENV_LOCK;
+    use crate::test_support::{
+        run_git as shared_run_git, setup_temp_repo as shared_setup_temp_repo,
+    };
 
     /// A small, valid structured-text task list used by the OpenRun tests.
     ///
@@ -2826,54 +2829,8 @@ Do the thing in `lib.rs`.
         Config::resolve(GlobalConfig::default(), ProjectConfig::default())
     }
 
-    /// Create a minimal git repo on a `develop` branch in a fresh tempdir so the
-    /// WorktreeManager can create worktrees off it (mirrors the engine tests).
-    fn setup_temp_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = dir.path();
-        run_git(path, &["init"]);
-        run_git(path, &["config", "user.email", "test@example.com"]);
-        run_git(path, &["config", "user.name", "Test User"]);
-        run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-        let branch = String::from_utf8(
-            StdCommand::new("git")
-                .args(["-C", &path.to_string_lossy()])
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .output()
-                .expect("git rev-parse HEAD")
-                .stdout,
-        )
-        .expect("utf8")
-        .trim()
-        .to_string();
-        if branch != "develop" {
-            run_git(path, &["branch", "-m", &branch, "develop"]);
-        }
-        dir
-    }
-
-    fn run_git(path: &std::path::Path, args: &[&str]) {
-        let status = StdCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(args)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
-        let output = StdCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(args)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-        assert!(
-            output.status.success(),
-            "git {args:?} failed\nstderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let output = shared_run_git(path, args);
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
@@ -2994,7 +2951,7 @@ Do the thing in `lib.rs`.
             "Implemented the feature.".into(),
             r#"{"verdict":"approve"}"#.into(),
         ]));
-        let repo_dir = setup_temp_repo();
+        let repo_dir = shared_setup_temp_repo();
         let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
         let api = CoreApi::with_audit_registry(
             ingestion,
@@ -3021,7 +2978,7 @@ Do the thing in `lib.rs`.
             None,
         )
         .expect("planner build must succeed with None backend");
-        let repo_dir = setup_temp_repo();
+        let repo_dir = shared_setup_temp_repo();
         let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
         let api = CoreApi::with_audit_registry(
             ingestion,
@@ -3793,7 +3750,7 @@ Create beta.
             "Implemented the feature.".into(),
             r#"{"verdict":"approve"}"#.into(),
         ]));
-        let repo_dir = setup_temp_repo();
+        let repo_dir = shared_setup_temp_repo();
         let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
         let mut config = no_gate_config();
         config.merge.final_ = crate::config::FinalMerge::Manual;
@@ -4175,7 +4132,7 @@ This description is long enough to pass the thin-description threshold.
             Arc::new(StructuredTextInterpreter::new()),
         ));
         let (backend, _release) = GatedBackend::new();
-        let repo_dir = setup_temp_repo();
+        let repo_dir = shared_setup_temp_repo();
         let repo_root = repo_dir.path().to_path_buf();
         let wm = WorktreeManager::new(repo_root.clone(), "develop".into());
         let mut config = no_gate_config();
@@ -4440,7 +4397,7 @@ This description is long enough to pass the thin-description threshold.
             Arc::new(StructuredTextInterpreter::new()),
         ));
         let (backend, release) = GatedBackend::new();
-        let repo_dir = setup_temp_repo();
+        let repo_dir = shared_setup_temp_repo();
         let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
         let mut config = no_gate_config();
         config.concurrency = 1; // strictly one task at a time.
@@ -4590,7 +4547,7 @@ This description is long enough to pass the thin-description threshold.
         )
         .expect("model ingestion interpreter must build");
 
-        let repo_dir = setup_temp_repo();
+        let repo_dir = shared_setup_temp_repo();
         let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
         let api = CoreApi::new(interpreter, backend, wm, no_gate_config());
 

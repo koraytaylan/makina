@@ -371,19 +371,7 @@ mod tests {
 
         // ── Real git worktree for the commit step ────────────────────────────
         let dev_worktree = tempfile::tempdir().expect("temp worktree dir");
-        let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dev_worktree.path())
-                .args(args)
-                .status()
-                .expect("git must be available");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run_git(&["init"]);
-        run_git(&["config", "user.email", "test@example.com"]);
-        run_git(&["config", "user.name", "Test User"]);
-        run_git(&["commit", "--allow-empty", "-m", "init"]);
+        crate::test_support::init_git_repo_with_identity(dev_worktree.path());
 
         // ── Task ─────────────────────────────────────────────────────────────
         let now = Utc::now();

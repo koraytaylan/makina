@@ -27,7 +27,6 @@
 //! harness.
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -40,6 +39,7 @@ use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
+use makina_core::test_support::setup_temp_repo;
 use makina_core::worktree::WorktreeManager;
 
 use tracing::field::{Field, Visit};
@@ -185,48 +185,6 @@ where
 }
 
 // ── Temp-repo helpers (mirror tests/supervisor_audit_registry.rs) ────────────────
-
-fn setup_temp_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("should create temp dir");
-    let path = dir.path();
-
-    run_git(path, &["init"]);
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-
-    let current_branch = String::from_utf8(
-        Command::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .expect("git rev-parse HEAD")
-            .stdout,
-    )
-    .expect("utf8")
-    .trim()
-    .to_string();
-
-    if current_branch != "develop" {
-        run_git(path, &["branch", "-m", &current_branch, "develop"]);
-    }
-
-    dir
-}
-
-fn run_git(path: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-    assert!(
-        status.success(),
-        "git {args:?} in {path:?} exited with {:?}",
-        status.code()
-    );
-}
 
 fn task(id: &str) -> Task {
     let now = Utc::now();

@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show            # installs the rust-toolchain.toml pin
+      - uses: Swatinem/rust-cache@v2
+      - name: Poison global git config (hermeticity canary)
+        run: |
+          git config --global commit.gpgsign true
+          git config --global init.defaultBranch main
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

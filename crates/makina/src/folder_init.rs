@@ -30,6 +30,13 @@ pub fn initialize_folder(folder: &Path) -> Result<(), String> {
             run_git(folder, &["config", "user.email", "makina@localhost"])?;
             run_git(folder, &["config", "user.name", "Makina"])?;
         }
+        // Shield this repo (and every worktree spawned from it) against a host
+        // with `commit.gpgsign = true` and no signing key configured for
+        // automation: engine-spawned commits (this bootstrap commit, and later
+        // the Developer/merge actors) must never block on GPG, so disable
+        // signing locally rather than relying on ambient config — mirrors the
+        // hermetic shield in makina_core::test_support::init_git_repo_with_identity.
+        run_git(folder, &["config", "commit.gpgsign", "false"])?;
         // Pin the bootstrap commit's identity via env (env beats config): the commit
         // is Makina's, and resolving identity from ambient config here is racy when
         // the process's HOME changes between the probe above and this commit.

@@ -22,7 +22,6 @@
 //! - No arbitrary sleeps.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -35,49 +34,12 @@ use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::orchestrator::{CoreApi, run_slug};
 use makina_core::persist::{load_graph, persist_graph, tasks_path};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
+use makina_core::test_support::{init_git_repo_with_identity, setup_temp_repo};
 use makina_core::worktree::WorktreeManager;
 
 // ── Temp-repo helpers ─────────────────────────────────────────────────────────
 
 /// Create a minimal git repository in a fresh tempdir on a `develop` branch.
-fn setup_temp_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let path = dir.path();
-
-    run_git(path, &["init"]);
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-
-    let branch = String::from_utf8(
-        Command::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .expect("git rev-parse HEAD")
-            .stdout,
-    )
-    .expect("utf8")
-    .trim()
-    .to_string();
-
-    if branch != "develop" {
-        run_git(path, &["branch", "-m", &branch, "develop"]);
-    }
-
-    dir
-}
-
-fn run_git(path: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-    assert!(status.success(), "git {args:?} failed");
-}
-
 /// Build a `CoreApi` over the deterministic interpreter + `NoopBackend` +
 /// a temp-repo `WorktreeManager` + a no-gate `Config`.
 fn build_api(repo_root: PathBuf) -> CoreApi {
@@ -660,11 +622,8 @@ async fn disk_snapshot_ids_do_not_collide_with_subsequent_live_open_ids() {
     let root = dir.path();
     unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
-    // Minimal git repo so WorktreeManager etc are happy.
-    run_git(root, &["init"]);
-    run_git(root, &["config", "user.email", "t@example.com"]);
-    run_git(root, &["config", "user.name", "T"]);
-    run_git(root, &["commit", "--allow-empty", "-m", "init"]);
+    // Minimal git repo so WorktreeManager etc are happy (uses shared hermetic setup).
+    init_git_repo_with_identity(root);
 
     // Seed one historical completed run (plan-like slug).
     let run_uid = "01DISKIDCOLLISIONTEST0000000";

@@ -30,6 +30,8 @@ pub mod roles;
 pub mod run_metadata;
 pub mod state_machine;
 pub mod task;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod worktree;
 
 /// Process-global serialisation lock for tests that mutate the `HOME` env var.

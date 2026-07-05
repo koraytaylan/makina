@@ -40,7 +40,7 @@ discovered gates, loop-back to the Developer, and the shared cap — see
 
 ## Requirements
 
-- **Rust** (edition 2024; built with 1.94) and **git**.
+- **Rust** (edition 2024; MSRV 1.85, pinned to 1.96.1 via `rust-toolchain.toml`) and **git**.
 - An **ACP-compatible, already-authenticated agent CLI** from the supported-agent compatibility matrix below.
 
 ### Supported agents

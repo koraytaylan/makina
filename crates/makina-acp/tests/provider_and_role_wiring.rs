@@ -13,7 +13,6 @@
 
 mod common;
 
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -29,47 +28,11 @@ use makina_core::config::{
 };
 use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
+use makina_core::test_support::setup_temp_repo;
 use makina_core::worktree::WorktreeManager;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::wrappers::ReceiverStream;
-
-// ── Git repo helper ───────────────────────────────────────────────────────────
-
-fn run_git(dir: &std::path::Path, args: &[&str]) {
-    Command::new("git")
-        .args(["-C", &dir.to_string_lossy()])
-        .args(args)
-        .output()
-        .expect("git command failed");
-}
-
-fn setup_temp_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("should create temp dir");
-    let path = dir.path();
-
-    run_git(path, &["init"]);
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-
-    // Ensure the branch is named `develop` regardless of init.defaultBranch.
-    let current_branch = String::from_utf8(
-        Command::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .expect("git rev-parse HEAD")
-            .stdout,
-    )
-    .unwrap_or_default();
-    let current_branch = current_branch.trim();
-    if current_branch != "develop" {
-        run_git(path, &["branch", "-m", current_branch, "develop"]);
-    }
-
-    dir
-}
 
 fn make_task(id: &str) -> Task {
     let now = Utc::now();

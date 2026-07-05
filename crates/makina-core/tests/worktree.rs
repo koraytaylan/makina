@@ -23,6 +23,7 @@
 use std::process::Command;
 
 use makina_core::paths;
+use makina_core::test_support::{run_git, setup_temp_repo};
 use makina_core::worktree::{WorktreeError, WorktreeManager};
 
 /// Process-global lock for tests in this binary that set HOME.
@@ -33,86 +34,9 @@ static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── Temp-repo helper ──────────────────────────────────────────────────────────
 
-/// Create a minimal git repository in a new temporary directory.
-///
-/// Steps performed:
-/// 1. `git init`
-/// 2. `git config user.email test@example.com`
-/// 3. `git config user.name "Test User"`
-/// 4. Create an empty initial commit so HEAD and `develop` exist.
-/// 5. Rename the default branch to `develop` (handles repos where git defaults
-///    to `main` or `master`).
-///
-/// Returns the temp dir (must be kept alive for the duration of the test).
-fn setup_temp_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("should create temp dir");
-    let path = dir.path();
-
-    // git init
-    run_git(path, &["init"]);
-
-    // Configure identity so commits work.
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-
-    // Create an initial commit so HEAD is valid.
-    // We need at least one commit for `git worktree add -b <branch> <base>` to work.
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-
-    // Ensure the branch is named `develop` regardless of git's init.defaultBranch.
-    // First, check what the current branch name is.
-    let current_branch = String::from_utf8(
-        Command::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .expect("git rev-parse HEAD")
-            .stdout,
-    )
-    .expect("utf8")
-    .trim()
-    .to_string();
-
-    if current_branch != "develop" {
-        run_git(path, &["branch", "-m", &current_branch, "develop"]);
-    }
-
-    dir
-}
-
-/// Run a `git -C {path}` command, asserting it exits 0.
-/// Panics with a helpful message on failure.
-fn run_git(path: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn git {:?}: {e}", args));
-    assert!(
-        status.success(),
-        "git {:?} in {:?} exited with {:?}",
-        args,
-        path,
-        status.code()
-    );
-}
-
-/// Run a `git -C {path}` command and return its trimmed stdout, asserting exit 0.
+/// Run a `git` command and return its trimmed stdout, asserting exit 0.
 fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn git {:?}: {e}", args));
-    assert!(
-        output.status.success(),
-        "git {:?} in {:?} exited with {:?}",
-        args,
-        path,
-        output.status.code()
-    );
+    let output = run_git(path, args);
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 

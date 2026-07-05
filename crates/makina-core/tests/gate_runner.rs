@@ -26,7 +26,6 @@
 
 mod common;
 
-use std::process::Command;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -36,54 +35,7 @@ use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{BackendConfig, CapsConfig, Config, GateConfig, PlannerConfig};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
-
-// ── Temp-repo helper (mirrors tests/develop_review_loop.rs) ──────────────────────
-
-/// Create a minimal git repository in a new temporary directory, on a `develop`
-/// branch with one initial commit (so `git worktree add -b … develop` works).
-fn setup_temp_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("should create temp dir");
-    let path = dir.path();
-
-    run_git(path, &["init"]);
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-
-    // Ensure the branch is named `develop` regardless of init.defaultBranch.
-    let current_branch = String::from_utf8(
-        Command::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .expect("git rev-parse HEAD")
-            .stdout,
-    )
-    .expect("utf8")
-    .trim()
-    .to_string();
-
-    if current_branch != "develop" {
-        run_git(path, &["branch", "-m", &current_branch, "develop"]);
-    }
-
-    dir
-}
-
-/// Run a `git -C {path}` command, asserting it exits 0.
-fn run_git(path: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-    assert!(
-        status.success(),
-        "git {args:?} in {path:?} exited with {:?}",
-        status.code()
-    );
-}
+use makina_core::test_support::setup_temp_repo;
 
 // ── Config builder ───────────────────────────────────────────────────────────────
 

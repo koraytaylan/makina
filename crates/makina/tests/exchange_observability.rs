@@ -57,6 +57,7 @@ use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::dependency::EdgeInferrer;
 use makina_core::interpreter::StructuredTextInterpreter;
 use makina_core::orchestrator::CoreApi;
+use makina_core::test_support::setup_temp_repo;
 use makina_core::worktree::WorktreeManager;
 
 /// A single-task structured-text task list: the smallest graph that drives one
@@ -120,45 +121,6 @@ fn rich_turn() -> Vec<ResponseEvent> {
 /// through (the same no-gate config the orchestrator integration tests use).
 fn no_gate_config() -> Config {
     Config::resolve(GlobalConfig::default(), ProjectConfig::default())
-}
-
-/// Create a minimal git repo on a `develop` branch in a fresh tempdir so the
-/// `WorktreeManager` can create per-task worktrees off it.
-fn setup_temp_repo() -> tempfile::TempDir {
-    use std::process::Command as StdCommand;
-
-    fn run_git(path: &std::path::Path, args: &[&str]) {
-        let status = StdCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(args)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let path = dir.path();
-    run_git(path, &["init"]);
-    run_git(path, &["config", "user.email", "test@example.com"]);
-    run_git(path, &["config", "user.name", "Test User"]);
-    run_git(path, &["config", "commit.gpgsign", "false"]);
-    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"]);
-    let branch = String::from_utf8(
-        StdCommand::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .expect("git rev-parse HEAD")
-            .stdout,
-    )
-    .expect("utf8")
-    .trim()
-    .to_string();
-    if branch != "develop" {
-        run_git(path, &["branch", "-m", &branch, "develop"]);
-    }
-    dir
 }
 
 /// Write `contents` to a markdown file in a fresh tempdir; return both (keep the

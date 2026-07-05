@@ -2,8 +2,13 @@
 name = "makina"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Makina — multi-agent software-factory orchestrator (ratatui TUI entry point)"
 
 [[bin]]
@@ -59,6 +64,8 @@ tempfile = "3"
 # (`exit.rs`, `tests/`) can register a fake agent pgid, install a recording kill
 # stub, and assert the registry is drained — without signalling real processes.
 makina-acp = { workspace = true, features = ["test-util"] }
+# Hermetic git test helpers (run_git, setup_temp_repo).
+makina-core = { workspace = true, features = ["test-support"] }
 # Self-referential dev-dependency: enables this crate's own `test-util`
 # feature (exposing `event::resolve_io_for_test`) for the `tests/` integration
 # binaries, which compile against `makina` as an external dependency and so

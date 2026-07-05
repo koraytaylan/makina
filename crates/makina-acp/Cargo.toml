@@ -2,8 +2,13 @@
 name = "makina-acp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "ACP (agent client protocol) backend implementation for Makina — subprocesses an ACP-compatible CLI over stdio"
 
 [features]
@@ -32,3 +37,5 @@ tempfile = "3"
 tokio-util = "0.7"
 async-trait = { workspace = true }
 chrono = { workspace = true }
+# Hermetic git test helpers (run_git, setup_temp_repo).
+makina-core = { workspace = true, features = ["test-support"] }

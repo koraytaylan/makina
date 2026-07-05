@@ -2,8 +2,13 @@
 name = "makina-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Makina orchestration core: Tokio scheduler, task lifecycle, worktree manager, config, and agent-backend trait"
 
 [dependencies]
@@ -26,11 +31,15 @@ chrono = { workspace = true }
 # on every Run when it is opened (mk-run-id).  The lexicographic order of the
 # string matches chronological order, giving a stable cross-process run key.
 ulid = "1"
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
 # `per_task_logs.rs` installs a span-field routing tracing layer (mirroring the
 # `makina` binary's `RunFileLayer`, which lives downstream and cannot be imported
 # here) to assert that a task driver's `task_slug` span routes its records to the
 # task's log file.
 tracing-subscriber = { workspace = true }
+makina-core = { path = ".", features = ["test-support"] }
+
+[features]
+test-support = ["dep:tempfile"]
