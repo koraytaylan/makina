@@ -534,8 +534,10 @@ mod tests {
     /// `config.toml` and `tasks/` remain committable under `.makina/`, while
     /// runtime state (`worktrees/`, `runs/`) now lives outside the repo under
     /// `~/.makina/projects/{ns}/`. The root `.gitignore` does not ignore `.makina/`
-    /// itself, and no in-repo `.gitignore` rule is required to exclude runtime
-    /// state since it is relocated off-repo (under `~/.makina` when `$HOME` is set).
+    /// itself, and no in-repo `.gitignore` rule is required to exclude Makina's
+    /// runtime state since it is relocated off-repo (under `~/.makina` when `$HOME`
+    /// is set). The root `/.worktrees/` rule covers the implement-plan dev engine's
+    /// in-repo task worktrees, not Makina runtime state.
     ///
     /// This test reads the `.gitignore` files (the root one two levels above
     /// `CARGO_MANIFEST_DIR`, plus `.makina/.gitignore`) and checks the rules by
@@ -558,10 +560,13 @@ mod tests {
         let contents = std::fs::read_to_string(&gitignore_path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", gitignore_path.display()));
 
-        // /.worktrees/ must NOT appear as a gitignore rule (relocated off-repo).
+        // Makina's own task worktrees are relocated off-repo, but the repo's
+        // implement-plan dev engine (.claude/workflows/) checks task worktrees
+        // out under /.worktrees/ in-repo; the rule keeps failed-task leftovers
+        // (embedded repos) out of accidental `git add -A` staging.
         assert!(
-            !contents.lines().any(|l| l.trim() == "/.worktrees/"),
-            "/.worktrees/ must NOT be listed in the root .gitignore — found:\n{contents}"
+            contents.lines().any(|l| l.trim() == "/.worktrees/"),
+            "/.worktrees/ must be listed in the root .gitignore — found:\n{contents}"
         );
 
         // No rule that would ignore .makina/ or .makina should be present
