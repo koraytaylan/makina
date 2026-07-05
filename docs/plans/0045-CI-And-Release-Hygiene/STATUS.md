@@ -21,4 +21,4 @@ _Last updated: 2026-07-05, against develop._
 | 0004 | Versioning & Release Automation | `add-changelog` | ✅ Done |
 | 0004 | Versioning & Release Automation | `add-workspace-metadata` | ✅ Done |
 | 0004 | Versioning & Release Automation | `add-release-workflow` | ✅ Done |
-| 0004 | Versioning & Release Automation | `tag-v0-1-0` (GATED) | 🔲 Gated (not run) |
+| 0004 | Versioning & Release Automation | `tag-v0-1-0` (GATED) | 🔲 Gated — ready to run: CI (gates + canary) green on `6a9e041` (run #3, 2026-07-05), CHANGELOG dated, metadata + release.yml present; tag push awaits explicit maintainer approval since it publishes a public GitHub release |
