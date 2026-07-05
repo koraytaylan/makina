@@ -14,8 +14,9 @@ so Makina never handles model credentials.
 > **Status: MVP.** The full loop works end-to-end against a real agent. See
 > [`docs/trial/trial-findings.md`](docs/trial/trial-findings.md) for what's proven
 > and the known gaps, [`docs/demo/makina.tape`](docs/demo/makina.tape) for a
-> scriptable demo, and [`docs/plans/0001-Initial/`](docs/plans/0001-Initial/) for
-> the vision, architecture, and roadmap.
+> scriptable demo ([render recipe](docs/demo/README.md)), and
+> [`docs/plans/0001-Initial/`](docs/plans/0001-Initial/) for the vision,
+> architecture, and roadmap.
 
 ## How it works
 
@@ -132,8 +133,9 @@ once (e.g. run `gemini` interactively) — Makina inherits its session.
 The shipped `.makina/config.toml` uses `concurrency = 2` (a first-timer-safe ceiling:
 each gate pass compiles the full workspace and agent turns drive real model calls, so
 concurrency ≥ 10 raises machine load and merge-lock contention). Raise it once you trust
-the run on your machine. For prebuilt release binaries, toolchain details, and release
-notes, see [`CHANGELOG.md`](CHANGELOG.md).
+the run on your machine. Prebuilt release binaries are published on
+[GitHub Releases](https://github.com/koraytaylan/makina/releases) (built by the
+tag-triggered Release workflow); release notes live in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Write a task list
 

@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 🚧 In progress — 4/7 tasks landed on `implement-plan/0046`; not merged into develop — the landed tasks remain on `implement-plan/0046` pending a future resume.
+**Status:** ✅ Complete — 7/7 tasks landed on `implement-plan/0046`, squash-merged into develop as `d5112a4`.
 
 _Last updated: 2026-07-05, against develop._
 
@@ -12,8 +12,8 @@ _Last updated: 2026-07-05, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Launch Doctor On Empty Backend | `launch-doctor-on-empty-backend` | 📋 Planned (gate lifted — commissioned by this plan's brief) |
-| 0002 | CLI Argument Surface | `add-cli-parser` ✅, `add-git-sha-build-script` ✅, `wire-cli-in-main` ⛔ | ⛔ Blocked |
-| 0003 | Safe Concurrency Default | `set-safe-concurrency-default` | ✅ Done |
-| 0004 | Committed Demo Recording | `add-demo-tape-and-recipe` | ✅ Done |
-| 0005 | README Refresh Against Shipped Reality | `readme-refresh-shipped-reality` | ⛔ Blocked |
+| 0001 | Launch Doctor On Empty Backend | `launch-doctor-on-empty-backend` ✅ | ✅ Done |
+| 0002 | CLI Argument Surface | `add-cli-parser` ✅, `add-git-sha-build-script` ✅, `wire-cli-in-main` ✅ | ✅ Done |
+| 0003 | Safe Concurrency Default | `set-safe-concurrency-default` ✅ | ✅ Done |
+| 0004 | Committed Demo Recording | `add-demo-tape-and-recipe` ✅ | ✅ Done |
+| 0005 | README Refresh Against Shipped Reality | `readme-refresh-shipped-reality` ✅ | ✅ Done |
