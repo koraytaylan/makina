@@ -24,21 +24,33 @@ pub fn initialize_folder(folder: &Path) -> Result<(), String> {
     //    (`git branch`/`checkout -b` need a commit to point at). Bootstrap only
     //    when HEAD is unborn, so re-running on an initialized repo is a no-op.
     if run_git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err() {
-        // A commit needs an author identity; fall back to a repo-local one when the
-        // machine has no global git identity configured (otherwise the commit errors).
+        // Leave a repo-local identity behind when the machine has none configured,
+        // so later commits in this repo (e.g. by agents) don't fail on identity.
         if run_git(folder, &["config", "user.email"]).is_err() {
             run_git(folder, &["config", "user.email", "makina@localhost"])?;
             run_git(folder, &["config", "user.name", "Makina"])?;
         }
-        run_git(
-            folder,
-            &[
+        // Pin the bootstrap commit's identity via env (env beats config): the commit
+        // is Makina's, and resolving identity from ambient config here is racy when
+        // the process's HOME changes between the probe above and this commit.
+        let output = Command::new("git")
+            .args([
                 "commit",
                 "--allow-empty",
                 "-m",
                 "chore: initialize repository",
-            ],
-        )?;
+            ])
+            .env("GIT_AUTHOR_NAME", "Makina")
+            .env("GIT_AUTHOR_EMAIL", "makina@localhost")
+            .env("GIT_COMMITTER_NAME", "Makina")
+            .env("GIT_COMMITTER_EMAIL", "makina@localhost")
+            .current_dir(folder)
+            .output()
+            .map_err(|e| format!("failed to run git: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git failed: {}", stderr));
+        }
         // Name the initial branch `main` regardless of the user's init.defaultBranch.
         run_git(folder, &["branch", "-M", "main"])?;
     }

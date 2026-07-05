@@ -1500,7 +1500,7 @@ async fn read_dir_event_folders_only(dir: &std::path::Path) -> AppEvent {
             }
         }
         // Sort alphabetically (case-insensitive).
-        items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        items.sort_by_key(|a| a.name.to_lowercase());
         entries.extend(items);
     }
 

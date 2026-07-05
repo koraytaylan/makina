@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ⛔ Blocked — 0/5 tasks landed on `implement-plan/0044`; not merged into develop — the branch remains for a future resume.
 
 _Last updated: 2026-07-05, against develop._
 
@@ -12,7 +12,7 @@ _Last updated: 2026-07-05, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | JSON-RPC Id Correctness | `flexible-jsonrpc-request-id` | 📋 Planned |
-| 0002 | Expanded KNOWN_AGENTS Launch Profiles | `expand-known-agents` | 📋 Planned |
-| 0003 | Registry-Derived Surface Sync | `sync-scaffold-and-validation`, `sync-shipped-config-comment` | 📋 Planned |
-| 0004 | README Compatibility Matrix | `readme-compat-matrix` | 📋 Planned |
+| 0001 | JSON-RPC Id Correctness | `flexible-jsonrpc-request-id` | ❌ Failed |
+| 0002 | Expanded KNOWN_AGENTS Launch Profiles | `expand-known-agents` | ❌ Failed |
+| 0003 | Registry-Derived Surface Sync | `sync-scaffold-and-validation`, `sync-shipped-config-comment` | ⛔ Blocked |
+| 0004 | README Compatibility Matrix | `readme-compat-matrix` | ⛔ Blocked |
