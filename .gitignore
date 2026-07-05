@@ -4,3 +4,6 @@
 
 # Throwaway dummy projects for test-driving Makina (each its own git repo)
 /sandbox/
+
+# Per-task worktrees created by the implement-plan engine and Makina runs
+/.worktrees/
