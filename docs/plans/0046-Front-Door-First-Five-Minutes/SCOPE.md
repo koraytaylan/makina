@@ -1,0 +1,55 @@
+# Scope — Plan 0046
+
+> Convert Makina's hostile first run into a guided one — land the gated 0043 detect→confirm→persist launch on empty-backend, give the binary a real `--help`/`--version`/`--doctor` CLI, ship a first-timer-safe concurrency default and a committed demo, and refresh the README against shipped reality — so an outside developer's first five minutes are welcoming instead of a `process::exit(1)`.
+
+## Why this plan
+
+**1. The empty-backend failure hard-exits instead of guiding, so the users who most need setup help never get it.** `main` prints a files-checked block and calls `std::process::exit(1)` for *every* `ConfigError` — the `Err(e)` arm at `main.rs:52-86` ends in `std::process::exit(1)` (`main.rs:85`) with no branch for the recoverable empty-backend case, even though plan 0043 already built the Doctor `w` detect→confirm→persist scaffold (`event.rs:1031` `write_doctor_scaffold`) and left the `launch-doctor-on-empty-backend` task GATED (`docs/plans/0043-.../STATUS.md:18`; spec at `docs/plans/0043-.../TASKS.md:261-280`).
+
+**2. There is no CLI surface at all, so `makina --help`/`--version` launch the full-screen TUI.** `main` never reads `std::env::args` (grep of `crates/makina/src/main.rs` for `env::args`/`args()` returns nothing; `fn main()` at `main.rs:37` goes straight to `Config::load_defaults_with_paths()` at `main.rs:51`), and there is no `clap` dependency (`grep clap Cargo.toml crates/*/Cargo.toml` is empty), so an outsider probing `makina --help` gets dropped into a raw-mode TUI with no usage, version, or headless health check.
+
+**3. The shipped project config auto-approves ten agents mutating a fresh clone.** `.makina/config.toml:30` sets `concurrency = 10`, while the README's own example shows `concurrency = 2` (`README.md:107`); ten concurrent auto-approved (`WorktreePolicy`) agents each compiling the whole workspace is a hostile default for a first-timer, and nothing in the codebase asserts the shipped value, so lowering it is safe.
+
+**4. There is no committed demo, so an outsider cannot see the TUI without building it.** `docs/demo` does not exist (`ls docs/demo` absent) and a repo-wide grep for `vhs`/`asciinema`/`.cast`/`.tape` returns nothing; the README's "Status: MVP" block (`README.md:14-17`) points only to prose findings, never a rendering.
+
+**5. The README still says running requires two config files, contradicting the auto-detection 0043 shipped.** `README.md:148` reads `cargo run -p makina    # requires the two config files above`, but the same README documents auto-detection making the global config optional (`README.md:72-80`); the Doctor overlay key (`!`, `event.rs:1821`) and the `w` starter-config scaffold are undocumented, the new CLI flags are absent, and the throwaway-clone safety guidance sits *after* the Run section (`README.md:162-172`) rather than before it.
+
+## In scope
+
+Work items in [TASKS.md](TASKS.md) (workstreams 0001–0005):
+
+- **0001 — Launch Doctor On Empty Backend.** Land the gated 0043 `launch-doctor-on-empty-backend` task: add `ConfigError::is_recoverable_empty_backend` in `crates/makina-core/src/config.rs` (unit-tested), classify the recoverable empty-backend `ConfigError::Validation` in the `main.rs` `Err(e)` arm (`main.rs:52-86`), and — instead of a bare `std::process::exit(1)` — either launch the TUI seeded with `AppEvent::OpenDoctor` so `w` runs the detect→confirm→persist scaffold, or (if constructing a partial-config `App` cleanly is infeasible because `CoreApi` requires a validated `Config`) print the enriched guidance plus an explicit `w`-Doctor pointer and retain `exit(1)`, recording the overlay-launch deferral. Binary land-or-revert-and-record per the 0043 clause.
+- **0002 — CLI Argument Surface.** Give the `makina` binary a real argument surface: a new hand-rolled parser `crates/makina/src/cli.rs` (`CliAction` enum + pure `parse_args`, `help_text`, `version_text`, `render_doctor_report`, all unit-tested), a `crates/makina/build.rs` that stamps `MAKINA_GIT_SHA`, and argv dispatch in `main.rs` so `makina --help` prints usage + config file locations + docs pointers, `makina --version`/`-V` prints the workspace version plus git sha when available, and `makina --doctor` runs a headless preflight (reusing `preflight::detect_backend_in_path` and `probe_providers`), prints the report, and exits non-zero on failure — while a bare `makina` (no args) still launches the TUI.
+- **0003 — Safe Concurrency Default.** Lower the shipped `.makina/config.toml` `concurrency` from 10 to 2 (matching the README example at `README.md:107`) so a fresh clone does not auto-approve ten concurrent agents mutating the repo, and rewrite the surrounding comment (`.makina/config.toml:26-30`) to explain the first-timer-safe default and how to raise it once trusted.
+- **0004 — Committed Demo Recording.** Add a scriptable, reproducible demo so an outsider can see the TUI without building it: commit `docs/demo/makina.tape` (a charmbracelet/vhs script that launches the TUI, opens a task list, and shows the per-task loop) and `docs/demo/README.md` documenting the exact `vhs docs/demo/makina.tape` render recipe and its output path `docs/demo/makina.gif`; render and commit `docs/demo/makina.gif` when vhs is available on the build host, otherwise record the render as deferred.
+- **0005 — README Refresh Against Shipped Reality.** Refresh `README.md` to match shipped behavior: replace the stale `cargo run -p makina    # requires the two config files above` claim (`README.md:148`) with auto-detection reality, document the Doctor overlay key (`!`) and the `w` starter-config scaffold in the Keys list, document the new `makina --help`/`--version`/`--doctor` CLI flags in the Run section, move the throwaway-clone safety guidance (`README.md:162-172`) *before* the Run section, note that the shipped `concurrency` now matches the example, and reference the committed demo GIF near the top; reconcile the 0045 install/release story (pinned 1.96.1 toolchain, MSRV 1.85, release binaries, CHANGELOG). Documentation-only.
+
+## Origin -> workstream mapping
+
+| Finding | Addressed by |
+|---|---|
+| 1 — Empty-backend startup hard-exits with `process::exit(1)` instead of guiding to the Doctor scaffold (`main.rs:52-86`). | `0001` |
+| 2 — No CLI surface; `main` never reads argv and there is no `clap` (`main.rs:37`; `Cargo.toml`). | `0002` |
+| 3 — Shipped `concurrency = 10` auto-approves ten agents on a fresh clone (`.makina/config.toml:30`). | `0003` |
+| 4 — No committed demo, so an outsider cannot see the TUI without building (`docs/demo` absent). | `0004` |
+| 5 — README says running requires two config files, contradicting auto-detection (`README.md:148`). | `0005` |
+
+## Locked decisions
+
+- **launch-doctor-on-empty-backend is binary land-or-revert-and-record.** The gated 0043 task lands only if it can launch the Doctor overlay (App seeded with `AppEvent::OpenDoctor`) cleanly; if constructing a partial-config `App` is infeasible because `CoreApi::with_audit_registry` (`main.rs:289`) requires a validated `Config`, it falls back to the enriched guidance plus an explicit `w`-Doctor pointer with `exit(1)` retained, and the overlay-launch deferral is recorded in `docs/plans/0043-.../STATUS.md`. Either way the pure `is_recoverable_empty_backend` classifier and its unit test land. Revisit if the orchestrator is refactored to accept a deferred/partial config.
+- **Classify the recoverable case by the reason prefix, not a new error variant.** `is_recoverable_empty_backend` matches `ConfigError::Validation { reason }` where `reason.starts_with("backend.command")`, because plan 0043's enriched empty-backend reason is guaranteed to begin with `backend.command` (`config.rs:907`) and no other validation reason does (caps reasons start with `caps.`, role reasons with `role '…'`). This avoids widening the `ConfigError` enum and keeps the change a pure, testable predicate. Revisit only if the empty-backend reason string is reworded to not lead with `backend.command`.
+- **CLI parsing is hand-rolled, not clap.** The plan adds a small pure parser in `crates/makina/src/cli.rs` rather than a `clap` dependency, because the surface is three flags plus a bare-launch default and the codebase carries no `clap` today; a pure `parse_args` is trivially unit-testable and adds zero dependency weight. Revisit if the flag set grows to need subcommands, arguments, or completion.
+- **Git sha is best-effort via a build script; version still prints without git.** `crates/makina/build.rs` stamps `MAKINA_GIT_SHA` from `git rev-parse --short HEAD` and `cli::version_text` reads it via `option_env!`, so a source build without a `.git` directory still compiles and prints the plain `makina {CARGO_PKG_VERSION}`. The build script never fails the build. Revisit if release tarballs need an embedded sha independent of git.
+- **The demo GIF render is best-effort; the tape and recipe are always committed.** `docs/demo/makina.tape` and `docs/demo/README.md` are deterministic plain text and always land; the binary `docs/demo/makina.gif` is rendered and committed only if vhs is available on the build host, otherwise the render is recorded as deferred in `docs/demo/README.md` and STATUS. This avoids blocking the plan on a tool that may be absent in the execution environment. Revisit once CI can render vhs tapes.
+- **The shipped project config stays backend-free; only `concurrency` and comments change.** Per plan 0043, the backend is machine-specific and belongs to `~/.makina/config.toml`; `set-safe-concurrency-default` lowers `concurrency` 10→2 and rewrites the adjacent comment without adding any `[backend]`/`[[providers]]` table, preserving parsing and the project-over-global precedence.
+
+## Out of scope
+
+- Adopting `clap` or any argument-parsing crate. The three-flag surface is served by a pure hand-rolled parser; adding a dependency and derive macros is unnecessary weight and out of scope for the front-door pass.
+- A full interactive first-run wizard beyond the existing Doctor `w` scaffold. Plan 0043 already built detect→confirm→persist behind `w`; this plan only routes users to it and documents it, not a new wizard flow.
+- Rendering and committing the demo GIF in CI. vhs may be absent on the execution/CI host; the tape and recipe are committed and the GIF render is best-effort, tracked as deferred when it cannot run.
+- Changing the auto-detection order or the KNOWN_AGENTS registry. The registry and its detection priority were finalized by plans 0043/0044; this plan consumes `detect_backend_in_path`/`probe_providers` read-only and does not alter agent coverage.
+- Publishing prebuilt release binaries or altering the release workflow. Plan 0045 owns CI/release hygiene (toolchain 1.96.1, MSRV 1.85, release.yml, CHANGELOG); this plan only references that story in the README, it does not modify the workflow.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the concrete edits.
+See [TASKS.md](TASKS.md) for the executable task list with "Done when" criteria.
