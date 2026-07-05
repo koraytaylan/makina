@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete — 9/10 tasks landed on `implement-plan/0045`; squash-merged into develop as `f48dc98d3b83157ee0f0ca95f17a899472ae4585`.
 
 _Last updated: 2026-07-05, against develop._
 
@@ -10,9 +10,15 @@ _Last updated: 2026-07-05, against develop._
 - **Root cause:** The repo defined a three-gate quality bar (.makina/config.toml) but never ran it in CI, pinned no toolchain or MSRV, left temp-repo tests inheriting host git config (only 2 of ~25 sites disable commit.gpgsign), and shipped an untagged 0.1.0 with no release metadata, changelog, or automation.
 - **Approach:** Pin the toolchain and declare the 1.85 MSRV floor; add a GitHub Actions workflow running fmt/clippy/test on push/PR; introduce one shared hermetic git test helper, migrate every temp-repo site to it, and poison the CI runner's global git config to enforce hermeticity; fill workspace crates.io metadata, seed CHANGELOG.md, add a tag-triggered linux/macos release workflow, and tag a green v0.1.0.
 
-| WS | Workstream | Tasks | State |
+| WS | Workstream | Task | State |
 |---|---|---|---|
-| 0001 | Toolchain Pinning & MSRV | `pin-rust-toolchain`, `add-workspace-msrv` | 📋 Planned |
-| 0002 | GitHub Actions CI | `add-ci-workflow` | 📋 Planned |
-| 0003 | Test Hermeticity | `shared-hermetic-git-helper`, `migrate-git-helpers`, `ci-hermeticity-canary` | 📋 Planned |
-| 0004 | Versioning & Release Automation | `add-changelog`, `add-workspace-metadata`, `add-release-workflow`, `tag-v0-1-0` | 📋 Planned |
+| 0001 | Toolchain Pinning & MSRV | `pin-rust-toolchain` | ✅ Done |
+| 0001 | Toolchain Pinning & MSRV | `add-workspace-msrv` | ✅ Done |
+| 0002 | GitHub Actions CI | `add-ci-workflow` | ✅ Done |
+| 0003 | Test Hermeticity | `shared-hermetic-git-helper` | ✅ Done |
+| 0003 | Test Hermeticity | `migrate-git-helpers` | ✅ Done |
+| 0003 | Test Hermeticity | `ci-hermeticity-canary` | ✅ Done |
+| 0004 | Versioning & Release Automation | `add-changelog` | ✅ Done |
+| 0004 | Versioning & Release Automation | `add-workspace-metadata` | ✅ Done |
+| 0004 | Versioning & Release Automation | `add-release-workflow` | ✅ Done |
+| 0004 | Versioning & Release Automation | `tag-v0-1-0` (GATED) | 🔲 Gated (not run) |
