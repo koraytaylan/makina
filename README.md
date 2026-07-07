@@ -156,14 +156,29 @@ Add a documented helper function with unit tests to `makina-core`.
 ## Caution — running a list mutates the repository
 
 A Run creates `task/{plan_slug}--{task_id}` branches and
-`.makina/worktrees/{plan_slug}--{task_id}/` checkouts and
-**squash-merges approved work into `base_branch` (default `develop`)**. Point it at
-a repository you're comfortable having it write to; for experimentation, use a
-throwaway clone:
+`.worktrees/{plan_slug}--{task_id}/` checkouts and
+**squash-merges approved work into `base_branch` (default `develop`)**. For safe experimentation,
+use `makina create` to scaffold a brand-new project outside this repo (see [Try it safely](#try-it-safely) below).
+
+Alternatively, if you want to experiment on an existing repository, use a throwaway clone:
 
 ```bash
 git clone /path/to/repo /tmp/repo-trial && cd /tmp/repo-trial
 ```
+
+## Try it safely
+
+The safest first run creates a brand-new project OUTSIDE this repo, so nothing
+Makina does can touch your working tree:
+
+```bash
+makina create ~/tmp/todo --template todo   # scaffold a runnable project
+cd ~/tmp/todo && makina                     # open it in the TUI
+```
+
+`makina create <path> [--template <name>]` bootstraps a git repo (with `main`
+and `develop`), a committed `.makina/config.toml`, and a starter
+`docs/plans/0001-Todo-Starter` plan. The only template today is `todo`.
 
 ## Run
 

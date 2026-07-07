@@ -3,12 +3,16 @@
 //! Provides a pure parser (no env reads) for dispatching on command-line flags,
 //! along with help, version, and doctor report renderers.
 
+pub const AVAILABLE_TEMPLATES: &[&str] = &["todo"];
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliAction {
     LaunchTui,
     ShowHelp,
     ShowVersion,
     RunDoctor,
+    Create { path: String, template: String },
+    CreateError(String),
     Unknown(String),
 }
 
@@ -19,8 +23,41 @@ pub fn parse_args(args: &[String]) -> CliAction {
         Some("-h") | Some("--help") => CliAction::ShowHelp,
         Some("-V") | Some("--version") => CliAction::ShowVersion,
         Some("--doctor") => CliAction::RunDoctor,
+        Some("create") => parse_create(&args[1..]),
         Some(other) => CliAction::Unknown(other.to_string()),
     }
+}
+
+fn parse_create(rest: &[String]) -> CliAction {
+    let mut path: Option<String> = None;
+    let mut template = String::from("todo");
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--template" => match rest.get(i + 1) {
+                Some(t) => {
+                    template = t.clone();
+                    i += 2;
+                }
+                None => return CliAction::CreateError("--template requires a value".to_string()),
+            },
+            other if !other.starts_with('-') && path.is_none() => {
+                path = Some(other.to_string());
+                i += 1;
+            }
+            other => return CliAction::CreateError(format!("unexpected argument: {other}")),
+        }
+    }
+    let Some(path) = path else {
+        return CliAction::CreateError("makina create requires a target <path>".to_string());
+    };
+    if !AVAILABLE_TEMPLATES.contains(&template.as_str()) {
+        return CliAction::CreateError(format!(
+            "unknown template '{template}'; available templates: {}",
+            AVAILABLE_TEMPLATES.join(", ")
+        ));
+    }
+    CliAction::Create { path, template }
 }
 
 /// Return the help text listing usage, config file locations, and available flags.
@@ -38,6 +75,11 @@ pub fn help_text() -> String {
          Show version and git commit hash\n  \
          --doctor\n    \
          Run a headless preflight check (exit non-zero if no backend is configured or detected)\n\
+         \n\
+         SUBCOMMANDS:\n  \
+         create <path> [--template <name>]\n    \
+         Scaffold a new, runnable Makina project at <path> (default template: todo)\n    \
+         Available templates: todo\n\
          \n\
          CONFIGURATION:\n  \
          Global config: ~/.makina/config.toml\n  \
@@ -103,5 +145,41 @@ mod tests {
         assert_eq!(render_doctor_report(Some("gemini"), false).1, 0);
         assert_eq!(render_doctor_report(None, true).1, 0);
         assert_eq!(render_doctor_report(None, false).1, 1);
+    }
+
+    #[test]
+    fn parse_args_handles_create_subcommand() {
+        assert_eq!(
+            parse_args(&["create".into(), "/tmp/x".into()]),
+            CliAction::Create {
+                path: "/tmp/x".into(),
+                template: "todo".into()
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "create".into(),
+                "/tmp/x".into(),
+                "--template".into(),
+                "todo".into()
+            ]),
+            CliAction::Create {
+                path: "/tmp/x".into(),
+                template: "todo".into()
+            }
+        );
+        match parse_args(&["create".into()]) {
+            CliAction::CreateError(msg) => assert!(msg.contains("path")),
+            other => panic!("expected CreateError, got {other:?}"),
+        }
+        match parse_args(&[
+            "create".into(),
+            "/tmp/x".into(),
+            "--template".into(),
+            "nope".into(),
+        ]) {
+            CliAction::CreateError(msg) => assert!(msg.contains("todo")),
+            other => panic!("expected CreateError, got {other:?}"),
+        }
     }
 }

@@ -35,6 +35,7 @@ pub mod markup;
 #[cfg(test)]
 pub mod placeholder;
 pub mod replay;
+pub mod scaffold;
 pub mod selection;
 pub mod settings_validation;
 pub mod syntax;

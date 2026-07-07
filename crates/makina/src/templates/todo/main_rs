@@ -1,0 +1,38 @@
+//! A tiny todo list — the Makina `todo` starter project.
+
+/// A single todo item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    pub title: String,
+    pub done: bool,
+}
+
+impl Task {
+    /// Create a new, not-yet-done task.
+    pub fn new(title: &str) -> Self {
+        Self {
+            title: title.to_string(),
+            done: false,
+        }
+    }
+}
+
+fn main() {
+    let tasks = [Task::new("write my first Makina task list")];
+    for task in &tasks {
+        let mark = if task.done { "x" } else { " " };
+        println!("[{mark}] {}", task.title);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_task_is_not_done() {
+        let t = Task::new("demo");
+        assert_eq!(t.title, "demo");
+        assert!(!t.done);
+    }
+}

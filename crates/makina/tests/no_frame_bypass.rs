@@ -8,14 +8,14 @@
 //! (`tui-error-pane-channel-wire`), so nothing writes outside the frame and
 //! corrupts the alternate screen.
 //!
-//! `main.rs` is handled separately: it is allowed to contain EXACTLY ten
+//! `main.rs` is handled separately: it is allowed to contain EXACTLY thirteen
 //! fatal `eprintln!`/`println!` sites that are intentionally exempt because none runs while
 //! a live ratatui frame exists — the CLI dispatch prints (--help, --version, --doctor, unknown flag,
-//! all pre-`Tui::init()`), the config-load failure (pre-`Tui::init()`),
+//! create success, create error, all pre-`Tui::init()`), the config-load failure (pre-`Tui::init()`),
 //! the terminal-init failure itself, the post-`tui.restore()` error print,
 //! the planner-mechanism fallback, the workspace-load failure (pre-`Tui::init()`),
 //! and the Doctor 'w' pointer for empty-backend recovery (pre-`Tui::init()`).
-//! The test pins the count to ten so a NEW in-frame `eprintln!` added to `main.rs`
+//! The test pins the count to thirteen so a NEW in-frame `eprintln!` added to `main.rs`
 //! (e.g. between `Tui::init()` and `tui.restore()`) trips the guard.
 
 use std::path::PathBuf;
@@ -27,9 +27,9 @@ const LIVE_FRAME_REGION: &[&str] = &["event.rs", "app.rs", "ui.rs", "tui.rs", "b
 
 /// `main.rs` is exempt but pinned: exactly these FATAL sites may print,
 /// and only because each runs with NO live ratatui frame.
-/// Updated to 10 to include CLI dispatch prints (--help, --version, --doctor, unknown flag)
-/// which all run before Tui::init().
-const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 10;
+/// Updated to 13 to include CLI dispatch prints (--help, --version, --doctor, unknown flag,
+/// create success report print, create error) which all run before Tui::init().
+const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 13;
 
 fn src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -84,7 +84,7 @@ fn main_rs_has_exactly_the_exempt_print_sites() {
     assert_eq!(
         count, MAIN_RS_EXEMPT_PRINT_COUNT,
         "main.rs must contain EXACTLY the {MAIN_RS_EXEMPT_PRINT_COUNT} fatal, \
-         frame-exempt eprintln!/println! sites (CLI dispatch prints for --help/--version/--doctor/unknown, \
+         frame-exempt eprintln!/println! sites (CLI dispatch prints for --help/--version/--doctor/unknown/create-success/create-error, \
          config-load failure before Tui::init(), terminal-init failure, \
          the post-tui.restore() error print, the planner mechanism fallback at startup, \
          workspace-load failure, and the Doctor 'w' pointer for empty-backend recovery); \

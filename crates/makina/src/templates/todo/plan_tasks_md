@@ -1,0 +1,20 @@
+# Todo Starter — Plan 0001
+
+A tiny starter plan for the scaffolded `todo` project. Each task keeps `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` green.
+
+## 0001 — Todo Core
+
+### add-task-toggle — Add A `Task::toggle` Method
+Add a `toggle(&mut self)` method to `Task` in `src/main.rs` that flips `done`, with a unit test.
+- **Depends on:** —
+- **Done when:** `Task::toggle` flips `done` and a unit test proves it; cargo test / clippy / fmt pass.
+
+### add-task-count — Add A `count_open` Helper
+Add a free `count_open(tasks: &[Task]) -> usize` returning how many tasks are not done, with a unit test.
+- **Depends on:** —
+- **Done when:** `count_open` returns the open-task count and a unit test proves it; cargo test / clippy / fmt pass.
+
+### print-open-summary — Print An Open-Task Summary In `main`
+Use `count_open` in `main` to print a trailing `N task(s) open` line.
+- **Depends on:** add-task-toggle, add-task-count
+- **Done when:** `main` prints the open-task summary and cargo test / clippy / fmt pass.

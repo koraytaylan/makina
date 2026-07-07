@@ -77,6 +77,22 @@ async fn main() {
         makina::cli::CliAction::RunDoctor => {
             std::process::exit(run_headless_doctor());
         }
+        makina::cli::CliAction::Create { path, template } => {
+            match makina::scaffold::scaffold_project(std::path::Path::new(&path), &template) {
+                Ok(report) => {
+                    println!("{report}");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        makina::cli::CliAction::CreateError(msg) => {
+            eprintln!("error: {msg}\n\n{}", makina::cli::help_text());
+            std::process::exit(2);
+        }
         makina::cli::CliAction::Unknown(flag) => {
             eprintln!("unknown flag: {flag}\n\n{}", makina::cli::help_text());
             std::process::exit(2);
