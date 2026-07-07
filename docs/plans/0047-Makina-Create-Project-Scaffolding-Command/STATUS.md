@@ -2,7 +2,7 @@
 
 Task-level status lives here; the roll-up row in [../STATUS.md](../STATUS.md) must stay in sync.
 
-**Status:** 📋 Planned.
+**Status:** ✅ Complete — 6/6 tasks landed on `implement-plan/0047`, squash-merged into develop as `85a5568`.
 
 _Last updated: 2026-07-07, against develop._
 
@@ -12,8 +12,8 @@ _Last updated: 2026-07-07, against develop._
 
 | WS | Workstream | Tasks | State |
 |---|---|---|---|
-| 0001 | Embedded `todo` Template | `add-todo-template-files` | 📋 Planned |
-| 0002 | Folder Bootstrap & Conflict Rules | `add-scaffold-module` | 📋 Planned |
-| 0003 | Create Subcommand CLI Surface | `add-create-cli-action`, `wire-create-dispatch-in-main` | 📋 Planned |
-| 0004 | Parser & End-to-End Scaffold Tests | `add-scaffold-integration-test` | 📋 Planned |
-| 0005 | README Quickstart 'Try It Safely' | `readme-quickstart-try-it-safely` | 📋 Planned |
+| 0001 | Embedded `todo` Template | `add-todo-template-files` ✅ | ✅ Done |
+| 0002 | Folder Bootstrap & Conflict Rules | `add-scaffold-module` ✅ | ✅ Done |
+| 0003 | Create Subcommand CLI Surface | `add-create-cli-action` ✅, `wire-create-dispatch-in-main` ✅ | ✅ Done |
+| 0004 | Parser & End-to-End Scaffold Tests | `add-scaffold-integration-test` ✅ | ✅ Done |
+| 0005 | README Quickstart 'Try It Safely' | `readme-quickstart-try-it-safely` ✅ | ✅ Done |
