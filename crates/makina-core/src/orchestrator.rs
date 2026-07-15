@@ -76,6 +76,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
@@ -177,6 +178,28 @@ pub fn plan_slug(task_list_path: &Path) -> String {
     }
 
     SLUG_FALLBACK.to_string()
+}
+
+/// Resolve a stable plan identity while preserving the supported TASKS-less
+/// flow (where the file does not exist yet but its plan directory does).
+async fn canonical_task_list_path(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
+        return canonical;
+    }
+
+    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())
+        && let Ok(canonical_parent) = tokio::fs::canonicalize(parent).await
+    {
+        return canonical_parent.join(file_name);
+    }
+
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or(path)
+    }
 }
 
 /// Return `true` when `path` is a plan-style task list (`file_name == "TASKS.md"`,
@@ -587,6 +610,8 @@ impl RuntimeSettings {
 /// Stored in the [`RunEntry`] once `StartRun` spawns the scheduler so that
 /// `PauseRun` / `CancelRun` can signal the running task.
 struct RunHandle {
+    /// Monotonic ownership epoch for this scheduler invocation.
+    generation: u64,
     /// Cancellation signal for the background scheduler.  `CancelRun` cancels it
     /// (scheduler aborts + cleans up); also cancelled if a fresh `StartRun`
     /// supersedes a still-running task (defensive).
@@ -594,6 +619,9 @@ struct RunHandle {
     /// Cooperative pause flag.  `PauseRun` sets it `true` (scheduler stops
     /// launching new tasks); a fresh `StartRun` clears it before resuming.
     pause: Arc<AtomicBool>,
+    /// Retained scheduler task so replacement/reset/cancel can wait for all
+    /// drivers and cleanup to drain before reusing plan-scoped resources.
+    join: Option<JoinHandle<()>>,
 }
 
 // ── Registry entry ──────────────────────────────────────────────────────────────
@@ -607,6 +635,9 @@ struct RunHandle {
 struct RunEntry {
     /// Path to the task-list file this Run was opened from.
     task_list_path: PathBuf,
+    /// Canonical plan identity used to make OpenRun idempotent even when the
+    /// same file is addressed through relative paths or symlinks.
+    plan_identity: PathBuf,
     /// Persistent, sortable run identity (26-char ULID string) minted when this
     /// Run is opened.  Unlike the in-memory [`RunId`] session handle, the ULID's
     /// lexicographic order matches chronological order, giving a stable key that
@@ -635,6 +666,9 @@ struct RunEntry {
     status: RunStatus,
     /// The background execution's control handle.  `None` until `StartRun`.
     handle: Option<RunHandle>,
+    /// Latest scheduler ownership epoch. A completion from any older epoch is
+    /// stale and may neither finalize status nor clear the current handle.
+    scheduler_generation: u64,
     /// Ingestion report computed at open (validate + qualify). Threaded to
     /// every RunView snapshot.
     report: crate::ingestion::IngestionReport,
@@ -753,6 +787,14 @@ struct CoreState {
     /// The Runs registry: `RunId` → [`RunEntry`].  A `BTreeMap` keeps iteration
     /// order stable (ascending `RunId`, i.e. insertion order) for [`Api::runs`].
     runs: Mutex<BTreeMap<u64, RunEntry>>,
+
+    /// Single-flight gate for canonicalize/load/interpret/register. This keeps
+    /// concurrent OpenRun requests for one plan from both doing side effects.
+    open_lock: AsyncMutex<()>,
+
+    /// Serializes lifecycle operations that can replace or drain schedulers.
+    /// Registry locks remain short and are never held while awaiting joins.
+    lifecycle_lock: AsyncMutex<()>,
 
     /// Monotonic allocator for fresh [`RunId`]s.  First id is `1`.
     next_id: AtomicU64,
@@ -891,34 +933,52 @@ impl CoreState {
     /// executing).  Called only from the background task; `run_graph` has already
     /// broadcast the matching `RunStatusChanged` event, so this just keeps the
     /// registry's snapshot status consistent with what the TUI was told.
-    async fn finalize_run_status(&self, run: RunId) {
+    async fn finalize_run_status(&self, run: RunId, generation: u64) {
         // Snapshot the graph handle + whether this run was cancelled, under the
         // registry lock; drop the guard before awaiting the graph lock.  Also
         // snapshot the run's identity (run_uid/run_slug/started_at) so the
         // finalization-time `run.json` can be built without re-taking the lock.
-        let (graph, cancelled, run_uid, run_slug, plan_slug, started_at) = {
+        let (graph, cancelled, run_uid, run_slug, plan_slug, task_list_path, started_at) = {
             let runs = self.runs.lock().expect("runs registry mutex poisoned");
             match runs.get(&run.0) {
-                Some(entry) => {
+                Some(entry)
+                    if entry.scheduler_generation == generation
+                        && entry
+                            .handle
+                            .as_ref()
+                            .is_some_and(|handle| handle.generation == generation) =>
+                {
                     let cancelled = entry
                         .handle
                         .as_ref()
-                        .map(|h| h.cancel.is_cancelled())
-                        .unwrap_or(false);
+                        .is_some_and(|h| h.cancel.is_cancelled());
                     (
                         Arc::clone(&entry.graph),
                         cancelled,
                         entry.run_uid.clone(),
                         entry.run_slug.clone(),
                         entry.plan_slug.clone(),
+                        entry.task_list_path.clone(),
                         entry.started_at,
                     )
                 }
-                None => return, // run was removed; nothing to finalize.
+                _ => return, // removed or superseded; this scheduler owns nothing.
             }
         };
         if cancelled {
-            return; // Cancel set the status explicitly; do not overwrite it.
+            let mut runs = self.runs.lock().expect("runs registry mutex poisoned");
+            if let Some(entry) = runs.get_mut(&run.0)
+                && entry.scheduler_generation == generation
+                && entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.generation == generation)
+            {
+                entry.handle = None;
+            }
+            drop(runs);
+            self.audit_registry.evict_run(&run.to_string());
+            return; // Cancel/replacement owns the visible status.
         }
         // Derive the terminal status from the live task states and collect
         // per-task snapshots for the persistent run record.
@@ -954,16 +1014,28 @@ impl CoreState {
 
         {
             let mut runs = self.runs.lock().expect("runs registry mutex poisoned");
-            if let Some(entry) = runs.get_mut(&run.0) {
-                // Only finalize if the run is still in the executing state we set
-                // on start (Running).  A concurrent Pause/Cancel/Start may have
-                // moved it on; respect that.
-                if entry.status == RunStatus::Running {
-                    entry.status = status.clone();
-                }
-                // The scheduler has finished; the handle is spent.
-                entry.handle = None;
+            let Some(entry) = runs.get_mut(&run.0) else {
+                return;
+            };
+            if entry.scheduler_generation != generation
+                || entry
+                    .handle
+                    .as_ref()
+                    .is_none_or(|handle| handle.generation != generation)
+            {
+                return;
             }
+            // Only finalize a scheduler that still owns a Running run. A
+            // cooperative pause deliberately drains the scheduler with a
+            // non-terminal graph; it must keep Paused and must not write a
+            // misleading terminal run.json.
+            if entry.status != RunStatus::Running {
+                entry.handle = None;
+                return;
+            }
+            entry.status = status.clone();
+            // The scheduler has finished; the handle is spent.
+            entry.handle = None;
         } // registry guard dropped before the best-effort async write.
 
         // Persist the run's identity + lifecycle window + per-task snapshots
@@ -978,7 +1050,8 @@ impl CoreState {
             started_at,
             Utc::now(),
             task_snapshots,
-        );
+        )
+        .with_task_list_path(&task_list_path, &self.worktree_manager.repo_root);
         if let Err(e) = write_run_metadata(&meta, &self.worktree_manager.repo_root).await {
             tracing::warn!(run_uid = %run_uid, error = %e, "run.json write failed");
         }
@@ -1089,12 +1162,58 @@ impl CoreApi {
                 config,
                 runtime_settings: Mutex::new(runtime_settings),
                 runs: Mutex::new(BTreeMap::new()),
+                open_lock: AsyncMutex::new(()),
+                lifecycle_lock: AsyncMutex::new(()),
                 next_id: AtomicU64::new(1),
                 event_tx,
                 audit_registry,
             }),
             normalizer,
         }
+    }
+
+    async fn quarantine_artifact_issue(
+        &self,
+        repo_root: &Path,
+        slug: &str,
+        reason: impl std::fmt::Display,
+    ) -> Result<crate::ingestion::IngestionIssue, ApiError> {
+        let reason = reason.to_string();
+        let quarantined = crate::persist::quarantine_graph(repo_root, slug)
+            .await
+            .map_err(|e| ApiError::InvalidCommand {
+                reason: format!(
+                    "persisted artifact for `{slug}` is invalid ({reason}); refusing to overwrite it because quarantine failed: {e}"
+                ),
+            })?;
+        let path = quarantined
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<artifact disappeared before quarantine>".to_string());
+        tracing::warn!(slug = %slug, %reason, quarantine_path = %path, "quarantined unusable task graph artifact");
+        Ok(crate::ingestion::IngestionIssue {
+            task_id: None,
+            severity: crate::ingestion::IssueSeverity::Warning,
+            source: crate::ingestion::IssueSource::Validator,
+            code: "artifact-quarantined".to_string(),
+            message: format!(
+                "The persisted artifact was unusable ({reason}) and was moved to `{path}` before rebuilding."
+            ),
+            suggestion: Some(
+                "inspect or remove the quarantined backup after verifying this run".into(),
+            ),
+        })
+    }
+
+    fn bind_graph_identity(mut graph: TaskGraph, expected_slug: &str) -> TaskGraph {
+        if graph.slug != expected_slug {
+            tracing::warn!(
+                returned_slug = %graph.slug,
+                %expected_slug,
+                "rebinding interpreted graph to trusted plan identity"
+            );
+            graph.slug = expected_slug.to_string();
+        }
+        graph
     }
 
     /// Implement the `OpenRun` command: prefer the persisted artifact, fall back
@@ -1122,11 +1241,61 @@ impl CoreApi {
     /// held**; the registry lock is taken only for the brief insert, then dropped
     /// before the broadcast.
     async fn open_run(&self, task_list_path: PathBuf) -> Result<CommandOutcome, ApiError> {
+        // Serialize the entire identity/load/register path. Without this, two
+        // concurrent opens can both miss the registry and allocate distinct
+        // runs that share plan branches and worktree names.
+        let _open_guard = self.state.open_lock.lock().await;
+
         // 0. Run project discovery on first open (auto-run if [discovery] stamp absent).
         self.run_discovery_if_needed().await;
 
-        // 1. Derive the plan-scoped slug (no I/O — just path manipulation).
+        let task_list_path = canonical_task_list_path(task_list_path).await;
+        let plan_identity = task_list_path.clone();
         let slug = run_slug(&task_list_path);
+        let worktree_plan_slug = plan_slug(&task_list_path);
+
+        // OpenRun is idempotent for the canonical project+plan identity. A
+        // CoreApi is bound to one project, so the canonical plan path is the
+        // remaining identity component.
+        let existing = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            runs.iter().find_map(|(id, entry)| {
+                (entry.plan_identity == plan_identity).then_some(RunId(*id))
+            })
+        };
+        if let Some(run) = existing {
+            let _ = self.state.event_tx.send(Event::RunOpened {
+                run,
+                task_list_path,
+            });
+            return Ok(CommandOutcome::RunOpened { run });
+        }
+
+        // Distinct source paths must not share either the artifact slug or the
+        // plan-scoped branch/worktree namespace while both are live.
+        {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            if let Some(entry) = runs
+                .values()
+                .find(|entry| entry.run_slug == slug || entry.plan_slug == worktree_plan_slug)
+            {
+                return Err(ApiError::InvalidCommand {
+                    reason: format!(
+                        "plan `{}` is already open from `{}`; refusing a second live run that would share artifacts or worktrees",
+                        worktree_plan_slug,
+                        entry.task_list_path.display()
+                    ),
+                });
+            }
+        }
 
         let repo_root = &self.state.worktree_manager.repo_root;
 
@@ -1142,14 +1311,12 @@ impl CoreApi {
                         (loaded, vec![])
                     }
                     Err(e) => {
-                        // Corrupt artifact: warn and fall back to a fresh interpret.
-                        tracing::warn!(
-                            slug = %slug,
-                            error = %e,
-                            "persisted artifact failed validation; falling back to fresh interpret",
-                        );
-                        self.interpret_and_seed(&slug, &task_list_path, repo_root, true)
-                            .await?
+                        let warning = self.quarantine_artifact_issue(repo_root, &slug, e).await?;
+                        let (graph, mut issues) = self
+                            .interpret_and_seed(&slug, &task_list_path, repo_root, true)
+                            .await?;
+                        issues.push(warning);
+                        (graph, issues)
                     }
                 }
             }
@@ -1159,14 +1326,12 @@ impl CoreApi {
                     .await?
             }
             Err(e) => {
-                // Unreadable / corrupt artifact — warn and fall back.
-                tracing::warn!(
-                    slug = %slug,
-                    error = %e,
-                    "failed to load persisted artifact; falling back to fresh interpret",
-                );
-                self.interpret_and_seed(&slug, &task_list_path, repo_root, true)
-                    .await?
+                let warning = self.quarantine_artifact_issue(repo_root, &slug, e).await?;
+                let (graph, mut issues) = self
+                    .interpret_and_seed(&slug, &task_list_path, repo_root, true)
+                    .await?;
+                issues.push(warning);
+                (graph, issues)
             }
         };
 
@@ -1196,13 +1361,15 @@ impl CoreApi {
                 id.0,
                 RunEntry {
                     task_list_path: task_list_path.clone(),
+                    plan_identity,
                     run_uid,
                     run_slug: slug.clone(),
-                    plan_slug: plan_slug(&task_list_path),
+                    plan_slug: worktree_plan_slug,
                     started_at: None,
                     graph: Arc::new(AsyncMutex::new(graph)),
                     status: RunStatus::Pending,
                     handle: None,
+                    scheduler_generation: 0,
                     report,
                 },
             );
@@ -1457,11 +1624,12 @@ impl CoreApi {
         // Interpret into a fresh TaskGraph.
         match self.state.interpreter.interpret(slug, &text).await {
             Ok(graph) => {
+                let graph = Self::bind_graph_identity(graph, slug);
                 // Seed-persist the freshly-interpreted graph so the artifact exists
                 // immediately (before StartRun).  Best-effort: a failure only warns;
                 // opening a run must not break because the disk is unwritable.
                 if seed_persist
-                    && let Err(e) = crate::persist::persist_graph(&graph, repo_root).await
+                    && let Err(e) = crate::persist::persist_graph_as(&graph, repo_root, slug).await
                 {
                     tracing::warn!(
                         slug = %slug,
@@ -1514,11 +1682,13 @@ impl CoreApi {
                                 // Re-interpret the normalized text.
                                 match self.state.interpreter.interpret(slug, &normalized).await {
                                     Ok(graph) => {
+                                        let graph = Self::bind_graph_identity(graph, slug);
                                         // Seed-persist the normalized graph.
                                         if seed_persist
-                                            && let Err(e) =
-                                                crate::persist::persist_graph(&graph, repo_root)
-                                                    .await
+                                            && let Err(e) = crate::persist::persist_graph_as(
+                                                &graph, repo_root, slug,
+                                            )
+                                            .await
                                         {
                                             tracing::warn!(
                                                 slug = %slug,
@@ -1660,7 +1830,7 @@ impl CoreApi {
             .generate(slug, &brief, system_prompt_override)
             .await
         {
-            Ok(g) => g,
+            Ok(g) => Self::bind_graph_identity(g, slug),
             Err(e) => {
                 // Generate failed (offline, validation error, etc.) → return a
                 // reviewable issue, not a hard error.
@@ -1691,7 +1861,9 @@ impl CoreApi {
         }
 
         // 5. Seed-persist the graph (best-effort).
-        if seed_persist && let Err(e) = crate::persist::persist_graph(&graph, repo_root).await {
+        if seed_persist
+            && let Err(e) = crate::persist::persist_graph_as(&graph, repo_root, slug).await
+        {
             tracing::warn!(
                 slug = %slug,
                 error = %e,
@@ -1707,22 +1879,34 @@ impl CoreApi {
     /// Looks up the Run's shared graph, builds a fresh [`RunControl`] (a sink
     /// wired to the broadcast, a cleared pause flag, a fresh cancel token),
     /// records the handle, sets the status `Running`, then `tokio::spawn`s
-    /// [`run_graph`] over the graph and returns promptly.  The scheduler emits
-    /// the live events the TUI observes; this method does not block on execution.
+    /// [`run_graph`] over the graph and returns promptly for a fresh run. Resume
+    /// first joins the cancelled paused generation so cleanup cannot overlap.
+    /// The scheduler emits the live events the TUI observes.
     ///
     /// Resume: re-issuing `StartRun` on a paused Run clears the pause flag and
     /// spawns a fresh scheduler that continues launching ready tasks (done tasks
     /// are skipped).
-    fn start_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+    async fn start_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
+
         // Take everything we need out of the registry under ONE lock, then drop
         // the guard before spawning (no lock across the spawn / await boundary).
-        let (graph, cancel, pause, run_slug, run_uid, plan_slug) = {
+        let (graph, cancel, pause, run_slug, run_uid, plan_slug, generation, old_join) = {
             let mut runs = self
                 .state
                 .runs
                 .lock()
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+
+            if !matches!(entry.status, RunStatus::Pending | RunStatus::Paused) {
+                return Err(ApiError::InvalidCommand {
+                    reason: format!(
+                        "cannot start a run in status {:?}; only Pending or Paused runs may be started",
+                        entry.status
+                    ),
+                });
+            }
 
             if entry.report.is_blocked() {
                 let blockers: Vec<_> = entry.report.blocking().collect();
@@ -1740,17 +1924,30 @@ impl CoreApi {
                 });
             }
 
-            // If a previous handle exists (e.g. resuming a paused run), cancel its
-            // (already-finished or paused) scheduler defensively and replace it.
-            if let Some(old) = entry.handle.take() {
+            // A paused scheduler may still be draining in-flight work. Cancel it
+            // and retain its join so plan-scoped worktrees cannot overlap the
+            // replacement scheduler.
+            let old_join = entry.handle.take().and_then(|mut old| {
                 old.cancel.cancel();
-            }
+                old.pause.store(false, Ordering::SeqCst);
+                old.join.take()
+            });
 
             let cancel = CancellationToken::new();
             let pause = Arc::new(AtomicBool::new(false));
+            let generation =
+                entry
+                    .scheduler_generation
+                    .checked_add(1)
+                    .ok_or_else(|| ApiError::Internal {
+                        reason: format!("scheduler generation overflow for run {run}"),
+                    })?;
+            entry.scheduler_generation = generation;
             entry.handle = Some(RunHandle {
+                generation,
                 cancel: cancel.clone(),
                 pause: Arc::clone(&pause),
+                join: None,
             });
             entry.status = RunStatus::Running;
             // Stamp the run's start instant for the finalization-time `run.json`.
@@ -1778,10 +1975,41 @@ impl CoreApi {
                 slug,
                 run_uid,
                 plan_slug,
+                generation,
+                old_join,
             )
         }; // registry guard dropped here.
 
-        self.spawn_run_scheduler(run, graph, cancel, pause, run_slug, run_uid, plan_slug);
+        if let Some(join) = old_join
+            && let Err(e) = join.await
+            && !e.is_cancelled()
+        {
+            tracing::warn!(run = %run, error = %e, "superseded scheduler join failed");
+        }
+
+        let join = self.spawn_run_scheduler(
+            run, graph, cancel, pause, run_slug, run_uid, plan_slug, generation,
+        );
+
+        // Retain the JoinHandle only if this generation still owns the run. A
+        // very small graph may finish before this lock is reacquired; in that
+        // case finalization already cleared the provisional handle and dropping
+        // this completed JoinHandle is correct.
+        {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            if let Some(handle) = runs
+                .get_mut(&run.0)
+                .filter(|entry| entry.scheduler_generation == generation)
+                .and_then(|entry| entry.handle.as_mut())
+                .filter(|handle| handle.generation == generation)
+            {
+                handle.join = Some(join);
+            }
+        }
 
         Ok(CommandOutcome::Acknowledged)
     }
@@ -1805,7 +2033,8 @@ impl CoreApi {
         run_slug: String,
         run_uid: String,
         plan_slug: String,
-    ) {
+        generation: u64,
+    ) -> JoinHandle<()> {
         // Build the per-run control (sink → broadcast, pause flag, cancel token).
         let control = RunControl {
             run,
@@ -1841,7 +2070,8 @@ impl CoreApi {
         // not await it — execution proceeds in the background; the TUI observes
         // via subscribe().  When it returns we finalize the registry status so a
         // later `run()`/`runs()` snapshot reflects Completed/Failed.  The
-        // JoinHandle is detached: the run drives itself to terminal + cleans up.
+        // The returned JoinHandle is retained in RunEntry so lifecycle commands
+        // can wait for terminal cleanup before reusing plan-scoped resources.
         tokio::spawn(async move {
             match run_graph(
                 graph,
@@ -1868,8 +2098,8 @@ impl CoreApi {
                     tracing::error!(error = %e, "run_graph failed");
                 }
             }
-            state.finalize_run_status(run).await;
-        });
+            state.finalize_run_status(run, generation).await;
+        })
     }
 
     /// Update settings that the next spawned scheduler should use.
@@ -1889,7 +2119,8 @@ impl CoreApi {
     /// Sets the cooperative pause flag on the Run's handle (if running) and the
     /// status to `Paused`, then broadcasts `RunStatusChanged{Paused}`.  See the
     /// module-level pause-semantics note.
-    fn pause_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+    async fn pause_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
         {
             let mut runs = self
                 .state
@@ -1897,7 +2128,18 @@ impl CoreApi {
                 .lock()
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
-            if let Some(handle) = entry.handle.as_ref() {
+            if !matches!(entry.status, RunStatus::Pending | RunStatus::Running) {
+                return Err(ApiError::InvalidCommand {
+                    reason: format!(
+                        "cannot pause a run in status {:?}; only Pending or Running runs may be paused",
+                        entry.status
+                    ),
+                });
+            }
+            if entry.status == RunStatus::Running {
+                let handle = entry.handle.as_ref().ok_or_else(|| ApiError::Internal {
+                    reason: format!("running run {run} has no scheduler handle"),
+                })?;
                 handle.pause.store(true, Ordering::SeqCst);
             }
             entry.status = RunStatus::Paused;
@@ -1916,15 +2158,16 @@ impl CoreApi {
     /// sets the status to `Failed` (cancelled), and broadcasts the change.  The
     /// Run is kept in the registry (its final state is observable) rather than
     /// dropped — the TUI can still inspect what completed before cancellation.
-    fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
-        {
+    async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
+        let join = {
             let mut runs = self
                 .state
                 .runs
                 .lock()
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
-            if let Some(handle) = entry.handle.take() {
+            let join = entry.handle.take().and_then(|mut handle| {
                 // Cancel the background scheduler; it aborts + cleans up.  We do
                 // NOT drop the handle's cancel state from the entry before the
                 // scheduler observes it — `cancel.cancel()` is sticky, so the
@@ -1937,9 +2180,25 @@ impl CoreApi {
                 // Clearing the pause flag is harmless and avoids a stuck flag if
                 // the run is somehow resumed; cancel takes precedence anyway.
                 handle.pause.store(false, Ordering::SeqCst);
-            }
+                handle.join.take()
+            });
+            entry.scheduler_generation =
+                entry
+                    .scheduler_generation
+                    .checked_add(1)
+                    .ok_or_else(|| ApiError::Internal {
+                        reason: format!("scheduler generation overflow for run {run}"),
+                    })?;
             entry.status = RunStatus::Failed;
-        } // guard dropped before broadcast.
+            join
+        }; // guard dropped before awaiting scheduler cleanup.
+        if let Some(join) = join
+            && let Err(e) = join.await
+            && !e.is_cancelled()
+        {
+            tracing::warn!(run = %run, error = %e, "cancelled scheduler join failed");
+        }
+        self.state.audit_registry.evict_run(&run.to_string());
         let _ = self.state.event_tx.send(Event::RunStatusChanged {
             run,
             status: RunStatus::Failed,
@@ -1956,6 +2215,7 @@ impl CoreApi {
     /// This is the same tolerance already present for concurrent `OpenRun` of the same slug
     /// from two TUI instances. A per-run in-flight flag can be added later if needed.
     async fn reinterpret_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
         let repo_root = self.state.worktree_manager.repo_root.clone();
 
         // Lookup path + slug + enforce Pending (no lock held across the await).
@@ -2010,7 +2270,7 @@ impl CoreApi {
 
         // Seed only after the swap succeeds; never while holding the registry lock.
         if let Some(graph) = seed_snapshot
-            && let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await
+            && let Err(e) = crate::persist::persist_graph_as(&graph, &repo_root, &slug).await
         {
             tracing::warn!(
                 slug = %slug,
@@ -2071,9 +2331,10 @@ impl CoreApi {
 
     /// Reset a run to a freshly interpreted Pending graph without re-dispatching.
     async fn reset_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
         let repo_root = self.state.worktree_manager.repo_root.clone();
 
-        let (task_list_path, run_uid, run_slug, plan_slug, old_handle, old_graph) = {
+        let (task_list_path, run_uid, run_slug, plan_slug, old_join, had_handle, old_graph) = {
             let mut runs = self
                 .state
                 .runs
@@ -2085,12 +2346,27 @@ impl CoreApi {
                     reason: "stop or pause the run before resetting it".into(),
                 });
             }
+            let old_handle = entry.handle.take();
+            let had_handle = old_handle.is_some();
+            let old_join = old_handle.and_then(|mut handle| {
+                handle.cancel.cancel();
+                handle.pause.store(false, Ordering::SeqCst);
+                handle.join.take()
+            });
+            entry.scheduler_generation =
+                entry
+                    .scheduler_generation
+                    .checked_add(1)
+                    .ok_or_else(|| ApiError::Internal {
+                        reason: format!("scheduler generation overflow for run {run}"),
+                    })?;
             (
                 entry.task_list_path.clone(),
                 entry.run_uid.clone(),
                 entry.run_slug.clone(),
                 entry.plan_slug.clone(),
-                entry.handle.take(),
+                old_join,
+                had_handle,
                 Arc::clone(&entry.graph),
             )
         };
@@ -2107,14 +2383,19 @@ impl CoreApi {
             "Starting reset",
         );
 
-        if let Some(handle) = old_handle {
-            handle.cancel.cancel();
+        if had_handle {
             self.emit_plan_operation(
                 &plan_slug,
                 &label,
                 crate::api::PlanOperationPhase::Step,
                 "Cancelled in-flight scheduler",
             );
+        }
+        if let Some(join) = old_join
+            && let Err(e) = join.await
+            && !e.is_cancelled()
+        {
+            tracing::warn!(run = %run, error = %e, "reset scheduler join failed");
         }
 
         let old_task_ids = {
@@ -2218,7 +2499,7 @@ impl CoreApi {
                 crate::api::PlanOperationPhase::Step,
                 "Persisting fresh pending graph",
             );
-            if let Err(e) = crate::persist::persist_graph(&graph, &repo_root).await {
+            if let Err(e) = crate::persist::persist_graph_as(&graph, &repo_root, &run_slug).await {
                 tracing::warn!(
                     run_uid = %run_uid,
                     error = %e,
@@ -2283,15 +2564,17 @@ impl CoreApi {
     ) -> Result<CommandOutcome, ApiError> {
         use crate::task::{TaskId as DomainTaskId, TaskState as DomainTaskState};
 
+        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
+
         // 1. Lock the registry: validate the run is open + retryable, snapshot the
         //    graph handle and run identity, then drop the guard before awaiting.
-        let (graph, run_uid, run_slug, plan_slug, started_at) = {
-            let runs = self
+        let (graph, run_uid, run_slug, plan_slug, task_list_path, started_at, generation, old_join) = {
+            let mut runs = self
                 .state
                 .runs
                 .lock()
                 .expect("runs registry mutex poisoned");
-            let entry = runs.get(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
             // Idempotence / race guard: only Failed/Paused/Completed runs are
             // retryable. A still-actively-Running (or Pending) run is rejected so
             // a retry never races the live scheduler.
@@ -2306,14 +2589,37 @@ impl CoreApi {
                     ),
                 });
             }
+            let old_join = entry.handle.take().and_then(|mut handle| {
+                handle.cancel.cancel();
+                handle.pause.store(false, Ordering::SeqCst);
+                handle.join.take()
+            });
+            let generation =
+                entry
+                    .scheduler_generation
+                    .checked_add(1)
+                    .ok_or_else(|| ApiError::Internal {
+                        reason: format!("scheduler generation overflow for run {run}"),
+                    })?;
+            entry.scheduler_generation = generation;
             (
                 Arc::clone(&entry.graph),
                 entry.run_uid.clone(),
                 entry.run_slug.clone(),
                 entry.plan_slug.clone(),
+                entry.task_list_path.clone(),
                 entry.started_at,
+                generation,
+                old_join,
             )
         }; // registry guard dropped before awaiting the graph lock.
+
+        if let Some(join) = old_join
+            && let Err(e) = join.await
+            && !e.is_cancelled()
+        {
+            tracing::warn!(run = %run, error = %e, "retry scheduler join failed");
+        }
 
         // 2. Reset the target task(s) under the graph lock; collect every reset
         //    (and revived) id so we can emit + persist after dropping the guard.
@@ -2372,9 +2678,12 @@ impl CoreApi {
         }; // graph guard dropped before persisting / spawning.
 
         // 3. Persist the reset graph (best-effort; warn on failure).
-        if let Err(e) =
-            crate::persist::persist_graph(&graph_snapshot, &self.state.worktree_manager.repo_root)
-                .await
+        if let Err(e) = crate::persist::persist_graph_as(
+            &graph_snapshot,
+            &self.state.worktree_manager.repo_root,
+            &run_slug,
+        )
+        .await
         {
             tracing::warn!(
                 run_uid = %run_uid,
@@ -2409,7 +2718,8 @@ impl CoreApi {
             started_at,
             Utc::now(),
             task_snapshots,
-        );
+        )
+        .with_task_list_path(&task_list_path, &self.state.worktree_manager.repo_root);
         if let Err(e) = write_run_metadata(&meta, &self.state.worktree_manager.repo_root).await {
             tracing::warn!(run_uid = %run_uid, error = %e, "run.json refresh failed after retry");
         }
@@ -2446,12 +2756,11 @@ impl CoreApi {
                 .lock()
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
-            if let Some(old) = entry.handle.take() {
-                old.cancel.cancel();
-            }
             entry.handle = Some(RunHandle {
+                generation,
                 cancel: cancel.clone(),
                 pause: Arc::clone(&pause),
+                join: None,
             });
             entry.status = RunStatus::Running;
             if entry.started_at.is_none() {
@@ -2464,7 +2773,24 @@ impl CoreApi {
             status: RunStatus::Running,
         });
 
-        self.spawn_run_scheduler(run, graph, cancel, pause, run_slug, run_uid, plan_slug);
+        let join = self.spawn_run_scheduler(
+            run, graph, cancel, pause, run_slug, run_uid, plan_slug, generation,
+        );
+        {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            if let Some(handle) = runs
+                .get_mut(&run.0)
+                .filter(|entry| entry.scheduler_generation == generation)
+                .and_then(|entry| entry.handle.as_mut())
+                .filter(|handle| handle.generation == generation)
+            {
+                handle.join = Some(join);
+            }
+        }
 
         Ok(CommandOutcome::Acknowledged)
     }
@@ -2523,13 +2849,11 @@ impl Api for CoreApi {
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
             Command::OpenRun { task_list_path } => self.open_run(task_list_path).await,
-            // Start/Pause/Cancel are synchronous registry+signal operations that
-            // spawn/signal the background scheduler; none of them awaits, so they
-            // are infallible-to-call and return promptly.
-            // ReinterpretRun is async (performs interpret I/O) like OpenRun.
-            Command::StartRun { run } => self.start_run(run),
-            Command::PauseRun { run } => self.pause_run(run),
-            Command::CancelRun { run } => self.cancel_run(run),
+            // Lifecycle commands may await a superseded scheduler's cleanup so
+            // plan-scoped worktrees are never owned by overlapping generations.
+            Command::StartRun { run } => self.start_run(run).await,
+            Command::PauseRun { run } => self.pause_run(run).await,
+            Command::CancelRun { run } => self.cancel_run(run).await,
             Command::ReinterpretRun { run } => self.reinterpret_run(run).await,
             // Retry is async: it persists the reset graph + run snapshot.
             Command::RetryTask { run, task } => self.retry_task(run, task).await,
@@ -3218,6 +3542,106 @@ Do the thing in `lib.rs`.
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, RunId(1));
         assert_eq!(all[1].id, RunId(2));
+    }
+
+    #[tokio::test]
+    async fn concurrent_open_is_idempotent_for_canonical_plan_identity() {
+        let (api, _repo) = execution_core_api();
+        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
+        let alias = path
+            .parent()
+            .expect("task list parent")
+            .join(".")
+            .join(path.file_name().unwrap());
+
+        let (first, second) = tokio::join!(
+            api.execute(Command::OpenRun {
+                task_list_path: path,
+            }),
+            api.execute(Command::OpenRun {
+                task_list_path: alias,
+            })
+        );
+        let run_of = |outcome: Result<CommandOutcome, ApiError>| match outcome.unwrap() {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("expected RunOpened, got {other:?}"),
+        };
+        assert_eq!(run_of(first), run_of(second));
+        assert_eq!(
+            api.runs().await.len(),
+            1,
+            "one canonical plan has one live run"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_sources_cannot_share_one_live_plan_namespace() {
+        let (api, _repo) = execution_core_api();
+        let dir = tempfile::tempdir().expect("create plan dir");
+        let first = dir.path().join("TASKS.md");
+        let second = dir.path().join("alternate.md");
+        std::fs::write(&first, SAMPLE_TASK_LIST).expect("write first task list");
+        std::fs::write(&second, SAMPLE_TASK_LIST).expect("write second task list");
+
+        api.execute(Command::OpenRun {
+            task_list_path: first,
+        })
+        .await
+        .expect("first source opens");
+        let second_open = api
+            .execute(Command::OpenRun {
+                task_list_path: second,
+            })
+            .await;
+        assert!(matches!(
+            second_open,
+            Err(ApiError::InvalidCommand { reason })
+                if reason.contains("share artifacts or worktrees")
+        ));
+        assert_eq!(api.runs().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_artifact_is_quarantined_and_recovery_is_reported() {
+        let (api, repo) = execution_core_api();
+        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
+        let canonical = canonical_task_list_path(path.clone()).await;
+        let slug = run_slug(&canonical);
+        let artifact = crate::persist::tasks_path(repo.path(), &slug);
+        std::fs::create_dir_all(artifact.parent().unwrap()).expect("create tasks dir");
+        std::fs::write(
+            &artifact,
+            r#"{"schema_version":999,"slug":"ignored","tasks":[]}"#,
+        )
+        .expect("write future artifact");
+
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .expect("OpenRun recovers after quarantine")
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("expected RunOpened, got {other:?}"),
+        };
+        let view = api.run(run).await.expect("opened run");
+        assert!(view.report.issues.iter().any(|issue| {
+            issue.code == "artifact-quarantined"
+                && issue.severity == crate::api::IssueSeverity::Warning
+        }));
+        assert!(
+            std::fs::read_dir(artifact.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".quarantine.")),
+            "the unusable artifact must remain available for inspection"
+        );
+        let recovered = crate::persist::load_graph(repo.path(), &slug)
+            .await
+            .expect("load recovered graph")
+            .expect("recovered artifact exists");
+        assert_eq!(recovered.slug, slug);
     }
 
     /// `mk-run-id`: every opened Run is stamped with a persistent, sortable ULID
@@ -4028,6 +4452,76 @@ Create beta.
         assert!(matches!(err, Err(ApiError::UnknownRun { run: RunId(999) })));
     }
 
+    #[tokio::test]
+    async fn start_run_rejects_every_state_except_pending_or_paused() {
+        let (api, _repo) = execution_core_api();
+        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+
+        for status in [RunStatus::Running, RunStatus::Completed, RunStatus::Failed] {
+            api.state
+                .runs
+                .lock()
+                .unwrap()
+                .get_mut(&run.0)
+                .unwrap()
+                .status = status.clone();
+            let result = api.execute(Command::StartRun { run }).await;
+            assert!(
+                matches!(result, Err(ApiError::InvalidCommand { .. })),
+                "StartRun must reject {status:?}, got {result:?}"
+            );
+            assert_eq!(api.run(run).await.unwrap().status, status);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_scheduler_generation_cannot_finalize_or_clear_replacement() {
+        let (api, _repo) = execution_core_api();
+        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
+        let run = match api
+            .execute(Command::OpenRun {
+                task_list_path: path,
+            })
+            .await
+            .unwrap()
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        {
+            let mut runs = api.state.runs.lock().unwrap();
+            let entry = runs.get_mut(&run.0).unwrap();
+            entry.status = RunStatus::Running;
+            entry.scheduler_generation = 2;
+            entry.handle = Some(RunHandle {
+                generation: 2,
+                cancel: CancellationToken::new(),
+                pause: Arc::new(AtomicBool::new(false)),
+                join: None,
+            });
+        }
+
+        api.state.finalize_run_status(run, 1).await;
+
+        let runs = api.state.runs.lock().unwrap();
+        let entry = runs.get(&run.0).unwrap();
+        assert_eq!(entry.status, RunStatus::Running);
+        assert_eq!(
+            entry.handle.as_ref().map(|handle| handle.generation),
+            Some(2)
+        );
+    }
+
     // ── StartRun refuses when report blocked (ingest guard) ───────────────────
 
     /// Refuses `StartRun` (with InvalidCommand) while the run's ingestion report
@@ -4393,6 +4887,12 @@ This description is long enough to pass the thin-description threshold.
     ///    never reaches `Completed` — proving "stop launching new tasks".
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pause_stops_second_task_from_launching() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK for the test's full lifetime.
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
         let interpreter = Arc::new(EdgeInferrer::new(
             Arc::new(StructuredTextInterpreter::new()),
         ));
@@ -4477,6 +4977,14 @@ This description is long enough to pass the thin-description threshold.
                 break;
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        // SAFETY: serialised by HOME_ENV_LOCK.
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
         }
     }
 

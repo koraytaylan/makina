@@ -378,7 +378,8 @@ pub enum Command {
         run: RunId,
     },
 
-    /// Transition a [`RunStatus::Running`] Run to [`RunStatus::Paused`].
+    /// Transition a [`RunStatus::Pending`] or [`RunStatus::Running`] Run to
+    /// [`RunStatus::Paused`].
     ///
     /// In-flight agent turns are allowed to complete; no new agents will be
     /// dispatched until [`Command::StartRun`] is issued.

@@ -143,7 +143,7 @@ use crate::gate::{GateOutcome, GateRunner};
 use crate::interpreter::TaskListInterpreter;
 use crate::merge::{MergeOutcome, SquashMerger, StageOutcome};
 use crate::paths;
-use crate::persist::persist_graph;
+use crate::persist::persist_graph_as;
 use crate::state_machine::{TaskEvent, transition};
 use crate::task::{Task, TaskGraph, TaskId, TaskState};
 use crate::worktree::WorktreeManager;
@@ -275,6 +275,11 @@ struct DriverContext {
     /// [`task_driver`]).
     graph: Arc<Mutex<TaskGraph>>,
 
+    /// Serializes snapshot acquisition and atomic replacement for this run.
+    /// The lock is acquired before cloning the graph, so an older snapshot can
+    /// never queue behind and overwrite a newer one.
+    persist_lock: Arc<Mutex<()>>,
+
     /// The **develop merge lock**: serializes the squash-merge step (the only
     /// part of a driver that mutates the single shared `develop` checkout).  A
     /// `Mutex<()>` whose guard is held for the minimal merge span only.
@@ -399,14 +404,22 @@ impl DriverContext {
     /// 4. On any I/O error: logs a `tracing::warn!` and returns — the run
     ///    continues unaffected (best-effort persistence).
     async fn persist(&self) {
-        // Clone the graph under the lock (tight critical section; no await).
+        // Order snapshot acquisition as well as the write. Taking this lock
+        // only after cloning would still allow S2 to commit before a delayed S1.
+        let _persist_guard = self.persist_lock.lock().await;
         let snapshot = {
             let g = self.graph.lock().await;
             g.clone()
         };
-        // Write outside the lock.
+        // Write outside the graph lock, while retaining the per-run ordering
+        // guard until the atomic replacement is durable.
         let repo_root = &self.worktree_manager.repo_root;
-        if let Err(e) = persist_graph(&snapshot, repo_root).await {
+        let expected_slug = if self.run_slug.is_empty() {
+            snapshot.slug.as_str()
+        } else {
+            self.run_slug.as_str()
+        };
+        if let Err(e) = persist_graph_as(&snapshot, repo_root, expected_slug).await {
             tracing::warn!(
                 slug = %snapshot.slug,
                 error = %e,
@@ -460,7 +473,11 @@ pub async fn run_graph(
     // `.entered()` guard) so the future stays `Send` across `.await` points —
     // `EnteredSpan` is `!Send` and this future is `tokio::spawn`ed.
     use tracing::Instrument as _;
-    let run_span = tracing::info_span!("run_graph", run_uid = %run_uid);
+    let run_span = tracing::info_span!(
+        "run_graph",
+        run_uid = %run_uid,
+        project_root = %worktree_manager.repo_root.display()
+    );
     run_graph_inner(
         graph,
         worktree_manager,
@@ -523,6 +540,7 @@ async fn run_graph_inner(
 
     let ctx = DriverContext {
         graph: Arc::clone(&graph),
+        persist_lock: Arc::new(Mutex::new(())),
         merge_lock: Arc::new(Mutex::new(())),
         worktree_manager: worktree_manager.clone(),
         gate_runner: GateRunner::new(),
@@ -537,7 +555,12 @@ async fn run_graph_inner(
         plan_slug,
     };
 
-    let mut result = scheduler(ctx, config.concurrency).await;
+    let mut result = scheduler(ctx.clone(), config.concurrency).await;
+
+    // Drivers have fully drained at this point. Persist one unconditional final
+    // snapshot through the same per-run ordering gate so crash recovery cannot
+    // observe an earlier transition as the terminal state.
+    ctx.persist().await;
 
     // Final merge: decide whether to land plan/{slug} into base_branch (if all tasks Done).
     // This happens BEFORE restoring base_branch, so the plan branch is still checked out.
@@ -642,7 +665,7 @@ async fn run_graph_inner(
     // Derive + emit the aggregate terminal status — but NOT when cancelled: a
     // cancelled run's status is owned by the caller (Cancel sets it explicitly),
     // and we must not overwrite it with a misleading Completed/Failed.
-    if !control.cancel.is_cancelled() {
+    if !control.cancel.is_cancelled() && !control.pause.load(Ordering::SeqCst) {
         let status = {
             let g = graph.lock().await;
             aggregate_run_status(&g)
@@ -2220,6 +2243,58 @@ mod tests {
             finished_at: None,
             failure_reason: None,
         }
+    }
+
+    /// A persistence request queued behind an earlier write must acquire the
+    /// per-run ordering gate before it snapshots. Otherwise it can retain an
+    /// old clone and overwrite a newer state after the newer write commits.
+    #[tokio::test]
+    async fn queued_persist_snapshots_only_after_acquiring_run_order() {
+        let repo = tempfile::tempdir().expect("create temp repo");
+        let graph = Arc::new(Mutex::new(TaskGraph {
+            slug: "persist-order".into(),
+            tasks: vec![task_in("task", TaskState::Ready)],
+        }));
+        let persist_lock = Arc::new(Mutex::new(()));
+        let manager = WorktreeManager::new(repo.path().to_path_buf(), "develop".into());
+        let config = Config::resolve(
+            crate::config::GlobalConfig::default(),
+            crate::config::ProjectConfig::default(),
+        );
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend::noop::NoopBackend::default());
+        let ctx = DriverContext {
+            graph: Arc::clone(&graph),
+            persist_lock: Arc::clone(&persist_lock),
+            merge_lock: Arc::new(Mutex::new(())),
+            worktree_manager: manager,
+            gate_runner: GateRunner::new(),
+            squash_merger: SquashMerger::new(repo.path().to_path_buf(), "develop".into()),
+            config,
+            developer_backend: Arc::clone(&backend),
+            reviewer_backend: backend,
+            control: RunControl::silent(),
+            audit_registry: Arc::new(crate::audit::NoopAuditRegistry),
+            run_slug: "persist-order".into(),
+            run_uid: "test-run".into(),
+            plan_slug: String::new(),
+        };
+
+        let held = persist_lock.lock().await;
+        let queued = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { ctx.persist().await }
+        });
+        tokio::task::yield_now().await;
+
+        graph.lock().await.tasks[0].state = TaskState::Done;
+        drop(held);
+        queued.await.expect("queued persistence task");
+
+        let loaded = crate::persist::load_graph(repo.path(), "persist-order")
+            .await
+            .expect("load final graph")
+            .expect("graph exists");
+        assert_eq!(loaded.tasks[0].state, TaskState::Done);
     }
 
     /// `advance_to_ready` returns `Err` for an id that is not in the graph — the

@@ -20,7 +20,7 @@
 //! surface historical runs that have been evicted from memory.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
@@ -82,6 +82,11 @@ pub struct RunMetadata {
     /// `#[serde(default)]` for back-compat with pre- plan_slug run.json files.
     #[serde(default)]
     plan_slug: String,
+    /// Originating task-list location. New records store a repo-relative path
+    /// when the plan is inside the project (portable across clones), otherwise
+    /// the canonical absolute path. Absent from legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_list_path: Option<PathBuf>,
     /// Terminal status of the run.
     status: RunStatus,
     /// When the run transitioned to `Running`.
@@ -108,6 +113,7 @@ impl RunMetadata {
             run_uid,
             run_slug,
             plan_slug,
+            task_list_path: None,
             status,
             started_at,
             ended_at,
@@ -129,6 +135,7 @@ impl RunMetadata {
             run_uid,
             run_slug,
             plan_slug,
+            task_list_path: None,
             status,
             started_at,
             ended_at,
@@ -152,6 +159,33 @@ impl RunMetadata {
         &self.plan_slug
     }
 
+    /// Attach the canonical origin path, storing it relative to `repo_root`
+    /// where possible so snapshots remain portable.
+    pub fn with_task_list_path(mut self, task_list_path: &Path, repo_root: &Path) -> Self {
+        let canonical_root = absolute_project_root(repo_root);
+        let canonical_path =
+            std::fs::canonicalize(task_list_path).unwrap_or_else(|_| task_list_path.to_path_buf());
+        self.task_list_path = Some(
+            canonical_path
+                .strip_prefix(&canonical_root)
+                .map(Path::to_path_buf)
+                .unwrap_or(canonical_path),
+        );
+        self
+    }
+
+    /// Resolve the persisted origin to an absolute path in this project.
+    pub fn resolved_task_list_path(&self, repo_root: &Path) -> Option<PathBuf> {
+        let project_root = absolute_project_root(repo_root);
+        self.task_list_path.as_ref().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                project_root.join(path)
+            }
+        })
+    }
+
     /// The terminal status recorded for the run.
     pub fn status(&self) -> &RunStatus {
         &self.status
@@ -171,6 +205,18 @@ impl RunMetadata {
     pub fn tasks(&self) -> &[TaskSnapshot] {
         &self.tasks
     }
+}
+
+fn absolute_project_root(repo_root: &Path) -> PathBuf {
+    std::fs::canonicalize(repo_root).unwrap_or_else(|_| {
+        if repo_root.is_absolute() {
+            repo_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(repo_root))
+                .unwrap_or_else(|_| repo_root.to_path_buf())
+        }
+    })
 }
 
 /// Best-effort writer for [`RunMetadata`].
@@ -361,7 +407,10 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
     //   participate in sidebar plan/run dedup and context resolution.
     // - Fall back to the old `.tasks/{run_slug}.json` for non-plan runs and
     //   pre-plan_slug records whose run_slug does not look plan-like.
-    let task_list_path = synthetic_task_list_path(&effective_plan, meta.run_slug());
+    let task_list_path = meta.resolved_task_list_path(repo_root).unwrap_or_else(|| {
+        absolute_project_root(repo_root)
+            .join(synthetic_task_list_path(&effective_plan, meta.run_slug()))
+    });
 
     RunView {
         id,
@@ -533,6 +582,9 @@ mod tests {
 
         let started = fixed_ts(2026, 5, 1);
         let ended = fixed_ts(2026, 5, 2);
+        let task_list_path = root.join("docs/plans/demo-plan/TASKS.md");
+        std::fs::create_dir_all(task_list_path.parent().unwrap()).expect("create plan dir");
+        std::fs::write(&task_list_path, "# Tasks\n").expect("write task list");
         let meta = RunMetadata::new(
             "01ABCDEF0123456789ABCDEFGH".to_string(),
             "demo-plan".to_string(),
@@ -540,7 +592,8 @@ mod tests {
             RunStatus::Completed,
             started,
             ended,
-        );
+        )
+        .with_task_list_path(&task_list_path, root);
 
         write_run_metadata(&meta, root)
             .await
@@ -563,6 +616,16 @@ mod tests {
         assert_eq!(loaded.status, meta.status, "status must survive");
         assert_eq!(loaded.started_at, started, "started_at must survive");
         assert_eq!(loaded.ended_at, ended, "ended_at must survive");
+        assert_eq!(
+            loaded.task_list_path,
+            Some(PathBuf::from("docs/plans/demo-plan/TASKS.md")),
+            "in-project origins should be portable repo-relative paths"
+        );
+        assert_eq!(
+            loaded.resolved_task_list_path(root),
+            Some(task_list_path),
+            "disk views must recover an absolute project-qualified path"
+        );
     }
 
     #[tokio::test]

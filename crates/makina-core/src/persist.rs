@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 use crate::task::{TaskGraph, TaskState};
 
@@ -76,6 +77,32 @@ pub enum PersistError {
         source: serde_json::Error,
     },
 
+    /// The artifact declares a schema newer than this binary understands.
+    #[error(
+        "unsupported task graph schema version {found} in `{path}` (maximum supported: {supported})"
+    )]
+    UnsupportedSchema {
+        /// Path of the artifact carrying the unsupported version.
+        path: String,
+        /// Version declared by the artifact.
+        found: u64,
+        /// Highest version understood by this binary.
+        supported: u64,
+    },
+
+    /// The graph embedded in an artifact does not belong to the requested plan.
+    #[error(
+        "task graph identity mismatch for `{path}`: expected slug `{expected}`, found `{found}`"
+    )]
+    IdentityMismatch {
+        /// Path that was read or was about to be written.
+        path: String,
+        /// Slug selected by the trusted plan identity.
+        expected: String,
+        /// Slug embedded in the serialized graph.
+        found: String,
+    },
+
     /// An I/O operation (create dir, write temp file, rename, read) failed.
     #[error("I/O error for `{path}`: {source}")]
     Io {
@@ -86,6 +113,10 @@ pub enum PersistError {
         source: std::io::Error,
     },
 }
+
+/// Current on-disk task-graph schema. Artifacts without this field are legacy
+/// version 1 and remain readable.
+const TASK_GRAPH_SCHEMA_VERSION: u64 = 1;
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -145,14 +176,37 @@ fn temp_path(repo_root: &Path, slug: &str) -> PathBuf {
 ///
 /// Concurrent writes for the same slug are safe: each call writes to a unique
 /// temp file (distinct PID + sequence) and atomically renames it into place, so
-/// a reader always sees a complete, consistent snapshot.  Ordering is
-/// last-writer-wins, which is acceptable for this durability aid — no
-/// caller-side mutex is required.
+/// a reader always sees a complete, consistent snapshot. Atomicity alone does
+/// not order snapshots, however: callers persisting a live run must serialize
+/// snapshot acquisition and this call through one per-run lock. The Supervisor
+/// does so in `DriverContext::persist`.
 ///
 /// # Errors
 ///
 /// Returns [`PersistError`] on serialization or I/O failure.
 pub async fn persist_graph(graph: &TaskGraph, repo_root: &Path) -> Result<(), PersistError> {
+    persist_graph_as(graph, repo_root, &graph.slug).await
+}
+
+/// Persist `graph` for a trusted plan slug.
+///
+/// Unlike [`persist_graph`], callers that already know the plan identity pass
+/// it separately. The destination is always constructed from `expected_slug`,
+/// and a mismatched embedded slug is rejected before any file is touched.
+pub async fn persist_graph_as(
+    graph: &TaskGraph,
+    repo_root: &Path,
+    expected_slug: &str,
+) -> Result<(), PersistError> {
+    let dest = tasks_path(repo_root, expected_slug);
+    if graph.slug != expected_slug {
+        return Err(PersistError::IdentityMismatch {
+            path: dest.display().to_string(),
+            expected: expected_slug.to_string(),
+            found: graph.slug.clone(),
+        });
+    }
+
     let tasks_dir = repo_root.join(".makina").join("tasks");
 
     // 1. Ensure .tasks/ exists.
@@ -164,8 +218,18 @@ pub async fn persist_graph(graph: &TaskGraph, repo_root: &Path) -> Result<(), Pe
         })?;
 
     // 2. Serialize.
-    let mut json = serde_json::to_string_pretty(graph).map_err(|e| PersistError::Serialize {
-        slug: graph.slug.clone(),
+    let mut value = serde_json::to_value(graph).map_err(|e| PersistError::Serialize {
+        slug: expected_slug.to_string(),
+        source: e,
+    })?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "schema_version".to_string(),
+            serde_json::Value::from(TASK_GRAPH_SCHEMA_VERSION),
+        );
+    }
+    let mut json = serde_json::to_string_pretty(&value).map_err(|e| PersistError::Serialize {
+        slug: expected_slug.to_string(),
         source: e,
     })?;
     // Append a trailing newline so the file ends cleanly (POSIX convention and
@@ -173,18 +237,31 @@ pub async fn persist_graph(graph: &TaskGraph, repo_root: &Path) -> Result<(), Pe
     json.push('\n');
 
     // 3. Write to temp file inside .tasks/.
-    let tmp = temp_path(repo_root, &graph.slug);
-    tokio::fs::write(&tmp, json.as_bytes())
+    let tmp = temp_path(repo_root, expected_slug);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
         .await
         .map_err(|e| PersistError::Io {
             path: tmp.display().to_string(),
             source: e,
         })?;
+    file.write_all(json.as_bytes())
+        .await
+        .map_err(|e| PersistError::Io {
+            path: tmp.display().to_string(),
+            source: e,
+        })?;
+    file.sync_all().await.map_err(|e| PersistError::Io {
+        path: tmp.display().to_string(),
+        source: e,
+    })?;
+    drop(file);
 
     // 4. Atomic rename onto the canonical path.
     //    tokio::fs::rename keeps this off the blocking thread pool; on failure
     //    we do a best-effort cleanup of the temp file to avoid leaking it.
-    let dest = tasks_path(repo_root, &graph.slug);
     if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(PersistError::Io {
@@ -192,6 +269,20 @@ pub async fn persist_graph(graph: &TaskGraph, repo_root: &Path) -> Result<(), Pe
             source: e,
         });
     }
+
+    // Make the rename durable as well as atomic. Directory syncing is
+    // supported on the Unix platforms Makina targets; surface a failure rather
+    // than claiming a durable checkpoint that may disappear after power loss.
+    let dir = tokio::fs::File::open(&tasks_dir)
+        .await
+        .map_err(|e| PersistError::Io {
+            path: tasks_dir.display().to_string(),
+            source: e,
+        })?;
+    dir.sync_all().await.map_err(|e| PersistError::Io {
+        path: tasks_dir.display().to_string(),
+        source: e,
+    })?;
 
     Ok(())
 }
@@ -219,13 +310,96 @@ pub async fn load_graph(repo_root: &Path, slug: &str) -> Result<Option<TaskGraph
         }
     };
 
-    let graph: TaskGraph =
+    let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| PersistError::Deserialize {
             path: path.display().to_string(),
             source: e,
         })?;
 
+    if let Some(version) = value.get("schema_version") {
+        let found = version.as_u64().ok_or_else(|| PersistError::Deserialize {
+            path: path.display().to_string(),
+            source: serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "schema_version must be an unsigned integer",
+            )),
+        })?;
+        if found > TASK_GRAPH_SCHEMA_VERSION {
+            return Err(PersistError::UnsupportedSchema {
+                path: path.display().to_string(),
+                found,
+                supported: TASK_GRAPH_SCHEMA_VERSION,
+            });
+        }
+    }
+
+    let graph: TaskGraph =
+        serde_json::from_value(value).map_err(|e| PersistError::Deserialize {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+
+    if graph.slug != slug {
+        return Err(PersistError::IdentityMismatch {
+            path: path.display().to_string(),
+            expected: slug.to_string(),
+            found: graph.slug,
+        });
+    }
+
     Ok(Some(graph))
+}
+
+/// Move an unusable artifact aside before a fresh graph is written.
+///
+/// The backup remains next to the canonical artifact with a unique
+/// `.quarantine.<pid>.<seq>` suffix. Returning the path lets callers surface
+/// the recovery decision instead of silently overwriting evidence.
+pub async fn quarantine_graph(
+    repo_root: &Path,
+    slug: &str,
+) -> Result<Option<PathBuf>, PersistError> {
+    static QUARANTINE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let source = tasks_path(repo_root, slug);
+    match tokio::fs::metadata(&source).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(PersistError::Io {
+                path: source.display().to_string(),
+                source: e,
+            });
+        }
+    }
+
+    let seq = QUARANTINE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let destination = source.with_file_name(format!(
+        "{slug}.json.quarantine.{}.{}",
+        std::process::id(),
+        seq
+    ));
+    tokio::fs::rename(&source, &destination)
+        .await
+        .map_err(|e| PersistError::Io {
+            path: source.display().to_string(),
+            source: e,
+        })?;
+
+    if let Some(parent) = destination.parent() {
+        let dir = tokio::fs::File::open(parent)
+            .await
+            .map_err(|e| PersistError::Io {
+                path: parent.display().to_string(),
+                source: e,
+            })?;
+        dir.sync_all().await.map_err(|e| PersistError::Io {
+            path: parent.display().to_string(),
+            source: e,
+        })?;
+    }
+
+    Ok(Some(destination))
 }
 
 // ── Resume recovery ───────────────────────────────────────────────────────────
@@ -386,6 +560,65 @@ mod tests {
             graph, loaded,
             "loaded TaskGraph must equal the persisted original"
         );
+
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(tasks_path(root, &graph.slug)).expect("read artifact"),
+        )
+        .expect("parse artifact value");
+        assert_eq!(
+            raw.get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(TASK_GRAPH_SCHEMA_VERSION),
+            "new artifacts must declare their schema version"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_future_schema_and_mismatched_plan_identity() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        let tasks_dir = root.join(".makina").join("tasks");
+        std::fs::create_dir_all(&tasks_dir).expect("create tasks dir");
+
+        let future_path = tasks_path(root, "future-plan");
+        std::fs::write(
+            &future_path,
+            r#"{"schema_version":999,"slug":"future-plan","tasks":[]}"#,
+        )
+        .expect("write future artifact");
+        assert!(matches!(
+            load_graph(root, "future-plan").await,
+            Err(PersistError::UnsupportedSchema { found: 999, .. })
+        ));
+
+        let mismatch_path = tasks_path(root, "expected-plan");
+        std::fs::write(&mismatch_path, r#"{"slug":"other-plan","tasks":[]}"#)
+            .expect("write mismatched artifact");
+        assert!(matches!(
+            load_graph(root, "expected-plan").await,
+            Err(PersistError::IdentityMismatch { expected, found, .. })
+                if expected == "expected-plan" && found == "other-plan"
+        ));
+    }
+
+    #[tokio::test]
+    async fn quarantine_moves_invalid_artifact_without_overwriting_it() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+        let original = tasks_path(root, "broken-plan");
+        std::fs::create_dir_all(original.parent().unwrap()).expect("create tasks dir");
+        std::fs::write(&original, b"not-json").expect("write invalid artifact");
+
+        let backup = quarantine_graph(root, "broken-plan")
+            .await
+            .expect("quarantine succeeds")
+            .expect("artifact existed");
+        assert!(
+            !original.exists(),
+            "canonical path must be freed for recovery"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"not-json");
+        assert!(backup.to_string_lossy().contains(".quarantine."));
     }
 
     // ── Test 2: No null for omitted optional fields ───────────────────────────
