@@ -124,6 +124,11 @@ fn map_error(err: AcpError) -> BackendError {
 /// sessions spawned by this backend.  Inject it via
 /// [`AcpBackend::with_audit_sink`]; the default is [`NoopAuditSink`].
 ///
+/// Each agent gets a worktree-local `CARGO_TARGET_DIR` by default so Cargo
+/// artifacts cannot outlive their source worktree and be reused by a later
+/// task. A provider can intentionally override that default through
+/// [`AcpBackend::env`].
+///
 /// The **permission policy** is session-scoped (it depends on `working_dir`).
 /// By default a [`crate::permission::WorktreePolicy`] is built from the session's
 /// `working_dir` at connect time.  The policy flows through [`AcpCommand`], so
@@ -213,6 +218,22 @@ impl AcpBackend {
             .with_audit_sink(Arc::clone(&self.audit_sink));
         command.run_id = config.run_id.clone();
         command.task_id = config.task_id.clone();
+
+        // ACP subprocesses inherit Makina's environment for authentication,
+        // but a shared external Cargo target directory is unsafe for ephemeral
+        // task worktrees: compiled tests can retain paths to a deleted
+        // worktree. Default to a session-local target directory unless this
+        // provider explicitly opts into a different one below.
+        if !self.env.iter().any(|(key, _)| key == "CARGO_TARGET_DIR") {
+            command = command.env(
+                "CARGO_TARGET_DIR",
+                config
+                    .working_dir
+                    .join("target")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
         for (key, value) in &self.env {
             command = command.env(key.clone(), value.clone());
         }
@@ -886,12 +907,76 @@ mod tests {
         assert_eq!(
             command.env,
             vec![
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    "/work/dir/target".to_string()
+                ),
                 ("FOO".to_string(), "bar".to_string()),
                 ("BAZ".to_string(), "qux".to_string()),
             ]
         );
         assert_eq!(command.run_id, "test-run");
         assert_eq!(command.task_id, None);
+    }
+
+    #[test]
+    fn command_for_isolates_cargo_target_dir_per_working_dir() {
+        let backend = AcpBackend::new("agent", Vec::new());
+        let config_for = |working_dir: &str| SessionConfig {
+            working_dir: PathBuf::from(working_dir),
+            system_prompt: String::new(),
+            mode: None,
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: "test-run".into(),
+        };
+
+        let first = backend.command_for(&config_for("/work/task-one"));
+        let second = backend.command_for(&config_for("/work/task-two"));
+
+        assert_eq!(
+            first.env,
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                "/work/task-one/target".to_string()
+            )]
+        );
+        assert_eq!(
+            second.env,
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                "/work/task-two/target".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn provider_cargo_target_dir_overrides_working_dir_default() {
+        let backend =
+            AcpBackend::new("agent", Vec::new()).env("CARGO_TARGET_DIR", "/provider/shared-target");
+        let config = SessionConfig {
+            working_dir: PathBuf::from("/work/task"),
+            system_prompt: String::new(),
+            mode: None,
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: "test-run".into(),
+        };
+
+        let command = backend.command_for(&config);
+
+        assert_eq!(
+            command.env,
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                "/provider/shared-target".to_string()
+            )],
+            "the provider's explicit setting must take precedence"
+        );
     }
 
     /// Build a minimal [`AcpClient`] connected to a scripted handshake peer.

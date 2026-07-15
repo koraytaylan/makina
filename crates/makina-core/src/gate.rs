@@ -185,6 +185,14 @@ impl GateRunner {
         working_dir: &Path,
     ) -> Result<GateOutcome, GateRunnerError> {
         for gate in gates {
+            // Cargo embeds source-root paths in build artifacts. Reusing a
+            // parent-level target directory across short-lived task worktrees
+            // can therefore resurrect test binaries compiled against a
+            // worktree that has already been deleted. Pin every gate to the
+            // task worktree's own target directory, even when Makina itself
+            // inherited a shared `CARGO_TARGET_DIR`.
+            let cargo_target_dir = working_dir.join("target");
+
             // Execute the gate's command line through a shell so operators can
             // use ordinary shell syntax (pipes, &&, env expansion, etc.).
             let mut cmd = if let Some(ref image) = gate.image {
@@ -197,6 +205,11 @@ impl GateRunner {
                     .arg(format!("{wd}:{wd}"))
                     .arg("-w")
                     .arg(working_dir)
+                    .arg("--env")
+                    .arg(format!(
+                        "CARGO_TARGET_DIR={}",
+                        cargo_target_dir.to_string_lossy()
+                    ))
                     .arg(image)
                     .arg("sh")
                     .arg("-c")
@@ -204,7 +217,11 @@ impl GateRunner {
                 docker_cmd
             } else {
                 let mut sh_cmd = tokio::process::Command::new("sh");
-                sh_cmd.arg("-c").arg(&gate.command).current_dir(working_dir);
+                sh_cmd
+                    .arg("-c")
+                    .arg(&gate.command)
+                    .current_dir(working_dir)
+                    .env("CARGO_TARGET_DIR", &cargo_target_dir);
                 sh_cmd
             };
 
@@ -296,6 +313,36 @@ mod tests {
             .await
             .expect("launch ok");
         assert_eq!(outcome, GateOutcome::Passed);
+    }
+
+    #[tokio::test]
+    async fn cargo_target_dir_is_isolated_per_working_dir() {
+        let first_dir = tempfile::tempdir().expect("first temp dir");
+        let second_dir = tempfile::tempdir().expect("second temp dir");
+        let gates = vec![gate(
+            "record-target-dir",
+            "printf '%s' \"$CARGO_TARGET_DIR\" > observed-target-dir",
+        )];
+        let runner = GateRunner::new();
+
+        for working_dir in [first_dir.path(), second_dir.path()] {
+            assert_eq!(
+                runner
+                    .run_gates(&gates, working_dir)
+                    .await
+                    .expect("gate launches"),
+                GateOutcome::Passed
+            );
+            let observed = std::fs::read_to_string(working_dir.join("observed-target-dir"))
+                .expect("gate records target dir");
+            assert_eq!(observed, working_dir.join("target").to_string_lossy());
+        }
+
+        assert_ne!(
+            first_dir.path().join("target"),
+            second_dir.path().join("target"),
+            "separate worktrees must not share Cargo artifacts"
+        );
     }
 
     #[tokio::test]
