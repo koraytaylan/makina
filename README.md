@@ -12,8 +12,9 @@ external **ACP** (Agent Client Protocol) CLI subprocess that is already signed i
 so Makina never handles model credentials.
 
 > **Status: MVP.** The full loop works end-to-end against a real agent. See
-> [`docs/trial/trial-findings.md`](docs/trial/trial-findings.md) for what's proven
-> and the known gaps, [`docs/demo/makina.tape`](docs/demo/makina.tape) for a
+> [`docs/current-status.md`](docs/current-status.md) for current capabilities and
+> safety boundaries, [`docs/trial/trial-findings.md`](docs/trial/trial-findings.md)
+> for the historical first-run evidence, [`docs/demo/makina.tape`](docs/demo/makina.tape) for a
 > scriptable demo ([render recipe](docs/demo/README.md)), and
 > [`docs/plans/0001-Initial/`](docs/plans/0001-Initial/) for the vision,
 > architecture, and roadmap.
@@ -218,8 +219,11 @@ approved tasks land on your base branch.
 - Permission requests are answered automatically by `WorktreePolicy`, which
   auto-allows operations inside the assigned worktree and audits every decision.
 
-These and prioritized next steps are tracked in
-[`docs/trial/trial-findings.md`](docs/trial/trial-findings.md).
+Current capabilities, safety boundaries, and remaining operational limitations
+are tracked in [`docs/current-status.md`](docs/current-status.md). The original
+end-to-end trial remains available as
+[`docs/trial/trial-findings.md`](docs/trial/trial-findings.md), but it is a
+historical record rather than the current roadmap.
 
 ## License
 

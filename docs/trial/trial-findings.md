@@ -1,5 +1,10 @@
 # Makina Trial Findings (plan 0001 — task 34)
 
+> **Historical record (2026-05-29).** This document captures the first
+> real-agent trial and intentionally preserves the implementation gaps observed
+> at that time. It is not the current status or roadmap. See
+> [`../current-status.md`](../current-status.md) for the maintained view.
+>
 > **Purpose:** Record what worked, what broke, and which `FUTURE.md` directions
 > the test-drive makes most urgent, to inform prioritization for plan 0002.
 > Run evidence lives in [`docs/trial/e2e-run.md`](e2e-run.md).
