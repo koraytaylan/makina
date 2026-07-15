@@ -40,9 +40,9 @@ inside an OS/container sandbox when host-level containment is required.
 
 - Real-agent integration tests require an installed, authenticated ACP CLI and
   remain opt-in; deterministic fake-backend coverage runs by default.
-- A clean, isolated Cargo target directory is recommended when testing across
-  temporary Git worktrees, because Rust test binaries can embed their build-time
-  source root.
+- Cargo gates and ACP sessions default `CARGO_TARGET_DIR` to the active task
+  worktree, preventing binaries that embed a deleted worktree path from being
+  reused by another task. Providers may explicitly override that directory.
 - Runtime logs and worktrees are transient. Task-graph artifacts and project
   configuration are the reviewable state intended for version control.
 
