@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use makina::app::{AccordionSection, App, TabContent};
+use makina::app::{AccordionSection, App, PlanIdentity, TabContent};
 use makina::ui;
 use makina_core::api::{
     Api, ApiError, Command, CommandOutcome, EventStream, RunId, RunStatus, RunView, TaskId,
@@ -121,6 +121,14 @@ fn make_app_with_tasks_and_plans() -> App {
     app
 }
 
+fn run_plan(app: &App) -> PlanIdentity {
+    app.plan_identity_for_run(&app.runs[0])
+}
+
+fn discovered_plan(app: &App) -> PlanIdentity {
+    app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0])
+}
+
 /// Helper to extract screen content from a terminal.
 fn screen_of(terminal: &Terminal<TestBackend>) -> String {
     terminal
@@ -139,14 +147,18 @@ fn tabbed_pane_renders_open_tabs() {
         Terminal::new(backend).unwrap()
     };
     let mut app = make_app_with_tasks();
+    let plan = run_plan(&app);
+    let run = app.runs[0].id;
 
     // Open a couple of tabs
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0001".to_string(),
+        plan: plan.clone(),
+        run,
         task_id: TaskId("task-1".to_string()),
     });
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0001".to_string(),
+        plan,
+        run,
         task_id: TaskId("task-2".to_string()),
     });
 
@@ -171,14 +183,18 @@ fn tabbed_pane_active_tab_is_distinguished() {
         Terminal::new(backend).unwrap()
     };
     let mut app = make_app_with_tasks();
+    let plan = run_plan(&app);
+    let run = app.runs[0].id;
 
     // Open two tabs
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0001".to_string(),
+        plan: plan.clone(),
+        run,
         task_id: TaskId("task-1".to_string()),
     });
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0001".to_string(),
+        plan,
+        run,
         task_id: TaskId("task-2".to_string()),
     });
 
@@ -232,17 +248,19 @@ fn render_task_and_plan_tabs_together() {
         Terminal::new(backend).unwrap()
     };
     let mut app = make_app_with_tasks_and_plans();
+    let task_plan = run_plan(&app);
+    let plan = discovered_plan(&app);
+    let run = app.runs[0].id;
 
     // Open a task tab
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0001".to_string(),
+        plan: task_plan,
+        run,
         task_id: TaskId("task-1".to_string()),
     });
 
     // Open a plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0001-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan });
 
     terminal.draw(|frame| ui::render(&app, frame)).unwrap();
     let screen = screen_of(&terminal);
@@ -318,17 +336,13 @@ fn plan_tabs_render_accordion_sections_without_panic() {
         status_text: Some("✅ Complete.".to_string()),
     };
     app.discovered_plans.push(plan);
+    let plan = discovered_plan(&app);
 
     // Open the plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0031-test".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan: plan.clone() });
 
     // Expand all sections
-    let expanded = app
-        .accordion_state
-        .entry("0031-test".to_string())
-        .or_default();
+    let expanded = app.accordion_state.entry(plan).or_default();
     expanded.insert(AccordionSection::Scope);
     expanded.insert(AccordionSection::Architecture);
     expanded.insert(AccordionSection::Tasks);
@@ -495,15 +509,17 @@ fn render_records_tab_and_sidebar_click_bounds() {
         Terminal::new(backend).unwrap()
     };
     let mut app = make_app_with_tasks_and_plans();
+    let task_plan = run_plan(&app);
+    let plan = discovered_plan(&app);
+    let run = app.runs[0].id;
 
     // Open a task tab and a plan tab so the tab bar has two chips.
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0001".to_string(),
+        plan: task_plan,
+        run,
         task_id: TaskId("task-1".to_string()),
     });
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0001-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan });
 
     terminal.draw(|frame| ui::render(&app, frame)).unwrap();
 

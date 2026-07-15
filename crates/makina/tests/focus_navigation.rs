@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use makina::app::{AccordionSection, App, AppEvent, Panel, TabContent};
+use makina::app::{AccordionSection, App, AppEvent, Panel, PlanIdentity, TabContent};
 use makina::ui;
 use makina_core::api::{
     Api, ApiError, Command, CommandOutcome, EventStream, RunId, RunView, TaskId,
@@ -78,6 +78,10 @@ fn make_app_with_plan() -> App {
     app
 }
 
+fn test_plan(app: &App) -> PlanIdentity {
+    app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0])
+}
+
 /// Test: Tab navigates Sidebar → Main when no plan tab is active
 #[test]
 fn test_tab_sidebar_to_main_no_plan() {
@@ -126,11 +130,10 @@ fn test_tab_sidebar_to_main_no_plan() {
 #[test]
 fn test_tab_full_cycle_with_plan_tab() {
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan });
     app.tabs.active_tab = Some(0);
 
     // Start in Sidebar
@@ -203,11 +206,10 @@ fn test_tab_full_cycle_with_plan_tab() {
 #[test]
 fn test_shift_tab_sidebar_to_status_with_plan_tab() {
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan });
     app.tabs.active_tab = Some(0);
 
     // Start in Sidebar
@@ -228,11 +230,10 @@ fn test_shift_tab_sidebar_to_status_with_plan_tab() {
 #[test]
 fn test_shift_tab_full_reverse_with_plan_tab() {
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan });
     app.tabs.active_tab = Some(0);
 
     // Start in Status (last section)
@@ -327,11 +328,10 @@ fn test_shift_tab_sidebar_noop_no_plan() {
 #[test]
 fn test_shift_tab_main_to_status_with_plan_tab() {
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan });
     app.tabs.active_tab = Some(0);
 
     // Start in Main with no section focus
@@ -353,11 +353,10 @@ fn test_shift_tab_main_to_status_with_plan_tab() {
 #[test]
 fn test_tab_wrapping_multiple_cycles() {
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan });
     app.tabs.active_tab = Some(0);
 
     // Do a full cycle: Sidebar → Main → Scope → Architecture → Tasks → Status → Sidebar
@@ -392,18 +391,14 @@ fn test_focused_section_visual_indicator() {
     };
 
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan: plan.clone() });
     app.tabs.active_tab = Some(0);
 
     // Expand all sections
-    let expanded = app
-        .accordion_state
-        .entry("0034-test-plan".to_string())
-        .or_default();
+    let expanded = app.accordion_state.entry(plan).or_default();
     expanded.insert(AccordionSection::Scope);
     expanded.insert(AccordionSection::Architecture);
     expanded.insert(AccordionSection::Tasks);
@@ -459,15 +454,15 @@ fn test_focused_section_visual_indicator() {
 #[test]
 fn test_tab_behavior_when_plan_tab_not_active() {
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab but then open a task tab
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan: plan.clone() });
 
     // Open a task tab (making it active)
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0034-test-plan".to_string(),
+        plan,
+        run: RunId(1),
         task_id: TaskId::new("task-1"),
     });
 
@@ -501,13 +496,13 @@ fn test_tab_behavior_when_plan_tab_not_active() {
 #[test]
 fn test_shift_tab_main_no_plan_active() {
     let mut app = make_app_with_plan();
+    let plan = test_plan(&app);
 
     // Open a plan tab but then make a non-plan tab active
-    app.tabs.open_tab(TabContent::Plan {
-        plan_slug: "0034-test-plan".to_string(),
-    });
+    app.tabs.open_tab(TabContent::Plan { plan: plan.clone() });
     app.tabs.open_tab(TabContent::Task {
-        plan_slug: "0034-test-plan".to_string(),
+        plan,
+        run: RunId(1),
         task_id: TaskId::new("task-1"),
     });
 

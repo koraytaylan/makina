@@ -122,6 +122,7 @@ mod tests {
     ) -> Settings {
         use crate::app::SettingsField;
         Settings {
+            project_root: std::path::PathBuf::from("."),
             gate_iterations: gate_iterations.to_string(),
             reviewer_iterations: reviewer_iterations.to_string(),
             wall_clock_secs: wall_clock_secs.to_string(),

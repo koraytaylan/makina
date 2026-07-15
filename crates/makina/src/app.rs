@@ -599,6 +599,9 @@ pub enum SettingsField {
 /// seeded from the App's loaded caps, plus the focused field.
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Immutable project selected when the modal opened. Saving must update
+    /// this project's config and routed runtime, even if other UI state changes.
+    pub project_root: PathBuf,
     pub gate_iterations: String,
     pub reviewer_iterations: String,
     pub wall_clock_secs: String,
@@ -613,15 +616,100 @@ pub struct Settings {
 /// Confirmation details for resetting the current plan/run.
 #[derive(Debug, Clone)]
 pub struct ResetConfirmation {
-    pub slug: String,
+    /// Immutable project + plan target shown in the confirmation dialog.
+    ///
+    /// Confirmation execution must consume this exact value instead of
+    /// recomputing selection after the modal has opened.
+    pub target: PlanIdentity,
     pub label: String,
+    /// Live run known when the confirmation was created.  Disk-only run ids are
+    /// harmless: the IO layer validates this id and opens `target` when it is
+    /// not backed by the live API registry.
+    pub run: Option<RunId>,
+}
+
+/// Stable identity of one plan inside one project.
+///
+/// Plan slugs are deliberately not identities: two repositories routinely
+/// contain the same scaffolded slug.  The task-list path remains useful even
+/// when `TASKS.md` does not exist yet because Core treats that synthetic path
+/// as the request to generate tasks from the other plan documents.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PlanIdentity {
+    pub project_root: PathBuf,
     pub task_list_path: PathBuf,
+    pub slug: String,
+}
+
+impl PlanIdentity {
+    pub fn new(project_root: PathBuf, task_list_path: PathBuf, slug: String) -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let project_root = lexical_absolute(&cwd, &project_root);
+        let task_list_path = lexical_absolute(&project_root, &task_list_path);
+        Self {
+            project_root,
+            task_list_path,
+            slug,
+        }
+    }
+
+    /// Test/back-compat identity for callers that have only a slug. Production
+    /// folder and run activation always uses [`PlanIdentity::new`].
+    pub fn legacy(slug: impl Into<String>) -> Self {
+        let slug = slug.into();
+        Self {
+            project_root: PathBuf::new(),
+            task_list_path: PathBuf::from("docs")
+                .join("plans")
+                .join(&slug)
+                .join("TASKS.md"),
+            slug,
+        }
+    }
+}
+
+/// Lexically make `path` absolute relative to `base`, removing `.` and `..`
+/// components without requiring the final path to exist.
+fn lexical_absolute(base: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Recover a repository root from the plan convention
+/// `{root}/docs/plans/{slug}/TASKS.md`.
+fn project_root_from_plan_path(path: &std::path::Path) -> Option<PathBuf> {
+    let plan_dir = path.parent()?;
+    let plans_dir = plan_dir.parent()?;
+    if plans_dir.file_name().and_then(|name| name.to_str()) != Some("plans") {
+        return None;
+    }
+    let docs_dir = plans_dir.parent()?;
+    if docs_dir.file_name().and_then(|name| name.to_str()) != Some("docs") {
+        return None;
+    }
+    docs_dir.parent().map(std::path::Path::to_path_buf)
 }
 
 /// One plan-level operation tracked by a small UI state machine.
 #[derive(Debug, Clone)]
 pub struct PlanOperationState {
-    pub slug: String,
+    pub target: PlanIdentity,
     pub label: String,
     pub kind: makina_core::api::PlanOperationKind,
     pub phase: makina_core::api::PlanOperationPhase,
@@ -641,7 +729,7 @@ impl PlanOperationState {
 /// Modal shown when the user asks for a command blocked by a plan operation.
 #[derive(Debug, Clone)]
 pub struct OperationNotice {
-    pub slug: String,
+    pub target: PlanIdentity,
     pub attempted: String,
 }
 
@@ -786,23 +874,19 @@ impl TreeNode {
     }
 }
 
-/// Namespaced key for [`App::collapsed_plans`].
-///
-/// Collapse state must be tracked for two independent plan-discovery paths
-/// whose indices would otherwise collide: the legacy single-folder path (keyed
-/// by index into `discovered_plans`) and the multi-folder path (keyed by folder
-/// index + the plan's index within that folder). Encoding the discriminant in
-/// the key type — instead of the old `folder_idx * 1000 + plan_idx` arithmetic —
-/// makes a legacy plan and a folder-scoped plan structurally distinct, so their
-/// collapse state can never alias.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Stable project-scoped key for [`App::collapsed_plans`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CollapseKey {
-    /// A plan discovered via the legacy single-folder path, keyed by index into
-    /// `discovered_plans`.
+    Plan(PlanIdentity),
+    /// Compatibility-only keys for older unit fixtures. Shipping code never
+    /// constructs index-based collapse identity.
+    #[cfg(test)]
     LegacyPlan(usize),
-    /// A folder-scoped plan (multi-folder path), keyed by folder index and the
-    /// plan's index within that folder's plan list.
-    FolderPlan { folder: usize, plan: usize },
+    #[cfg(test)]
+    FolderPlan {
+        folder: usize,
+        plan: usize,
+    },
 }
 
 // ── App input event ───────────────────────────────────────────────────────────
@@ -927,6 +1011,8 @@ pub enum AppEvent {
     },
     /// Per-folder discovery result arrived: store discovered plans by folder.
     PlansDiscoveredPerFolder {
+        /// Exact canonical folder snapshot used for this discovery pass.
+        roots: Vec<PathBuf>,
         /// The plans discovered per folder: folder_idx → list of PlanEntry.
         plans_map: std::collections::HashMap<usize, Vec<makina_core::orchestrator::PlanEntry>>,
     },
@@ -984,15 +1070,25 @@ pub enum AppEvent {
     /// Reset the selected run/plan back to a fresh pending graph.
     RequestResetRun,
     /// Execute a reset after the confirmation modal has been accepted.
-    ResetRun,
+    ResetRun { confirmation: ResetConfirmation },
     /// Close the reset confirmation modal without doing anything.
     CloseResetConfirmation,
     /// A reset has started in a background task.
-    ResetStarted { slug: String, label: String },
+    ResetStarted { target: PlanIdentity, label: String },
     /// A background reset finished.
-    ResetFinished { slug: String, message: String },
+    ResetFinished {
+        target: PlanIdentity,
+        message: String,
+    },
     /// A command was attempted while a plan operation is running.
-    OperationBlocked { slug: String, attempted: String },
+    OperationBlocked {
+        target: PlanIdentity,
+        attempted: String,
+    },
+    /// A project-scoped plan open/start was launched in the background.
+    PlanOpenStarted { target: PlanIdentity },
+    /// The background open/start completed (successfully or otherwise).
+    PlanOpenFinished { target: PlanIdentity },
     /// Close the operation notice modal.
     CloseOperationNotice,
 
@@ -1073,6 +1169,14 @@ pub enum AppEvent {
     SettingsNextOption,
     /// User pressed enter to save settings.
     SettingsCommit,
+    /// Project config was written successfully (runtime update may have warned
+    /// separately through the status message).
+    SettingsSaved {
+        project_root: PathBuf,
+        values: crate::settings_validation::SettingsValidation,
+    },
+    /// Settings validation or persistence failed; keep the modal open.
+    SettingsSaveFailed { reason: String },
     /// Close the settings screen without saving.
     CloseSettings,
 
@@ -1204,14 +1308,18 @@ pub struct SelectionPane {
 /// Content displayed in a tab in the main pane.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TabContent {
-    /// A task within a run: identified by plan slug and task ID.
-    Task { plan_slug: String, task_id: TaskId },
+    /// A task within a run, scoped to its project/plan and live run id.
+    Task {
+        plan: PlanIdentity,
+        run: RunId,
+        task_id: TaskId,
+    },
     /// A task preview under a discovered plan (parsed from its TASKS.md):
     /// identified by the plan slug and the task's kebab id. Distinct from
     /// [`TabContent::Task`], which is backed by a running task.
-    PlanTask { plan_slug: String, task_id: String },
-    /// A discovered plan: identified by plan slug.
-    Plan { plan_slug: String },
+    PlanTask { plan: PlanIdentity, task_id: String },
+    /// A discovered plan, including stable project identity.
+    Plan { plan: PlanIdentity },
 }
 
 /// State for the tabbed content pane.
@@ -1402,6 +1510,14 @@ pub struct App {
     /// The list of open Runs, seeded from `api.runs()` at startup and
     /// incrementally updated from api events.
     pub runs: Vec<RunView>,
+
+    /// Canonical project owner retained for each run.
+    ///
+    /// Run task-list paths are not required to use the `docs/plans/...`
+    /// convention. Remembering the owner while its folder is open keeps an
+    /// arbitrary path (for example `repo-b/custom.md`) project-scoped even
+    /// after that folder is closed and disappears from `opened_folders`.
+    run_project_roots: HashMap<RunId, PathBuf>,
 
     /// Index into `runs` identifying the currently selected/focused Run.
     /// `None` when `runs` is empty.
@@ -1603,8 +1719,13 @@ pub struct App {
     /// What happens to a completed plan branch at run end.
     pub final_merge: FinalMerge,
 
-    /// Plan-level operations keyed by plan slug.
-    pub plan_operations: HashMap<String, PlanOperationState>,
+    /// Plan-level operations keyed by canonical project + task-list identity.
+    pub plan_operations: HashMap<PlanIdentity, PlanOperationState>,
+
+    /// Plan opens currently executing `OpenRun` (and optionally `StartRun`).
+    /// This closes the TUI-side repeated-interaction window before Core has had
+    /// time to publish `RunOpened`.
+    pub opening_plans: HashSet<PlanIdentity>,
 
     /// State for the tabbed main content pane.
     pub tabs: TabState,
@@ -1612,7 +1733,7 @@ pub struct App {
     /// Accordion expand/collapse state for plan tabs.
     /// Keyed by plan slug; the set contains sections that are expanded.
     /// Sections not in the set are collapsed. All sections default to collapsed.
-    pub accordion_state: HashMap<String, HashSet<AccordionSection>>,
+    pub accordion_state: HashMap<PlanIdentity, HashSet<AccordionSection>>,
 
     /// Accordion expand/collapse state for task tabs.
     /// Keyed by task id; the set contains sections that are expanded.
@@ -1727,6 +1848,11 @@ pub fn hash_text(text: &str) -> u64 {
 }
 
 impl App {
+    pub(crate) fn canonical_repo_root(&self) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        lexical_absolute(&cwd, &self.repo_root)
+    }
+
     /// Load transcripts for the initially-selected run (if any).
     ///
     /// Should be called right after `new()` to populate exchanges for the first
@@ -1741,13 +1867,13 @@ impl App {
     pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
 
-        // Slugs of plans that already have an open Run (any status, deduped to
+        // Project-scoped plans that already have an open Run (any status, deduped to
         // latest below). Such a plan is rendered as its Run node — NOT also as
         // static plan — otherwise starting would duplicate.
-        let run_slugs: std::collections::HashSet<String> = self
+        let run_plans: std::collections::HashSet<PlanIdentity> = self
             .runs
             .iter()
-            .map(|r| makina_core::orchestrator::plan_slug(&r.task_list_path))
+            .map(|run| self.plan_identity_for_run(run))
             .collect();
 
         // Step 1: Add discovered folders and their plans.
@@ -1761,7 +1887,9 @@ impl App {
             {
                 for (local_plan_idx, plan) in plans.iter().enumerate() {
                     // Skip if this plan has an open Run (same dedup as before).
-                    if run_slugs.contains(&plan.slug) {
+                    let target =
+                        self.plan_identity_for_entry(&self.opened_folders[folder_idx], plan);
+                    if run_plans.contains(&target) {
                         continue;
                     }
                     nodes.push(TreeNode::PlanInFolder {
@@ -1770,10 +1898,10 @@ impl App {
                     });
 
                     // Expand plan tasks if not collapsed.
-                    if !self.collapsed_plans.contains(&CollapseKey::FolderPlan {
-                        folder: folder_idx,
-                        plan: local_plan_idx,
-                    }) {
+                    if !self
+                        .collapsed_plans
+                        .contains(&CollapseKey::Plan(target.clone()))
+                    {
                         for task_idx in 0..plan.tasks.len() {
                             nodes.push(TreeNode::PlanTaskInFolder {
                                 folder_idx,
@@ -1789,14 +1917,12 @@ impl App {
         // Step 2: Add legacy discovered plans (for backward compat).
         // These use the legacy Plan/PlanTask variants.
         for (plan_idx, plan) in self.discovered_plans.iter().enumerate() {
-            if run_slugs.contains(&plan.slug) {
+            let target = self.plan_identity_for_entry(&self.repo_root, plan);
+            if run_plans.contains(&target) {
                 continue;
             }
             nodes.push(TreeNode::Plan { plan_idx });
-            if !self
-                .collapsed_plans
-                .contains(&CollapseKey::LegacyPlan(plan_idx))
-            {
+            if !self.collapsed_plans.contains(&CollapseKey::Plan(target)) {
                 for task_idx in 0..plan.tasks.len() {
                     nodes.push(TreeNode::PlanTask { plan_idx, task_idx });
                 }
@@ -1811,8 +1937,8 @@ impl App {
         };
         for (run_idx, run) in self.runs.iter().enumerate() {
             let add_this = if is_plan_style(&run.task_list_path) {
-                let pslug = makina_core::orchestrator::plan_slug(&run.task_list_path);
-                self.latest_run_for_plan(&pslug)
+                let target = self.plan_identity_for_run(run);
+                self.latest_run_for_plan(&target)
                     .is_some_and(|lr| lr.id == run.id)
             } else {
                 true
@@ -1897,22 +2023,10 @@ impl App {
         };
         let prev_run = self.selected_run;
         match self.tabs.open_tabs.get(active) {
-            Some(TabContent::Task { plan_slug, task_id }) => {
-                let plan_slug = plan_slug.clone();
-                let task_id = task_id.clone();
-                // Pick the *latest* run for the slug that contains the task (in case of
-                // multiple runs for same plan).
-                let best = self
-                    .runs
-                    .iter()
-                    .filter(|run| {
-                        makina_core::orchestrator::plan_slug(&run.task_list_path) == plan_slug
-                            && run.tasks.iter().any(|t| t.id == task_id)
-                    })
-                    .max_by_key(|run| &run.run_uid);
-                if let Some(run_view) = best
-                    && let Some(run_idx) = self.runs.iter().position(|r| r.id == run_view.id)
-                {
+            Some(TabContent::Task { run, task_id, .. }) => {
+                if let Some(run_idx) = self.runs.iter().position(|view| {
+                    view.id == *run && view.tasks.iter().any(|task| task.id == *task_id)
+                }) {
                     self.selected_run = Some(run_idx);
                 }
             }
@@ -1920,10 +2034,9 @@ impl App {
             // the run for that plan if one is open, else CLEAR any stale
             // selection — so run-control acts on this plan (Start opens + runs
             // it) instead of a previously selected, unrelated run.
-            Some(TabContent::Plan { plan_slug }) | Some(TabContent::PlanTask { plan_slug, .. }) => {
-                let plan_slug = plan_slug.clone();
+            Some(TabContent::Plan { plan }) | Some(TabContent::PlanTask { plan, .. }) => {
                 self.selected_run = self
-                    .latest_run_for_plan(&plan_slug)
+                    .latest_run_for_plan(plan)
                     .and_then(|r| self.runs.iter().position(|rr| rr.id == r.id));
             }
             _ => {}
@@ -1937,33 +2050,32 @@ impl App {
     /// `plans_by_folder` (plan 0032; extended for per-folder discovery in
     /// plan 0043). Called when plans are re-discovered and the list changes.
     fn close_tabs_for_missing_plans(&mut self) {
-        let valid_plans: std::collections::HashSet<_> = self
-            .discovered_plans
-            .iter()
-            .map(|p| p.slug.clone())
-            .chain(
-                self.plans_by_folder
-                    .values()
-                    .flatten()
-                    .map(|p| p.slug.clone()),
-            )
-            .collect();
+        let mut valid_plans = std::collections::HashSet::new();
+        for plan in &self.discovered_plans {
+            valid_plans.insert(self.plan_identity_for_entry(&self.repo_root, plan));
+        }
+        for (folder_idx, plans) in &self.plans_by_folder {
+            let Some(root) = self.opened_folders.get(*folder_idx) else {
+                continue;
+            };
+            for plan in plans {
+                valid_plans.insert(self.plan_identity_for_entry(root, plan));
+            }
+        }
         let mut indices_to_close = Vec::new();
-        let mut slugs_to_remove = Vec::new();
+        let mut plans_to_remove = Vec::new();
         for (idx, tab) in self.tabs.open_tabs.iter().enumerate() {
             // Both plan tabs and a plan's task-preview tabs are keyed by plan
             // slug; close either when its plan is gone.
-            let plan_slug = match tab {
-                TabContent::Plan { plan_slug } | TabContent::PlanTask { plan_slug, .. } => {
-                    Some(plan_slug)
-                }
+            let plan = match tab {
+                TabContent::Plan { plan } | TabContent::PlanTask { plan, .. } => Some(plan),
                 TabContent::Task { .. } => None,
             };
-            if let Some(plan_slug) = plan_slug
-                && !valid_plans.contains(plan_slug)
+            if let Some(plan) = plan
+                && !valid_plans.contains(plan)
             {
                 indices_to_close.push(idx);
-                slugs_to_remove.push(plan_slug.clone());
+                plans_to_remove.push(plan.clone());
             }
         }
         // Close tabs in reverse order so indices don't shift.
@@ -1971,8 +2083,8 @@ impl App {
             self.tabs.close_tab(*idx);
         }
         // Clean up accordion state for removed plans.
-        for slug in slugs_to_remove {
-            self.accordion_state.remove(&slug);
+        for plan in plans_to_remove {
+            self.accordion_state.remove(&plan);
         }
     }
 
@@ -2030,7 +2142,9 @@ impl App {
                 {
                     return false;
                 }
-                let key = CollapseKey::LegacyPlan(plan_idx);
+                let Some(key) = self.collapse_key_for_node(TreeNode::Plan { plan_idx }) else {
+                    return false;
+                };
                 if self.collapsed_plans.contains(&key) {
                     self.collapsed_plans.remove(&key);
                 } else {
@@ -2064,9 +2178,11 @@ impl App {
                     return false;
                 }
                 // Use the same collapse key as visible_tree_nodes() uses.
-                let collapse_key = CollapseKey::FolderPlan {
-                    folder: folder_idx,
-                    plan: plan_idx,
+                let Some(collapse_key) = self.collapse_key_for_node(TreeNode::PlanInFolder {
+                    folder_idx,
+                    plan_idx,
+                }) else {
+                    return false;
                 };
                 if self.collapsed_plans.contains(&collapse_key) {
                     self.collapsed_plans.remove(&collapse_key);
@@ -2083,9 +2199,12 @@ impl App {
                 ..
             }) => {
                 // On a task leaf, collapse its parent plan and park the cursor on the plan header.
-                let collapse_key = CollapseKey::FolderPlan {
-                    folder: folder_idx,
-                    plan: plan_idx,
+                let Some(collapse_key) = self.collapse_key_for_node(TreeNode::PlanTaskInFolder {
+                    folder_idx,
+                    plan_idx,
+                    task_idx: 0,
+                }) else {
+                    return false;
                 };
                 self.collapsed_plans.insert(collapse_key);
                 self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
@@ -2148,14 +2267,14 @@ impl App {
     fn activate_plan_in_folder(&mut self, folder_idx: usize, plan_idx: usize) {
         if let Some(plans) = self.plans_by_folder.get(&folder_idx)
             && let Some(plan) = plans.get(plan_idx)
+            && let Some(project_root) = self.opened_folders.get(folder_idx)
         {
-            let plan_slug = plan.slug.clone();
-            self.tabs.open_tab(TabContent::Plan { plan_slug });
+            let target = self.plan_identity_for_entry(project_root, plan);
+            self.tabs.open_tab(TabContent::Plan {
+                plan: target.clone(),
+            });
             if !plan.tasks.is_empty() {
-                let collapse_key = CollapseKey::FolderPlan {
-                    folder: folder_idx,
-                    plan: plan_idx,
-                };
+                let collapse_key = CollapseKey::Plan(target.clone());
                 self.collapsed_plans.remove(&collapse_key);
                 self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
                 self.sync_selection_from_cursor();
@@ -2169,11 +2288,13 @@ impl App {
     /// (OpenTreeRow) on plan rows.
     fn activate_plan_node(&mut self, plan_idx: usize) {
         if let Some(plan) = self.discovered_plans.get(plan_idx) {
-            let plan_slug = plan.slug.clone();
-            self.tabs.open_tab(TabContent::Plan { plan_slug });
+            let target = self.plan_identity_for_entry(&self.repo_root, plan);
+            self.tabs.open_tab(TabContent::Plan {
+                plan: target.clone(),
+            });
             if !plan.tasks.is_empty() {
                 self.collapsed_plans
-                    .remove(&CollapseKey::LegacyPlan(plan_idx));
+                    .remove(&CollapseKey::Plan(target.clone()));
                 self.move_cursor_to_plan_header(plan_idx);
                 self.sync_selection_from_cursor();
             }
@@ -2201,7 +2322,7 @@ impl App {
                     && let Some(preview) = plan.tasks.get(task_idx)
                 {
                     let tab_content = TabContent::PlanTask {
-                        plan_slug: plan.slug.clone(),
+                        plan: self.plan_identity_for_entry(&self.repo_root, plan),
                         task_id: preview.id.clone(),
                     };
                     self.tabs.open_tab(tab_content);
@@ -2223,9 +2344,10 @@ impl App {
                 if let Some(plans) = self.plans_by_folder.get(&folder_idx)
                     && let Some(plan) = plans.get(plan_idx)
                     && let Some(preview) = plan.tasks.get(task_idx)
+                    && let Some(project_root) = self.opened_folders.get(folder_idx)
                 {
                     let tab_content = TabContent::PlanTask {
-                        plan_slug: plan.slug.clone(),
+                        plan: self.plan_identity_for_entry(project_root, plan),
                         task_id: preview.id.clone(),
                     };
                     self.tabs.open_tab(tab_content);
@@ -2241,9 +2363,10 @@ impl App {
                 if let Some(run_view) = self.runs.get(run)
                     && let Some(task_view) = run_view.tasks.get(task)
                 {
-                    let plan_slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+                    let plan = self.plan_identity_for_run(run_view);
                     let tab_content = TabContent::Task {
-                        plan_slug,
+                        plan,
+                        run: run_view.id,
                         task_id: task_view.id.clone(),
                     };
                     self.tabs.open_tab(tab_content);
@@ -2253,9 +2376,9 @@ impl App {
             }
             Some(TreeNode::Run { run }) => {
                 if let Some(run_view) = self.runs.get(run) {
-                    let slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
-                    if self.discovered_plans.iter().any(|p| p.slug == slug) {
-                        self.tabs.open_tab(TabContent::Plan { plan_slug: slug });
+                    let target = self.plan_identity_for_run(run_view);
+                    if self.plan_entry(&target).is_some() {
+                        self.tabs.open_tab(TabContent::Plan { plan: target });
                         opened_tab = true;
                     }
                     // Expand the run so its tasks become visible in the sidebar
@@ -2301,7 +2424,7 @@ impl App {
         // launch render expanded with their tasks visible, which makes the
         // first plan appear "already expanded" on startup.
         let collapsed_runs: HashSet<RunId> = initial_runs.iter().map(|r| r.id).collect();
-        Self {
+        let mut app = Self {
             should_quit: false,
             api,
             focused_panel: Panel::Sidebar,
@@ -2315,6 +2438,7 @@ impl App {
             providers: Vec::new(),
             roles: RolesConfig::default(),
             runs: initial_runs,
+            run_project_roots: HashMap::new(),
             selected_run,
             selected_task,
             collapsed_runs,
@@ -2357,6 +2481,7 @@ impl App {
             concurrency: 3,
             final_merge: FinalMerge::Squash,
             plan_operations: HashMap::new(),
+            opening_plans: HashSet::new(),
             verbose_mode: false,
             active_theme: crate::theme::ayu_dark(),
             role_metrics: HashMap::new(),
@@ -2377,7 +2502,9 @@ impl App {
             opened_folders: Vec::new(),
             workspace: crate::workspace::Workspace::new(),
             workspace_path_override: None,
-        }
+        };
+        app.refresh_run_project_roots();
+        app
     }
 
     /// Build a new [`App`] with explicit providers, roles, probes, and doctor state from a resolved config.
@@ -2411,6 +2538,7 @@ impl App {
         app.concurrency = concurrency;
         app.final_merge = final_merge;
         app.opened_folders = opened_folders;
+        app.refresh_run_project_roots();
         app.workspace = workspace;
         app
     }
@@ -2481,6 +2609,75 @@ impl App {
         }
     }
 
+    /// Remove an opened folder and synchronously repair every index-based
+    /// folder state before asynchronous rediscovery can render another frame.
+    pub fn remove_opened_folder(&mut self, path: &std::path::Path) -> bool {
+        let Some(removed_idx) = self.opened_folders.iter().position(|root| root == path) else {
+            return false;
+        };
+        // Capture run ownership before the folder disappears. Convention-based
+        // plans can recover their root from the path, but arbitrary task-list
+        // paths cannot do so once `opened_folders` has been reindexed.
+        self.refresh_run_project_roots();
+        let removed_root = lexical_absolute(&self.repo_root, path);
+        self.opened_folders.remove(removed_idx);
+
+        self.plans_by_folder = std::mem::take(&mut self.plans_by_folder)
+            .into_iter()
+            .filter_map(|(idx, plans)| match idx.cmp(&removed_idx) {
+                std::cmp::Ordering::Less => Some((idx, plans)),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some((idx - 1, plans)),
+            })
+            .collect();
+        self.collapsed_folders = std::mem::take(&mut self.collapsed_folders)
+            .into_iter()
+            .filter_map(|idx| match idx.cmp(&removed_idx) {
+                std::cmp::Ordering::Less => Some(idx),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(idx - 1),
+            })
+            .collect();
+        self.collapsed_plans.retain(|key| match key {
+            CollapseKey::Plan(target) => target.project_root != removed_root,
+            #[cfg(test)]
+            CollapseKey::LegacyPlan(_) | CollapseKey::FolderPlan { .. } => true,
+        });
+
+        let tabs_to_close: Vec<usize> = self
+            .tabs
+            .open_tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tab)| {
+                let target = match tab {
+                    TabContent::Plan { plan }
+                    | TabContent::PlanTask { plan, .. }
+                    | TabContent::Task { plan, .. } => plan,
+                };
+                (target.project_root == removed_root).then_some(idx)
+            })
+            .collect();
+        for idx in tabs_to_close.into_iter().rev() {
+            self.tabs.close_tab(idx);
+        }
+        self.accordion_state
+            .retain(|target, _| target.project_root != removed_root);
+        self.plan_operations
+            .retain(|target, _| target.project_root != removed_root);
+        self.opening_plans
+            .retain(|target| target.project_root != removed_root);
+
+        let count = self.visible_tree_nodes().len();
+        self.tree_cursor = match (self.tree_cursor, count) {
+            (_, 0) => None,
+            (Some(cursor), count) => Some(cursor.min(count - 1)),
+            (None, _) => Some(0),
+        };
+        self.sync_selection_from_cursor();
+        true
+    }
+
     /// Get the folder browser purpose if currently in folder browser mode.
     pub fn folder_browser_purpose(&self) -> Option<FolderBrowserPurpose> {
         match self.mode {
@@ -2519,43 +2716,101 @@ impl App {
         self.mode == Mode::OperationNotice
     }
 
-    /// Human label for a plan slug that is currently resetting.
-    pub fn resetting_label(&self, slug: &str) -> Option<&str> {
+    /// Human label for a project-scoped plan that is currently resetting.
+    pub fn resetting_label(&self, target: &PlanIdentity) -> Option<&str> {
         self.plan_operations
-            .get(slug)
+            .get(target)
             .filter(|op| op.kind == makina_core::api::PlanOperationKind::Reset && op.is_running())
             .map(|op| op.label.as_str())
     }
 
     /// Whether the given run belongs to a plan currently being reset.
     pub fn is_resetting_run(&self, run: &RunView) -> bool {
-        let slug = makina_core::orchestrator::plan_slug(&run.task_list_path);
-        self.resetting_label(&slug).is_some()
+        let target = self.plan_identity_for_run(run);
+        self.resetting_label(&target).is_some()
     }
 
-    /// Running operation for a plan slug, if any.
-    pub fn running_plan_operation(&self, slug: &str) -> Option<&PlanOperationState> {
-        self.plan_operations.get(slug).filter(|op| op.is_running())
+    /// Running operation for a project-scoped plan, if any.
+    pub fn running_plan_operation(&self, target: &PlanIdentity) -> Option<&PlanOperationState> {
+        self.plan_operations
+            .get(target)
+            .filter(|op| op.is_running())
     }
 
     /// Operation log for the current plan/run context.
     pub fn context_operation_log(&self) -> Option<&PlanOperationState> {
-        let slug = self.reset_context_slug()?;
-        self.plan_operations.get(&slug)
+        let target = self.context_plan_identity()?;
+        self.plan_operations.get(&target)
     }
 
-    /// The current plan/run slug for command guarding.
-    pub fn reset_context_slug(&self) -> Option<String> {
-        if let Some(plan) = self.context_plan() {
-            return Some(plan.slug.clone());
+    /// The current project-scoped plan target for command guarding.
+    pub fn reset_context_target(&self) -> Option<PlanIdentity> {
+        if let Some(target) = self.context_plan_identity() {
+            return Some(target);
         }
         self.selected_run()
-            .map(|run| makina_core::orchestrator::plan_slug(&run.task_list_path))
+            .map(|run| self.plan_identity_for_run(run))
+    }
+
+    /// Canonical project targeted by project-level commands. A sidebar
+    /// selection is authoritative only while the sidebar owns focus; otherwise
+    /// the active tab supplies the immutable project context.
+    pub fn context_project_root(&self) -> PathBuf {
+        if self.focused_panel == Panel::Sidebar {
+            match self.focused_node() {
+                Some(TreeNode::Folder { folder_idx }) => {
+                    if let Some(root) = self.opened_folders.get(folder_idx) {
+                        return lexical_absolute(&self.repo_root, root);
+                    }
+                }
+                Some(
+                    node @ (TreeNode::Plan { .. }
+                    | TreeNode::PlanTask { .. }
+                    | TreeNode::PlanInFolder { .. }
+                    | TreeNode::PlanTaskInFolder { .. }),
+                ) => {
+                    if let Some(target) = self.plan_identity_for_node(node) {
+                        return target.project_root;
+                    }
+                }
+                Some(TreeNode::Run { run }) | Some(TreeNode::Task { run, .. }) => {
+                    if let Some(view) = self.runs.get(run) {
+                        return self.plan_identity_for_run(view).project_root;
+                    }
+                }
+                None => {}
+            }
+        }
+
+        if let Some(active) = self.tabs.active_tab
+            && let Some(tab) = self.tabs.open_tabs.get(active)
+        {
+            let target = match tab {
+                TabContent::Plan { plan }
+                | TabContent::PlanTask { plan, .. }
+                | TabContent::Task { plan, .. } => plan,
+            };
+            if target.project_root.as_os_str().is_empty() {
+                if let Some(entry) = self.plan_entry(target) {
+                    return self
+                        .plan_identity_for_entry(&self.repo_root, entry)
+                        .project_root;
+                }
+            } else {
+                return target.project_root.clone();
+            }
+        }
+
+        self.selected_run()
+            .map(|run| self.plan_identity_for_run(run).project_root)
+            .unwrap_or_else(|| self.canonical_repo_root())
     }
 
     /// Build reset confirmation details for the active plan/run context.
     pub fn reset_confirmation_for_context(&self) -> Result<ResetConfirmation, String> {
-        if let Some(plan) = self.context_plan() {
+        if let Some(target) = self.context_plan_identity()
+            && let Some(plan) = self.plan_entry(&target)
+        {
             if !plan.has_tasks {
                 return Err(format!(
                     "{}: no TASKS.md to reset — author tasks first",
@@ -2563,18 +2818,18 @@ impl App {
                 ));
             }
             return Ok(ResetConfirmation {
-                slug: plan.slug.clone(),
                 label: plan.slug.clone(),
-                task_list_path: plan.dir.join("TASKS.md"),
+                run: self.latest_run_for_plan(&target).map(|run| run.id),
+                target,
             });
         }
 
         if let Some(run) = self.selected_run() {
-            let slug = makina_core::orchestrator::plan_slug(&run.task_list_path);
+            let target = self.plan_identity_for_run(run);
             return Ok(ResetConfirmation {
-                label: slug.clone(),
-                slug,
-                task_list_path: run.task_list_path.clone(),
+                label: target.slug.clone(),
+                target,
+                run: Some(run.id),
             });
         }
 
@@ -2594,8 +2849,255 @@ impl App {
         self.selected_run.and_then(|i| self.runs.get(i))
     }
 
+    /// Build an identity for a discovered folder plan.
+    pub fn plan_identity_for_entry(
+        &self,
+        project_root: &std::path::Path,
+        plan: &makina_core::orchestrator::PlanEntry,
+    ) -> PlanIdentity {
+        let task_list_path = plan.dir.join("TASKS.md");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let configured_root = lexical_absolute(&cwd, project_root);
+        let effective_root =
+            if task_list_path.is_absolute() && !task_list_path.starts_with(&configured_root) {
+                project_root_from_plan_path(&task_list_path).unwrap_or(configured_root)
+            } else {
+                configured_root
+            };
+        PlanIdentity::new(effective_root, task_list_path, plan.slug.clone())
+    }
+
+    /// Stable identity for a plan or plan-task sidebar node.
+    pub fn plan_identity_for_node(&self, node: TreeNode) -> Option<PlanIdentity> {
+        match node {
+            TreeNode::Plan { plan_idx } | TreeNode::PlanTask { plan_idx, .. } => self
+                .discovered_plans
+                .get(plan_idx)
+                .map(|plan| self.plan_identity_for_entry(&self.repo_root, plan)),
+            TreeNode::PlanInFolder {
+                folder_idx,
+                plan_idx,
+            }
+            | TreeNode::PlanTaskInFolder {
+                folder_idx,
+                plan_idx,
+                ..
+            } => self
+                .opened_folders
+                .get(folder_idx)
+                .zip(
+                    self.plans_by_folder
+                        .get(&folder_idx)
+                        .and_then(|plans| plans.get(plan_idx)),
+                )
+                .map(|(root, plan)| self.plan_identity_for_entry(root, plan)),
+            _ => None,
+        }
+    }
+
+    pub fn collapse_key_for_node(&self, node: TreeNode) -> Option<CollapseKey> {
+        self.plan_identity_for_node(node).map(CollapseKey::Plan)
+    }
+
+    /// Infer a run's canonical project while enough workspace context exists
+    /// to do so without guessing. Callers retain successful inferences because
+    /// an opened folder may later be closed.
+    fn infer_project_root_for_run(&self, run: &RunView) -> Option<PathBuf> {
+        let launch_root = self.canonical_repo_root();
+        let path = &run.task_list_path;
+
+        if path.is_absolute() {
+            let absolute_path = lexical_absolute(&launch_root, path);
+            return self
+                .opened_folders
+                .iter()
+                .map(|root| lexical_absolute(&launch_root, root))
+                .filter(|root| absolute_path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .or_else(|| project_root_from_plan_path(&absolute_path))
+                .or_else(|| {
+                    absolute_path
+                        .starts_with(&launch_root)
+                        .then_some(launch_root)
+                });
+        }
+
+        // Historical snapshots store relative paths. Their persisted project
+        // label is enough only when it names exactly one opened folder.
+        if !run.project.is_empty() {
+            let mut named = self
+                .opened_folders
+                .iter()
+                .map(|root| lexical_absolute(&launch_root, root))
+                .filter(|root| {
+                    root.file_name().and_then(|name| name.to_str()) == Some(run.project.as_str())
+                });
+            if let (Some(root), None) = (named.next(), named.next()) {
+                return Some(root);
+            }
+            if launch_root.file_name().and_then(|name| name.to_str()) == Some(run.project.as_str())
+            {
+                return Some(launch_root);
+            }
+        }
+
+        None
+    }
+
+    fn remember_run_project_root(&mut self, run: &RunView) {
+        if let Some(root) = self.infer_project_root_for_run(run) {
+            self.run_project_roots.entry(run.id).or_insert(root);
+        }
+    }
+
+    fn refresh_run_project_roots(&mut self) {
+        let inferred: Vec<_> = self
+            .runs
+            .iter()
+            .filter_map(|run| {
+                self.infer_project_root_for_run(run)
+                    .map(|root| (run.id, root))
+            })
+            .collect();
+        for (run, root) in inferred {
+            self.run_project_roots.entry(run).or_insert(root);
+        }
+    }
+
+    /// Recover canonical project + plan identity for a run. Live plan paths are
+    /// normally absolute. Historical disk snapshots are relative synthetic
+    /// `docs/plans/.../TASKS.md` paths, so they are rooted using the unique
+    /// matching opened project (falling back to the launch project). A retained
+    /// owner takes precedence so closing a project cannot re-home its runs.
+    pub fn plan_identity_for_run(&self, run: &RunView) -> PlanIdentity {
+        let path = &run.task_list_path;
+        let project_root = self
+            .run_project_roots
+            .get(&run.id)
+            .cloned()
+            .or_else(|| self.infer_project_root_for_run(run))
+            .unwrap_or_else(|| self.canonical_repo_root());
+        PlanIdentity::new(
+            project_root,
+            path.clone(),
+            makina_core::orchestrator::plan_slug(path),
+        )
+    }
+
+    /// Look up one plan by its full identity. Iteration order is irrelevant
+    /// because a candidate must match project root and task-list path.
+    pub fn plan_entry(
+        &self,
+        target: &PlanIdentity,
+    ) -> Option<&makina_core::orchestrator::PlanEntry> {
+        if target.project_root.as_os_str().is_empty() {
+            let mut matches = self
+                .discovered_plans
+                .iter()
+                .chain(self.plans_by_folder.values().flatten())
+                .filter(|plan| plan.slug == target.slug);
+            let first = matches.next();
+            return first.filter(|_| matches.next().is_none());
+        }
+        if let Some(plan) = self
+            .discovered_plans
+            .iter()
+            .find(|plan| self.plan_identity_for_entry(&self.repo_root, plan) == *target)
+        {
+            return Some(plan);
+        }
+        self.plans_by_folder
+            .iter()
+            .filter_map(|(folder_idx, plans)| {
+                self.opened_folders
+                    .get(*folder_idx)
+                    .map(|root| (root, plans))
+            })
+            .flat_map(|(root, plans)| plans.iter().map(move |plan| (root, plan)))
+            .find_map(|(root, plan)| {
+                (self.plan_identity_for_entry(root, plan) == *target).then_some(plan)
+            })
+    }
+
+    fn active_tab_plan_identity(&self) -> Option<PlanIdentity> {
+        if let Some(active) = self.tabs.active_tab
+            && let Some(content) = self.tabs.open_tabs.get(active)
+        {
+            match content {
+                TabContent::Plan { plan }
+                | TabContent::PlanTask { plan, .. }
+                | TabContent::Task { plan, .. } => {
+                    if plan.project_root.as_os_str().is_empty()
+                        && let Some(entry) = self.plan_entry(plan)
+                    {
+                        if let Some((folder_idx, _)) =
+                            self.plans_by_folder.iter().find(|(_, plans)| {
+                                plans.iter().any(|candidate| std::ptr::eq(candidate, entry))
+                            })
+                            && let Some(root) = self.opened_folders.get(*folder_idx)
+                        {
+                            return Some(self.plan_identity_for_entry(root, entry));
+                        }
+                        return Some(self.plan_identity_for_entry(&self.repo_root, entry));
+                    }
+                    return Some(plan.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn plan_identity_for_context_node(&self, node: TreeNode) -> Option<PlanIdentity> {
+        match node {
+            TreeNode::Plan { plan_idx } | TreeNode::PlanTask { plan_idx, .. } => self
+                .discovered_plans
+                .get(plan_idx)
+                .map(|plan| self.plan_identity_for_entry(&self.repo_root, plan)),
+            TreeNode::PlanInFolder {
+                folder_idx,
+                plan_idx,
+            }
+            | TreeNode::PlanTaskInFolder {
+                folder_idx,
+                plan_idx,
+                ..
+            } => self
+                .opened_folders
+                .get(folder_idx)
+                .zip(
+                    self.plans_by_folder
+                        .get(&folder_idx)
+                        .and_then(|plans| plans.get(plan_idx)),
+                )
+                .map(|(root, plan)| self.plan_identity_for_entry(root, plan)),
+            TreeNode::Run { run } | TreeNode::Task { run, .. } => self
+                .runs
+                .get(run)
+                .map(|view| self.plan_identity_for_run(view)),
+            TreeNode::Folder { .. } => None,
+        }
+    }
+
+    /// Stable identity for the plan the user is currently "in". A focused
+    /// sidebar node is authoritative while the sidebar owns focus; otherwise
+    /// the active tab supplies immutable context. This prevents commands from
+    /// targeting a stale tab while the user is acting on another sidebar plan,
+    /// without letting a stale sidebar cursor override the tab shown in Main.
+    pub fn context_plan_identity(&self) -> Option<PlanIdentity> {
+        if self.focused_panel == Panel::Sidebar
+            && let Some(node) = self.focused_node()
+        {
+            return self.plan_identity_for_context_node(node);
+        }
+
+        self.active_tab_plan_identity().or_else(|| {
+            self.focused_node()
+                .and_then(|node| self.plan_identity_for_context_node(node))
+        })
+    }
+
     /// The discovered plan the user is currently "in" — derived from the active
-    /// tab's slug (a plan or plan-task preview tab), falling back to the focused
+    /// tab's identity (a plan or plan-task preview tab), falling back to focused
     /// sidebar node (a plan or plan-task node).
     ///
     /// This lets run-control actions act on a discovered plan that has **no open
@@ -2603,27 +3105,8 @@ impl App {
     /// (see `crate::event`), instead of forcing the user through the `[o]` file
     /// browser. Returns `None` when the context is a run/run-task or nothing.
     pub fn context_plan(&self) -> Option<&makina_core::orchestrator::PlanEntry> {
-        // Prefer the active tab's plan slug (Plan or PlanTask preview tabs).
-        if let Some(active) = self.tabs.active_tab
-            && let Some(content) = self.tabs.open_tabs.get(active)
-        {
-            let slug = match content {
-                TabContent::Plan { plan_slug } | TabContent::PlanTask { plan_slug, .. } => {
-                    Some(plan_slug.as_str())
-                }
-                TabContent::Task { .. } => None,
-            };
-            if let Some(slug) = slug {
-                return self.discovered_plans.iter().find(|p| p.slug == slug);
-            }
-        }
-        // Fall back to the focused sidebar node.
-        match self.focused_node() {
-            Some(TreeNode::Plan { plan_idx }) | Some(TreeNode::PlanTask { plan_idx, .. }) => {
-                self.discovered_plans.get(plan_idx)
-            }
-            _ => None,
-        }
+        let target = self.context_plan_identity()?;
+        self.plan_entry(&target)
     }
 
     /// The [`RunId`] a run-control action should act on:
@@ -2636,20 +3119,47 @@ impl App {
     /// Return the most recent run (by `run_uid` ULID, i.e. newest) matching the
     /// given plan slug, if any. Used to deduplicate multiple historical runs for
     /// the same plan so the sidebar does not show duplicate "same plan" entries.
-    pub(crate) fn latest_run_for_plan(&self, slug: &str) -> Option<&RunView> {
+    pub(crate) fn latest_run_for_plan(&self, target: &PlanIdentity) -> Option<&RunView> {
         self.runs
             .iter()
-            .filter(|r| makina_core::orchestrator::plan_slug(&r.task_list_path) == slug)
+            .filter(|run| {
+                if target.project_root.as_os_str().is_empty() {
+                    makina_core::orchestrator::plan_slug(&run.task_list_path) == target.slug
+                } else {
+                    self.plan_identity_for_run(run) == *target
+                }
+            })
             .max_by_key(|r| &r.run_uid)
     }
 
     /// for the current context (the caller may then open one for the plan).
     pub fn active_run_id(&self) -> Option<makina_core::api::RunId> {
-        if let Some(run) = self.selected_run() {
-            return Some(run.id);
+        if self.focused_panel == Panel::Sidebar
+            && let Some(node) = self.focused_node()
+        {
+            return match node {
+                TreeNode::Run { run } | TreeNode::Task { run, .. } => {
+                    self.runs.get(run).map(|view| view.id)
+                }
+                TreeNode::Plan { .. }
+                | TreeNode::PlanTask { .. }
+                | TreeNode::PlanInFolder { .. }
+                | TreeNode::PlanTaskInFolder { .. } => self
+                    .plan_identity_for_context_node(node)
+                    .and_then(|target| self.latest_run_for_plan(&target))
+                    .map(|run| run.id),
+                TreeNode::Folder { .. } => None,
+            };
         }
-        let plan = self.context_plan()?;
-        self.latest_run_for_plan(&plan.slug).map(|r| r.id)
+        if let Some(active) = self.tabs.active_tab
+            && let Some(TabContent::Task { run, .. }) = self.tabs.open_tabs.get(active)
+        {
+            return Some(*run);
+        }
+        if let Some(target) = self.context_plan_identity() {
+            return self.latest_run_for_plan(&target).map(|run| run.id);
+        }
+        self.selected_run().map(|run| run.id)
     }
 
     /// Resolve the `(RunId, TaskId)` whose agent log the `[L]` panel should show,
@@ -2662,20 +3172,10 @@ impl App {
     pub fn log_pane_target(&self) -> Option<(RunId, TaskId)> {
         // 1. Active task tab → its run + task.
         if let Some(active) = self.tabs.active_tab
-            && let Some(TabContent::Task { plan_slug, task_id }) = self.tabs.open_tabs.get(active)
+            && let Some(TabContent::Task { run, task_id, .. }) = self.tabs.open_tabs.get(active)
+            && self.runs.iter().any(|view| view.id == *run)
         {
-            // Pick latest run for slug containing the task.
-            let best = self
-                .runs
-                .iter()
-                .filter(|r| {
-                    makina_core::orchestrator::plan_slug(&r.task_list_path) == *plan_slug
-                        && r.tasks.iter().any(|t| t.id == *task_id)
-                })
-                .max_by_key(|r| &r.run_uid);
-            if let Some(run) = best {
-                return Some((run.id, task_id.clone()));
-            }
+            return Some((*run, task_id.clone()));
         }
         // 2. Focused sidebar task node.
         if let Some(TreeNode::Task { run, task }) = self.focused_node()
@@ -3126,9 +3626,9 @@ impl App {
                         .runs
                         .get(run)
                         .is_some_and(|r| self.collapsed_runs.contains(&r.id)),
-                    Some(TreeNode::Plan { plan_idx }) => {
-                        self.collapsed_plans
-                            .contains(&CollapseKey::LegacyPlan(plan_idx))
+                    Some(node @ TreeNode::Plan { plan_idx }) => {
+                        self.collapse_key_for_node(node)
+                            .is_some_and(|key| self.collapsed_plans.contains(&key))
                             && self
                                 .discovered_plans
                                 .get(plan_idx)
@@ -3137,15 +3637,14 @@ impl App {
                     Some(TreeNode::Folder { folder_idx }) => {
                         self.collapsed_folders.contains(&folder_idx)
                     }
-                    Some(TreeNode::PlanInFolder {
-                        folder_idx,
-                        plan_idx,
-                    }) => {
-                        let collapse_key = CollapseKey::FolderPlan {
-                            folder: folder_idx,
-                            plan: plan_idx,
-                        };
-                        self.collapsed_plans.contains(&collapse_key)
+                    Some(
+                        node @ TreeNode::PlanInFolder {
+                            folder_idx,
+                            plan_idx,
+                        },
+                    ) => {
+                        self.collapse_key_for_node(node)
+                            .is_some_and(|key| self.collapsed_plans.contains(&key))
                             && self
                                 .plans_by_folder
                                 .get(&folder_idx)
@@ -3193,10 +3692,10 @@ impl App {
                         {
                             self.tree_toggle_expand(); // collapse it
                         }
-                        Some(TreeNode::Plan { plan_idx })
-                            if !self
-                                .collapsed_plans
-                                .contains(&CollapseKey::LegacyPlan(plan_idx))
+                        Some(node @ TreeNode::Plan { plan_idx })
+                            if self
+                                .collapse_key_for_node(node)
+                                .is_some_and(|key| !self.collapsed_plans.contains(&key))
                                 && self
                                     .discovered_plans
                                     .get(plan_idx)
@@ -3206,8 +3705,11 @@ impl App {
                         }
                         Some(TreeNode::PlanTask { plan_idx, .. }) => {
                             // Collapse the parent plan and move the cursor up to it.
-                            self.collapsed_plans
-                                .insert(CollapseKey::LegacyPlan(plan_idx));
+                            if let Some(key) =
+                                self.collapse_key_for_node(TreeNode::Plan { plan_idx })
+                            {
+                                self.collapsed_plans.insert(key);
+                            }
                             self.move_cursor_to_plan_header(plan_idx);
                             self.sync_selection_from_cursor();
                         }
@@ -3216,15 +3718,14 @@ impl App {
                         {
                             self.tree_toggle_expand(); // collapse it
                         }
-                        Some(TreeNode::PlanInFolder {
-                            folder_idx,
-                            plan_idx,
-                        }) if {
-                            let collapse_key = CollapseKey::FolderPlan {
-                                folder: folder_idx,
-                                plan: plan_idx,
-                            };
-                            !self.collapsed_plans.contains(&collapse_key)
+                        Some(
+                            node @ TreeNode::PlanInFolder {
+                                folder_idx,
+                                plan_idx,
+                            },
+                        ) if {
+                            self.collapse_key_for_node(node)
+                                .is_some_and(|key| !self.collapsed_plans.contains(&key))
                                 && self
                                     .plans_by_folder
                                     .get(&folder_idx)
@@ -3240,11 +3741,12 @@ impl App {
                             ..
                         }) => {
                             // Collapse the parent plan and move the cursor up to it.
-                            let collapse_key = CollapseKey::FolderPlan {
-                                folder: folder_idx,
-                                plan: plan_idx,
-                            };
-                            self.collapsed_plans.insert(collapse_key);
+                            if let Some(key) = self.collapse_key_for_node(TreeNode::PlanInFolder {
+                                folder_idx,
+                                plan_idx,
+                            }) {
+                                self.collapsed_plans.insert(key);
+                            }
                             self.move_cursor_to_plan_in_folder_header(folder_idx, plan_idx);
                             self.sync_selection_from_cursor();
                         }
@@ -3361,11 +3863,11 @@ impl App {
                         // Toggle the focused accordion section (if one is focused).
                         if let Some(focused_section) = self.focused_section
                             && let Some(active_idx) = self.tabs.active_tab
-                            && let Some(TabContent::Plan { plan_slug }) =
+                            && let Some(TabContent::Plan { plan }) =
                                 self.tabs.open_tabs.get(active_idx)
                         {
-                            let plan_slug = plan_slug.clone();
-                            let sections = self.accordion_state.entry(plan_slug).or_default();
+                            let plan = plan.clone();
+                            let sections = self.accordion_state.entry(plan).or_default();
                             if sections.contains(&focused_section) {
                                 sections.remove(&focused_section);
                             } else {
@@ -3394,6 +3896,9 @@ impl App {
 
             // ── Task-status view (task 29) ────────────────────────────────────
             AppEvent::RunLoaded(full_run) => {
+                self.remember_run_project_root(&full_run);
+                let loaded_target = self.plan_identity_for_run(&full_run);
+                self.opening_plans.remove(&loaded_target);
                 // Clear markdown cache when content changes
                 self.markdown_cache.borrow_mut().clear();
                 // Replace or insert the RunView with the fully-populated one from
@@ -3533,8 +4038,12 @@ impl App {
                 // index so the tree opens tidy and Right/Space/Enter reveal the
                 // tasks. (This also resets any prior expand state on a
                 // re-discovery.)
-                self.collapsed_plans = (0..self.discovered_plans.len())
-                    .map(CollapseKey::LegacyPlan)
+                self.collapsed_plans = self
+                    .discovered_plans
+                    .iter()
+                    .map(|plan| {
+                        CollapseKey::Plan(self.plan_identity_for_entry(&self.repo_root, plan))
+                    })
                     .collect();
                 // Close plan tabs whose slug is no longer in `discovered_plans`
                 // (plan 0032: close_tabs_for_missing_plans).
@@ -3556,7 +4065,14 @@ impl App {
                 true
             }
 
-            AppEvent::PlansDiscoveredPerFolder { plans_map } => {
+            AppEvent::PlansDiscoveredPerFolder { roots, plans_map } => {
+                // A folder may have been closed/reordered while this blocking
+                // scan was running. Never apply index-keyed results to a
+                // different root vector; the folder mutation launched a fresh
+                // scan whose snapshot will match.
+                if roots != self.opened_folders {
+                    return false;
+                }
                 // Store per-folder discovered plans for sidebar tree integration.
                 self.plans_by_folder = plans_map;
                 // Start every folder collapsed EXCEPT the first (folder_idx 0).
@@ -3574,18 +4090,17 @@ impl App {
                 // Right/Space/Enter reveal the tasks — mirroring the legacy
                 // `PlansDiscovered` seeding above. Plans with no tasks are
                 // leaves (never expandable) so they need no collapse key.
-                self.collapsed_plans = self
-                    .plans_by_folder
-                    .iter()
-                    .flat_map(|(folder_idx, plans)| {
-                        (0..plans.len())
-                            .filter(|&plan_idx| !plans[plan_idx].tasks.is_empty())
-                            .map(|plan_idx| CollapseKey::FolderPlan {
-                                folder: *folder_idx,
-                                plan: plan_idx,
-                            })
-                    })
-                    .collect();
+                let mut collapsed = HashSet::new();
+                for (folder_idx, plans) in &self.plans_by_folder {
+                    let Some(root) = self.opened_folders.get(*folder_idx) else {
+                        continue;
+                    };
+                    for plan in plans.iter().filter(|plan| !plan.tasks.is_empty()) {
+                        collapsed
+                            .insert(CollapseKey::Plan(self.plan_identity_for_entry(root, plan)));
+                    }
+                }
+                self.collapsed_plans = collapsed;
                 // Close plan tabs whose slug is no longer in `plans_by_folder`
                 // (plan 0032: close_tabs_for_missing_plans).
                 self.close_tabs_for_missing_plans();
@@ -3675,9 +4190,11 @@ impl App {
             AppEvent::RequestResetRun => {
                 match self.reset_confirmation_for_context() {
                     Ok(confirm) => {
-                        if self.running_plan_operation(&confirm.slug).is_some() {
+                        if self.running_plan_operation(&confirm.target).is_some()
+                            || self.opening_plans.contains(&confirm.target)
+                        {
                             self.operation_notice = Some(OperationNotice {
-                                slug: confirm.slug,
+                                target: confirm.target,
                                 attempted: "Reset selected plan/run".to_string(),
                             });
                             self.mode = Mode::OperationNotice;
@@ -3697,7 +4214,7 @@ impl App {
                 true
             }
 
-            AppEvent::ResetRun => true,
+            AppEvent::ResetRun { .. } => true,
 
             AppEvent::CloseResetConfirmation => {
                 self.mode = Mode::Normal;
@@ -3705,11 +4222,11 @@ impl App {
                 true
             }
 
-            AppEvent::ResetStarted { slug, label } => {
+            AppEvent::ResetStarted { target, label } => {
                 self.plan_operations.insert(
-                    slug.clone(),
+                    target.clone(),
                     PlanOperationState {
-                        slug,
+                        target,
                         label: label.clone(),
                         kind: makina_core::api::PlanOperationKind::Reset,
                         phase: makina_core::api::PlanOperationPhase::Started,
@@ -3725,9 +4242,9 @@ impl App {
                 true
             }
 
-            AppEvent::ResetFinished { slug, message } => {
+            AppEvent::ResetFinished { target, message } => {
                 let failed = message.to_lowercase().contains("failed");
-                if let Some(op) = self.plan_operations.get_mut(&slug) {
+                if let Some(op) = self.plan_operations.get_mut(&target) {
                     op.phase = if failed {
                         makina_core::api::PlanOperationPhase::Failed
                     } else {
@@ -3741,10 +4258,20 @@ impl App {
                 true
             }
 
-            AppEvent::OperationBlocked { slug, attempted } => {
-                self.operation_notice = Some(OperationNotice { slug, attempted });
+            AppEvent::OperationBlocked { target, attempted } => {
+                self.operation_notice = Some(OperationNotice { target, attempted });
                 self.mode = Mode::OperationNotice;
                 self.command_palette = None;
+                true
+            }
+
+            AppEvent::PlanOpenStarted { target } => {
+                self.opening_plans.insert(target);
+                true
+            }
+
+            AppEvent::PlanOpenFinished { target } => {
+                self.opening_plans.remove(&target);
                 true
             }
 
@@ -3912,19 +4439,30 @@ impl App {
 
             // ── Settings screen (plan 0070) ───────────────────────────────────────
             AppEvent::OpenSettings => {
+                let project_root = self.context_project_root();
+                let (caps, concurrency, final_merge, error) =
+                    match makina_core::config::Config::load_for_repo_with_paths(&project_root).0 {
+                        Ok(config) => (config.caps, config.concurrency, config.merge.final_, None),
+                        Err(load_error) => (
+                            self.caps.clone(),
+                            self.concurrency,
+                            self.final_merge,
+                            Some(format!(
+                                "Could not load {} settings: {load_error}",
+                                project_root.display()
+                            )),
+                        ),
+                    };
                 self.settings = Some(Settings {
-                    gate_iterations: self.caps.gate_iterations.to_string(),
-                    reviewer_iterations: self.caps.reviewer_iterations.to_string(),
-                    wall_clock_secs: self.caps.wall_clock_secs.to_string(),
-                    idle_secs: self
-                        .caps
-                        .idle_secs
-                        .map(|s| s.to_string())
-                        .unwrap_or_default(),
-                    concurrency: self.concurrency.to_string(),
-                    final_merge: self.final_merge,
+                    project_root,
+                    gate_iterations: caps.gate_iterations.to_string(),
+                    reviewer_iterations: caps.reviewer_iterations.to_string(),
+                    wall_clock_secs: caps.wall_clock_secs.to_string(),
+                    idle_secs: caps.idle_secs.map(|s| s.to_string()).unwrap_or_default(),
+                    concurrency: concurrency.to_string(),
+                    final_merge,
                     focused: SettingsField::GateIterations,
-                    error: None,
+                    error,
                 });
                 self.mode = Mode::Settings;
                 true
@@ -4173,25 +4711,34 @@ impl App {
 
             AppEvent::SettingsCommit => {
                 if let Some(settings) = &mut self.settings {
-                    // Validate all fields using the shared validator.
                     use crate::settings_validation::validate_settings;
-                    match validate_settings(settings) {
-                        Ok(valid) => {
-                            // All validation passed; apply the values.
-                            self.caps.gate_iterations = valid.gate_iterations;
-                            self.caps.reviewer_iterations = valid.reviewer_iterations;
-                            self.caps.wall_clock_secs = valid.wall_clock_secs;
-                            self.caps.idle_secs = valid.idle_secs;
-                            self.concurrency = valid.concurrency;
-                            self.final_merge = valid.final_merge;
-                            self.mode = Mode::Normal;
-                            self.settings = None;
-                        }
-                        Err(msg) => {
-                            // Validation failed; set the error and keep the modal open.
-                            settings.error = Some(msg);
-                        }
+                    if let Err(message) = validate_settings(settings) {
+                        settings.error = Some(message);
                     }
+                }
+                true
+            }
+
+            AppEvent::SettingsSaved {
+                project_root,
+                values,
+            } => {
+                if project_root == self.canonical_repo_root() {
+                    self.caps.gate_iterations = values.gate_iterations;
+                    self.caps.reviewer_iterations = values.reviewer_iterations;
+                    self.caps.wall_clock_secs = values.wall_clock_secs;
+                    self.caps.idle_secs = values.idle_secs;
+                    self.concurrency = values.concurrency;
+                    self.final_merge = values.final_merge;
+                }
+                self.mode = Mode::Normal;
+                self.settings = None;
+                true
+            }
+
+            AppEvent::SettingsSaveFailed { reason } => {
+                if let Some(settings) = &mut self.settings {
+                    settings.error = Some(reason);
                 }
                 true
             }
@@ -4287,20 +4834,23 @@ impl App {
                         if let Some(plan) = self.discovered_plans.get(plan_idx)
                             && let Some(preview) = plan.tasks.get(task_idx)
                         {
-                            let plan_slug = plan.slug.clone();
+                            let plan = self.plan_identity_for_entry(&self.repo_root, plan);
                             let task_id = preview.id.clone();
-                            self.tabs
-                                .open_tab(TabContent::PlanTask { plan_slug, task_id });
+                            self.tabs.open_tab(TabContent::PlanTask { plan, task_id });
                         }
                     }
                     TreeNode::Task { run, task } => {
                         if let Some(run_view) = self.runs.get(run)
                             && let Some(task_view) = run_view.tasks.get(task)
                         {
-                            let plan_slug =
-                                makina_core::orchestrator::plan_slug(&run_view.task_list_path);
+                            let plan = self.plan_identity_for_run(run_view);
+                            let run_id = run_view.id;
                             let task_id = task_view.id.clone();
-                            self.tabs.open_tab(TabContent::Task { plan_slug, task_id });
+                            self.tabs.open_tab(TabContent::Task {
+                                plan,
+                                run: run_id,
+                                task_id,
+                            });
                             self.sync_selected_run_to_active_tab();
                         }
                     }
@@ -4309,10 +4859,9 @@ impl App {
                         // now opens its plan details tab, matching the new Enter
                         // behavior. Non-plan runs just select (no tab).
                         if let Some(run_view) = self.runs.get(run) {
-                            let slug =
-                                makina_core::orchestrator::plan_slug(&run_view.task_list_path);
-                            if self.discovered_plans.iter().any(|p| p.slug == slug) {
-                                self.tabs.open_tab(TabContent::Plan { plan_slug: slug });
+                            let target = self.plan_identity_for_run(run_view);
+                            if self.plan_entry(&target).is_some() {
+                                self.tabs.open_tab(TabContent::Plan { plan: target });
                             }
                             // Expand the run so its tasks become visible in the sidebar.
                             self.collapsed_runs.remove(&run_view.id);
@@ -4347,11 +4896,11 @@ impl App {
                         if let Some(plans) = self.plans_by_folder.get(&folder_idx)
                             && let Some(plan) = plans.get(plan_idx)
                             && let Some(preview) = plan.tasks.get(task_idx)
+                            && let Some(project_root) = self.opened_folders.get(folder_idx)
                         {
-                            let plan_slug = plan.slug.clone();
+                            let plan = self.plan_identity_for_entry(project_root, plan);
                             let task_id = preview.id.clone();
-                            self.tabs
-                                .open_tab(TabContent::PlanTask { plan_slug, task_id });
+                            self.tabs.open_tab(TabContent::PlanTask { plan, task_id });
                         }
                     }
                 }
@@ -4362,11 +4911,10 @@ impl App {
             AppEvent::ToggleAccordionSection(section) => {
                 // Only toggle if the active tab is a plan tab.
                 if let Some(active_idx) = self.tabs.active_tab
-                    && let Some(TabContent::Plan { plan_slug }) =
-                        self.tabs.open_tabs.get(active_idx)
+                    && let Some(TabContent::Plan { plan }) = self.tabs.open_tabs.get(active_idx)
                 {
-                    let plan_slug = plan_slug.clone();
-                    let sections = self.accordion_state.entry(plan_slug).or_default();
+                    let plan = plan.clone();
+                    let sections = self.accordion_state.entry(plan).or_default();
                     if sections.contains(&section) {
                         sections.remove(&section);
                     } else {
@@ -4507,11 +5055,6 @@ impl App {
     fn load_exchanges_for_selected_run(&mut self) {
         use makina_core::paths;
 
-        // Seed the displayed countdown from the resolved config cap on the App; the
-        // Supervisor still enforces the real cap. RunView carries no caps field,
-        // so we read from App.
-        self.wall_clock_secs_config = self.caps.wall_clock_secs;
-
         let Some(run) = self.selected_run() else {
             return;
         };
@@ -4525,10 +5068,19 @@ impl App {
         let run_id = run.id;
         let run_uid = run.run_uid.clone();
         let tasks = run.tasks.clone();
+        let project_root = self.plan_identity_for_run(run).project_root;
+
+        // RunView carries no caps field. Resolve the owning project's current
+        // config so a repo-B task does not display repo A's wall-clock budget.
+        self.wall_clock_secs_config =
+            makina_core::config::Config::load_for_repo_with_paths(&project_root)
+                .0
+                .map(|config| config.caps.wall_clock_secs)
+                .unwrap_or(self.caps.wall_clock_secs);
 
         // Use the pure path helper (no I/O, no create_dir_all) so the replay
         // loader does not silently create directories for non-existent runs.
-        let logs_dir = paths::run_dir(&self.repo_root, &run_uid).join("logs");
+        let logs_dir = paths::run_dir(&project_root, &run_uid).join("logs");
 
         // Try to load transcripts for each task in this run.
         for task in tasks {
@@ -4568,19 +5120,30 @@ impl App {
                 run,
                 task_list_path,
             } => {
+                self.opening_plans.retain(|target| {
+                    target.task_list_path != lexical_absolute(&target.project_root, task_list_path)
+                });
+                let project = self
+                    .runs
+                    .iter()
+                    .find(|view| view.id == *run)
+                    .map(|view| view.project.clone())
+                    .unwrap_or_default();
+                let identity_view = RunView {
+                    id: *run,
+                    run_uid: String::new(),
+                    task_list_path: task_list_path.clone(),
+                    status: RunStatus::Pending,
+                    project,
+                    tasks: vec![],
+                    report: makina_core::api::IngestionReport::default(),
+                };
+                self.remember_run_project_root(&identity_view);
                 // If we don't already have a RunView for this id (the initial
                 // `api.runs()` query might have raced with the event), insert a
                 // placeholder.  Tasks 27 and 29 will flesh out proper handling.
                 if !self.runs.iter().any(|r| r.id == *run) {
-                    self.runs.push(RunView {
-                        id: *run,
-                        run_uid: String::new(),
-                        task_list_path: task_list_path.clone(),
-                        status: RunStatus::Pending,
-                        project: String::new(),
-                        tasks: vec![],
-                        report: makina_core::api::IngestionReport::default(),
-                    });
+                    self.runs.push(identity_view);
                     if self.selected_run.is_none() {
                         self.selected_run = Some(0);
                     }
@@ -4735,37 +5298,43 @@ impl App {
             // Project discovery completed (plan 0025).
             // Surface a transient status message showing the discovery outcome.
             Event::ProjectDiscovered {
+                project_root,
                 gate_count,
                 scanned_files,
             } => {
                 let msg = format!(
-                    "Discovered {} gates from {} files",
-                    gate_count, scanned_files
+                    "Discovered {} gates from {} files in {}",
+                    gate_count,
+                    scanned_files,
+                    project_root.display()
                 );
                 self.status_message = Some(msg);
             }
             Event::PlanOperation {
-                plan_slug,
+                run,
+                plan_slug: _,
                 label,
                 operation,
                 phase,
                 message,
             } => {
-                let op = self
-                    .plan_operations
-                    .entry(plan_slug.clone())
-                    .or_insert_with(|| PlanOperationState {
-                        slug: plan_slug.clone(),
-                        label: label.clone(),
-                        kind: *operation,
-                        phase: *phase,
-                        log: Vec::new(),
-                    });
-                op.label = label.clone();
-                op.kind = *operation;
-                op.phase = *phase;
-                if op.log.last().is_none_or(|last| last != message) {
-                    op.log.push(message.clone());
+                // Run ids are router-global and resolve to an exact canonical
+                // project/task-list identity. The display slug is never used
+                // to select state because separate projects may share it.
+                let target = self
+                    .runs
+                    .iter()
+                    .find(|view| view.id == *run)
+                    .map(|view| self.plan_identity_for_run(view));
+                if let Some(target) = target
+                    && let Some(op) = self.plan_operations.get_mut(&target)
+                {
+                    op.label = label.clone();
+                    op.kind = *operation;
+                    op.phase = *phase;
+                    if op.log.last().is_none_or(|last| last != message) {
+                        op.log.push(message.clone());
+                    }
                 }
                 if matches!(
                     phase,
@@ -5736,8 +6305,9 @@ mod tests {
             architecture_text: None,
             status_text: None,
         }];
+        let target = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0099-demo".to_string(),
+            plan: target.clone(),
         });
         app.selected_run = None;
 
@@ -5780,7 +6350,8 @@ mod tests {
         // No sidebar task selected, but a task tab for the run's task is active.
         app.selected_task = None;
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "0042-demo".to_string(),
+            plan: PlanIdentity::legacy("0042-demo".to_string()),
+            run: RunId(3),
             task_id: TaskId::new("build-thing"),
         });
         app.tabs.active_tab = Some(0);
@@ -8658,7 +9229,7 @@ mod tests {
             status_text: None,
         }];
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0099-demo".to_string(),
+            plan: PlanIdentity::legacy("0099-demo".to_string()),
         });
 
         let changed = app.update(AppEvent::RequestResetRun);
@@ -8669,9 +9240,9 @@ mod tests {
             .reset_confirmation
             .as_ref()
             .expect("reset confirmation must be open");
-        assert_eq!(confirm.slug, "0099-demo");
+        assert_eq!(confirm.target.slug, "0099-demo");
         assert_eq!(
-            confirm.task_list_path,
+            confirm.target.task_list_path,
             PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md")
         );
     }
@@ -8679,9 +9250,10 @@ mod tests {
     #[test]
     fn reset_started_tracks_operation_and_opens_logs() {
         let mut app = make_app();
+        let target = PlanIdentity::legacy("0099-demo");
 
         let changed = app.update(AppEvent::ResetStarted {
-            slug: "0099-demo".to_string(),
+            target: target.clone(),
             label: "Demo plan".to_string(),
         });
 
@@ -8694,7 +9266,7 @@ mod tests {
         assert_eq!(app.output_tab, OutputTab::Logs);
         let op = app
             .plan_operations
-            .get("0099-demo")
+            .get(&target)
             .expect("reset must create a tracked plan operation");
         assert!(op.is_running());
         assert_eq!(op.log, vec!["Starting reset".to_string()]);
@@ -8703,8 +9275,23 @@ mod tests {
     #[test]
     fn plan_operation_event_appends_visible_reset_progress() {
         let mut app = make_app();
+        app.runs.push(RunView {
+            id: RunId(99),
+            run_uid: "reset-run".to_string(),
+            task_list_path: PathBuf::from("/tmp/docs/plans/0099-demo/TASKS.md"),
+            status: makina_core::api::RunStatus::Running,
+            project: "tmp".to_string(),
+            tasks: Vec::new(),
+            report: makina_core::api::IngestionReport::default(),
+        });
+        let target = app.plan_identity_for_run(&app.runs[0]);
+        app.update(AppEvent::ResetStarted {
+            target: target.clone(),
+            label: "Demo plan".to_string(),
+        });
 
         app.update(AppEvent::ApiEvent(Event::PlanOperation {
+            run: RunId(99),
             plan_slug: "0099-demo".to_string(),
             label: "Demo plan".to_string(),
             operation: makina_core::api::PlanOperationKind::Reset,
@@ -8716,19 +9303,26 @@ mod tests {
         assert_eq!(app.output_tab, OutputTab::Logs);
         let op = app
             .plan_operations
-            .get("0099-demo")
+            .get(&target)
             .expect("operation event must upsert plan operation state");
         assert_eq!(op.phase, makina_core::api::PlanOperationPhase::Step);
-        assert_eq!(op.log, vec!["Deleting plan branch".to_string()]);
+        assert_eq!(
+            op.log,
+            vec![
+                "Starting reset".to_string(),
+                "Deleting plan branch".to_string()
+            ]
+        );
         assert_eq!(app.status_message.as_deref(), Some("Deleting plan branch"));
     }
 
     #[test]
     fn operation_blocked_opens_notice_modal() {
         let mut app = make_app();
+        let target = PlanIdentity::legacy("0099-demo");
 
         let changed = app.update(AppEvent::OperationBlocked {
-            slug: "0099-demo".to_string(),
+            target,
             attempted: "Start run".to_string(),
         });
 
@@ -8738,7 +9332,7 @@ mod tests {
             .operation_notice
             .as_ref()
             .expect("blocked operation must open notice modal");
-        assert_eq!(notice.slug, "0099-demo");
+        assert_eq!(notice.target.slug, "0099-demo");
         assert_eq!(notice.attempted, "Start run");
     }
 
@@ -9101,6 +9695,14 @@ mod tests {
         // Both sources produce the same empty string for idle_secs; this
         // verifies the basic wiring for the None case.
         let mut app = make_app();
+        let repo = tempfile::tempdir().expect("settings repo");
+        std::fs::create_dir_all(repo.path().join(".makina")).expect("config directory");
+        std::fs::write(
+            repo.path().join(".makina/config.toml"),
+            "concurrency = 4\n[caps]\ngate_iterations = 7\nreviewer_iterations = 3\nwall_clock_secs = 1200\n[merge]\nfinal = \"squash\"\n",
+        )
+        .expect("write project settings");
+        app.repo_root = repo.path().to_path_buf();
         app.caps = makina_core::config::CapsConfig {
             gate_iterations: 7,
             reviewer_iterations: 3,
@@ -9136,6 +9738,14 @@ mod tests {
         // one (idle_secs_config).  If OpenSettings reads idle_secs_config the
         // field would be "" despite the config having 30s configured.
         let mut app2 = make_app();
+        let repo2 = tempfile::tempdir().expect("second settings repo");
+        std::fs::create_dir_all(repo2.path().join(".makina")).expect("config directory");
+        std::fs::write(
+            repo2.path().join(".makina/config.toml"),
+            "concurrency = 2\n[caps]\ngate_iterations = 2\nreviewer_iterations = 2\nwall_clock_secs = 900\nidle_secs = 30\n[merge]\nfinal = \"squash\"\n",
+        )
+        .expect("write second project settings");
+        app2.repo_root = repo2.path().to_path_buf();
         app2.caps = makina_core::config::CapsConfig {
             gate_iterations: 2,
             reviewer_iterations: 2,
@@ -9278,6 +9888,7 @@ mod tests {
     fn settings_input_and_backspace_edit_focused_field() {
         let mut app = make_app();
         app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().gate_iterations = "5".to_string();
 
         // Initially on GateIterations, which is "5" (the default).
         assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "5");
@@ -9354,10 +9965,14 @@ mod tests {
 
         app.update(AppEvent::OpenSettings);
         assert_eq!(app.mode, Mode::Settings);
+        let initial_gate_iterations = app.settings.as_ref().unwrap().gate_iterations.clone();
 
         // Edit a field.
         app.update(AppEvent::SettingsInput('9'));
-        assert_eq!(app.settings.as_ref().unwrap().gate_iterations, "79");
+        assert_eq!(
+            app.settings.as_ref().unwrap().gate_iterations,
+            format!("{initial_gate_iterations}9")
+        );
 
         // Close without saving.
         app.update(AppEvent::CloseSettings);
@@ -9381,6 +9996,12 @@ mod tests {
         app.concurrency = 4;
 
         app.update(AppEvent::OpenSettings);
+        {
+            let settings = app.settings.as_mut().unwrap();
+            settings.reviewer_iterations = "3".to_string();
+            settings.wall_clock_secs = "1200".to_string();
+            settings.idle_secs.clear();
+        }
 
         // Clear GateIterations and set to "10".
         app.settings.as_mut().unwrap().gate_iterations.clear();
@@ -9409,8 +10030,16 @@ mod tests {
             FinalMerge::Stage
         );
 
-        // Commit.
-        app.update(AppEvent::SettingsCommit);
+        // Apply the IO layer's successful persistence result.
+        let project_root = app.settings.as_ref().unwrap().project_root.clone();
+        let values = crate::settings_validation::validate_settings(
+            app.settings.as_ref().expect("settings open"),
+        )
+        .expect("valid settings");
+        app.update(AppEvent::SettingsSaved {
+            project_root,
+            values,
+        });
 
         // Verify caps were updated.
         assert_eq!(app.caps.gate_iterations, 10);
@@ -9437,6 +10066,7 @@ mod tests {
         app.concurrency = 4;
 
         app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().idle_secs = "30".to_string();
         assert_eq!(app.settings.as_ref().unwrap().idle_secs, "30");
 
         // Move to IdleSecs field.
@@ -9453,8 +10083,16 @@ mod tests {
         assert_eq!(app.settings.as_ref().unwrap().idle_secs, "");
         assert_eq!(app.settings.as_ref().unwrap().error, None);
 
-        // Commit with empty idle_secs.
-        app.update(AppEvent::SettingsCommit);
+        // Apply the IO layer's successful persistence result.
+        let project_root = app.settings.as_ref().unwrap().project_root.clone();
+        let values = crate::settings_validation::validate_settings(
+            app.settings.as_ref().expect("settings open"),
+        )
+        .expect("valid settings");
+        app.update(AppEvent::SettingsSaved {
+            project_root,
+            values,
+        });
 
         // Verify it's now None.
         assert_eq!(app.caps.idle_secs, None);
@@ -9721,15 +10359,19 @@ mod tests {
         app.update(AppEvent::PlansDiscovered {
             plans: make_plan_entries(),
         });
+        let collapse_key = CollapseKey::Plan(
+            app.plan_identity_for_node(TreeNode::Plan { plan_idx: 0 })
+                .expect("plan identity"),
+        );
         // alpha (index 0) has 2 tasks and starts collapsed.
-        assert!(app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)));
+        assert!(app.collapsed_plans.contains(&collapse_key));
         assert_eq!(app.visible_tree_nodes().len(), 2, "only 2 plan headers");
 
         app.update(AppEvent::OpenFocusedNode);
 
         assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab opened");
         assert!(
-            !app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)),
+            !app.collapsed_plans.contains(&collapse_key),
             "alpha must be expanded"
         );
         assert_eq!(
@@ -9803,7 +10445,7 @@ mod tests {
         assert!(
             app.tabs.open_tabs.iter().any(|t| matches!(
                 t,
-                TabContent::Plan { plan_slug } if plan_slug == "0001-alpha"
+                TabContent::Plan { plan } if plan.slug == "0001-alpha"
             )),
             "right-cross from plan must open its plan details tab"
         );
@@ -9838,19 +10480,19 @@ mod tests {
 
         // Open a plan tab
         app.update(AppEvent::OpenTab(TabContent::Plan {
-            plan_slug: "0001-alpha".to_string(),
+            plan: PlanIdentity::legacy("0001-alpha".to_string()),
         }));
         assert_eq!(app.tabs.open_tabs.len(), 1, "one tab opened");
         assert_eq!(app.tabs.active_tab, Some(0), "tab is active");
         assert!(matches!(
             &app.tabs.open_tabs[0],
-            TabContent::Plan { plan_slug } if plan_slug == "0001-alpha"
+            TabContent::Plan { plan } if plan.slug == "0001-alpha"
         ));
 
         // Open the same plan tab again — should focus the existing tab, not create a duplicate
         // (this is the "open if closed, focus if open" contract from plan 0031).
         app.update(AppEvent::OpenTab(TabContent::Plan {
-            plan_slug: "0001-alpha".to_string(),
+            plan: PlanIdentity::legacy("0001-alpha".to_string()),
         }));
         assert_eq!(
             app.tabs.open_tabs.len(),
@@ -9878,12 +10520,12 @@ mod tests {
         app.update(AppEvent::FocusRightOrExpand);
         app.tree_cursor = Some(2); // alpha's second PlanTask
         app.update(AppEvent::OpenTab(TabContent::Plan {
-            plan_slug: "0001-beta".to_string(),
+            plan: PlanIdentity::legacy("0001-beta".to_string()),
         }));
         assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab is open");
         assert!(matches!(
             &app.tabs.open_tabs[0],
-            TabContent::Plan { plan_slug } if plan_slug == "0001-beta"
+            TabContent::Plan { plan } if plan.slug == "0001-beta"
         ));
 
         // Re-discover with only the alpha plan (beta is gone).
@@ -9980,7 +10622,7 @@ mod tests {
     fn open_tab_adds_new_tab() {
         let mut state = TabState::new();
         let content = TabContent::Plan {
-            plan_slug: "0001-test".to_string(),
+            plan: PlanIdentity::legacy("0001-test".to_string()),
         };
         state.open_tab(content);
         assert_eq!(state.open_tabs.len(), 1);
@@ -9991,10 +10633,10 @@ mod tests {
     fn open_existing_tab_switches_to_it() {
         let mut state = TabState::new();
         let content1 = TabContent::Plan {
-            plan_slug: "0001".to_string(),
+            plan: PlanIdentity::legacy("0001".to_string()),
         };
         let content2 = TabContent::Plan {
-            plan_slug: "0002".to_string(),
+            plan: PlanIdentity::legacy("0002".to_string()),
         };
         state.open_tab(content1.clone());
         state.open_tab(content2);
@@ -10007,10 +10649,10 @@ mod tests {
     fn close_tab_removes_it() {
         let mut state = TabState::new();
         let content1 = TabContent::Plan {
-            plan_slug: "0001".to_string(),
+            plan: PlanIdentity::legacy("0001".to_string()),
         };
         let content2 = TabContent::Plan {
-            plan_slug: "0002".to_string(),
+            plan: PlanIdentity::legacy("0002".to_string()),
         };
         state.open_tab(content1);
         state.open_tab(content2);
@@ -10023,13 +10665,13 @@ mod tests {
     fn close_tab_before_active_preserves_active_content() {
         let mut state = TabState::new();
         let content1 = TabContent::Plan {
-            plan_slug: "0001".to_string(),
+            plan: PlanIdentity::legacy("0001".to_string()),
         };
         let content2 = TabContent::Plan {
-            plan_slug: "0002".to_string(),
+            plan: PlanIdentity::legacy("0002".to_string()),
         };
         let content3 = TabContent::Plan {
-            plan_slug: "0003".to_string(),
+            plan: PlanIdentity::legacy("0003".to_string()),
         };
         state.open_tab(content1);
         state.open_tab(content2.clone());
@@ -10056,7 +10698,7 @@ mod tests {
         // Open a plan tab
         let plan_slug = "0001-test".to_string();
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+            plan: PlanIdentity::legacy(plan_slug.clone()),
         });
 
         // Set active tab to the plan tab we just opened
@@ -10068,7 +10710,7 @@ mod tests {
         // Verify the section is now expanded
         assert!(
             app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Scope)),
             "SCOPE should be expanded after toggle"
         );
@@ -10083,7 +10725,7 @@ mod tests {
 
         // Open a plan tab and set it as active
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+            plan: PlanIdentity::legacy(plan_slug.clone()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10093,7 +10735,7 @@ mod tests {
         // Verify SCOPE is expanded
         assert!(
             app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Scope))
         );
 
@@ -10103,7 +10745,7 @@ mod tests {
         // Verify SCOPE is now collapsed (not in the set)
         assert!(
             !app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Scope)),
             "SCOPE should be collapsed after toggle"
         );
@@ -10123,7 +10765,8 @@ mod tests {
 
         let task_id = TaskId::new("demo-task");
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "0001-test".to_string(),
+            plan: PlanIdentity::legacy("0001-test".to_string()),
+            run: RunId(1),
             task_id: task_id.clone(),
         });
         app.tabs.active_tab = Some(0);
@@ -10159,7 +10802,7 @@ mod tests {
 
         let task_id = TaskId::new("preview-task");
         app.tabs.open_tab(TabContent::PlanTask {
-            plan_slug: "0001-test".to_string(),
+            plan: PlanIdentity::legacy("0001-test".to_string()),
             task_id: task_id.0.clone(),
         });
         app.tabs.active_tab = Some(0);
@@ -10204,7 +10847,8 @@ mod tests {
 
         // Open a task tab
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "0001-test".to_string(),
+            plan: PlanIdentity::legacy("0001-test".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("task-1".to_string()),
         });
         app.tabs.active_tab = Some(0);
@@ -10225,7 +10869,7 @@ mod tests {
 
         // Open a plan tab
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+            plan: PlanIdentity::legacy(plan_slug.clone()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10234,7 +10878,7 @@ mod tests {
         app.update(AppEvent::ToggleAccordionSection(AccordionSection::Tasks));
 
         // Verify both are expanded
-        let expanded = &app.accordion_state[&plan_slug];
+        let expanded = &app.accordion_state[&PlanIdentity::legacy(plan_slug.clone())];
         assert!(expanded.contains(&AccordionSection::Scope));
         assert!(expanded.contains(&AccordionSection::Tasks));
         assert!(!expanded.contains(&AccordionSection::Architecture));
@@ -10267,19 +10911,19 @@ mod tests {
 
         // Open first plan tab and expand SCOPE
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0001-test".to_string(),
+            plan: PlanIdentity::legacy("0001-test".to_string()),
         });
         app.accordion_state
-            .entry("0001-test".to_string())
+            .entry(PlanIdentity::legacy("0001-test"))
             .or_default()
             .insert(AccordionSection::Scope);
 
         // Open second plan tab and expand TASKS
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0002-test".to_string(),
+            plan: PlanIdentity::legacy("0002-test".to_string()),
         });
         app.accordion_state
-            .entry("0002-test".to_string())
+            .entry(PlanIdentity::legacy("0002-test"))
             .or_default()
             .insert(AccordionSection::Tasks);
 
@@ -10289,14 +10933,14 @@ mod tests {
         // Verify first tab's state is preserved
         assert!(
             app.accordion_state
-                .get("0001-test")
+                .get(&PlanIdentity::legacy("0001-test"))
                 .map(|s| s.contains(&AccordionSection::Scope))
                 .unwrap_or(false),
             "Plan 1's SCOPE should remain expanded"
         );
         assert!(
             !app.accordion_state
-                .get("0001-test")
+                .get(&PlanIdentity::legacy("0001-test"))
                 .map(|s| s.contains(&AccordionSection::Tasks))
                 .unwrap_or(true),
             "Plan 1's TASKS should remain collapsed"
@@ -10306,7 +10950,7 @@ mod tests {
         app.tabs.active_tab = Some(1);
         assert!(
             app.accordion_state
-                .get("0002-test")
+                .get(&PlanIdentity::legacy("0002-test"))
                 .map(|s| s.contains(&AccordionSection::Tasks))
                 .unwrap_or(false),
             "Plan 2's TASKS should remain expanded"
@@ -10336,27 +10980,27 @@ mod tests {
         };
         let mut app = App::new(api, vec![], PathBuf::from("."));
         app.discovered_plans = vec![plan_alpha, plan_beta];
+        let alpha = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
+        let beta = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[1]);
 
         // Open both plan tabs and expand different sections
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0001-alpha".to_string(),
+            plan: alpha.clone(),
         });
         app.accordion_state
-            .entry("0001-alpha".to_string())
+            .entry(alpha.clone())
             .or_default()
             .insert(AccordionSection::Scope);
 
-        app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0002-beta".to_string(),
-        });
+        app.tabs.open_tab(TabContent::Plan { plan: beta.clone() });
         app.accordion_state
-            .entry("0002-beta".to_string())
+            .entry(beta.clone())
             .or_default()
             .insert(AccordionSection::Architecture);
 
         // Verify both accordion states exist
-        assert!(app.accordion_state.contains_key("0001-alpha"));
-        assert!(app.accordion_state.contains_key("0002-beta"));
+        assert!(app.accordion_state.contains_key(&alpha));
+        assert!(app.accordion_state.contains_key(&beta));
         assert_eq!(app.accordion_state.len(), 2);
 
         // Re-discover with only alpha (beta is removed)
@@ -10373,11 +11017,11 @@ mod tests {
 
         // Verify beta's accordion state is cleaned up, but alpha's remains
         assert!(
-            app.accordion_state.contains_key("0001-alpha"),
+            app.accordion_state.contains_key(&alpha),
             "Alpha accordion state should remain"
         );
         assert!(
-            !app.accordion_state.contains_key("0002-beta"),
+            !app.accordion_state.contains_key(&beta),
             "Beta accordion state should be removed"
         );
         assert_eq!(
@@ -10387,7 +11031,7 @@ mod tests {
         );
         assert!(
             app.accordion_state
-                .get("0001-alpha")
+                .get(&alpha)
                 .map(|s| s.contains(&AccordionSection::Scope))
                 .unwrap_or(false),
             "Alpha's SCOPE should still be expanded"
@@ -10442,7 +11086,7 @@ mod tests {
         };
         app.discovered_plans = vec![plan_entry];
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0001-test".to_string(),
+            plan: PlanIdentity::legacy("0001-test".to_string()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10556,7 +11200,7 @@ mod tests {
         };
         app.discovered_plans = vec![plan_entry];
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0001-test".to_string(),
+            plan: PlanIdentity::legacy("0001-test".to_string()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10642,7 +11286,7 @@ mod tests {
 
         // Open a plan tab
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+            plan: PlanIdentity::legacy(plan_slug.clone()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10653,7 +11297,7 @@ mod tests {
         // Initially, SCOPE should not be expanded
         assert!(
             !app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .map(|s| s.contains(&AccordionSection::Scope))
                 .unwrap_or(false),
             "SCOPE should initially be collapsed"
@@ -10665,7 +11309,7 @@ mod tests {
         // SCOPE should now be expanded
         assert!(
             app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Scope)),
             "SCOPE should be expanded after pressing Enter"
         );
@@ -10676,7 +11320,7 @@ mod tests {
         // SCOPE should now be collapsed
         assert!(
             !app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .map(|s| s.contains(&AccordionSection::Scope))
                 .unwrap_or(false),
             "SCOPE should be collapsed after pressing Enter again"
@@ -10719,7 +11363,7 @@ mod tests {
         assert_eq!(app.tabs.open_tabs.len(), 1);
         assert!(matches!(
             &app.tabs.open_tabs[0],
-            TabContent::Plan { plan_slug } if plan_slug == "0001-test"
+            TabContent::Plan { plan } if plan.slug == "0001-test"
         ));
     }
 
@@ -10732,7 +11376,7 @@ mod tests {
 
         // Open a plan tab
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+            plan: PlanIdentity::legacy(plan_slug.clone()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10759,7 +11403,7 @@ mod tests {
 
         // Open a plan tab
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+            plan: PlanIdentity::legacy(plan_slug.clone()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10771,7 +11415,7 @@ mod tests {
         app.update(AppEvent::ToggleTreeNode);
         assert!(
             app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Scope)),
             "SCOPE should be expanded"
         );
@@ -10783,13 +11427,13 @@ mod tests {
         app.update(AppEvent::ToggleTreeNode);
         assert!(
             app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Architecture)),
             "ARCHITECTURE should be expanded"
         );
 
         // Verify both are expanded
-        let expanded = &app.accordion_state[&plan_slug];
+        let expanded = &app.accordion_state[&PlanIdentity::legacy(plan_slug.clone())];
         assert!(expanded.contains(&AccordionSection::Scope));
         assert!(expanded.contains(&AccordionSection::Architecture));
         assert!(!expanded.contains(&AccordionSection::Tasks));
@@ -10800,7 +11444,7 @@ mod tests {
         app.update(AppEvent::ToggleTreeNode);
 
         // Scope should be collapsed, Architecture should remain expanded
-        let expanded = &app.accordion_state[&plan_slug];
+        let expanded = &app.accordion_state[&PlanIdentity::legacy(plan_slug.clone())];
         assert!(!expanded.contains(&AccordionSection::Scope));
         assert!(expanded.contains(&AccordionSection::Architecture));
     }
@@ -10814,7 +11458,7 @@ mod tests {
 
         // Open a plan tab
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: plan_slug.clone(),
+            plan: PlanIdentity::legacy(plan_slug.clone()),
         });
         app.tabs.active_tab = Some(0);
 
@@ -10826,7 +11470,7 @@ mod tests {
         app.update(AppEvent::ToggleAccordionSection(AccordionSection::Scope));
         assert!(
             app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Scope)),
             "SCOPE should be expanded via S keybinding"
         );
@@ -10835,7 +11479,7 @@ mod tests {
         app.update(AppEvent::ToggleTreeNode);
         assert!(
             !app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .map(|s| s.contains(&AccordionSection::Scope))
                 .unwrap_or(false),
             "SCOPE should be collapsed via Enter"
@@ -10848,7 +11492,7 @@ mod tests {
         ));
         assert!(
             app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .is_some_and(|s| s.contains(&AccordionSection::Architecture)),
             "ARCHITECTURE should be expanded via A keybinding"
         );
@@ -10858,7 +11502,7 @@ mod tests {
         app.update(AppEvent::ToggleTreeNode);
         assert!(
             !app.accordion_state
-                .get(&plan_slug)
+                .get(&PlanIdentity::legacy(plan_slug.clone()))
                 .map(|s| s.contains(&AccordionSection::Architecture))
                 .unwrap_or(false),
             "ARCHITECTURE should be collapsed via Enter"
@@ -11384,7 +12028,8 @@ mod tests {
     fn main_scroll_target_task_tab_routes_to_task_entry() {
         let mut app = make_app();
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "p".to_string(),
+            plan: PlanIdentity::legacy("p".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("t-1"),
         });
         assert_eq!(
@@ -11400,7 +12045,7 @@ mod tests {
     fn main_scroll_target_plan_and_plan_task_tabs_route_to_their_rendered_panes() {
         let mut app = make_app();
         app.tabs.open_tab(crate::app::TabContent::Plan {
-            plan_slug: "p".to_string(),
+            plan: PlanIdentity::legacy("p".to_string()),
         });
         assert_eq!(
             app.main_scroll_target(),
@@ -11410,7 +12055,7 @@ mod tests {
 
         let mut app2 = make_app();
         app2.tabs.open_tab(crate::app::TabContent::PlanTask {
-            plan_slug: "p".to_string(),
+            plan: PlanIdentity::legacy("p".to_string()),
             task_id: "t-1".to_string(),
         });
         assert_eq!(
@@ -11442,7 +12087,8 @@ mod tests {
     fn select_down_with_task_tab_scrolls_task_entry_not_exchange() {
         let mut app = make_app();
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "p".to_string(),
+            plan: PlanIdentity::legacy("p".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("t-1"),
         });
         app.focused_panel = Panel::Main;
@@ -11478,7 +12124,8 @@ mod tests {
     fn select_up_with_task_tab_scrolls_task_entry_up() {
         let mut app = make_app();
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "p".to_string(),
+            plan: PlanIdentity::legacy("p".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("t-1"),
         });
         app.focused_panel = Panel::Main;
@@ -11549,7 +12196,7 @@ mod tests {
 
         // Open a plan tab
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
         });
 
         // Manually add a discovered plan so we can render it
@@ -11567,7 +12214,7 @@ mod tests {
         // Verify SCOPE section is initially collapsed (not in expanded set)
         let expanded = app
             .accordion_state
-            .get("test-plan")
+            .get(&PlanIdentity::legacy("test-plan"))
             .cloned()
             .unwrap_or_default();
         assert!(
@@ -11628,7 +12275,7 @@ mod tests {
         // After toggle, SCOPE should be expanded
         let expanded = app
             .accordion_state
-            .get("test-plan")
+            .get(&PlanIdentity::legacy("test-plan"))
             .cloned()
             .unwrap_or_default();
         assert!(
@@ -11643,7 +12290,7 @@ mod tests {
         // Should be collapsed again
         let expanded = app
             .accordion_state
-            .get("test-plan")
+            .get(&PlanIdentity::legacy("test-plan"))
             .cloned()
             .unwrap_or_default();
         assert!(
@@ -11659,10 +12306,10 @@ mod tests {
 
         // Open two plan tabs
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "plan-1".to_string(),
+            plan: PlanIdentity::legacy("plan-1".to_string()),
         });
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "plan-2".to_string(),
+            plan: PlanIdentity::legacy("plan-2".to_string()),
         });
 
         // plan-2 should be active (it was the last one opened)
@@ -11730,7 +12377,8 @@ mod tests {
 
         // Open a task tab
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: task_id.clone(),
         });
 
@@ -11804,7 +12452,8 @@ mod tests {
 
         // Open first task tab
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: task_id_1.clone(),
         });
 
@@ -11817,7 +12466,8 @@ mod tests {
 
         // Open second task tab
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: task_id_2.clone(),
         });
 
@@ -11858,11 +12508,13 @@ mod tests {
         let task_a = app.runs[0].tasks[0].id.clone();
         let task_b = app.runs[0].tasks[1].id.clone();
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "p".into(),
+            plan: PlanIdentity::legacy("p"),
+            run: RunId(1),
             task_id: task_a,
         });
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "p".into(),
+            plan: PlanIdentity::legacy("p"),
+            run: RunId(1),
             task_id: task_b,
         });
         assert_eq!(app.tabs.active_tab, Some(1), "second tab active after open");
@@ -11895,15 +12547,18 @@ mod tests {
         let task_b = app.runs[0].tasks[1].id.clone();
         let task_c = TaskId("task-c".to_string());
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "p".into(),
+            plan: PlanIdentity::legacy("p"),
+            run: RunId(1),
             task_id: task_a,
         });
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "p".into(),
+            plan: PlanIdentity::legacy("p"),
+            run: RunId(1),
             task_id: task_b.clone(),
         });
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: "p".into(),
+            plan: PlanIdentity::legacy("p"),
+            run: RunId(1),
             task_id: task_c,
         });
         app.tabs.active_tab = Some(1);
@@ -11954,7 +12609,7 @@ mod tests {
         assert!(
             matches!(
                 app.tabs.open_tabs.first(),
-                Some(TabContent::Plan { plan_slug }) if plan_slug == "0099-clickable"
+                Some(TabContent::Plan { plan }) if plan.slug == "0099-clickable"
             ),
             "clicking a plan row opens that plan's tab"
         );
@@ -12024,7 +12679,7 @@ mod tests {
         assert!(
             matches!(
                 &app.tabs.open_tabs[0],
-                TabContent::Plan { plan_slug } if plan_slug == "0042-done"
+                TabContent::Plan { plan } if plan.slug == "0042-done"
             ),
             "must have opened the plan tab for the run's slug"
         );
@@ -12036,7 +12691,7 @@ mod tests {
         assert!(
             matches!(
                 app.tabs.open_tabs.first(),
-                Some(TabContent::Plan { plan_slug }) if plan_slug == "0042-done"
+                Some(TabContent::Plan { plan }) if plan.slug == "0042-done"
             ),
             "click on plan-run row must also open plan details tab"
         );
@@ -12130,10 +12785,10 @@ mod tests {
 
         // Open plan tabs for both slugs.
         app.update(AppEvent::OpenTab(TabContent::Plan {
-            plan_slug: plan_slug_0.clone(),
+            plan: PlanIdentity::legacy(plan_slug_0.clone()),
         }));
         app.update(AppEvent::OpenTab(TabContent::Plan {
-            plan_slug: plan_slug_1.clone(),
+            plan: PlanIdentity::legacy(plan_slug_1.clone()),
         }));
         assert_eq!(app.tabs.open_tabs.len(), 2, "two plan tabs open");
 
@@ -12180,10 +12835,10 @@ mod tests {
             report: Default::default(),
         }];
         app.update(AppEvent::OpenTab(TabContent::Plan {
-            plan_slug: "0001-alpha".to_string(),
+            plan: PlanIdentity::legacy("0001-alpha".to_string()),
         }));
         app.update(AppEvent::OpenTab(TabContent::Plan {
-            plan_slug: "0002-beta".to_string(),
+            plan: PlanIdentity::legacy("0002-beta".to_string()),
         }));
 
         // Activate the run-backed plan tab → selected_run points at run 0.
@@ -12318,7 +12973,6 @@ mod tests {
             status_text: None,
         };
         app.plans_by_folder.insert(0, vec![plan_entry]);
-
         // Folder starts collapsed (seeds in PlansDiscoveredPerFolder event handler)
         // In tests we manually seed this
         app.collapsed_folders.insert(0);
@@ -12390,6 +13044,12 @@ mod tests {
             status_text: None,
         };
         app.plans_by_folder.insert(0, vec![plan_entry]);
+        let collapse_key = app
+            .collapse_key_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            })
+            .expect("folder plan identity");
 
         // Expand the folder first
         app.collapsed_folders.clear();
@@ -12426,7 +13086,6 @@ mod tests {
 
         // Space should collapse the plan's tasks
         app.update(AppEvent::ToggleTreeNode);
-        let collapse_key = CollapseKey::FolderPlan { folder: 0, plan: 0 };
         assert!(
             app.collapsed_plans.contains(&collapse_key),
             "plan should be collapsed after ToggleTreeNode"
@@ -12516,8 +13175,8 @@ mod tests {
         // Verify a plan tab was opened
         assert_eq!(app.tabs.open_tabs.len(), 1, "plan tab should be opened");
         if let Some(active_idx) = app.tabs.active_tab {
-            if let TabContent::Plan { plan_slug } = &app.tabs.open_tabs[active_idx] {
-                assert_eq!(plan_slug, "test-plan", "correct plan should be in the tab");
+            if let TabContent::Plan { plan } = &app.tabs.open_tabs[active_idx] {
+                assert_eq!(plan.slug, "test-plan", "correct plan should be in the tab");
             } else {
                 panic!("active tab should contain a plan");
             }
@@ -12761,12 +13420,17 @@ mod tests {
             status_text: None,
         };
         app.plans_by_folder.insert(0, vec![plan_entry]);
+        let collapse_key = app
+            .collapse_key_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            })
+            .expect("folder plan identity");
 
         // Expand folder and plan so tasks are visible
         app.collapsed_folders.clear();
         assert!(
-            !app.collapsed_plans
-                .contains(&CollapseKey::FolderPlan { folder: 0, plan: 0 }),
+            !app.collapsed_plans.contains(&collapse_key),
             "plan should start expanded"
         );
 
@@ -12790,7 +13454,6 @@ mod tests {
 
         // Focus-left should collapse the parent plan
         app.update(AppEvent::FocusLeftOrCollapse);
-        let collapse_key = CollapseKey::FolderPlan { folder: 0, plan: 0 };
         assert!(
             app.collapsed_plans.contains(&collapse_key),
             "parent plan should be collapsed"
@@ -13128,7 +13791,7 @@ mod tests {
         assert!(
             matches!(
                 &app.tabs.open_tabs[active_idx],
-                TabContent::Plan { plan_slug } if plan_slug == "test-plan"
+                TabContent::Plan { plan } if plan.slug == "test-plan"
             ),
             "active tab should be the folder-scoped plan"
         );
@@ -13181,8 +13844,8 @@ mod tests {
         assert!(
             matches!(
                 &app.tabs.open_tabs[active_idx],
-                TabContent::PlanTask { plan_slug, task_id }
-                    if plan_slug == "test-plan" && task_id == "task-1"
+                TabContent::PlanTask { plan, task_id }
+                    if plan.slug == "test-plan" && task_id == "task-1"
             ),
             "active tab should be the folder-scoped task preview"
         );
@@ -13220,7 +13883,10 @@ mod tests {
         plans_map.insert(0, vec![plan_entry]);
 
         // Update app with the discovery event.
-        app.update(AppEvent::PlansDiscoveredPerFolder { plans_map });
+        app.update(AppEvent::PlansDiscoveredPerFolder {
+            roots: app.opened_folders.clone(),
+            plans_map,
+        });
 
         // Verify that the app now has plans_by_folder populated.
         assert!(
@@ -13245,9 +13911,14 @@ mod tests {
 
         // Plans start collapsed by default (seeds collapsed_plans) so the tree
         // opens tidy — mirroring the legacy `PlansDiscovered` seeding.
+        let collapse_key = app
+            .collapse_key_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            })
+            .expect("folder plan identity");
         assert!(
-            app.collapsed_plans
-                .contains(&CollapseKey::FolderPlan { folder: 0, plan: 0 }),
+            app.collapsed_plans.contains(&collapse_key),
             "plan 0 in folder 0 should start collapsed (in collapsed_plans)"
         );
 
@@ -13297,8 +13968,7 @@ mod tests {
         );
 
         // Expand the plan and verify the task node becomes visible.
-        app.collapsed_plans
-            .remove(&CollapseKey::FolderPlan { folder: 0, plan: 0 });
+        app.collapsed_plans.remove(&collapse_key);
         let nodes = app.visible_tree_nodes();
         let task_node = nodes
             .iter()
@@ -13350,9 +14020,13 @@ mod tests {
         // Seed plans_by_folder and open a plan tab for it (as if the plan was
         // opened from the sidebar after a previous discovery).
         app.plans_by_folder.insert(0, vec![plan_entry]);
-        app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0001-test".to_string(),
-        });
+        let target = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            })
+            .expect("folder plan identity");
+        app.tabs.open_tab(TabContent::Plan { plan: target });
         assert_eq!(
             app.tabs.open_tabs.len(),
             1,
@@ -13360,12 +14034,293 @@ mod tests {
         );
 
         // Re-fire discovery with the SAME plan still present.
-        app.update(AppEvent::PlansDiscoveredPerFolder { plans_map });
+        app.update(AppEvent::PlansDiscoveredPerFolder {
+            roots: app.opened_folders.clone(),
+            plans_map,
+        });
 
         assert_eq!(
             app.tabs.open_tabs.len(),
             1,
             "tab for a plan still present in plans_by_folder must NOT be closed"
         );
+    }
+
+    #[test]
+    fn identical_slugs_in_different_projects_keep_distinct_tabs_and_runs() {
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), PathBuf::from("/work/repo-a"));
+        app.opened_folders = vec![PathBuf::from("/work/repo-a"), PathBuf::from("/work/repo-b")];
+        let plan = |root: &str| makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from(root).join("docs/plans/0042-same"),
+            slug: "0042-same".to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder.insert(0, vec![plan("/work/repo-a")]);
+        app.plans_by_folder.insert(1, vec![plan("/work/repo-b")]);
+        let repo_a = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            })
+            .unwrap();
+        let repo_b = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 1,
+                plan_idx: 0,
+            })
+            .unwrap();
+
+        app.tabs.open_tab(TabContent::Plan {
+            plan: repo_a.clone(),
+        });
+        app.tabs.open_tab(TabContent::Plan {
+            plan: repo_b.clone(),
+        });
+        assert_ne!(repo_a, repo_b);
+        assert_eq!(app.tabs.open_tabs.len(), 2);
+
+        let run = |id, root: &str| RunView {
+            id: RunId(id),
+            run_uid: format!("run-{id}"),
+            task_list_path: PathBuf::from(root).join("docs/plans/0042-same/TASKS.md"),
+            status: makina_core::api::RunStatus::Running,
+            project: std::path::Path::new(root)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            tasks: Vec::new(),
+            report: makina_core::api::IngestionReport::default(),
+        };
+        app.runs.push(run(11, "/work/repo-a"));
+        app.runs.push(run(22, "/work/repo-b"));
+        assert_eq!(app.latest_run_for_plan(&repo_a).unwrap().id, RunId(11));
+        assert_eq!(app.latest_run_for_plan(&repo_b).unwrap().id, RunId(22));
+
+        app.tabs.open_tab(TabContent::Plan { plan: repo_a });
+        app.sync_selected_run_to_active_tab();
+        assert_eq!(app.selected_run().unwrap().id, RunId(11));
+        app.tabs.open_tab(TabContent::Plan { plan: repo_b });
+        app.sync_selected_run_to_active_tab();
+        assert_eq!(app.selected_run().unwrap().id, RunId(22));
+    }
+
+    #[test]
+    fn removing_folder_immediately_rekeys_folder_state_and_closes_only_its_tabs() {
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), PathBuf::from("/work/repo-a"));
+        app.opened_folders = vec![
+            PathBuf::from("/work/repo-a"),
+            PathBuf::from("/work/repo-b"),
+            PathBuf::from("/work/repo-c"),
+        ];
+        let plan = |root: &str, slug: &str| makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from(root).join("docs/plans").join(slug),
+            slug: slug.to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder
+            .insert(0, vec![plan("/work/repo-a", "a")]);
+        app.plans_by_folder
+            .insert(1, vec![plan("/work/repo-b", "b")]);
+        app.plans_by_folder
+            .insert(2, vec![plan("/work/repo-c", "c")]);
+        let target_b = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 1,
+                plan_idx: 0,
+            })
+            .unwrap();
+        let target_c = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 2,
+                plan_idx: 0,
+            })
+            .unwrap();
+        app.collapsed_folders.extend([0, 2]);
+        app.collapsed_plans.extend([
+            CollapseKey::Plan(target_b.clone()),
+            CollapseKey::Plan(target_c.clone()),
+        ]);
+        app.tabs.open_tab(TabContent::Plan {
+            plan: target_b.clone(),
+        });
+        app.tabs.open_tab(TabContent::Plan {
+            plan: target_c.clone(),
+        });
+
+        assert!(app.remove_opened_folder(std::path::Path::new("/work/repo-b")));
+        assert_eq!(
+            app.opened_folders,
+            vec![PathBuf::from("/work/repo-a"), PathBuf::from("/work/repo-c")]
+        );
+        assert_eq!(app.plans_by_folder[&1][0].slug, "c");
+        assert!(!app.plans_by_folder.contains_key(&2));
+        assert_eq!(app.collapsed_folders, HashSet::from([0, 1]));
+        assert!(!app.collapsed_plans.contains(&CollapseKey::Plan(target_b)));
+        assert!(
+            app.collapsed_plans
+                .contains(&CollapseKey::Plan(target_c.clone()))
+        );
+        assert_eq!(
+            app.tabs.open_tabs,
+            vec![TabContent::Plan { plan: target_c }]
+        );
+    }
+
+    #[test]
+    fn arbitrary_task_path_keeps_its_project_after_folder_is_closed() {
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(22),
+            run_uid: "run-b".to_string(),
+            task_list_path: PathBuf::from("/work/repo-b/custom.md"),
+            status: makina_core::api::RunStatus::Pending,
+            project: "repo-b".to_string(),
+            tasks: Vec::new(),
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], PathBuf::from("/work/repo-a"));
+        app.opened_folders = vec![PathBuf::from("/work/repo-a"), PathBuf::from("/work/repo-b")];
+
+        assert!(app.remove_opened_folder(std::path::Path::new("/work/repo-b")));
+
+        let target = app.plan_identity_for_run(&app.runs[0]);
+        assert_eq!(target.project_root, PathBuf::from("/work/repo-b"));
+        assert_eq!(
+            target.task_list_path,
+            PathBuf::from("/work/repo-b/custom.md")
+        );
+    }
+
+    #[test]
+    fn command_plan_context_follows_the_panel_that_owns_focus() {
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), PathBuf::from("/work/repo-a"));
+        app.opened_folders = vec![PathBuf::from("/work/repo-a"), PathBuf::from("/work/repo-b")];
+        let plan = |root: &str, slug: &str| makina_core::orchestrator::PlanEntry {
+            dir: PathBuf::from(root).join("docs/plans").join(slug),
+            slug: slug.to_string(),
+            has_tasks: true,
+            tasks: Vec::new(),
+            scope_text: None,
+            architecture_text: None,
+            status_text: None,
+        };
+        app.plans_by_folder
+            .insert(0, vec![plan("/work/repo-a", "plan-a")]);
+        app.plans_by_folder
+            .insert(1, vec![plan("/work/repo-b", "plan-b")]);
+        let tab_target = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            })
+            .unwrap();
+        let sidebar_target = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 1,
+                plan_idx: 0,
+            })
+            .unwrap();
+        app.tabs.open_tab(TabContent::Plan {
+            plan: tab_target.clone(),
+        });
+        app.tree_cursor = app.visible_tree_nodes().iter().position(|node| {
+            matches!(
+                node,
+                TreeNode::PlanInFolder {
+                    folder_idx: 1,
+                    plan_idx: 0
+                }
+            )
+        });
+
+        app.focused_panel = Panel::Sidebar;
+        assert_eq!(app.context_plan_identity(), Some(sidebar_target));
+
+        app.focused_panel = Panel::Main;
+        assert_eq!(app.context_plan_identity(), Some(tab_target));
+    }
+
+    #[test]
+    fn bare_folder_focus_overrides_stale_tab_for_project_commands() {
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), PathBuf::from("/work/repo-a"));
+        app.opened_folders = vec![PathBuf::from("/work/repo-a"), PathBuf::from("/work/repo-b")];
+        app.plans_by_folder.insert(0, Vec::new());
+        app.plans_by_folder.insert(1, Vec::new());
+        app.tabs.open_tab(TabContent::Plan {
+            plan: PlanIdentity::new(
+                PathBuf::from("/work/repo-a"),
+                PathBuf::from("/work/repo-a/docs/plans/a/TASKS.md"),
+                "a".to_string(),
+            ),
+        });
+        app.focused_panel = Panel::Sidebar;
+        app.tree_cursor = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, TreeNode::Folder { folder_idx: 1 }));
+
+        assert_eq!(app.context_project_root(), PathBuf::from("/work/repo-b"));
+    }
+
+    #[test]
+    fn settings_for_focused_secondary_project_load_that_projects_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_a = temp.path().join("repo-a");
+        let repo_b = temp.path().join("repo-b");
+        std::fs::create_dir_all(repo_b.join(".makina")).unwrap();
+        std::fs::write(
+            repo_b.join(".makina/config.toml"),
+            r#"
+concurrency = 7
+
+[caps]
+gate_iterations = 8
+reviewer_iterations = 9
+wall_clock_secs = 901
+idle_secs = 45
+
+[merge]
+final = "stage"
+"#,
+        )
+        .unwrap();
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), repo_a.clone());
+        app.caps.gate_iterations = 1;
+        app.concurrency = 2;
+        app.final_merge = FinalMerge::Squash;
+        app.opened_folders = vec![repo_a, repo_b.clone()];
+        app.plans_by_folder.insert(0, Vec::new());
+        app.plans_by_folder.insert(1, Vec::new());
+        app.tree_cursor = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, TreeNode::Folder { folder_idx: 1 }));
+
+        app.update(AppEvent::OpenSettings);
+
+        let settings = app.settings.as_ref().unwrap();
+        assert_eq!(settings.project_root, repo_b);
+        assert_eq!(settings.gate_iterations, "8");
+        assert_eq!(settings.reviewer_iterations, "9");
+        assert_eq!(settings.wall_clock_secs, "901");
+        assert_eq!(settings.idle_secs, "45");
+        assert_eq!(settings.concurrency, "7");
+        assert_eq!(settings.final_merge, FinalMerge::Stage);
+        assert!(settings.error.is_none());
     }
 }

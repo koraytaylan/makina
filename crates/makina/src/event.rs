@@ -41,7 +41,7 @@ use makina_core::log_record::LogRecord;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::app::{App, AppEvent, ErrorLevel, ErrorMessage};
+use crate::app::{App, AppEvent, ErrorLevel, ErrorMessage, PlanIdentity, ResetConfirmation};
 use crate::tui::Tui;
 use crate::ui;
 
@@ -318,6 +318,7 @@ async fn resolve_io(
                         entry.path.clone(),
                         background_tx.clone(),
                         false,
+                        None,
                     );
                     (AppEvent::CloseBrowser, Some(status))
                 }
@@ -395,6 +396,19 @@ async fn resolve_io(
                 return (AppEvent::Tick, None);
             }
 
+            let path = match register_project(app, &path).await {
+                Ok(path) => path,
+                Err(message) => {
+                    app.push_error(ErrorMessage {
+                        timestamp: std::time::SystemTime::now(),
+                        level: ErrorLevel::Error,
+                        text: message.clone(),
+                    });
+                    app.mode = crate::app::Mode::Normal;
+                    return (AppEvent::Tick, Some(message));
+                }
+            };
+
             // Add to opened_folders if not already present.
             if !app.opened_folders.contains(&path) {
                 app.opened_folders.push(path.clone());
@@ -424,6 +438,18 @@ async fn resolve_io(
             // Call folder_init::initialize_folder() to set up git, branches, and docs/plans.
             match crate::folder_init::initialize_folder(&path) {
                 Ok(_) => {
+                    let path = match register_project(app, &path).await {
+                        Ok(path) => path,
+                        Err(message) => {
+                            app.push_error(ErrorMessage {
+                                timestamp: std::time::SystemTime::now(),
+                                level: ErrorLevel::Error,
+                                text: message.clone(),
+                            });
+                            app.mode = crate::app::Mode::Normal;
+                            return (AppEvent::Tick, Some(message));
+                        }
+                    };
                     // Add to opened_folders if not already present.
                     if !app.opened_folders.contains(&path) {
                         app.opened_folders.push(path.clone());
@@ -507,8 +533,26 @@ async fn resolve_io(
             (AppEvent::Tick, None)
         }
         AppEvent::CloseFolderConfirmed { path } => {
-            // Remove the folder from opened_folders.
-            app.opened_folders.retain(|p| p != &path);
+            if let Err(error) = app
+                .api
+                .execute(makina_core::api::Command::UnregisterProject {
+                    project_root: path.clone(),
+                })
+                .await
+            {
+                let message = format!("Could not close project {}: {error}", path.display());
+                app.push_error(ErrorMessage {
+                    timestamp: std::time::SystemTime::now(),
+                    level: ErrorLevel::Error,
+                    text: message.clone(),
+                });
+                app.mode = crate::app::Mode::Normal;
+                return (AppEvent::Tick, Some(message));
+            }
+
+            // Remove and rekey all folder-indexed state synchronously, before
+            // rediscovery can leave a frame where B is indexed as A.
+            app.remove_opened_folder(&path);
 
             // Update workspace and save.
             app.workspace.remove_folder(&path);
@@ -537,40 +581,49 @@ async fn resolve_io(
         // it — so a plan can be launched from its tab/node without the [o] file
         // browser. When a Run already exists it just starts/resumes it.
         //
-        // We only treat an active_run_id as "existing" for control purposes if
-        // api.run(id) resolves it (i.e. it is backed by a live registry entry).
-        // Disk snapshot runs (seeded at launch from load_disk_run_views) have
-        // synth ids for which run() returns None; attempting Start on them must
-        // fall through to opening a fresh run for the plan instead of erroring.
+        // Historical snapshots are queryable through `run(id)` too, so liveness
+        // is determined by the mutating command: only UnknownRun falls back to
+        // opening the snapshot's immutable task-list target.
         AppEvent::StartRun => {
             if let Some(event) = operation_blocked_event(app, "Start run") {
                 return (event, None);
             }
-            let has_live_run = if let Some(rid) = app.active_run_id() {
-                app.api.run(rid).await.is_some()
-            } else {
-                false
-            };
-            if has_live_run {
-                (AppEvent::Tick, run_control(app, ControlKind::Start).await)
-            } else {
-                match resolve_plan_to_open(app) {
-                    Some(PlanOpen::Tasks { path, label }) => {
-                        spawn_open_run(
-                            std::sync::Arc::clone(&app.api),
-                            path,
-                            background_tx.clone(),
-                            true,
-                        );
-                        (AppEvent::Tick, Some(format!("Starting {label}…")))
+            let active_run = app.active_run_id();
+            if let Some(run) = active_run {
+                match app
+                    .api
+                    .execute(makina_core::api::Command::StartRun { run })
+                    .await
+                {
+                    Ok(_) => return (AppEvent::Tick, Some(format!("Start {run}"))),
+                    Err(makina_core::api::ApiError::UnknownRun { .. })
+                        if app
+                            .runs
+                            .iter()
+                            .find(|view| view.id == run)
+                            .is_some_and(|view| is_plan_task_list_path(&view.task_list_path)) => {}
+                    Err(error) => {
+                        return (AppEvent::Tick, Some(format!("Start failed: {error}")));
                     }
-                    Some(PlanOpen::NoTasks { label }) => (
-                        AppEvent::Tick,
-                        Some(format!("{label}: no TASKS.md to run — author tasks first")),
-                    ),
-                    // No run and no plan context: surface the standard hint.
-                    None => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
                 }
+            }
+
+            match resolve_plan_to_open(app) {
+                Some(PlanOpen { target, label }) => {
+                    spawn_open_run(
+                        std::sync::Arc::clone(&app.api),
+                        target.task_list_path.clone(),
+                        background_tx.clone(),
+                        true,
+                        Some(target.clone()),
+                    );
+                    (
+                        AppEvent::PlanOpenStarted { target },
+                        Some(format!("Starting {label}…")),
+                    )
+                }
+                // No run and no plan context: surface the standard hint.
+                None => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
             }
         }
         AppEvent::PauseRun => match operation_blocked_event(app, "Pause run") {
@@ -593,7 +646,9 @@ async fn resolve_io(
             Some(event) => (event, None),
             None => (AppEvent::Tick, retry_focused(app).await),
         },
-        AppEvent::ResetRun => start_reset_active_run(app, background_tx).await,
+        AppEvent::ResetRun { confirmation } => {
+            start_reset_confirmed(app, confirmation, background_tx).await
+        }
         AppEvent::PurgeWorktrees => (AppEvent::Tick, purge_worktrees(app).await),
         // ── Provider configuration editor commit (task 0041) ──────────────────
         // Write the editor's current providers + roles back to the project config
@@ -611,10 +666,7 @@ async fn resolve_io(
         // on any error, returns the reason without writing. The writer preserves
         // project fields and updates CoreApi's live runtime settings; App::update
         // then closes the modal and applies the same values to local TUI state.
-        AppEvent::SettingsCommit => {
-            let status = commit_settings(app).await;
-            (AppEvent::SettingsCommit, status)
-        }
+        AppEvent::SettingsCommit => commit_settings(app).await,
         // ── Doctor scaffold (task 0046) ──────────────────────────────────────
         // Write starter config templates to both config paths if neither exists.
         // Never overwrite existing files; re-check and refuse if present.
@@ -725,8 +777,10 @@ fn spawn_discover_plans(
     fallback_to_browser: bool,
 ) {
     tokio::spawn(async move {
+        let roots = opened_folders;
+        let scan_roots = roots.clone();
         let plans_map = tokio::task::spawn_blocking(move || {
-            makina_core::orchestrator::discover_plans_per_folder(&opened_folders)
+            makina_core::orchestrator::discover_plans_per_folder(&scan_roots)
         })
         .await
         .unwrap_or_default();
@@ -740,7 +794,7 @@ fn spawn_discover_plans(
             let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             read_dir_event(&start).await
         } else {
-            AppEvent::PlansDiscoveredPerFolder { plans_map }
+            AppEvent::PlansDiscoveredPerFolder { roots, plans_map }
         };
         let _ = background_tx.send(event).await;
     });
@@ -758,10 +812,11 @@ fn spawn_open_run(
     task_list_path: std::path::PathBuf,
     background_tx: mpsc::Sender<AppEvent>,
     auto_start: bool,
+    target: Option<PlanIdentity>,
 ) {
     use makina_core::api::{Command, CommandOutcome};
     tokio::spawn(async move {
-        match api.execute(Command::OpenRun { task_list_path }).await {
+        let opened = match api.execute(Command::OpenRun { task_list_path }).await {
             // The new Run is created Pending; when the user's intent was to
             // *start* the plan (not just open it), immediately issue StartRun on
             // the freshly-opened run. The RunOpened/RunStatusChanged events flow
@@ -772,27 +827,51 @@ fn spawn_open_run(
                         .send(AppEvent::StatusMessage(format!("Start failed: {e}")))
                         .await;
                 }
+                true
             }
-            Ok(_) => {}
+            Ok(CommandOutcome::RunOpened { .. }) => true,
+            Ok(_) => false,
             Err(e) => {
                 let _ = background_tx
                     .send(AppEvent::StatusMessage(format!("Open failed: {e}")))
                     .await;
+                false
             }
+        };
+        // A successful OpenRun stays guarded until RunOpened/RunLoaded reaches
+        // App state. Clearing here recreates the interaction window where a
+        // second Start can open the same plan before the subscription event is
+        // processed. Failed/unexpected opens have no event, so clear those.
+        if !opened && let Some(target) = target {
+            let _ = background_tx
+                .send(AppEvent::PlanOpenFinished { target })
+                .await;
         }
     });
 }
 
+fn is_plan_task_list_path(path: &std::path::Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("TASKS.md")
+        && path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("plans")
+        && path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("docs")
+}
+
 /// What a `Start` press should do for the plan the user is currently in, when
 /// no Run exists for it yet (see [`resolve_plan_to_open`]).
-enum PlanOpen {
-    /// The plan has a `TASKS.md`: open it as a new Run at `path` and auto-start.
-    Tasks {
-        path: std::path::PathBuf,
-        label: String,
-    },
-    /// The plan has no `TASKS.md` to run yet.
-    NoTasks { label: String },
+struct PlanOpen {
+    target: PlanIdentity,
+    label: String,
 }
 
 /// Resolve the [`App::context_plan`](crate::app::App::context_plan) into a
@@ -802,16 +881,12 @@ enum PlanOpen {
 /// [`App::active_run_id`](crate::app::App::active_run_id) first), so this never
 /// opens a duplicate Run for a plan that is already running.
 fn resolve_plan_to_open(app: &App) -> Option<PlanOpen> {
-    let plan = app.context_plan()?;
-    Some(if plan.has_tasks {
-        PlanOpen::Tasks {
-            path: plan.dir.join("TASKS.md"),
-            label: plan.slug.clone(),
-        }
-    } else {
-        PlanOpen::NoTasks {
-            label: plan.slug.clone(),
-        }
+    let target = app
+        .context_plan_identity()
+        .or_else(|| app.selected_run().map(|run| app.plan_identity_for_run(run)))?;
+    Some(PlanOpen {
+        label: target.slug.clone(),
+        target,
     })
 }
 
@@ -875,17 +950,33 @@ async fn commit_provider_config(app: &App) -> Option<String> {
 /// `[[gates]]`, discovery stamps, and role prompts) survive the round-trip. On a
 /// successful write it also updates the live CoreApi runtime settings so a
 /// restart is not required before the next scheduler run observes the new mode.
-async fn commit_settings(app: &App) -> Option<String> {
+async fn commit_settings(app: &App) -> (AppEvent, Option<String>) {
     use crate::settings_validation::validate_settings;
     use makina_core::api::Command;
     use makina_core::config::{CapsOverride, MergeConfig, write_project_config};
 
-    let settings = app.settings.as_ref()?;
+    let Some(settings) = app.settings.as_ref() else {
+        let reason = "Settings are not open".to_string();
+        return (
+            AppEvent::SettingsSaveFailed {
+                reason: reason.clone(),
+            },
+            Some(reason),
+        );
+    };
+    let project_root = settings.project_root.clone();
 
     // Parse and validate every field using the shared validator.
     let valid = match validate_settings(settings) {
         Ok(v) => v,
-        Err(reason) => return Some(reason),
+        Err(reason) => {
+            return (
+                AppEvent::SettingsSaveFailed {
+                    reason: reason.clone(),
+                },
+                Some(reason),
+            );
+        }
     };
 
     let caps = makina_core::config::CapsConfig {
@@ -895,7 +986,7 @@ async fn commit_settings(app: &App) -> Option<String> {
         idle_secs: valid.idle_secs,
     };
 
-    if let Err(e) = write_project_config(&app.repo_root, |cfg| {
+    if let Err(e) = write_project_config(&project_root, |cfg| {
         cfg.caps = Some(CapsOverride {
             gate_iterations: Some(valid.gate_iterations),
             reviewer_iterations: Some(valid.reviewer_iterations),
@@ -909,21 +1000,35 @@ async fn commit_settings(app: &App) -> Option<String> {
     })
     .await
     {
-        return Some(format!("Config write error: {e}"));
+        let reason = format!("Config write error: {e}");
+        return (
+            AppEvent::SettingsSaveFailed {
+                reason: reason.clone(),
+            },
+            Some(reason),
+        );
     }
 
-    match app
+    let status = match app
         .api
         .execute(Command::UpdateRuntimeSettings {
+            project_root: project_root.clone(),
             caps,
             concurrency: valid.concurrency,
             final_merge: valid.final_merge,
         })
         .await
     {
-        Ok(_) => Some("Settings saved".to_string()),
-        Err(e) => Some(format!("Settings saved; runtime update failed: {e}")),
-    }
+        Ok(_) => "Settings saved".to_string(),
+        Err(e) => format!("Settings saved; runtime update failed: {e}"),
+    };
+    (
+        AppEvent::SettingsSaved {
+            project_root,
+            values: valid,
+        },
+        Some(status),
+    )
 }
 
 /// Persist the chosen theme name to `{repo_root}/.makina/config.toml`.
@@ -1256,91 +1361,62 @@ async fn retry_focused(app: &App) -> Option<String> {
 }
 
 fn operation_blocked_event(app: &App, attempted: &str) -> Option<AppEvent> {
-    let slug = app.reset_context_slug()?;
-    app.running_plan_operation(&slug)?;
+    let target = app.reset_context_target()?;
+    if app.running_plan_operation(&target).is_none() && !app.opening_plans.contains(&target) {
+        return None;
+    }
     Some(AppEvent::OperationBlocked {
-        slug,
+        target,
         attempted: attempted.to_string(),
     })
 }
 
-async fn start_reset_active_run(
+async fn start_reset_confirmed(
     app: &App,
+    confirmation: ResetConfirmation,
     background_tx: &mpsc::Sender<AppEvent>,
 ) -> (AppEvent, Option<String>) {
-    if let Some(event) = operation_blocked_event(app, "Reset selected plan/run") {
-        return (event, None);
+    let ResetConfirmation { target, label, run } = confirmation;
+    if app.running_plan_operation(&target).is_some() || app.opening_plans.contains(&target) {
+        return (
+            AppEvent::OperationBlocked {
+                target,
+                attempted: "Reset selected plan/run".to_string(),
+            },
+            None,
+        );
     }
 
-    if let Some(run) = app.active_run_id()
+    // Use a captured live id only when it still resolves to the exact project
+    // and task-list path the user approved. A stale/reused id must never reset
+    // a different run.
+    if let Some(run) = run
         && let Some(run_view) = app.api.run(run).await
+        && app.plan_identity_for_run(&run_view) == target
     {
-        let slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
-        let label = reset_label_from_path(&run_view.task_list_path);
         spawn_reset_run(
             std::sync::Arc::clone(&app.api),
             run,
-            slug.clone(),
+            target.clone(),
             label.clone(),
             background_tx.clone(),
         );
-        return (AppEvent::ResetStarted { slug, label }, None);
+        return (AppEvent::ResetStarted { target, label }, None);
     }
 
-    if let Some(plan) = app.context_plan() {
-        if !plan.has_tasks {
-            return (
-                AppEvent::CloseResetConfirmation,
-                Some(format!(
-                    "{}: no TASKS.md to reset — author tasks first",
-                    plan.slug
-                )),
-            );
-        }
-        let slug = plan.slug.clone();
-        let label = plan.slug.clone();
-        spawn_open_and_reset_task_list(
-            std::sync::Arc::clone(&app.api),
-            plan.dir.join("TASKS.md"),
-            slug.clone(),
-            label.clone(),
-            background_tx.clone(),
-        );
-        return (AppEvent::ResetStarted { slug, label }, None);
-    }
-
-    if let Some(run_view) = app.selected_run() {
-        let slug = makina_core::orchestrator::plan_slug(&run_view.task_list_path);
-        let label = reset_label_from_path(&run_view.task_list_path);
-        spawn_open_and_reset_task_list(
-            std::sync::Arc::clone(&app.api),
-            run_view.task_list_path.clone(),
-            slug.clone(),
-            label.clone(),
-            background_tx.clone(),
-        );
-        return (AppEvent::ResetStarted { slug, label }, None);
-    }
-
-    (
-        AppEvent::CloseResetConfirmation,
-        Some("No plan or run selected — open or select a plan first".to_string()),
-    )
-}
-
-fn reset_label_from_path(path: &std::path::Path) -> String {
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .or_else(|| path.file_stem().and_then(|s| s.to_str()))
-        .unwrap_or("selected run")
-        .to_string()
+    spawn_open_and_reset_task_list(
+        std::sync::Arc::clone(&app.api),
+        target.clone(),
+        label.clone(),
+        background_tx.clone(),
+    );
+    (AppEvent::ResetStarted { target, label }, None)
 }
 
 fn spawn_reset_run(
     api: std::sync::Arc<dyn makina_core::api::Api>,
     run: makina_core::api::RunId,
-    slug: String,
+    target: PlanIdentity,
     label: String,
     background_tx: mpsc::Sender<AppEvent>,
 ) {
@@ -1349,47 +1425,63 @@ fn spawn_reset_run(
     tokio::spawn(async move {
         let message = match api.execute(Command::ResetRun { run }).await {
             Ok(_) => format!("Reset {label}"),
+            Err(makina_core::api::ApiError::UnknownRun { .. }) => {
+                open_and_reset_message(api.as_ref(), &target, &label).await
+            }
             Err(e) => format!("Reset failed: {e}"),
         };
         let _ = background_tx
-            .send(AppEvent::ResetFinished { slug, message })
+            .send(AppEvent::ResetFinished { target, message })
             .await;
     });
 }
 
 fn spawn_open_and_reset_task_list(
     api: std::sync::Arc<dyn makina_core::api::Api>,
-    task_list_path: std::path::PathBuf,
-    slug: String,
+    target: PlanIdentity,
     label: String,
     background_tx: mpsc::Sender<AppEvent>,
 ) {
-    use makina_core::api::{Command, CommandOutcome};
-
     tokio::spawn(async move {
-        let message = match api.execute(Command::OpenRun { task_list_path }).await {
-            Ok(CommandOutcome::RunOpened { run }) => {
-                match api.execute(Command::ResetRun { run }).await {
-                    Ok(_) => format!("Reset {label}"),
-                    Err(e) => format!("Reset failed: {e}"),
-                }
-            }
-            Ok(_) => format!("Reset failed: opening {label} did not return a run"),
-            Err(e) => format!("Reset failed: {e}"),
-        };
+        let message = open_and_reset_message(api.as_ref(), &target, &label).await;
         let _ = background_tx
-            .send(AppEvent::ResetFinished { slug, message })
+            .send(AppEvent::ResetFinished { target, message })
             .await;
     });
 }
 
-async fn purge_worktrees(app: &App) -> Option<String> {
-    match app
-        .api
-        .execute(makina_core::api::Command::PurgeWorktrees)
+async fn open_and_reset_message(
+    api: &dyn makina_core::api::Api,
+    target: &PlanIdentity,
+    label: &str,
+) -> String {
+    use makina_core::api::{Command, CommandOutcome};
+
+    match api
+        .execute(Command::OpenRun {
+            task_list_path: target.task_list_path.clone(),
+        })
         .await
     {
-        Ok(_) => Some("Purged Makina worktrees".to_string()),
+        Ok(CommandOutcome::RunOpened { run }) => match api.execute(Command::ResetRun { run }).await
+        {
+            Ok(_) => format!("Reset {label}"),
+            Err(error) => format!("Reset failed: {error}"),
+        },
+        Ok(_) => format!("Reset failed: opening {label} did not return a run"),
+        Err(error) => format!("Reset failed: {error}"),
+    }
+}
+
+async fn purge_worktrees(app: &App) -> Option<String> {
+    let project_root = command_project_root(app);
+    let label = project_root.display().to_string();
+    match app
+        .api
+        .execute(makina_core::api::Command::PurgeWorktrees { project_root })
+        .await
+    {
+        Ok(_) => Some(format!("Purged Makina worktrees in {label}")),
         Err(e) => Some(format!("Purge worktrees failed: {e}")),
     }
 }
@@ -1405,14 +1497,37 @@ async fn purge_worktrees(app: &App) -> Option<String> {
 /// Non-fatal: discovery failure is logged by the orchestrator and returns
 /// `Acknowledged`; this function surfaces the outcome in the status bar.
 async fn discover_project(app: &App) -> Option<String> {
+    let project_root = command_project_root(app);
+    let label = project_root.display().to_string();
     match app
         .api
-        .execute(makina_core::api::Command::DiscoverProject)
+        .execute(makina_core::api::Command::DiscoverProject { project_root })
         .await
     {
-        Ok(_) => Some("Project discovery started".to_string()),
+        Ok(_) => Some(format!("Project discovery started for {label}")),
         Err(e) => Some(format!("Project discovery failed: {e}")),
     }
+}
+
+fn command_project_root(app: &App) -> std::path::PathBuf {
+    app.context_project_root()
+}
+
+async fn register_project(app: &App, path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let project_root = crate::project_api::canonicalize_project_root(path)
+        .map_err(|error| format!("Could not resolve project {}: {error}", path.display()))?;
+    app.api
+        .execute(makina_core::api::Command::RegisterProject {
+            project_root: project_root.clone(),
+        })
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not register project {}: {error}",
+                project_root.display()
+            )
+        })?;
+    Ok(project_root)
 }
 
 /// Read `dir` and build a [`AppEvent::BrowserOpened`] event from its entries.
@@ -1692,7 +1807,11 @@ fn translate_key(
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 AppEvent::CloseResetConfirmation
             }
-            KeyCode::Enter => AppEvent::ResetRun,
+            KeyCode::Enter => app
+                .reset_confirmation
+                .clone()
+                .map(|confirmation| AppEvent::ResetRun { confirmation })
+                .unwrap_or(AppEvent::CloseResetConfirmation),
             _ => AppEvent::Tick,
         }
     } else if command_palette {
@@ -2975,8 +3094,9 @@ mod tests {
             architecture_text: None,
             status_text: None,
         }];
+        let target = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0099-demo".to_string(),
+            plan: target.clone(),
         });
         assert!(
             app.active_run_id().is_none(),
@@ -2987,13 +3107,26 @@ mod tests {
         // returns an immediate "Starting …" status.
         let (tx, _rx) = background_events();
         let (ev, status) = resolve_io(&mut app, AppEvent::StartRun, &tx).await;
-        assert!(matches!(ev, AppEvent::Tick));
+        assert!(matches!(&ev, AppEvent::PlanOpenStarted { target: opened } if opened == &target));
         assert!(
             status
                 .as_deref()
                 .is_some_and(|m| m.contains("Starting") && m.contains("0099-demo")),
             "Start on a plan must surface a 'Starting <plan>…' status; got {status:?}"
         );
+        app.update(ev);
+
+        // A second interaction before RunOpened reaches App state must not
+        // launch another background OpenRun for the same canonical plan.
+        let (second, second_status) = resolve_io(&mut app, AppEvent::StartRun, &tx).await;
+        assert!(matches!(
+            second,
+            AppEvent::OperationBlocked {
+                target: ref blocked,
+                ref attempted
+            } if blocked == &target && attempted == "Start run"
+        ));
+        assert!(second_status.is_none());
 
         // The background task issues OpenRun then StartRun. Poll until both land.
         let cmds = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -3021,6 +3154,7 @@ mod tests {
             "second command must auto-start the freshly opened run; got {:?}",
             cmds[1]
         );
+        assert_eq!(cmds.len(), 2, "repeated Start must not open a second run");
     }
 
     /// Reset mirrors the Start-on-plan fallback: an already-open plan tab with
@@ -3074,20 +3208,38 @@ mod tests {
             architecture_text: None,
             status_text: None,
         }];
+        let target = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0099-demo".to_string(),
+            plan: target.clone(),
         });
 
         let (tx, mut rx) = background_events();
-        let (ev, status) = resolve_io(&mut app, AppEvent::ResetRun, &tx).await;
+        let confirmation = app
+            .reset_confirmation_for_context()
+            .expect("plan should produce reset confirmation");
+        // Change the active context after the modal captured its target. The
+        // confirmed action must still operate on the path the user approved.
+        app.discovered_plans
+            .push(makina_core::orchestrator::PlanEntry {
+                dir: std::path::PathBuf::from("/other/docs/plans/0099-demo"),
+                slug: "0099-demo".to_string(),
+                has_tasks: true,
+                tasks: Vec::new(),
+                scope_text: None,
+                architecture_text: None,
+                status_text: None,
+            });
+        let other = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[1]);
+        app.tabs.open_tab(TabContent::Plan { plan: other });
+        let (ev, status) = resolve_io(&mut app, AppEvent::ResetRun { confirmation }, &tx).await;
         assert!(status.is_none());
         assert!(
             matches!(
                 ev,
                 AppEvent::ResetStarted {
-                    ref slug,
+                    target: ref reset_target,
                     ref label
-                } if slug == "0099-demo" && label == "0099-demo"
+                } if reset_target == &target && label == "0099-demo"
             ),
             "reset must immediately mark the plan as resetting; got {ev:?}"
         );
@@ -3119,8 +3271,8 @@ mod tests {
         assert!(
             matches!(
                 rx.try_recv(),
-                Ok(AppEvent::ResetFinished { slug, message })
-                    if slug == "0099-demo" && message == "Reset 0099-demo"
+                Ok(AppEvent::ResetFinished { target: reset_target, message })
+                    if reset_target == target && message == "Reset 0099-demo"
             ),
             "background reset must report completion"
         );
@@ -3172,11 +3324,12 @@ mod tests {
             architecture_text: None,
             status_text: None,
         }];
+        let target = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0099-demo".to_string(),
+            plan: target.clone(),
         });
         app.update(AppEvent::ResetStarted {
-            slug: "0099-demo".to_string(),
+            target: target.clone(),
             label: "0099-demo".to_string(),
         });
 
@@ -3186,8 +3339,8 @@ mod tests {
         assert!(
             matches!(
                 ev,
-                AppEvent::OperationBlocked { ref slug, ref attempted }
-                    if slug == "0099-demo" && attempted == "Start run"
+                AppEvent::OperationBlocked { target: ref blocked, ref attempted }
+                    if blocked == &target && attempted == "Start run"
             ),
             "StartRun must open the operation notice while reset is in progress; got {ev:?}"
         );
@@ -3198,8 +3351,8 @@ mod tests {
         );
     }
 
-    /// **Start on a plan with no `TASKS.md`.** Such a plan cannot be opened as a
-    /// Run, so `Start` reports a helpful message and issues no command.
+    /// A TASKS-less plan still opens its synthetic TASKS.md path so Core can
+    /// generate tasks from SCOPE.md and ARCHITECTURE.md.
     #[tokio::test]
     async fn start_on_plan_without_tasks_md_reports_and_issues_nothing() {
         use crate::app::{App, AppEvent, TabContent};
@@ -3215,8 +3368,11 @@ mod tests {
         #[async_trait]
         impl Api for RecordingApi {
             async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
-                self.commands.lock().unwrap().push(command);
-                Ok(CommandOutcome::Acknowledged)
+                self.commands.lock().unwrap().push(command.clone());
+                match command {
+                    Command::OpenRun { .. } => Ok(CommandOutcome::RunOpened { run: RunId(42) }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
             }
             async fn runs(&self) -> Vec<RunView> {
                 vec![]
@@ -3246,22 +3402,132 @@ mod tests {
             architecture_text: None,
             status_text: None,
         }];
+        let target = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0100-empty".to_string(),
+            plan: target.clone(),
         });
 
         let (ev, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
-        assert!(matches!(ev, AppEvent::Tick));
         assert!(
-            status.as_deref().is_some_and(|m| m.contains("no TASKS.md")),
-            "Start on a tasks-less plan must report it has no TASKS.md; got {status:?}"
+            matches!(ev, AppEvent::PlanOpenStarted { target: ref opened } if opened == &target)
         );
-        // Give any (erroneously) spawned task a chance to run, then assert none did.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
-            api.commands.lock().unwrap().is_empty(),
-            "no command must be issued for a plan with no TASKS.md"
+            status.as_deref().is_some_and(|m| m.contains("Starting")),
+            "Start on a tasks-less plan must begin generation; got {status:?}"
         );
+        let commands = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let commands = api.commands.lock().unwrap().clone();
+                if commands.len() >= 2 {
+                    break commands;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("TASKS-less open/start did not complete");
+        assert!(matches!(&commands[0], Command::OpenRun { task_list_path }
+            if task_list_path == &target.task_list_path));
+        assert!(matches!(commands[1], Command::StartRun { run: RunId(42) }));
+    }
+
+    #[tokio::test]
+    async fn start_on_disk_snapshot_reopens_canonical_project_task_list() {
+        use crate::app::{App, AppEvent};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunStatus, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+            disk_run: RunView,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command.clone());
+                match command {
+                    Command::StartRun { run: RunId(900) } => {
+                        Err(ApiError::UnknownRun { run: RunId(900) })
+                    }
+                    Command::OpenRun { .. } => Ok(CommandOutcome::RunOpened { run: RunId(42) }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                Vec::new()
+            }
+            async fn run(&self, id: RunId) -> Option<RunView> {
+                (id == self.disk_run.id).then(|| self.disk_run.clone())
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let disk_run = RunView {
+            id: RunId(900),
+            run_uid: "disk-snapshot".to_string(),
+            task_list_path: std::path::PathBuf::from("docs/plans/0042-same/TASKS.md"),
+            status: RunStatus::Pending,
+            project: "repo-b".to_string(),
+            tasks: Vec::new(),
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+            disk_run: disk_run.clone(),
+        });
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![disk_run],
+            std::path::PathBuf::from("/work/repo-a"),
+        );
+        app.opened_folders = vec![
+            std::path::PathBuf::from("/work/repo-a"),
+            std::path::PathBuf::from("/work/repo-b"),
+        ];
+        app.tree_cursor = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, crate::app::TreeNode::Run { run: 0 }));
+
+        let (event, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
+        let expected = std::path::PathBuf::from("/work/repo-b/docs/plans/0042-same/TASKS.md");
+        assert!(matches!(
+            event,
+            AppEvent::PlanOpenStarted { target }
+                if target.project_root == std::path::Path::new("/work/repo-b")
+                    && target.task_list_path == expected
+        ));
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|message| message.contains("Starting"))
+        );
+
+        let commands = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let commands = api.commands.lock().unwrap().clone();
+                if commands.len() >= 3 {
+                    break commands;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "disk snapshot open/start did not complete; commands: {:?}",
+                api.commands.lock().unwrap()
+            )
+        });
+        assert!(matches!(commands[0], Command::StartRun { run: RunId(900) }));
+        assert!(matches!(&commands[1], Command::OpenRun { task_list_path }
+            if task_list_path == &expected));
+        assert!(matches!(commands[2], Command::StartRun { run: RunId(42) }));
     }
 
     /// A command error from the api is surfaced as a status message (not dropped).
@@ -3744,6 +4010,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let folder = tmp.path().join("my-project");
         std::fs::create_dir_all(&folder).expect("create folder");
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&folder)
+            .status()
+            .expect("run git init");
+        assert!(initialized.success(), "git init fixture must succeed");
 
         let workspace_file = tmp.path().join("workspace.toml");
 
@@ -3786,6 +4059,78 @@ mod tests {
         let saved = crate::workspace::Workspace::load_from(&workspace_file)
             .expect("saved workspace must parse");
         assert!(saved.opened_folders.contains(&folder));
+    }
+
+    #[tokio::test]
+    async fn open_folder_registration_failure_does_not_authorize_project() {
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunView,
+        };
+        use std::sync::Arc;
+
+        struct RejectRegistration;
+        #[async_trait]
+        impl Api for RejectRegistration {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                match command {
+                    Command::RegisterProject { project_root } => Err(ApiError::InvalidCommand {
+                        reason: format!("{} is not allowed", project_root.display()),
+                    }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                Vec::new()
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("rejected");
+        std::fs::create_dir_all(&folder).unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&folder)
+            .status()
+            .expect("run git init");
+        assert!(initialized.success(), "git init fixture must succeed");
+        let mut app = App::new(
+            Arc::new(RejectRegistration),
+            Vec::new(),
+            temp.path().to_path_buf(),
+        );
+        app.workspace_path_override = Some(temp.path().join("workspace.toml"));
+        let (tx, _rx) = background_events();
+
+        let (event, status) = resolve_io(
+            &mut app,
+            AppEvent::OpenFolderSelected {
+                path: folder.clone(),
+            },
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(event, AppEvent::Tick));
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|message| message.contains("register"))
+        );
+        assert!(!app.opened_folders.contains(&folder));
+        assert!(!app.workspace.opened_folders.contains(&folder));
+        assert!(
+            app.error_messages
+                .iter()
+                .any(|message| message.text.contains("register"))
+        );
     }
 
     /// **`OpenFolderSelected` re-opening an already-opened folder is
@@ -5271,16 +5616,20 @@ final = "squash"
         app.update(AppEvent::SettingsNextOption);
 
         // Commit settings via resolve_io.
-        let (_resolved_event, status) =
+        let (resolved_event, status) =
             resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
 
         // Status should be "Settings saved".
         assert_eq!(status, Some("Settings saved".to_string()));
-
-        // Now process the SettingsCommit through update (in production, the loop does this).
-        // For this test, we manually apply the values since resolve_io doesn't mutate app.
-        // (In production, the loop calls update(SettingsCommit) after resolve_io returns.)
-        // Instead, just verify the file was written correctly.
+        assert!(matches!(
+            &resolved_event,
+            AppEvent::SettingsSaved { project_root, .. } if project_root == repo_root
+        ));
+        app.update(resolved_event);
+        assert!(!app.is_settings(), "a successful save must close the modal");
+        assert_eq!(app.caps.gate_iterations, 10);
+        assert_eq!(app.concurrency, 8);
+        assert_eq!(app.final_merge, makina_core::config::FinalMerge::Stage);
 
         // Re-read the config file and verify it was updated.
         let new_config_str = std::fs::read_to_string(&config_path).expect("read config");
@@ -5329,6 +5678,44 @@ final = "squash"
                 .and_then(|role| role.system_prompt.as_deref()),
             Some("Follow the repository style."),
             "project role prompt must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_write_failure_keeps_modal_open_with_the_error() {
+        use crate::app::App;
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let blocked_root = tmpdir.path().join("not-a-directory");
+        std::fs::write(&blocked_root, "blocks .makina directory creation")
+            .expect("write blocking file");
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], blocked_root);
+        app.update(AppEvent::OpenSettings);
+        assert!(app.is_settings());
+
+        let (resolved_event, status) =
+            resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+        assert!(matches!(
+            resolved_event,
+            AppEvent::SettingsSaveFailed { .. }
+        ));
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|message| message.contains("Config write error"))
+        );
+
+        app.update(resolved_event);
+        assert!(app.is_settings(), "a failed save must keep the modal open");
+        assert!(
+            app.settings
+                .as_ref()
+                .and_then(|settings| settings.error.as_deref())
+                .is_some_and(|message| message.contains("Config write error"))
         );
     }
 
@@ -5540,7 +5927,8 @@ final = "squash"
             .expect("timed out waiting for PlansDiscoveredPerFolder")
             .expect("background channel closed");
         match &discovered {
-            AppEvent::PlansDiscoveredPerFolder { plans_map } => {
+            AppEvent::PlansDiscoveredPerFolder { roots, plans_map } => {
+                assert_eq!(roots, &app.opened_folders);
                 assert_eq!(
                     plans_map.len(),
                     1,
@@ -5621,11 +6009,13 @@ final = "squash"
         app.tree_cursor = Some(0);
 
         // Simulate initial collapsed state (as PlansDiscovered would seed).
-        app.collapsed_plans = (0..app.discovered_plans.len())
-            .map(CollapseKey::LegacyPlan)
-            .collect();
+        let collapse_key = CollapseKey::Plan(
+            app.plan_identity_for_node(TreeNode::Plan { plan_idx: 0 })
+                .expect("plan identity"),
+        );
+        app.collapsed_plans = std::iter::once(collapse_key.clone()).collect();
         assert!(
-            app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)),
+            app.collapsed_plans.contains(&collapse_key),
             "plan should start collapsed"
         );
 
@@ -5650,10 +6040,10 @@ final = "squash"
         assert_eq!(app.tabs.open_tabs.len(), 1);
         assert!(matches!(
             &app.tabs.open_tabs[0],
-            crate::app::TabContent::Plan { plan_slug } if plan_slug == "0001-test"
+            crate::app::TabContent::Plan { plan } if plan.slug == "0001-test"
         ));
         assert!(
-            !app.collapsed_plans.contains(&CollapseKey::LegacyPlan(0)),
+            !app.collapsed_plans.contains(&collapse_key),
             "Enter on plan node must expand it in the sidebar"
         );
     }
@@ -5822,7 +6212,7 @@ final = "squash"
     fn s_and_z_keys_in_main_with_plan_task_tab_toggle_task_sections() {
         let mut app = test_app();
         app.tabs.open_tab(crate::app::TabContent::PlanTask {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
             task_id: "preview-task".to_string(),
         });
 
@@ -5892,7 +6282,7 @@ final = "squash"
 
         // Open a plan tab
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
         });
         app.focused_panel = crate::app::Panel::Main;
 
@@ -5915,7 +6305,10 @@ final = "squash"
         app.update(ev);
 
         // The accordion state should have the Scope section expanded
-        let expanded = app.accordion_state.get("test-plan").unwrap();
+        let expanded = app
+            .accordion_state
+            .get(&PlanIdentity::legacy("test-plan"))
+            .unwrap();
         assert!(expanded.contains(&crate::app::AccordionSection::Scope));
 
         // Toggle it again (should collapse)
@@ -5929,7 +6322,10 @@ final = "squash"
         app.update(ev2);
 
         // Should be collapsed now
-        let expanded = app.accordion_state.get("test-plan").unwrap();
+        let expanded = app
+            .accordion_state
+            .get(&PlanIdentity::legacy("test-plan"))
+            .unwrap();
         assert!(!expanded.contains(&crate::app::AccordionSection::Scope));
     }
 
@@ -5989,10 +6385,10 @@ final = "squash"
 
         // Open two plan tabs
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "plan-1".to_string(),
+            plan: PlanIdentity::legacy("plan-1".to_string()),
         });
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "plan-2".to_string(),
+            plan: PlanIdentity::legacy("plan-2".to_string()),
         });
 
         // plan-2 should be active (it was the last one opened)
@@ -6096,7 +6492,8 @@ final = "squash"
 
         let mut app = test_app();
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: makina_core::api::TaskId::new("test-task"),
         });
         *app.accordion_header_bounds.borrow_mut() = vec![(
@@ -6130,7 +6527,7 @@ final = "squash"
 
         let mut app = test_app();
         app.tabs.open_tab(crate::app::TabContent::PlanTask {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
             task_id: "preview-task".to_string(),
         });
         *app.accordion_header_bounds.borrow_mut() = vec![(

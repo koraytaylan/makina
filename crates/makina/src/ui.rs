@@ -582,13 +582,14 @@ pub fn render(app: &App, frame: &mut Frame) {
                     TreeNode::Plan { plan_idx } => {
                         let plan_entry = &app.discovered_plans[*plan_idx];
                         let n_tasks = plan_entry.tasks.len();
+                        let target = app.plan_identity_for_entry(&app.repo_root, plan_entry);
                         // Disclosure glyph: a plan with tasks gets ▸/▾; a plan with
                         // no tasks is a leaf (no triangle).
                         let disclosure = if n_tasks == 0 {
                             "  "
                         } else if app
                             .collapsed_plans
-                            .contains(&CollapseKey::LegacyPlan(*plan_idx))
+                            .contains(&CollapseKey::Plan(target.clone()))
                         {
                             "▸ "
                         } else {
@@ -619,7 +620,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ));
                         }
-                        if app.resetting_label(&plan_entry.slug).is_some() {
+                        if app.resetting_label(&target).is_some() {
                             line_spans.push(Span::styled(
                                 format!("  {} resetting", spinner_frame(app.tick)),
                                 Style::default()
@@ -736,11 +737,9 @@ pub fn render(app: &App, frame: &mut Frame) {
                         let plan_entry = &app.plans_by_folder[folder_idx][*plan_idx];
                         let n_tasks = plan_entry.tasks.len();
 
-                        // Namespaced collapse key, matching visible_tree_nodes().
-                        let collapse_key = CollapseKey::FolderPlan {
-                            folder: *folder_idx,
-                            plan: *plan_idx,
-                        };
+                        let target = app
+                            .plan_identity_for_entry(&app.opened_folders[*folder_idx], plan_entry);
+                        let collapse_key = CollapseKey::Plan(target.clone());
 
                         let disclosure = if n_tasks == 0 {
                             "    "
@@ -777,8 +776,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                             ));
                         }
 
-                        // Check for resetting status via plan slug.
-                        if app.resetting_label(&plan_entry.slug).is_some() {
+                        if app.resetting_label(&target).is_some() {
                             line_spans.push(Span::styled(
                                 format!("  {} resetting", spinner_frame(app.tick)),
                                 Style::default()
@@ -1021,8 +1019,8 @@ pub fn render(app: &App, frame: &mut Frame) {
     // otherwise a hint.
     let active_plan_tab = app.tabs.active_tab.and_then(|idx| {
         app.tabs.open_tabs.get(idx).and_then(|tab_content| {
-            if let crate::app::TabContent::Plan { plan_slug } = tab_content {
-                find_plan_entry_by_slug(app, plan_slug)
+            if let crate::app::TabContent::Plan { plan } = tab_content {
+                app.plan_entry(plan)
             } else {
                 None
             }
@@ -1043,12 +1041,13 @@ pub fn render(app: &App, frame: &mut Frame) {
     // preview, rendered as a standalone task pane (distinct from the plan tab).
     let active_plan_task_tab = app.tabs.active_tab.and_then(|idx| {
         app.tabs.open_tabs.get(idx).and_then(|tab_content| {
-            if let crate::app::TabContent::PlanTask { plan_slug, task_id } = tab_content {
-                find_plan_entry_by_slug(app, plan_slug).and_then(|plan| {
-                    plan.tasks
+            if let crate::app::TabContent::PlanTask { plan, task_id } = tab_content {
+                app.plan_entry(plan).and_then(|entry| {
+                    entry
+                        .tasks
                         .iter()
                         .find(|t| t.id == *task_id)
-                        .map(|preview| (plan, preview))
+                        .map(|preview| (plan, entry, preview))
                 })
             } else {
                 None
@@ -1092,7 +1091,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 rect: plan_area,
             });
         }
-        (None, Some((plan, preview)), _, _) => {
+        (None, Some((plan_identity, plan, preview)), _, _) => {
             // A plan-task tab starts as a read-only preview, then upgrades to
             // the live task detail as soon as a matching run exists.
             let split = Layout::default()
@@ -1102,7 +1101,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             render_tab_bar(app, frame, split[0]);
             let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
             if let Some((run, task_idx)) =
-                find_live_plan_task_for_preview(app, &plan.slug, &preview.id)
+                find_live_plan_task_for_preview(app, plan_identity, &preview.id)
             {
                 render_task_entry_pane(app, run, task_idx, frame, task_area);
             } else {
@@ -1457,7 +1456,7 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
         let (kind, label) = match tab {
             TabContent::Task { task_id, .. } => ("task ", task_id.0.clone()),
             TabContent::PlanTask { task_id, .. } => ("task ", task_id.clone()),
-            TabContent::Plan { plan_slug } => ("plan ", plan_slug.clone()),
+            TabContent::Plan { plan } => ("plan ", plan.slug.clone()),
         };
         let chip = format!(" {kind}{label} × ");
         let chip_w = chip.chars().count() as u16;
@@ -2879,38 +2878,15 @@ fn find_task_idx_in_run(app: &App, task_id: &TaskId) -> Option<usize> {
         .and_then(|run| run.tasks.iter().position(|t| &t.id == task_id))
 }
 
-/// Find a [`PlanEntry`] by slug across BOTH plan stores: the legacy
-/// `discovered_plans` (single-folder) and the multi-folder `plans_by_folder`.
-/// Tab content carries only the slug, so the render path must search both
-/// stores to resolve a plan tab opened from either a legacy `Plan` node or a
-/// folder-scoped `PlanInFolder` node. Without the `plans_by_folder` search,
-/// Enter on a folder-scoped plan opens the tab but the main pane renders the
-/// empty hint instead of the plan accordion (the tab's slug is absent from
-/// `discovered_plans`).
-fn find_plan_entry_by_slug<'a>(
-    app: &'a App,
-    plan_slug: &str,
-) -> Option<&'a makina_core::orchestrator::PlanEntry> {
-    app.discovered_plans
-        .iter()
-        .find(|p| p.slug == plan_slug)
-        .or_else(|| {
-            app.plans_by_folder
-                .values()
-                .flatten()
-                .find(|p| p.slug == plan_slug)
-        })
-}
-
 fn find_live_plan_task_for_preview<'a>(
     app: &'a App,
-    expected_plan_slug: &str,
+    expected_plan: &crate::app::PlanIdentity,
     task_id: &str,
 ) -> Option<(&'a RunView, usize)> {
     let task_id = TaskId::new(task_id);
 
     if let Some(run) = app.selected_run()
-        && makina_core::orchestrator::plan_slug(&run.task_list_path) == expected_plan_slug
+        && app.plan_identity_for_run(run) == *expected_plan
         && let Some(task_idx) = run.tasks.iter().position(|task| task.id == task_id)
     {
         return Some((run, task_idx));
@@ -2918,7 +2894,7 @@ fn find_live_plan_task_for_preview<'a>(
 
     let mut best: Option<(&RunView, usize)> = None;
     for run in &app.runs {
-        if makina_core::orchestrator::plan_slug(&run.task_list_path) != expected_plan_slug {
+        if app.plan_identity_for_run(run) != *expected_plan {
             continue;
         }
         let Some(task_idx) = run.tasks.iter().position(|task| task.id == task_id) else {
@@ -3029,9 +3005,16 @@ pub(crate) fn render_plan_accordion_pane(
     push_line!(Line::from(""));
 
     // Get accordion state for this plan
+    let plan_identity = app
+        .context_plan_identity()
+        .unwrap_or_else(|| crate::app::PlanIdentity::legacy(plan.slug.clone()));
     let expanded = app
         .accordion_state
-        .get(&plan.slug)
+        .get(&plan_identity)
+        .or_else(|| {
+            app.accordion_state
+                .get(&crate::app::PlanIdentity::legacy(plan.slug.clone()))
+        })
         .cloned()
         .unwrap_or_default();
 
@@ -4417,7 +4400,10 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
     let footer_area = chunks[2];
 
     // Build the list of settings fields
-    let mut items: Vec<ListItem> = vec![];
+    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![Span::styled(
+        format!("  Project: {}", settings.project_root.display()),
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+    )]))];
 
     let final_merge_value = format!(
         "< {} >",
@@ -4557,7 +4543,7 @@ fn render_reset_confirmation(
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             ),
             Span::styled(
-                confirm.task_list_path.display().to_string(),
+                confirm.target.task_list_path.display().to_string(),
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             ),
         ]),
@@ -4602,10 +4588,10 @@ fn render_operation_notice(
         .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(inner);
 
-    let operation = app.plan_operations.get(&notice.slug);
+    let operation = app.plan_operations.get(&notice.target);
     let label = operation
         .map(|op| op.label.as_str())
-        .unwrap_or(notice.slug.as_str());
+        .unwrap_or(notice.target.slug.as_str());
     let current_step = operation
         .and_then(|op| op.log.last())
         .map(String::as_str)
@@ -5206,7 +5192,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ScrollablePanel};
+    use crate::app::{App, PlanIdentity, ScrollablePanel};
     use crate::placeholder::PlaceholderApi;
     use makina_core::api::{
         IngestionIssue, IngestionReport, IssueSeverity, IssueSource, RunId, RunStatus, RunView,
@@ -5344,7 +5330,11 @@ mod tests {
             status_text: None,
         }];
         app.tree_cursor = Some(0);
-        app.collapsed_plans.insert(CollapseKey::LegacyPlan(0)); // PlansDiscovered seeds this in the real flow
+        let collapse_key = CollapseKey::Plan(
+            app.plan_identity_for_node(TreeNode::Plan { plan_idx: 0 })
+                .expect("plan identity"),
+        );
+        app.collapsed_plans.insert(collapse_key); // PlansDiscovered seeds this in the real flow
         // Plan starts collapsed (children hidden) until expanded.
         terminal.draw(|f| render(&app, f)).unwrap();
         assert!(
@@ -5387,7 +5377,7 @@ mod tests {
         // Open a plan tab for this plan (plan 0032).
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan_slug: "0001-initial".to_string(),
+                plan: PlanIdentity::legacy("0001-initial".to_string()),
             },
         ));
 
@@ -5396,7 +5386,7 @@ mod tests {
         assert!(screen.contains("Plan: 0001-initial"), "plan header missing");
         // Sections are collapsed by default, so we expand TASKS to see the task list
         app.accordion_state
-            .entry("0001-initial".to_string())
+            .entry(PlanIdentity::legacy("0001-initial"))
             .or_default()
             .insert(crate::app::AccordionSection::Tasks);
         terminal.draw(|f| render(&app, f)).unwrap();
@@ -5449,7 +5439,7 @@ mod tests {
         // Open a plan tab for the folder-scoped plan.
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan_slug: "0001-initial".to_string(),
+                plan: PlanIdentity::legacy("0001-initial".to_string()),
             },
         ));
 
@@ -5500,21 +5490,21 @@ mod tests {
         // Open a plan tab for this plan.
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan_slug: "0001-initial".to_string(),
+                plan: PlanIdentity::legacy("0001-initial".to_string()),
             },
         ));
 
         // Expand all sections to make content tall.
         app.accordion_state
-            .entry("0001-initial".to_string())
+            .entry(PlanIdentity::legacy("0001-initial"))
             .or_default()
             .insert(crate::app::AccordionSection::Scope);
         app.accordion_state
-            .entry("0001-initial".to_string())
+            .entry(PlanIdentity::legacy("0001-initial"))
             .or_default()
             .insert(crate::app::AccordionSection::Architecture);
         app.accordion_state
-            .entry("0001-initial".to_string())
+            .entry(PlanIdentity::legacy("0001-initial"))
             .or_default()
             .insert(crate::app::AccordionSection::Status);
 
@@ -5574,7 +5564,7 @@ mod tests {
         // Open a plan tab for this plan.
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan_slug: "0001-initial".to_string(),
+                plan: PlanIdentity::legacy("0001-initial".to_string()),
             },
         ));
 
@@ -5661,20 +5651,20 @@ mod tests {
 
         // Open a plan tab.
         app.update(AppEvent::OpenTab(crate::app::TabContent::Plan {
-            plan_slug: "0001-initial".to_string(),
+            plan: PlanIdentity::legacy("0001-initial".to_string()),
         }));
 
         // Expand all sections to make content tall.
         app.accordion_state
-            .entry("0001-initial".to_string())
+            .entry(PlanIdentity::legacy("0001-initial"))
             .or_default()
             .insert(crate::app::AccordionSection::Scope);
         app.accordion_state
-            .entry("0001-initial".to_string())
+            .entry(PlanIdentity::legacy("0001-initial"))
             .or_default()
             .insert(crate::app::AccordionSection::Architecture);
         app.accordion_state
-            .entry("0001-initial".to_string())
+            .entry(PlanIdentity::legacy("0001-initial"))
             .or_default()
             .insert(crate::app::AccordionSection::Status);
 
@@ -7063,7 +7053,7 @@ mod tests {
             status_text: None,
         }];
         app.tabs.open_tab(TabContent::Plan {
-            plan_slug: "0007-demo".to_string(),
+            plan: PlanIdentity::legacy("0007-demo".to_string()),
         });
         app.tabs.active_tab = Some(0);
         assert!(
@@ -7558,7 +7548,8 @@ mod tests {
         // exchange pane is visible.
         app.collapsed_runs.clear();
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "exchange-test".to_string(),
+            plan: PlanIdentity::legacy("exchange-test".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("task-a"),
         });
         app.sync_selected_run_to_active_tab();
@@ -7626,7 +7617,8 @@ mod tests {
         // Open a task tab for task-a so the log target is deterministic.
         let slug = makina_core::orchestrator::plan_slug(&app.runs[0].task_list_path);
         app.tabs.open_tab(TabContent::Task {
-            plan_slug: slug,
+            plan: PlanIdentity::legacy(slug),
+            run: RunId(1),
             task_id: TaskId::new("task-a"),
         });
         app.tabs.active_tab = Some(0);
@@ -7778,7 +7770,8 @@ mod tests {
         // With tabs, the active tab determines which task's content is displayed.
         // Open task-b's tab so the exchange pane switches to its log.
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "exchange-test".to_string(),
+            plan: PlanIdentity::legacy("exchange-test".to_string()),
+            run: RunId(1),
             task_id: makina_core::api::TaskId::new("task-b"),
         });
         app.sync_selected_run_to_active_tab();
@@ -10475,6 +10468,7 @@ mod tests {
         // Set up settings with known values
         app.mode = crate::app::Mode::Settings;
         app.settings = Some(crate::app::Settings {
+            project_root: std::path::PathBuf::from("."),
             gate_iterations: "7".to_string(),
             reviewer_iterations: "3".to_string(),
             wall_clock_secs: "600".to_string(),
@@ -10713,7 +10707,7 @@ mod tests {
         {
             let sections = app
                 .accordion_state
-                .entry("0032-test".to_string())
+                .entry(PlanIdentity::legacy("0032-test"))
                 .or_default();
             sections.insert(AccordionSection::Scope);
             sections.insert(AccordionSection::Architecture);
@@ -10811,7 +10805,7 @@ mod tests {
         {
             let sections = app
                 .accordion_state
-                .entry("0032-missing".to_string())
+                .entry(PlanIdentity::legacy("0032-missing"))
                 .or_default();
             sections.insert(AccordionSection::Scope);
             sections.insert(AccordionSection::Architecture);
@@ -10883,7 +10877,7 @@ mod tests {
         {
             let sections = app
                 .accordion_state
-                .entry("0035-md".to_string())
+                .entry(PlanIdentity::legacy("0035-md"))
                 .or_default();
             sections.insert(AccordionSection::Scope);
             sections.insert(AccordionSection::Architecture);
@@ -11767,7 +11761,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("test-task"),
         });
 
@@ -11822,7 +11817,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("click-test"),
         });
 
@@ -11871,7 +11867,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("width-test"),
         });
 
@@ -11932,7 +11929,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("scroll-test"),
         });
 
@@ -12010,7 +12008,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "test-plan".to_string(),
+            plan: PlanIdentity::legacy("test-plan".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("offset-test"),
         });
 
@@ -12089,7 +12088,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "exec-test".to_string(),
+            plan: PlanIdentity::legacy("exec-test".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("exec-task"),
         });
         // Verbose mode so thought bodies and tool content render too.
@@ -12247,7 +12247,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "rail-test".to_string(),
+            plan: PlanIdentity::legacy("rail-test".to_string()),
+            run: RunId(1),
             task_id: task_id.clone(),
         });
         app.exchange_logs.insert(
@@ -12363,7 +12364,8 @@ mod tests {
         app.selected_task = Some(0);
         app.verbose_mode = true;
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "markdown-detail".to_string(),
+            plan: PlanIdentity::legacy("markdown-detail".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("markdown-detail"),
         });
 
@@ -12466,8 +12468,9 @@ mod tests {
             architecture_text: None,
             status_text: None,
         }];
+        let plan_identity = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::PlanTask {
-            plan_slug: "0004-markdown-plan".to_string(),
+            plan: plan_identity,
             task_id: "render-markdown".to_string(),
         });
 
@@ -12615,8 +12618,9 @@ mod tests {
             architecture_text: None,
             status_text: None,
         }];
+        let plan_identity = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::PlanTask {
-            plan_slug: "0004-markdown-plan".to_string(),
+            plan: plan_identity,
             task_id: "render-markdown".to_string(),
         });
 
@@ -12770,7 +12774,8 @@ mod tests {
         let mut app = App::new(api, vec![run], PathBuf::from("."));
         app.selected_task = Some(0);
         app.tabs.open_tab(crate::app::TabContent::Task {
-            plan_slug: "empty-test".to_string(),
+            plan: PlanIdentity::legacy("empty-test".to_string()),
+            run: RunId(1),
             task_id: TaskId::new("empty-task"),
         });
 

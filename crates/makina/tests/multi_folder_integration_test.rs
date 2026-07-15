@@ -31,10 +31,15 @@ struct PlaceholderApi;
 
 #[async_trait]
 impl Api for PlaceholderApi {
-    async fn execute(&self, _command: Command) -> Result<CommandOutcome, ApiError> {
-        Err(ApiError::Internal {
-            reason: "stub".into(),
-        })
+    async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+        match command {
+            Command::RegisterProject { .. } | Command::UnregisterProject { .. } => {
+                Ok(CommandOutcome::Acknowledged)
+            }
+            _ => Err(ApiError::Internal {
+                reason: "stub".into(),
+            }),
+        }
     }
 
     async fn runs(&self) -> Vec<RunView> {
@@ -87,7 +92,10 @@ fn render_to_string(app: &App) -> String {
 /// appear.
 fn discover_and_apply(app: &mut App) {
     let plans_map = makina_core::orchestrator::discover_plans_per_folder(&app.opened_folders);
-    app.update(AppEvent::PlansDiscoveredPerFolder { plans_map });
+    app.update(AppEvent::PlansDiscoveredPerFolder {
+        roots: app.opened_folders.clone(),
+        plans_map,
+    });
 }
 
 /// Open `folder` by dispatching the real `OpenFolderSelected` event through
@@ -95,6 +103,12 @@ fn discover_and_apply(app: &mut App) {
 /// mutation) — the same two-step pipeline the production event loop runs —
 /// then applies discovery so the sidebar reflects the folder's plans.
 async fn open_folder_via_event(app: &mut App, folder: &Path) {
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(folder)
+        .status()
+        .expect("run git init");
+    assert!(status.success(), "test folder must be a Git worktree");
     let (resolved, status) = resolve_io_for_test(
         app,
         AppEvent::OpenFolderSelected {
@@ -561,8 +575,9 @@ async fn test_sidebar_tree_three_level_structure() {
     );
 
     // Expand the plan so its task becomes visible.
+    let plan = app.plan_identity_for_entry(&app.opened_folders[0], &app.plans_by_folder[&0][0]);
     app.collapsed_plans
-        .remove(&makina::app::CollapseKey::FolderPlan { folder: 0, plan: 0 });
+        .remove(&makina::app::CollapseKey::Plan(plan));
     let nodes = app.visible_tree_nodes();
     assert!(
         nodes.iter().any(|n| matches!(
