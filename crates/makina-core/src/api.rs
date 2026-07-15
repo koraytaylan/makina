@@ -469,6 +469,26 @@ pub enum Command {
         run: RunId,
     },
 
+    /// Register a canonical Git project root with a multiplexing API.
+    ///
+    /// A repository-bound CoreApi validates that the path names its own root
+    /// and acknowledges the command. A multi-project router uses it to extend
+    /// its explicit workspace allowlist before accepting OpenRun paths there.
+    RegisterProject {
+        /// Project folder selected by the user.
+        project_root: PathBuf,
+    },
+
+    /// Remove a Git project root from a multiplexing API's workspace allowlist.
+    ///
+    /// Existing run handles remain valid so in-flight lifecycle cleanup can
+    /// finish, but new path/project commands for the folder are rejected until
+    /// it is registered again.
+    UnregisterProject {
+        /// Project folder closed by the user.
+        project_root: PathBuf,
+    },
+
     /// Update the runtime settings used by newly spawned schedulers.
     ///
     /// The TUI settings screen persists these values to `.makina/config.toml`
@@ -477,6 +497,8 @@ pub enum Command {
     /// merge mode. In-flight task drivers keep the config snapshot they were
     /// started with.
     UpdateRuntimeSettings {
+        /// Canonical repository root whose runtime settings should change.
+        project_root: PathBuf,
         /// Updated termination caps.
         caps: CapsConfig,
         /// Updated maximum scheduler concurrency.
@@ -494,13 +516,19 @@ pub enum Command {
     ///
     /// Non-fatal: if discovery fails, the error is logged and the command
     /// returns `Ok(Acknowledged)` rather than an error — the config is not modified.
-    DiscoverProject,
+    DiscoverProject {
+        /// Canonical repository root to discover.
+        project_root: PathBuf,
+    },
 
     /// Remove Makina-created git worktrees for the current repository.
     ///
     /// This only targets worktrees stored under Makina's transient state root for
     /// the project; user-created worktrees elsewhere are ignored.
-    PurgeWorktrees,
+    PurgeWorktrees {
+        /// Canonical repository root whose Makina worktrees should be removed.
+        project_root: PathBuf,
+    },
 }
 
 /// The successful outcome of a [`Command`] executed via [`Api::execute`].
@@ -932,6 +960,8 @@ pub enum Event {
     /// The TUI can surface this as a transient "Discovered N gates from M files"
     /// status message.
     ProjectDiscovered {
+        /// Canonical repository root that was discovered.
+        project_root: PathBuf,
         /// Number of gates discovered.
         gate_count: usize,
         /// Number of files scanned.
@@ -940,6 +970,8 @@ pub enum Event {
 
     /// Progress for a long-running plan-level operation such as reset.
     PlanOperation {
+        /// Run that owns the operation.
+        run: RunId,
         /// Stable plan slug the operation applies to.
         plan_slug: String,
         /// Human-facing plan label.
@@ -1051,17 +1083,20 @@ pub trait Api: Send + Sync {
     /// unexpected failures.
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError>;
 
-    /// Return a snapshot of all currently open Runs.
+    /// Return a snapshot of all currently open Runs and persisted historical
+    /// Runs discovered for this project.
     ///
     /// Used by the TUI to populate the sidebar.  Returns an empty `Vec` when no
-    /// Runs have been opened yet.  The order is stable within a session
-    /// (insertion order of `OpenRun` commands).
+    /// Runs have been opened or persisted yet. The returned identifiers remain
+    /// stable within a session; live runs retain insertion order and historical
+    /// runs retain chronological order.
     ///
     /// This is a point-in-time snapshot; the TUI SHOULD update its local state
     /// from the [`EventStream`] rather than polling this method repeatedly.
     async fn runs(&self) -> Vec<RunView>;
 
-    /// Return a snapshot of a single Run, or `None` if `id` is unknown.
+    /// Return a snapshot of a single live or previously surfaced historical
+    /// Run, or `None` if `id` is unknown.
     ///
     /// Returns `None` (not an error) for an unknown [`RunId`] because the TUI
     /// may hold a stale reference that became invalid while the user was
@@ -1209,12 +1244,14 @@ mod tests {
                         Err(ApiError::UnknownRun { run })
                     }
                 }
-                Command::DiscoverProject => {
+                Command::DiscoverProject { .. } => {
                     // Stub: acknowledge without doing real discovery.
                     Ok(CommandOutcome::Acknowledged)
                 }
+                Command::RegisterProject { .. } => Ok(CommandOutcome::Acknowledged),
+                Command::UnregisterProject { .. } => Ok(CommandOutcome::Acknowledged),
                 Command::UpdateRuntimeSettings { .. } => Ok(CommandOutcome::Acknowledged),
-                Command::PurgeWorktrees => Ok(CommandOutcome::Acknowledged),
+                Command::PurgeWorktrees { .. } => Ok(CommandOutcome::Acknowledged),
             }
         }
 

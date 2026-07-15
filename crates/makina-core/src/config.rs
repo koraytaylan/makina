@@ -1112,9 +1112,22 @@ impl Config {
     /// - `.1` — the [`ConfigPaths`] that were resolved before the load attempt.
     ///   These are valid regardless of whether `.0` is `Ok` or `Err`.
     pub fn load_defaults_with_paths() -> (Result<Config, ConfigError>, ConfigPaths) {
-        let global_path = home_dir().map(|h| h.join(".makina").join("config.toml"));
         let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let (project_path, _legacy) = resolve_project_config_path(&repo_root);
+        Self::load_for_repo_with_paths(&repo_root)
+    }
+
+    /// Resolve and load configuration for an explicit repository root.
+    ///
+    /// Unlike [`Config::load_defaults_with_paths`], this does not depend on the
+    /// process current directory. It is the production entry point for
+    /// multi-project runtimes: every project receives its own project config,
+    /// gates, base branch, and role constraints while sharing the operator's
+    /// global provider configuration.
+    pub fn load_for_repo_with_paths(
+        repo_root: &Path,
+    ) -> (Result<Config, ConfigError>, ConfigPaths) {
+        let global_path = home_dir().map(|h| h.join(".makina").join("config.toml"));
+        let (project_path, _legacy) = resolve_project_config_path(repo_root);
 
         let paths = ConfigPaths {
             global: global_path.clone(),

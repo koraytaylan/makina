@@ -65,7 +65,7 @@
 //! | `StartRun` / `PauseRun` / `CancelRun` driving the Supervisor | **implemented** | this task (31) |
 //! | model-backed interpreter + real ACP backend | injected, not wired | e2e (task 33) |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -799,6 +799,13 @@ struct CoreState {
     /// Monotonic allocator for fresh [`RunId`]s.  First id is `1`.
     next_id: AtomicU64,
 
+    /// Stable session handles for historical runs loaded from `run.json`.
+    ///
+    /// Disk snapshots are rediscovered on every [`Api::runs`] query. Keeping
+    /// their ULID-to-handle binding here prevents the same historical run from
+    /// changing identity between queries or colliding with a later live run.
+    disk_run_ids: Mutex<HashMap<String, RunId>>,
+
     /// Broadcast sender for the live event stream.  Each [`Api::subscribe`] call
     /// derives an independent receiver; the background scheduler's [`EventSink`]
     /// forwards engine events into this same sender.
@@ -1165,6 +1172,7 @@ impl CoreApi {
                 open_lock: AsyncMutex::new(()),
                 lifecycle_lock: AsyncMutex::new(()),
                 next_id: AtomicU64::new(1),
+                disk_run_ids: Mutex::new(HashMap::new()),
                 event_tx,
                 audit_registry,
             }),
@@ -1436,6 +1444,7 @@ impl CoreApi {
                         .state
                         .event_tx
                         .send(crate::api::Event::ProjectDiscovered {
+                            project_root: repo_root.clone(),
                             gate_count: 0,
                             scanned_files: 0,
                         });
@@ -1473,6 +1482,7 @@ impl CoreApi {
             .state
             .event_tx
             .send(crate::api::Event::ProjectDiscovered {
+                project_root: repo_root.clone(),
                 gate_count: result.gates.len(),
                 scanned_files: scanned_files.len(),
             });
@@ -1519,6 +1529,7 @@ impl CoreApi {
                         .state
                         .event_tx
                         .send(crate::api::Event::ProjectDiscovered {
+                            project_root: repo_root.clone(),
                             gate_count: 0,
                             scanned_files: 0,
                         });
@@ -1556,11 +1567,42 @@ impl CoreApi {
             .state
             .event_tx
             .send(crate::api::Event::ProjectDiscovered {
+                project_root: repo_root.clone(),
                 gate_count: result.gates.len(),
                 scanned_files: scanned_files.len(),
             });
 
         Ok(CommandOutcome::Acknowledged)
+    }
+
+    /// Reject a project-qualified command sent to the wrong repository API.
+    fn require_project_root(&self, requested: &Path) -> Result<(), ApiError> {
+        let expected =
+            std::fs::canonicalize(&self.state.worktree_manager.repo_root).map_err(|error| {
+                ApiError::Internal {
+                    reason: format!(
+                        "cannot resolve configured project root {}: {error}",
+                        self.state.worktree_manager.repo_root.display()
+                    ),
+                }
+            })?;
+        let requested =
+            std::fs::canonicalize(requested).map_err(|error| ApiError::InvalidCommand {
+                reason: format!(
+                    "cannot resolve requested project root {}: {error}",
+                    requested.display()
+                ),
+            })?;
+        if requested != expected {
+            return Err(ApiError::InvalidCommand {
+                reason: format!(
+                    "command targets project {} but this API owns {}",
+                    requested.display(),
+                    expected.display()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Read + interpret the task-list file at `task_list_path` and (on success)
@@ -1850,14 +1892,43 @@ impl CoreApi {
             }
         };
 
-        // 4. Write TASKS.md back into the dir from the graph (best-effort;
-        //    warn-only like seed-persist — a write failure must not block the open).
-        if let Err(e) = write_tasks_md(dir, &graph).await {
-            tracing::warn!(
-                slug = %slug,
-                error = %e,
-                "failed to write generated TASKS.md; continuing without artifact",
-            );
+        // 4. Publish the generated task list without replacing an entry that
+        //    appeared while the planner was running. A conflicting entry may
+        //    be a legitimate user edit or a symlink, so do not follow/read it
+        //    here and do not seed an artifact from the losing generated graph.
+        match write_tasks_md(task_list_path, &graph).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                tracing::warn!(
+                    slug = %slug,
+                    path = %task_list_path.display(),
+                    "task list appeared during generation; refusing to replace or follow it",
+                );
+                return Ok((
+                    graph,
+                    vec![crate::ingestion::IngestionIssue {
+                        task_id: None,
+                        severity: crate::ingestion::IssueSeverity::Blocking,
+                        source: crate::ingestion::IssueSource::Interpreter,
+                        code: "task-list-generation-race".into(),
+                        message: format!(
+                            "`{}` appeared while tasks were being generated; the generated draft was not persisted",
+                            task_list_path.display()
+                        ),
+                        suggestion: Some(
+                            "review the task list that won the race, then re-interpret the run"
+                                .into(),
+                        ),
+                    }],
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    slug = %slug,
+                    error = %error,
+                    "failed to write generated task list; continuing without source artifact",
+                );
+            }
         }
 
         // 5. Seed-persist the graph (best-effort).
@@ -2315,12 +2386,14 @@ impl CoreApi {
 
     fn emit_plan_operation(
         &self,
+        run: RunId,
         plan_slug: &str,
         label: &str,
         phase: crate::api::PlanOperationPhase,
         message: impl Into<String>,
     ) {
         let _ = self.state.event_tx.send(Event::PlanOperation {
+            run,
             plan_slug: plan_slug.to_string(),
             label: label.to_string(),
             operation: crate::api::PlanOperationKind::Reset,
@@ -2377,6 +2450,7 @@ impl CoreApi {
             plan_slug.clone()
         };
         self.emit_plan_operation(
+            run,
             &plan_slug,
             &label,
             crate::api::PlanOperationPhase::Started,
@@ -2385,6 +2459,7 @@ impl CoreApi {
 
         if had_handle {
             self.emit_plan_operation(
+                run,
                 &plan_slug,
                 &label,
                 crate::api::PlanOperationPhase::Step,
@@ -2404,6 +2479,7 @@ impl CoreApi {
         };
 
         self.emit_plan_operation(
+            run,
             &plan_slug,
             &label,
             crate::api::PlanOperationPhase::Step,
@@ -2427,6 +2503,7 @@ impl CoreApi {
         }
         if !plan_slug.is_empty() {
             self.emit_plan_operation(
+                run,
                 &plan_slug,
                 &label,
                 crate::api::PlanOperationPhase::Step,
@@ -2448,6 +2525,7 @@ impl CoreApi {
         }
 
         self.emit_plan_operation(
+            run,
             &plan_slug,
             &label,
             crate::api::PlanOperationPhase::Step,
@@ -2460,6 +2538,7 @@ impl CoreApi {
             Ok(result) => result,
             Err(e) => {
                 self.emit_plan_operation(
+                    run,
                     &plan_slug,
                     &label,
                     crate::api::PlanOperationPhase::Failed,
@@ -2494,6 +2573,7 @@ impl CoreApi {
 
         if let Some(graph) = graph_snapshot {
             self.emit_plan_operation(
+                run,
                 &plan_slug,
                 &label,
                 crate::api::PlanOperationPhase::Step,
@@ -2509,6 +2589,7 @@ impl CoreApi {
         }
 
         self.emit_plan_operation(
+            run,
             &plan_slug,
             &label,
             crate::api::PlanOperationPhase::Step,
@@ -2516,6 +2597,7 @@ impl CoreApi {
         );
         let removed = remove_run_metadata_for_plan(&repo_root, &plan_slug).await;
         self.emit_plan_operation(
+            run,
             &plan_slug,
             &label,
             crate::api::PlanOperationPhase::Step,
@@ -2531,6 +2613,7 @@ impl CoreApi {
             task_list_path,
         });
         self.emit_plan_operation(
+            run,
             &plan_slug,
             &label,
             crate::api::PlanOperationPhase::Finished,
@@ -2826,6 +2909,44 @@ impl CoreApi {
             report,
         ))
     }
+
+    /// Reload a historical snapshot for a stable session handle previously
+    /// assigned by [`Api::runs`]. Historical handles are deliberately kept out
+    /// of the live registry so lifecycle commands continue to reject them.
+    fn disk_view_of(&self, id: RunId) -> Option<RunView> {
+        let run_uid = {
+            let disk_run_ids = self
+                .state
+                .disk_run_ids
+                .lock()
+                .expect("disk run id mutex poisoned");
+            disk_run_ids
+                .iter()
+                .find_map(|(run_uid, mapped)| (*mapped == id).then(|| run_uid.clone()))
+        };
+        let run_uid = run_uid?;
+
+        let live_run_uids = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            runs.values()
+                .map(|entry| entry.run_uid.clone())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let mut provisional_id = 0;
+        let mut view = load_disk_run_views(
+            &self.state.worktree_manager.repo_root,
+            &live_run_uids,
+            &mut provisional_id,
+        )
+        .into_iter()
+        .find(|view| view.run_uid == run_uid)?;
+        view.id = id;
+        Some(view)
+    }
 }
 
 #[async_trait]
@@ -2859,13 +2980,31 @@ impl Api for CoreApi {
             Command::RetryTask { run, task } => self.retry_task(run, task).await,
             Command::RetryFailedTasks { run } => self.retry_failed_tasks(run).await,
             Command::ResetRun { run } => self.reset_run(run).await,
+            Command::RegisterProject { project_root } => {
+                self.require_project_root(&project_root)?;
+                Ok(CommandOutcome::Acknowledged)
+            }
+            Command::UnregisterProject { project_root } => {
+                self.require_project_root(&project_root)?;
+                Ok(CommandOutcome::Acknowledged)
+            }
             Command::UpdateRuntimeSettings {
+                project_root,
                 caps,
                 concurrency,
                 final_merge,
-            } => self.update_runtime_settings(caps, concurrency, final_merge),
-            Command::DiscoverProject => self.force_discover_project().await,
-            Command::PurgeWorktrees => self.purge_worktrees().await,
+            } => {
+                self.require_project_root(&project_root)?;
+                self.update_runtime_settings(caps, concurrency, final_merge)
+            }
+            Command::DiscoverProject { project_root } => {
+                self.require_project_root(&project_root)?;
+                self.force_discover_project().await
+            }
+            Command::PurgeWorktrees { project_root } => {
+                self.require_project_root(&project_root)?;
+                self.purge_worktrees().await
+            }
         }
     }
 
@@ -2880,7 +3019,7 @@ impl Api for CoreApi {
         // Snapshot the (id, path, status, graph-handle) tuples under the registry
         // lock, drop the guard, THEN lock each graph to build its view — so the
         // registry lock is never held across the graph `.await`.
-        let (entries, live_run_uids, mut disk_next_id): (
+        let (entries, live_run_uids): (
             Vec<(
                 RunId,
                 String,
@@ -2890,7 +3029,6 @@ impl Api for CoreApi {
                 Arc<AsyncMutex<TaskGraph>>,
             )>,
             std::collections::HashSet<String>,
-            u64,
         ) = {
             let runs = self
                 .state
@@ -2899,11 +3037,6 @@ impl Api for CoreApi {
                 .expect("runs registry mutex poisoned");
             let live_uids: std::collections::HashSet<String> =
                 runs.values().map(|e| e.run_uid.clone()).collect();
-            // The next available id for disk-loaded views must not collide with any
-            // live id.  We peek at the current next_id counter (load Relaxed here —
-            // we only need an approximate upper bound; the disk views are session-only
-            // handles that never outlive this `runs()` call's snapshot).
-            let next = self.state.next_id.load(Ordering::Relaxed);
             let entries = runs
                 .iter()
                 .map(|(id, entry)| {
@@ -2917,7 +3050,7 @@ impl Api for CoreApi {
                     )
                 })
                 .collect();
-            (entries, live_uids, next)
+            (entries, live_uids)
         }; // registry guard dropped before any graph await.
 
         let mut views = Vec::with_capacity(entries.len());
@@ -2935,32 +3068,36 @@ impl Api for CoreApi {
         }
 
         // Append finished runs loaded from disk (not in the live registry).
-        let disk_views = load_disk_run_views(
+        let mut provisional_id = 0;
+        let mut disk_views = load_disk_run_views(
             &self.state.worktree_manager.repo_root,
             &live_run_uids,
-            &mut disk_next_id,
+            &mut provisional_id,
         );
-        views.extend(disk_views);
-
-        // Claim the RunId numbers handed out to disk snapshots so that
-        // subsequent `alloc_id()` (used by OpenRun etc) cannot collide with
-        // them.  Without this, a fresh launch that loads N historical runs
-        // seeds app.runs with synth ids 1..N; the live next_id (still at 1)
-        // then re-allocates 1 for the first new run, RunOpened/RunLoaded
-        // clobbers the historical entry by id match, and "earlier run"
-        // disappears (or "merges" into the new one).
-        let after_disk = disk_next_id;
-        let live_next = self.state.next_id.load(Ordering::Relaxed);
-        if after_disk > live_next {
-            self.state.next_id.store(after_disk, Ordering::Relaxed);
+        {
+            let mut disk_run_ids = self
+                .state
+                .disk_run_ids
+                .lock()
+                .expect("disk run id mutex poisoned");
+            for view in &mut disk_views {
+                view.id = *disk_run_ids
+                    .entry(view.run_uid.clone())
+                    .or_insert_with(|| self.state.alloc_id());
+            }
         }
+        views.extend(disk_views);
 
         views
     }
 
-    /// Snapshot a single Run, or `None` for an unknown id.
+    /// Snapshot a live Run or a historical snapshot whose stable handle was
+    /// previously surfaced by [`Api::runs`].
     async fn run(&self, id: RunId) -> Option<RunView> {
-        self.view_of(id).await
+        match self.view_of(id).await {
+            Some(view) => Some(view),
+            None => self.disk_view_of(id),
+        }
     }
 
     /// Subscribe to the live event stream.
@@ -2999,17 +3136,49 @@ async fn read_plan_brief(plan_dir: &std::path::Path) -> String {
 }
 
 /// Render a [`TaskGraph`] as structured-text Markdown (TASKS.md convention) and
-/// write it to `dir/TASKS.md`.
+/// create it at the exact requested path without replacing any existing entry.
 ///
 /// The output follows the convention so it can round-trip through
 /// `StructuredTextInterpreter::interpret`.
 async fn write_tasks_md(
-    dir: &std::path::Path,
+    path: &std::path::Path,
     graph: &crate::task::TaskGraph,
 ) -> Result<(), std::io::Error> {
+    use tokio::io::AsyncWriteExt as _;
+
     let markdown = render_tasks_md(graph);
-    let path = dir.join("TASKS.md");
-    tokio::fs::write(path, markdown).await
+    // This path is reached only after the requested task list was observed
+    // missing. `create_new` makes the final check and creation one filesystem
+    // operation, so a dangling symlink (or any other entry) inserted after
+    // routing cannot make generation write outside the selected project.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    let write_result = async {
+        file.write_all(markdown.as_bytes()).await?;
+        file.sync_all().await
+    }
+    .await;
+
+    if let Err(error) = write_result {
+        // Close the handle before removing the incomplete file (required on
+        // Windows). Preserve the original write/sync error for the caller.
+        drop(file);
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cleanup_error) => tracing::warn!(
+                path = %path.display(),
+                error = %cleanup_error,
+                "failed to remove partial generated task list"
+            ),
+        }
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 /// Render a [`TaskGraph`] as structured-text Markdown following the convention
@@ -3708,6 +3877,166 @@ Do the thing in `lib.rs`.
         );
     }
 
+    #[tokio::test]
+    async fn project_registration_commands_validate_the_bound_repository() {
+        let (api, repo) = execution_core_api();
+        for command in [
+            Command::RegisterProject {
+                project_root: repo.path().to_path_buf(),
+            },
+            Command::UnregisterProject {
+                project_root: repo.path().to_path_buf(),
+            },
+        ] {
+            assert!(matches!(
+                api.execute(command).await,
+                Ok(CommandOutcome::Acknowledged)
+            ));
+        }
+
+        let other = shared_setup_temp_repo();
+        let error = api
+            .execute(Command::RegisterProject {
+                project_root: other.path().to_path_buf(),
+            })
+            .await
+            .expect_err("a repository-bound API must reject another root");
+        assert!(matches!(error, ApiError::InvalidCommand { .. }));
+    }
+
+    #[tokio::test]
+    async fn historical_run_ids_are_stable_across_queries() {
+        let _home_guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialized by HOME_ENV_LOCK for the full test lifetime.
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let (api, repo) = execution_core_api();
+        let run_uid = ulid::Ulid::new().to_string();
+        let now = Utc::now();
+        let metadata = RunMetadata::new(
+            run_uid.clone(),
+            "historical-tasks".to_string(),
+            "historical".to_string(),
+            RunStatus::Completed,
+            now,
+            now,
+        );
+        write_run_metadata(&metadata, repo.path())
+            .await
+            .expect("write historical run metadata");
+
+        let first = api
+            .runs()
+            .await
+            .into_iter()
+            .find(|view| view.run_uid == run_uid)
+            .expect("first historical view");
+        let second = api
+            .runs()
+            .await
+            .into_iter()
+            .find(|view| view.run_uid == run_uid)
+            .expect("second historical view");
+        assert_eq!(first.id, second.id, "one run_uid must keep one handle");
+        let by_id = api
+            .run(first.id)
+            .await
+            .expect("a surfaced historical handle must remain queryable");
+        assert_eq!(by_id.run_uid, run_uid);
+        assert_eq!(by_id.id, first.id);
+
+        let (_dir, task_list_path) = write_task_list(SAMPLE_TASK_LIST);
+        let live = match api
+            .execute(Command::OpenRun { task_list_path })
+            .await
+            .expect("open live run")
+        {
+            CommandOutcome::RunOpened { run } => run,
+            other => panic!("expected RunOpened, got {other:?}"),
+        };
+        assert_ne!(
+            live, first.id,
+            "a live run must not reuse a historical handle"
+        );
+
+        // SAFETY: restore the process-global value while HOME_ENV_LOCK is held.
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn project_qualified_commands_validate_the_bound_repository_root() {
+        let (api, repo) = execution_core_api();
+        let same_root_alias = repo.path().join(".");
+
+        assert!(matches!(
+            api.execute(Command::RegisterProject {
+                project_root: same_root_alias.clone(),
+            })
+            .await,
+            Ok(CommandOutcome::Acknowledged)
+        ));
+        assert!(matches!(
+            api.execute(Command::UnregisterProject {
+                project_root: same_root_alias,
+            })
+            .await,
+            Ok(CommandOutcome::Acknowledged)
+        ));
+
+        let other = shared_setup_temp_repo();
+        let other_root = other.path().to_path_buf();
+        let settings = no_gate_config();
+        let wrong_project_commands = vec![
+            Command::RegisterProject {
+                project_root: other_root.clone(),
+            },
+            Command::UnregisterProject {
+                project_root: other_root.clone(),
+            },
+            Command::UpdateRuntimeSettings {
+                project_root: other_root.clone(),
+                caps: settings.caps.clone(),
+                concurrency: settings.concurrency,
+                final_merge: settings.merge.final_,
+            },
+            Command::DiscoverProject {
+                project_root: other_root.clone(),
+            },
+            Command::PurgeWorktrees {
+                project_root: other_root,
+            },
+        ];
+        for command in wrong_project_commands {
+            let error = api
+                .execute(command)
+                .await
+                .expect_err("a repository-bound API must reject another project");
+            assert!(matches!(
+                error,
+                ApiError::InvalidCommand { reason } if reason.contains("targets project")
+            ));
+        }
+
+        let error = api
+            .execute(Command::RegisterProject {
+                project_root: repo.path().join("missing-project"),
+            })
+            .await
+            .expect_err("a missing project root must be rejected");
+        assert!(matches!(
+            error,
+            ApiError::InvalidCommand { reason }
+                if reason.contains("cannot resolve requested project root")
+        ));
+    }
+
     // ── Plan-scoped run slug (mk-run-slug) ────────────────────────────────────
 
     /// Returns whether `s` satisfies the §4.1 kebab predicate: starts and ends
@@ -4192,6 +4521,7 @@ Create beta.
         ));
 
         api.execute(Command::UpdateRuntimeSettings {
+            project_root: repo_dir.path().to_path_buf(),
             caps,
             concurrency,
             final_merge: crate::config::FinalMerge::Squash,
@@ -6070,6 +6400,53 @@ Description text that is long enough for parser.
 
     // ── planner-generate-on-open tests ───────────────────────────────────────
 
+    #[derive(Clone, Default)]
+    struct DeterministicGenerator {
+        race_winner: Option<(PathBuf, String)>,
+    }
+
+    #[async_trait]
+    impl TaskListInterpreter for DeterministicGenerator {
+        async fn interpret(
+            &self,
+            slug: &str,
+            source_text: &str,
+        ) -> Result<TaskGraph, crate::interpreter::InterpretError> {
+            StructuredTextInterpreter::new()
+                .interpret(slug, source_text)
+                .await
+        }
+
+        async fn generate(
+            &self,
+            slug: &str,
+            _brief: &str,
+            _system_prompt_override: Option<&str>,
+        ) -> Result<TaskGraph, crate::interpreter::InterpretError> {
+            if let Some((path, contents)) = &self.race_winner {
+                tokio::fs::write(path, contents)
+                    .await
+                    .expect("publish racing task list");
+            }
+            StructuredTextInterpreter::new()
+                .interpret(slug, ONE_TASK_LIST)
+                .await
+        }
+    }
+
+    fn generation_test_api(repo_root: &Path, planner: Arc<dyn TaskListInterpreter>) -> CoreApi {
+        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::new());
+        CoreApi::with_audit_registry(
+            Arc::new(StructuredTextInterpreter::new()),
+            planner,
+            Arc::clone(&backend),
+            backend,
+            WorktreeManager::new(repo_root.to_path_buf(), "main".into()),
+            no_gate_config(),
+            Arc::new(NoopAuditRegistry),
+        )
+    }
+
     /// **Acceptance: missing TASKS.md triggers planner generate.**
     ///
     /// A dir with SCOPE.md + ARCHITECTURE.md but no TASKS.md should not return
@@ -6169,6 +6546,107 @@ Description text that is long enough for parser.
         assert!(
             issues.is_empty(),
             "successful generation should produce no issues; got {issues:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_tasks_write_refuses_a_racing_symlink() {
+        let plan = tempfile::tempdir().expect("create plan directory");
+        let outside = plan
+            .path()
+            .parent()
+            .unwrap()
+            .join(format!("makina-outside-{}", ulid::Ulid::new()));
+        std::os::unix::fs::symlink(&outside, plan.path().join("TASKS.md"))
+            .expect("create dangling TASKS.md symlink");
+        let graph = TaskGraph {
+            slug: "racing-link".to_string(),
+            tasks: Vec::new(),
+        };
+
+        let error = write_tasks_md(&plan.path().join("TASKS.md"), &graph)
+            .await
+            .expect_err("create_new must reject an existing symlink");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!outside.exists(), "generation must not follow the symlink");
+    }
+
+    #[tokio::test]
+    async fn generated_tasks_preserve_the_exact_requested_filename() {
+        let tmp = tempfile::tempdir().expect("create temp directory");
+        let plan_dir = tmp.path().join("lowercase-plan");
+        std::fs::create_dir(&plan_dir).expect("create plan directory");
+        std::fs::write(plan_dir.join("SCOPE.md"), "# Scope\nGenerate one task.")
+            .expect("write scope");
+        let requested_path = plan_dir.join("tasks.md");
+        let api = generation_test_api(tmp.path(), Arc::new(DeterministicGenerator::default()));
+
+        let CommandOutcome::RunOpened { run } = api
+            .execute(Command::OpenRun {
+                task_list_path: requested_path.clone(),
+            })
+            .await
+            .expect("open lowercase task-list path")
+        else {
+            panic!("expected RunOpened")
+        };
+
+        assert!(
+            requested_path.is_file(),
+            "the requested path must be created"
+        );
+        assert!(
+            !plan_dir.join("TASKS.md").exists(),
+            "generation must not silently change the requested filename"
+        );
+        assert_eq!(
+            api.run(run).await.expect("opened run").task_list_path,
+            std::fs::canonicalize(&requested_path).expect("canonical generated path")
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_tasks_race_blocks_without_overwriting_or_persisting_the_loser() {
+        let tmp = tempfile::tempdir().expect("create temp directory");
+        let plan_dir = tmp.path().join("racing-plan");
+        std::fs::create_dir(&plan_dir).expect("create plan directory");
+        std::fs::write(plan_dir.join("SCOPE.md"), "# Scope\nGenerate one task.")
+            .expect("write scope");
+        let requested_path = plan_dir.join("TASKS.md");
+        let planner: Arc<dyn TaskListInterpreter> = Arc::new(DeterministicGenerator {
+            race_winner: Some((requested_path.clone(), SAMPLE_TASK_LIST.to_string())),
+        });
+        let api = generation_test_api(tmp.path(), planner);
+        let slug = run_slug(&requested_path);
+
+        let CommandOutcome::RunOpened { run } = api
+            .execute(Command::OpenRun {
+                task_list_path: requested_path.clone(),
+            })
+            .await
+            .expect("open racing task-list path")
+        else {
+            panic!("expected RunOpened")
+        };
+
+        assert_eq!(
+            std::fs::read_to_string(&requested_path).expect("read race winner"),
+            SAMPLE_TASK_LIST,
+            "generation must not overwrite the entry that won the race"
+        );
+        let view = api.run(run).await.expect("opened blocked run");
+        assert!(view.report.issues.iter().any(|issue| {
+            issue.code == "task-list-generation-race"
+                && issue.severity == crate::ingestion::IssueSeverity::Blocking
+        }));
+        assert!(
+            crate::persist::load_graph(tmp.path(), &slug)
+                .await
+                .expect("load generated artifact")
+                .is_none(),
+            "the losing generated graph must not be persisted"
         );
     }
 

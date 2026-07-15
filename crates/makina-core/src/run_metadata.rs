@@ -458,6 +458,14 @@ pub fn load_disk_run_views(
         // Attempt to read run.json; skip on any error (best-effort).
         match read_run_metadata(repo_root, &run_uid) {
             Ok(Some(meta)) => {
+                if meta.run_uid() != run_uid {
+                    tracing::warn!(
+                        directory_run_uid = %run_uid,
+                        metadata_run_uid = %meta.run_uid(),
+                        "run.json identity does not match its containing directory; skipping"
+                    );
+                    continue;
+                }
                 let id = RunId(*next_id);
                 *next_id += 1;
                 views.push(run_view_from_metadata(id, &meta, repo_root));
@@ -626,6 +634,49 @@ mod tests {
             Some(task_list_path),
             "disk views must recover an absolute project-qualified path"
         );
+    }
+
+    #[tokio::test]
+    async fn disk_loader_rejects_metadata_with_a_mismatched_directory_identity() {
+        let _guard = HOME_ENV_LOCK.lock().await;
+        let tmp_home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // SAFETY: serialized by HOME_ENV_LOCK for the full environment mutation.
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        let directory_run_uid = "01DIRECTORY000000000000000";
+        let metadata = RunMetadata::new(
+            "01METADATA0000000000000000".to_string(),
+            "mismatched-run".to_string(),
+            "mismatched".to_string(),
+            RunStatus::Completed,
+            fixed_ts(2026, 5, 1),
+            fixed_ts(2026, 5, 2),
+        );
+        let run_dir = crate::paths::run_dir(root, directory_run_uid);
+        std::fs::create_dir_all(&run_dir).expect("create mismatched run directory");
+        std::fs::write(
+            run_dir.join("run.json"),
+            serde_json::to_vec_pretty(&metadata).expect("serialize run metadata"),
+        )
+        .expect("write mismatched run metadata");
+
+        let mut next_id = 1;
+        let views = load_disk_run_views(root, &HashSet::new(), &mut next_id);
+
+        // SAFETY: restore the process-global value while HOME_ENV_LOCK is held.
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(views.is_empty(), "mismatched run identity must be ignored");
+        assert_eq!(next_id, 1, "a rejected snapshot must not consume a RunId");
     }
 
     #[tokio::test]
