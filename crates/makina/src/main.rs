@@ -24,14 +24,129 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
+use makina::project_api::{
+    ProjectApiFactory, ProjectApiRouter, canonicalize_project_root, normalize_workspace_roots,
+};
 use makina::{app, event, exit, log, tui};
 use makina_acp::AcpBackend;
+use makina_core::api::{Api, ApiError};
 use makina_core::audit::JsonlAuditSink;
 use makina_core::backend::AgentBackend;
 use makina_core::config::Config;
 use makina_core::orchestrator::CoreApi;
 use makina_core::preflight::probe_providers;
 use makina_core::worktree::WorktreeManager;
+
+/// Resolve one role's configured backend from a project's provider set.
+fn resolve_role_backend(
+    provider_name: Option<&str>,
+    provider_backends: &HashMap<String, Arc<dyn AgentBackend>>,
+    first_provider_name: Option<&str>,
+    legacy_backend: Arc<dyn AgentBackend>,
+) -> Arc<dyn AgentBackend> {
+    let name = provider_name.or(first_provider_name).unwrap_or("default");
+    provider_backends
+        .get(name)
+        .cloned()
+        .unwrap_or(legacy_backend)
+}
+
+/// Build one repository-rooted orchestrator.
+///
+/// Config, worktrees, persisted graphs, transcripts, logs, and the permission
+/// audit registry must all agree on this root. The project router calls this
+/// once per opened Git repository instead of reusing the launch repository's
+/// dependencies for every folder.
+fn build_project_api(repo_root: &std::path::Path, config: Config) -> Arc<dyn Api> {
+    let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.to_path_buf()));
+
+    let mut provider_backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
+    for provider in &config.providers {
+        let mut backend =
+            AcpBackend::new(provider.command.clone(), provider.args.clone()).with_audit_sink(
+                Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>,
+            );
+        for (key, value) in &provider.env {
+            backend = backend.env(key.clone(), value.clone());
+        }
+        provider_backends.insert(provider.name.clone(), Arc::new(backend));
+    }
+
+    let legacy_backend: Arc<dyn AgentBackend> =
+        Arc::new(
+            AcpBackend::new(config.backend.command.clone(), config.backend.args.clone())
+                .with_audit_sink(
+                    Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>
+                ),
+        );
+    let first_provider_name = config
+        .providers
+        .first()
+        .map(|provider| provider.name.as_str());
+    let developer_backend = resolve_role_backend(
+        config
+            .roles
+            .developer
+            .as_ref()
+            .map(|role| role.provider.as_str()),
+        &provider_backends,
+        first_provider_name,
+        Arc::clone(&legacy_backend),
+    );
+    let reviewer_backend = resolve_role_backend(
+        config
+            .roles
+            .reviewer
+            .as_ref()
+            .map(|role| role.provider.as_str()),
+        &provider_backends,
+        first_provider_name,
+        Arc::clone(&legacy_backend),
+    );
+    let planner_backend = resolve_role_backend(
+        config
+            .roles
+            .planner
+            .as_ref()
+            .map(|role| role.provider.as_str()),
+        &provider_backends,
+        first_provider_name,
+        legacy_backend,
+    );
+
+    let ingestion_interpreter: Arc<dyn makina_core::interpreter::TaskListInterpreter> =
+        Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
+            makina_core::interpreter::StructuredTextInterpreter::new(),
+        )));
+    let planner_interpreter = match makina_core::interpreter::build_planner_interpreter(
+        &config.planner.mechanism,
+        Some(planner_backend),
+    ) {
+        Ok(interpreter) => interpreter,
+        Err(error) => {
+            tracing::warn!(
+                project_root = %repo_root.display(),
+                %error,
+                "planner mechanism unavailable; using deterministic planner"
+            );
+            Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
+                makina_core::interpreter::StructuredTextInterpreter::new(),
+            ))) as Arc<dyn makina_core::interpreter::TaskListInterpreter>
+        }
+    };
+    let worktree_manager =
+        WorktreeManager::new(repo_root.to_path_buf(), config.base_branch.clone());
+
+    Arc::new(CoreApi::with_audit_registry(
+        ingestion_interpreter,
+        planner_interpreter,
+        developer_backend,
+        reviewer_backend,
+        worktree_manager,
+        config,
+        audit_sink as Arc<dyn makina_core::audit::AuditRegistry>,
+    ))
+}
 
 /// Run the headless `--doctor` preflight check.
 ///
@@ -102,6 +217,16 @@ async fn main() {
         }
     }
 
+    // Resolve the launch checkout through Git before loading project config or
+    // constructing any project-scoped service. Launching from a subdirectory,
+    // linked worktree, or symlink alias must still select one authoritative
+    // repository root.
+    let launch_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let launch_project_root = canonicalize_project_root(&launch_dir).ok();
+    let repo_root = launch_project_root
+        .clone()
+        .unwrap_or_else(|| std::fs::canonicalize(&launch_dir).unwrap_or(launch_dir));
+
     // ── Config ──────────────────────────────────────────────────────────────────
     // Load the resolved two-layer config (global ~/.makina/config.toml + project
     // ./makina.toml).  Supplies the agent backend command, the gates, the caps,
@@ -112,10 +237,10 @@ async fn main() {
     // checked, whether each existed, the "project overrides global" precedence
     // note, and a pointer to the README "Configure" section.
     //
-    // `load_defaults_with_paths` returns `(Result<Config, ConfigError>, ConfigPaths)`
+    // `load_for_repo_with_paths` returns `(Result<Config, ConfigError>, ConfigPaths)`
     // so the resolved paths are in hand even when loading fails — no need to
     // re-derive them in the error arm.
-    let (load_result, load_paths) = Config::load_defaults_with_paths();
+    let (load_result, load_paths) = Config::load_for_repo_with_paths(&repo_root);
     let config = match load_result {
         Ok(c) => c,
         Err(e) => {
@@ -169,8 +294,6 @@ async fn main() {
     //    seam swaps this for any other `AgentBackend`; tests inject NoopBackend);
     //  - a WORKTREE MANAGER rooted at the repo (CWD) on `config.base_branch`;
     //  - the resolved CONFIG (gates, caps, concurrency).
-    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-
     // ── Workspace Persistence ───────────────────────────────────────────────
     // Load the workspace from $HOME/.makina/workspace.toml. Auto-discover the
     // launch CWD if it is a Makina-ready git repo (has .git and docs/plans),
@@ -180,22 +303,23 @@ async fn main() {
         makina::workspace::Workspace::new()
     });
 
-    // Auto-discover: if CWD is a git repo with docs/plans, add it to opened_folders.
-    if repo_root.join(".git").exists() && repo_root.join("docs/plans").exists() {
-        workspace.add_folder(repo_root.clone());
+    // Auto-discover the authoritative launch root, then canonicalize every
+    // persisted entry. This collapses subdirectory/symlink aliases before the
+    // exact same list is given to both App and ProjectApiRouter.
+    if let Some(root) = launch_project_root
+        && root.join("docs/plans").exists()
+    {
+        workspace.add_folder(root);
     }
-    let opened_folders: Vec<std::path::PathBuf> =
-        workspace.opened_folders.iter().cloned().collect();
-
-    // ── Audit sink (task supervisor-audit-writer) ─────────────────────────────
-    // The `JsonlAuditSink` is the Supervisor-owned ledger writer.  A single
-    // `Arc` is shared as both:
-    //  - the `AuditSink` injected into the ACP backend (transport fires it on
-    //    every permission decision), and
-    //  - the `AuditRegistry` passed into the orchestrator so the Supervisor can
-    //    register each task's worktree context before dispatching a driver.
-    // This guarantees the sink is the ONLY writer under `.tasks/{slug}/audit.jsonl`.
-    let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.clone()));
+    let (opened_folders, rejected_folders) =
+        normalize_workspace_roots(workspace.opened_folders.iter().cloned());
+    for (folder, error) in rejected_folders {
+        eprintln!(
+            "ignoring invalid workspace folder {}: {error}",
+            folder.display()
+        );
+    }
+    workspace.opened_folders = opened_folders.iter().cloned().collect();
 
     // ── Tracing subscriber: file + TUI-channel layers (tasks log-subscriber-*) ─
     // Installed ONCE here, after the audit-sink setup and before the event loop.
@@ -225,116 +349,7 @@ async fn main() {
         log_rx
     };
 
-    // ── Build one backend per declared provider ───────────────────────────────
-    // Build a name → Arc<dyn AgentBackend> map from config.providers.
-    // The shared audit sink is the same Arc injected into every backend so all
-    // permission decisions are routed through the same JSONL ledger.
-    let mut provider_backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
-    for provider in &config.providers {
-        let mut backend =
-            AcpBackend::new(provider.command.clone(), provider.args.clone()).with_audit_sink(
-                Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>,
-            );
-        for (key, value) in &provider.env {
-            backend = backend.env(key.clone(), value.clone());
-        }
-        provider_backends.insert(provider.name.clone(), Arc::new(backend));
-    }
-
-    /// Resolve the backend for a role from the provider map.
-    ///
-    /// Looks up the role's assignment provider name, falling back to "default"
-    /// or the first configured provider, and finally to the legacy `[backend]`
-    /// field for configs that predate named providers.
-    fn resolve_role_backend(
-        provider_name_opt: Option<&str>,
-        provider_backends: &HashMap<String, Arc<dyn AgentBackend>>,
-        first_provider_name: Option<&str>,
-        legacy_backend: Arc<dyn AgentBackend>,
-    ) -> Arc<dyn AgentBackend> {
-        let name = provider_name_opt
-            .or(first_provider_name)
-            .unwrap_or("default");
-        provider_backends
-            .get(name)
-            .cloned()
-            .unwrap_or(legacy_backend)
-    }
-
-    // Build the legacy fallback backend (used only when no providers are configured).
-    let legacy_backend: Arc<dyn AgentBackend> =
-        Arc::new(
-            AcpBackend::new(config.backend.command.clone(), config.backend.args.clone())
-                .with_audit_sink(
-                    Arc::clone(&audit_sink) as Arc<dyn makina_core::governance::AuditSink>
-                ),
-        );
-
-    let first_provider_name = config.providers.first().map(|p| p.name.as_str());
-
-    let developer_backend: Arc<dyn AgentBackend> = resolve_role_backend(
-        config.roles.developer.as_ref().map(|a| a.provider.as_str()),
-        &provider_backends,
-        first_provider_name,
-        Arc::clone(&legacy_backend),
-    );
-
-    let reviewer_backend: Arc<dyn AgentBackend> = resolve_role_backend(
-        config.roles.reviewer.as_ref().map(|a| a.provider.as_str()),
-        &provider_backends,
-        first_provider_name,
-        Arc::clone(&legacy_backend),
-    );
-
-    // The developer backend is also used for the planner (one-shot-agent path)
-    // when no planner assignment is configured.
-    let backend: Arc<dyn AgentBackend> = resolve_role_backend(
-        config.roles.planner.as_ref().map(|a| a.provider.as_str()),
-        &provider_backends,
-        first_provider_name,
-        Arc::clone(&legacy_backend),
-    );
-    let worktree_manager = WorktreeManager::new(repo_root.clone(), config.base_branch.clone());
-
-    // ── Api ───────────────────────────────────────────────────────────────────
-    // The real, core-backed orchestrator Api.  It opens Runs by reading a
-    // task-list file and interpreting it via the deterministic
-    // `StructuredTextInterpreter` + `EdgeInferrer` path (always, for TUI
-    // OpenRun/ReinterpretRun responsiveness; we always use the deterministic
-    // ingestion interpreter in the shipping binary). The model path selected by
-    // `config.planner.mechanism` + ACP backend is reserved exclusively for the
-    // Planner actor/spoke; ingestion in the TUI binary is never the model path.
-    // (always use the deterministic path for TUI ingestion)
-    // The run is then driven with the injected backend + worktree manager +
-    // config (task 31).
-    tracing::info!(
-        "Using deterministic structured-text + edge inference for TUI OpenRun/ReinterpretRun (planner mechanism only affects the Planner actor)"
-    );
-    let ingestion_interpreter: Arc<dyn makina_core::interpreter::TaskListInterpreter> =
-        Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
-            makina_core::interpreter::StructuredTextInterpreter::new(),
-        )));
-    // INVARIANT: the ingestion interpreter used for OpenRun/ReinterpretRun in the
-    // shipping TUI is *never* the model-backed interpreter.  All model use for task-list
-    // interpretation goes through the Planner actor (build_planner_interpreter).
-    // If you change this, update plan 0005 and the test that asserts the invariant.
-
-    // Build a *separate* planner interpreter that *does* respect the configured
-    // mechanism (may be model-backed).  This is passed through CoreApi state
-    // into run_graph so the Planner actor (when spawned) uses the user's choice.
-    // Ingestion stays det for TUI responsiveness.
-    let planner_interpreter = match makina_core::interpreter::build_planner_interpreter(
-        &config.planner.mechanism,
-        Some(Arc::clone(&backend)),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("planner mechanism unavailable; falling back to deterministic planner: {e}");
-            Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
-                makina_core::interpreter::StructuredTextInterpreter::new(),
-            ))) as Arc<dyn makina_core::interpreter::TaskListInterpreter>
-        }
-    };
+    tracing::info!("Using project-scoped CoreApi instances with deterministic TUI ingestion");
 
     // Probe each provider's command for presence on the filesystem before
     // moving config into the API.
@@ -363,15 +378,32 @@ async fn main() {
     let final_merge_for_app = config.merge.final_;
     let theme_name_for_app = config.theme_name.clone();
 
-    let api: Arc<dyn makina_core::api::Api> = Arc::new(CoreApi::with_audit_registry(
-        ingestion_interpreter,
-        planner_interpreter,
-        developer_backend,
-        reviewer_backend,
-        worktree_manager,
-        config,
-        audit_sink as Arc<dyn makina_core::audit::AuditRegistry>,
-    ));
+    let factory: ProjectApiFactory = Arc::new(|project_root| {
+        let (result, _paths) = Config::load_for_repo_with_paths(project_root);
+        let project_config = result.map_err(|error| ApiError::InvalidCommand {
+            reason: format!(
+                "failed to load configuration for {}: {error}",
+                project_root.display()
+            ),
+        })?;
+        Ok(build_project_api(project_root, project_config))
+    });
+    let project_api = Arc::new(ProjectApiRouter::new(opened_folders.clone(), factory));
+
+    // Pre-register every persisted workspace folder so historical run
+    // snapshots from all projects are visible at startup. A broken folder is
+    // non-fatal: discovery can still render it and OpenRun will surface the
+    // project-specific configuration error if the user tries to execute it.
+    for folder in &opened_folders {
+        if let Err(error) = project_api.register_project(folder).await {
+            tracing::warn!(
+                project_root = %folder.display(),
+                %error,
+                "workspace project runtime is unavailable"
+            );
+        }
+    }
+    let api: Arc<dyn Api> = project_api;
 
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;

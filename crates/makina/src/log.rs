@@ -85,6 +85,11 @@ struct RunUid(String);
 #[derive(Clone)]
 struct TaskSlug(String);
 
+/// The repository root attached to a run span. Multi-project execution uses
+/// this to keep each run's transient logs in that project's state namespace.
+#[derive(Clone)]
+struct ProjectRoot(PathBuf);
+
 /// A [`Visit`]or that pulls the `run_uid` / `task_slug` strings out of a span's
 /// fields or an event's fields. Records both the routing keys (for spans) and a
 /// flattened human-readable message buffer (for events).
@@ -94,6 +99,8 @@ struct FieldVisitor {
     run_uid: Option<String>,
     /// Captured `task_slug`, if the visited field set carried one.
     task_slug: Option<String>,
+    /// Captured repository root, if the run span carried one.
+    project_root: Option<PathBuf>,
     /// Accumulated `key=value` text for all other fields (event rendering).
     message: String,
 }
@@ -103,6 +110,7 @@ impl Visit for FieldVisitor {
         match field.name() {
             "run_uid" => self.run_uid = Some(value.to_owned()),
             "task_slug" => self.task_slug = Some(value.to_owned()),
+            "project_root" => self.project_root = Some(PathBuf::from(value)),
             _ => self.record_debug(field, &value),
         }
     }
@@ -116,6 +124,9 @@ impl Visit for FieldVisitor {
             }
             "task_slug" => {
                 self.task_slug = Some(format!("{value:?}").trim_matches('"').to_owned());
+            }
+            "project_root" => {
+                self.project_root = Some(PathBuf::from(format!("{value:?}").trim_matches('"')));
             }
             "message" => {
                 // Render the message without a `message=` prefix for readability.
@@ -248,10 +259,17 @@ impl RunFileLayer {
     /// writer is cached per resolved path. Best-effort: any I/O error is
     /// swallowed (logging must never break a run). Mirrors the
     /// resolve-path-then-append pattern in `JsonlAuditSink::record`.
-    fn append(&self, run_uid: &str, task_slug: Option<&str>, line: &str) {
+    fn append(
+        &self,
+        project_root: Option<&PathBuf>,
+        run_uid: &str,
+        task_slug: Option<&str>,
+        line: &str,
+    ) {
+        let repo_root = project_root.unwrap_or(&self.repo_root);
         let path = match task_slug {
-            Some(slug) => makina_core::paths::task_log(&self.repo_root, run_uid, slug),
-            None => makina_core::paths::run_dir(&self.repo_root, run_uid)
+            Some(slug) => makina_core::paths::task_log(repo_root, run_uid, slug),
+            None => makina_core::paths::run_dir(repo_root, run_uid)
                 .join("logs")
                 .join("run.log"),
         };
@@ -265,7 +283,6 @@ impl RunFileLayer {
         // on a cache MISS, right before opening the new writer — cache hits skip
         // the `create_dir_all` syscall entirely. The cache is bounded, so the
         // oldest writer is evicted (closing its fd) when the cap is reached.
-        let repo_root = &self.repo_root;
         let Some(file) = writers.writer(&path, || {
             // `run_logs_dir` `create_dir_all`s the `{run_uid}/logs` directory.
             makina_core::paths::run_logs_dir(repo_root, run_uid).is_ok()
@@ -297,6 +314,9 @@ where
             if let Some(task_slug) = visitor.task_slug {
                 span.extensions_mut().insert(TaskSlug(task_slug));
             }
+            if let Some(project_root) = visitor.project_root {
+                span.extensions_mut().insert(ProjectRoot(project_root));
+            }
         }
     }
 
@@ -306,15 +326,18 @@ where
     /// to that task's `{task_slug}.log`; otherwise it falls back to `run.log`.
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         // Walk from the innermost span outward; the first stashed key wins.
-        let (run_uid, task_slug) = match ctx.event_scope(event) {
-            Some(scope) => scope.from_root().fold((None, None), |(run, task), span| {
-                let ext = span.extensions();
-                (
-                    ext.get::<RunUid>().map(|r| r.0.clone()).or(run),
-                    ext.get::<TaskSlug>().map(|t| t.0.clone()).or(task),
-                )
-            }),
-            None => (None, None),
+        let (run_uid, task_slug, project_root) = match ctx.event_scope(event) {
+            Some(scope) => scope
+                .from_root()
+                .fold((None, None, None), |(run, task, root), span| {
+                    let ext = span.extensions();
+                    (
+                        ext.get::<RunUid>().map(|r| r.0.clone()).or(run),
+                        ext.get::<TaskSlug>().map(|t| t.0.clone()).or(task),
+                        ext.get::<ProjectRoot>().map(|r| r.0.clone()).or(root),
+                    )
+                }),
+            None => (None, None, None),
         };
 
         let Some(run_uid) = run_uid else {
@@ -332,7 +355,7 @@ where
             meta.target(),
             visitor.message.trim_end()
         );
-        self.append(&run_uid, task_slug.as_deref(), &line);
+        self.append(project_root.as_ref(), &run_uid, task_slug.as_deref(), &line);
     }
 }
 
@@ -500,6 +523,52 @@ mod tests {
             !run.contains("alpha") && !run.contains("bravo"),
             "run-level log must NOT contain per-task events, got: {run:?}"
         );
+    }
+
+    #[test]
+    fn run_span_project_root_overrides_launch_root() {
+        let _home_guard = makina_core::HOME_ENV_LOCK.blocking_lock();
+        let home = tempfile::tempdir().expect("create temp home");
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialised by HOME_ENV_LOCK (held for the whole test).
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let launch = tempfile::tempdir().expect("create launch repo");
+        let project = tempfile::tempdir().expect("create routed repo");
+        let run_uid = "01HXPROJECTROUTED000000001";
+        let project_root = project.path().display().to_string();
+        let subscriber = registry().with(RunFileLayer::new(launch.path()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "run_graph",
+                run_uid = %run_uid,
+                project_root = %project_root,
+            );
+            let _guard = span.enter();
+            tracing::warn!("routed");
+        });
+
+        let routed = makina_core::paths::run_dir(project.path(), run_uid)
+            .join("logs")
+            .join("run.log");
+        assert!(
+            std::fs::read_to_string(&routed)
+                .expect("read routed log")
+                .contains("routed")
+        );
+        let wrong = makina_core::paths::run_dir(launch.path(), run_uid)
+            .join("logs")
+            .join("run.log");
+        assert!(!wrong.exists(), "log must not use the launch repository");
+
+        // SAFETY: restore the process-global value while HOME_ENV_LOCK is held.
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     /// Driving **more distinct log paths than the cache cap** through the layer

@@ -34,6 +34,7 @@ pub mod log;
 pub mod markup;
 #[cfg(test)]
 pub mod placeholder;
+pub mod project_api;
 pub mod replay;
 pub mod scaffold;
 pub mod selection;

@@ -564,6 +564,7 @@ fn log_event(ev: &Event) {
         Event::ProjectDiscovered {
             gate_count,
             scanned_files,
+            ..
         } => {
             eprintln!(
                 "  · ProjectDiscovered gates={} scanned_files={}",
