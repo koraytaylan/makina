@@ -299,7 +299,8 @@ async fn run_mock<R, W>(
                                 ],
                                 "toolCall": {
                                     "toolCallId": tool_call_id,
-                                    "title": format!("Executing {tool_call_id}")
+                                    "title": format!("Executing {tool_call_id}"),
+                                    "locations": [{ "path": "probe.txt" }]
                                 }
                             }
                         }),

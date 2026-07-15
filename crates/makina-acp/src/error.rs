@@ -52,10 +52,13 @@ pub enum AcpError {
 
     /// The agent process exited (or its stdout closed) before completing the
     /// expected exchange. Carries any captured stderr tail for diagnostics.
-    #[error("ACP agent exited unexpectedly{}{}",
+    #[error("ACP agent{} exited unexpectedly{}{}",
+        if .command.is_empty() { String::new() } else { format!(" `{}`", .command) },
         if .status.is_empty() { String::new() } else { format!(" ({})", .status) },
         if .stderr.is_empty() { String::new() } else { format!(": {}", .stderr) })]
     AgentExited {
+        /// Program and arguments used to launch the agent (environment omitted).
+        command: String,
         /// Description of the exit status, if known (e.g. `"exit code 1"`).
         status: String,
         /// Tail of the agent's stderr, captured for diagnostics.

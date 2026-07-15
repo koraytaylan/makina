@@ -494,7 +494,8 @@ impl AuditSink for CapturingAuditSink {
 /// 5. Exactly one [`AuditEntry`] with [`AuditDecision::Allow`] was recorded.
 #[tokio::test]
 async fn interleaved_permission_request_completes_turn_and_records_audit_entry() {
-    let worktree = std::env::temp_dir().join("makina-backend-trait-perm-test");
+    let temp = tempfile::tempdir().unwrap();
+    let worktree = temp.path().to_path_buf();
 
     // Build the capturing sink; keep the concrete Arc to read entries back.
     let capturing = Arc::new(CapturingAuditSink::default());
@@ -665,4 +666,77 @@ async fn acp_session_cancel_sends_cancel_notification() {
     drop(session);
     peer.await
         .expect("mock peer task must complete without panic");
+}
+
+#[tokio::test]
+async fn terminate_is_bounded_when_peer_ignores_cancel_mid_turn() {
+    let (client_io, peer_io) = tokio::io::duplex(8192);
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+    let (prompt_seen_tx, prompt_seen_rx) = tokio::sync::oneshot::channel();
+
+    let peer = tokio::spawn(async move {
+        let mut lines = BufReader::new(peer_read).lines();
+
+        macro_rules! send {
+            ($value:expr) => {{
+                let mut bytes = serde_json::to_vec(&$value).unwrap();
+                bytes.push(b'\n');
+                peer_write.write_all(&bytes).await.unwrap();
+                peer_write.flush().await.unwrap();
+            }};
+        }
+
+        let _initialize = lines.next_line().await.unwrap().unwrap();
+        send!(serde_json::json!({
+            "jsonrpc": "2.0", "id": 0,
+            "result": { "protocolVersion": 1 }
+        }));
+        let _session_new = lines.next_line().await.unwrap().unwrap();
+        send!(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "sessionId": "silent-peer" }
+        }));
+
+        let prompt = lines.next_line().await.unwrap().unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&prompt).unwrap();
+        assert_eq!(prompt["method"], "session/prompt");
+        let _ = prompt_seen_tx.send(());
+
+        // Observe cancellation but deliberately send no prompt response. The
+        // session must abort its worker instead of waiting forever to reclaim
+        // the client from this silent peer.
+        let cancel = lines.next_line().await.unwrap().unwrap();
+        let cancel: serde_json::Value = serde_json::from_str(&cancel).unwrap();
+        assert_eq!(cancel["method"], "session/cancel");
+
+        while let Ok(Some(_)) = lines.next_line().await {}
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let client = AcpClient::with_transport(
+        client_read,
+        client_write,
+        temp.path(),
+        None,
+        None,
+        String::new(),
+        None,
+    )
+    .await
+    .expect("handshake should succeed");
+    let mut session = AcpSession::from_client(client, "");
+    let _stream = session
+        .prompt(Prompt::new("wait forever"))
+        .await
+        .expect("prompt should start");
+    prompt_seen_rx
+        .await
+        .expect("peer should observe the prompt");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), session.terminate())
+        .await
+        .expect("terminate must be bounded")
+        .expect("terminate should succeed");
+    peer.await.unwrap();
 }

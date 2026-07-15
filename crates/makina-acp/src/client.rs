@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use futures::future::BoxFuture;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
 
 use std::sync::Arc;
@@ -48,7 +48,7 @@ use crate::protocol::{
     InitializeResult, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
     SessionUpdate, StopReason,
 };
-use crate::transport::{CONTROL_REQUEST_TIMEOUT_SECS, Transport};
+use crate::transport::{CONTROL_REQUEST_TIMEOUT_SECS, ProcessDiagnostics, Transport};
 
 /// Boxed write half used by the production (subprocess) transport, so
 /// [`AcpClient`] is not generic over the stream type.
@@ -266,13 +266,16 @@ pub enum AcpResponseChunk {
 pub struct AcpClient {
     /// The agent subprocess, when this client owns one. `None` for transports
     /// injected directly in tests.
-    child: Option<Child>,
+    child: Option<Arc<tokio::sync::Mutex<Child>>>,
     /// Process-group id of the spawned agent (its own pid, since it is the
     /// group leader via `process_group(0)`). `None` when no subprocess is owned
     /// (test transports) or the child's pid was already taken. Used to
     /// **group-kill** the agent and every descendant it forked, not just the
     /// direct child.
     pgid: Option<u32>,
+    /// Bounded command/status/stderr collector shared with the transport reader.
+    /// `None` for in-memory transports that do not own a subprocess.
+    process_diagnostics: Option<Arc<ProcessDiagnostics>>,
     /// JSON-RPC transport over the agent's stdio.
     transport: Transport<BoxedWriter>,
     /// The session created at connect time.
@@ -324,9 +327,14 @@ impl AcpClient {
     /// The subprocess inherits the parent environment (Zed auth model); any
     /// `command.env` entries are layered on top.
     pub async fn connect(command: AcpCommand) -> Result<Self> {
-        let (child, pgid, transport) = spawn_transport(&command)?;
+        let SpawnedTransport {
+            child,
+            pgid,
+            transport,
+            diagnostics,
+        } = spawn_transport(&command)?;
         // Build atop the generic constructor so spawn + protocol stay separable.
-        let mut client = Self::from_parts(Some(child), pgid, transport);
+        let mut client = Self::from_parts(Some(child), pgid, transport, Some(diagnostics));
         client.handshake(&command.working_dir).await?;
         Ok(client)
     }
@@ -370,20 +378,22 @@ impl AcpClient {
             run_id,
             task_id,
         );
-        let mut client = Self::from_parts(None, None, transport);
+        let mut client = Self::from_parts(None, None, transport, None);
         client.handshake(&cwd).await?;
         Ok(client)
     }
 
     /// Assemble a not-yet-handshaked client from its parts.
     fn from_parts(
-        child: Option<Child>,
+        child: Option<Arc<tokio::sync::Mutex<Child>>>,
         pgid: Option<u32>,
         transport: Transport<BoxedWriter>,
+        process_diagnostics: Option<Arc<ProcessDiagnostics>>,
     ) -> Self {
         Self {
             child,
             pgid,
+            process_diagnostics,
             transport,
             session_id: String::new(),
             protocol_version: 0,
@@ -670,18 +680,34 @@ impl AcpClient {
         }
         self.closed = true;
 
-        if let Some(child) = self.child.as_mut() {
+        if let Some(child) = self.child.as_ref() {
             // Group-kill the whole process group (the agent + every descendant
             // it forked), not just the direct child. SIGTERM first for a clean
             // exit, a short grace, then SIGKILL. Falls back to a direct-child
             // kill when there is no pgid or we're not on Unix.
-            group_kill(self.pgid, child);
+            {
+                let mut child = child.lock().await;
+                group_kill(self.pgid, &mut child);
+            }
             // Give the group a moment to react to SIGTERM before escalating.
             tokio::time::sleep(KILL_GRACE).await;
-            group_kill_force(self.pgid, child);
-            // Reap so no zombie lingers. Ignore the status — we are tearing down.
-            let _ = child.wait().await;
+            let status = {
+                let mut child = child.lock().await;
+                match child.try_wait() {
+                    Ok(Some(status)) => Ok(status),
+                    Ok(None) => {
+                        group_kill_force(self.pgid, &mut child);
+                        // Reap so no zombie lingers.
+                        child.wait().await
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+            if let (Ok(status), Some(diagnostics)) = (status, &self.process_diagnostics) {
+                diagnostics.record_status(status.to_string());
+            }
         }
+        self.child = None;
         // We have reaped our own group; drop it from the process-wide reaper so
         // a later `kill_all_agents()` does not re-kill a (possibly recycled) pgid.
         if let Some(pgid) = self.pgid {
@@ -740,8 +766,21 @@ impl Drop for AcpClient {
         // straight away (no grace period). `kill_on_drop(true)` on the `Child`
         // remains the last-resort direct-child backstop, and the `Transport`'s
         // own `Drop` aborts the reader task.
-        if let Some(child) = self.child.as_mut() {
-            group_kill_force(self.pgid, child);
+        if let Some(child) = self.child.as_ref() {
+            if let Ok(mut child) = child.try_lock() {
+                group_kill_force(self.pgid, &mut child);
+            } else {
+                // The status monitor only holds the child lock for `try_wait`,
+                // but if Drop races that instant we can still signal the process
+                // group without acquiring the handle.
+                #[cfg(unix)]
+                if let Some(pgid) = self.pgid {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pgid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+            }
         }
         // Deregister from the process-wide reaper after our own group-kill, so a
         // later `kill_all_agents()` does not re-kill a (possibly recycled) pgid.
@@ -753,10 +792,18 @@ impl Drop for AcpClient {
 
 // ── Subprocess spawning ──────────────────────────────────────────────────────────
 
+struct SpawnedTransport {
+    child: Arc<tokio::sync::Mutex<Child>>,
+    pgid: Option<u32>,
+    transport: Transport<BoxedWriter>,
+    diagnostics: Arc<ProcessDiagnostics>,
+}
+
 /// Spawn the agent subprocess with piped stdio and wrap its stdout/stdin in a
-/// [`Transport`]. Stderr is captured and forwarded line-by-line to this
-/// process's stderr (useful for surfacing agent diagnostics / auth prompts).
-fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transport<BoxedWriter>)> {
+/// [`Transport`]. Stderr is retained as a bounded diagnostic tail and forwarded
+/// to tracing for surfacing agent diagnostics / auth prompts.
+fn spawn_transport(command: &AcpCommand) -> Result<SpawnedTransport> {
+    let command_display = display_command(command);
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
         .current_dir(&command.working_dir)
@@ -778,10 +825,12 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
 
     let mut child = cmd.spawn().map_err(|e| {
         AcpError::Spawn(format!(
-            "could not spawn `{}`: {e}",
-            command.program.display()
+            "could not spawn `{command_display}` in `{}`: {e}",
+            command.working_dir.display()
         ))
     })?;
+
+    let diagnostics = Arc::new(ProcessDiagnostics::new(command_display));
 
     // The agent is its own process-group leader, so its pgid equals its pid.
     let pgid = child.id();
@@ -807,8 +856,13 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
     // over the live frame. This task ends when stderr closes (process exit); it
     // holds no client state.
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(forward_stderr(stderr));
+        tokio::spawn(forward_stderr(stderr, Arc::clone(&diagnostics)));
+    } else {
+        diagnostics.record_stderr_closed();
     }
+
+    let child = Arc::new(tokio::sync::Mutex::new(child));
+    monitor_child_status(&child, Arc::clone(&diagnostics));
 
     let reader = Box::pin(stdout) as Pin<Box<dyn AsyncRead + Send>>;
     let writer = Box::pin(stdin) as BoxedWriter;
@@ -816,7 +870,7 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
     // Use the single shared derivation so the production and test paths are
     // always in sync (see `AcpCommand::transport_inputs`).
     let (policy, sink) = command.transport_inputs();
-    let transport = Transport::new(
+    let transport = Transport::new_with_process_diagnostics(
         reader,
         writer,
         policy,
@@ -824,23 +878,91 @@ fn spawn_transport(command: &AcpCommand) -> Result<(Child, Option<u32>, Transpor
         sink,
         command.run_id.clone(),
         command.task_id.clone(),
+        Arc::clone(&diagnostics),
     );
-    Ok((child, pgid, transport))
+    Ok(SpawnedTransport {
+        child,
+        pgid,
+        transport,
+        diagnostics,
+    })
 }
 
-/// Drain the child's stderr line-by-line into `tracing`.
+/// Render the exact executable and argument vector without environment values
+/// (which may contain secrets). Debug quoting keeps whitespace unambiguous.
+fn display_command(command: &AcpCommand) -> String {
+    std::iter::once(command.program.display().to_string())
+        .chain(command.args.iter().map(|arg| format!("{arg:?}")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Poll `Child::try_wait` without owning the child forever. The weak reference
+/// ensures this observer never keeps a dropped client/process alive.
+fn monitor_child_status(
+    child: &Arc<tokio::sync::Mutex<Child>>,
+    diagnostics: Arc<ProcessDiagnostics>,
+) {
+    let child = Arc::downgrade(child);
+    tokio::spawn(async move {
+        loop {
+            let Some(child) = child.upgrade() else {
+                return;
+            };
+            let status = {
+                let mut child = child.lock().await;
+                child.try_wait()
+            };
+            drop(child);
+
+            match status {
+                Ok(Some(status)) => {
+                    diagnostics.record_status(status.to_string());
+                    return;
+                }
+                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(err) => {
+                    diagnostics.record_status(format!("exit status unavailable: {err}"));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Drain the child's stderr in fixed-size chunks into `tracing` and the bounded
+/// terminal diagnostic tail.
 ///
 /// Each line is emitted as a `tracing::info!` event under the `acp_agent`
 /// target so plan-0003's subscriber routes it to the per-run/per-task log file
 /// and the TUI error pane. It must **not** be written to this process's stderr:
 /// the ACP backend runs while the TUI's ratatui frame is live, so a raw
 /// `eprintln!` would dump over the alternate screen and corrupt the UI.
-async fn forward_stderr(stderr: tokio::process::ChildStderr) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "acp_agent", "{line}");
+async fn forward_stderr(
+    mut stderr: tokio::process::ChildStderr,
+    diagnostics: Arc<ProcessDiagnostics>,
+) {
+    // Fixed-size reads avoid an unbounded temporary allocation if a broken
+    // agent emits a huge line without a newline. The retained tail is bounded
+    // separately by `ProcessDiagnostics`.
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = match stderr.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) => {
+                tracing::warn!(target: "acp_agent", %err, "failed to read agent stderr");
+                break;
+            }
+        };
+        let chunk = String::from_utf8_lossy(&buffer[..read]);
+        diagnostics.record_stderr(&chunk);
+        let message = chunk.trim_end();
+        if !message.is_empty() {
+            tracing::info!(target: "acp_agent", "{message}");
+        }
     }
+    diagnostics.record_stderr_closed();
 }
 
 // ── Tool detail extraction ────────────────────────────────────────────────────────

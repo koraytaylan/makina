@@ -65,6 +65,61 @@ async fn agent_eof_during_handshake_is_typed_error() {
     peer.await.unwrap();
 }
 
+#[tokio::test]
+async fn real_process_exit_reports_command_status_and_bounded_stderr_tail() {
+    let Some(shell) = which_sh() else {
+        return;
+    };
+    let script = r#"
+i=0
+while [ "$i" -lt 2500 ]; do
+    printf 'discarded-prefix-%04d-xxxxxxxxxxxxxxxx\n' "$i" >&2
+    i=$((i + 1))
+done
+printf 'ACTIONABLE: authenticate the agent CLI\n' >&2
+exit 7
+"#;
+    let command = AcpCommand::new(&shell, std::env::temp_dir()).args(["-c", script]);
+
+    let err = AcpClient::connect(command)
+        .await
+        .expect_err("agent should exit during initialize");
+    let rendered = err.to_string();
+    let AcpError::AgentExited {
+        command,
+        status,
+        stderr,
+    } = err
+    else {
+        panic!("expected AgentExited, got {err:?}");
+    };
+
+    assert!(command.contains(&shell.display().to_string()));
+    assert!(
+        command.contains("\"-c\""),
+        "argument vector should be shown"
+    );
+    assert!(
+        status.contains('7'),
+        "exit status should be preserved: {status}"
+    );
+    assert!(
+        stderr.contains("ACTIONABLE: authenticate the agent CLI"),
+        "stderr tail should retain the actionable final line"
+    );
+    assert!(
+        stderr.len() <= 17 * 1024,
+        "stderr diagnostic must remain bounded, got {} bytes",
+        stderr.len()
+    );
+    assert!(
+        stderr.starts_with("[stderr tail truncated]"),
+        "diagnostic should disclose truncation"
+    );
+    assert!(rendered.contains("ACTIONABLE: authenticate the agent CLI"));
+    assert!(rendered.contains(&status));
+}
+
 // ── handshake: tolerate non-JSON preamble (real-CLI behaviour) ───────────────────
 
 #[tokio::test]

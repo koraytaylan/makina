@@ -77,6 +77,14 @@ use crate::protocol::StopReason;
 /// rarely blocks the worker between consumer polls.
 const CHANNEL_CAPACITY: usize = 64;
 
+/// Maximum time allowed for the out-of-band cancel notification write. A peer
+/// that stopped reading stdin must not block termination on the writer mutex.
+const CANCEL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Grace period for a cancelled turn worker to return its client normally.
+const CLIENT_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Bound for observing an aborted worker and for the client's final shutdown.
+const FORCED_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 // ── Error mapping ──────────────────────────────────────────────────────────────
 
 /// Map an [`AcpError`] onto the generic [`BackendError`], per the task-13 handoff
@@ -384,6 +392,10 @@ pub struct AcpSession {
     /// turn ends (success, error, or early consumer drop). Reclaimed before the
     /// next `prompt`/`terminate`.
     pending_return: Option<oneshot::Receiver<AcpClient>>,
+    /// Handle for the in-flight turn worker. Retained so termination can abort
+    /// it out of band if a silent peer ignores `session/cancel`; aborting drops
+    /// the worker-owned client, whose `Drop` force-kills the process group.
+    worker_task: Option<tokio::task::JoinHandle<()>>,
     /// The session/role prompt, prepended to the first prompt's text. `take`n on
     /// first use so later turns are sent verbatim.
     system_prompt: Option<String>,
@@ -425,6 +437,7 @@ impl AcpSession {
         Self {
             client: Some(client),
             pending_return: None,
+            worker_task: None,
             // An empty system prompt is treated as "no prelude" so we never send
             // a stray leading blank line.
             system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
@@ -450,6 +463,38 @@ impl AcpSession {
                 // Worker vanished without returning the client (e.g. task abort):
                 // treat the session as terminated rather than hang.
                 Err(_) => self.client = None,
+            }
+        }
+        if let Some(worker) = self.worker_task.take() {
+            let _ = worker.await;
+        }
+    }
+
+    /// Attempt to reclaim an in-flight worker within `timeout`. Returns false
+    /// without losing the receiver when the peer remains silent.
+    async fn reclaim_client_bounded(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(mut rx) = self.pending_return.take() else {
+            return true;
+        };
+
+        match tokio::time::timeout(timeout, &mut rx).await {
+            Ok(Ok(client)) => {
+                self.client = Some(client);
+                if let Some(worker) = self.worker_task.take() {
+                    let _ = worker.await;
+                }
+                true
+            }
+            Ok(Err(_)) => {
+                self.client = None;
+                if let Some(worker) = self.worker_task.take() {
+                    let _ = worker.await;
+                }
+                true
+            }
+            Err(_) => {
+                self.pending_return = Some(rx);
+                false
             }
         }
     }
@@ -527,7 +572,7 @@ impl AgentSession for AcpSession {
 
         let stop_cell = Arc::clone(&self.last_stop_reason);
 
-        tokio::spawn(async move {
+        self.worker_task = Some(tokio::spawn(async move {
             // Drive one ACP turn. Inside `run_turn`, `client.prompt` borrows
             // `client` to build the `PromptStream`; that borrow ends when
             // `run_turn` returns (its stream local is dropped), so the client is
@@ -538,7 +583,7 @@ impl AgentSession for AcpSession {
             // and the client is dropped here — its own `Drop` tears the
             // subprocess down, so nothing leaks.
             let _ = return_tx.send(client);
-        });
+        }));
 
         Ok(Box::pin(ReceiverStream::new(event_rx)))
     }
@@ -554,9 +599,33 @@ impl AgentSession for AcpSession {
     /// allowing the peer's read side to see EOF without waiting for `AcpSession`
     /// itself to be dropped.
     async fn terminate(&mut self) -> Result<(), BackendError> {
-        // Reclaim the client from any pending turn so we can shut it down (and so
-        // a still-running worker is wound down rather than leaked).
-        self.reclaim_client().await;
+        // Cancel through the independent sender before attempting to reclaim
+        // the worker-owned client. This path remains available while `client`
+        // is `None`; bound it because a peer may have stopped reading stdin.
+        if let Some(sender) = &self.cancel_sender {
+            let cancel = sender.send_cancel(&self.session_id);
+            if tokio::time::timeout(CANCEL_SEND_TIMEOUT, cancel)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    "timed out sending out-of-band ACP cancellation"
+                );
+            }
+        }
+
+        // Give a conforming peer a short chance to complete the cancelled turn.
+        // If it stays silent, abort the worker. Dropping the worker-owned client
+        // invokes AcpClient::Drop, which force-kills the entire process group.
+        if !self.reclaim_client_bounded(CLIENT_RECLAIM_TIMEOUT).await {
+            if let Some(worker) = self.worker_task.take() {
+                worker.abort();
+                let _ = tokio::time::timeout(FORCED_SHUTDOWN_TIMEOUT, worker).await;
+            }
+            self.pending_return = None;
+            self.client = None;
+        }
 
         // Release the cancel sender now so the transport's write Arc is freed
         // as soon as the client drops, rather than when AcpSession is dropped.
@@ -568,7 +637,18 @@ impl AgentSession for AcpSession {
             Some(mut client) => {
                 // `AcpClient::shutdown` is itself idempotent and maps to Ok even
                 // if the subprocess is already gone; surface any error typed.
-                client.shutdown().await.map_err(map_error)
+                match tokio::time::timeout(FORCED_SHUTDOWN_TIMEOUT, client.shutdown()).await {
+                    Ok(result) => result.map_err(map_error),
+                    Err(_) => {
+                        // Dropping `client` below invokes its synchronous
+                        // process-group kill, so timeout still releases it.
+                        tracing::warn!(
+                            session_id = %self.session_id,
+                            "timed out waiting for ACP client shutdown; forcing drop"
+                        );
+                        Ok(())
+                    }
+                }
             }
             // Already terminated — idempotent success.
             None => Ok(()),
@@ -727,6 +807,7 @@ mod tests {
         ));
         assert!(matches!(
             map_error(AcpError::AgentExited {
+                command: "agent --acp".into(),
                 status: "exit 1".into(),
                 stderr: String::new()
             }),
@@ -948,7 +1029,8 @@ mod tests {
         let sink_arc: Arc<dyn AuditSink> = Arc::new(sink);
 
         // ── backend with injected sink ──────────────────────────────────────
-        let worktree = std::env::temp_dir().join("makina-backend-unit-perm-test");
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
         // Best-effort: ensure the directory exists so WorktreePolicy can stat it
         // if it ever needs to, keeping the test deterministic regardless.
         let _ = std::fs::create_dir_all(&worktree);
@@ -1019,7 +1101,8 @@ mod tests {
                     ],
                     "toolCall": {
                         "toolCallId": "write_file__unit_test_1",
-                        "title": "Write file"
+                        "title": "Write file",
+                        "locations": [{ "path": "probe.txt" }]
                     }
                 }
             }));
@@ -1382,7 +1465,8 @@ mod tests {
         let sink_arc: Arc<dyn AuditSink> = Arc::new(sink);
 
         // ── backend and worktree ────────────────────────────────────────────
-        let worktree = std::env::temp_dir().join("makina-backend-run-task-ids-test");
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
         let _ = std::fs::create_dir_all(&worktree);
         let backend =
             AcpBackend::new("echo", vec!["--acp".into()]).with_audit_sink(Arc::clone(&sink_arc));
@@ -1445,7 +1529,8 @@ mod tests {
                     ],
                     "toolCall": {
                         "toolCallId": "write_file__run_task_id_test",
-                        "title": "Write file"
+                        "title": "Write file",
+                        "locations": [{ "path": "probe.txt" }]
                     }
                 }
             }));

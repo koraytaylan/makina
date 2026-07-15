@@ -19,6 +19,23 @@ use crate::backend::{AgentSession, ResponseEvent, ResponseStream};
 use crate::config::RoleAssignment;
 use crate::roles::current_model_from;
 
+/// Cleanup is best-effort after a broken/stalled response stream. Backend
+/// implementations must not be allowed to turn a short idle watchdog into an
+/// unbounded wait.
+const SESSION_TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn terminate_session_bounded<S: AgentSession + ?Sized>(session: &mut S) {
+    if tokio::time::timeout(SESSION_TERMINATE_TIMEOUT, session.terminate())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_secs = SESSION_TERMINATE_TIMEOUT.as_secs(),
+            "timed out terminating agent session"
+        );
+    }
+}
+
 // ── Drain error type ─────────────────────────────────────────────────────────
 
 /// Shared error type returned by [`drain_agent_turn`].
@@ -109,7 +126,7 @@ pub(crate) async fn drain_agent_turn<S: AgentSession + ?Sized>(
                     Err(_elapsed) => {
                         // Idle timeout fired: no output for idle_secs.
                         let _ = events;
-                        let _ = session.terminate().await;
+                        terminate_session_bounded(session).await;
                         sink(api::Event::TaskIdle {
                             run,
                             task: task_id,
@@ -214,12 +231,12 @@ pub(crate) async fn drain_agent_turn<S: AgentSession + ?Sized>(
             }
             Some(Err(e)) => {
                 let _ = events;
-                let _ = session.terminate().await;
+                terminate_session_bounded(session).await;
                 return Err(DrainError::Stream(e.to_string()));
             }
             None => {
                 let _ = events;
-                let _ = session.terminate().await;
+                terminate_session_bounded(session).await;
                 return Err(DrainError::EndedUnexpectedly);
             }
         }
@@ -231,7 +248,20 @@ pub(crate) async fn drain_agent_turn<S: AgentSession + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{AgentBackend, noop::NoopBackend};
+    use crate::backend::{AgentBackend, BackendError, Prompt, noop::NoopBackend};
+
+    struct HangingTerminateSession;
+
+    #[async_trait::async_trait]
+    impl AgentSession for HangingTerminateSession {
+        async fn prompt(&mut self, _prompt: Prompt) -> Result<ResponseStream, BackendError> {
+            Err(BackendError::Terminated)
+        }
+
+        async fn terminate(&mut self) -> Result<(), BackendError> {
+            std::future::pending().await
+        }
+    }
 
     /// Verify that text chunks are forwarded to the sink and accumulated into output.
     #[tokio::test]
@@ -428,7 +458,6 @@ mod tests {
     /// never yields, so the timeout is the only thing that can resolve the future.
     #[tokio::test]
     async fn test_drain_agent_turn_handles_idle_timeout() {
-        use crate::backend::BackendError;
         use futures::stream;
 
         // Pause the Tokio clock so we can advance time deterministically.
@@ -518,5 +547,39 @@ mod tests {
             has_task_idle,
             "drain_agent_turn must emit TaskIdle when the watchdog fires; got: {captured:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_does_not_wait_forever_for_backend_termination() {
+        use futures::stream;
+
+        tokio::time::pause();
+        let mut session = HangingTerminateSession;
+        let mut pending_stream: ResponseStream =
+            Box::pin(stream::pending::<Result<ResponseEvent, BackendError>>());
+        let sink: Arc<dyn Fn(api::Event) + Send + Sync> = Arc::new(|_| {});
+
+        let drain = drain_agent_turn(
+            &mut session,
+            &mut pending_stream,
+            api::AgentRole::Developer,
+            api::TaskId::new("bounded-termination"),
+            Some(1),
+            &sink,
+            api::RunId(100),
+            Instant::now(),
+            None,
+        );
+        let advance = async {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(SESSION_TERMINATE_TIMEOUT + Duration::from_secs(1)).await;
+        };
+        let (result, ()) = tokio::join!(drain, advance);
+
+        assert!(matches!(
+            result,
+            Err(DrainError::IdleTimeout { idle_secs: 1 })
+        ));
     }
 }

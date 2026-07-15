@@ -31,7 +31,7 @@ use chrono::Utc;
 use makina_core::governance::{AuditDecision, AuditEntry, AuditSink, PolicyInfo, ToolRef};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::{AcpError, Result};
@@ -50,12 +50,134 @@ use crate::protocol::{
 /// cap is its outer backstop.
 pub const CONTROL_REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum amount of subprocess stderr retained for a terminal diagnostic.
+/// Stderr is also streamed to tracing; this buffer exists only so persisted
+/// task failures include the actionable tail without unbounded memory growth.
+const STDERR_TAIL_MAX_BYTES: usize = 16 * 1024;
+
+/// Briefly wait after stdout EOF for the child-status monitor to observe the
+/// corresponding process exit. A process that merely closes stdout must not
+/// block the transport indefinitely.
+const EXIT_STATUS_CAPTURE_WAIT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Default)]
+struct StderrCapture {
+    text: String,
+    truncated: bool,
+}
+
+/// Shared subprocess diagnostics populated by the stderr drainer and child
+/// status monitor, then snapshotted by the transport reader on EOF.
+#[derive(Debug)]
+pub(crate) struct ProcessDiagnostics {
+    command: String,
+    status: Mutex<Option<String>>,
+    stderr: Mutex<StderrCapture>,
+    status_ready: Notify,
+    stderr_closed: Mutex<bool>,
+    stderr_ready: Notify,
+}
+
+impl ProcessDiagnostics {
+    pub(crate) fn new(command: String) -> Self {
+        Self {
+            command,
+            status: Mutex::new(None),
+            stderr: Mutex::new(StderrCapture::default()),
+            status_ready: Notify::new(),
+            stderr_closed: Mutex::new(false),
+            stderr_ready: Notify::new(),
+        }
+    }
+
+    pub(crate) fn record_status(&self, status: impl Into<String>) {
+        let mut slot = self.status.lock().expect("process status mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(status.into());
+            self.status_ready.notify_waiters();
+        }
+    }
+
+    pub(crate) fn record_stderr(&self, chunk: &str) {
+        let mut capture = self.stderr.lock().expect("stderr capture mutex poisoned");
+        capture.text.push_str(chunk);
+        if capture.text.len() > STDERR_TAIL_MAX_BYTES {
+            let mut cut = capture.text.len() - STDERR_TAIL_MAX_BYTES;
+            while !capture.text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            capture.text.drain(..cut);
+            capture.truncated = true;
+        }
+    }
+
+    pub(crate) fn record_stderr_closed(&self) {
+        let mut closed = self
+            .stderr_closed
+            .lock()
+            .expect("stderr closed mutex poisoned");
+        if !*closed {
+            *closed = true;
+            self.stderr_ready.notify_waiters();
+        }
+    }
+
+    async fn snapshot_after_eof(&self) -> (String, String, String) {
+        // Register before checking to avoid missing notifications between the
+        // state checks and creation of the notified futures.
+        let status_notified = self.status_ready.notified();
+        let stderr_notified = self.stderr_ready.notified();
+        let has_status = self
+            .status
+            .lock()
+            .expect("process status mutex poisoned")
+            .is_some();
+        let stderr_closed = *self
+            .stderr_closed
+            .lock()
+            .expect("stderr closed mutex poisoned");
+        let _ = tokio::time::timeout(EXIT_STATUS_CAPTURE_WAIT, async {
+            tokio::join!(
+                async {
+                    if !has_status {
+                        status_notified.await;
+                    }
+                },
+                async {
+                    if !stderr_closed {
+                        stderr_notified.await;
+                    }
+                }
+            );
+        })
+        .await;
+
+        let status = self
+            .status
+            .lock()
+            .expect("process status mutex poisoned")
+            .clone()
+            .unwrap_or_else(|| "exit status unavailable after stdout closed".into());
+        let capture = self.stderr.lock().expect("stderr capture mutex poisoned");
+        let stderr = if capture.truncated {
+            format!("[stderr tail truncated]\n{}", capture.text.trim())
+        } else {
+            capture.text.trim().to_string()
+        };
+        (self.command.clone(), status, stderr)
+    }
+}
+
 /// Why the reader task stopped — recorded so late callers get a precise error
 /// instead of a generic "channel closed".
 #[derive(Debug, Clone)]
 enum ReaderEnd {
     /// The read side reached clean EOF (the agent closed stdout / exited).
-    Eof,
+    Eof {
+        command: String,
+        status: String,
+        stderr: String,
+    },
     /// A transport I/O error occurred while reading.
     Io(String),
 }
@@ -64,9 +186,14 @@ impl ReaderEnd {
     /// Turn the terminal reason into the error a pending/new request observes.
     fn to_error(&self) -> AcpError {
         match self {
-            ReaderEnd::Eof => AcpError::AgentExited {
-                status: String::new(),
-                stderr: String::new(),
+            ReaderEnd::Eof {
+                command,
+                status,
+                stderr,
+            } => AcpError::AgentExited {
+                command: command.clone(),
+                status: status.clone(),
+                stderr: stderr.clone(),
             },
             ReaderEnd::Io(msg) => AcpError::Transport(msg.clone()),
         }
@@ -323,6 +450,61 @@ where
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
+        Self::new_inner(
+            reader,
+            writer,
+            policy,
+            working_dir,
+            audit_sink,
+            run_id,
+            task_id,
+            None,
+        )
+    }
+
+    /// Construct a transport backed by a real subprocess and attach its bounded
+    /// diagnostics collector. Kept separate from [`Self::new`] so in-memory
+    /// transport users remain source-compatible.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_process_diagnostics<R>(
+        reader: R,
+        writer: W,
+        policy: Arc<dyn PermissionPolicy>,
+        working_dir: PathBuf,
+        audit_sink: Arc<dyn AuditSink>,
+        run_id: String,
+        task_id: Option<String>,
+        diagnostics: Arc<ProcessDiagnostics>,
+    ) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        Self::new_inner(
+            reader,
+            writer,
+            policy,
+            working_dir,
+            audit_sink,
+            run_id,
+            task_id,
+            Some(diagnostics),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner<R>(
+        reader: R,
+        writer: W,
+        policy: Arc<dyn PermissionPolicy>,
+        working_dir: PathBuf,
+        audit_sink: Arc<dyn AuditSink>,
+        run_id: String,
+        task_id: Option<String>,
+        diagnostics: Option<Arc<ProcessDiagnostics>>,
+    ) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
         let shared = Arc::new(Shared::new());
         let (notif_tx, notif_rx) = mpsc::unbounded_channel();
 
@@ -346,6 +528,7 @@ where
             Arc::clone(&shared),
             notif_tx,
             sender.clone(),
+            diagnostics,
         ));
 
         Self {
@@ -404,6 +587,7 @@ async fn read_loop<R, W>(
     shared: Arc<Shared>,
     notif_tx: mpsc::UnboundedSender<SessionNotificationParams>,
     sender: TransportSender<W>,
+    diagnostics: Option<Arc<ProcessDiagnostics>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -413,7 +597,15 @@ async fn read_loop<R, W>(
         match lines.next_line().await {
             // Clean EOF: the agent closed stdout.
             Ok(None) => {
-                shared.shutdown(ReaderEnd::Eof);
+                let (command, status, stderr) = match diagnostics {
+                    Some(ref diagnostics) => diagnostics.snapshot_after_eof().await,
+                    None => (String::new(), String::new(), String::new()),
+                };
+                shared.shutdown(ReaderEnd::Eof {
+                    command,
+                    status,
+                    stderr,
+                });
                 return;
             }
             Ok(Some(line)) => {
@@ -796,7 +988,8 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client_io);
         let (mut peer_read, mut peer_write) = tokio::io::split(peer_io);
 
-        let worktree = PathBuf::from("/tmp/makina-test-worktree-perm");
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
         let policy: Arc<dyn PermissionPolicy> = Arc::new(WorktreePolicy::new(worktree.clone()));
         let sink = Arc::new(TestAuditSink::default());
         let entries = sink.entries.clone();
@@ -855,7 +1048,8 @@ mod tests {
                     ],
                     "toolCall": {
                         "toolCallId": "write_file__42",
-                        "title": "Writing probe.txt"
+                        "title": "Writing probe.txt",
+                        "locations": [{ "path": "probe.txt" }]
                     }
                 }
             });
@@ -939,7 +1133,8 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client_io);
         let (mut peer_read, mut peer_write) = tokio::io::split(peer_io);
 
-        let worktree = PathBuf::from("/tmp/makina-test-worktree-perm-str");
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
         let policy: Arc<dyn PermissionPolicy> = Arc::new(WorktreePolicy::new(worktree.clone()));
         let sink = Arc::new(TestAuditSink::default());
         let entries = sink.entries.clone();
@@ -998,7 +1193,8 @@ mod tests {
                     ],
                     "toolCall": {
                         "toolCallId": "write_file__42",
-                        "title": "Writing probe.txt"
+                        "title": "Writing probe.txt",
+                        "locations": [{ "path": "probe.txt" }]
                     }
                 }
             });
@@ -1154,7 +1350,8 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client_io);
         let (mut peer_read, mut peer_write) = tokio::io::split(peer_io);
 
-        let worktree = PathBuf::from("/tmp/makina-test-run-task-ids");
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().to_path_buf();
         let policy: Arc<dyn PermissionPolicy> = Arc::new(WorktreePolicy::new(worktree.clone()));
         let sink = Arc::new(TestAuditSink::default());
         let entries = sink.entries.clone();
@@ -1214,7 +1411,8 @@ mod tests {
                     ],
                     "toolCall": {
                         "toolCallId": "test_tool_123",
-                        "title": "Test Tool"
+                        "title": "Test Tool",
+                        "locations": [{ "path": "probe.txt" }]
                     }
                 }
             });
