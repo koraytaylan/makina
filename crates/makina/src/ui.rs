@@ -500,7 +500,10 @@ pub fn render(app: &App, frame: &mut Frame) {
                         };
                         let resetting = app.is_resetting_run(run_view);
                         let starting = app.starting_runs.contains(&run_view.id)
-                            && run_view.status == RunStatus::Pending;
+                            && matches!(
+                                run_view.status,
+                                RunStatus::Pending | RunStatus::WaitingForRepository { .. }
+                            );
                         let (badge, badge_color) = if resetting {
                             (
                                 spinner_frame(app.tick),

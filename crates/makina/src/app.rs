@@ -5249,9 +5249,12 @@ impl App {
                     registration_oid
                 ));
             }
-            Event::RunOpened { run, plan_dir } => {
-                self.opening_plans
-                    .retain(|target| target.plan_dir != *plan_dir);
+            Event::RunOpened { run, plan_dir: _ } => {
+                // Keep opening_plans: the "starting" badge on the plan node
+                // should stay visible until the run actually starts executing
+                // (Running), not just until RunOpened arrives. RunOpened is
+                // instantaneous and the user would never see the badge if we
+                // cleared it here. It is cleared on RunStatusChanged{Running}.
                 let project = self
                     .runs
                     .iter()
@@ -5268,6 +5271,10 @@ impl App {
                     report: makina_core::api::IngestionReport::default(),
                 };
                 self.remember_run_project_root(&identity_view);
+                // Mark this run as "starting" immediately on RunOpened so the
+                // sidebar shows the animated badge even before the separate
+                // RunStarting event arrives from the background auto-start.
+                self.starting_runs.insert(*run);
                 // If we don't already have a RunView for this id (the initial
                 // `api.runs()` query might have raced with the event), insert a
                 // placeholder.  Tasks 27 and 29 will flesh out proper handling.
@@ -5279,20 +5286,26 @@ impl App {
                 }
             }
             Event::RunStatusChanged { run, status } => {
-                // Once the run transitions out of Pending, the "starting"
-                // badge is no longer accurate — clear it.
-                if !matches!(status, RunStatus::Pending) {
+                // Clear the "starting" badge only when the run actually reaches
+                // Running — the real status badge ([▶]) now applies. Keep it
+                // through Pending and WaitingForRepository so the user sees
+                // continuous feedback from the moment they pressed Start.
+                if matches!(status, RunStatus::Running) {
                     self.starting_runs.remove(run);
+                    // Also clear opening_plans for this run's plan now that
+                    // the run is actually executing.
+                    if let Some(rv) = self.runs.iter().find(|r| r.id == *run) {
+                        self.opening_plans
+                            .retain(|target| target.plan_dir != rv.plan_dir);
+                    }
                 }
                 if let Some(rv) = self.runs.iter_mut().find(|r| r.id == *run) {
                     rv.status = status.clone();
                 }
             }
             Event::RepositoryLeaseWaiting { run, owner } => {
-                // The run has moved past Pending into the lease queue — clear
-                // the "starting" badge; the [⌛] WaitingForRepository badge
-                // now reflects the current state.
-                self.starting_runs.remove(run);
+                // Keep starting_runs: the run is in the lease queue but hasn't
+                // started executing yet. The "starting" badge stays visible.
                 if let Some(rv) = self.runs.iter_mut().find(|r| r.id == *run) {
                     rv.status = RunStatus::WaitingForRepository {
                         owner: owner.clone(),
