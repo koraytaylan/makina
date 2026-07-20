@@ -55,7 +55,7 @@ use crate::app::{
     AccordionSection, App, CollapseKey, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
     ScrollablePanel, TabContent, ToolDiffKey, TreeNode,
 };
-use makina_core::api::{AgentRole, FailureKind, RunId, RunView, TaskId};
+use makina_core::api::{AgentRole, FailureKind, RunId, RunStatus, RunView, TaskId};
 use makina_core::roles::{ReviewVerdict, parse_review_verdict};
 
 /// Render markdown with caching by (text_hash, width, style/theme context).
@@ -499,10 +499,21 @@ pub fn render(app: &App, frame: &mut Frame) {
                             "▾ "
                         };
                         let resetting = app.is_resetting_run(run_view);
+                        let starting = app.starting_runs.contains(&run_view.id)
+                            && run_view.status == RunStatus::Pending;
                         let (badge, badge_color) = if resetting {
                             (
                                 spinner_frame(app.tick),
                                 app.active_theme.get(crate::theme::ThemeRole::Warning),
+                            )
+                        } else if starting {
+                            // A StartRun is in flight but the run is still
+                            // Pending (no Running/WaitingForRepository event
+                            // yet). Animate the badge so the user sees
+                            // immediate feedback instead of a static [·].
+                            (
+                                spinner_frame(app.tick),
+                                app.active_theme.get(crate::theme::ThemeRole::Accent),
                             )
                         } else {
                             status_badge(&run_view.status, app)
@@ -519,6 +530,12 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 "  resetting",
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
+                            ));
+                        } else if starting {
+                            spans.push(Span::styled(
+                                "  starting",
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                             ));
                         }
                         let line = Line::from(spans);
@@ -5423,6 +5440,44 @@ mod tests {
         assert!(
             screen.contains("starting"),
             "sidebar must show a 'starting' badge when a plan is being opened/started;\nscreen was:\n{screen}"
+        );
+    }
+
+    /// Regression test: when a `StartRun` has been issued on a Pending run but
+    /// the run has not yet transitioned to `Running`/`WaitingForRepository`
+    /// (the async events haven't arrived yet), the sidebar must render an
+    /// animated "starting" badge on the run node. Before the fix, the run sat
+    /// at a static `[·] Pending` badge that looked like nothing happened.
+    #[test]
+    fn render_pending_run_with_start_in_flight_shows_starting_badge() {
+        let mut terminal = make_terminal(120, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let run = RunView {
+            id: RunId(1),
+            run_uid: String::new(),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+            status: RunStatus::Pending,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        };
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+        // Simulate a StartRun that just succeeded: the run is still Pending but
+        // has been marked as "starting" (the RunStarting event arrived).
+        app.starting_runs.insert(RunId(1));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("starting"),
+            "sidebar must show a 'starting' badge on a Pending run with StartRun in flight;\nscreen was:\n{screen}"
+        );
+        // The static Pending badge must NOT appear (it would look like nothing
+        // is happening).
+        assert!(
+            !screen.contains("[·]"),
+            "sidebar must NOT show the static Pending badge when the run is starting;\nscreen was:\n{screen}"
         );
     }
 

@@ -619,7 +619,14 @@ async fn resolve_io(
                     .execute(makina_core::api::Command::StartRun { run })
                     .await
                 {
-                    Ok(_) => return (AppEvent::Tick, Some(format!("Start {run}"))),
+                    Ok(_) => {
+                        // Mark the run as "starting" so the sidebar renders an
+                        // animated badge while the run is still Pending (before
+                        // RepositoryLeaseWaiting/Running arrives). Cleared when
+                        // the run transitions out of Pending.
+                        app.starting_runs.insert(run);
+                        return (AppEvent::Tick, Some(format!("Start {run}")));
+                    }
                     Err(makina_core::api::ApiError::UnknownRun { .. })
                         if app
                             .runs
@@ -855,12 +862,20 @@ fn spawn_open_run(
             // the freshly-opened run. The RunOpened/RunStatusChanged events flow
             // back through subscribe() to update the UI.
             Ok(CommandOutcome::RunOpened { run }) if auto_start => {
-                if let Err(e) = api.execute(Command::StartRun { run }).await {
-                    let _ = background_tx
-                        .send(AppEvent::StatusMessage(format!("Start failed: {e}")))
-                        .await;
+                match api.execute(Command::StartRun { run }).await {
+                    Ok(_) => {
+                        // Notify the App to render an animated "starting"
+                        // badge on this run while it is still Pending.
+                        let _ = background_tx.send(AppEvent::RunStarting { run }).await;
+                        true
+                    }
+                    Err(e) => {
+                        let _ = background_tx
+                            .send(AppEvent::StatusMessage(format!("Start failed: {e}")))
+                            .await;
+                        true
+                    }
                 }
-                true
             }
             Ok(CommandOutcome::RunOpened { .. }) => true,
             Ok(_) => false,

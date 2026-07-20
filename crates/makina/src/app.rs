@@ -1140,6 +1140,12 @@ pub enum AppEvent {
     PlanOpenStarted { target: PlanIdentity },
     /// The background open/start completed (successfully or otherwise).
     PlanOpenFinished { target: PlanIdentity },
+    /// A run was just opened (or an existing Pending run was started) and is
+    /// now in the "starting" phase — the sidebar should render an animated
+    /// badge until the run transitions out of `Pending`. Emitted by the
+    /// background `spawn_open_run` auto-start path and by the direct
+    /// `StartRun` resolve_io arm.
+    RunStarting { run: makina_core::api::RunId },
     /// Close the operation notice modal.
     CloseOperationNotice,
 
@@ -1781,6 +1787,13 @@ pub struct App {
     /// This closes the TUI-side repeated-interaction window before Core has had
     /// time to publish `RunOpened`.
     pub opening_plans: HashSet<PlanIdentity>,
+
+    /// Runs that have a `StartRun` in flight but have not yet transitioned out
+    /// of `Pending` (i.e. no `RepositoryLeaseWaiting`/`RunStatusChanged{Running}`
+    /// event has arrived). The sidebar renders an animated "starting" badge for
+    /// these runs so the user sees immediate feedback the moment they start a
+    /// plan, instead of a static `[·] Pending` that looks like nothing happened.
+    pub starting_runs: HashSet<makina_core::api::RunId>,
 
     /// State for the tabbed main content pane.
     pub tabs: TabState,
@@ -2574,6 +2587,7 @@ impl App {
             final_merge: FinalMerge::Squash,
             plan_operations: HashMap::new(),
             opening_plans: HashSet::new(),
+            starting_runs: HashSet::new(),
             verbose_mode: false,
             active_theme: crate::theme::ayu_dark(),
             role_metrics: HashMap::new(),
@@ -4376,6 +4390,11 @@ impl App {
                 true
             }
 
+            AppEvent::RunStarting { run } => {
+                self.starting_runs.insert(run);
+                true
+            }
+
             AppEvent::CloseOperationNotice => {
                 self.operation_notice = None;
                 self.mode = Mode::Normal;
@@ -5260,11 +5279,20 @@ impl App {
                 }
             }
             Event::RunStatusChanged { run, status } => {
+                // Once the run transitions out of Pending, the "starting"
+                // badge is no longer accurate — clear it.
+                if !matches!(status, RunStatus::Pending) {
+                    self.starting_runs.remove(run);
+                }
                 if let Some(rv) = self.runs.iter_mut().find(|r| r.id == *run) {
                     rv.status = status.clone();
                 }
             }
             Event::RepositoryLeaseWaiting { run, owner } => {
+                // The run has moved past Pending into the lease queue — clear
+                // the "starting" badge; the [⌛] WaitingForRepository badge
+                // now reflects the current state.
+                self.starting_runs.remove(run);
                 if let Some(rv) = self.runs.iter_mut().find(|r| r.id == *run) {
                     rv.status = RunStatus::WaitingForRepository {
                         owner: owner.clone(),
