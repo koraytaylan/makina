@@ -57,7 +57,11 @@ fn resolve_role_backend(
 /// audit registry must all agree on this root. The project router calls this
 /// once per opened Git repository instead of reusing the launch repository's
 /// dependencies for every folder.
-fn build_project_api(repo_root: &std::path::Path, config: Config) -> Arc<dyn Api> {
+fn build_project_api(
+    repo_root: &std::path::Path,
+    config: Config,
+    repository_leases: Arc<makina_core::repository_lease::RepositoryLeaseRegistry>,
+) -> Arc<dyn Api> {
     let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.to_path_buf()));
 
     let mut provider_backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
@@ -116,7 +120,7 @@ fn build_project_api(repo_root: &std::path::Path, config: Config) -> Arc<dyn Api
 
     let ingestion_interpreter: Arc<dyn makina_core::interpreter::TaskListInterpreter> =
         Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
-            makina_core::interpreter::StructuredTextInterpreter::new(),
+            makina_core::interpreter::SourceProjectionUnavailable::new(),
         )));
     let planner_interpreter = match makina_core::interpreter::build_planner_interpreter(
         &config.planner.mechanism,
@@ -127,17 +131,17 @@ fn build_project_api(repo_root: &std::path::Path, config: Config) -> Arc<dyn Api
             tracing::warn!(
                 project_root = %repo_root.display(),
                 %error,
-                "planner mechanism unavailable; using deterministic planner"
+                "planner mechanism unavailable; model projection disabled"
             );
             Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
-                makina_core::interpreter::StructuredTextInterpreter::new(),
+                makina_core::interpreter::SourceProjectionUnavailable::new(),
             ))) as Arc<dyn makina_core::interpreter::TaskListInterpreter>
         }
     };
     let worktree_manager =
         WorktreeManager::new(repo_root.to_path_buf(), config.base_branch.clone());
 
-    Arc::new(CoreApi::with_audit_registry(
+    Arc::new(CoreApi::with_repository_lease_registry(
         ingestion_interpreter,
         planner_interpreter,
         developer_backend,
@@ -145,6 +149,7 @@ fn build_project_api(repo_root: &std::path::Path, config: Config) -> Arc<dyn Api
         worktree_manager,
         config,
         audit_sink as Arc<dyn makina_core::audit::AuditRegistry>,
+        repository_leases,
     ))
 }
 
@@ -180,6 +185,13 @@ async fn main() {
     // ensures --help, --version, and --doctor print and exit without launching
     // the full TUI stack.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("plan-contract") {
+        if let Err(message) = run_plan_contract(&args[1..]).await {
+            eprintln!("error: {message}");
+            std::process::exit(2);
+        }
+        return;
+    }
     match makina::cli::parse_args(&args) {
         makina::cli::CliAction::ShowHelp => {
             println!("{}", makina::cli::help_text());
@@ -193,7 +205,7 @@ async fn main() {
             std::process::exit(run_headless_doctor());
         }
         makina::cli::CliAction::Create { path, template } => {
-            match makina::scaffold::scaffold_project(std::path::Path::new(&path), &template) {
+            match makina::scaffold::scaffold_project(std::path::Path::new(&path), &template).await {
                 Ok(report) => {
                     println!("{report}");
                     return;
@@ -326,7 +338,7 @@ async fn main() {
     //
     // Two layers are composed onto one registry:
     //  - `RunFileLayer` (task log-subscriber-file): run ids are allocated lazily
-    //    per OpenRun and many runs can be open at once, so the file destination
+    //    per OpenPlan and many runs can be open at once, so the file destination
     //    cannot be a static path — it resolves per event from the current span's
     //    `run_uid` field and appends to `.makina/runs/{run_uid}/logs/run.log`.
     //    Events carry the key because `run_graph` opens an
@@ -378,7 +390,8 @@ async fn main() {
     let final_merge_for_app = config.merge.final_;
     let theme_name_for_app = config.theme_name.clone();
 
-    let factory: ProjectApiFactory = Arc::new(|project_root| {
+    let repository_leases = Arc::new(makina_core::repository_lease::RepositoryLeaseRegistry::new());
+    let factory: ProjectApiFactory = Arc::new(move |project_root| {
         let (result, _paths) = Config::load_for_repo_with_paths(project_root);
         let project_config = result.map_err(|error| ApiError::InvalidCommand {
             reason: format!(
@@ -386,13 +399,17 @@ async fn main() {
                 project_root.display()
             ),
         })?;
-        Ok(build_project_api(project_root, project_config))
+        Ok(build_project_api(
+            project_root,
+            project_config,
+            Arc::clone(&repository_leases),
+        ))
     });
     let project_api = Arc::new(ProjectApiRouter::new(opened_folders.clone(), factory));
 
     // Pre-register every persisted workspace folder so historical run
     // snapshots from all projects are visible at startup. A broken folder is
-    // non-fatal: discovery can still render it and OpenRun will surface the
+    // non-fatal: discovery can still render it and OpenPlan will surface the
     // project-specific configuration error if the user tries to execute it.
     for folder in &opened_folders {
         if let Err(error) = project_api.register_project(folder).await {
@@ -403,7 +420,7 @@ async fn main() {
             );
         }
     }
-    let api: Arc<dyn Api> = project_api;
+    let api: Arc<dyn Api> = project_api.clone();
 
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;
@@ -423,6 +440,7 @@ async fn main() {
         opened_folders,
         workspace,
     );
+    app.project_api = Some(project_api);
 
     // Restore theme from GlobalConfig; unknown/absent names fall back to Ayu Dark with no panic.
     let active_theme = makina::theme::Theme::builtin_themes()
@@ -473,4 +491,33 @@ async fn main() {
     // tui.restore() is called by the Drop impl, but calling it explicitly here
     // ensures we exit the alternate screen before any post-main cleanup runs.
     tui.restore();
+}
+
+async fn run_plan_contract(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("serve") {
+        return Err("usage: makina plan-contract serve --endpoint PATH --auth-token TOKEN --build-source-oid OID".into());
+    }
+    let value = |flag: &str| -> Result<String, String> {
+        let index = args
+            .iter()
+            .position(|arg| arg == flag)
+            .ok_or_else(|| format!("missing {flag}"))?;
+        args.get(index + 1)
+            .cloned()
+            .ok_or_else(|| format!("missing value for {flag}"))
+    };
+    let endpoint = value("--endpoint")?;
+    let auth_token = value("--auth-token")?;
+    let build_source_oid = value("--build-source-oid")?;
+    if auth_token.len() < 32 {
+        return Err("--auth-token must contain at least 32 bytes".into());
+    }
+    makina_core::plan_contract::PlanContractServer::new(makina_core::plan_contract::ServerConfig {
+        endpoint: endpoint.into(),
+        auth_token,
+        build_source_oid,
+    })
+    .serve()
+    .await
+    .map_err(|error| error.to_string())
 }

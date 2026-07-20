@@ -25,8 +25,8 @@ touches:
   - crates/makina/tests/**
   - crates/makina-acp/tests/**
   - crates/makina-core/tests/fixtures/generated-plans/**
-status: planned
-merged_as: ""
+status: done
+merged_as: "cb284bb36cd196bf50f7ec0cc244f4e09bea99bb"
 ---
 # Generate Complete Task Bundles Atomically
 

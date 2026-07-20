@@ -273,7 +273,11 @@ pub fn transition(from: TaskState, event: TaskEvent) -> Result<TaskState, Illega
 pub fn is_terminal(state: TaskState) -> bool {
     matches!(
         state,
-        TaskState::Done | TaskState::Failed | TaskState::Skipped
+        TaskState::Done
+            | TaskState::Failed
+            | TaskState::Skipped
+            | TaskState::Blocked
+            | TaskState::Dropped
     )
 }
 
@@ -310,6 +314,7 @@ pub fn legal_events(from: TaskState) -> Vec<TaskEvent> {
         Done => vec![],
         Failed => vec![RetryRequested],
         Skipped => vec![DependencyReset],
+        Blocked | Dropped | Gated => vec![],
     }
 }
 

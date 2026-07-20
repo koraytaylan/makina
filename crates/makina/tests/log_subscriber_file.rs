@@ -1,7 +1,7 @@
 //! Per-run **file** layer of the tracing subscriber (task `log-subscriber-file`).
 //!
 //! The subscriber is installed once at process startup, but run ids are
-//! allocated lazily per `OpenRun` and several runs can be open at once — so the
+//! allocated lazily per `OpenPlan` and several runs can be open at once — so the
 //! file destination cannot be a static path chosen at install time. The
 //! [`makina::log::RunFileLayer`] resolves it per event from the current span's
 //! `run_uid` field, appending each event to

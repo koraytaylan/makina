@@ -35,7 +35,7 @@ use makina_core::audit::NoopAuditRegistry;
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
-use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::test_support::setup_temp_repo;
 use makina_core::worktree::WorktreeManager;
@@ -209,6 +209,7 @@ async fn run_graph_emits_tracing_transition_and_gate_events() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: slug.into(),
         tasks: vec![task(task_id_str)],
+        authored: Default::default(),
     }));
 
     let worktree_manager = WorktreeManager::new(repo_root.clone(), "develop".into());
@@ -234,7 +235,7 @@ async fn run_graph_emits_tracing_transition_and_gate_events() {
         slug.to_string(),
         run_uid.to_string(),
         String::new(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph must not error");

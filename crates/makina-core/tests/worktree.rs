@@ -32,13 +32,58 @@ use makina_core::worktree::{WorktreeError, WorktreeManager};
 /// Uses `tokio::sync::Mutex` so async tests can hold it across `.await`.
 static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-// ── Temp-repo helper ──────────────────────────────────────────────────────────
+#[tokio::test]
+async fn purge_removes_only_clean_landed_worktrees_and_preserves_recovery_evidence() {
+    let tmp_home = tempfile::tempdir().expect("create temp home");
+    let _guard = HOME_LOCK.lock().await;
+    // SAFETY: serialized by HOME_LOCK for the duration of the test.
+    unsafe { std::env::set_var("HOME", tmp_home.path()) };
+    let repo = setup_temp_repo();
+    let manager = WorktreeManager::new(repo.path().to_path_buf(), "develop".into());
 
-/// Run a `git` command and return its trimmed stdout, asserting exit 0.
-fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
-    let output = run_git(path, args);
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let clean = manager.create("0401-lease", "clean").await.unwrap();
+    let dirty = manager.create("0401-lease", "dirty").await.unwrap();
+    std::fs::write(dirty.path.join("recovery.txt"), "untracked recovery").unwrap();
+    let ahead = manager.create("0401-lease", "ahead").await.unwrap();
+    std::fs::write(ahead.path.join("ahead.txt"), "unique commit").unwrap();
+    run_git(&ahead.path, &["add", "ahead.txt"]);
+    run_git(&ahead.path, &["commit", "-m", "unlanded recovery"]);
+    let orphan = paths::worktrees_dir(repo.path())
+        .unwrap()
+        .join("orphan-recovery");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("notes.txt"), "keep me").unwrap();
+
+    let report = manager.purge_makina_worktrees().await.unwrap();
+
+    assert_eq!(report.worktrees_removed, 1);
+    assert!(!clean.path.exists());
+    assert!(!branch_exists(repo.path(), &clean.branch));
+    assert!(dirty.path.exists());
+    assert!(branch_exists(repo.path(), &dirty.branch));
+    assert!(ahead.path.exists());
+    assert!(branch_exists(repo.path(), &ahead.branch));
+    assert!(orphan.exists());
+    assert!(
+        report.preserved.iter().any(|item| {
+            item.path == dirty.path && item.reason.contains("tracked or untracked")
+        })
+    );
+    assert!(
+        report
+            .preserved
+            .iter()
+            .any(|item| { item.path == ahead.path && item.reason.contains("not reachable") })
+    );
+    assert!(
+        report
+            .preserved
+            .iter()
+            .any(|item| item.path == orphan && item.reason.contains("recovery evidence"))
+    );
 }
+
+// ── Temp-repo helper ──────────────────────────────────────────────────────────
 
 /// Return true if the branch exists in the repo at `path`.
 fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
@@ -81,7 +126,8 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
     // Pre-compute the expected path + branch NOW (while HOME is still set to
     // tmp_home).  Both use the bounded, hashed `short_worktree_name`, not the old
     // `{plan_slug}--{task_id}` form.
-    let expected_path = paths::worktree(&repo_root, plan_slug, "sample-task");
+    let expected_path =
+        paths::worktree(&repo_root, plan_slug, "sample-task").expect("external state root");
     let expected_branch = format!(
         "task/{}",
         paths::short_worktree_name(plan_slug, "sample-task")
@@ -135,10 +181,11 @@ async fn create_makes_worktree_and_branch_remove_tears_them_down() {
         handle.path
     );
 
-    // Branch must be gone.
+    // The ref remains as recovery evidence until durable landing provenance
+    // proves its commits are reachable elsewhere.
     assert!(
-        !branch_exists(&repo_root, &expected_branch),
-        "branch {expected_branch} must be gone after remove"
+        branch_exists(&repo_root, &expected_branch),
+        "branch {expected_branch} must be retained after worktree removal"
     );
 }
 
@@ -182,44 +229,12 @@ async fn create_reclaims_a_stale_slot() {
         .expect("writing sentinel into stale worktree must succeed");
     assert!(sentinel.exists(), "sentinel must exist before reclaim");
 
-    // ── Second create for the SAME pair: must reclaim, not error. ──────────────
-    let second = mgr
-        .create(plan_slug, task_id)
-        .await
-        .expect("second create must reclaim the stale slot, not return GitCommandFailed");
-
-    // Same path — the slot is reused, recreated fresh.
-    assert_eq!(
-        second.path, first.path,
-        "reclaimed worktree must live at the same path"
-    );
-    assert_eq!(
-        second.branch, expected_branch,
-        "reclaimed worktree must use the same branch name"
-    );
-
-    // Fresh checkout: the sentinel from the prior attempt is gone.
-    assert!(
-        second.path.exists(),
-        "reclaimed worktree dir {:?} must exist",
-        second.path
-    );
-    assert!(
-        !sentinel.exists(),
-        "sentinel {:?} must be gone — the slot was reset fresh off base_branch",
-        sentinel
-    );
-
-    // The branch must exist and point at base_branch (no commits of its own yet).
+    let error = mgr.create(plan_slug, task_id).await.unwrap_err();
+    assert!(matches!(error, WorktreeError::RecoveryEvidence { .. }));
+    assert!(sentinel.exists(), "stale recovery bytes must be preserved");
     assert!(
         branch_exists(&repo_root, &expected_branch),
-        "branch {expected_branch} must exist after reclaim"
-    );
-    let base_head = git_stdout(&repo_root, &["rev-parse", "develop"]);
-    let branch_head = git_stdout(&repo_root, &["rev-parse", &expected_branch]);
-    assert_eq!(
-        branch_head, base_head,
-        "reclaimed branch must be cut fresh from base_branch (develop)"
+        "stale branch must be retained"
     );
 }
 
@@ -412,6 +427,6 @@ async fn two_distinct_task_ids_yield_independent_worktrees() {
     // Both gone.
     assert!(!h1.path.exists(), "task-alpha worktree must be gone");
     assert!(!h2.path.exists(), "task-beta worktree must be gone");
-    assert!(!branch_exists(&repo_root, &branch_alpha));
-    assert!(!branch_exists(&repo_root, &branch_beta));
+    assert!(branch_exists(&repo_root, &branch_alpha));
+    assert!(branch_exists(&repo_root, &branch_beta));
 }

@@ -14,7 +14,6 @@
 //! convert → `AppEvent::ErrorMessageArrived` → `App::update`), and asserts the
 //! converted message lands in `app.error_messages`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -62,10 +61,11 @@ fn exchange_app() -> App {
     let run = RunView {
         id: RunId(1),
         run_uid: String::new(),
-        task_list_path: PathBuf::from(".tasks/exchange-test.json"),
+        plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
         status: RunStatus::Running,
         project: String::new(),
         tasks: vec![TaskView {
+            authored: None,
             id: TaskId::new("task-a"),
             title: "Task A".into(),
             state: TaskState::InProgress,

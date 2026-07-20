@@ -106,9 +106,7 @@ pub struct Review {
 /// the typed error to decide the [`crate::api::FailureKind`] without string
 /// matching.
 ///
-/// This alias mirrors [`DevelopAck`](super::developer::DevelopAck) and
-/// [`InterpretTaskListAck`](super::planner::InterpretTaskListAck) for consistency
-/// across the spokes (addressing the actor-traits review note).
+/// This alias mirrors [`DevelopAck`](super::developer::DevelopAck).
 pub type ReviewReply = Result<ReviewVerdict, ReviewerError>;
 
 /// Run one Reviewer turn against `backend`.

@@ -19,8 +19,8 @@ touches:
   - crates/makina-core/tests/squash_merge.rs
   - crates/makina-core/tests/supervisor_write_path.rs
   - crates/makina/src/app.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "37e5919ee266ba8695b61966860603fdfff3a25b"
 ---
 # Isolate Integration Git Mutations
 

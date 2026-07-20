@@ -61,15 +61,35 @@ fn new_app() -> App {
     App::new(api, vec![], PathBuf::from("/"))
 }
 
-/// Add a minimal Makina plan directory (`SCOPE.md` + `ARCHITECTURE.md`, the
-/// convention gate `discover_plans_per_folder` checks) under
-/// `folder/docs/plans/<slug>/` so the folder's plan discovery finds it.
+/// Add a minimal, unregistered typed plan under `folder/docs/plans/<slug>/`.
 fn add_plan(folder: &Path, slug: &str) {
     let plan_dir = folder.join("docs").join("plans").join(slug);
     fs::create_dir_all(&plan_dir).expect("failed to create plan dir");
-    fs::write(plan_dir.join("SCOPE.md"), "# Scope\n").expect("failed to write SCOPE.md");
-    fs::write(plan_dir.join("ARCHITECTURE.md"), "# Architecture\n")
-        .expect("failed to write ARCHITECTURE.md");
+    let number = slug.split_once('-').map_or(slug, |(number, _)| number);
+    fs::write(
+        plan_dir.join("SCOPE.md"),
+        format!("# Scope — Plan {number}\n\n## In scope\n\n- **0001 — Fixture.** Show one task.\n"),
+    )
+    .expect("write scope");
+    fs::write(
+        plan_dir.join("ARCHITECTURE.md"),
+        format!("# Architecture — Plan {number}\n\n## 0001 — Fixture\n\nA display-only fixture.\n"),
+    )
+    .expect("write architecture");
+    fs::write(
+        plan_dir.join("STATUS.md"),
+        format!(
+            "# Plan {number} — Fixture Plan — 📋 Planned\n\n- **Status:** 📋 Planned.\n- **Goal:** display one typed task.\n- **Root cause:** the sidebar needs a fixture.\n- **Approach:** use one unregistered task document.\n- **Progress:** 0/1 tasks done; 0 blocked; 0 dropped.\n- **Integration:** `planned`; run —; base `develop` @ `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`; validation base —; mode —; final integration —.\n- **Exceptions:** —.\n- **Outcome:** the plan appears in discovery.\n\n_Last updated: 2026-07-20, against `develop` @ `aaaaaaa`._\n"
+        ),
+    )
+    .expect("write status");
+    let tasks_dir = plan_dir.join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("create tasks directory");
+    fs::write(
+        tasks_dir.join("0101-show-fixture.md"),
+        "---\nid: show-fixture\ntitle: Show Fixture\nworkstream: \"0001\"\nkind: task\ndepends_on: []\ngated: false\ntouches:\n  - src/main.rs\nstatus: planned\nmerged_as: \"\"\n---\n# Show Fixture\n\nRender the fixture task.\n\n**Steps:**\n\n1. Display the task.\n\n- **Done when:** the sidebar shows this task.\n",
+    )
+    .expect("write task");
 }
 
 /// Render `app` to an off-screen `TestBackend` and return its content as a
@@ -320,8 +340,8 @@ async fn test_initialize_folder_creates_structure() {
         "README should contain Layout section"
     );
     assert!(
-        content.contains("## TASKS.md contract"),
-        "README should contain TASKS.md contract section"
+        content.contains("## Task document contract"),
+        "README should contain the per-task document contract section"
     );
 
     // The newly initialized folder must render in the sidebar too.
@@ -523,16 +543,7 @@ async fn test_sidebar_tree_three_level_structure() {
     fs::create_dir_all(&folder_a).expect("failed to create folder-a");
     makina::folder_init::initialize_folder(&folder_a).expect("failed to init folder A");
 
-    // Write a plan with a real TASKS.md so a task preview is parsed.
-    let plan_dir = folder_a.join("docs").join("plans").join("0001-test-plan");
-    fs::create_dir_all(&plan_dir).expect("failed to create plan dir");
-    fs::write(plan_dir.join("SCOPE.md"), "# Scope\n").expect("write SCOPE.md");
-    fs::write(plan_dir.join("ARCHITECTURE.md"), "# Architecture\n").expect("write ARCHITECTURE.md");
-    fs::write(
-        plan_dir.join("TASKS.md"),
-        "### my-task — Do the thing\n\n- **Depends on:** none\n- **Done when:** it is done\n",
-    )
-    .expect("write TASKS.md");
+    add_plan(&folder_a, "0001-test-plan");
 
     let workspace_path = temp_dir.path().join("workspace.toml");
     let mut app = new_app();
@@ -576,6 +587,12 @@ async fn test_sidebar_tree_three_level_structure() {
 
     // Expand the plan so its task becomes visible.
     let plan = app.plan_identity_for_entry(&app.opened_folders[0], &app.plans_by_folder[&0][0]);
+    assert!(
+        !app.plans_by_folder[&0][0].tasks().is_empty(),
+        "typed fixture must expose tasks; state={:?}, diagnostics={:?}",
+        app.plans_by_folder[&0][0].state,
+        app.plans_by_folder[&0][0].diagnostics
+    );
     app.collapsed_plans
         .remove(&makina::app::CollapseKey::Plan(plan));
     let nodes = app.visible_tree_nodes();
@@ -594,7 +611,7 @@ async fn test_sidebar_tree_three_level_structure() {
     let rendered = render_to_string(&app);
     assert!(rendered.contains("folder-a"), "rendered: {rendered}");
     assert!(rendered.contains("0001-test-plan"), "rendered: {rendered}");
-    assert!(rendered.contains("my-task"), "rendered: {rendered}");
+    assert!(rendered.contains("show-fixture"), "rendered: {rendered}");
 }
 
 /// Test that empty (uninitialized, no docs/plans) folders are tracked and

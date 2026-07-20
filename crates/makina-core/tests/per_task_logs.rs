@@ -37,7 +37,7 @@ use makina_core::audit::NoopAuditRegistry;
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
-use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::test_support::setup_temp_repo;
 use makina_core::worktree::WorktreeManager;
@@ -114,9 +114,9 @@ impl TestRunFileLayer {
         let path = match task_slug {
             Some(slug) => makina_core::paths::task_log(&self.repo_root, run_uid, slug),
             None => makina_core::paths::run_dir(&self.repo_root, run_uid)
-                .join("logs")
-                .join("run.log"),
+                .map(|dir| dir.join("logs").join("run.log")),
         };
+        let Ok(path) = path else { return };
         let Ok(mut writers) = self.writers.lock() else {
             return;
         };
@@ -250,6 +250,7 @@ async fn per_task_logs() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: slug.into(),
         tasks: vec![task(task_id_str)],
+        authored: Default::default(),
     }));
 
     let worktree_manager = WorktreeManager::new(repo_root.clone(), "develop".into());
@@ -274,7 +275,7 @@ async fn per_task_logs() {
         slug.to_string(),
         run_uid.to_string(),
         String::new(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph must not error");
@@ -288,7 +289,8 @@ async fn per_task_logs() {
     );
 
     // ── Assert: the per-task log file exists and holds the task's records ────────
-    let task_log = makina_core::paths::task_log(&repo_root, run_uid, task_id_str);
+    let task_log = makina_core::paths::task_log(&repo_root, run_uid, task_id_str)
+        .expect("external state root");
     assert!(
         task_log.exists(),
         "per-task log file must exist at {task_log:?}"

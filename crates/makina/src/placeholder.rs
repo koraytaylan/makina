@@ -15,10 +15,9 @@
 //! * `execute()` accepts all commands and returns plausible outcomes.
 //!
 //! It holds **no orchestration logic**; it is a test double, not a coordinator.
-//! Tests that need the real `OpenRun` → interpret → register → broadcast path
+//! Tests that need the real `OpenPlan` → validate → register → broadcast path
 //! (e.g. the TUI↔CoreApi flow test in [`crate::event`]) use `CoreApi` directly.
 
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,6 +27,7 @@ use makina_core::api::{
     AgentRole, Api, ApiError, Command, CommandOutcome, Event, EventStream, ExchangeEvent, RunId,
     RunStatus, RunView, TaskId, TaskState, TaskView,
 };
+use makina_core::plan::PlanKey;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -95,12 +95,55 @@ impl Default for PlaceholderApi {
 impl Api for PlaceholderApi {
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
-            Command::OpenRun { task_list_path } => {
+            Command::GeneratePlanBundle { .. } => Err(ApiError::InvalidCommand {
+                reason: "plan generation requires a repository-bound API".into(),
+            }),
+            Command::RegisterPlan { .. } => Ok(CommandOutcome::Acknowledged),
+            Command::SetTaskDisposition { run, .. } => {
+                if self
+                    .runs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.id == run)
+                {
+                    Ok(CommandOutcome::Acknowledged)
+                } else {
+                    Err(ApiError::UnknownRun { run })
+                }
+            }
+            Command::FinalizePlan {
+                run_uid,
+                expected_plan_oid,
+                ..
+            }
+            | Command::ReprepareFinalization {
+                run_uid,
+                expected_plan_oid,
+                ..
+            } => {
+                if self
+                    .runs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.run_uid == run_uid)
+                {
+                    Ok(CommandOutcome::FinalizationAccepted {
+                        plan_oid: expected_plan_oid,
+                    })
+                } else {
+                    Err(ApiError::InvalidCommand {
+                        reason: "unknown run_uid".into(),
+                    })
+                }
+            }
+            Command::OpenPlan { plan_dir } => {
                 let id = self.alloc_id();
                 let run = RunView {
                     id,
                     run_uid: String::new(),
-                    task_list_path: task_list_path.clone(),
+                    plan_dir: plan_dir.clone(),
                     status: RunStatus::Pending,
                     project: String::new(),
                     tasks: vec![],
@@ -108,10 +151,7 @@ impl Api for PlaceholderApi {
                 };
                 self.runs.lock().unwrap().push(run);
                 // Broadcast a RunOpened event so any subscriber sees it.
-                let _ = self.event_tx.send(Event::RunOpened {
-                    run: id,
-                    task_list_path,
-                });
+                let _ = self.event_tx.send(Event::RunOpened { run: id, plan_dir });
                 Ok(CommandOutcome::RunOpened { run: id })
             }
             Command::StartRun { run } => {
@@ -305,11 +345,12 @@ fn sample_run(id: RunId) -> RunView {
     RunView {
         id,
         run_uid: String::new(),
-        task_list_path: PathBuf::from(".tasks/demo-feature.json"),
+        plan_dir: PlanKey::parse("docs/plans/0001-demo-feature").expect("valid sample plan"),
         status: RunStatus::Running,
         project: "makina".into(),
         tasks: vec![
             TaskView {
+                authored: None,
                 id: TaskId::new("core-api"),
                 title: "Core API surface".into(),
                 state: TaskState::Done,
@@ -322,6 +363,7 @@ fn sample_run(id: RunId) -> RunView {
                 entry_text: String::new(),
             },
             TaskView {
+                authored: None,
                 id: TaskId::new("tui-scaffold"),
                 title: "TUI scaffold".into(),
                 state: TaskState::InProgress,
@@ -334,6 +376,7 @@ fn sample_run(id: RunId) -> RunView {
                 entry_text: String::new(),
             },
             TaskView {
+                authored: None,
                 id: TaskId::new("runs-sidebar"),
                 title: "Runs sidebar".into(),
                 state: TaskState::Ready,
@@ -442,11 +485,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn placeholder_execute_open_run_adds_run() {
+    async fn placeholder_execute_open_plan_adds_run() {
         let api = PlaceholderApi::empty();
         let outcome: Result<CommandOutcome, ApiError> = api
-            .execute(Command::OpenRun {
-                task_list_path: PathBuf::from(".tasks/test.json"),
+            .execute(Command::OpenPlan {
+                plan_dir: PlanKey::parse("docs/plans/0001-test").expect("valid plan"),
             })
             .await;
         assert!(matches!(outcome.unwrap(), CommandOutcome::RunOpened { .. }));
@@ -460,8 +503,8 @@ mod tests {
         let mut stream = api.subscribe();
 
         let _: Result<CommandOutcome, ApiError> = api
-            .execute(Command::OpenRun {
-                task_list_path: PathBuf::from(".tasks/test.json"),
+            .execute(Command::OpenPlan {
+                plan_dir: PlanKey::parse("docs/plans/0001-test").expect("valid plan"),
             })
             .await;
 

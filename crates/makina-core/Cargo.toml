@@ -14,6 +14,10 @@ description = "Makina orchestration core: Tokio scheduler, task lifecycle, workt
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
+serde-saphyr = { workspace = true }
+sha2 = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 async-trait = { workspace = true }
@@ -25,6 +29,7 @@ tokio-stream = { workspace = true, features = ["sync"] }
 # (task 31, run-control) to signal a background Supervisor scheduler to abort.
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
+libc = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 # `ulid` mints the persistent, sortable 26-char run identity (`run_uid`) stamped

@@ -1,6 +1,6 @@
 //! File-browser state and pure navigation logic.
 //!
-//! [`FileBrowser`] is the view state for picking a task-list file to open.  It
+//! [`FileBrowser`] is the view state for picking a plan directory to open. It
 //! holds **no IO**: the actual directory reads happen in the IO layer
 //! ([`crate::event`]), which feeds fresh listings in via
 //! [`crate::app::AppEvent::BrowserOpened`].  This module only owns the in-memory
@@ -13,7 +13,7 @@
 //! state + pure `update`, with all reads/writes pushed to the async event loop.
 //! The event loop reads a directory, builds the [`Vec<DirEntry>`], and hands it
 //! to `App::update`; selecting a directory triggers another read; selecting a
-//! file triggers `api.execute(OpenRun{..})`.
+//! plan directory triggers `api.execute(OpenPlan{..})`.
 
 use std::path::{Path, PathBuf};
 

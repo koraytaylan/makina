@@ -18,13 +18,17 @@ license = "Elastic-2.0"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal", "test-util"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "sync", "time", "fs", "signal", "test-util"] }
 
 # TUI
 ratatui = "0.30"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
+serde-saphyr = "0.0.29"
+sha2 = "0.10.9"
+cap-std = "3.4"
+cap-fs-ext = "3.4"
 
 # Config / data format
 toml = "1.1"
@@ -55,6 +59,7 @@ dirs = "5.0"
 
 # Derive-based error types
 thiserror = "2.0"
+libc = "0.2"
 
 # Structured logging / diagnostics
 tracing = "0.1"

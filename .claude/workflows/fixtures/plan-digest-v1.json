@@ -1,0 +1,7 @@
+{
+  "empty": {"records":[],"source":"600d6e2ca251b0dd3bb10a7e406790fa1b4ec93af7fad470d39856ee3e8330ff","executable":"cea4b2a7ff0304c2a18c112d99340b74132db2dff70f093f8acf9d4da942f795"},
+  "list": {"list":{"tag":"values","items":[]},"source":"584869143963d0849458b9a4435f6f024d39859c92dd5f5e8df02a48d1741eeb","executable":"c715a595b758611cf1ead6ccd5b42adec953e43ca49c9aeeb98092dcb4d86d57"},
+  "unicode": {"records":[["title","Makina — 日本語"]],"source":"fbfd4fa5a215b791f2e07bde9dd90f021dea43b1a9f3512d2236d1be2dee8a38","executable":"62bd69e6ee036c062b8d118018001fb3c18af94d8fba06b39134c6be49f7004e"},
+  "boundary": {"records":[["x",{"repeat":"a","count":256}]],"source":"5fa1018f4f9adfd0374aa4736db53e41978cf963764442cb9faa17258eda8a2a","executable":"f6ba4265b2f5738df88d0fbe659e8f6e2872125b782671aa239dc3052934e4bf"},
+  "whole_plan": {"fixture":"crates/makina-core/tests/fixtures/plan-bundles/valid/0049-Sample","source":"1e06c0cecfd59df78c411a1c11af43c119fdb31c029799e08d347802bc0ba5e1","executable":"e96503d0a1b8ee11d84f61b36fb79d28c35aa66555089da1dbf7778c3f38b787"}
+}

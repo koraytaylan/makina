@@ -1,2 +1,0 @@
-# Runtime state (worktrees, runs) has been relocated to ~/.makina/projects/{ns}/
-# This directory now contains only committed artifacts: config.toml and tasks/

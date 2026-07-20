@@ -399,7 +399,13 @@ impl AuditSink for JsonlAuditSink {
         // The path is `.makina/runs/{run_uid}/audit.jsonl`, which differs per
         // run, so it is resolved here (on the caller's thread, cheap) and the
         // writer re-opens it per message.
-        let path = crate::paths::audit_log(&self.repo_root, &ctx.run_uid);
+        let path = match crate::paths::audit_log(&self.repo_root, &ctx.run_uid) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(run_uid = %ctx.run_uid, %error, "audit state root unavailable; dropping entry");
+                return;
+            }
+        };
 
         // ── Hand off to the background writer (non-blocking) ───────────────────
         // `try_send` only — never `send().await` or `blocking_send()` — to keep
@@ -555,7 +561,7 @@ mod tests {
 
         // Assert the JSONL file exists and has exactly two lines (append).
         // The audit log now lives under state_root(repo_root) instead of repo_root/.makina.
-        let audit_path = crate::paths::audit_log(&repo_root, "run-uid-1");
+        let audit_path = crate::paths::audit_log(&repo_root, "run-uid-1").unwrap();
         assert!(
             audit_path.exists(),
             "audit.jsonl must be created after record + flush"
@@ -760,7 +766,7 @@ mod tests {
 
         // Assert the file has exactly N lines, in enqueue order.
         // The audit log now lives under state_root(repo_root)/runs/{run_uid}/audit.jsonl.
-        let audit_path = crate::paths::audit_log(&repo_root, "run-uid-1");
+        let audit_path = crate::paths::audit_log(&repo_root, "run-uid-1").unwrap();
         let contents = std::fs::read_to_string(&audit_path).expect("read audit.jsonl");
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(

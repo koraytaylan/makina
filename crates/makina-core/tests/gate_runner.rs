@@ -141,6 +141,7 @@ async fn passing_gates_advance_to_review_and_done() {
     let graph = TaskGraph {
         slug: "gate-pass".into(),
         tasks: vec![task("build-thing")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
@@ -214,6 +215,7 @@ async fn gate_failure_loops_then_passes_and_relays_feedback() {
     let graph = TaskGraph {
         slug: "gate-retry".into(),
         tasks: vec![task("fix-thing")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
@@ -314,6 +316,7 @@ async fn discovered_gate_failure_loops_back_to_developer() {
     let graph = TaskGraph {
         slug: "discovered-gate-loop".into(),
         tasks: vec![task("test-task")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
@@ -406,6 +409,7 @@ async fn passing_gates_proceed_to_reviewer() {
     let graph = TaskGraph {
         slug: "discovered-pass".into(),
         tasks: vec![task("passing-task")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
@@ -481,6 +485,7 @@ async fn gate_cap_classifies_gatecap() {
     let graph = TaskGraph {
         slug: "discovered-gate-cap".into(),
         tasks: vec![task("doomed-task")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),
@@ -567,6 +572,7 @@ async fn always_failing_gate_hits_cap_and_fails_task() {
     let graph = TaskGraph {
         slug: "gate-cap".into(),
         tasks: vec![task("doomed-thing")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = common::run_graph_in_repo(
         repo_root.clone(),

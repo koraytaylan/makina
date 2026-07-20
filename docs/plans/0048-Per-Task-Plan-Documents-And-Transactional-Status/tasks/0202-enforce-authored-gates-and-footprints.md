@@ -11,8 +11,8 @@ touches:
   - crates/makina-core/src/actors/supervisor.rs
   - crates/makina-core/tests/authored_scheduling.rs
   - crates/makina-core/tests/edge_inference.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "1d8ee6545badfe9bd7d29578d219c252c7a4d2d6"
 ---
 # Enforce Authored Gates Statuses And Footprints
 

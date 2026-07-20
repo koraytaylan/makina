@@ -31,8 +31,8 @@ touches:
   - crates/makina-core/tests/fixtures/repository-lease/**
   - crates/makina/src/**
   - crates/makina/tests/**
-status: planned
-merged_as: ""
+status: done
+merged_as: "9154419d9cd46a88410d3a9ebaacfc62e4cf6751"
 ---
 # Port The Plan Authoring And Execution Workflows
 

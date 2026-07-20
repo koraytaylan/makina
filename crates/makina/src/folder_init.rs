@@ -73,8 +73,17 @@ pub fn initialize_folder(folder: &Path) -> Result<(), String> {
     let plans_dir = folder.join("docs").join("plans");
     std::fs::create_dir_all(&plans_dir).map_err(|e| format!("failed to create docs/plans: {e}"))?;
     const PLANS_README: &str = include_str!("templates/plans_readme.md");
-    std::fs::write(plans_dir.join("README.md"), PLANS_README)
-        .map_err(|e| format!("failed to write docs/plans/README.md: {e}"))?;
+    let readme = plans_dir.join("README.md");
+    if !readme.exists() {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&readme)
+            .map_err(|e| format!("failed to create docs/plans/README.md: {e}"))?;
+        file.write_all(PLANS_README.as_bytes())
+            .map_err(|e| format!("failed to write docs/plans/README.md: {e}"))?;
+    }
 
     Ok(())
 }
@@ -145,8 +154,8 @@ mod tests {
             "README should contain '## Layout' heading"
         );
         assert!(
-            readme_content.contains("## TASKS.md contract"),
-            "README should contain '## TASKS.md contract' heading"
+            readme_content.contains("## Task document contract"),
+            "README should contain the task document contract"
         );
 
         // Verify that the README does not contain the literal substring \n (it should use real newlines)

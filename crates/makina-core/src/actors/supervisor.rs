@@ -151,6 +151,249 @@ use crate::worktree::WorktreeManager;
 use super::developer::{Develop, DevelopOutcome, DeveloperError, develop};
 use super::reviewer::{Review, ReviewVerdict, ReviewerError, review};
 
+/// One side of a NUL-safe Git name/status diff, normalized by the coordinator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FootprintChange {
+    pub path: String,
+    pub change: crate::plan::RepoChange,
+    /// Required for the modify-only tracked config exception.
+    pub ordinary_file_result: bool,
+}
+
+/// A correction returned at both the review-acceptance and pre-Phase-A seams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FootprintViolation {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Decode `git diff --name-status -z -M -C` without ever interpreting a path as
+/// text-delimited output. Rename/copy records produce entries for both sides.
+pub fn parse_name_status_z(
+    output: &[u8],
+    ordinary_results: &std::collections::HashSet<String>,
+    submodules: &std::collections::HashSet<String>,
+) -> Result<Vec<FootprintChange>, String> {
+    let fields = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut cursor = 0;
+    let mut changes = Vec::new();
+    while cursor < fields.len() && !fields[cursor].is_empty() {
+        let status = std::str::from_utf8(fields[cursor])
+            .map_err(|_| "Git emitted a non-UTF-8 status token")?;
+        cursor += 1;
+        let path_count = usize::from(status.starts_with('R') || status.starts_with('C')) + 1;
+        if cursor + path_count > fields.len() {
+            return Err("truncated NUL-delimited Git name/status record".into());
+        }
+        for raw_path in &fields[cursor..cursor + path_count] {
+            let path = std::str::from_utf8(raw_path)
+                .map_err(|_| "repository path is not valid UTF-8")?
+                .to_owned();
+            let change = if submodules.contains(&path) {
+                crate::plan::RepoChange::Submodule
+            } else {
+                match status.as_bytes().first().copied() {
+                    Some(b'M') => crate::plan::RepoChange::ModifiedOrdinaryFile,
+                    Some(b'D') => crate::plan::RepoChange::Deleted,
+                    Some(b'A') => crate::plan::RepoChange::Added,
+                    Some(b'R' | b'C') => crate::plan::RepoChange::RenamedOrCopied,
+                    Some(b'T') => crate::plan::RepoChange::TypeChanged,
+                    Some(b'U') => crate::plan::RepoChange::Unmerged,
+                    _ => return Err(format!("unsupported Git status `{status}`")),
+                }
+            };
+            changes.push(FootprintChange {
+                ordinary_file_result: ordinary_results.contains(&path),
+                path,
+                change,
+            });
+        }
+        cursor += path_count;
+    }
+    Ok(changes)
+}
+
+/// Enforce an authored footprint against an already NUL-safely decoded diff.
+/// Rename/copy callers must provide both source and destination entries.
+pub fn enforce_authored_footprint(
+    touches: &[crate::plan::RepoPattern],
+    changes: &[FootprintChange],
+) -> Result<(), Vec<FootprintViolation>> {
+    let mut violations = Vec::new();
+    for changed in changes {
+        if is_reserved_status_path(&changed.path) {
+            violations.push(FootprintViolation {
+                path: changed.path.clone(),
+                reason: "coordinator-owned status path is reserved".into(),
+            });
+            continue;
+        }
+        let permitted = touches.iter().any(|pattern| {
+            if !pattern.is_executable()
+                || !crate::dependency::footprint_matches(pattern.as_str(), &changed.path)
+                || !pattern.permits_change(changed.change)
+            {
+                return false;
+            }
+            !matches!(
+                pattern,
+                crate::plan::RepoPattern::TrackedMakinaConfig { .. }
+            ) || changed.ordinary_file_result
+        });
+        if !permitted {
+            violations.push(FootprintViolation {
+                path: changed.path.clone(),
+                reason: "change is outside the authored footprint or uses a forbidden Git status"
+                    .into(),
+            });
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+fn is_reserved_status_path(path: &str) -> bool {
+    path == "docs/plans/STATUS.md"
+        || (path.starts_with("docs/plans/") && path.ends_with("/STATUS.md"))
+        || (path.starts_with("docs/plans/") && path.contains("/tasks/") && path.ends_with(".md"))
+}
+
+pub async fn enforce_task_branch_footprint(
+    repo: &Path,
+    task_id: &TaskId,
+    branch: &str,
+    touches: &[crate::task::AuthoredRepoPattern],
+    recorded_base: &str,
+) -> Result<(), String> {
+    let base = recorded_base;
+    let raw = git_output(
+        repo,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            "-C",
+            base,
+            branch,
+            "--",
+        ],
+    )
+    .await?;
+    let mut paths = Vec::new();
+    // First parse discovers all paths without trusting line delimiters.
+    let provisional = parse_name_status_z(&raw, &Default::default(), &Default::default())?;
+    paths.extend(provisional.iter().map(|change| change.path.clone()));
+    let mut ordinary = std::collections::HashSet::new();
+    let mut submodules = std::collections::HashSet::new();
+    for path in paths {
+        let tip_entry = literal_tree_entry(repo, branch, &path).await?;
+        let base_entry = literal_tree_entry(repo, base, &path).await?;
+        if tip_entry
+            .as_ref()
+            .is_some_and(|entry| entry.mode == "160000")
+            || base_entry
+                .as_ref()
+                .is_some_and(|entry| entry.mode == "160000")
+        {
+            submodules.insert(path);
+        } else if tip_entry.as_ref().is_some_and(|entry| {
+            matches!(entry.mode.as_str(), "100644" | "100755") && entry.object_type == "blob"
+        }) {
+            ordinary.insert(path);
+        }
+    }
+    let changes = parse_name_status_z(&raw, &ordinary, &submodules)?;
+    let patterns = touches
+        .iter()
+        .map(crate::task::AuthoredRepoPattern::to_repo_pattern)
+        .collect::<Vec<_>>();
+    enforce_authored_footprint(&patterns, &changes).map_err(|violations| {
+        let details = violations
+            .iter()
+            .map(|violation| format!("{} ({})", violation.path, violation.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("task {task_id} changed paths outside its authored footprint: {details}")
+    })
+}
+
+struct LiteralTreeEntry {
+    mode: String,
+    object_type: String,
+}
+
+async fn literal_tree_entry(
+    repo: &Path,
+    revision: &str,
+    path: &str,
+) -> Result<Option<LiteralTreeEntry>, String> {
+    let literal = format!(":(literal){path}");
+    let output = git_output(repo, &["ls-tree", "-z", revision, "--", &literal]).await?;
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let record = output
+        .strip_suffix(&[0])
+        .ok_or("ls-tree record was not NUL terminated")?;
+    let tab = record
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or("malformed ls-tree record")?;
+    let (metadata, returned_with_tab) = record.split_at(tab);
+    let returned_path = &returned_with_tab[1..];
+    if returned_path != path.as_bytes() {
+        return Err("ls-tree returned a different path than requested".into());
+    }
+    let mut fields = metadata.split(|byte| *byte == b' ');
+    let mode = std::str::from_utf8(fields.next().ok_or("missing ls-tree mode")?)
+        .map_err(|_| "invalid ls-tree mode")?;
+    let object_type = std::str::from_utf8(fields.next().ok_or("missing ls-tree type")?)
+        .map_err(|_| "invalid ls-tree type")?;
+    if fields.next().is_none() || fields.next().is_some() {
+        return Err("malformed ls-tree metadata".into());
+    }
+    Ok(Some(LiteralTreeEntry {
+        mode: mode.into(),
+        object_type: object_type.into(),
+    }))
+}
+
+async fn git_output(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .await
+        .map_err(|error| format!("could not run git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+async fn return_footprint_correction(
+    ctx: &DriverContext,
+    task_id: &TaskId,
+    message: String,
+) -> Result<(), String> {
+    {
+        let mut graph = ctx.graph.lock().await;
+        apply_event_locked(&mut graph, task_id, TaskEvent::ReviewerRejected)?;
+    }
+    ctx.persist().await;
+    ctx.emit_task_state(task_id, TaskState::InProgress);
+    tracing::warn!(task = %task_id, reason = %message, "task returned for footprint correction");
+    Ok(())
+}
+
 // ── Live event emission (task 31: run-control) ──────────────────────────────────
 
 /// A sink for the live [`api::Event`]s the Supervisor scheduler/drivers emit.
@@ -239,6 +482,7 @@ pub struct RunReport {
     /// (Manual mode, a failed run, or a final-merge conflict); `None` when it was
     /// squashed/merge-committed into base_branch.
     pub plan_branch_left: Option<String>,
+    pub landing_evidence: Vec<crate::task::TaskLandingEvidence>,
 }
 
 // ── DevelopGateOutcome ──────────────────────────────────────────────────────────
@@ -274,6 +518,7 @@ struct DriverContext {
     /// held across an `.await`** (see the lock-discipline note on
     /// [`task_driver`]).
     graph: Arc<Mutex<TaskGraph>>,
+    landing_evidence: Arc<Mutex<Vec<crate::task::TaskLandingEvidence>>>,
 
     /// Serializes snapshot acquisition and atomic replacement for this run.
     /// The lock is acquired before cloning the graph, so an older snapshot can
@@ -360,9 +605,206 @@ struct DriverContext {
     /// driver passes it to `WorktreeManager::create`/`remove` so the worktree
     /// dir + branch are plan-scoped as `{plan_slug}--{task_id}`.
     plan_slug: String,
+    checkpoint_identity: Option<crate::checkpoint::CheckpointIdentity>,
+    #[cfg(test)]
+    pre_a_observer: Option<tokio::sync::mpsc::UnboundedSender<TaskId>>,
 }
 
 impl DriverContext {
+    async fn commit_claim(&self, task_id: &TaskId) -> Result<(), String> {
+        let Some(identity) = self.checkpoint_identity.as_ref() else {
+            return Ok(());
+        };
+        let root = self.squash_merger.integration_root();
+        let source = crate::plan::FilesystemPlanFileSource::new(root, None)
+            .map_err(|error| format!("open integration plan for claim: {error}"))?;
+        let candidate = crate::plan::load_plan_path(
+            &source,
+            &identity.plan_dir,
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|report| format!("load integration plan for claim: {:?}", report.diagnostics))?;
+        let crate::plan::PlanCandidate::Plan(mut plan) = candidate else {
+            return Err("registered integration source is not a plan".into());
+        };
+        let task = plan
+            .tasks
+            .iter_mut()
+            .find(|task| task.frontmatter.id.as_str() == task_id.0)
+            .ok_or_else(|| format!("claim task {task_id} is absent from registered plan"))?;
+        task.update_bookkeeping(crate::plan::AuthoredTaskStatus::InProgress, None)
+            .map_err(|error| format!("render task claim: {error}"))?;
+        plan.status.integration_state = crate::plan::PlanIntegrationState::Assembling;
+        plan.status.run = Some(self.run_uid.clone());
+        plan.status.display_status = "🔄 In progress".into();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: None,
+            final_oid: None,
+            display_status: plan.status.display_status.clone(),
+            last_updated: plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| format!("render claim status: {error}"))?;
+        plan.status.source.body = status.clone();
+        let root_path = std::path::PathBuf::from("docs/plans/STATUS.md");
+        let root_status = tokio::fs::read_to_string(root.join(&root_path))
+            .await
+            .map_err(|error| format!("read root status for claim: {error}"))?;
+        let root_status = crate::plan_status::update_root_row(&root_status, &plan)
+            .map_err(|error| format!("render claim root status: {error}"))?;
+        let task = plan
+            .tasks
+            .iter()
+            .find(|task| task.frontmatter.id.as_str() == task_id.0)
+            .unwrap();
+        let plan_ref = format!("refs/heads/plan/{}", self.plan_slug);
+        let old = git_output(root, &["rev-parse", "--verify", &plan_ref])
+            .await
+            .map_err(|error| format!("read plan ref for claim: {error}"))?;
+        let old = std::str::from_utf8(&old)
+            .map_err(|_| "plan ref was not UTF-8")?
+            .trim();
+        crate::landing::commit_task_claim(
+            root,
+            &plan_ref,
+            old,
+            &[
+                crate::landing::OwnedWrite {
+                    path: task.source_path.clone(),
+                    bytes: task.render().into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: plan.status.source.source_path.clone(),
+                    bytes: status.into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: root_path,
+                    bytes: root_status.into_bytes(),
+                },
+            ],
+            &crate::landing::StatusLandingIdentity {
+                plan: self.plan_slug.clone(),
+                task: task_id.0.clone(),
+                run: self.run_uid.clone(),
+                landing: old.into(),
+            },
+        )
+        .await
+        .map_err(|error| format!("commit claim for {task_id}: {error}"))?;
+        Ok(())
+    }
+
+    async fn commit_phase_b(
+        &self,
+        task_id: &TaskId,
+        landing_oid: &crate::plan::GitObjectId,
+    ) -> Result<String, String> {
+        let identity = self
+            .checkpoint_identity
+            .as_ref()
+            .ok_or("typed Phase B requires checkpoint identity")?;
+        let source =
+            crate::plan::FilesystemPlanFileSource::new(self.squash_merger.integration_root(), None)
+                .map_err(|error| format!("open integration plan for Phase B: {error}"))?;
+        let candidate = crate::plan::load_plan_path(
+            &source,
+            &identity.plan_dir,
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|report| {
+            format!(
+                "load integration plan for Phase B: {:?}",
+                report.diagnostics
+            )
+        })?;
+        let crate::plan::PlanCandidate::Plan(mut plan) = candidate else {
+            return Err("registered integration source is not a plan".into());
+        };
+        let task = plan
+            .tasks
+            .iter_mut()
+            .find(|task| task.frontmatter.id.as_str() == task_id.0)
+            .ok_or_else(|| format!("Phase B task {task_id} is absent from registered plan"))?;
+        task.update_bookkeeping(
+            crate::plan::AuthoredTaskStatus::Done,
+            Some(landing_oid.clone()),
+        )
+        .map_err(|error| format!("render Phase B task: {error}"))?;
+
+        plan.status.done = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+            .count();
+        plan.status.blocked = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Blocked)
+            .count();
+        plan.status.dropped = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Dropped)
+            .count();
+        plan.status.display_status = "🔄 In progress".into();
+        plan.status.integration_state = crate::plan::PlanIntegrationState::AwaitingIntegration;
+        plan.status.mode = Some("Squash".into());
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: Some(self.run_uid.clone()),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: plan.status.mode.clone(),
+            final_oid: None,
+            display_status: plan.status.display_status.clone(),
+            last_updated: plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| format!("render Phase B status: {error}"))?;
+        plan.status.source.body = status.clone();
+        let root_path = std::path::PathBuf::from("docs/plans/STATUS.md");
+        let root =
+            tokio::fs::read_to_string(self.squash_merger.integration_root().join(&root_path))
+                .await
+                .map_err(|error| format!("read root status for Phase B: {error}"))?;
+        let root = crate::plan_status::update_root_row(&root, &plan)
+            .map_err(|error| format!("render Phase B root status: {error}"))?;
+        let task = plan
+            .tasks
+            .iter()
+            .find(|task| task.frontmatter.id.as_str() == task_id.0)
+            .unwrap();
+        let writes = vec![
+            crate::landing::OwnedWrite {
+                path: task.source_path.clone(),
+                bytes: task.render().into_bytes(),
+            },
+            crate::landing::OwnedWrite {
+                path: plan.status.source.source_path.clone(),
+                bytes: status.into_bytes(),
+            },
+            crate::landing::OwnedWrite {
+                path: root_path,
+                bytes: root.into_bytes(),
+            },
+        ];
+        crate::landing::commit_task_status(
+            self.squash_merger.integration_root(),
+            &format!("refs/heads/plan/{}", self.plan_slug),
+            landing_oid.as_str(),
+            &writes,
+            &crate::landing::StatusLandingIdentity {
+                plan: self.plan_slug.clone(),
+                task: task_id.0.clone(),
+                run: self.run_uid.clone(),
+                landing: landing_oid.as_str().into(),
+            },
+        )
+        .await
+        .map_err(|error| format!("commit Phase B for {task_id}: {error}"))
+    }
     /// Emit `TaskStateChanged{run, task, state}` for this run (task 31).
     ///
     /// Maps the domain [`TaskState`] to its [`api::TaskState`] mirror and calls
@@ -419,12 +861,75 @@ impl DriverContext {
         } else {
             self.run_slug.as_str()
         };
-        if let Err(e) = persist_graph_as(&snapshot, repo_root, expected_slug).await {
-            tracing::warn!(
-                slug = %snapshot.slug,
-                error = %e,
-                "supervisor: persist_graph failed (best-effort, run continues)"
-            );
+        let is_checkpoint = self.checkpoint_identity.is_some();
+        let result = if let Some(identity) = self.checkpoint_identity.clone() {
+            let key = crate::plan::PlanKey::parse(identity.plan_dir.clone())
+                .map_err(|error| error.to_string());
+            let evidence = match key {
+                Ok(key) => crate::checkpoint::inspect_repository_evidence(repo_root, &key)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
+            let (active_refs, active_worktrees) = match evidence {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    self.fail_for_persistence(error).await;
+                    return;
+                }
+            };
+            crate::checkpoint::persist_checkpoint_with_evidence(
+                repo_root,
+                identity,
+                &snapshot,
+                active_refs,
+                active_worktrees,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        } else {
+            persist_graph_as(&snapshot, repo_root, expected_slug)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        if let Err(e) = result {
+            if is_checkpoint {
+                self.fail_for_persistence(e).await;
+            } else {
+                tracing::warn!(slug = %snapshot.slug, error = %e, "legacy artifact persistence failed");
+            }
+        }
+    }
+
+    async fn fail_for_persistence(&self, error: String) {
+        tracing::error!(slug = %self.run_slug, %error, "durable checkpoint failed; stopping run");
+        self.control.cancel.cancel();
+        let changed = {
+            let mut graph = self.graph.lock().await;
+            graph
+                .tasks
+                .iter_mut()
+                .filter(|task| {
+                    matches!(
+                        task.state,
+                        TaskState::New
+                            | TaskState::Ready
+                            | TaskState::InProgress
+                            | TaskState::InReview
+                    )
+                })
+                .map(|task| {
+                    task.state = TaskState::Failed;
+                    task.failure_reason = Some(api::FailureReason {
+                        kind: api::FailureKind::HardError,
+                        message: format!("durable checkpoint failed: {error}"),
+                    });
+                    (task.id.clone(), task.state)
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, state) in changed {
+            self.emit_task_state(&id, state);
         }
     }
 }
@@ -465,6 +970,38 @@ pub async fn run_graph(
     plan_slug: String,
     _planner_interpreter: Arc<dyn TaskListInterpreter>,
 ) -> Result<RunReport, String> {
+    run_graph_with_checkpoint(
+        graph,
+        worktree_manager,
+        config,
+        developer_backend,
+        reviewer_backend,
+        control,
+        audit_registry,
+        run_slug,
+        run_uid,
+        plan_slug,
+        _planner_interpreter,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_graph_with_checkpoint(
+    graph: Arc<Mutex<TaskGraph>>,
+    worktree_manager: WorktreeManager,
+    config: Config,
+    developer_backend: Arc<dyn AgentBackend>,
+    reviewer_backend: Arc<dyn AgentBackend>,
+    control: RunControl,
+    audit_registry: Arc<dyn AuditRegistry>,
+    run_slug: String,
+    run_uid: String,
+    plan_slug: String,
+    _planner_interpreter: Arc<dyn TaskListInterpreter>,
+    checkpoint_identity: Option<crate::checkpoint::CheckpointIdentity>,
+) -> Result<RunReport, String> {
     // Open the run-scoped tracing span so every event emitted while driving this
     // graph carries the `run_uid` key. The `makina` binary's per-run file layer
     // reads this field to route events to `.makina/runs/{run_uid}/logs/run.log`
@@ -490,6 +1027,7 @@ pub async fn run_graph(
         run_uid,
         plan_slug,
         _planner_interpreter,
+        checkpoint_identity,
     )
     .instrument(run_span)
     .await
@@ -508,6 +1046,7 @@ async fn run_graph_inner(
     run_uid: String,
     plan_slug: String,
     _planner_interpreter: Arc<dyn TaskListInterpreter>,
+    checkpoint_identity: Option<crate::checkpoint::CheckpointIdentity>,
 ) -> Result<RunReport, String> {
     // Announce the run is now executing.
     control.emit(api::Event::RunStatusChanged {
@@ -517,29 +1056,49 @@ async fn run_graph_inner(
 
     // 1. Create + check out the per-plan integration branch off base_branch.
     // (Skip for ask path with empty plan_slug — keep legacy behavior with fork_branch: None.)
-    let (plan_branch, worktree_manager) = if !plan_slug.is_empty() {
-        let branch = worktree_manager
-            .create_plan_branch(&plan_slug)
+    let (plan_branch, integration_root, worktree_manager) = if !plan_slug.is_empty() {
+        let mut workspace = worktree_manager
+            .create_integration_workspace(&plan_slug, &run_uid)
             .await
-            .map_err(|e| format!("failed to create plan branch: {e}"))?;
+            .map_err(|e| format!("failed to create integration workspace: {e}"))?;
+        // Legacy graph-only callers have no typed registration evidence. Keep
+        // their compatibility branch creation ref-only and attach it inside the
+        // private workspace; typed runs must arrive with a published R ref.
+        if checkpoint_identity.is_none() {
+            worktree_manager
+                .create_plan_branch(&plan_slug)
+                .await
+                .map_err(|e| format!("failed to create legacy plan ref: {e}"))?;
+            workspace = worktree_manager
+                .create_integration_workspace(&plan_slug, &run_uid)
+                .await
+                .map_err(|e| format!("failed to attach integration workspace: {e}"))?;
+        }
+        let branch = workspace.plan_branch;
         // 2. Task worktrees fork from the plan branch.
         let mgr = worktree_manager.with_fork_branch(branch.clone());
-        (branch, mgr)
+        (branch, workspace.path, mgr)
     } else {
         // Ask path: no plan branch, keep fork_branch: None (merges into base_branch).
-        (worktree_manager.base_branch.clone(), worktree_manager)
+        (
+            worktree_manager.base_branch.clone(),
+            worktree_manager.repo_root.clone(),
+            worktree_manager,
+        )
     };
 
     // Build the driver context directly (we drive the `scheduler` ourselves so
     // we keep ownership of the shared graph for the final status derivation).
     // 3. The per-task merger targets the plan branch (now checked out in repo_root).
-    let squash_merger = SquashMerger::new(worktree_manager.repo_root.clone(), plan_branch.clone());
+    let squash_merger = SquashMerger::new(integration_root.clone(), plan_branch.clone())
+        .with_repository_child_token(worktree_manager.repository_child_token());
 
     // Track whether this is a real plan-branch run (not the ask path).
     let has_plan_branch = !plan_slug.is_empty();
 
     let ctx = DriverContext {
         graph: Arc::clone(&graph),
+        landing_evidence: Arc::new(Mutex::new(Vec::new())),
         persist_lock: Arc::new(Mutex::new(())),
         merge_lock: Arc::new(Mutex::new(())),
         worktree_manager: worktree_manager.clone(),
@@ -553,6 +1112,9 @@ async fn run_graph_inner(
         run_slug,
         run_uid,
         plan_slug,
+        checkpoint_identity,
+        #[cfg(test)]
+        pre_a_observer: None,
     };
 
     let mut result = scheduler(ctx.clone(), config.concurrency).await;
@@ -572,69 +1134,154 @@ async fn run_graph_inner(
             aggregate_run_status(&g) == api::RunStatus::Completed
         };
 
-        let plan_branch_left = if all_done {
-            // All tasks Done: proceed with final merge per config.
+        let plan_branch_left = if all_done && ctx.checkpoint_identity.is_none() {
+            // Graph-only runs predate transactional status and retain their
+            // immediate final-merge contract.
             let final_merger = SquashMerger::new(
                 worktree_manager.repo_root.clone(),
                 worktree_manager.base_branch.clone(),
             );
-
-            // Construct a suitable final-merge commit message using the plan branch name.
             let merge_message = format!("{}: integration branch", &plan_branch);
-
             match config.merge.final_ {
-                FinalMerge::Squash => {
-                    match final_merger
-                        .final_squash(&plan_branch, &merge_message)
-                        .await
-                    {
-                        Ok(MergeOutcome::Merged) => None,
-                        Ok(MergeOutcome::Conflict { .. }) => Some(plan_branch.clone()),
-                        Err(e) => {
-                            // Hard error during final merge: treat like a conflict
-                            // (leave the branch, do not corrupt base_branch).
-                            tracing::warn!(
-                                error = %e,
-                                "final squash merge failed; leaving plan branch unmerged"
-                            );
-                            Some(plan_branch.clone())
-                        }
-                    }
-                }
-                FinalMerge::Stage => match final_merger.final_stage_changes(&plan_branch).await {
-                    Ok(StageOutcome::Staged) => None,
-                    Ok(StageOutcome::Conflict { .. }) => Some(plan_branch.clone()),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "final stage-changes failed; leaving plan branch unmerged"
-                        );
+                FinalMerge::Squash => match final_merger
+                    .final_squash(&plan_branch, &merge_message)
+                    .await
+                {
+                    Ok(MergeOutcome::Merged { .. }) => None,
+                    Ok(MergeOutcome::Conflict { .. }) => Some(plan_branch.clone()),
+                    Err(error) => {
+                        tracing::warn!(%error, "final squash merge failed; leaving plan branch unmerged");
                         Some(plan_branch.clone())
                     }
                 },
-                FinalMerge::MergeCommit => {
-                    match final_merger
-                        .final_merge_commit(&plan_branch, &merge_message)
-                        .await
-                    {
-                        Ok(MergeOutcome::Merged) => None,
-                        Ok(MergeOutcome::Conflict { .. }) => Some(plan_branch.clone()),
-                        Err(e) => {
-                            // Hard error during final merge: treat like a conflict
-                            // (leave the branch, do not corrupt base_branch).
-                            tracing::warn!(
-                                error = %e,
-                                "final merge-commit failed; leaving plan branch unmerged"
-                            );
-                            Some(plan_branch.clone())
-                        }
+                FinalMerge::Stage => match final_merger.final_stage_changes(&plan_branch).await {
+                    Ok(StageOutcome::Staged) => None,
+                    Ok(StageOutcome::Conflict { .. }) => Some(plan_branch.clone()),
+                    Err(error) => {
+                        tracing::warn!(%error, "final stage-changes failed; leaving plan branch unmerged");
+                        Some(plan_branch.clone())
                     }
-                }
-                FinalMerge::Manual => {
-                    // Manual mode: always leave the branch for human merge.
-                    Some(plan_branch.clone())
-                }
+                },
+                FinalMerge::MergeCommit => match final_merger
+                    .final_merge_commit(&plan_branch, &merge_message)
+                    .await
+                {
+                    Ok(MergeOutcome::Merged { .. }) => None,
+                    Ok(MergeOutcome::Conflict { .. }) => Some(plan_branch.clone()),
+                    Err(error) => {
+                        tracing::warn!(%error, "final merge-commit failed; leaving plan branch unmerged");
+                        Some(plan_branch.clone())
+                    }
+                },
+                FinalMerge::Manual => Some(plan_branch.clone()),
             }
+        } else if all_done {
+            // Typed runs stop at durable Phase P. F/C are intentionally delayed
+            // until FinalizePlan reacquires the repository lease.
+            let prepared = async {
+                let source = crate::plan::FilesystemPlanFileSource::new(&integration_root, None)
+                    .map_err(|error| error.to_string())?;
+                let key = ctx
+                    .checkpoint_identity
+                    .as_ref()
+                    .ok_or("typed finalization requires checkpoint identity")?
+                    .plan_dir
+                    .clone();
+                let crate::plan::PlanCandidate::Plan(mut plan) = crate::plan::load_plan_path(
+                    &source,
+                    &key,
+                    &crate::plan::PlanReservations::default(),
+                )
+                .map_err(|report| format!("cannot load plan for P: {:?}", report.diagnostics))?
+                else {
+                    return Err("registered source is not a plan".into());
+                };
+                let mode = match config.merge.final_ {
+                    FinalMerge::Squash => "squash",
+                    FinalMerge::MergeCommit => "merge-commit",
+                    FinalMerge::Stage => "stage",
+                    FinalMerge::Manual => "manual",
+                };
+                let base_ref = format!("refs/heads/{}", worktree_manager.base_branch);
+                let base = String::from_utf8(
+                    git_output(&integration_root, &["rev-parse", &base_ref])
+                        .await
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|_| "base OID is not UTF-8")?
+                .trim()
+                .to_owned();
+                let old = String::from_utf8(
+                    git_output(&integration_root, &["rev-parse", &plan_branch])
+                        .await
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|_| "plan OID is not UTF-8")?
+                .trim()
+                .to_owned();
+                plan.status.integration_state =
+                    crate::plan::PlanIntegrationState::FinalizationPending;
+                plan.status.run = Some(ctx.run_uid.clone());
+                plan.status.mode = Some(mode.into());
+                plan.status.final_oid = None;
+                plan.status.display_status = "⏳ Finalizing".into();
+                let status = crate::plan_status::render_plan_status(
+                    &plan,
+                    &crate::plan_status::StatusTransition {
+                        integration_state: plan.status.integration_state,
+                        run: plan.status.run.clone(),
+                        validation_base: plan.status.validation_base_oid.clone(),
+                        mode: plan.status.mode.clone(),
+                        final_oid: None,
+                        display_status: plan.status.display_status.clone(),
+                        last_updated: plan.status.last_updated.clone(),
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                plan.status.source.body = status.clone();
+                let base_source = crate::plan::GitTreePlanFileSource::new(&integration_root, &base)
+                    .map_err(|e| e.to_string())?;
+                use crate::plan::PlanFileSource as _;
+                let board = String::from_utf8(
+                    base_source
+                        .read_file(std::path::Path::new("docs/plans/STATUS.md"))
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|_| "root board is not UTF-8")?;
+                let board = crate::plan_status::update_root_row(&board, &plan)
+                    .map_err(|e| e.to_string())?;
+                crate::landing::commit_finalization_prepared(
+                    &integration_root,
+                    &format!("refs/heads/{plan_branch}"),
+                    &base_ref,
+                    &old,
+                    &base,
+                    &[
+                        crate::landing::OwnedWrite {
+                            path: plan.status.source.source_path.clone(),
+                            bytes: status.into_bytes(),
+                        },
+                        crate::landing::OwnedWrite {
+                            path: "docs/plans/STATUS.md".into(),
+                            bytes: board.into_bytes(),
+                        },
+                    ],
+                    &crate::landing::FinalizationIdentity {
+                        plan: ctx.plan_slug.clone(),
+                        run: ctx.run_uid.clone(),
+                        mode: mode.into(),
+                        expected_base: base.clone(),
+                    },
+                    true,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+            .await;
+            if let Err(error) = prepared {
+                tracing::warn!(%error, "Phase P preparation failed; retaining plan branch");
+            }
+            Some(plan_branch.clone())
         } else {
             // Any failed task: leave the plan branch unmerged.
             Some(plan_branch.clone())
@@ -654,12 +1301,15 @@ async fn run_graph_inner(
         }
     }
 
-    // Run end: restore repo_root back to base_branch (best-effort; warn on failure).
-    if let Err(e) = worktree_manager
-        .checkout(&worktree_manager.base_branch)
-        .await
+    // Legacy runs still use the repository checkout as their integration
+    // workspace. Typed runs use private worktrees and must not mutate an
+    // operator checkout while waiting between P and F/C.
+    if ctx.checkpoint_identity.is_none()
+        && let Err(error) = worktree_manager
+            .checkout(&worktree_manager.base_branch)
+            .await
     {
-        tracing::warn!(error = %e, "failed to restore base branch in repo_root");
+        tracing::warn!(%error, "failed to restore base branch in repo_root");
     }
 
     // Derive + emit the aggregate terminal status — but NOT when cancelled: a
@@ -1087,6 +1737,7 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
             outcomes,
             failed_tasks,
             plan_branch_left: None,
+            landing_evidence: ctx.landing_evidence.lock().await.clone(),
         }),
     }
 }
@@ -1105,6 +1756,7 @@ fn next_ready_task_id(
         .iter()
         .find(|t| {
             matches!(t.state, TaskState::New | TaskState::Ready)
+                && graph.is_authored_dispatchable(&t.id)
                 && !in_flight.contains(&t.id)
                 && t.depends_on.iter().all(|dep| {
                     graph
@@ -1153,6 +1805,7 @@ struct DriverGuard {
     /// directory + branch during safety-net teardown.
     plan_slug: String,
     worktree_manager: WorktreeManager,
+    transactional: bool,
     /// Set to `true` once the driver has already torn the worktree down on a
     /// normal terminal path, so `Drop` does not redundantly try again.
     worktree_removed: bool,
@@ -1169,12 +1822,17 @@ impl Drop for DriverGuard {
             let mgr = self.worktree_manager.clone();
             let id = self.task_id.clone();
             let plan_slug = self.plan_slug.clone();
+            let transactional = self.transactional;
             // `tokio::spawn` requires being inside a runtime; the driver always
             // runs inside one (JoinSet task).  Best-effort: remove() is
             // idempotent and treats "not found" as success.
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = mgr.remove(&plan_slug, &id).await;
+                    let _ = if transactional {
+                        mgr.remove(&plan_slug, &id).await
+                    } else {
+                        mgr.remove_legacy(&plan_slug, &id).await
+                    };
                 });
             }
         }
@@ -1282,6 +1940,7 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
         task_id: task_id.0.clone(),
         plan_slug: ctx.plan_slug.clone(),
         worktree_manager: ctx.worktree_manager.clone(),
+        transactional: ctx.checkpoint_identity.is_some(),
         worktree_removed: false,
     };
 
@@ -1297,6 +1956,13 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     } // graph guard dropped before any await.
     // Persist New→Ready (if the task was New; no-op cost otherwise).
     ctx.persist().await;
+
+    // Durable authored claim precedes task branch/worktree creation and any
+    // worker session. Exact claim evidence makes response-loss retry safe.
+    if ctx.checkpoint_identity.is_some() {
+        let _merge_guard = ctx.merge_lock.lock().await;
+        ctx.commit_claim(task_id).await?;
+    }
 
     // ── Step 2: create the worktree, then Ready → InProgress (Dispatched) ──────
     //
@@ -1330,6 +1996,33 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
             return Err(msg);
         }
     };
+
+    // Freeze the exact branch starting commit before any agent can mutate it.
+    // Footprint checks must always diff from this recorded OID, never from a
+    // later merge-base that may move as integration advances.
+    let has_authored_metadata = {
+        let graph = ctx.graph.lock().await;
+        graph.authored(task_id).is_some()
+    };
+    if has_authored_metadata {
+        let revision = format!("{}^{{commit}}", worktree.branch);
+        let oid = git_output(
+            &ctx.worktree_manager.repo_root,
+            &["rev-parse", "--verify", &revision],
+        )
+        .await
+        .map_err(|error| format!("could not record task branch base for {task_id}: {error}"))?;
+        let oid = std::str::from_utf8(&oid)
+            .map_err(|_| format!("task branch base for {task_id} was not UTF-8"))?
+            .trim()
+            .to_owned();
+        let mut graph = ctx.graph.lock().await;
+        graph
+            .authored
+            .get_mut(task_id)
+            .expect("authored metadata was present before Git lookup")
+            .branch_base_oid = Some(oid);
+    }
 
     // ── Register the worktree context with the audit registry (task supervisor-audit-writer) ──
     //
@@ -1475,11 +2168,80 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     let graph = ctx.graph.lock().await;
                     squash_commit_message_locked(&graph, task_id)?
                 };
+                let authored_footprint = {
+                    let graph = ctx.graph.lock().await;
+                    graph.authored(task_id).map(|metadata| {
+                        (metadata.touches.clone(), metadata.branch_base_oid.clone())
+                    })
+                };
+
+                // Review-acceptance checkpoint: undeclared work is returned to
+                // the task branch for correction, never silently landed.
+                if matches!(authored_footprint, Some((_, None))) {
+                    let reason = format!("task {task_id} has no recorded branch base OID");
+                    return_footprint_correction(ctx, task_id, reason.clone()).await?;
+                    feedback = Some(reason);
+                    continue;
+                }
+                if let Some((touches, Some(recorded_base))) = &authored_footprint {
+                    if let Err(reason) = enforce_task_branch_footprint(
+                        &ctx.worktree_manager.repo_root,
+                        task_id,
+                        &branch,
+                        touches,
+                        recorded_base,
+                    )
+                    .await
+                    {
+                        return_footprint_correction(ctx, task_id, reason.clone()).await?;
+                        feedback = Some(reason);
+                        continue;
+                    }
+                }
+                #[cfg(test)]
+                if let Some(observer) = &ctx.pre_a_observer {
+                    let _ = observer.send(task_id.clone());
+                }
 
                 let merge_outcome = {
                     // Minimal critical section: acquire → merge → release.
                     let _merge_guard = ctx.merge_lock.lock().await;
-                    ctx.squash_merger.squash_merge(&branch, &message).await
+                    // Recheck immediately before Phase A while serialized with
+                    // other integration mutations, closing the review→landing
+                    // branch-change window.
+                    match if let Some((touches, Some(recorded_base))) = &authored_footprint {
+                        enforce_task_branch_footprint(
+                            &ctx.worktree_manager.repo_root,
+                            task_id,
+                            &branch,
+                            touches,
+                            recorded_base,
+                        )
+                        .await
+                    } else {
+                        Ok(())
+                    } {
+                        Ok(()) if ctx.checkpoint_identity.is_some() => {
+                            ctx.squash_merger
+                                .squash_merge_with_evidence(
+                                    &branch,
+                                    &message,
+                                    &crate::merge::TaskLandingIdentity {
+                                        plan: ctx.plan_slug.clone(),
+                                        task: task_id.0.clone(),
+                                        run: ctx.run_uid.clone(),
+                                    },
+                                )
+                                .await
+                        }
+                        Ok(()) => ctx.squash_merger.squash_merge(&branch, &message).await,
+                        Err(reason) => {
+                            drop(_merge_guard);
+                            return_footprint_correction(ctx, task_id, reason.clone()).await?;
+                            feedback = Some(reason);
+                            continue;
+                        }
+                    }
                 }; // merge lock released here.
 
                 let merge_outcome = match merge_outcome {
@@ -1512,19 +2274,58 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 };
 
                 match merge_outcome {
-                    MergeOutcome::Merged => {
-                        // ── Merged: InReview → Done (ReviewerApproved) ──────────
+                    MergeOutcome::Merged { oid } => {
+                        if ctx.checkpoint_identity.is_none() {
+                            {
+                                let mut graph = ctx.graph.lock().await;
+                                apply_event_locked(
+                                    &mut graph,
+                                    task_id,
+                                    TaskEvent::ReviewerApproved,
+                                )?;
+                                mark_finished_locked(&mut graph, task_id);
+                            }
+                            ctx.persist().await;
+                            remove_worktree(ctx, task_id).await;
+                            guard.worktree_removed = true;
+                            terminal_state = TaskState::Done;
+                            break;
+                        }
+                        ctx.landing_evidence
+                            .lock()
+                            .await
+                            .push(crate::task::TaskLandingEvidence {
+                                task: task_id.clone(),
+                                implementation_oid: oid.clone(),
+                            });
+                        // Phase A is durable. From this point any error must retain
+                        // the task workspace and runtime InReview for exact-B recovery.
+                        guard.worktree_removed = true;
+                        {
+                            let _merge_guard = ctx.merge_lock.lock().await;
+                            ctx.commit_phase_b(task_id, &oid).await?;
+                        }
                         {
                             let mut graph = ctx.graph.lock().await;
                             apply_event_locked(&mut graph, task_id, TaskEvent::ReviewerApproved)?;
                             mark_finished_locked(&mut graph, task_id);
                         }
-                        // Persist InReview→Done + finished_at stamp (best-effort;
-                        // lock released above).
                         ctx.persist().await;
-                        // Tear down the worktree + branch (the work has landed).
+                        if ctx.control.cancel.is_cancelled() {
+                            // Phase B is durable but the runtime Done checkpoint
+                            // was not. Retain the recoverable InReview boundary;
+                            // restart reconciliation can project Done from B.
+                            let mut graph = ctx.graph.lock().await;
+                            if let Some(task) =
+                                graph.tasks.iter_mut().find(|task| task.id == *task_id)
+                            {
+                                task.state = TaskState::InReview;
+                            }
+                            return Err(format!(
+                                "runtime persistence failed after Phase B for {task_id}"
+                            ));
+                        }
                         remove_worktree(ctx, task_id).await;
-                        guard.worktree_removed = true;
                         terminal_state = TaskState::Done;
                         break;
                     }
@@ -1873,11 +2674,18 @@ async fn develop_until_gates_pass(
 
 /// Best-effort worktree teardown (idempotent; ignores "already gone").
 async fn remove_worktree(ctx: &DriverContext, task_id: &TaskId) {
-    // `remove` is idempotent and treats "not found" as success.
-    let _ = ctx
-        .worktree_manager
-        .remove(&ctx.plan_slug, &task_id.0)
-        .await;
+    if ctx.checkpoint_identity.is_none() {
+        let _ = ctx
+            .worktree_manager
+            .remove_legacy(&ctx.plan_slug, &task_id.0)
+            .await;
+    } else {
+        // Transactional runs preserve recovery refs and refuse dirty cleanup.
+        let _ = ctx
+            .worktree_manager
+            .remove(&ctx.plan_slug, &task_id.0)
+            .await;
+    }
 }
 
 // ── Locked graph helpers (NEVER hold the guard across an .await) ──────────────────
@@ -2254,6 +3062,7 @@ mod tests {
         let graph = Arc::new(Mutex::new(TaskGraph {
             slug: "persist-order".into(),
             tasks: vec![task_in("task", TaskState::Ready)],
+            authored: Default::default(),
         }));
         let persist_lock = Arc::new(Mutex::new(()));
         let manager = WorktreeManager::new(repo.path().to_path_buf(), "develop".into());
@@ -2264,6 +3073,7 @@ mod tests {
         let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend::noop::NoopBackend::default());
         let ctx = DriverContext {
             graph: Arc::clone(&graph),
+            landing_evidence: Arc::new(Mutex::new(Vec::new())),
             persist_lock: Arc::clone(&persist_lock),
             merge_lock: Arc::new(Mutex::new(())),
             worktree_manager: manager,
@@ -2277,6 +3087,8 @@ mod tests {
             run_slug: "persist-order".into(),
             run_uid: "test-run".into(),
             plan_slug: String::new(),
+            checkpoint_identity: None,
+            pre_a_observer: None,
         };
 
         let held = persist_lock.lock().await;
@@ -2297,6 +3109,139 @@ mod tests {
         assert_eq!(loaded.tasks[0].state, TaskState::Done);
     }
 
+    #[tokio::test]
+    async fn production_pre_a_recheck_blocks_branch_mutation_after_review_acceptance() {
+        let _home_guard = crate::HOME_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-b", "develop"], repo.path());
+        git(&["config", "user.email", "test@example.com"], repo.path());
+        git(&["config", "user.name", "Test"], repo.path());
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/base.rs"), "base\n").unwrap();
+        git(&["add", "."], repo.path());
+        git(&["commit", "-m", "base"], repo.path());
+        let develop_before = git(&["rev-parse", "develop"], repo.path());
+
+        let mut authored = std::collections::BTreeMap::new();
+        authored.insert(
+            TaskId::new("task"),
+            crate::task::AuthoredTaskMetadata {
+                source_path: "tasks/0101-task.md".into(),
+                workstream: "0001".into(),
+                kind: "task".into(),
+                gated: false,
+                touches: vec![crate::task::AuthoredRepoPattern::Glob("src/**".into())],
+                status: crate::plan::AuthoredTaskStatus::Planned,
+                merged_as: None,
+                seed: crate::task::AuthoredSeedOutcome::Seeded(TaskState::New),
+                collision_dependencies: vec![],
+                branch_base_oid: None,
+            },
+        );
+        let graph = Arc::new(Mutex::new(TaskGraph {
+            slug: "plan".into(),
+            tasks: vec![task_in("task", TaskState::Ready)],
+            authored,
+        }));
+        let manager = WorktreeManager::new(repo.path().to_path_buf(), "develop".into());
+        let config = Config::resolve(
+            crate::config::GlobalConfig::default(),
+            crate::config::ProjectConfig::default(),
+        );
+        let developer: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend::noop::NoopBackend::with_responses(vec![
+                "done".into(),
+            ]));
+        let reviewer: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend::noop::NoopBackend::with_responses(vec![
+                r#"{"verdict":"approve"}"#.into(),
+            ]));
+        let merge_lock = Arc::new(Mutex::new(()));
+        let held = merge_lock.lock().await;
+        let (observe_tx, mut observe_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = DriverContext {
+            graph: Arc::clone(&graph),
+            landing_evidence: Arc::new(Mutex::new(Vec::new())),
+            persist_lock: Arc::new(Mutex::new(())),
+            merge_lock: Arc::clone(&merge_lock),
+            worktree_manager: manager.clone(),
+            gate_runner: GateRunner::new(),
+            squash_merger: SquashMerger::new(repo.path().to_path_buf(), "develop".into()),
+            config,
+            developer_backend: developer,
+            reviewer_backend: reviewer,
+            control: RunControl::silent(),
+            audit_registry: Arc::new(crate::audit::NoopAuditRegistry),
+            run_slug: "plan".into(),
+            run_uid: "run".into(),
+            plan_slug: "plan".into(),
+            checkpoint_identity: None,
+            pre_a_observer: Some(observe_tx),
+        };
+        let mut driver = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { task_driver(&ctx, &TaskId::new("task")).await }
+        });
+        tokio::select! {
+            observed = observe_rx.recv() => observed.expect("pre-A observer closed"),
+            result = &mut driver => panic!("driver exited before pre-A observer: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("driver did not reach pre-A observer"),
+        };
+        let task_worktree = crate::paths::worktree(repo.path(), "plan", "task").unwrap();
+        std::fs::write(task_worktree.join("undeclared.txt"), "late mutation\n").unwrap();
+        git(&["add", "undeclared.txt"], &task_worktree);
+        git(
+            &["commit", "-m", "late undeclared mutation"],
+            &task_worktree,
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if graph.lock().await.tasks[0].state == TaskState::InProgress {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            git(&["rev-parse", "develop"], repo.path()),
+            develop_before,
+            "pre-A rejection must prevent squash merge"
+        );
+        let task_ref = format!(
+            "refs/heads/task/{}",
+            crate::paths::short_worktree_name("plan", "task")
+        );
+        assert!(git(&["show-ref", "--verify", &task_ref], repo.path()).contains(&task_ref));
+        driver.abort();
+        let _ = driver.await;
+        let _ = manager.remove("plan", "task").await;
+        if let Some(value) = old_home {
+            unsafe { std::env::set_var("HOME", value) }
+        } else {
+            unsafe { std::env::remove_var("HOME") }
+        }
+    }
+
     /// `advance_to_ready` returns `Err` for an id that is not in the graph — the
     /// defensive input that the scheduler's fill-phase advance arm must handle.
     #[test]
@@ -2304,6 +3249,7 @@ mod tests {
         let mut graph = TaskGraph {
             slug: "advance-missing".into(),
             tasks: vec![task_in("a", TaskState::New)],
+            authored: Default::default(),
         };
         let err = advance_to_ready(&mut graph, &TaskId::new("ghost"))
             .expect_err("advancing a missing task id must error");
@@ -2330,6 +3276,7 @@ mod tests {
         let mut graph = TaskGraph {
             slug: "advance-not-fatal".into(),
             tasks: vec![task_in("a", TaskState::New)],
+            authored: Default::default(),
         };
 
         // The fill arm's two pieces of run-level state.  `fatal_error` stays
@@ -2395,6 +3342,7 @@ mod tests {
         let mut graph = TaskGraph {
             slug: "reset-meta".into(),
             tasks: vec![failed],
+            authored: Default::default(),
         };
 
         reset_task_for_retry_locked(&mut graph, &TaskId::new("a"))
@@ -2422,6 +3370,7 @@ mod tests {
                 task_in("x", TaskState::Failed),
                 task_dep("y", TaskState::Skipped, &["x"]),
             ],
+            authored: Default::default(),
         };
 
         // Reset only A, then un-skip its cascade.
@@ -2461,6 +3410,7 @@ mod tests {
                 task_in("x", TaskState::Failed),
                 task_dep("z", TaskState::Skipped, &["a", "x"]),
             ],
+            authored: Default::default(),
         };
         reset_task_for_retry_locked(&mut graph, &TaskId::new("a")).unwrap();
         let revived = unskip_dependents_locked(&mut graph, &[TaskId::new("a")]);
@@ -2486,6 +3436,7 @@ mod tests {
             let mut graph = TaskGraph {
                 slug: "reject".into(),
                 tasks: vec![task_in("a", state)],
+                authored: Default::default(),
             };
             let err = reset_task_for_retry_locked(&mut graph, &TaskId::new("a"))
                 .expect_err("reset of a non-Failed task must error");
@@ -2508,6 +3459,7 @@ mod tests {
                 task_dep("blocked", TaskState::New, &["new-dep"]),
                 task_in("new-dep", TaskState::New),
             ],
+            authored: Default::default(),
         };
         let readied = remark_ready_locked(&mut graph);
         assert_eq!(

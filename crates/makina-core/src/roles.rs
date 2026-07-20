@@ -108,6 +108,8 @@ satisfy it.
 the task scope.
 - Aim for correct, compiling output. Makina runs quality gates separately, so \
 you do not need to run them yourself, but your code should be correct.
+- Do not modify docs/plans/STATUS.md, the active plan's STATUS.md, or its \
+tasks/*.md files. Those paths are reserved for coordinator transactions.
 - If the task is already done, say so clearly and make no changes.";
 
 /// System prompt for the **Reviewer** role.
@@ -149,6 +151,8 @@ after it (a ```json code fence is acceptable but optional):
   {\"verdict\":\"reject\",\"feedback\":\"<actionable reason>\"}
 
 Rules:
+- Do not modify docs/plans/STATUS.md, the active plan's STATUS.md, or its \
+tasks/*.md files. Report outcomes in the verdict; the coordinator owns them.
 - Use \"approve\" if the implementation fully satisfies the task criterion.
 - Use \"reject\" if it does not; provide a concrete, actionable `feedback` \
 string explaining what must change.

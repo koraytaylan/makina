@@ -330,6 +330,7 @@ async fn run_continues_after_one_independent_fails() {
     let graph = TaskGraph {
         slug: "continue-on-failure".into(),
         tasks: vec![task("a", &[]), task("b", &[]), task("c", &[])],
+        authored: Default::default(),
     };
 
     // The run must NOT hard-error even though `b` fails.
@@ -419,6 +420,7 @@ async fn failed_task_reason_recorded_while_dependent_is_skipped() {
     let graph = TaskGraph {
         slug: "failed-reason-dependent-skipped".into(),
         tasks: vec![task("a", &[]), task("b", &[]), task("d", &["b"])],
+        authored: Default::default(),
     };
 
     // The run must NOT hard-error even though `b` fails.
@@ -518,6 +520,7 @@ async fn backend_prompt_panic_is_contained_and_run_continues() {
     let graph = TaskGraph {
         slug: "panic-is-contained".into(),
         tasks: vec![task("a", &[]), task("b", &[]), task("c", &[])],
+        authored: Default::default(),
     };
 
     // A contained backend panic must NOT hard-error the run.

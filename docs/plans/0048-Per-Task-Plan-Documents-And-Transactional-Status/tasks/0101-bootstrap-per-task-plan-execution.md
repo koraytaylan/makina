@@ -13,8 +13,8 @@ touches:
   - .claude/workflows/plan-digest.py
   - .claude/workflows/fixtures/plan-digest-v1.json
   - .claude/workflows/implement-plan.per-task.test.mjs
-status: planned
-merged_as: ""
+status: done
+merged_as: "7d432292aec7c6f8e7b61d29825ad155edb9cd24"
 ---
 # Bootstrap Per-Task Plan Execution
 

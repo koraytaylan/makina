@@ -7,8 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::dependency::transitive_depends_on;
-use crate::task::{TaskGraph, TaskGraphError, TaskId};
+#[cfg(test)]
+use crate::task::TaskGraphError;
+use crate::task::{TaskGraph, TaskId};
 
 // ── Qualifier thresholds (tunable, test-pinned) ──────────────────────────────
 
@@ -157,27 +158,44 @@ impl Default for IngestionReport {
 /// construct a graph; this validator is used later to build an
 /// [`IngestionReport`] for the review gate.
 pub fn validate(graph: &TaskGraph) -> Vec<IngestionIssue> {
-    let mut issues: Vec<IngestionIssue> = Vec::new();
-
-    // 1. Duplicate task IDs (emit once per duplicated id, in discovery order).
-    let mut seen: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
-    let mut reported_dups: std::collections::HashSet<TaskId> = std::collections::HashSet::new();
-    for task in &graph.tasks {
-        if !seen.insert(task.id.clone()) && reported_dups.insert(task.id.clone()) {
-            issues.push(IngestionIssue {
-                task_id: Some(task.id.clone()),
+    let records = graph
+        .tasks
+        .iter()
+        .map(|task| {
+            (
+                task.id.0.clone(),
+                task.depends_on
+                    .iter()
+                    .map(|dependency| dependency.0.clone())
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut issues = crate::plan::validate_dependency_records(&records)
+        .into_iter()
+        .map(|diagnostic| {
+            let suggestion = match diagnostic.code {
+                "duplicate-task-id" => "ensure every task has a unique id",
+                "unknown-dependency" => "remove the reference or add the missing task to the graph",
+                "self-dependency" => "remove the self-reference from `depends_on`",
+                "dependency-cycle" => "break the cycle by removing one of the edges in the loop",
+                _ => "correct the task dependency graph",
+            };
+            IngestionIssue {
+                task_id: diagnostic.task_id.map(TaskId::new),
                 severity: IssueSeverity::Blocking,
                 source: IssueSource::Validator,
-                code: "duplicate-task-id".to_string(),
-                message: format!("duplicate task id: {}", task.id),
-                suggestion: Some("ensure every task has a unique id".to_string()),
-            });
-        }
-    }
-
-    // 2–4. Per-task checks (empty done_when, self-dependency, dangling).
+                code: if diagnostic.code == "unknown-dependency" {
+                    "dangling-dependency".into()
+                } else {
+                    diagnostic.code.into()
+                },
+                message: diagnostic.message,
+                suggestion: Some(suggestion.into()),
+            }
+        })
+        .collect::<Vec<_>>();
     for task in &graph.tasks {
-        // empty done_when (whitespace-only counts as empty).
         if task.done_when.trim().is_empty() {
             issues.push(IngestionIssue {
                 task_id: Some(task.id.clone()),
@@ -190,55 +208,7 @@ pub fn validate(graph: &TaskGraph) -> Vec<IngestionIssue> {
                 ),
             });
         }
-
-        // self-dependency (lists own id).
-        if task.depends_on.iter().any(|d| d == &task.id) {
-            issues.push(IngestionIssue {
-                task_id: Some(task.id.clone()),
-                severity: IssueSeverity::Blocking,
-                source: IssueSource::Validator,
-                code: "self-dependency".to_string(),
-                message: format!("task `{}` depends on itself", task.id),
-                suggestion: Some("remove the self-reference from `depends_on`".to_string()),
-            });
-        }
-
-        // dangling dependencies (reference names no task in graph).
-        for dep in &task.depends_on {
-            if graph.get(dep).is_none() {
-                issues.push(IngestionIssue {
-                    task_id: Some(task.id.clone()),
-                    severity: IssueSeverity::Blocking,
-                    source: IssueSource::Validator,
-                    code: "dangling-dependency".to_string(),
-                    message: format!("task `{}` depends on unknown task `{}`", task.id, dep),
-                    suggestion: Some(
-                        "remove the reference or add the missing task to the graph".to_string(),
-                    ),
-                });
-            }
-        }
     }
-
-    // 5. Cycle detection reuses the existing reachability primitive.
-    // A cycle exists if any task transitively depends on itself.
-    let has_cycle = graph
-        .tasks
-        .iter()
-        .any(|t| transitive_depends_on(graph, &t.id, &t.id));
-    if has_cycle {
-        issues.push(IngestionIssue {
-            task_id: None,
-            severity: IssueSeverity::Blocking,
-            source: IssueSource::Validator,
-            code: "dependency-cycle".to_string(),
-            message: "the task graph contains a dependency cycle".to_string(),
-            suggestion: Some(
-                "break the cycle by removing one of the edges in the loop".to_string(),
-            ),
-        });
-    }
-
     issues
 }
 
@@ -247,6 +217,7 @@ pub fn validate(graph: &TaskGraph) -> Vec<IngestionIssue> {
 ///
 /// Used by `interpret_and_seed` to give users the same codes they would have
 /// seen from validate had a graph been built.
+#[cfg(test)]
 pub(crate) fn validator_issues_from_graph_error(e: &TaskGraphError) -> Vec<IngestionIssue> {
     match e {
         TaskGraphError::DuplicateId { id } => vec![IngestionIssue {
@@ -627,6 +598,7 @@ mod tests {
         TaskGraph {
             slug: "test".to_string(),
             tasks,
+            authored: Default::default(),
         }
     }
 

@@ -474,7 +474,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
                 Line::from(vec![Span::styled(
-                    "  task-list file.",
+                    "  plan directory.",
                     Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                 )]),
             ]
@@ -581,7 +581,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                     }
                     TreeNode::Plan { plan_idx } => {
                         let plan_entry = &app.discovered_plans[*plan_idx];
-                        let n_tasks = plan_entry.tasks.len();
+                        let n_tasks = plan_entry.tasks().len();
                         let target = app.plan_identity_for_entry(&app.repo_root, plan_entry);
                         // Disclosure glyph: a plan with tasks gets ▸/▾; a plan with
                         // no tasks is a leaf (no triangle).
@@ -602,8 +602,8 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 Style::default().add_modifier(Modifier::BOLD),
                             ),
                         ];
-                        if !plan_entry.has_tasks {
-                            // No TASKS.md: this plan still needs a task list.
+                        if plan_entry.document.is_none() {
+                            // Invalid plans expose diagnostics instead of tasks.
                             line_spans.push(Span::styled(
                                 " (no tasks — will plan)",
                                 Style::default()
@@ -632,8 +632,8 @@ pub fn render(app: &App, frame: &mut Frame) {
                     TreeNode::PlanTask { plan_idx, task_idx } => {
                         // Read-only task preview under an expanded plan: tree
                         // connector + id — title, with a GATED marker.
-                        let task = &app.discovered_plans[*plan_idx].tasks[*task_idx];
-                        let last = *task_idx + 1 == app.discovered_plans[*plan_idx].tasks.len();
+                        let task = &app.discovered_plans[*plan_idx].tasks()[*task_idx];
+                        let last = *task_idx + 1 == app.discovered_plans[*plan_idx].tasks().len();
                         let connector = if last { "  └ " } else { "  ├ " };
                         let mut spans = vec![
                             Span::styled(
@@ -642,17 +642,17 @@ pub fn render(app: &App, frame: &mut Frame) {
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ),
                             Span::styled(
-                                &task.id,
+                                task.frontmatter.id.as_str(),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                             ),
                             Span::styled(
-                                format!(" — {}", task.title),
+                                format!(" — {}", task.frontmatter.title),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ),
                         ];
-                        if task.gated {
+                        if task.frontmatter.gated {
                             spans.push(Span::styled(
                                 "  GATED",
                                 Style::default()
@@ -735,7 +735,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                     } => {
                         // Plan node in folder: level 1 (indented) with [+]/[-] disclosure glyph.
                         let plan_entry = &app.plans_by_folder[folder_idx][*plan_idx];
-                        let n_tasks = plan_entry.tasks.len();
+                        let n_tasks = plan_entry.tasks().len();
 
                         let target = app
                             .plan_identity_for_entry(&app.opened_folders[*folder_idx], plan_entry);
@@ -757,8 +757,8 @@ pub fn render(app: &App, frame: &mut Frame) {
                             ),
                         ];
 
-                        if !plan_entry.has_tasks {
-                            // No TASKS.md: this plan still needs a task list.
+                        if plan_entry.document.is_none() {
+                            // Invalid plans expose diagnostics instead of tasks.
                             line_spans.push(Span::styled(
                                 " (no tasks — will plan)",
                                 Style::default()
@@ -793,9 +793,9 @@ pub fn render(app: &App, frame: &mut Frame) {
                     } => {
                         // Task preview under a folder-scoped plan: level 2 (further indented)
                         // with tree connector + id — title, and optional GATED marker.
-                        let task = &app.plans_by_folder[folder_idx][*plan_idx].tasks[*task_idx];
-                        let plan_tasks = &app.plans_by_folder[folder_idx][*plan_idx].tasks;
-                        let last = *task_idx + 1 == plan_tasks.len();
+                        let task = &app.plans_by_folder[folder_idx][*plan_idx].tasks()[*task_idx];
+                        let authored_tasks = app.plans_by_folder[folder_idx][*plan_idx].tasks();
+                        let last = *task_idx + 1 == authored_tasks.len();
                         let connector = if last { "    └ " } else { "    ├ " };
 
                         let mut spans = vec![
@@ -805,17 +805,17 @@ pub fn render(app: &App, frame: &mut Frame) {
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ),
                             Span::styled(
-                                &task.id,
+                                task.frontmatter.id.as_str(),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                             ),
                             Span::styled(
-                                format!(" — {}", task.title),
+                                format!(" — {}", task.frontmatter.title),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ),
                         ];
-                        if task.gated {
+                        if task.frontmatter.gated {
                             spans.push(Span::styled(
                                 "  GATED",
                                 Style::default()
@@ -1044,9 +1044,9 @@ pub fn render(app: &App, frame: &mut Frame) {
             if let crate::app::TabContent::PlanTask { plan, task_id } = tab_content {
                 app.plan_entry(plan).and_then(|entry| {
                     entry
-                        .tasks
+                        .tasks()
                         .iter()
-                        .find(|t| t.id == *task_id)
+                        .find(|t| t.frontmatter.id.as_str() == task_id)
                         .map(|preview| (plan, entry, preview))
                 })
             } else {
@@ -1101,7 +1101,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             render_tab_bar(app, frame, split[0]);
             let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
             if let Some((run, task_idx)) =
-                find_live_plan_task_for_preview(app, plan_identity, &preview.id)
+                find_live_plan_task_for_preview(app, plan_identity, preview.frontmatter.id.as_str())
             {
                 render_task_entry_pane(app, run, task_idx, frame, task_area);
             } else {
@@ -1512,12 +1512,12 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
 
 /// Render the content pane for an active plan-task tab using the same task-detail
 /// accordion as a live task tab. A discovered plan's task is still a read-only
-/// preview ([`PlanTaskPreview`]), but its Scope/Execution layout should not
+/// preview ([`makina_core::plan::TaskDocument`]), but its Scope/Execution layout should not
 /// diverge from the task detail the user sees once a run exists.
 fn render_plan_task_pane(
     app: &App,
     _plan: &makina_core::orchestrator::PlanEntry,
-    preview: &makina_core::orchestrator::PlanTaskPreview,
+    preview: &makina_core::plan::TaskDocument,
     frame: &mut Frame,
     area: Rect,
 ) {
@@ -1870,7 +1870,7 @@ fn render_dependency_view(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 /// Render the dependency overlay body for a discovered plan that has no run yet,
-/// sourcing the graph from the plan's preview tasks (`PlanTaskPreview`, which
+/// sourcing the graph from the plan's preview tasks (`makina_core::plan::TaskDocument`, which
 /// carry `depends_on` + `gated`). Mirrors the run-backed views:
 /// - `List`: one line per task, `id (GATED?) ← dep1, dep2`.
 /// - `Tree`: an ASCII forest rooted at tasks nothing depends on.
@@ -1885,7 +1885,7 @@ fn render_dependency_view_plan(
     let fg = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
     let gated_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Warning));
 
-    let lines: Vec<Line> = if plan.tasks.is_empty() {
+    let lines: Vec<Line> = if plan.tasks().is_empty() {
         vec![Line::from(vec![Span::styled(
             "  No tasks in this plan.",
             dim,
@@ -1893,17 +1893,28 @@ fn render_dependency_view_plan(
     } else {
         match app.dependency_view {
             DependencyViewMode::List => plan
-                .tasks
+                .tasks()
                 .iter()
                 .map(|t| {
-                    let deps = if t.depends_on.is_empty() {
+                    let deps = if t.frontmatter.depends_on.is_empty() {
                         "—".to_string()
                     } else {
-                        t.depends_on.join(", ")
+                        t.frontmatter
+                            .depends_on
+                            .iter()
+                            .map(|dependency| dependency.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     };
                     Line::from(vec![
-                        Span::styled(t.id.clone(), if t.gated { gated_style } else { fg }),
-                        Span::styled(if t.gated { " (GATED)" } else { "" }, gated_style),
+                        Span::styled(
+                            t.frontmatter.id.as_str().to_owned(),
+                            if t.frontmatter.gated { gated_style } else { fg },
+                        ),
+                        Span::styled(
+                            if t.frontmatter.gated { " (GATED)" } else { "" },
+                            gated_style,
+                        ),
                         Span::styled(format!("  ← {deps}"), dim),
                     ])
                 })
@@ -1912,20 +1923,20 @@ fn render_dependency_view_plan(
                 // Roots = tasks that no other task depends on; render each root's
                 // prerequisite subtree so each chain appears once.
                 let depended_on: std::collections::HashSet<&str> = plan
-                    .tasks
+                    .tasks()
                     .iter()
-                    .flat_map(|t| t.depends_on.iter().map(String::as_str))
+                    .flat_map(|t| t.frontmatter.depends_on.iter().map(|id| id.as_str()))
                     .collect();
                 let mut acc: Vec<Line> = Vec::new();
                 for t in plan
-                    .tasks
+                    .tasks()
                     .iter()
-                    .filter(|t| !depended_on.contains(t.id.as_str()))
+                    .filter(|t| !depended_on.contains(t.frontmatter.id.as_str()))
                 {
                     render_plan_dependency_tree(
                         app,
-                        &plan.tasks,
-                        &t.id,
+                        plan.tasks(),
+                        t.frontmatter.id.as_str(),
                         "",
                         true,
                         true,
@@ -1936,11 +1947,11 @@ fn render_dependency_view_plan(
                 if acc.is_empty() {
                     // Every task is depended on (a cycle, or single mutual pair) —
                     // fall back to rendering every task as a root.
-                    for t in &plan.tasks {
+                    for t in plan.tasks() {
                         render_plan_dependency_tree(
                             app,
-                            &plan.tasks,
-                            &t.id,
+                            plan.tasks(),
+                            t.frontmatter.id.as_str(),
                             "",
                             true,
                             true,
@@ -1977,7 +1988,7 @@ fn render_dependency_view_plan(
 #[allow(clippy::too_many_arguments)]
 fn render_plan_dependency_tree(
     app: &App,
-    tasks: &[makina_core::orchestrator::PlanTaskPreview],
+    tasks: &[makina_core::plan::TaskDocument],
     id: &str,
     prefix: &str,
     is_last: bool,
@@ -1992,9 +2003,17 @@ fn render_plan_dependency_tree(
     } else {
         "├── "
     };
-    let task = tasks.iter().find(|t| t.id == id);
+    let task = tasks.iter().find(|t| t.frontmatter.id.as_str() == id);
     let (label, deps, gated) = match task {
-        Some(t) => (t.id.clone(), t.depends_on.clone(), t.gated),
+        Some(t) => (
+            t.frontmatter.id.as_str().to_owned(),
+            t.frontmatter
+                .depends_on
+                .iter()
+                .map(|dependency| dependency.as_str().to_owned())
+                .collect(),
+            t.frontmatter.gated,
+        ),
         None => (format!("{id} [?]"), Vec::new(), false),
     };
     let style = if gated {
@@ -2419,118 +2438,16 @@ enum TaskDetailSource<'a> {
         task: &'a makina_core::api::TaskView,
     },
     PlanPreview {
-        preview: &'a makina_core::orchestrator::PlanTaskPreview,
+        preview: &'a makina_core::plan::TaskDocument,
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PlanPreviewField {
-    DependsOn,
-    DoneWhen,
-}
-
-fn plan_preview_field_continues(line: &str) -> bool {
-    let trimmed = line.trim();
-    let trimmed_start = line.trim_start();
-    !trimmed.is_empty()
-        && !trimmed_start.starts_with("- ")
-        && !trimmed_start.starts_with("* ")
-        && !trimmed_start.starts_with("## ")
-        && !trimmed_start.starts_with("---")
-        && !trimmed_start.split_once(". ").is_some_and(|(prefix, _)| {
-            !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit())
-        })
-}
-
-fn append_plan_preview_field_text(target: &mut String, text: &str) {
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-    if !target.is_empty() {
-        target.push(' ');
-    }
-    target.push_str(text);
-}
-
-fn normalized_plan_preview_scope(body: &str) -> Option<String> {
-    let mut description_lines: Vec<String> = Vec::new();
-    let mut done_when = String::new();
-    let mut active_field: Option<PlanPreviewField> = None;
-    let mut in_code_fence = false;
-
-    for raw in body.lines() {
-        let trimmed_start = raw.trim_start();
-        let fence_line = trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~");
-
-        if !in_code_fence {
-            if trimmed_start
-                .strip_prefix("- **Depends on:**")
-                .or_else(|| trimmed_start.strip_prefix("- **Depends on**:"))
-                .is_some()
-            {
-                active_field = Some(PlanPreviewField::DependsOn);
-                continue;
-            }
-            if let Some(payload) = trimmed_start
-                .strip_prefix("- **Done when:**")
-                .or_else(|| trimmed_start.strip_prefix("- **Done when**:"))
-            {
-                append_plan_preview_field_text(&mut done_when, payload);
-                active_field = Some(PlanPreviewField::DoneWhen);
-                continue;
-            }
-            if let Some(field) = active_field {
-                if plan_preview_field_continues(raw) {
-                    if field == PlanPreviewField::DoneWhen {
-                        append_plan_preview_field_text(&mut done_when, raw);
-                    }
-                    continue;
-                }
-                active_field = None;
-            }
-        }
-
-        description_lines.push(raw.to_string());
-        if fence_line {
-            in_code_fence = !in_code_fence;
-            active_field = None;
-        }
-    }
-
-    let mut start = 0;
-    let mut end = description_lines.len();
-    while start < end && description_lines[start].trim().is_empty() {
-        start += 1;
-    }
-    while end > start && description_lines[end - 1].trim().is_empty() {
-        end -= 1;
-    }
-    let description = description_lines[start..end].join("\n");
-
-    let mut scope = String::new();
-    if !description.trim().is_empty() {
-        scope.push_str(&description);
-    }
-    if !done_when.trim().is_empty() {
-        if !scope.is_empty() {
-            scope.push_str("\n\n");
-        }
-        scope.push_str("### Done when\n\n");
-        scope.push_str(done_when.trim());
-    }
-
-    if scope.trim().is_empty() {
-        None
+fn plan_preview_scope_text(preview: &makina_core::plan::TaskDocument) -> Cow<'_, str> {
+    if preview.body.trim().is_empty() {
+        Cow::Borrowed("(no authored task detail)")
     } else {
-        Some(scope)
+        Cow::Borrowed(&preview.body)
     }
-}
-
-fn plan_preview_scope_text(preview: &makina_core::orchestrator::PlanTaskPreview) -> Cow<'_, str> {
-    normalized_plan_preview_scope(&preview.body)
-        .map(Cow::Owned)
-        .unwrap_or(Cow::Borrowed("(no further detail in TASKS.md)"))
 }
 
 fn render_task_execution_empty_section(
@@ -2655,12 +2572,20 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
         }
         TaskDetailSource::PlanPreview { preview } => {
             let scope = plan_preview_scope_text(preview);
-            let deps = if preview.depends_on.is_empty() {
+            let deps = if preview.frontmatter.depends_on.is_empty() {
                 None
             } else {
-                Some(preview.depends_on.join(", "))
+                Some(
+                    preview
+                        .frontmatter
+                        .depends_on
+                        .iter()
+                        .map(|dependency| dependency.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
             };
-            let (badge, badge_color) = if preview.gated {
+            let (badge, badge_color) = if preview.frontmatter.gated {
                 (
                     "[gated]",
                     app.active_theme.get(crate::theme::ThemeRole::Warning),
@@ -2672,14 +2597,14 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
                 )
             };
             (
-                TaskId::new(preview.id.clone()),
-                preview.id.as_str(),
-                preview.title.as_str(),
+                TaskId::new(preview.frontmatter.id.as_str()),
+                preview.frontmatter.id.as_str(),
+                preview.frontmatter.title.as_str(),
                 scope,
                 deps,
                 badge,
                 badge_color,
-                preview.gated,
+                preview.frontmatter.gated,
                 0,
                 0,
             )
@@ -2696,6 +2621,80 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
         format!("  {badge}"),
         Style::default().fg(badge_color),
     )]));
+
+    let authored_summary = match source {
+        TaskDetailSource::Live { task, .. } => task.authored.as_ref().map(|authored| {
+            let merged = authored
+                .merged_as
+                .as_deref()
+                .map(|oid| &oid[..oid.len().min(12)])
+                .unwrap_or("—");
+            let collisions = authored
+                .collision_dependencies
+                .iter()
+                .map(|dependency| dependency.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![
+                format!(
+                    "  Workstream {} · {} · authored {} · gated {}",
+                    authored.workstream, authored.kind, authored.status, authored.gated
+                ),
+                format!("  Touches: {}", authored.touches.join(", ")),
+                format!(
+                    "  Collision dependencies: {}",
+                    if collisions.is_empty() {
+                        "—"
+                    } else {
+                        &collisions
+                    }
+                ),
+                format!(
+                    "  Source: {} · merged_as: {merged}",
+                    authored.source_path.display()
+                ),
+            ]
+        }),
+        TaskDetailSource::PlanPreview { preview } => {
+            let merged = preview
+                .frontmatter
+                .merged_as
+                .as_ref()
+                .map(|oid| &oid.as_str()[..oid.as_str().len().min(12)])
+                .unwrap_or("—");
+            Some(vec![
+                format!(
+                    "  Workstream {} · {} · authored {} · gated {}",
+                    preview.frontmatter.workstream,
+                    preview.frontmatter.kind,
+                    preview.frontmatter.status,
+                    preview.frontmatter.gated
+                ),
+                format!(
+                    "  Touches: {}",
+                    preview
+                        .frontmatter
+                        .touches
+                        .iter()
+                        .map(|pattern| pattern.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!(
+                    "  Source: {} · merged_as: {merged}",
+                    preview.source_path.display()
+                ),
+            ])
+        }
+    };
+    if let Some(summary) = authored_summary {
+        for text in summary {
+            push_line!(Line::from(Span::styled(
+                text,
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            )));
+        }
+    }
 
     if gated {
         push_line!(Line::from(vec![Span::styled(
@@ -3002,19 +3001,41 @@ pub(crate) fn render_plan_accordion_pane(
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         ),
     ]));
+    push_line!(Line::from(format!("State: {}", plan.state)));
+    if let Some(document) = &plan.document {
+        push_line!(Line::from(format!("Title: {}", document.title)));
+        push_line!(Line::from(format!(
+            "Status: {} · progress {}/{} · blocked {} · dropped {}",
+            document.status.display_status,
+            document.status.done,
+            document.status.total,
+            document.status.blocked,
+            document.status.dropped,
+        )));
+    } else {
+        for diagnostic in &plan.diagnostics.diagnostics {
+            push_line!(Line::from(format!(
+                "Invalid: {}: {}",
+                diagnostic.code, diagnostic.message
+            )));
+        }
+    }
     push_line!(Line::from(""));
 
     // Get accordion state for this plan
-    let plan_identity = app
-        .context_plan_identity()
-        .unwrap_or_else(|| crate::app::PlanIdentity::legacy(plan.slug.clone()));
+    let plan_identity = app.context_plan_identity().unwrap_or_else(|| {
+        let project_root = plan
+            .dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| app.canonical_repo_root());
+        crate::app::PlanIdentity::new(project_root, plan.dir.clone(), plan.slug.clone())
+    });
     let expanded = app
         .accordion_state
         .get(&plan_identity)
-        .or_else(|| {
-            app.accordion_state
-                .get(&crate::app::PlanIdentity::legacy(plan.slug.clone()))
-        })
         .cloned()
         .unwrap_or_default();
 
@@ -3026,7 +3047,10 @@ pub(crate) fn render_plan_accordion_pane(
         "SCOPE",
         AccordionSection::Scope,
         &expanded,
-        plan.scope_text.as_deref().unwrap_or("(no SCOPE.md)"),
+        plan.document
+            .as_ref()
+            .map(|document| document.scope.body.as_str())
+            .unwrap_or("(plan source is not loadable)"),
         scope_focused,
         content_area.width,
         true,
@@ -3043,9 +3067,10 @@ pub(crate) fn render_plan_accordion_pane(
         "ARCHITECTURE",
         AccordionSection::Architecture,
         &expanded,
-        plan.architecture_text
-            .as_deref()
-            .unwrap_or("(no ARCHITECTURE.md)"),
+        plan.document
+            .as_ref()
+            .map(|document| document.architecture.body.as_str())
+            .unwrap_or("(plan source is not loadable)"),
         arch_focused,
         content_area.width,
         true,
@@ -3055,7 +3080,7 @@ pub(crate) fn render_plan_accordion_pane(
     push_line!(Line::from(""));
 
     // TASKS section
-    let tasks_text = format_tasks_section(&plan.tasks);
+    let tasks_text = format_tasks_section(plan.tasks());
     let tasks_focused = matches!(app.focused_section, Some(AccordionSection::Tasks));
     accordion_header_rows.push((AccordionSection::Tasks, rendered_row));
     for l in render_accordion_section(
@@ -3080,7 +3105,10 @@ pub(crate) fn render_plan_accordion_pane(
         "STATUS",
         AccordionSection::Status,
         &expanded,
-        plan.status_text.as_deref().unwrap_or("(no STATUS.md)"),
+        plan.document
+            .as_ref()
+            .map(|document| document.status.source.body.as_str())
+            .unwrap_or("(plan source is not loadable)"),
         status_focused,
         content_area.width,
         true,
@@ -3221,13 +3249,13 @@ fn render_accordion_section(
     result
 }
 
-/// Format the tasks section content: task list with GATED markers and dependencies.
-fn format_tasks_section(tasks: &[makina_core::orchestrator::PlanTaskPreview]) -> String {
+/// Format the authored tasks section with GATED markers and dependencies.
+fn format_tasks_section(tasks: &[makina_core::plan::TaskDocument]) -> String {
     if tasks.is_empty() {
         return "(no tasks)".to_string();
     }
     let mut text = format!("Tasks ({})", tasks.len());
-    let gated = tasks.iter().filter(|t| t.gated).count();
+    let gated = tasks.iter().filter(|t| t.frontmatter.gated).count();
     if gated > 0 {
         text.push_str(&format!("  · {} gated", gated));
     }
@@ -3235,15 +3263,41 @@ fn format_tasks_section(tasks: &[makina_core::orchestrator::PlanTaskPreview]) ->
     text.push('\n');
     for (i, t) in tasks.iter().enumerate() {
         text.push_str(&format!("  {}. ", i + 1));
-        text.push_str(&t.id);
-        text.push_str(&format!(" — {}", t.title));
-        if t.gated {
+        text.push_str(t.frontmatter.id.as_str());
+        text.push_str(&format!(" — {}", t.frontmatter.title));
+        text.push_str(&format!(
+            " [{} · {} · {}]",
+            t.frontmatter.workstream, t.frontmatter.kind, t.frontmatter.status
+        ));
+        if t.frontmatter.gated {
             text.push_str("  GATED");
         }
         text.push('\n');
-        if !t.depends_on.is_empty() {
-            text.push_str(&format!("     depends on: {}", t.depends_on.join(", ")));
+        if !t.frontmatter.depends_on.is_empty() {
+            text.push_str(&format!(
+                "     depends on: {}",
+                t.frontmatter
+                    .depends_on
+                    .iter()
+                    .map(|dependency| dependency.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
             text.push('\n');
+        }
+        if !t.frontmatter.touches.is_empty() {
+            text.push_str(&format!(
+                "     touches: {}\n",
+                t.frontmatter
+                    .touches
+                    .iter()
+                    .map(|pattern| pattern.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(merged_as) = &t.frontmatter.merged_as {
+            text.push_str(&format!("     merged as: {}\n", &merged_as.as_str()[..12]));
         }
     }
     text
@@ -4012,14 +4066,14 @@ fn render_file_browser(
     frame.render_widget(Clear, popup);
 
     // Folder-browser mode (plan 0043) reuses this same modal to pick a
-    // directory rather than a task-list file; distinguish the title so the
+    // directory rather than a file; distinguish the title so the
     // purpose (open vs. initialize a folder) is clear instead of the
-    // file-browser's "Open task list" wording bleeding through.
+    // plan browser's wording does not bleed through.
     let title_verb = match app.folder_browser_purpose() {
         Some(crate::app::FolderBrowserPurpose::OpenFolder) => "Open folder",
         Some(crate::app::FolderBrowserPurpose::InitializeFolder) => "Initialize folder",
         Some(crate::app::FolderBrowserPurpose::CloseFolders) => "Close folder",
-        None => "Open task list",
+        None => "Open plan",
     };
     let title = format!(" {title_verb} — {} ", browser.cwd.display());
     let block = Block::default()
@@ -4533,7 +4587,7 @@ fn render_reset_confirmation(
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
         )]),
         Line::from(vec![Span::styled(
-            "then re-read TASKS.md into a fresh pending run.",
+            "then re-read the plan directory into a fresh pending run.",
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
         )]),
         Line::from(""),
@@ -4543,7 +4597,7 @@ fn render_reset_confirmation(
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             ),
             Span::styled(
-                confirm.target.task_list_path.display().to_string(),
+                confirm.target.plan_dir.relative_dir.display().to_string(),
                 Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
             ),
         ]),
@@ -5065,31 +5119,14 @@ fn panel_block(app: &App, title: &str, focused: bool) -> Block<'static> {
         .padding(Padding::horizontal(1))
 }
 
-/// Derive the sidebar run label as `{project}/{plan}` for plan-style task-list
-/// paths, falling back to the bare file stem otherwise.
-///
-/// A path is plan-style when its `file_name` is `TASKS.md` (case-insensitive)
-/// AND its parent directory name is non-empty; in that case `{plan}` is the
-/// parent-directory name and `{project}` is [`RunView::project`]. For any other
-/// shape (e.g. `.tasks/feature.json`) the label is just the `file_stem`.
+/// Derive the sidebar label from the typed plan identity.
 fn run_label(run: &makina_core::api::RunView) -> String {
-    let path = &run.task_list_path;
-    let is_tasks_md = path
+    run.plan_dir
+        .relative_dir
         .file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|n| n.eq_ignore_ascii_case("TASKS.md"));
-    let plan = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str());
-    if is_tasks_md && let Some(plan) = plan.filter(|p| !p.is_empty()) {
-        let project = &run.project;
-        return format!("{project}/{plan}");
-    }
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string()
+        .and_then(|name| name.to_str())
+        .unwrap_or(run.plan_dir.slug.as_str())
+        .to_owned()
 }
 
 /// Return the short status badge text and its display colour for a [`RunStatus`].
@@ -5101,6 +5138,10 @@ fn status_badge(s: &makina_core::api::RunStatus, app: &App) -> (&'static str, Co
     use makina_core::api::RunStatus;
     match s {
         RunStatus::Pending => ("[·]", app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        RunStatus::WaitingForRepository { .. } => (
+            "[⌛]",
+            app.active_theme.get(crate::theme::ThemeRole::Warning),
+        ),
         RunStatus::Running => (
             "[▶]",
             app.active_theme.get(crate::theme::ThemeRole::Success),
@@ -5143,6 +5184,18 @@ fn task_state_badge(s: &makina_core::api::TaskState, app: &App) -> (&'static str
             "[⊘ skipped]",
             app.active_theme.get(crate::theme::ThemeRole::Dim),
         ),
+        TaskState::Blocked => (
+            "[! blocked]",
+            app.active_theme.get(crate::theme::ThemeRole::Error),
+        ),
+        TaskState::Dropped => (
+            "[− dropped]",
+            app.active_theme.get(crate::theme::ThemeRole::Dim),
+        ),
+        TaskState::Gated => (
+            "[◆ gated]",
+            app.active_theme.get(crate::theme::ThemeRole::Warning),
+        ),
     }
 }
 
@@ -5168,8 +5221,10 @@ pub fn spinner_frame(tick: u64) -> &'static str {
 fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
     use makina_core::api::Event;
     match ev {
+        Event::PlanRegistered { .. } => "PlanRegistered",
         Event::RunOpened { .. } => "RunOpened",
         Event::RunStatusChanged { .. } => "RunStatusChanged",
+        Event::RepositoryLeaseWaiting { .. } => "RepositoryLeaseWaiting",
         Event::TaskStateChanged { .. } => "TaskStateChanged",
         Event::TaskIterationsUpdated { .. } => "TaskIterationsUpdated",
         Event::SessionCapabilities { .. } => "SessionCapabilities",
@@ -5191,6 +5246,9 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[path = "../../../tests/plan_fixture.rs"]
+    mod plan_fixture;
+
     use super::*;
     use crate::app::{App, PlanIdentity, ScrollablePanel};
     use crate::placeholder::PlaceholderApi;
@@ -5198,9 +5256,10 @@ mod tests {
         IngestionIssue, IngestionReport, IssueSeverity, IssueSource, RunId, RunStatus, RunView,
         TaskId, TaskState, TaskView,
     };
+    use plan_fixture::{Task as TestPlanTask, entry as test_plan_entry};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     // Use the process-global HOME_ENV_LOCK from makina_core so tests that
@@ -5211,6 +5270,17 @@ mod tests {
     fn make_terminal(width: u16, height: u16) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         Terminal::new(backend).unwrap()
+    }
+
+    fn discovered_plan_identity(app: &App, index: usize) -> PlanIdentity {
+        app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[index])
+    }
+
+    fn fixture_plan_identity(
+        app: &App,
+        plan: &makina_core::orchestrator::PlanEntry,
+    ) -> PlanIdentity {
+        app.plan_identity_for_entry(&app.repo_root, plan)
     }
 
     // ── Render: empty state ───────────────────────────────────────────────────
@@ -5274,21 +5344,17 @@ mod tests {
         let mut terminal = make_terminal(80, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
-            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
-            slug: "0001-initial".to_string(),
-            has_tasks: true,
-            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(
+            PathBuf::from("/repo/docs/plans/0001-Initial"),
+            "0001-initial".to_string(),
+            vec![TestPlanTask {
                 id: "cargo-scaffold".to_string(),
                 title: "Compiling Skeleton".to_string(),
                 gated: false,
                 body: String::new(),
                 depends_on: Vec::new(),
             }],
-            scope_text: None,
-            architecture_text: None,
-            status_text: None,
-        }];
+        )];
 
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
@@ -5305,19 +5371,18 @@ mod tests {
         let mut terminal = make_terminal(90, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
-            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
-            slug: "0001-initial".to_string(),
-            has_tasks: true,
-            tasks: vec![
-                makina_core::orchestrator::PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(
+            PathBuf::from("/repo/docs/plans/0001-Initial"),
+            "0001-initial".to_string(),
+            vec![
+                TestPlanTask {
                     id: "cargo-scaffold".to_string(),
                     title: "Skeleton".to_string(),
                     gated: false,
                     body: String::new(),
                     depends_on: Vec::new(),
                 },
-                makina_core::orchestrator::PlanTaskPreview {
+                TestPlanTask {
                     id: "task-model".to_string(),
                     title: "Domain Model".to_string(),
                     gated: false,
@@ -5325,10 +5390,7 @@ mod tests {
                     depends_on: vec!["cargo-scaffold".to_string()],
                 },
             ],
-            scope_text: None,
-            architecture_text: None,
-            status_text: None,
-        }];
+        )];
         app.tree_cursor = Some(0);
         let collapse_key = CollapseKey::Plan(
             app.plan_identity_for_node(TreeNode::Plan { plan_idx: 0 })
@@ -5358,35 +5420,31 @@ mod tests {
         let mut terminal = make_terminal(100, 26);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
-            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
-            slug: "0001-initial".to_string(),
-            has_tasks: true,
-            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(
+            PathBuf::from("/repo/docs/plans/0001-Initial"),
+            "0001-initial".to_string(),
+            vec![TestPlanTask {
                 id: "json-store".to_string(),
                 title: "JSON Store".to_string(),
                 gated: true,
                 body: String::new(),
                 depends_on: vec!["task-model".to_string()],
             }],
-            scope_text: None,
-            architecture_text: None,
-            status_text: None,
-        }];
+        )];
         app.tree_cursor = Some(0);
         // Open a plan tab for this plan (plan 0032).
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan: PlanIdentity::legacy("0001-initial".to_string()),
+                plan: discovered_plan_identity(&app, 0),
             },
         ));
 
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(screen.contains("Plan: 0001-initial"), "plan header missing");
-        // Sections are collapsed by default, so we expand TASKS to see the task list
+        // Sections are collapsed by default, so expand Tasks to see authored tasks.
         app.accordion_state
-            .entry(PlanIdentity::legacy("0001-initial"))
+            .entry(discovered_plan_identity(&app, 0))
             .or_default()
             .insert(crate::app::AccordionSection::Tasks);
         terminal.draw(|f| render(&app, f)).unwrap();
@@ -5420,26 +5478,25 @@ mod tests {
             .push(std::path::PathBuf::from("/test/folder"));
         app.plans_by_folder.insert(
             0,
-            vec![makina_core::orchestrator::PlanEntry {
-                dir: PathBuf::from("/test/folder/docs/plans/0001-Initial"),
-                slug: "0001-initial".to_string(),
-                has_tasks: true,
-                tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+            vec![test_plan_entry(
+                PathBuf::from("/test/folder/docs/plans/0001-Initial"),
+                "0001-initial".to_string(),
+                vec![TestPlanTask {
                     id: "json-store".to_string(),
                     title: "JSON Store".to_string(),
                     gated: true,
                     body: String::new(),
                     depends_on: vec!["task-model".to_string()],
                 }],
-                scope_text: Some("scope text".to_string()),
-                architecture_text: None,
-                status_text: None,
-            }],
+            )],
         );
         // Open a plan tab for the folder-scoped plan.
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan: PlanIdentity::legacy("0001-initial".to_string()),
+                plan: app.plan_identity_for_entry(
+                    Path::new("/test/folder"),
+                    &app.plans_by_folder[&0][0],
+                ),
             },
         ));
 
@@ -5468,43 +5525,37 @@ mod tests {
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         // Create a plan with very long content so all sections expanded will exceed pane height.
-        let long_content = "This is a test section.\n".repeat(50);
-
-        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
-            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
-            slug: "0001-initial".to_string(),
-            has_tasks: true,
-            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(
+            PathBuf::from("/repo/docs/plans/0001-Initial"),
+            "0001-initial".to_string(),
+            vec![TestPlanTask {
                 id: "json-store".to_string(),
                 title: "JSON Store".to_string(),
                 gated: true,
                 body: String::new(),
                 depends_on: vec!["task-model".to_string()],
             }],
-            scope_text: Some(long_content.clone()),
-            architecture_text: Some(long_content.clone()),
-            status_text: Some(long_content.clone()),
-        }];
+        )];
         app.tree_cursor = Some(0);
 
         // Open a plan tab for this plan.
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan: PlanIdentity::legacy("0001-initial".to_string()),
+                plan: discovered_plan_identity(&app, 0),
             },
         ));
 
         // Expand all sections to make content tall.
         app.accordion_state
-            .entry(PlanIdentity::legacy("0001-initial"))
+            .entry(discovered_plan_identity(&app, 0))
             .or_default()
             .insert(crate::app::AccordionSection::Scope);
         app.accordion_state
-            .entry(PlanIdentity::legacy("0001-initial"))
+            .entry(discovered_plan_identity(&app, 0))
             .or_default()
             .insert(crate::app::AccordionSection::Architecture);
         app.accordion_state
-            .entry(PlanIdentity::legacy("0001-initial"))
+            .entry(discovered_plan_identity(&app, 0))
             .or_default()
             .insert(crate::app::AccordionSection::Status);
 
@@ -5544,27 +5595,23 @@ mod tests {
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         // Create a plan with minimal content so expanded sections fit in pane height.
-        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
-            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
-            slug: "0001-initial".to_string(),
-            has_tasks: true,
-            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(
+            PathBuf::from("/repo/docs/plans/0001-Initial"),
+            "0001-initial".to_string(),
+            vec![TestPlanTask {
                 id: "json-store".to_string(),
                 title: "JSON Store".to_string(),
                 gated: true,
                 body: String::new(),
                 depends_on: vec!["task-model".to_string()],
             }],
-            scope_text: Some("Short scope text.\n".to_string()),
-            architecture_text: Some("Short arch text.\n".to_string()),
-            status_text: Some("Short status text.\n".to_string()),
-        }];
+        )];
         app.tree_cursor = Some(0);
 
         // Open a plan tab for this plan.
         app.update(crate::app::AppEvent::OpenTab(
             crate::app::TabContent::Plan {
-                plan: PlanIdentity::legacy("0001-initial".to_string()),
+                plan: discovered_plan_identity(&app, 0),
             },
         ));
 
@@ -5628,43 +5675,35 @@ mod tests {
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         // Create a plan with tall content so scroll_max > 0.
-        let long_content = (0..80)
-            .map(|i| format!("Section line {}\n", i))
-            .collect::<String>();
-
-        app.discovered_plans = vec![makina_core::orchestrator::PlanEntry {
-            dir: PathBuf::from("/repo/docs/plans/0001-Initial"),
-            slug: "0001-initial".to_string(),
-            has_tasks: true,
-            tasks: vec![makina_core::orchestrator::PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(
+            PathBuf::from("/repo/docs/plans/0001-Initial"),
+            "0001-initial".to_string(),
+            vec![TestPlanTask {
                 id: "test-task".to_string(),
                 title: "Test Task".to_string(),
                 gated: false,
                 body: String::new(),
                 depends_on: vec![],
             }],
-            scope_text: Some(long_content.clone()),
-            architecture_text: Some(long_content.clone()),
-            status_text: Some(long_content.clone()),
-        }];
+        )];
         app.tree_cursor = Some(0);
 
         // Open a plan tab.
         app.update(AppEvent::OpenTab(crate::app::TabContent::Plan {
-            plan: PlanIdentity::legacy("0001-initial".to_string()),
+            plan: discovered_plan_identity(&app, 0),
         }));
 
         // Expand all sections to make content tall.
         app.accordion_state
-            .entry(PlanIdentity::legacy("0001-initial"))
+            .entry(discovered_plan_identity(&app, 0))
             .or_default()
             .insert(crate::app::AccordionSection::Scope);
         app.accordion_state
-            .entry(PlanIdentity::legacy("0001-initial"))
+            .entry(discovered_plan_identity(&app, 0))
             .or_default()
             .insert(crate::app::AccordionSection::Architecture);
         app.accordion_state
-            .entry(PlanIdentity::legacy("0001-initial"))
+            .entry(discovered_plan_identity(&app, 0))
             .or_default()
             .insert(crate::app::AccordionSection::Status);
 
@@ -5992,10 +6031,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/my-feature.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("t1"),
                 title: "First task".into(),
                 state: TaskState::InProgress,
@@ -6026,8 +6066,8 @@ mod tests {
 
         // The run's file stem appears in the sidebar (List uses file_stem).
         assert!(
-            screen.contains("my-feature"),
-            "sidebar should list the open run's file stem"
+            screen.contains("0001-Test"),
+            "sidebar should list the open run's typed plan slug"
         );
         // The first task's title now appears in the sidebar tree (not the main table).
         assert!(
@@ -6046,7 +6086,7 @@ mod tests {
             RunView {
                 id: RunId(1),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/alpha.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-alpha").unwrap(),
                 status: RunStatus::Running,
                 project: String::new(),
                 tasks: vec![],
@@ -6055,7 +6095,7 @@ mod tests {
             RunView {
                 id: RunId(2),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/beta.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0002-beta").unwrap(),
                 status: RunStatus::Failed,
                 project: String::new(),
                 tasks: vec![],
@@ -6064,7 +6104,7 @@ mod tests {
             RunView {
                 id: RunId(3),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/gamma.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0003-gamma").unwrap(),
                 status: RunStatus::Completed,
                 project: String::new(),
                 tasks: vec![],
@@ -6119,7 +6159,7 @@ mod tests {
             RunView {
                 id: RunId(2),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/feature.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-feature").unwrap(),
                 status: RunStatus::Completed,
                 project: "makina".into(),
                 tasks: vec![],
@@ -6128,9 +6168,10 @@ mod tests {
             RunView {
                 id: RunId(1),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(
-                    "docs/plans/0002-Governance-and-Persistence/TASKS.md",
-                ),
+                plan_dir: makina_core::plan::PlanKey::parse(
+                    "docs/plans/0002-Governance-and-Persistence",
+                )
+                .unwrap(),
                 status: RunStatus::Running,
                 project: "makina".into(),
                 tasks: vec![],
@@ -6174,7 +6215,7 @@ mod tests {
             RunView {
                 id: RunId(1),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/pending.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-pending").unwrap(),
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
@@ -6183,7 +6224,7 @@ mod tests {
             RunView {
                 id: RunId(2),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/running.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0002-running").unwrap(),
                 status: RunStatus::Running,
                 project: String::new(),
                 tasks: vec![],
@@ -6192,7 +6233,7 @@ mod tests {
             RunView {
                 id: RunId(3),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/paused.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0003-paused").unwrap(),
                 status: RunStatus::Paused,
                 project: String::new(),
                 tasks: vec![],
@@ -6201,7 +6242,7 @@ mod tests {
             RunView {
                 id: RunId(4),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/completed.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0004-completed").unwrap(),
                 status: RunStatus::Completed,
                 project: String::new(),
                 tasks: vec![],
@@ -6210,7 +6251,7 @@ mod tests {
             RunView {
                 id: RunId(5),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/failed.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0005-failed").unwrap(),
                 status: RunStatus::Failed,
                 project: String::new(),
                 tasks: vec![],
@@ -6248,7 +6289,7 @@ mod tests {
             RunView {
                 id: RunId(1),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/first.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
                 status: RunStatus::Running,
                 project: String::new(),
                 tasks: vec![],
@@ -6257,7 +6298,7 @@ mod tests {
             RunView {
                 id: RunId(2),
                 run_uid: String::new(),
-                task_list_path: PathBuf::from(".tasks/second.json"),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
                 status: RunStatus::Pending,
                 project: String::new(),
                 tasks: vec![],
@@ -6293,7 +6334,7 @@ mod tests {
         let runs = vec![RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/live.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![],
@@ -6324,7 +6365,7 @@ mod tests {
         let runs = vec![RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/broken.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Failed,
             project: String::new(),
             tasks: vec![],
@@ -6354,7 +6395,7 @@ mod tests {
         let runs = vec![RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/bad.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
@@ -6403,7 +6444,7 @@ mod tests {
         let runs = vec![RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/warn.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
@@ -6442,7 +6483,7 @@ mod tests {
         let runs = vec![RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/blocked.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
@@ -6595,10 +6636,7 @@ mod tests {
         let screen = screen_of(&terminal);
 
         // The popup title shows the current directory.
-        assert!(
-            screen.contains("Open task list"),
-            "browser title must be shown"
-        );
+        assert!(screen.contains("Open plan"), "browser title must be shown");
         // Directory entries render with a trailing slash; files do not.
         assert!(
             screen.contains("src/"),
@@ -6665,7 +6703,7 @@ mod tests {
 
     /// The modal reuses `render_file_browser` for folder selection (plan 0043),
     /// but its title must reflect the folder-browser purpose instead of the
-    /// file-browser's "Open task list" wording.
+    /// plan-browser's "Open plan" wording.
     #[test]
     fn render_folder_browser_open_folder_shows_open_folder_title() {
         use crate::app::FolderBrowserPurpose;
@@ -6691,11 +6729,11 @@ mod tests {
         let screen = screen_of(&terminal);
         assert!(
             screen.contains("Open folder"),
-            "folder browser (OpenFolder purpose) must show an 'Open folder' title, not 'Open task list'"
+            "folder browser (OpenFolder purpose) must show an 'Open folder' title, not 'Open plan'"
         );
         assert!(
-            !screen.contains("Open task list"),
-            "folder browser must not show the file-browser's 'Open task list' title"
+            !screen.contains("Open plan"),
+            "folder browser must not show the plan-browser's 'Open plan' title"
         );
     }
 
@@ -6730,7 +6768,7 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
-            !screen.contains("Open task list"),
+            !screen.contains("Open plan"),
             "browser overlay must not render in Normal mode"
         );
     }
@@ -6745,11 +6783,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/status-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("alpha"),
                     title: "Alpha task".into(),
                     state: TaskState::Done,
@@ -6762,6 +6801,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("beta"),
                     title: "Beta task".into(),
                     state: TaskState::InProgress,
@@ -6774,6 +6814,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("gamma"),
                     title: "Gamma task".into(),
                     state: TaskState::New,
@@ -6786,6 +6827,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("delta"),
                     title: "Delta task".into(),
                     state: TaskState::Failed,
@@ -6910,11 +6952,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/dep-tree-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("root"),
                     title: "Root task".into(),
                     state: TaskState::Ready,
@@ -6927,6 +6970,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("a"),
                     title: "A task".into(),
                     state: TaskState::Done,
@@ -6939,6 +6983,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("b"),
                     title: "B task".into(),
                     state: TaskState::Failed,
@@ -6951,6 +6996,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("c"),
                     title: "C task".into(),
                     state: TaskState::New,
@@ -7024,23 +7070,21 @@ mod tests {
     #[test]
     fn dependency_view_renders_on_plan_tab_from_preview_tasks() {
         use crate::app::{DependencyViewMode, TabContent};
-        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
 
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-        app.discovered_plans = vec![PlanEntry {
-            dir: std::path::PathBuf::from("/tmp/docs/plans/0007-demo"),
-            slug: "0007-demo".to_string(),
-            has_tasks: true,
-            tasks: vec![
-                PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(
+            std::path::PathBuf::from("/tmp/docs/plans/0007-demo"),
+            "0007-demo".to_string(),
+            vec![
+                TestPlanTask {
                     id: "scaffold".to_string(),
                     title: "Scaffold".to_string(),
                     gated: false,
                     depends_on: vec![],
                     body: String::new(),
                 },
-                PlanTaskPreview {
+                TestPlanTask {
                     id: "wire-cli".to_string(),
                     title: "Wire CLI".to_string(),
                     gated: false,
@@ -7048,10 +7092,7 @@ mod tests {
                     body: String::new(),
                 },
             ],
-            scope_text: None,
-            architecture_text: None,
-            status_text: None,
-        }];
+        )];
         app.tabs.open_tab(TabContent::Plan {
             plan: PlanIdentity::legacy("0007-demo".to_string()),
         });
@@ -7123,12 +7164,13 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/gantt-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 // Task 1: has started and finished — shows a solid bar.
                 TaskView {
+                    authored: None,
                     id: TaskId::new("started"),
                     title: "Started task".into(),
                     state: TaskState::Done,
@@ -7142,6 +7184,7 @@ mod tests {
                 },
                 // Task 2: not yet started — must show ghost, not '█'.
                 TaskView {
+                    authored: None,
                     id: TaskId::new("pending"),
                     title: "Pending task".into(),
                     state: TaskState::New,
@@ -7194,11 +7237,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/empty-timing.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("task-a"),
                     title: "Task A".into(),
                     state: TaskState::New,
@@ -7211,6 +7255,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("task-b"),
                     title: "Task B".into(),
                     state: TaskState::Ready,
@@ -7270,11 +7315,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/status-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("alpha"),
                     title: "Alpha task".into(),
                     state: TaskState::New,
@@ -7287,6 +7333,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("beta"),
                     title: "Beta task".into(),
                     state: TaskState::New,
@@ -7370,7 +7417,7 @@ mod tests {
         let run = makina_core::api::RunView {
             id: makina_core::api::RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/empty-run.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: makina_core::api::RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
@@ -7387,7 +7434,7 @@ mod tests {
         // With task table removed, we no longer show "Loading tasks" hint.
         // The sidebar shows just the run header; the exchange pane has more space.
         assert!(
-            screen.contains("empty-run"),
+            screen.contains("0001-Test"),
             "run with no tasks must show the run in the sidebar"
         );
     }
@@ -7410,10 +7457,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/live.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("live-task"),
                 title: "Live task".into(),
                 state: TaskState::New,
@@ -7511,11 +7559,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/exchange-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("task-a"),
                     title: "Task A".into(),
                     state: TaskState::InProgress,
@@ -7528,6 +7577,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("task-b"),
                     title: "Task B".into(),
                     state: TaskState::Ready,
@@ -7615,7 +7665,10 @@ mod tests {
 
         let mut app = exchange_app();
         // Open a task tab for task-a so the log target is deterministic.
-        let slug = makina_core::orchestrator::plan_slug(&app.runs[0].task_list_path);
+        let slug = format!(
+            "{:04}-{}",
+            app.runs[0].plan_dir.number, app.runs[0].plan_dir.slug
+        );
         app.tabs.open_tab(TabContent::Task {
             plan: PlanIdentity::legacy(slug),
             run: RunId(1),
@@ -7672,7 +7725,7 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/blocked.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Pending,
             project: String::new(),
             tasks: vec![],
@@ -7833,10 +7886,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/ansi-diff.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("task-a"),
                 title: "Task A".into(),
                 state: TaskState::InProgress,
@@ -7931,10 +7985,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/markdown.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("task-md"),
                 title: "Markdown Task".into(),
                 state: TaskState::InProgress,
@@ -8304,10 +8359,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/no-exchange.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("t1"),
                 title: "T1".into(),
                 state: TaskState::InProgress,
@@ -8321,12 +8377,21 @@ mod tests {
             }],
             report: makina_core::api::IngestionReport::default(),
         };
-        let app = App::new(api, vec![run], std::path::PathBuf::from("."));
+        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+        app.tabs.open_tab(crate::app::TabContent::Task {
+            plan: PlanIdentity::from_key(
+                app.repo_root.clone(),
+                app.runs[0].plan_dir.clone(),
+                "0001-Test".to_string(),
+            ),
+            run: RunId(1),
+            task_id: TaskId::new("t1"),
+        });
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
-            screen.contains("No exchange yet") || screen.contains("exchange"),
-            "exchange pane must show 'No exchange yet' placeholder when log is empty"
+            screen.contains("No execution yet"),
+            "task pane must show 'No execution yet' when the exchange log is empty"
         );
     }
 
@@ -8567,10 +8632,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/scrollbar-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("tall-log"),
                 title: "Tall Log".into(),
                 state: TaskState::InProgress,
@@ -8658,10 +8724,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/scrollbar-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("short-log"),
                 title: "Short Log".into(),
                 state: TaskState::InProgress,
@@ -8752,10 +8819,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/scrollbar-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("mid-offset"),
                 title: "Mid Offset".into(),
                 state: TaskState::InProgress,
@@ -8855,10 +8923,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/scroll-offset-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("offset-test"),
                 title: "Offset Test".into(),
                 state: TaskState::InProgress,
@@ -9010,10 +9079,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/auto-follow-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("auto-follow-test"),
                 title: "Auto Follow Test".into(),
                 state: TaskState::InProgress,
@@ -9114,11 +9184,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("alpha"),
                     title: "Alpha task".into(),
                     state: TaskState::Done,
@@ -9131,6 +9202,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("beta"),
                     title: "Beta task".into(),
                     state: TaskState::InProgress,
@@ -9184,10 +9256,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("gamma"),
                 title: "Gamma task".into(),
                 state: TaskState::Done,
@@ -9234,10 +9307,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Failed,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("delta"),
                 title: "Delta task".into(),
                 state: TaskState::Failed,
@@ -9304,8 +9378,9 @@ mod tests {
         unsafe { std::env::set_var("HOME", temp_home.path()) };
 
         // Build the worktree path via the NEW relocated short-name layout.
-        let repo_root = std::path::PathBuf::from("/home/user/workspace/myproject");
-        let state_root = makina_core::paths::state_root(&repo_root);
+        let repo_root = temp_home.path().join("repo");
+        std::fs::create_dir(&repo_root).unwrap();
+        let state_root = makina_core::paths::state_root(&repo_root).unwrap();
         let short_name = makina_core::paths::short_worktree_name("0009-sidebar-tree", "task1");
         let worktree_path = format!(
             "{}/worktrees/{}/src/main.rs",
@@ -9382,10 +9457,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: makina_core::api::RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("test-task"),
                 title: "Test Task".into(),
                 state: makina_core::api::TaskState::InProgress,
@@ -9457,10 +9533,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/plan0009.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("pane-fidelity"),
                 title: "Pane Fidelity".into(),
                 state: TaskState::InProgress,
@@ -9512,7 +9589,7 @@ mod tests {
         // relocated state_root/worktrees/<short-name>/ prefix. Without the
         // compact_paths implementation the full worktree prefix would survive
         // in the rendered output and assertion 5 would fail.
-        let state_root = makina_core::paths::state_root(&repo_root);
+        let state_root = makina_core::paths::state_root(&repo_root).unwrap();
         let short_name =
             makina_core::paths::short_worktree_name("0009-exchange-pane-fidelity", "pane-fidelity");
         let worktree_tool_path = format!(
@@ -9681,10 +9758,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("test-task"),
                 title: "Test task".into(),
                 state: TaskState::InProgress,
@@ -9809,11 +9887,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/plan-0016.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("done-task"),
                     title: "Completed task".into(),
                     state: TaskState::Done,
@@ -9826,6 +9905,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("failed-task"),
                     title: "Failed task".into(),
                     state: TaskState::Failed,
@@ -9909,11 +9989,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/collapse-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("task-a"),
                     title: "Task A".into(),
                     state: TaskState::Done,
@@ -9926,6 +10007,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("task-b"),
                     title: "Task B".into(),
                     state: TaskState::Done,
@@ -9995,11 +10077,12 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/no-table.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![
                 TaskView {
+                    authored: None,
                     id: TaskId::new("t1"),
                     title: "Task One".into(),
                     state: TaskState::Done,
@@ -10012,6 +10095,7 @@ mod tests {
                     entry_text: String::new(),
                 },
                 TaskView {
+                    authored: None,
                     id: TaskId::new("t2"),
                     title: "Task Two".into(),
                     state: TaskState::InProgress,
@@ -10522,6 +10606,7 @@ mod tests {
         let task_id = TaskId::new("test-task");
 
         let task = TaskView {
+            authored: None,
             id: task_id.clone(),
             title: "Test Task".into(),
             state: TaskState::Done,
@@ -10537,7 +10622,7 @@ mod tests {
         let run = RunView {
             id: run_id,
             run_uid: "test-uid".to_string(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Completed,
             project: "test-project".to_string(),
             tasks: vec![task],
@@ -10598,6 +10683,7 @@ mod tests {
         let task_id = TaskId::new("test-task");
 
         let task = TaskView {
+            authored: None,
             id: task_id.clone(),
             title: "Test Task".into(),
             state: TaskState::Done,
@@ -10613,7 +10699,7 @@ mod tests {
         let run = RunView {
             id: run_id,
             run_uid: "test-uid".to_string(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Completed,
             project: "test-project".to_string(),
             tasks: vec![task],
@@ -10675,22 +10761,18 @@ mod tests {
         let mut app = App::new(api, vec![], PathBuf::from("."));
 
         // Build a PlanEntry with long scope content (30 lines — more than the 10-row terminal).
-        let long_scope: String = (1..=30)
-            .map(|i| format!("Scope line {i}: some content about the plan scope.\n"))
-            .collect();
-        let plan = makina_core::orchestrator::PlanEntry {
-            slug: "0032-test".to_string(),
-            dir: PathBuf::from("docs/plans/0032-test"),
-            has_tasks: true,
-            tasks: vec![
-                makina_core::orchestrator::PlanTaskPreview {
+        let plan = test_plan_entry(
+            PathBuf::from("docs/plans/0032-test"),
+            "0032-test".to_string(),
+            vec![
+                TestPlanTask {
                     id: "task-alpha".to_string(),
                     title: "Alpha task".to_string(),
                     gated: false,
                     body: String::new(),
                     depends_on: vec![],
                 },
-                makina_core::orchestrator::PlanTaskPreview {
+                TestPlanTask {
                     id: "task-beta".to_string(),
                     title: "Beta task (GATED)".to_string(),
                     gated: true,
@@ -10698,16 +10780,13 @@ mod tests {
                     depends_on: vec!["task-alpha".to_string()],
                 },
             ],
-            scope_text: Some(long_scope),
-            architecture_text: Some("Architecture overview.".to_string()),
-            status_text: Some("In progress.".to_string()),
-        };
+        );
 
         // Expand all four sections so every render path is exercised.
         {
             let sections = app
                 .accordion_state
-                .entry(PlanIdentity::legacy("0032-test"))
+                .entry(fixture_plan_identity(&app, &plan))
                 .or_default();
             sections.insert(AccordionSection::Scope);
             sections.insert(AccordionSection::Architecture);
@@ -10752,15 +10831,11 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let app = App::new(api, vec![], PathBuf::from("."));
 
-        let plan = makina_core::orchestrator::PlanEntry {
-            slug: "0032-collapsed".to_string(),
-            dir: PathBuf::from("docs/plans/0032-collapsed"),
-            has_tasks: false,
-            tasks: vec![],
-            scope_text: Some("Some scope content.".to_string()),
-            architecture_text: None,
-            status_text: None,
-        };
+        let plan = test_plan_entry(
+            PathBuf::from("docs/plans/0032-collapsed"),
+            "0032-collapsed".to_string(),
+            vec![],
+        );
 
         // No accordion_state entry — all sections default to collapsed.
         terminal
@@ -10791,21 +10866,17 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], PathBuf::from("."));
 
-        let plan = makina_core::orchestrator::PlanEntry {
-            slug: "0032-missing".to_string(),
-            dir: PathBuf::from("docs/plans/0032-missing"),
-            has_tasks: false,
-            tasks: vec![],
-            scope_text: None,
-            architecture_text: None,
-            status_text: None,
-        };
+        let plan = test_plan_entry(
+            PathBuf::from("docs/plans/0032-missing"),
+            "0032-missing".to_string(),
+            vec![],
+        );
 
         // Expand all four sections to force placeholder rendering.
         {
             let sections = app
                 .accordion_state
-                .entry(PlanIdentity::legacy("0032-missing"))
+                .entry(fixture_plan_identity(&app, &plan))
                 .or_default();
             sections.insert(AccordionSection::Scope);
             sections.insert(AccordionSection::Architecture);
@@ -10827,18 +10898,14 @@ mod tests {
             screen.contains("[-]"),
             "expanded sections must show '[-]' markers; screen:\n{screen}"
         );
-        // Placeholders for missing content appear when sections are expanded.
+        // Typed fixture documents provide their canonical section bodies.
         assert!(
-            screen.contains("(no SCOPE.md)"),
-            "missing SCOPE must show placeholder when expanded; screen:\n{screen}"
+            screen.contains("This plan implements tab-based focus navigation."),
+            "typed SCOPE content must render when expanded; screen:\n{screen}"
         );
         assert!(
-            screen.contains("(no ARCHITECTURE.md)"),
-            "missing ARCHITECTURE must show placeholder when expanded; screen:\n{screen}"
-        );
-        assert!(
-            screen.contains("(no STATUS.md)"),
-            "missing STATUS must show placeholder when expanded; screen:\n{screen}"
+            screen.contains("The focus model supports keyboard navigation."),
+            "typed ARCHITECTURE content must render when expanded; screen:\n{screen}"
         );
         // Tasks placeholder when empty.
         assert!(
@@ -10859,25 +10926,17 @@ mod tests {
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], PathBuf::from("."));
 
-        let plan = makina_core::orchestrator::PlanEntry {
-            slug: "0035-md".to_string(),
-            dir: PathBuf::from("docs/plans/0035-md"),
-            has_tasks: false,
-            tasks: vec![],
-            scope_text: Some(
-                "## Scope Heading\n\nA **bold** word and an _italic_ word.\n\n\
-                 - first bullet\n- second bullet\n\n`inline_code` here.\n"
-                    .to_string(),
-            ),
-            architecture_text: Some("### Layers\n\nText with `code`.".to_string()),
-            status_text: Some("**Status:** done.".to_string()),
-        };
+        let plan = test_plan_entry(
+            PathBuf::from("docs/plans/0035-md"),
+            "0035-md".to_string(),
+            vec![],
+        );
 
         // Expand SCOPE, ARCHITECTURE, and STATUS (the Markdown-rendered sections).
         {
             let sections = app
                 .accordion_state
-                .entry(PlanIdentity::legacy("0035-md"))
+                .entry(fixture_plan_identity(&app, &plan))
                 .or_default();
             sections.insert(AccordionSection::Scope);
             sections.insert(AccordionSection::Architecture);
@@ -10895,16 +10954,12 @@ mod tests {
 
         // The human-readable text survives …
         assert!(
-            screen.contains("Scope Heading"),
-            "heading text must render; screen:\n{screen}"
+            screen.contains("This plan implements tab-based focus navigation."),
+            "scope text must render; screen:\n{screen}"
         );
         assert!(
-            screen.contains("bold") && screen.contains("italic"),
-            "inline-styled words must render; screen:\n{screen}"
-        );
-        assert!(
-            screen.contains("first bullet"),
-            "list items must render; screen:\n{screen}"
+            screen.contains("The focus model supports keyboard navigation."),
+            "architecture text must render; screen:\n{screen}"
         );
 
         // … but the raw CommonMark markup must NOT appear verbatim.
@@ -10935,7 +10990,8 @@ mod tests {
             .map(|i| RunView {
                 id: RunId(i as u64),
                 run_uid: format!("run-{}", i),
-                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                plan_dir: makina_core::plan::PlanKey::parse(format!("docs/plans/{:04}-Run", i + 1))
+                    .unwrap(),
                 status: RunStatus::Running,
                 project: "test-project".to_string(),
                 tasks: vec![],
@@ -10982,7 +11038,8 @@ mod tests {
             .map(|i| RunView {
                 id: RunId(i as u64),
                 run_uid: format!("run-{}", i),
-                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                plan_dir: makina_core::plan::PlanKey::parse(format!("docs/plans/{:04}-Run", i + 1))
+                    .unwrap(),
                 status: RunStatus::Running,
                 project: "test-project".to_string(),
                 tasks: vec![],
@@ -11038,7 +11095,8 @@ mod tests {
             .map(|i| RunView {
                 id: RunId(i as u64),
                 run_uid: format!("run-{}", i),
-                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                plan_dir: makina_core::plan::PlanKey::parse(format!("docs/plans/{:04}-Run", i + 1))
+                    .unwrap(),
                 status: RunStatus::Running,
                 project: "test-project".to_string(),
                 tasks: vec![],
@@ -11057,11 +11115,11 @@ mod tests {
         // the cursor (item 0) visible.
         let sidebar_content = extract_buffer_region(&buffer, 1, 21, 2, 8);
         assert!(
-            sidebar_content.contains("run-20"),
+            sidebar_content.contains("0021-Run"),
             "sidebar must show item 20 (the manual offset) when scrolled; was:\n{sidebar_content}"
         );
         assert!(
-            !sidebar_content.contains("run-0"),
+            !sidebar_content.contains("0001-Run"),
             "sidebar must NOT show the top item (run-0) after scrolling past it; was:\n{sidebar_content}"
         );
 
@@ -11110,7 +11168,8 @@ mod tests {
             .map(|i| RunView {
                 id: RunId(i as u64),
                 run_uid: format!("run-{}", i),
-                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                plan_dir: makina_core::plan::PlanKey::parse(format!("docs/plans/{:04}-Run", i + 1))
+                    .unwrap(),
                 status: RunStatus::Running,
                 project: "test-project".to_string(),
                 tasks: vec![],
@@ -11176,7 +11235,8 @@ mod tests {
             .map(|i| RunView {
                 id: RunId(i as u64),
                 run_uid: format!("run-{}", i),
-                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                plan_dir: makina_core::plan::PlanKey::parse(format!("docs/plans/{:04}-Run", i + 1))
+                    .unwrap(),
                 status: RunStatus::Running,
                 project: "test-project".to_string(),
                 tasks: vec![],
@@ -11197,7 +11257,7 @@ mod tests {
         let buf_before = terminal.backend().buffer().clone();
         let sidebar_before = extract_buffer_region(&buf_before, 4, 21, 2, 8);
         assert!(
-            sidebar_before.contains("run-0"),
+            sidebar_before.contains("0001-Run"),
             "initial render must show the top item; was:\n{sidebar_before}"
         );
 
@@ -11211,11 +11271,11 @@ mod tests {
         let buf_after = terminal.backend().buffer().clone();
         let sidebar_after = extract_buffer_region(&buf_after, 4, 21, 2, 8);
         assert!(
-            sidebar_after.contains("run-5"),
+            sidebar_after.contains("0006-Run"),
             "after 5 wheel-down clicks the sidebar must show item 5 (offset 5); was:\n{sidebar_after}"
         );
         assert!(
-            !sidebar_after.contains("run-0"),
+            !sidebar_after.contains("0001-Run"),
             "after 5 wheel-down clicks the top item (run-0) must be scrolled out of view; was:\n{sidebar_after}"
         );
     }
@@ -11235,7 +11295,8 @@ mod tests {
             .map(|i| RunView {
                 id: RunId(i as u64),
                 run_uid: format!("run-{}", i),
-                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                plan_dir: makina_core::plan::PlanKey::parse(format!("docs/plans/{:04}-Run", i + 1))
+                    .unwrap(),
                 status: RunStatus::Running,
                 project: "test-project".to_string(),
                 tasks: vec![],
@@ -11287,7 +11348,8 @@ mod tests {
             .map(|i| RunView {
                 id: RunId(i as u64),
                 run_uid: format!("run-{}", i),
-                task_list_path: PathBuf::from(format!(".tasks/run-{}.json", i)),
+                plan_dir: makina_core::plan::PlanKey::parse(format!("docs/plans/{:04}-Run", i + 1))
+                    .unwrap(),
                 status: RunStatus::Running,
                 project: "test-project".to_string(),
                 tasks: vec![],
@@ -11365,7 +11427,11 @@ mod tests {
                 .map(|i| RunView {
                     id: RunId(i as u64),
                     run_uid: format!("run-{i}"),
-                    task_list_path: PathBuf::from(format!(".tasks/run-{i}.json")),
+                    plan_dir: makina_core::plan::PlanKey::parse(format!(
+                        "docs/plans/{:04}-Run",
+                        i + 1
+                    ))
+                    .unwrap(),
                     status: RunStatus::Running,
                     project: "test-project".to_string(),
                     tasks: vec![],
@@ -11391,19 +11457,19 @@ mod tests {
         let sidebar1 = extract_buffer_region(&buf1, 1, 23, 2, 8);
 
         assert!(
-            sidebar1.contains("run-3"),
+            sidebar1.contains("0004-Run"),
             "offset=3: item at index 3 (run-3) must be visible in the sidebar; sidebar was:\n{sidebar1}"
         );
         assert!(
-            !sidebar1.contains("run-0"),
+            !sidebar1.contains("0001-Run"),
             "offset=3: item at index 0 (run-0) must NOT be visible; sidebar was:\n{sidebar1}"
         );
         assert!(
-            !sidebar1.contains("run-1"),
+            !sidebar1.contains("0002-Run"),
             "offset=3: item at index 1 (run-1) must NOT be visible; sidebar was:\n{sidebar1}"
         );
         assert!(
-            !sidebar1.contains("run-2"),
+            !sidebar1.contains("0003-Run"),
             "offset=3: item at index 2 (run-2) must NOT be visible; sidebar was:\n{sidebar1}"
         );
 
@@ -11420,12 +11486,12 @@ mod tests {
         let sidebar2 = extract_buffer_region(&buf2, 1, 23, 2, 8);
 
         assert!(
-            sidebar2.contains("run-0"),
+            sidebar2.contains("0001-Run"),
             "offset=0: item at index 0 (run-0) must be visible in the sidebar; sidebar was:\n{sidebar2}"
         );
         // With 6 inner rows and offset=0, items 0-5 are visible; item 6 is not.
         assert!(
-            !sidebar2.contains("run-6"),
+            !sidebar2.contains("0007-Run"),
             "offset=0: item at index 6 (run-6) must NOT be visible with only 6 inner rows; sidebar was:\n{sidebar2}"
         );
     }
@@ -11446,6 +11512,7 @@ mod tests {
         let mut dep_tasks = Vec::new();
         for i in 0..12 {
             dep_tasks.push(TaskView {
+                authored: None,
                 id: TaskId::new(format!("dep-{}", i)),
                 title: format!("Dependency {}", i),
                 state: TaskState::Done,
@@ -11465,6 +11532,7 @@ mod tests {
             depends_on.push(TaskId::new(format!("dep-{}", i)));
         }
         let task_with_deps = TaskView {
+            authored: None,
             id: TaskId::new("main-task"),
             title: "Main task".into(),
             state: TaskState::Done,
@@ -11481,7 +11549,7 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: "test-run".to_string(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: "test-project".to_string(),
             tasks: dep_tasks,
@@ -11609,10 +11677,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/geom-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("geom-task"),
                 title: "Geometry Task".into(),
                 state: TaskState::InProgress,
@@ -11740,10 +11809,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("test-task"),
                 title: "Test Task".into(),
                 state: TaskState::InProgress,
@@ -11797,10 +11867,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("click-test"),
                 title: "Click Test".into(),
                 state: TaskState::InProgress,
@@ -11847,10 +11918,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("width-test"),
                 title: "Width Test".into(),
                 state: TaskState::Ready,
@@ -11909,10 +11981,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("scroll-test"),
                 title: "Scroll Test".into(),
                 state: TaskState::InProgress,
@@ -11988,10 +12061,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("offset-test"),
                 title: "Offset Test".into(),
                 state: TaskState::InProgress,
@@ -12068,10 +12142,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/exec-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("exec-task"),
                 title: "Exec Task".into(),
                 state: TaskState::InProgress,
@@ -12227,10 +12302,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/rail-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: task_id.clone(),
                 title: "Rail Test".into(),
                 state: TaskState::InReview,
@@ -12342,10 +12418,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/markdown-detail.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+    authored: None,
                 id: TaskId::new("markdown-detail"),
                 title: "Markdown Detail".into(),
                 state: TaskState::InProgress,
@@ -12446,28 +12523,19 @@ mod tests {
     fn plan_task_tab_uses_same_markdown_detail_before_and_after_start() {
         use crate::app::{AppEvent, TabContent};
         use makina_core::api::{AgentRole, Event, ExchangeEvent};
-        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
 
         let mut terminal = make_terminal(150, 80);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], PathBuf::from("."));
         app.verbose_mode = true;
-        app.discovered_plans = vec![PlanEntry {
-            dir: PathBuf::from("docs/plans/0004-markdown-plan"),
-            slug: "0004-markdown-plan".to_string(),
-            has_tasks: true,
-            tasks: vec![PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(PathBuf::from("docs/plans/0004-markdown-plan"), "0004-markdown-plan".to_string(), vec![TestPlanTask {
                 id: "render-markdown".to_string(),
                 title: "Render Markdown".to_string(),
                 gated: false,
                 depends_on: vec!["setup-task".to_string()],
                 body: "Scope has **bold** preview.\n\n```rust\nlet preview_code = true;\n```\n\n- **Depends on:** setup-task\n- **Done when:** preview passes."
                     .to_string(),
-            }],
-            scope_text: None,
-            architecture_text: None,
-            status_text: None,
-        }];
+            }])];
         let plan_identity = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::PlanTask {
             plan: plan_identity,
@@ -12497,7 +12565,7 @@ mod tests {
                 && !preview_screen.contains("```")
                 && !preview_screen.contains("**Depends on:**")
                 && !preview_screen.contains("**Done when:**"),
-            "preview Scope must not leak raw task-list markdown fields; screen:\n{preview_screen}"
+            "preview Scope must not leak raw task-document fields; screen:\n{preview_screen}"
         );
         assert!(
             row_with_text_has_bg(
@@ -12511,10 +12579,11 @@ mod tests {
         app.runs.push(RunView {
             id: RunId(7),
             run_uid: "run-live".to_string(),
-            task_list_path: PathBuf::from("docs/plans/0004-markdown-plan/TASKS.md"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0004-markdown-plan").unwrap(),
             status: RunStatus::Running,
             project: "test".to_string(),
             tasks: vec![TaskView {
+    authored: None,
                 id: TaskId::new("render-markdown"),
                 title: "Render Markdown".to_string(),
                 state: TaskState::InProgress,
@@ -12596,28 +12665,19 @@ mod tests {
     fn plan_task_tab_uses_same_markdown_detail_before_and_after_start_repeat() {
         use crate::app::{AppEvent, TabContent};
         use makina_core::api::{AgentRole, Event, ExchangeEvent};
-        use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
 
         let mut terminal = make_terminal(150, 80);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], PathBuf::from("."));
         app.verbose_mode = true;
-        app.discovered_plans = vec![PlanEntry {
-            dir: PathBuf::from("docs/plans/0004-markdown-plan"),
-            slug: "0004-markdown-plan".to_string(),
-            has_tasks: true,
-            tasks: vec![PlanTaskPreview {
+        app.discovered_plans = vec![test_plan_entry(PathBuf::from("docs/plans/0004-markdown-plan"), "0004-markdown-plan".to_string(), vec![TestPlanTask {
                 id: "render-markdown".to_string(),
                 title: "Render Markdown".to_string(),
                 gated: false,
                 depends_on: vec!["setup-task".to_string()],
                 body: "Scope has **bold** preview.\n\n```rust\nlet preview_code = true;\n```\n\n- **Depends on:** setup-task\n- **Done when:** preview passes."
                     .to_string(),
-            }],
-            scope_text: None,
-            architecture_text: None,
-            status_text: None,
-        }];
+            }])];
         let plan_identity = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
         app.tabs.open_tab(TabContent::PlanTask {
             plan: plan_identity,
@@ -12647,7 +12707,7 @@ mod tests {
                 && !preview_screen.contains("```")
                 && !preview_screen.contains("**Depends on:**")
                 && !preview_screen.contains("**Done when:**"),
-            "preview Scope must not leak raw task-list markdown fields; screen:\n{preview_screen}"
+            "preview Scope must not leak raw task-document fields; screen:\n{preview_screen}"
         );
         assert!(
             row_with_text_has_bg(
@@ -12661,10 +12721,11 @@ mod tests {
         app.runs.push(RunView {
             id: RunId(7),
             run_uid: "run-live".to_string(),
-            task_list_path: PathBuf::from("docs/plans/0004-markdown-plan/TASKS.md"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0004-markdown-plan").unwrap(),
             status: RunStatus::Running,
             project: "test".to_string(),
             tasks: vec![TaskView {
+    authored: None,
                 id: TaskId::new("render-markdown"),
                 title: "Render Markdown".to_string(),
                 state: TaskState::InProgress,
@@ -12754,10 +12815,11 @@ mod tests {
         let run = RunView {
             id: RunId(1),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/empty-test.json"),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![TaskView {
+                authored: None,
                 id: TaskId::new("empty-task"),
                 title: "Empty Task".into(),
                 state: TaskState::Ready,
@@ -12937,19 +12999,15 @@ mod tests {
         const W: u16 = 80;
         const H: u16 = 24;
         // Row of the SCOPE header line (0-based): Plan, Dir, blank, then SCOPE.
-        const SCOPE_ROW: u16 = 3;
+        const SCOPE_ROW: u16 = 6;
         // Column where "SCOPE" text begins: "[+] " is 4 chars.
         const SCOPE_COL: u16 = 4;
 
-        let plan = makina_core::orchestrator::PlanEntry {
-            slug: "test-focus".to_string(),
-            dir: std::path::PathBuf::from("docs/plans/test-focus"),
-            has_tasks: false,
-            tasks: vec![],
-            scope_text: Some("Scope content.".to_string()),
-            architecture_text: None,
-            status_text: None,
-        };
+        let plan = test_plan_entry(
+            std::path::PathBuf::from("docs/plans/test-focus"),
+            "test-focus".to_string(),
+            vec![],
+        );
 
         let themes = vec![
             crate::theme::ayu_dark(),

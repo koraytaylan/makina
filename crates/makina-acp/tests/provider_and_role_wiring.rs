@@ -26,7 +26,7 @@ use makina_core::backend::{
 use makina_core::config::{
     Config, GlobalConfig, ProjectConfig, ProviderConfig, RoleAssignment, RolesConfig,
 };
-use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::test_support::setup_temp_repo;
 use makina_core::worktree::WorktreeManager;
@@ -167,6 +167,7 @@ async fn roles_use_distinct_providers() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: "provider-wiring".into(),
         tasks: vec![make_task(task_id)],
+        authored: Default::default(),
     }));
 
     let worktree_manager = WorktreeManager::new(repo_root.clone(), "develop".into());
@@ -195,7 +196,7 @@ async fn roles_use_distinct_providers() {
         "provider-wiring".into(),
         "test-run-uid-providers".into(),
         "provider-test".into(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph must not error");
@@ -477,6 +478,7 @@ async fn two_providers_two_roles() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: "two-providers-test".into(),
         tasks: vec![make_task(task_id)],
+        authored: Default::default(),
     }));
 
     let worktree_manager = WorktreeManager::new(repo_root.clone(), "develop".into());
@@ -547,7 +549,7 @@ async fn two_providers_two_roles() {
         "two-providers-test".into(),
         "test-run-uid-two-providers".into(),
         "two-providers-acceptance".into(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph must not error");

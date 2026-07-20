@@ -29,7 +29,7 @@ use makina_core::audit::NoopAuditRegistry;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::backend::{AgentBackend, Prompt, ResponseEvent, SessionConfig};
 use makina_core::config::Config;
-use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::paths;
 use makina_core::state_machine::{IllegalTransition, TaskEvent, transition};
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
@@ -86,6 +86,7 @@ pub fn sample_graph(slug: impl Into<String>, tasks: Vec<Task>) -> TaskGraph {
     TaskGraph {
         slug: slug.into(),
         tasks,
+        authored: Default::default(),
     }
 }
 
@@ -158,7 +159,7 @@ pub async fn run_graph_in_repo_result(
         run_slug,
         "test-run".to_string(),
         String::new(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await?;
 
@@ -172,7 +173,7 @@ pub async fn graph_snapshot(shared: &SharedTaskGraph) -> TaskGraph {
 
 /// Worktree path for the scheduler's test path (empty plan slug).
 pub fn scheduler_worktree_path(repo_root: &Path, task_id: &str) -> PathBuf {
-    paths::worktree(repo_root, "", task_id)
+    paths::worktree(repo_root, "", task_id).expect("external state root")
 }
 
 /// Task branch for the scheduler's test path (empty plan slug).

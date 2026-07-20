@@ -89,10 +89,36 @@
 //! parallel.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::cmd_output::combine_output;
+
+fn validate_identity(identity: &TaskLandingIdentity) -> Result<(), MergeError> {
+    for (name, value) in [
+        ("plan", identity.plan.as_str()),
+        ("task", identity.task.as_str()),
+        ("run", identity.run.as_str()),
+    ] {
+        if value.is_empty() || value.contains(['\n', '\r', '\0']) {
+            return Err(MergeError::GitCommandFailed {
+                command: "validate task landing identity".into(),
+                stderr: format!("{name} identity is empty or contains a line delimiter"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn exact_trailer<'a>(message: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}: ");
+    let mut values = message
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix));
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
 
 // ── MergeError ────────────────────────────────────────────────────────────────
 
@@ -131,6 +157,8 @@ pub enum MergeError {
         /// `git status --porcelain` output from the main worktree.
         status: String,
     },
+    #[error("target base branch `{branch}` is checked out at `{path}`; refusing ref advancement")]
+    BaseCheckedOut { branch: String, path: PathBuf },
 }
 
 // ── MergeOutcome ────────────────────────────────────────────────────────────────
@@ -144,7 +172,7 @@ pub enum MergeOutcome {
     /// The task branch was squash-merged successfully: exactly ONE new commit now
     /// sits on top of `base_branch` carrying the task's net change (possibly an
     /// empty commit for a no-op task — see the module docs).
-    Merged,
+    Merged { oid: crate::plan::GitObjectId },
 
     /// The squash-merge hit a conflict and was **not** applied.  `base_branch` has
     /// been restored to a clean state (no conflict markers, clean `git status`,
@@ -155,6 +183,22 @@ pub enum MergeOutcome {
         /// `merge --squash`), for diagnosis / agent reconciliation.
         details: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLandingIdentity {
+    pub plan: String,
+    pub task: String,
+    pub run: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LandingEvidenceStatus {
+    Missing,
+    Verified(crate::plan::GitObjectId),
+    Unreachable,
+    Mismatched,
+    Ambiguous,
 }
 
 /// The result of staging a completed plan's net diff into the main worktree.
@@ -186,7 +230,7 @@ pub enum StageOutcome {
 /// # async fn example() -> Result<(), makina_core::merge::MergeError> {
 /// let merger = SquashMerger::new(PathBuf::from("/path/to/repo"), "develop".into());
 /// match merger.squash_merge("task/my-task", "task(my-task): My task").await? {
-///     MergeOutcome::Merged => { /* tear down worktree, mark Done */ }
+///     MergeOutcome::Merged { .. } => { /* tear down worktree, mark Done */ }
 ///     MergeOutcome::Conflict { details } => {
 ///         // develop is already clean; reconcile (agent) or fail safely.
 ///         eprintln!("merge conflict:\n{details}");
@@ -209,9 +253,13 @@ pub struct SquashMerger {
     /// `reset --hard HEAD`, which targets whatever `repo_root` has checked out
     /// (expected to be `base_branch`).
     pub base_branch: String,
+    repository_child_token: Option<Arc<crate::repository_lease::RepositoryChildToken>>,
 }
 
 impl SquashMerger {
+    pub(crate) fn integration_root(&self) -> &std::path::Path {
+        &self.repo_root
+    }
     /// Create a new merger for the given repository and base branch.
     ///
     /// # Arguments
@@ -223,7 +271,16 @@ impl SquashMerger {
         Self {
             repo_root,
             base_branch,
+            repository_child_token: None,
         }
+    }
+
+    pub fn with_repository_child_token(
+        mut self,
+        token: Option<Arc<crate::repository_lease::RepositoryChildToken>>,
+    ) -> Self {
+        self.repository_child_token = token;
+        self
     }
 
     /// Squash-merge `task_branch` into `base_branch` as one commit.
@@ -267,7 +324,6 @@ impl SquashMerger {
             // then RESTORE the base branch to pristine before returning so
             // `develop` is never left with conflict markers / a half-staged index.
             let details = combine_output(&squash.stdout, &squash.stderr);
-            self.restore_base_branch().await?;
             return Ok(MergeOutcome::Conflict { details });
         }
 
@@ -287,7 +343,6 @@ impl SquashMerger {
             let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
             // Best-effort restore; if the restore itself errors, prefer to report
             // the restore error (the invariant is more important to surface).
-            self.restore_base_branch().await?;
             return Err(MergeError::GitCommandFailed {
                 command: format!(
                     "git -C {} commit --allow-empty -m {commit_message:?}",
@@ -297,7 +352,146 @@ impl SquashMerger {
             });
         }
 
-        Ok(MergeOutcome::Merged)
+        let oid = self.full_head_oid().await?;
+        Ok(MergeOutcome::Merged { oid })
+    }
+
+    pub async fn squash_merge_with_evidence(
+        &self,
+        task_branch: &str,
+        subject: &str,
+        identity: &TaskLandingIdentity,
+    ) -> Result<MergeOutcome, MergeError> {
+        validate_identity(identity)?;
+        match self.find_task_landing(identity).await? {
+            LandingEvidenceStatus::Verified(oid) => return Ok(MergeOutcome::Merged { oid }),
+            LandingEvidenceStatus::Missing => {}
+            other => {
+                return Err(MergeError::GitCommandFailed {
+                    command: "verify existing Phase-A evidence".into(),
+                    stderr: format!("landing evidence is not uniquely reusable: {other:?}"),
+                });
+            }
+        }
+        let message = format!(
+            "{subject}\n\nMakina-Plan: {}\nMakina-Task: {}\nMakina-Run: {}",
+            identity.plan, identity.task, identity.run
+        );
+        self.squash_merge(task_branch, &message).await
+    }
+
+    pub async fn find_task_landing(
+        &self,
+        identity: &TaskLandingIdentity,
+    ) -> Result<LandingEvidenceStatus, MergeError> {
+        validate_identity(identity)?;
+        let output = self
+            .run_git_raw(&[
+                "log",
+                "--first-parent",
+                "--format=%H%x00%B%x00%x1e",
+                &self.base_branch,
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(MergeError::GitCommandFailed {
+                command: "inspect first-parent landing lineage".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+            });
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut matches = Vec::new();
+        for record in text.split('\x1e') {
+            let mut fields = record.trim_matches('\n').splitn(2, '\0');
+            let Some(oid) = fields.next().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let body = fields.next().unwrap_or_default().trim_end_matches('\0');
+            if exact_trailer(body, "Makina-Phase").is_none()
+                && exact_trailer(body, "Makina-Plan") == Some(identity.plan.as_str())
+                && exact_trailer(body, "Makina-Task") == Some(identity.task.as_str())
+                && exact_trailer(body, "Makina-Run") == Some(identity.run.as_str())
+            {
+                matches.push(self.parse_oid(oid).await?);
+            }
+        }
+        Ok(match matches.len() {
+            0 => LandingEvidenceStatus::Missing,
+            1 => LandingEvidenceStatus::Verified(matches.remove(0)),
+            _ => LandingEvidenceStatus::Ambiguous,
+        })
+    }
+
+    pub async fn verify_task_landing_oid(
+        &self,
+        oid: &str,
+        identity: &TaskLandingIdentity,
+    ) -> Result<LandingEvidenceStatus, MergeError> {
+        validate_identity(identity)?;
+        let oid = match self.parse_oid(oid).await {
+            Ok(oid) => oid,
+            Err(_) => return Ok(LandingEvidenceStatus::Mismatched),
+        };
+        let exists = self
+            .run_git_raw(&["cat-file", "-e", &format!("{}^{{commit}}", oid.as_str())])
+            .await?;
+        if !exists.status.success() {
+            return Ok(LandingEvidenceStatus::Missing);
+        }
+        let reachable = self
+            .run_git_raw(&[
+                "merge-base",
+                "--is-ancestor",
+                oid.as_str(),
+                &self.base_branch,
+            ])
+            .await?;
+        if !reachable.status.success() {
+            return Ok(LandingEvidenceStatus::Unreachable);
+        }
+        let body = self
+            .run_git_raw(&["show", "-s", "--format=%B", oid.as_str()])
+            .await?;
+        let body = String::from_utf8_lossy(&body.stdout);
+        if exact_trailer(&body, "Makina-Phase").is_some()
+            || exact_trailer(&body, "Makina-Plan") != Some(identity.plan.as_str())
+            || exact_trailer(&body, "Makina-Task") != Some(identity.task.as_str())
+            || exact_trailer(&body, "Makina-Run") != Some(identity.run.as_str())
+        {
+            return Ok(LandingEvidenceStatus::Mismatched);
+        }
+        match self.find_task_landing(identity).await? {
+            LandingEvidenceStatus::Verified(actual) if actual == oid => {
+                Ok(LandingEvidenceStatus::Verified(oid))
+            }
+            LandingEvidenceStatus::Ambiguous => Ok(LandingEvidenceStatus::Ambiguous),
+            _ => Ok(LandingEvidenceStatus::Mismatched),
+        }
+    }
+
+    async fn full_head_oid(&self) -> Result<crate::plan::GitObjectId, MergeError> {
+        let oid = self.rev_parse("HEAD").await?;
+        self.parse_oid(&oid).await
+    }
+
+    async fn parse_oid(&self, oid: &str) -> Result<crate::plan::GitObjectId, MergeError> {
+        let format = self.rev_parse("--show-object-format").await?;
+        let format = match format.trim() {
+            "sha1" => crate::plan::GitObjectFormat::Sha1,
+            "sha256" => crate::plan::GitObjectFormat::Sha256,
+            other => {
+                return Err(MergeError::GitCommandFailed {
+                    command: "git rev-parse --show-object-format".into(),
+                    stderr: format!("unsupported object format {other}"),
+                });
+            }
+        };
+        crate::plan::GitObjectId::parse(oid.trim(), format).map_err(|error| {
+            MergeError::GitCommandFailed {
+                command: "validate full landing object ID".into(),
+                stderr: error.to_string(),
+            }
+        })
     }
 
     /// Squash-land `plan_branch` onto `base_branch` as ONE commit.
@@ -324,9 +518,11 @@ impl SquashMerger {
         plan_branch: &str,
         message: &str,
     ) -> Result<MergeOutcome, MergeError> {
-        // Check out base_branch first (we are currently on plan/{slug}).
+        let expected = self.rev_parse(&self.base_branch).await?;
+        // Prepare on a detached private workspace. The shared base ref moves
+        // only after the candidate commit exists and only by expected-old CAS.
         self.run_git_checked(
-            &["checkout", &self.base_branch],
+            &["checkout", "--detach", &expected],
             &format!(
                 "git -C {} checkout {}",
                 self.repo_root.display(),
@@ -343,7 +539,6 @@ impl SquashMerger {
         if !squash.status.success() {
             // Conflict. Capture detail and restore base_branch before returning.
             let details = combine_output(&squash.stdout, &squash.stderr);
-            self.restore_base_branch().await?;
             return Ok(MergeOutcome::Conflict { details });
         }
 
@@ -355,7 +550,6 @@ impl SquashMerger {
         if !commit.status.success() {
             // Commit failed. Restore base_branch before surfacing the error.
             let stderr = String::from_utf8_lossy(&commit.stderr).trim().to_string();
-            self.restore_base_branch().await?;
             return Err(MergeError::GitCommandFailed {
                 command: format!(
                     "git -C {} commit --allow-empty -m {message:?}",
@@ -365,7 +559,13 @@ impl SquashMerger {
             });
         }
 
-        Ok(MergeOutcome::Merged)
+        let candidate = self.rev_parse("HEAD").await?;
+        self.cas_branch(&self.base_branch, &candidate, &expected)
+            .await?;
+
+        Ok(MergeOutcome::Merged {
+            oid: self.parse_oid(&candidate).await?,
+        })
     }
 
     /// `git merge --no-ff {plan_branch}` onto `base_branch` (a real merge commit).
@@ -391,9 +591,9 @@ impl SquashMerger {
         plan_branch: &str,
         message: &str,
     ) -> Result<MergeOutcome, MergeError> {
-        // Check out base_branch first.
+        let expected = self.rev_parse(&self.base_branch).await?;
         self.run_git_checked(
-            &["checkout", &self.base_branch],
+            &["checkout", "--detach", &expected],
             &format!(
                 "git -C {} checkout {}",
                 self.repo_root.display(),
@@ -410,11 +610,16 @@ impl SquashMerger {
         if !merge.status.success() {
             // Conflict. Capture detail and restore base_branch before returning.
             let details = combine_output(&merge.stdout, &merge.stderr);
-            self.restore_base_branch().await?;
             return Ok(MergeOutcome::Conflict { details });
         }
 
-        Ok(MergeOutcome::Merged)
+        let candidate = self.rev_parse("HEAD").await?;
+        self.cas_branch(&self.base_branch, &candidate, &expected)
+            .await?;
+
+        Ok(MergeOutcome::Merged {
+            oid: self.parse_oid(&candidate).await?,
+        })
     }
 
     /// Stage `plan_branch`'s net diff onto `base_branch` without committing.
@@ -424,8 +629,9 @@ impl SquashMerger {
     /// unstaged changes, the method refuses to apply anything and leaves the
     /// plan branch available for manual recovery.
     pub async fn final_stage_changes(&self, plan_branch: &str) -> Result<StageOutcome, MergeError> {
+        let expected = self.rev_parse(&self.base_branch).await?;
         self.run_git_checked(
-            &["checkout", &self.base_branch],
+            &["checkout", "--detach", &expected],
             &format!(
                 "git -C {} checkout {}",
                 self.repo_root.display(),
@@ -459,7 +665,6 @@ impl SquashMerger {
 
         if !squash.status.success() {
             let details = combine_output(&squash.stdout, &squash.stderr);
-            self.restore_base_branch().await?;
             return Ok(StageOutcome::Conflict { details });
         }
 
@@ -488,27 +693,49 @@ impl SquashMerger {
     /// Steps 2 and 3 are load-bearing for the invariant, so a failure there is a
     /// hard [`MergeError`] (the caller then knows `develop` may be dirty and can
     /// halt rather than proceed on a corrupted base).
-    async fn restore_base_branch(&self) -> Result<(), MergeError> {
-        // 1) Best-effort: abort an in-progress merge if one exists. Ignore the
-        //    "there is no merge to abort" non-zero exit entirely.
-        let _ = self.run_git_raw(&["merge", "--abort"]).await;
+    async fn rev_parse(&self, revision: &str) -> Result<String, MergeError> {
+        let output = self.run_git_raw(&["rev-parse", revision]).await?;
+        if !output.status.success() {
+            return Err(MergeError::GitCommandFailed {
+                command: format!("git rev-parse {revision}"),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    }
 
-        // 2) Hard reset the index + working tree to HEAD (clears the staged
-        //    squash diff and any conflict markers in tracked files).
+    async fn cas_branch(
+        &self,
+        branch: &str,
+        candidate: &str,
+        expected: &str,
+    ) -> Result<(), MergeError> {
+        let listed = self
+            .run_git_raw(&["worktree", "list", "--porcelain"])
+            .await?;
+        let mut path = None;
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(value));
+            } else if line == format!("branch refs/heads/{branch}")
+                && path.as_ref().is_some_and(|value| value != &self.repo_root)
+            {
+                return Err(MergeError::BaseCheckedOut {
+                    branch: branch.into(),
+                    path: path.expect("checked above"),
+                });
+            }
+        }
         self.run_git_checked(
-            &["reset", "--hard", "HEAD"],
-            &format!("git -C {} reset --hard HEAD", self.repo_root.display()),
+            &[
+                "update-ref",
+                &format!("refs/heads/{branch}"),
+                candidate,
+                expected,
+            ],
+            &format!("compare-and-swap refs/heads/{branch} {expected} -> {candidate}"),
         )
-        .await?;
-
-        // 3) Remove any untracked files/dirs the squash may have introduced.
-        self.run_git_checked(
-            &["clean", "-fd"],
-            &format!("git -C {} clean -fd", self.repo_root.display()),
-        )
-        .await?;
-
-        Ok(())
+        .await
     }
 
     /// Run a `git -C {repo_root} {args}` command and return the raw [`Output`]
@@ -517,13 +744,14 @@ impl SquashMerger {
     ///
     /// [`Output`]: std::process::Output
     async fn run_git_raw(&self, args: &[&str]) -> Result<std::process::Output, MergeError> {
-        tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_root)
-            .args(args)
-            .output()
-            .await
-            .map_err(MergeError::Io)
+        let mut command = tokio::process::Command::new("git");
+        command.arg("-C").arg(&self.repo_root).args(args);
+        command.kill_on_drop(true);
+        #[cfg(unix)]
+        if let Some(token) = &self.repository_child_token {
+            token.inherit_into(&mut command);
+        }
+        command.output().await.map_err(MergeError::Io)
     }
 
     /// Run a `git -C {repo_root} {args}` command that MUST succeed; map a non-zero

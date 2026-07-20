@@ -1,8 +1,8 @@
 # Makina
 
 Makina is a multi-agent **software-factory orchestrator** written in Rust, with a
-terminal UI (ratatui) as its entry point. You point it at a **task list** written
-in structured Markdown; Makina plans it into a dependency-aware task graph, then
+terminal UI (ratatui) as its entry point. You point it at a validated **plan directory**
+containing per-task Markdown documents; Makina projects it into a dependency-aware task graph, then
 drives each task through a **develop → gate → review → merge** loop using an
 external AI coding agent — isolating every task in its own git worktree and
 squash-merging approved, gate-passing work back into your integration branch.
@@ -23,8 +23,8 @@ so Makina never handles model credentials.
 
 A central **Supervisor** drives each task through its lifecycle:
 
-1. **Plan** — the Planner interprets your Markdown task list into a task graph and
-   infers cross-cutting dependencies so conflicting work serializes.
+1. **Plan** — Makina validates typed plan/task documents, projects their DAG, and
+   adds deterministic footprint-collision edges so conflicting work serializes.
 2. **Develop** — the Supervisor creates a `task/{plan_slug}--{task_id}` branch +
    worktree off your base branch and hands the task to a Developer agent, which
    implements it.
@@ -138,23 +138,20 @@ the run on your machine. Prebuilt release binaries are published on
 [GitHub Releases](https://github.com/koraytaylan/makina/releases) (built by the
 tag-triggered Release workflow); release notes live in [`CHANGELOG.md`](CHANGELOG.md).
 
-## Write a task list
+## Write a plan
 
-A task list is structured Markdown: numbered sections, and per task a description,
-a `Depends on` line, and a gate-verifiable `Done when`. Full grammar:
-[`docs/spec/structured-text-convention.md`](docs/spec/structured-text-convention.md);
-worked example: [`docs/trial/dogfood-tasks.md`](docs/trial/dogfood-tasks.md).
+A plan is a directory containing scope, architecture, status, and one typed
+Markdown document per task. The directory is its stable identity; task
+frontmatter declares dependencies, gates, footprints, and authored status.
+Read the [authoritative format](docs/plans/README.md) and the complete
+[Plan 0048 example](docs/plans/0048-Per-Task-Plan-Documents-And-Transactional-Status/).
 
-```markdown
-## 0001 — My Slice
+Working-tree-only plans are `AwaitingCommit`; committed plans are `Unregistered`
+until exact registration binds their immutable validation base. Only registered,
+valid, dependency-ready, ungated tasks are `Ready`. Runtime checkpoints live
+outside the repository and cannot override plan documents or Git landing evidence.
 
-### add-helper — Add a small helper
-Add a documented helper function with unit tests to `makina-core`.
-- **Depends on:** —
-- **Done when:** the function exists with tests; `cargo test` and `cargo clippy -- -D warnings` pass.
-```
-
-## Caution — running a list mutates the repository
+## Caution — running a plan mutates the repository
 
 A Run creates `task/{plan_slug}--{task_id}` branches and
 `.worktrees/{plan_slug}--{task_id}/` checkouts and
@@ -177,9 +174,10 @@ makina create ~/tmp/todo --template todo   # scaffold a runnable project
 cd ~/tmp/todo && makina                     # open it in the TUI
 ```
 
-`makina create <path> [--template <name>]` bootstraps a git repo (with `main`
-and `develop`), a committed `.makina/config.toml`, and a starter
-`docs/plans/0001-Todo-Starter` plan. The only template today is `todo`.
+`makina create <path> [--template <name>]` bootstraps a git repo, a committed
+and registered starter plan on `develop`, and a checked-out `workspace` branch
+at the same commit. Keeping `develop` unchecked out lets Makina finalize it
+safely. The only template today is `todo`.
 
 ## Run
 
@@ -195,12 +193,12 @@ cargo run -p makina    # auto-detects an installed agent — no global config re
 **Keys:**
 - **`!`** — open the Doctor overlay for a headless health check
 - **`w`** (in Doctor overlay) — auto-detect an agent and write a starter `~/.makina/config.toml`
-- **`o`** — open the file browser and pick a task list (starts a Run)
+- **`o`** — open the file browser and pick a plan directory
 - **`Ctrl-P`** — open the command palette for start / pause / stop / reset
 - **`↑/↓`** (or `j/k`) — navigate · **`Tab`** or **`→/←`** — switch panel (Runs ↔ Detail) · **wheel** — scroll content · hold **Shift** (or **Option** in iTerm2) and drag to select & copy text
 - **`q`** / `Esc` / `Ctrl-C` — quit
 
-Open a list, choose **Start run** from the command palette, and watch per-task
+Open a plan, choose **Start run** from the command palette, and watch per-task
 state, iteration counts, and the live prompt/answer stream as the loop runs;
 approved tasks land on your base branch.
 
@@ -214,8 +212,8 @@ approved tasks land on your base branch.
 
 ## Limitations & Governance (MVP)
 
-- Task-graph state and task metadata are persisted in `.makina/tasks/{slug}.json`
-  with crash recovery (plans 0029/0030).
+- Volatile task checkpoints are persisted under Makina's external per-project
+  state root; durable task/status truth remains in plan documents and Git evidence.
 - Permission requests are answered automatically by `WorktreePolicy`, which
   auto-allows operations inside the assigned worktree and audits every decision.
 

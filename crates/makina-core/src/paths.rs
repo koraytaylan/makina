@@ -9,9 +9,9 @@
 //!
 //! **Transient helpers** (`run_dir`, `audit_log`, `task_log`, `run_logs_dir`,
 //! `worktree`) root at `state_root(repo_root)` — i.e.
-//! `$HOME/.makina/projects/{project_ns}/` when `HOME` is set, otherwise falling
-//! back to `repo_root/.makina`. The `state_root` function reads the `HOME`
-//! environment variable (the only env-var access in this module).
+//! `$HOME/.makina/projects/{project_ns}/`. Resolution fails when external user
+//! state is unavailable or aliases the repository; mutable runtime data never
+//! falls back to `repo_root/.makina`.
 
 use std::path::{Path, PathBuf};
 
@@ -185,16 +185,30 @@ pub fn project_ns(repo_root: &Path) -> String {
 /// **`HOME` env var:** this is the only place in `paths.rs` that reads the
 /// environment. The result is a pure function of `$HOME` and `repo_root`.
 ///
-/// Falls back to `repo_root/.makina` when `HOME` is unset (best-effort for
-/// `HOME`-less environments — explicitly documented, not a silent behaviour).
-pub fn state_root(repo_root: &Path) -> PathBuf {
-    match home_dir() {
-        Some(home) => home
-            .join(".makina")
-            .join("projects")
-            .join(project_ns(repo_root)),
-        None => repo_root.join(".makina"),
+/// Resolution is fallible and never falls back inside the repository.
+pub fn state_root(repo_root: &Path) -> std::io::Result<PathBuf> {
+    let home = home_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME/user state directory is unavailable",
+        )
+    })?;
+    let repository = std::fs::canonicalize(repo_root)?;
+    let home = std::fs::canonicalize(home)?;
+    let root = home
+        .join(".makina")
+        .join("projects")
+        .join(project_ns(&repository));
+    if root.starts_with(&repository) || repository.starts_with(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "runtime state root resolves inside repository: {}",
+                root.display()
+            ),
+        ));
     }
+    Ok(root)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +224,8 @@ pub fn state_root(repo_root: &Path) -> PathBuf {
 /// ```text
 /// /home/user/.makina/projects/myrepo-<hash6>/runs/01ABC
 /// ```
-pub fn run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
-    state_root(repo_root).join("runs").join(run_id)
+pub fn run_dir(repo_root: &Path, run_id: &str) -> std::io::Result<PathBuf> {
+    Ok(state_root(repo_root)?.join("runs").join(run_id))
 }
 
 /// Returns the audit-log path for a run:
@@ -223,8 +237,8 @@ pub fn run_dir(repo_root: &Path, run_id: &str) -> PathBuf {
 /// ```text
 /// /home/user/.makina/projects/myrepo-<hash6>/runs/01ABC/audit.jsonl
 /// ```
-pub fn audit_log(repo_root: &Path, run_id: &str) -> PathBuf {
-    run_dir(repo_root, run_id).join("audit.jsonl")
+pub fn audit_log(repo_root: &Path, run_id: &str) -> std::io::Result<PathBuf> {
+    Ok(run_dir(repo_root, run_id)?.join("audit.jsonl"))
 }
 
 /// Returns the per-task log path within a run:
@@ -236,16 +250,16 @@ pub fn audit_log(repo_root: &Path, run_id: &str) -> PathBuf {
 /// ```text
 /// /home/user/.makina/projects/myrepo-<hash6>/runs/01ABC/logs/task-a.log
 /// ```
-pub fn task_log(repo_root: &Path, run_id: &str, task_slug: &str) -> PathBuf {
-    run_dir(repo_root, run_id)
+pub fn task_log(repo_root: &Path, run_id: &str, task_slug: &str) -> std::io::Result<PathBuf> {
+    Ok(run_dir(repo_root, run_id)?
         .join("logs")
-        .join(format!("{task_slug}.log"))
+        .join(format!("{task_slug}.log")))
 }
 
 /// Returns the transient directory that holds Makina-created task worktrees:
 /// `$HOME/.makina/projects/{ns}/worktrees/`.
-pub fn worktrees_dir(repo_root: &Path) -> PathBuf {
-    state_root(repo_root).join("worktrees")
+pub fn worktrees_dir(repo_root: &Path) -> std::io::Result<PathBuf> {
+    Ok(state_root(repo_root)?.join("worktrees"))
 }
 
 /// Creates (if needed) and returns the per-run log directory:
@@ -255,7 +269,7 @@ pub fn worktrees_dir(repo_root: &Path) -> PathBuf {
 /// builders — this function performs I/O: it `create_dir_all`s the directory
 /// before returning it. Keep this the one clearly-separate I/O helper here.
 pub fn run_logs_dir(repo_root: &Path, run_id: &str) -> std::io::Result<PathBuf> {
-    let dir = run_dir(repo_root, run_id).join("logs");
+    let dir = run_dir(repo_root, run_id)?.join("logs");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -273,8 +287,8 @@ pub fn run_logs_dir(repo_root: &Path, run_id: &str) -> std::io::Result<PathBuf> 
 /// ```text
 /// /home/user/.makina/projects/myrepo-<hash6>/worktrees/0003-task-a-xxxx
 /// ```
-pub fn worktree(repo_root: &Path, plan_slug: &str, task_id: &str) -> PathBuf {
-    worktrees_dir(repo_root).join(short_worktree_name(plan_slug, task_id))
+pub fn worktree(repo_root: &Path, plan_slug: &str, task_id: &str) -> std::io::Result<PathBuf> {
+    Ok(worktrees_dir(repo_root)?.join(short_worktree_name(plan_slug, task_id)))
 }
 
 #[cfg(test)]
@@ -320,8 +334,8 @@ mod tests {
         // SAFETY: serialised by HOME_LOCK — no other thread mutates HOME concurrently
         unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
-        let expected = state_root(repo_root).join("runs").join("01ABC");
-        let got = run_dir(repo_root, "01ABC");
+        let expected = state_root(repo_root).unwrap().join("runs").join("01ABC");
+        let got = run_dir(repo_root, "01ABC").unwrap();
 
         assert_eq!(got, expected);
         // Must NOT be under repo_root/.makina
@@ -343,10 +357,11 @@ mod tests {
         unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
         let expected = state_root(repo_root)
+            .unwrap()
             .join("runs")
             .join("01ABC")
             .join("audit.jsonl");
-        let got = audit_log(repo_root, "01ABC");
+        let got = audit_log(repo_root, "01ABC").unwrap();
 
         assert_eq!(got, expected);
         assert!(
@@ -367,11 +382,12 @@ mod tests {
         unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
         let expected = state_root(repo_root)
+            .unwrap()
             .join("runs")
             .join("01ABC")
             .join("logs")
             .join("task-a.log");
-        let got = task_log(repo_root, "01ABC", "task-a");
+        let got = task_log(repo_root, "01ABC", "task-a").unwrap();
 
         assert_eq!(got, expected);
         assert!(
@@ -393,8 +409,11 @@ mod tests {
 
         // The leaf is now the short name, not the old plan--task composite.
         let short = short_worktree_name("my-plan", "task-a");
-        let expected = state_root(repo_root).join("worktrees").join(&short);
-        let got = worktree(repo_root, "my-plan", "task-a");
+        let expected = state_root(repo_root)
+            .unwrap()
+            .join("worktrees")
+            .join(&short);
+        let got = worktree(repo_root, "my-plan", "task-a").unwrap();
 
         assert_eq!(got, expected);
         assert!(
@@ -420,7 +439,7 @@ mod tests {
         // SAFETY: serialised by HOME_LOCK
         unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
-        let expected_prefix = state_root(repo_root);
+        let expected_prefix = state_root(repo_root).unwrap();
 
         let dir = run_logs_dir(repo_root, "01ABC").expect("first run_logs_dir call");
         assert!(
@@ -454,24 +473,26 @@ mod tests {
         // SAFETY: serialised by HOME_LOCK
         unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
-        let sr = state_root(repo_root);
+        let sr = state_root(repo_root).unwrap();
         let committed_root = repo_root.join(".makina");
 
         // Transient helpers must resolve under state_root
         assert!(
-            run_dir(repo_root, "r1").starts_with(&sr),
+            run_dir(repo_root, "r1").unwrap().starts_with(&sr),
             "run_dir must be under state_root"
         );
         assert!(
-            worktree(repo_root, "plan", "task").starts_with(&sr),
+            worktree(repo_root, "plan", "task")
+                .unwrap()
+                .starts_with(&sr),
             "worktree must be under state_root"
         );
         assert!(
-            task_log(repo_root, "r1", "t1").starts_with(&sr),
+            task_log(repo_root, "r1", "t1").unwrap().starts_with(&sr),
             "task_log must be under state_root"
         );
         assert!(
-            audit_log(repo_root, "r1").starts_with(&sr),
+            audit_log(repo_root, "r1").unwrap().starts_with(&sr),
             "audit_log must be under state_root"
         );
         // run_logs_dir is I/O — test the path before creation

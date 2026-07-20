@@ -6,7 +6,7 @@
 //! default) over a real git repository, and watches the full loop run:
 //!
 //! ```text
-//!   OpenRun(dogfood-tasks.md)          → Planner (deterministic interpreter)
+//!   OpenPlan(dogfood-tasks.md)          → Planner (deterministic interpreter)
 //!   StartRun                           → Supervisor scheduler
 //!     per task:  git worktree off develop
 //!                Developer (agent edits files in the worktree)
@@ -80,7 +80,7 @@ use makina_core::api::{
 use makina_core::backend::AgentBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::dependency::EdgeInferrer;
-use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::orchestrator::CoreApi;
 use makina_core::worktree::WorktreeManager;
 
@@ -175,7 +175,7 @@ fn live_repo_root() -> PathBuf {
 /// commit). Returns the tempdir (keep it alive) and the clone path.
 ///
 /// A *local* clone of a repo whose current branch is `develop` checks out
-/// `develop` and carries its full history — so the dogfood task list committed on
+/// `develop` and carries its full history — so the dogfood plan committed on
 /// `develop` is present in the clone.
 fn clone_live_repo() -> (tempfile::TempDir, PathBuf) {
     let live = live_repo_root();
@@ -289,7 +289,7 @@ async fn full_loop_lands_a_task_on_develop() {
     let dogfood = clone.join("docs/trial/dogfood-tasks.md");
     assert!(
         dogfood.exists(),
-        "dogfood task list must be present in the clone at {}",
+        "dogfood plan must be present in the clone at {}",
         dogfood.display()
     );
 
@@ -304,9 +304,9 @@ async fn full_loop_lands_a_task_on_develop() {
 
     // Deterministic planner (the dogfood list is well-formed structured text —
     // no model call needed for planning), same as the TUI's `main.rs`.
-    let interpreter = Arc::new(EdgeInferrer::new(
-        Arc::new(StructuredTextInterpreter::new()),
-    ));
+    let interpreter = Arc::new(EdgeInferrer::new(Arc::new(
+        SourceProjectionUnavailable::new(),
+    )));
 
     // Worktree manager + config rooted at the CLONE.
     let wm = WorktreeManager::new(clone.clone(), BASE_BRANCH.to_string());
@@ -327,13 +327,13 @@ async fn full_loop_lands_a_task_on_develop() {
         });
     }
 
-    // ── 4. OpenRun → StartRun (the two commands the TUI issues) ───────────────
+    // ── 4. OpenPlan → StartRun (the two commands the TUI issues) ───────────────
     let run = match api
-        .execute(Command::OpenRun {
-            task_list_path: dogfood.clone(),
+        .execute(Command::OpenPlan {
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
         })
         .await
-        .expect("OpenRun must succeed for the dogfood list")
+        .expect("OpenPlan must succeed for the dogfood list")
     {
         CommandOutcome::RunOpened { run } => run,
         other => panic!("expected RunOpened, got {other:?}"),
@@ -486,6 +486,15 @@ async fn full_loop_lands_a_task_on_develop() {
 /// Log one engine event compactly (so the run is observable with `--nocapture`).
 fn log_event(ev: &Event) {
     match ev {
+        Event::PlanRegistered {
+            plan_dir,
+            registration_oid,
+        } => {
+            eprintln!(
+                "  · PlanRegistered {} → {registration_oid}",
+                plan_dir.relative_dir.display()
+            )
+        }
         Event::RunOpened { run, .. } => eprintln!("  · RunOpened {run}"),
         Event::RunStatusChanged { run, status } => {
             eprintln!("  · RunStatusChanged {run} → {status:?}")
@@ -581,6 +590,9 @@ fn log_event(ev: &Event) {
         }
         Event::RunIntegrationBranchLeft { run, branch } => {
             eprintln!("  · RunIntegrationBranchLeft {run} → {branch}")
+        }
+        Event::RepositoryLeaseWaiting { run, .. } => {
+            eprintln!("  · RepositoryLeaseWaiting {run}")
         }
     }
 }

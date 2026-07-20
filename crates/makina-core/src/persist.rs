@@ -446,7 +446,10 @@ pub fn recover_for_resume(graph: &mut TaskGraph) {
             | TaskState::Ready
             | TaskState::Done
             | TaskState::Failed
-            | TaskState::Skipped => {}
+            | TaskState::Skipped
+            | TaskState::Blocked
+            | TaskState::Dropped
+            | TaskState::Gated => {}
         }
     }
 }
@@ -534,6 +537,7 @@ mod tests {
                     failure_reason: None,
                 },
             ],
+            authored: Default::default(),
         }
     }
 
@@ -887,6 +891,7 @@ mod tests {
                 make_task("t-done", TaskState::Done, 1, 1),
                 make_task("t-failed", TaskState::Failed, 3, 0),
             ],
+            authored: Default::default(),
         };
 
         super::recover_for_resume(&mut graph);
@@ -954,6 +959,7 @@ mod tests {
                 make_task("t-new", TaskState::New, 0, 0),
                 make_task("t-done", TaskState::Done, 1, 0),
             ],
+            authored: Default::default(),
         };
         let before = graph.clone();
 
@@ -1000,6 +1006,7 @@ mod tests {
                     message: "gate cap reached after 2 iterations".to_string(),
                 }),
             }],
+            authored: Default::default(),
         };
 
         // Persist and reload.

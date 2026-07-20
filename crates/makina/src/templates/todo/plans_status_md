@@ -1,0 +1,7 @@
+# Plans — roll-up board
+
+One row per plan. Task status is authored in each plan's `tasks/*.md` frontmatter and summarized by its `STATUS.md`.
+
+| Plan | Title | Status | Tasks | Outcome | Status doc |
+|---|---|---|---|---|---|
+| 0001 | Todo Starter | 📋 Planned | 0/1 | The starter project gains a tested task-state toggle while all configured gates remain green. | [status](0001-Todo-Starter/STATUS.md) |

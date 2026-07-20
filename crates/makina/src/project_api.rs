@@ -4,12 +4,12 @@
 //! in one Git repository: its worktree manager, config, persistence, audit, and
 //! transcript paths all belong to that repository. [`ProjectApiRouter`] keeps
 //! that invariant while letting the workspace UI open several repositories.
-//! It resolves an `OpenRun` path to its Git root, lazily creates one API per
-//! root, and translates each project's session-local [`RunId`] into a process-
-//! wide ID before exposing it to the TUI.
+//! Project-qualified plan identities select the Git root explicitly; the
+//! router lazily creates one API per root and translates each project's
+//! session-local [`RunId`] into a process-wide ID before exposing it to the TUI.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -118,33 +118,27 @@ impl RouterEvents {
     fn remap_event(&self, project_root: &Path, event: Event) -> Option<Event> {
         let map = |run| self.global_for(project_root, run);
         Some(match event {
+            Event::PlanRegistered {
+                plan_dir,
+                registration_oid,
+            } => Event::PlanRegistered {
+                plan_dir,
+                registration_oid,
+            },
             // Forward the inner API's single event instead of synthesizing a
             // second copy in `execute`. This preserves the refresh events that
             // ReinterpretRun and ResetRun intentionally emit as RunOpened.
-            Event::RunOpened {
-                run,
-                task_list_path,
-            } => {
-                let task_list_path = match project_task_path(project_root, &task_list_path) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        tracing::warn!(
-                            expected_project_root = %project_root.display(),
-                            task_list_path = %task_list_path.display(),
-                            %error,
-                            "dropping run event whose task list belongs to another project"
-                        );
-                        return None;
-                    }
-                };
-                Event::RunOpened {
-                    run: map(run),
-                    task_list_path,
-                }
-            }
+            Event::RunOpened { run, plan_dir } => Event::RunOpened {
+                run: map(run),
+                plan_dir,
+            },
             Event::RunStatusChanged { run, status } => Event::RunStatusChanged {
                 run: map(run),
                 status,
+            },
+            Event::RepositoryLeaseWaiting { run, owner } => Event::RepositoryLeaseWaiting {
+                run: map(run),
+                owner,
             },
             Event::TaskStateChanged { run, task, state } => Event::TaskStateChanged {
                 run: map(run),
@@ -282,6 +276,61 @@ pub struct ProjectApiRouter {
 }
 
 impl ProjectApiRouter {
+    /// Generate a plan through the API bound to an explicitly selected project.
+    ///
+    /// The project root is a routing concern and is intentionally not embedded
+    /// in the repository-local generation command.
+    pub async fn generate_plan_bundle(
+        &self,
+        project_root: &Path,
+        blueprint: makina_core::api::GeneratedPlanBlueprint,
+    ) -> Result<CommandOutcome, ApiError> {
+        let project_root = self.require_allowed_project(project_root)?;
+        self.project_api(&project_root)
+            .await?
+            .execute(Command::GeneratePlanBundle { blueprint })
+            .await
+    }
+
+    /// Open a plan in an explicitly selected workspace project.
+    ///
+    /// `PlanKey` is repository-relative, so the project root is deliberately
+    /// supplied at this binary boundary instead of inferred from matching
+    /// directory names across the workspace.
+    pub async fn open_plan(
+        &self,
+        project_root: &Path,
+        plan_dir: makina_core::plan::PlanKey,
+    ) -> Result<CommandOutcome, ApiError> {
+        let project_root = self.require_allowed_project(project_root)?;
+        let candidate = project_root.join(&plan_dir.relative_dir);
+        let resolved =
+            std::fs::canonicalize(&candidate).map_err(|error| ApiError::InvalidCommand {
+                reason: format!(
+                    "cannot resolve plan directory {}: {error}",
+                    candidate.display()
+                ),
+            })?;
+        if !resolved.starts_with(&project_root) || !resolved.is_dir() {
+            return Err(ApiError::InvalidCommand {
+                reason: format!(
+                    "plan directory {} is not contained in project {}",
+                    candidate.display(),
+                    project_root.display()
+                ),
+            });
+        }
+        let api = self.project_api(&project_root).await?;
+        let outcome = api.execute(Command::OpenPlan { plan_dir }).await?;
+        let CommandOutcome::RunOpened { run: local } = outcome else {
+            return Err(ApiError::Internal {
+                reason: "project API acknowledged OpenPlan without returning a run".to_string(),
+            });
+        };
+        let run = self.events.global_for(&project_root, local);
+        Ok(CommandOutcome::RunOpened { run })
+    }
+
     /// Create a router with an explicit initial workspace allowlist. Project
     /// APIs are built lazily or via [`register_project`](Self::register_project).
     pub fn new(
@@ -403,19 +452,6 @@ impl ProjectApiRouter {
     }
 
     fn qualify_view(&self, project_root: &Path, mut view: RunView) -> Option<RunView> {
-        view.task_list_path = match project_task_path(project_root, &view.task_list_path) {
-            Ok(path) => path,
-            Err(error) => {
-                tracing::warn!(
-                    expected_project_root = %project_root.display(),
-                    task_list_path = %view.task_list_path.display(),
-                    run_uid = %view.run_uid,
-                    %error,
-                    "dropping run view whose task list belongs to another project"
-                );
-                return None;
-            }
-        };
         view.id = self
             .events
             .global_for_view(project_root, view.id, &view.run_uid);
@@ -427,25 +463,82 @@ impl ProjectApiRouter {
 impl Api for ProjectApiRouter {
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
-            Command::OpenRun { task_list_path } => {
-                let (project_root, task_list_path) = project_for_task_path(&task_list_path)
-                    .map_err(|reason| ApiError::InvalidCommand { reason })?;
-                self.require_allowed_project(&project_root)?;
-                let api = self.project_api(&project_root).await?;
-                let outcome = api
-                    .execute(Command::OpenRun {
-                        task_list_path: task_list_path.clone(),
-                    })
-                    .await?;
-                let CommandOutcome::RunOpened { run: local } = outcome else {
-                    return Err(ApiError::Internal {
-                        reason: "project API acknowledged OpenRun without returning a run"
-                            .to_string(),
-                    });
-                };
-                let run = self.events.global_for(&project_root, local);
-                Ok(CommandOutcome::RunOpened { run })
+            Command::GeneratePlanBundle { .. } => Err(ApiError::InvalidCommand {
+                reason:
+                    "GeneratePlanBundle must be sent with an explicit project through the router"
+                        .into(),
+            }),
+            Command::RegisterPlan { .. } => Err(ApiError::InvalidCommand {
+                reason: "RegisterPlan must be sent to a repository-bound API".into(),
+            }),
+            Command::SetTaskDisposition {
+                run,
+                task,
+                expected_plan_oid,
+                action,
+            } => {
+                self.execute_for_run(run, |run| Command::SetTaskDisposition {
+                    run,
+                    task,
+                    expected_plan_oid,
+                    action,
+                })
+                .await
             }
+            Command::FinalizePlan {
+                plan_dir,
+                run_uid,
+                expected_plan_oid,
+                input,
+            } => {
+                let view = self
+                    .runs()
+                    .await
+                    .into_iter()
+                    .find(|view| view.run_uid == run_uid && view.plan_dir == plan_dir)
+                    .ok_or_else(|| ApiError::InvalidCommand {
+                        reason: "no routed run matches plan_dir and run_uid".into(),
+                    })?;
+                self.execute_for_run(view.id, |run| {
+                    let _ = run;
+                    Command::FinalizePlan {
+                        plan_dir,
+                        run_uid,
+                        expected_plan_oid,
+                        input,
+                    }
+                })
+                .await
+            }
+            Command::ReprepareFinalization {
+                plan_dir,
+                run_uid,
+                expected_plan_oid,
+            } => {
+                let view = self
+                    .runs()
+                    .await
+                    .into_iter()
+                    .find(|view| view.run_uid == run_uid && view.plan_dir == plan_dir)
+                    .ok_or_else(|| ApiError::InvalidCommand {
+                        reason: "no routed run matches plan_dir and run_uid".into(),
+                    })?;
+                self.execute_for_run(view.id, |run| {
+                    let _ = run;
+                    Command::ReprepareFinalization {
+                        plan_dir,
+                        run_uid,
+                        expected_plan_oid,
+                    }
+                })
+                .await
+            }
+            Command::OpenPlan { plan_dir } => Err(ApiError::InvalidCommand {
+                reason: format!(
+                    "OpenPlan for {} requires a project-qualified plan identity",
+                    plan_dir.relative_dir.display()
+                ),
+            }),
             Command::StartRun { run } => {
                 self.execute_for_run(run, |run| Command::StartRun { run })
                     .await
@@ -563,84 +656,6 @@ fn invalid_project(error: String) -> ApiError {
     ApiError::InvalidCommand { reason: error }
 }
 
-/// Resolve a task-list identity reported by a project API without allowing it
-/// to escape that API's canonical repository root.
-///
-/// Disk snapshots can legitimately point at a file that no longer exists, so
-/// this walks components instead of requiring the complete path to canonicalize.
-/// Any existing symlink component is still resolved and checked before the
-/// remaining (possibly missing) suffix is appended.
-fn project_task_path(project_root: &Path, task_path: &Path) -> Result<PathBuf, String> {
-    let relative = if task_path.is_absolute() {
-        task_path.strip_prefix(project_root).map_err(|_| {
-            format!(
-                "task list {} is outside project {}",
-                task_path.display(),
-                project_root.display()
-            )
-        })?
-    } else {
-        task_path
-    };
-
-    let mut resolved = project_root.to_path_buf();
-    for component in relative.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(name) => {
-                resolved.push(name);
-                match std::fs::symlink_metadata(&resolved) {
-                    Ok(_) => {
-                        resolved = std::fs::canonicalize(&resolved).map_err(|error| {
-                            format!(
-                                "cannot resolve task-list path {}: {error}",
-                                resolved.display()
-                            )
-                        })?;
-                        if !resolved.starts_with(project_root) {
-                            return Err(format!(
-                                "task list {} escapes project {} through a symlink",
-                                task_path.display(),
-                                project_root.display()
-                            ));
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "cannot inspect task-list path {}: {error}",
-                            resolved.display()
-                        ));
-                    }
-                }
-            }
-            Component::ParentDir => {
-                if resolved == project_root || !resolved.pop() {
-                    return Err(format!(
-                        "task list {} escapes project {}",
-                        task_path.display(),
-                        project_root.display()
-                    ));
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "task list {} has an invalid project-relative path",
-                    task_path.display()
-                ));
-            }
-        }
-    }
-    if !resolved.starts_with(project_root) {
-        return Err(format!(
-            "task list {} escapes project {}",
-            task_path.display(),
-            project_root.display()
-        ));
-    }
-    Ok(resolved)
-}
-
 /// Resolve any existing path inside a worktree to Git's authoritative top-level.
 ///
 /// This deliberately asks Git instead of walking ancestors for a `.git`
@@ -720,73 +735,6 @@ pub fn normalize_workspace_roots(
     (normalized, rejected)
 }
 
-/// Resolve an input task path to `(git root, canonical task path)`.
-///
-/// A missing final `TASKS.md` is accepted when its parent exists so Core can
-/// execute the documented TASKS-less generation flow. Existing symlinks are
-/// canonicalized before the Git root is selected, preventing a path that looks
-/// project-local from routing execution into a different repository.
-pub fn project_for_task_path(task_path: &Path) -> Result<(PathBuf, PathBuf), String> {
-    let absolute = if task_path.is_absolute() {
-        task_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| format!("cannot resolve current directory: {error}"))?
-            .join(task_path)
-    };
-
-    let canonical_task = match std::fs::symlink_metadata(&absolute) {
-        Ok(_) => std::fs::canonicalize(&absolute).map_err(|error| {
-            // In particular, reject a dangling final symlink instead of
-            // treating it as the documented missing-TASKS.md case.
-            format!("cannot resolve task list {}: {error}", absolute.display())
-        })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = absolute
-                .parent()
-                .ok_or_else(|| format!("task-list path has no parent: {}", absolute.display()))?;
-            let parent = std::fs::canonicalize(parent).map_err(|error| {
-                format!(
-                    "cannot resolve task-list parent {}: {error}",
-                    parent.display()
-                )
-            })?;
-            let name = absolute
-                .file_name()
-                .ok_or_else(|| format!("task-list path has no filename: {}", absolute.display()))?;
-            parent.join(name)
-        }
-        Err(error) => {
-            return Err(format!(
-                "cannot inspect task list {}: {error}",
-                absolute.display()
-            ));
-        }
-    };
-
-    let search_from = if canonical_task.is_dir() {
-        canonical_task.as_path()
-    } else {
-        canonical_task
-            .parent()
-            .ok_or_else(|| format!("task-list path has no parent: {}", canonical_task.display()))?
-    };
-    let project_root = canonicalize_project_root(search_from).map_err(|error| {
-        format!(
-            "task list {} is not inside a Git repository: {error}",
-            canonical_task.display()
-        )
-    })?;
-    if !canonical_task.starts_with(&project_root) {
-        return Err(format!(
-            "task list {} escapes project {}",
-            canonical_task.display(),
-            project_root.display()
-        ));
-    }
-    Ok((project_root, canonical_task))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,25 +770,20 @@ mod tests {
                 .expect("command mutex poisoned")
                 .push(command.clone());
             match command {
-                Command::OpenRun { task_list_path } => {
+                Command::OpenPlan { plan_dir } => {
                     let id = {
                         let mut runs = self.runs.lock().expect("runs mutex poisoned");
-                        if let Some(run) =
-                            runs.iter().find(|run| run.task_list_path == task_list_path)
-                        {
+                        if let Some(run) = runs.iter().find(|run| run.plan_dir == plan_dir) {
                             run.id
                         } else {
                             let id = RunId(self.next_id.fetch_add(1, Ordering::Relaxed));
-                            let project = canonicalize_project_root(&task_list_path)
-                                .ok()
-                                .and_then(|root| root.file_name().map(|name| name.to_owned()))
-                                .and_then(|name| name.to_str().map(str::to_owned))
-                                .unwrap_or_default();
+                            let project = "fake-project".to_string();
                             runs.push(RunView {
                                 id,
                                 run_uid: format!("fake-{}", id.0),
                                 project,
-                                task_list_path: task_list_path.clone(),
+                                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test")
+                                    .unwrap(),
                                 status: RunStatus::Pending,
                                 tasks: Vec::new(),
                                 report: IngestionReport::default(),
@@ -848,25 +791,19 @@ mod tests {
                             id
                         }
                     };
-                    let _ = self.events.send(Event::RunOpened {
-                        run: id,
-                        task_list_path,
-                    });
+                    let _ = self.events.send(Event::RunOpened { run: id, plan_dir });
                     Ok(CommandOutcome::RunOpened { run: id })
                 }
                 Command::ReinterpretRun { run } | Command::ResetRun { run } => {
-                    let task_list_path = self
+                    let plan_dir = self
                         .runs
                         .lock()
                         .expect("runs mutex poisoned")
                         .iter()
                         .find(|view| view.id == run)
-                        .map(|view| view.task_list_path.clone())
+                        .map(|view| view.plan_dir.clone())
                         .ok_or(ApiError::UnknownRun { run })?;
-                    let _ = self.events.send(Event::RunOpened {
-                        run,
-                        task_list_path,
-                    });
+                    let _ = self.events.send(Event::RunOpened { run, plan_dir });
                     Ok(CommandOutcome::Acknowledged)
                 }
                 _ => Ok(CommandOutcome::Acknowledged),
@@ -908,14 +845,77 @@ mod tests {
             "git init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        std::fs::create_dir_all(dir.path().join("docs/plans/same-plan"))
+        std::fs::create_dir_all(dir.path().join("docs/plans/0001-Test"))
             .expect("create plan directory");
-        std::fs::write(
-            dir.path().join("docs/plans/same-plan/TASKS.md"),
-            "# tasks\n",
-        )
-        .expect("write tasks");
+        std::fs::create_dir_all(dir.path().join("docs/plans/same-plan"))
+            .expect("create routing marker directory");
+        std::fs::write(dir.path().join("docs/plans/same-plan/marker"), "route\n")
+            .expect("write routing marker");
         dir
+    }
+
+    fn generation_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
+        use makina_core::api::{
+            GeneratedInitialStatusBlueprint, GeneratedPlanBlueprint, GeneratedTaskBlueprint,
+            GeneratedWorkstreamBlueprint,
+        };
+        GeneratedPlanBlueprint {
+            slug: "generated-plan".into(),
+            title: "Generated plan".into(),
+            scope: "Scope".into(),
+            architecture: "Architecture".into(),
+            initial_status: GeneratedInitialStatusBlueprint {
+                goal: "Goal".into(),
+                root_cause: "Cause".into(),
+                approach: "Approach".into(),
+                outcome: String::new(),
+                last_updated: "2026-07-20".into(),
+            },
+            workstreams: vec![GeneratedWorkstreamBlueprint {
+                id: "0001".into(),
+                title: "Core".into(),
+            }],
+            tasks: vec![GeneratedTaskBlueprint {
+                sequence: "01".into(),
+                id: "generate".into(),
+                title: "Generate".into(),
+                workstream: "0001".into(),
+                kind: "task".into(),
+                depends_on: vec![],
+                touches: vec!["crates/**".into()],
+                gated: false,
+                body: "Generate safely.".into(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_requires_and_routes_an_explicit_project() {
+        let repo = project("router-generation");
+        let fake = Arc::new(FakeApi::new());
+        let routed = Arc::clone(&fake);
+        let factory: ProjectApiFactory = Arc::new(move |_| {
+            let api: Arc<dyn Api> = routed.clone();
+            Ok(api)
+        });
+        let router = ProjectApiRouter::new([repo.path().to_path_buf()], factory);
+
+        router
+            .generate_plan_bundle(repo.path(), generation_blueprint())
+            .await
+            .expect("qualified generation should reach project API");
+        assert!(matches!(
+            fake.commands.lock().unwrap().as_slice(),
+            [Command::GeneratePlanBundle { .. }]
+        ));
+
+        let error = router
+            .execute(Command::GeneratePlanBundle {
+                blueprint: generation_blueprint(),
+            })
+            .await
+            .expect_err("unqualified generation must fail closed");
+        assert!(matches!(error, ApiError::InvalidCommand { .. }));
     }
 
     #[tokio::test]
@@ -939,18 +939,16 @@ mod tests {
             .await
             .expect("register second project");
 
-        let open = |path: PathBuf| Command::OpenRun {
-            task_list_path: path,
-        };
+        let plan = makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap();
         let CommandOutcome::RunOpened { run: first_run } = router
-            .execute(open(first.path().join("docs/plans/same-plan/TASKS.md")))
+            .open_plan(first.path(), plan.clone())
             .await
             .expect("open first")
         else {
             panic!("expected first RunOpened")
         };
         let CommandOutcome::RunOpened { run: second_run } = router
-            .execute(open(second.path().join("docs/plans/same-plan/TASKS.md")))
+            .open_plan(second.path(), plan)
             .await
             .expect("open second")
         else {
@@ -1043,6 +1041,33 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qualified_open_rejects_plan_directory_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let repo = project("router-symlink-escape");
+        let outside = tempfile::tempdir().expect("create outside directory");
+        let plan_path = repo.path().join("docs/plans/0001-Test");
+        std::fs::remove_dir(&plan_path).expect("remove real plan directory");
+        symlink(outside.path(), &plan_path).expect("create escaping symlink");
+
+        let factory: ProjectApiFactory = Arc::new(|_| Ok(Arc::new(FakeApi::new())));
+        let router = ProjectApiRouter::new([repo.path().to_path_buf()], factory);
+        let error = router
+            .open_plan(
+                repo.path(),
+                makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+            )
+            .await
+            .expect_err("escaping plan symlink must be rejected");
+
+        assert!(
+            matches!(error, ApiError::InvalidCommand { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn run_opened_is_forwarded_once_and_refresh_events_are_preserved() {
         let repo = project("router-events");
@@ -1051,9 +1076,10 @@ mod tests {
         let mut events = router.subscribe();
 
         let CommandOutcome::RunOpened { run } = router
-            .execute(Command::OpenRun {
-                task_list_path: repo.path().join("docs/plans/same-plan/TASKS.md"),
-            })
+            .open_plan(
+                repo.path(),
+                makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+            )
             .await
             .expect("open run")
         else {
@@ -1068,7 +1094,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(30), events.next())
                 .await
                 .is_err(),
-            "OpenRun must not be duplicated by the router"
+            "OpenPlan must not be duplicated by the router"
         );
 
         router
@@ -1103,12 +1129,9 @@ mod tests {
         #[async_trait]
         impl Api for BlockingSubscribeApi {
             async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
-                if let Command::OpenRun { task_list_path } = command {
+                if let Command::OpenPlan { plan_dir } = command {
                     let run = RunId(1);
-                    let _ = self.events.send(Event::RunOpened {
-                        run,
-                        task_list_path,
-                    });
+                    let _ = self.events.send(Event::RunOpened { run, plan_dir });
                     Ok(CommandOutcome::RunOpened { run })
                 } else {
                     Ok(CommandOutcome::Acknowledged)
@@ -1152,8 +1175,9 @@ mod tests {
 
         let register_router = Arc::clone(&router);
         let repo_root = repo.path().to_path_buf();
+        let register_root = repo_root.clone();
         let register =
-            tokio::spawn(async move { register_router.register_project(repo_root).await });
+            tokio::spawn(async move { register_router.register_project(register_root).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !subscribe_entered.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -1163,12 +1187,12 @@ mod tests {
         .expect("subscribe was never entered");
 
         let open_router = Arc::clone(&router);
-        let task_path = repo.path().join("docs/plans/same-plan/TASKS.md");
         let open = tokio::spawn(async move {
             open_router
-                .execute(Command::OpenRun {
-                    task_list_path: task_path,
-                })
+                .open_plan(
+                    &repo_root,
+                    makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+                )
                 .await
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1216,9 +1240,7 @@ mod tests {
             .expect("factory mutex poisoned")
             .clone()
             .expect("fake built");
-        let task_list_path =
-            std::fs::canonicalize(repo.path().join("docs/plans/same-plan/TASKS.md"))
-                .expect("canonical task list");
+        let plan_dir = makina_core::plan::PlanKey::parse("docs/plans/0001-Same-Plan").unwrap();
         fake.runs
             .lock()
             .expect("runs mutex poisoned")
@@ -1226,7 +1248,7 @@ mod tests {
                 id: RunId(40),
                 run_uid: "01STABLE-ROUTER-UID".to_string(),
                 project: "stable".to_string(),
-                task_list_path,
+                plan_dir,
                 status: RunStatus::Completed,
                 tasks: Vec::new(),
                 report: IngestionReport::default(),
@@ -1250,12 +1272,12 @@ mod tests {
         let second = project("router-allowed-second");
         let factory: ProjectApiFactory = Arc::new(|_| Ok(Arc::new(FakeApi::new())));
         let router = ProjectApiRouter::new([first.path().to_path_buf()], factory);
-        let second_tasks = second.path().join("docs/plans/same-plan/TASKS.md");
 
         let error = router
-            .execute(Command::OpenRun {
-                task_list_path: second_tasks.clone(),
-            })
+            .open_plan(
+                second.path(),
+                makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+            )
             .await
             .expect_err("unregistered project must be rejected");
         assert!(
@@ -1270,9 +1292,10 @@ mod tests {
             .expect("register project command");
         assert!(matches!(outcome, CommandOutcome::Acknowledged));
         let CommandOutcome::RunOpened { run } = router
-            .execute(Command::OpenRun {
-                task_list_path: second_tasks.clone(),
-            })
+            .open_plan(
+                second.path(),
+                makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+            )
             .await
             .expect("open registered project")
         else {
@@ -1290,9 +1313,10 @@ mod tests {
             "closed projects must not reappear in fresh run snapshots"
         );
         let error = router
-            .execute(Command::OpenRun {
-                task_list_path: second_tasks.clone(),
-            })
+            .open_plan(
+                second.path(),
+                makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+            )
             .await
             .expect_err("closed project must reject new opens");
         assert!(
@@ -1315,9 +1339,10 @@ mod tests {
             .expect("re-register project");
         assert!(matches!(
             router
-                .execute(Command::OpenRun {
-                    task_list_path: second_tasks,
-                })
+                .open_plan(
+                    second.path(),
+                    makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+                )
                 .await,
             Ok(CommandOutcome::RunOpened { .. })
         ));
@@ -1345,8 +1370,8 @@ mod tests {
             .expect("factory mutex poisoned")
             .clone()
             .expect("fake built");
-        let wrong_path = std::fs::canonicalize(second.path().join("docs/plans/same-plan/TASKS.md"))
-            .expect("canonical second task list");
+        let _wrong_path = std::fs::canonicalize(second.path().join("docs/plans/same-plan/marker"))
+            .expect("canonical second routing marker");
         fake.runs
             .lock()
             .expect("runs mutex poisoned")
@@ -1354,27 +1379,28 @@ mod tests {
                 id: RunId(7),
                 run_uid: "01WRONGPROJECTVIEW00000001".to_string(),
                 project: "wrong".to_string(),
-                task_list_path: wrong_path.clone(),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
                 status: RunStatus::Completed,
                 tasks: Vec::new(),
                 report: IngestionReport::default(),
             });
 
-        assert!(
-            router.runs().await.is_empty(),
-            "a disk view cannot escape the API's registered project identity"
+        assert_eq!(
+            router.runs().await.len(),
+            1,
+            "a typed PlanKey is qualified by the owning project API, not a path embedded in the view"
         );
 
         let mut events = router.subscribe();
         let _ = fake.events.send(Event::RunOpened {
             run: RunId(7),
-            task_list_path: wrong_path,
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(50), events.next())
                 .await
-                .is_err(),
-            "a RunOpened event cannot claim another repository's task list"
+                .is_ok(),
+            "the owner-qualified event must be forwarded"
         );
     }
 
@@ -1384,40 +1410,54 @@ mod tests {
         use makina_core::backend::noop::NoopBackend;
         use makina_core::config::{Config, GlobalConfig, ProjectConfig};
         use makina_core::dependency::EdgeInferrer;
-        use makina_core::interpreter::StructuredTextInterpreter;
+        use makina_core::interpreter::SourceProjectionUnavailable;
         use makina_core::orchestrator::{CoreApi, run_slug};
         use makina_core::test_support::setup_temp_repo;
         use makina_core::worktree::WorktreeManager;
 
-        const TASKS: &str = r#"# Same Plan — Task List
+        fn copy_tree(source: &Path, destination: &Path) {
+            std::fs::create_dir_all(destination).expect("create plan directory");
+            for entry in std::fs::read_dir(source).expect("read fixture") {
+                let entry = entry.expect("fixture entry");
+                let target = destination.join(entry.file_name());
+                if entry.file_type().expect("fixture type").is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).expect("copy fixture file");
+                }
+            }
+        }
 
-A project-local routing regression fixture.
-
----
-
-## 0001 — Foundation
-
-### local-task — Implement the local task
-Make a project-local change.
-- **Depends on:** —
-- **Done when:** The local task is complete and tested.
-"#;
-
-        fn write_plan(repo: &Path) -> PathBuf {
-            let plan = repo.join("docs/plans/same-plan");
-            std::fs::create_dir_all(&plan).expect("create plan directory");
-            let tasks = plan.join("TASKS.md");
-            std::fs::write(&tasks, TASKS).expect("write task list");
-            tasks
+        fn write_plan(repo: &Path) {
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../makina-core/tests/fixtures/plan-bundles/valid/0049-Sample");
+            copy_tree(&fixture, &repo.join("docs/plans/0049-Sample"));
+            let git = |args: &[&str]| {
+                let output = ProcessCommand::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .output()
+                    .expect("run git");
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["config", "user.email", "routing@example.invalid"]);
+            git(&["config", "user.name", "Routing Test"]);
+            git(&["branch", "-M", "develop"]);
+            git(&["add", "."]);
+            git(&["commit", "-qm", "typed plan fixture"]);
         }
 
         let first = setup_temp_repo();
         let second = setup_temp_repo();
-        let first_tasks = write_plan(first.path());
-        let second_tasks = write_plan(second.path());
+        write_plan(first.path());
+        write_plan(second.path());
         let factory: ProjectApiFactory = Arc::new(|root| {
             let interpreter = Arc::new(EdgeInferrer::new(Arc::new(
-                StructuredTextInterpreter::new(),
+                SourceProjectionUnavailable::new(),
             )));
             let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::new());
             let worktrees = WorktreeManager::new(root.to_path_buf(), "develop".to_string());
@@ -1439,40 +1479,27 @@ Make a project-local change.
             .await
             .expect("register second");
 
+        let plan_key = makina_core::plan::PlanKey::parse("docs/plans/0049-Sample").unwrap();
         let CommandOutcome::RunOpened { run: first_run } = router
-            .execute(Command::OpenRun {
-                task_list_path: first_tasks.clone(),
-            })
+            .open_plan(first.path(), plan_key.clone())
             .await
             .expect("open first")
         else {
             panic!("expected first RunOpened")
         };
-        let artifact_name = format!("{}.json", run_slug(&first_tasks));
-        let first_artifact = first.path().join(".makina/tasks").join(&artifact_name);
-        let second_artifact = second.path().join(".makina/tasks").join(&artifact_name);
-        assert!(
-            first_artifact.exists(),
-            "first CoreApi must persist in repo one"
-        );
-        assert!(
-            !second_artifact.exists(),
-            "opening repo one must not write repo two"
+        assert_eq!(run_slug(&plan_key.relative_dir), "0049-sample");
+        assert_eq!(
+            router.run(first_run).await.unwrap().project,
+            first.path().file_name().unwrap().to_string_lossy()
         );
 
         let CommandOutcome::RunOpened { run: second_run } = router
-            .execute(Command::OpenRun {
-                task_list_path: second_tasks.clone(),
-            })
+            .open_plan(second.path(), plan_key.clone())
             .await
             .expect("open second")
         else {
             panic!("expected second RunOpened")
         };
-        assert!(
-            second_artifact.exists(),
-            "second CoreApi must persist in repo two"
-        );
         assert_ne!(
             first_run, second_run,
             "local run:1 handles must be namespaced"
@@ -1480,35 +1507,26 @@ Make a project-local change.
 
         let first_view = router.run(first_run).await.expect("first route");
         let second_view = router.run(second_run).await.expect("second route");
-        assert!(first_view.task_list_path.starts_with(first.path()));
-        assert!(second_view.task_list_path.starts_with(second.path()));
-        assert!(!first_view.task_list_path.starts_with(second.path()));
-        assert!(!second_view.task_list_path.starts_with(first.path()));
+        assert_eq!(first_view.plan_dir, plan_key);
+        assert_eq!(second_view.plan_dir, first_view.plan_dir);
+        assert_eq!(first_view.tasks[0].id, second_view.tasks[0].id);
+        assert!(first_view.tasks[0].authored.is_some());
+        assert!(second_view.tasks[0].authored.is_some());
     }
 
     #[tokio::test]
-    async fn taskless_plan_routes_by_its_existing_parent_project() {
-        let repo = project("router-taskless");
-        std::fs::remove_file(repo.path().join("docs/plans/same-plan/TASKS.md"))
-            .expect("remove tasks");
+    async fn plan_routes_by_its_existing_parent_project() {
+        let repo = project("router-plan-parent");
         let factory: ProjectApiFactory = Arc::new(|_| Ok(Arc::new(FakeApi::new())));
         let router = ProjectApiRouter::new([repo.path().to_path_buf()], factory);
 
         let result = router
-            .execute(Command::OpenRun {
-                task_list_path: repo.path().join("docs/plans/same-plan/TASKS.md"),
-            })
+            .open_plan(
+                repo.path(),
+                makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+            )
             .await;
         assert!(matches!(result, Ok(CommandOutcome::RunOpened { .. })));
-    }
-
-    #[test]
-    fn path_outside_a_git_project_is_rejected() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("TASKS.md");
-        std::fs::write(&path, "# tasks\n").expect("write tasks");
-        let error = project_for_task_path(&path).expect_err("must reject non-project path");
-        assert!(error.contains("not inside a Git repository"));
     }
 
     #[test]
@@ -1546,18 +1564,5 @@ Make a project-local change.
             roots[0],
             std::fs::canonicalize(repo.path()).expect("canonical repo")
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dangling_final_task_symlink_is_rejected_not_treated_as_missing() {
-        use std::os::unix::fs::symlink;
-
-        let repo = project("router-dangling-task");
-        let task_path = repo.path().join("docs/plans/same-plan/TASKS.md");
-        std::fs::remove_file(&task_path).expect("remove task file");
-        symlink("missing-target.md", &task_path).expect("create dangling link");
-        let error = project_for_task_path(&task_path).expect_err("dangling link must fail");
-        assert!(error.contains("cannot resolve task list"));
     }
 }

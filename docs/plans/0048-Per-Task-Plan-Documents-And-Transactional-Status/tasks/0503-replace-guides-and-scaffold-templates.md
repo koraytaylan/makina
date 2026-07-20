@@ -25,8 +25,8 @@ touches:
   - crates/makina/src/scaffold.rs
   - crates/makina/src/folder_init.rs
   - crates/makina/tests/scaffold_integration_test.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "ece2ab6055f73309ea1dc5107d5d015d4baf73bf"
 ---
 # Replace Plan Guides And Scaffold Templates
 

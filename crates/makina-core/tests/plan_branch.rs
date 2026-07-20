@@ -41,7 +41,7 @@ use makina_core::backend::{
     AgentBackend, AgentSession, BackendError, Prompt, ResponseEvent, ResponseStream, SessionConfig,
 };
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
-use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::test_support::{run_git, setup_temp_repo};
 use makina_core::worktree::WorktreeManager;
@@ -201,6 +201,7 @@ async fn run_graph_with_plan_slug_and_config(
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: plan_slug.clone(),
         tasks,
+        authored: Default::default(),
     }));
 
     let control = RunControl {
@@ -221,7 +222,7 @@ async fn run_graph_with_plan_slug_and_config(
         "run-slug".into(),
         "run-uid".into(),
         plan_slug,
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph should succeed")
@@ -256,6 +257,9 @@ async fn run_graph_with_plan_slug_and_config(
 ///    was forked from the plan-branch tip, not from `develop`.
 #[tokio::test]
 async fn run_creates_plan_branch_and_merges_into_it() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
@@ -373,9 +377,11 @@ async fn run_creates_plan_branch_and_merges_into_it() {
 /// behavior). This proves the ask path is unchanged.
 #[tokio::test]
 async fn ask_path_with_empty_plan_slug_uses_legacy_behavior() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
-
     let backend = NoopBackend::with_responses(vec![
         "Implemented the feature.".into(),
         r#"{"verdict":"approve"}"#.into(),
@@ -439,12 +445,14 @@ async fn ask_path_with_empty_plan_slug_uses_legacy_behavior() {
 /// 3. Set `plan_branch_left = None` in the report.
 #[tokio::test]
 async fn final_squash_lands_one_commit_on_base() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
     // Capture develop's state BEFORE the run.
     let develop_count_before = commit_count(&repo_root);
-
     let backend = NoopBackend::with_responses(vec![
         "Implemented the feature.".into(),
         r#"{"verdict":"approve"}"#.into(),
@@ -460,6 +468,7 @@ async fn final_squash_lands_one_commit_on_base() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: "squash-test".into(),
         tasks: vec![task],
+        authored: Default::default(),
     }));
 
     let control = RunControl {
@@ -480,7 +489,7 @@ async fn final_squash_lands_one_commit_on_base() {
         "run-slug".into(),
         "run-uid".into(),
         "squash-test".into(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph should succeed");
@@ -497,28 +506,11 @@ async fn final_squash_lands_one_commit_on_base() {
         "task should finish; failure_reason={failure_reason:?}"
     );
 
-    // ── Develop gained exactly one new commit ─────────────────────────────────────
     let develop_count_after = commit_count(&repo_root);
-    assert_eq!(
-        develop_count_after,
-        develop_count_before + 1,
-        "exactly one squash commit must land on develop"
-    );
-
-    // ── plan_branch_left is None ─────────────────────────────────────────────────
-    assert_eq!(
-        report.plan_branch_left, None,
-        "plan_branch_left must be None when squash succeeds"
-    );
-
-    // ── The new commit is a squash (one commit, not a merge) ──────────────────────
+    assert_eq!(develop_count_after, develop_count_before + 1);
+    assert_eq!(report.plan_branch_left, None);
     let develop_parents = git_stdout(&repo_root, &["rev-parse", "develop^@"]);
-    // A squash commit has one parent; a merge has two (separated by space).
-    let parent_count = develop_parents.split_whitespace().count();
-    assert_eq!(
-        parent_count, 1,
-        "the new develop HEAD must have exactly one parent (squash, not merge)"
-    );
+    assert_eq!(develop_parents.split_whitespace().count(), 1);
 }
 
 /// **Proves "MergeCommit mode creates a merge commit".**
@@ -529,9 +521,11 @@ async fn final_squash_lands_one_commit_on_base() {
 /// 3. Set `plan_branch_left = None` in the report.
 #[tokio::test]
 async fn final_merge_commit_creates_a_merge_commit() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
-
     let backend = NoopBackend::with_responses(vec![
         "Implemented the feature.".into(),
         r#"{"verdict":"approve"}"#.into(),
@@ -547,6 +541,7 @@ async fn final_merge_commit_creates_a_merge_commit() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: "merge-test".into(),
         tasks: vec![task],
+        authored: Default::default(),
     }));
 
     let control = RunControl {
@@ -567,7 +562,7 @@ async fn final_merge_commit_creates_a_merge_commit() {
         "run-slug".into(),
         "run-uid".into(),
         "merge-test".into(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph should succeed");
@@ -584,28 +579,9 @@ async fn final_merge_commit_creates_a_merge_commit() {
         "task should finish; failure_reason={failure_reason:?}"
     );
 
-    // ── plan_branch_left is None ─────────────────────────────────────────────────
-    assert_eq!(
-        report.plan_branch_left, None,
-        "plan_branch_left must be None when merge-commit succeeds"
-    );
-
-    // ── The new commit is a merge (two parents) ──────────────────────────────────
+    assert_eq!(report.plan_branch_left, None);
     let develop_parents = git_stdout(&repo_root, &["rev-parse", "develop^@"]);
-    // A merge commit has two parents (separated by space); a squash has one.
-    let parent_count = develop_parents.split_whitespace().count();
-    assert_eq!(
-        parent_count, 2,
-        "the new develop HEAD must have exactly two parents (merge commit)"
-    );
-
-    // ── The commit appears in --merges (proof it is a merge commit) ───────────────
-    let merges = git_stdout(&repo_root, &["rev-list", "--merges", "develop"]);
-    let develop_head = git_stdout(&repo_root, &["rev-parse", "develop"]);
-    assert!(
-        merges.contains(&develop_head),
-        "the new develop HEAD must appear in git rev-list --merges"
-    );
+    assert_eq!(develop_parents.split_whitespace().count(), 2);
 }
 
 /// **Proves "Stage mode copies the plan diff to the main worktree as staged".**
@@ -637,6 +613,7 @@ async fn final_stage_leaves_changes_staged_on_base() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: "stage-test".into(),
         tasks: vec![task],
+        authored: Default::default(),
     }));
 
     let control = RunControl {
@@ -657,7 +634,7 @@ async fn final_stage_leaves_changes_staged_on_base() {
         "run-slug".into(),
         "run-uid".into(),
         "stage-test".into(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph should succeed");
@@ -705,6 +682,9 @@ async fn final_stage_leaves_changes_staged_on_base() {
 /// 3. Set `plan_branch_left = Some(branch_name)` in the report.
 #[tokio::test]
 async fn final_manual_leaves_branch_and_reports_name() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     let repo_dir = setup_temp_repo();
     let repo_root = repo_dir.path().to_path_buf();
 
@@ -725,6 +705,7 @@ async fn final_manual_leaves_branch_and_reports_name() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: "manual-test".into(),
         tasks: vec![task],
+        authored: Default::default(),
     }));
 
     let control = RunControl {
@@ -745,7 +726,7 @@ async fn final_manual_leaves_branch_and_reports_name() {
         "run-slug".into(),
         "run-uid".into(),
         "manual-test".into(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph should succeed");
@@ -785,6 +766,9 @@ async fn final_manual_leaves_branch_and_reports_name() {
 /// This test uses a rejected task to force a failure.
 #[tokio::test]
 async fn failed_task_leaves_branch_in_every_mode() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
     // Test all final-merge modes with a forced failure.
     let modes = vec![
         makina_core::config::FinalMerge::Squash,
@@ -816,6 +800,7 @@ async fn failed_task_leaves_branch_in_every_mode() {
         let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
             slug: format!("failed-{:?}", mode),
             tasks: vec![task],
+            authored: Default::default(),
         }));
 
         let control = RunControl {
@@ -836,7 +821,7 @@ async fn failed_task_leaves_branch_in_every_mode() {
             "run-slug".into(),
             "run-uid".into(),
             format!("failed-{:?}", mode),
-            Arc::new(StructuredTextInterpreter::new()),
+            Arc::new(SourceProjectionUnavailable::new()),
         )
         .await
         .expect("run_graph should succeed");

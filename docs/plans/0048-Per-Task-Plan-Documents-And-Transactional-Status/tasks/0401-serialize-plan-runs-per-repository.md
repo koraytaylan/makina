@@ -22,8 +22,8 @@ touches:
   - crates/makina/src/app.rs
   - crates/makina/src/ui.rs
   - crates/makina/tests/repository_run_lease.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "1cd966135ee50d4984d8c355342109ddbe5868be"
 ---
 # Serialize Executing Plans Per Repository
 

@@ -36,7 +36,7 @@ Re-running the render command will regenerate the GIF with the current version o
 The tape:
 1. Launches the Makina TUI via `cargo run -p makina`
 2. Waits for the TUI to initialize
-3. Opens the task list (via `o` key)
+3. Opens a discovered plan directory (via `o` key)
 4. Shows the task view briefly
 5. Quits the application (via `q` key)
 

@@ -12,8 +12,8 @@ touches:
   - crates/makina/tests/**
   - crates/makina-acp/tests/provider_and_role_wiring.rs
   - docs/spec/runtime-artifact-schema.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "37c2b73794b990792d799dc8c73573f5f7fe554f"
 ---
 # Project Plan Documents Into Runtime State
 

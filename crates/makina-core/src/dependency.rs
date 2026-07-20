@@ -28,7 +28,7 @@
 //! adding an edge whenever areas overlap.
 //!
 //! Note: high-frequency tokens like `` `makina-core` `` are weak discriminators
-//! and may over-serialize a real TASKS.md by linking many unrelated tasks.  This
+//! and may over-serialize a plan by linking many unrelated tasks. This
 //! is acceptable for the deterministic baseline but worth flagging; a future
 //! model-backed area extractor can narrow the signal.
 //!
@@ -70,6 +70,297 @@ use async_trait::async_trait;
 use crate::interpreter::{InterpretError, TaskListInterpreter};
 use crate::task::{TaskGraph, TaskId};
 
+/// An inferred serialization edge, kept separate from authored dependencies
+/// for diagnostics and presentation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollisionEdge {
+    pub prerequisite: TaskId,
+    pub dependent: TaskId,
+    pub left_pattern: String,
+    pub right_pattern: String,
+}
+
+/// Match a repository-relative path using Plan 0048's portable grammar.
+/// Patterns have already crossed the validated [`crate::plan::RepoPattern`]
+/// boundary: literals, `*` inside one segment, and terminal `/**` only.
+pub fn footprint_matches(pattern: &str, path: &str) -> bool {
+    let pattern_parts: Vec<_> = pattern.split('/').collect();
+    let path_parts: Vec<_> = path.split('/').collect();
+    let recursive = pattern_parts.last() == Some(&"**");
+    let fixed = if recursive {
+        &pattern_parts[..pattern_parts.len() - 1]
+    } else {
+        &pattern_parts[..]
+    };
+    if (!recursive && fixed.len() != path_parts.len())
+        || (recursive && path_parts.len() < fixed.len())
+    {
+        return false;
+    }
+    fixed
+        .iter()
+        .zip(path_parts.iter())
+        .all(|(pattern, value)| segment_matches(pattern, value))
+}
+
+fn segment_matches(pattern: &str, value: &str) -> bool {
+    let (mut p, mut v) = (0, 0);
+    let (mut star, mut retry) = (None, 0);
+    let p_bytes = pattern.as_bytes();
+    let v_bytes = value.as_bytes();
+    while v < v_bytes.len() {
+        if p < p_bytes.len() && p_bytes[p] == v_bytes[v] {
+            p += 1;
+            v += 1;
+        } else if p < p_bytes.len() && p_bytes[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = v;
+        } else if let Some(star_at) = star {
+            retry += 1;
+            v = retry;
+            p = star_at + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < p_bytes.len() && p_bytes[p] == b'*' {
+        p += 1;
+    }
+    p == p_bytes.len()
+}
+
+/// Conservative, exact overlap test for the supported grammar. Literal
+/// parent/child paths intentionally collide because replacing a directory or
+/// an entry below it cannot safely run concurrently.
+pub fn footprints_overlap(left: &str, right: &str) -> bool {
+    if left == right || is_component_prefix(left, right) || is_component_prefix(right, left) {
+        return true;
+    }
+    let l: Vec<_> = left.split('/').collect();
+    let r: Vec<_> = right.split('/').collect();
+    let l_recursive = l.last() == Some(&"**");
+    let r_recursive = r.last() == Some(&"**");
+    let l_fixed = if l_recursive {
+        &l[..l.len() - 1]
+    } else {
+        &l[..]
+    };
+    let r_fixed = if r_recursive {
+        &r[..r.len() - 1]
+    } else {
+        &r[..]
+    };
+    let shared = l_fixed.len().min(r_fixed.len());
+    if !(0..shared).all(|i| segments_intersect(l_fixed[i], r_fixed[i])) {
+        return false;
+    }
+    l_fixed.len() == r_fixed.len()
+        || (l_fixed.len() < r_fixed.len() && l_recursive)
+        || (r_fixed.len() < l_fixed.len() && r_recursive)
+}
+
+fn is_component_prefix(parent: &str, child: &str) -> bool {
+    child
+        .strip_prefix(parent)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn segments_intersect(left: &str, right: &str) -> bool {
+    // Supported segment globs contain only literals and `*`. Product-state
+    // reachability decides whether some finite byte string matches both.
+    let a = left.as_bytes();
+    let b = right.as_bytes();
+    let mut stack = vec![(0usize, 0usize)];
+    let mut seen = HashSet::new();
+    while let Some((i, j)) = stack.pop() {
+        if !seen.insert((i, j)) {
+            continue;
+        }
+        if i == a.len() && j == b.len() {
+            return true;
+        }
+        if i < a.len() && a[i] == b'*' {
+            stack.push((i + 1, j));
+        }
+        if j < b.len() && b[j] == b'*' {
+            stack.push((i, j + 1));
+        }
+        if i < a.len() && j < b.len() {
+            match (a[i], b[j]) {
+                (b'*', b'*') => {}
+                (b'*', _) => stack.push((i, j + 1)),
+                (_, b'*') => stack.push((i + 1, j)),
+                (x, y) if x == y => stack.push((i + 1, j + 1)),
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Add collision edges from explicit footprints. A single deterministic
+/// topological extension of the authored DAG fixes every direction, preventing
+/// pair-local choices from closing a cycle.
+pub fn infer_footprint_edges(
+    graph: &mut TaskGraph,
+    footprints: &HashMap<TaskId, Vec<String>>,
+) -> Result<Vec<CollisionEdge>, String> {
+    let order = authored_topological_order(graph)?;
+    let authored = graph.clone();
+    let mut inferred = Vec::new();
+    for left in 0..order.len() {
+        for right in (left + 1)..order.len() {
+            let prerequisite = order[left].clone();
+            let dependent = order[right].clone();
+            if transitive_depends_on(&authored, &prerequisite, &dependent)
+                || transitive_depends_on(&authored, &dependent, &prerequisite)
+            {
+                continue;
+            }
+            let Some((lp, rp)) = footprints
+                .get(&prerequisite)
+                .into_iter()
+                .flatten()
+                .find_map(|lp| {
+                    footprints
+                        .get(&dependent)
+                        .into_iter()
+                        .flatten()
+                        .find_map(|rp| footprints_overlap(lp, rp).then(|| (lp.clone(), rp.clone())))
+                })
+            else {
+                continue;
+            };
+            graph
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == dependent)
+                .expect("task came from graph")
+                .depends_on
+                .push(prerequisite.clone());
+            inferred.push(CollisionEdge {
+                prerequisite,
+                dependent,
+                left_pattern: lp,
+                right_pattern: rp,
+            });
+        }
+    }
+    if authored_topological_order(graph).is_err() {
+        return Err("inferred collision edges made the graph cyclic".into());
+    }
+    Ok(inferred)
+}
+
+/// Augment directly from metadata retained on the runtime graph.
+pub fn infer_authored_footprint_edges(graph: &mut TaskGraph) -> Result<Vec<CollisionEdge>, String> {
+    let authored_graph = graph.clone();
+    let footprints = graph
+        .authored
+        .iter()
+        .map(|(id, metadata)| {
+            (
+                id.clone(),
+                metadata
+                    .touches
+                    .iter()
+                    .map(|pattern| pattern.as_str().to_owned())
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut edges = infer_footprint_edges(graph, &footprints)?;
+    let order = authored_topological_order(&authored_graph)?;
+    let areas: HashMap<_, _> = authored_graph
+        .tasks
+        .iter()
+        .map(|task| (task.id.clone(), extract_areas(&task_text(task))))
+        .collect();
+    for left in 0..order.len() {
+        for right in (left + 1)..order.len() {
+            let prerequisite = &order[left];
+            let dependent = &order[right];
+            let suspicious = |id: &TaskId| {
+                graph.authored.get(id).is_none_or(|metadata| {
+                    metadata.touches.is_empty()
+                        || metadata.touches.iter().any(|pattern| {
+                            matches!(pattern, crate::task::AuthoredRepoPattern::InertCandidate(_))
+                        })
+                })
+            };
+            if !(suspicious(prerequisite) || suspicious(dependent))
+                || areas[prerequisite].is_disjoint(&areas[dependent])
+                || transitive_depends_on(graph, prerequisite, dependent)
+                || transitive_depends_on(graph, dependent, prerequisite)
+            {
+                continue;
+            }
+            graph
+                .tasks
+                .iter_mut()
+                .find(|task| &task.id == dependent)
+                .expect("topological task came from graph")
+                .depends_on
+                .push(prerequisite.clone());
+            tracing::warn!(
+                prerequisite = %prerequisite,
+                dependent = %dependent,
+                "suspicious authored footprint serialized by conservative textual fallback"
+            );
+            edges.push(CollisionEdge {
+                prerequisite: prerequisite.clone(),
+                dependent: dependent.clone(),
+                left_pattern: "<textual-fallback>".into(),
+                right_pattern: "<textual-fallback>".into(),
+            });
+        }
+    }
+    for edge in &edges {
+        if let Some(metadata) = graph.authored.get_mut(&edge.dependent) {
+            metadata
+                .collision_dependencies
+                .push(edge.prerequisite.clone());
+        }
+    }
+    Ok(edges)
+}
+
+fn authored_topological_order(graph: &TaskGraph) -> Result<Vec<TaskId>, String> {
+    let mut remaining: HashMap<TaskId, usize> = graph
+        .tasks
+        .iter()
+        .map(|t| (t.id.clone(), t.depends_on.len()))
+        .collect();
+    let mut result = Vec::with_capacity(graph.tasks.len());
+    while result.len() < graph.tasks.len() {
+        let next = graph
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| remaining.get(&task.id) == Some(&0))
+            .min_by_key(|(source, task)| (numeric_key(&task.id.0), *source))
+            .map(|(_, task)| task.id.clone())
+            .ok_or_else(|| "authored dependency graph contains a cycle".to_string())?;
+        remaining.remove(&next);
+        result.push(next.clone());
+        for task in &graph.tasks {
+            if task.depends_on.contains(&next) {
+                if let Some(value) = remaining.get_mut(&task.id) {
+                    *value -= 1;
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn numeric_key(id: &str) -> u64 {
+    id.split_once('-')
+        .and_then(|(prefix, _)| prefix.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
 // ── EdgeInferrer ──────────────────────────────────────────────────────────────
 
 /// A decorator over [`TaskListInterpreter`] that adds cross-cutting dependency
@@ -83,10 +374,10 @@ use crate::task::{TaskGraph, TaskId};
 ///
 /// ```rust,ignore
 /// use std::sync::Arc;
-/// use makina_core::interpreter::StructuredTextInterpreter;
+/// use makina_core::interpreter::SourceProjectionUnavailable;
 /// use makina_core::dependency::EdgeInferrer;
 ///
-/// let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
+/// let interpreter = EdgeInferrer::new(Arc::new(SourceProjectionUnavailable::new()));
 /// // `interpreter` now wraps the deterministic parser with inferred edges.
 /// ```
 ///
@@ -263,557 +554,3 @@ pub(crate) fn transitive_depends_on(graph: &TaskGraph, start: &TaskId, target: &
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::interpreter::StructuredTextInterpreter;
-    use std::sync::Arc;
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// Minimal well-formed structured-text task list with `n` tasks under one
-    /// section, given a closure that produces each task's body.
-    ///
-    /// `tasks` is a slice of `(id, title, description, done_when)`.
-    fn build_source(tasks: &[(&str, &str, &str, &str)]) -> String {
-        let mut src =
-            String::from("# Test Project — Task List\n\nPreamble.\n\n---\n\n## 0001 — Section\n\n");
-        let mut first = true;
-        for (id, title, description, done_when) in tasks {
-            if !first {
-                src.push('\n');
-            }
-            first = false;
-            src.push_str(&format!("### {id} — {title}\n"));
-            src.push_str(description);
-            src.push('\n');
-            src.push_str("- **Depends on:** —\n");
-            src.push_str(&format!("- **Done when:** {done_when}\n"));
-        }
-        src
-    }
-
-    /// Same as `build_source` but allows a custom `depends_on` line per task.
-    fn build_source_with_deps(tasks: &[(&str, &str, &str, &str, &str)]) -> String {
-        let mut src =
-            String::from("# Test Project — Task List\n\nPreamble.\n\n---\n\n## 0001 — Section\n\n");
-        let mut first = true;
-        for (id, title, description, done_when, deps) in tasks {
-            if !first {
-                src.push('\n');
-            }
-            first = false;
-            src.push_str(&format!("### {id} — {title}\n"));
-            src.push_str(description);
-            src.push('\n');
-            src.push_str(&format!("- **Depends on:** {deps}\n"));
-            src.push_str(&format!("- **Done when:** {done_when}\n"));
-        }
-        src
-    }
-
-    // ── Acceptance test: overlapping areas produce a linking edge ─────────────
-
-    /// Two tasks that both mention the same backtick span (`` `makina-core` ``)
-    /// must come out linked: the LATER task (task-b, index 1) must depend on
-    /// the EARLIER task (task-a, index 0).
-    #[tokio::test]
-    async fn overlapping_areas_produce_inferred_edge() {
-        let source = build_source(&[
-            (
-                "task-a",
-                "First task",
-                "Work on the `makina-core` crate and extend its public API.",
-                "`makina-core` builds successfully.",
-            ),
-            (
-                "task-b",
-                "Second task",
-                "Add tests to the `makina-core` crate for the new API.",
-                "All `makina-core` tests pass.",
-            ),
-        ]);
-
-        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
-        let graph = interpreter
-            .interpret("test", &source)
-            .await
-            .expect("interpretation must succeed");
-
-        // task-b (index 1) must depend on task-a (index 0).
-        let task_b = graph
-            .tasks
-            .iter()
-            .find(|t| t.id.0 == "task-b")
-            .expect("task-b must be in graph");
-
-        assert!(
-            task_b.depends_on.contains(&TaskId::new("task-a")),
-            "task-b must depend on task-a (inferred via shared `makina-core` area); \
-             actual depends_on: {:?}",
-            task_b.depends_on
-        );
-
-        // Direction check: the EARLIER task (task-a) must NOT depend on task-b.
-        let task_a = graph
-            .tasks
-            .iter()
-            .find(|t| t.id.0 == "task-a")
-            .expect("task-a must be in graph");
-        assert!(
-            !task_a.depends_on.contains(&TaskId::new("task-b")),
-            "task-a must NOT depend on task-b (would create forward edge); \
-             actual depends_on: {:?}",
-            task_a.depends_on
-        );
-    }
-
-    // ── No spurious edges for disjoint areas ──────────────────────────────────
-
-    /// Tasks that share NO backtick areas must NOT be linked by inference.
-    #[tokio::test]
-    async fn no_shared_area_produces_no_inferred_edge() {
-        let source = build_source(&[
-            (
-                "task-x",
-                "Database task",
-                "Set up the `postgres` database schema.",
-                "The `postgres` migration runs without errors.",
-            ),
-            (
-                "task-y",
-                "Frontend task",
-                "Build the `ui-components` library for the web app.",
-                "All `ui-components` stories render without errors.",
-            ),
-        ]);
-
-        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
-        let graph = interpreter
-            .interpret("test", &source)
-            .await
-            .expect("interpretation must succeed");
-
-        // Neither task should depend on the other.
-        let task_x = graph.tasks.iter().find(|t| t.id.0 == "task-x").unwrap();
-        let task_y = graph.tasks.iter().find(|t| t.id.0 == "task-y").unwrap();
-
-        assert!(
-            task_x.depends_on.is_empty(),
-            "task-x should have no inferred deps; got: {:?}",
-            task_x.depends_on
-        );
-        assert!(
-            task_y.depends_on.is_empty(),
-            "task-y should have no inferred deps; got: {:?}",
-            task_y.depends_on
-        );
-    }
-
-    // ── Explicit edges are preserved and not duplicated ───────────────────────
-
-    /// When two tasks share an area AND have an explicit `Depends on` edge,
-    /// the explicit edge must be preserved and must NOT be duplicated.
-    #[tokio::test]
-    async fn explicit_edge_preserved_and_not_duplicated() {
-        // task-b explicitly depends on task-a; they also share `backend.rs`.
-        let source = build_source_with_deps(&[
-            (
-                "task-a",
-                "First task",
-                "Implement the `backend.rs` module.",
-                "`backend.rs` compiles and tests pass.",
-                "—",
-            ),
-            (
-                "task-b",
-                "Second task",
-                "Refactor the `backend.rs` module.",
-                "`backend.rs` refactor is complete.",
-                "task-a", // explicit edge
-            ),
-        ]);
-
-        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
-        let graph = interpreter
-            .interpret("test", &source)
-            .await
-            .expect("interpretation must succeed");
-
-        let task_b = graph.tasks.iter().find(|t| t.id.0 == "task-b").unwrap();
-
-        // Exactly one edge to task-a (the explicit one; inference must not add a second).
-        let dep_count = task_b.depends_on.iter().filter(|d| d.0 == "task-a").count();
-        assert_eq!(
-            dep_count, 1,
-            "task-b must depend on task-a exactly once (not duplicated); \
-             actual depends_on: {:?}",
-            task_b.depends_on
-        );
-    }
-
-    // ── Validate passes and graph is acyclic for 3-task overlapping list ──────
-
-    /// A 3-task list where all tasks share a common area should still produce
-    /// a valid, acyclic graph: task-c → task-b → task-a (chained by inference).
-    ///
-    /// `TaskGraph::validate()` must pass, confirming all edges resolve and ids
-    /// are unique.  Acyclicity is verified by checking there are no back-edges
-    /// (i.e. no earlier-indexed task depends on a later-indexed task).
-    #[tokio::test]
-    async fn three_task_overlapping_graph_is_valid_and_acyclic() {
-        let source = build_source(&[
-            (
-                "task-1",
-                "First task",
-                "Create the `lib.rs` entry point for the crate.",
-                "`lib.rs` is present and the crate compiles.",
-            ),
-            (
-                "task-2",
-                "Second task",
-                "Add error types in `lib.rs`.",
-                "Error types in `lib.rs` have doc-tests that pass.",
-            ),
-            (
-                "task-3",
-                "Third task",
-                "Expose the public API via `lib.rs`.",
-                "All public items in `lib.rs` have rustdoc comments.",
-            ),
-        ]);
-
-        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
-        let graph = interpreter
-            .interpret("test", &source)
-            .await
-            .expect("interpretation must succeed");
-
-        // validate() checks unique ids and all edges resolve.
-        graph.validate().expect("graph must pass validate()");
-
-        // Build a position index for acyclicity check.
-        let pos: HashMap<&str, usize> = graph
-            .tasks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.id.0.as_str(), i))
-            .collect();
-
-        // For every edge (A depends on B), B must have a LOWER index than A.
-        for task in &graph.tasks {
-            let task_idx = pos[task.id.0.as_str()];
-            for dep in &task.depends_on {
-                let dep_idx = pos[dep.0.as_str()];
-                assert!(
-                    dep_idx < task_idx,
-                    "edge from `{}` (idx {}) to `{}` (idx {}) is a forward edge — acyclicity broken",
-                    task.id,
-                    task_idx,
-                    dep,
-                    dep_idx
-                );
-            }
-        }
-
-        // task-2 must depend on task-1 (shared `lib.rs`).
-        let task_2 = graph.tasks.iter().find(|t| t.id.0 == "task-2").unwrap();
-        assert!(
-            task_2.depends_on.contains(&TaskId::new("task-1")),
-            "task-2 must depend on task-1; got: {:?}",
-            task_2.depends_on
-        );
-
-        // task-3 must depend on task-1 (shared `lib.rs`).
-        let task_3 = graph.tasks.iter().find(|t| t.id.0 == "task-3").unwrap();
-        assert!(
-            task_3.depends_on.contains(&TaskId::new("task-1")),
-            "task-3 must depend on task-1; got: {:?}",
-            task_3.depends_on
-        );
-    }
-
-    // ── Unit tests for extract_areas ──────────────────────────────────────────
-
-    #[test]
-    fn extract_areas_finds_backtick_spans() {
-        let areas = extract_areas("Work on `makina-core` and `backend.rs` today.");
-        assert!(areas.contains("makina-core"), "must find makina-core");
-        assert!(areas.contains("backend.rs"), "must find backend.rs");
-        assert_eq!(areas.len(), 2, "exactly two spans");
-    }
-
-    #[test]
-    fn extract_areas_normalizes_to_lowercase() {
-        let areas = extract_areas("See `AgentBackend` and `TASKS.md`.");
-        assert!(areas.contains("agentbackend"), "must be lowercased");
-        assert!(areas.contains("tasks.md"), "must be lowercased");
-    }
-
-    #[test]
-    fn extract_areas_empty_spans_are_dropped() {
-        let areas = extract_areas("Look at `` (empty) and `real-thing`.");
-        assert!(!areas.contains(""), "empty span must be dropped");
-        assert!(areas.contains("real-thing"));
-    }
-
-    #[test]
-    fn extract_areas_no_backticks_returns_empty() {
-        let areas = extract_areas("No code spans at all in this sentence.");
-        assert!(areas.is_empty());
-    }
-
-    // ── infer_edges unit test (without async/interpreter) ────────────────────
-
-    /// Verify `infer_edges` directly on a hand-built `TaskGraph`.
-    #[test]
-    fn infer_edges_links_overlapping_tasks_and_skips_disjoint() {
-        use crate::task::{Task, TaskState};
-        use chrono::Utc;
-
-        let now = Utc::now();
-        let make_task = |id: &str, description: &str| Task {
-            id: TaskId::new(id),
-            title: id.to_string(),
-            description: description.to_string(),
-            done_when: "done.".to_string(),
-            depends_on: vec![],
-            section: None,
-            state: TaskState::New,
-            gate_iterations: 0,
-            review_iterations: 0,
-            created_at: now,
-            updated_at: now,
-            started_at: None,
-            finished_at: None,
-            failure_reason: None,
-        };
-
-        let mut graph = TaskGraph {
-            slug: "test".to_string(),
-            tasks: vec![
-                make_task("alpha", "Modifies `shared.rs` heavily."),
-                make_task("beta", "Also touches `shared.rs` for cleanup."),
-                make_task("gamma", "Only touches `other.rs`, nothing shared."),
-            ],
-        };
-
-        infer_edges(&mut graph);
-
-        // beta (idx 1) must depend on alpha (idx 0) — shared `shared.rs`.
-        let beta = graph.tasks.iter().find(|t| t.id.0 == "beta").unwrap();
-        assert!(beta.depends_on.contains(&TaskId::new("alpha")));
-
-        // gamma must have no inferred deps (no shared areas with alpha or beta).
-        let gamma = graph.tasks.iter().find(|t| t.id.0 == "gamma").unwrap();
-        assert!(gamma.depends_on.is_empty());
-
-        // alpha must not depend on beta (no back-edge).
-        let alpha = graph.tasks.iter().find(|t| t.id.0 == "alpha").unwrap();
-        assert!(!alpha.depends_on.contains(&TaskId::new("beta")));
-
-        graph.validate().expect("graph must still validate");
-    }
-
-    // ── Regression: explicit forward edge + shared area must not produce a cycle ──
-
-    /// **Cycle scenario regression test.**
-    ///
-    /// Task A (authored index 0) has an explicit `Depends on: task-b` (forward
-    /// reference — task-b is at index 1).  A and B both mention `` `lib.rs` ``.
-    ///
-    /// Without the reachability guard, `infer_edges` would add B→A (later depends
-    /// on earlier) to complement A→B, producing a cycle.  With the guard the B→A
-    /// edge must be skipped.
-    ///
-    /// Asserts:
-    /// - The explicit A→B edge is preserved.
-    /// - The inferred B→A edge is NOT added.
-    /// - The graph is acyclic (verified via DFS cycle detection, not just
-    ///   `validate()` which cannot detect cycles).
-    #[tokio::test]
-    async fn explicit_forward_edge_plus_shared_area_no_cycle() {
-        // task-a (index 0) explicitly depends on task-b (index 1) — forward ref.
-        // Both share the `lib.rs` area.
-        let source = build_source_with_deps(&[
-            (
-                "task-a",
-                "First task",
-                "Implement the public API in `lib.rs`.",
-                "`lib.rs` compiles without errors.",
-                "task-b", // explicit forward edge A → B
-            ),
-            (
-                "task-b",
-                "Second task",
-                "Add the module skeleton to `lib.rs`.",
-                "`lib.rs` has the module skeleton in place.",
-                "—", // no explicit deps
-            ),
-        ]);
-
-        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
-        let graph = interpreter
-            .interpret("test", &source)
-            .await
-            .expect("interpretation must succeed (forward ref is valid)");
-
-        // 1. Explicit edge A→B must be present.
-        let task_a = graph.tasks.iter().find(|t| t.id.0 == "task-a").unwrap();
-        assert!(
-            task_a.depends_on.contains(&TaskId::new("task-b")),
-            "task-a must retain its explicit dep on task-b; got: {:?}",
-            task_a.depends_on
-        );
-
-        // 2. Inferred edge B→A must NOT be added (would create A→B + B→A cycle).
-        let task_b = graph.tasks.iter().find(|t| t.id.0 == "task-b").unwrap();
-        assert!(
-            !task_b.depends_on.contains(&TaskId::new("task-a")),
-            "task-b must NOT depend on task-a (would be a cycle); got: {:?}",
-            task_b.depends_on
-        );
-
-        // 3. Full cycle detection via DFS — must find no cycle.
-        assert!(
-            !graph_has_cycle(&graph),
-            "the combined explicit+inferred graph must be acyclic"
-        );
-
-        // 4. validate() must also pass (resolves references, unique ids).
-        graph.validate().expect("graph must pass validate()");
-    }
-
-    /// Mixed graph: several tasks with both explicit forward edges and shared
-    /// areas.  The combined explicit+inferred graph must remain acyclic.
-    ///
-    /// Layout:
-    /// - task-p (idx 0): mentions `` `core.rs` ``
-    /// - task-q (idx 1): mentions `` `core.rs` ``, explicit `Depends on: task-r`
-    /// - task-r (idx 2): mentions `` `core.rs` `` and `` `util.rs` ``
-    /// - task-s (idx 3): mentions `` `util.rs` ``
-    ///
-    /// Explicit edge: task-q→task-r (forward reference, idx 1 → idx 2).
-    /// Potential inferred edges (all subject to reachability guard):
-    ///   - task-q → task-p (shares `core.rs`; safe — no existing q⇒p path)
-    ///   - task-r → task-p (shares `core.rs`; safe)
-    ///   - task-r → task-q (shares `core.rs`; safe? — q already depends on r,
-    ///                       so r transitively reaches q via q→r, meaning adding
-    ///                       r→q would CYCLE — must be skipped)
-    ///   - task-s → task-r (shares `util.rs`; safe)
-    #[tokio::test]
-    async fn mixed_explicit_forward_and_shared_areas_acyclic() {
-        let source = build_source_with_deps(&[
-            (
-                "task-p",
-                "P task",
-                "Foundation work on `core.rs`.",
-                "`core.rs` has its skeleton.",
-                "—",
-            ),
-            (
-                "task-q",
-                "Q task",
-                "Extend `core.rs` with error types.",
-                "Error types in `core.rs` compile.",
-                "task-r", // explicit forward edge Q → R
-            ),
-            (
-                "task-r",
-                "R task",
-                "Scaffold `core.rs` and `util.rs`.",
-                "`core.rs` and `util.rs` are present.",
-                "—",
-            ),
-            (
-                "task-s",
-                "S task",
-                "Add helpers to `util.rs`.",
-                "`util.rs` helpers are documented.",
-                "—",
-            ),
-        ]);
-
-        let interpreter = EdgeInferrer::new(Arc::new(StructuredTextInterpreter::new()));
-        let graph = interpreter
-            .interpret("test", &source)
-            .await
-            .expect("interpretation must succeed");
-
-        // Real cycle detection — must be acyclic.
-        assert!(
-            !graph_has_cycle(&graph),
-            "mixed explicit+inferred graph must be acyclic"
-        );
-
-        graph.validate().expect("graph must pass validate()");
-
-        // Explicit forward edge Q→R must be preserved.
-        let task_q = graph.tasks.iter().find(|t| t.id.0 == "task-q").unwrap();
-        assert!(
-            task_q.depends_on.contains(&TaskId::new("task-r")),
-            "task-q must retain explicit dep on task-r; got: {:?}",
-            task_q.depends_on
-        );
-
-        // The would-be inferred edge task-r → task-q would cycle (q already
-        // depends on r). It must NOT be added.
-        let task_r = graph.tasks.iter().find(|t| t.id.0 == "task-r").unwrap();
-        assert!(
-            !task_r.depends_on.contains(&TaskId::new("task-q")),
-            "task-r must NOT depend on task-q (would cycle with q→r); got: {:?}",
-            task_r.depends_on
-        );
-    }
-
-    // ── Cycle-detection helper (DFS) used by the regression tests above ────────
-
-    /// Returns `true` if `graph` contains at least one cycle when following
-    /// `depends_on` edges (i.e. treating each "X depends on Y" as an edge X→Y).
-    ///
-    /// Uses a standard DFS with three-colour marking:
-    ///   white (0) = unvisited, grey (1) = in current DFS path, black (2) = done.
-    /// A back-edge (reaching a grey node) signals a cycle.
-    fn graph_has_cycle(graph: &TaskGraph) -> bool {
-        // Map TaskId → index for O(1) lookup.
-        let id_to_idx: HashMap<&TaskId, usize> = graph
-            .tasks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (&t.id, i))
-            .collect();
-
-        let n = graph.tasks.len();
-        // 0 = white, 1 = grey, 2 = black
-        let mut color = vec![0u8; n];
-
-        fn dfs(
-            node: usize,
-            graph: &TaskGraph,
-            id_to_idx: &HashMap<&TaskId, usize>,
-            color: &mut Vec<u8>,
-        ) -> bool {
-            color[node] = 1; // grey — in current path
-            for dep in &graph.tasks[node].depends_on {
-                if let Some(&dep_idx) = id_to_idx.get(dep) {
-                    if color[dep_idx] == 1 {
-                        return true; // back-edge → cycle
-                    }
-                    if color[dep_idx] == 0 && dfs(dep_idx, graph, id_to_idx, color) {
-                        return true;
-                    }
-                }
-            }
-            color[node] = 2; // black — fully explored
-            false
-        }
-
-        for start in 0..n {
-            if color[start] == 0 && dfs(start, graph, &id_to_idx, &mut color) {
-                return true;
-            }
-        }
-        false
-    }
-}

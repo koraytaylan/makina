@@ -12,7 +12,7 @@
 //! # Why a custom file layer
 //!
 //! The subscriber is installed **once** at process startup ([`crate::main`]),
-//! but run ids are allocated **lazily** per `OpenRun` (the orchestrator's
+//! but run ids are allocated **lazily** per `OpenPlan` (the orchestrator's
 //! `next_id`/`run_uid`) and several runs can be open at once. So the file
 //! destination **cannot** be a single static path chosen at install time —
 //! it must be resolved per event from the run the event belongs to.
@@ -270,9 +270,9 @@ impl RunFileLayer {
         let path = match task_slug {
             Some(slug) => makina_core::paths::task_log(repo_root, run_uid, slug),
             None => makina_core::paths::run_dir(repo_root, run_uid)
-                .join("logs")
-                .join("run.log"),
+                .map(|dir| dir.join("logs").join("run.log")),
         };
+        let Ok(path) = path else { return };
 
         let Ok(mut writers) = self.writers.lock() else {
             return;
@@ -485,9 +485,10 @@ mod tests {
             tracing::warn!("runlevel");
         });
 
-        let task_a_log = makina_core::paths::task_log(&repo_root, run_uid, "task-a");
-        let task_b_log = makina_core::paths::task_log(&repo_root, run_uid, "task-b");
+        let task_a_log = makina_core::paths::task_log(&repo_root, run_uid, "task-a").unwrap();
+        let task_b_log = makina_core::paths::task_log(&repo_root, run_uid, "task-b").unwrap();
         let run_log = makina_core::paths::run_dir(&repo_root, run_uid)
+            .unwrap()
             .join("logs")
             .join("run.log");
 
@@ -550,6 +551,7 @@ mod tests {
         });
 
         let routed = makina_core::paths::run_dir(project.path(), run_uid)
+            .unwrap()
             .join("logs")
             .join("run.log");
         assert!(
@@ -558,6 +560,7 @@ mod tests {
                 .contains("routed")
         );
         let wrong = makina_core::paths::run_dir(launch.path(), run_uid)
+            .unwrap()
             .join("logs")
             .join("run.log");
         assert!(!wrong.exists(), "log must not use the launch repository");
@@ -616,7 +619,7 @@ mod tests {
         // paths were routed through it.
         for i in 0..total {
             let slug = format!("task-{i:04}");
-            let log = makina_core::paths::task_log(&repo_root, run_uid, &slug);
+            let log = makina_core::paths::task_log(&repo_root, run_uid, &slug).unwrap();
             let body = std::fs::read_to_string(&log)
                 .unwrap_or_else(|e| panic!("read {}: {e}", log.display()));
             assert!(

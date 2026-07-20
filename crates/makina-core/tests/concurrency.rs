@@ -308,6 +308,7 @@ async fn parallel_up_to_the_limit() {
     let graph = TaskGraph {
         slug: "parallel-test".into(),
         tasks,
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = run_with_timeout(
@@ -366,6 +367,7 @@ async fn cap_enforced_with_many_tasks() {
     let graph = TaskGraph {
         slug: "cap-test".into(),
         tasks,
+        authored: Default::default(),
     };
 
     let (report, _) = run_with_timeout(
@@ -411,6 +413,7 @@ async fn dependencies_still_serialize() {
     let graph = TaskGraph {
         slug: "deps-test".into(),
         tasks: vec![task("task-b", &["task-a"]), task("task-a", &[])],
+        authored: Default::default(),
     };
     graph.validate().expect("graph validates");
 
@@ -470,6 +473,7 @@ async fn single_dispatch_per_task() {
     let graph = TaskGraph {
         slug: "dispatch-test".into(),
         tasks,
+        authored: Default::default(),
     };
 
     let (report, _) = run_with_timeout(
@@ -531,6 +535,7 @@ async fn merges_into_develop_are_serialized_and_clean() {
     let graph = TaskGraph {
         slug: "merge-test".into(),
         tasks,
+        authored: Default::default(),
     };
 
     let count_before = commit_count(&repo_root);
@@ -607,6 +612,7 @@ async fn driver_intervals_observable() {
     let graph = TaskGraph {
         slug: "intervals-test".into(),
         tasks: vec![task("task-a", &[]), task("task-b", &[])],
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = run_with_timeout(
@@ -684,6 +690,7 @@ async fn drivers_overlap_under_concurrency_2() {
     let graph = TaskGraph {
         slug: "overlap-test".into(),
         tasks: vec![task("task-a", &[]), task("task-b", &[])],
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = run_with_timeout(

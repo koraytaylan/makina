@@ -202,6 +202,7 @@ async fn persist_file_exists_and_matches_snapshot_after_done() {
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("persist-task", "the task is persisted")],
+        authored: Default::default(),
     };
 
     // Drive the run.
@@ -318,6 +319,7 @@ async fn persist_file_matches_snapshot_after_gate_cap_failed() {
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("gate-task", "the gate passes")],
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = common::run_graph_in_repo(
@@ -424,6 +426,7 @@ async fn persist_file_matches_snapshot_after_reviewer_cap_failed() {
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("review-task", "the reviewer approves")],
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = common::run_graph_in_repo(
@@ -528,6 +531,7 @@ async fn task_view_carries_failure_reason() {
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("reason-task", "the gate passes")],
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = common::run_graph_in_repo(
@@ -619,6 +623,7 @@ async fn merge_conflict_classified_distinctly() {
     let graph = TaskGraph {
         slug: slug.into(),
         tasks: vec![task("conflict-task", "no conflict")],
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = common::run_graph_in_repo_with_backends(

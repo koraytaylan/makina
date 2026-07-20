@@ -13,8 +13,8 @@ touches:
   - crates/makina-core/src/plan.rs
   - crates/makina-core/tests/plan_task_document.rs
   - crates/makina-core/tests/fixtures/plan-documents/**
-status: planned
-merged_as: ""
+status: done
+merged_as: "29954626b24d091c5a7f259e96197e935d1b3080"
 ---
 # Define The Typed Task Document Schema
 

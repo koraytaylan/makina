@@ -30,7 +30,7 @@ use makina_core::audit::AuditRegistry;
 use makina_core::backend::AgentBackend;
 use makina_core::backend::noop::NoopBackend;
 use makina_core::config::{Config, GlobalConfig, ProjectConfig};
-use makina_core::interpreter::StructuredTextInterpreter;
+use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::paths;
 use makina_core::task::{Task, TaskGraph, TaskId, TaskState};
 use makina_core::test_support::setup_temp_repo;
@@ -159,6 +159,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
     let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
         slug: slug.into(),
         tasks: vec![task(task_id_str)],
+        authored: Default::default(),
     }));
 
     let worktree_manager = WorktreeManager::new(repo_root.clone(), "develop".into());
@@ -185,7 +186,7 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
         slug.to_string(),
         run_uid.to_string(),
         plan_slug.to_string(),
-        Arc::new(StructuredTextInterpreter::new()),
+        Arc::new(SourceProjectionUnavailable::new()),
     )
     .await
     .expect("run_graph must not error");
@@ -208,7 +209,8 @@ async fn run_graph_calls_audit_registry_register_on_dispatch() {
     let call = &calls[0];
 
     // Worktree now lives under state_root(repo_root)/worktrees/{plan_slug}--{task_id}.
-    let expected_working_dir = paths::worktree(&repo_root, plan_slug, task_id_str);
+    let expected_working_dir =
+        paths::worktree(&repo_root, plan_slug, task_id_str).expect("external state root");
     assert_eq!(
         call.working_dir, expected_working_dir,
         "register: working_dir must be state_root/worktrees/{plan_slug}--{task_id_str}"

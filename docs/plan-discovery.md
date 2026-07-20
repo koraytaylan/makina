@@ -1,66 +1,39 @@
-# Plan Auto-Discovery
+# Plan discovery and selection
 
-Makina includes automatic discovery of plan directories, making it easy to organize and manage your work using a recommended directory structure.
+Makina discovers plans by canonical repository-relative directory identity (`PlanKey`), never by a task-list filepath.
 
-## Convention
+## Candidate rule
 
-Makina recommends organizing plans under a `docs/plans/NNNN-*/` layout, where each plan directory contains three metadata files:
+A directory under a configured plan root is a new-format candidate when it contains `tasks/`. A valid executable bundle also contains `SCOPE.md`, `ARCHITECTURE.md`, `STATUS.md`, and at least one ordinary `tasks/*.md` file, with no nested task directories. Candidate validation is accumulated and shown deterministically; invalid candidates remain visible but cannot start.
 
-- **`SCOPE.md`** — the plan's scope, rationale, and decisions
-- **`ARCHITECTURE.md`** — the concrete deltas and design
-- **`TASKS.md`** — the executable task list with verifiable acceptance criteria
+A directory without `tasks/` is not a candidate. This deliberately makes historical pre-cutover plan directories inert. A directory combining `tasks/` with the former monolithic task-list format is malformed, not a precedence or compatibility case.
 
-Example structure:
-
-```
+```text
 docs/plans/
-├── 0001-Initial/
+├── STATUS.md
+├── 0048-per-task-plan-documents/
 │   ├── SCOPE.md
 │   ├── ARCHITECTURE.md
-│   └── TASKS.md
-└── 0027-Plan-Auto-Discovery/
-    ├── SCOPE.md
-    ├── ARCHITECTURE.md
-    └── TASKS.md
+│   ├── STATUS.md
+│   └── tasks/
+│       ├── 0101-define-schema.md
+│       └── 0201-project-runtime.md
+└── 0001-historical/          # no tasks/; inert record
 ```
 
-## Open Default
+## Source state
 
-When you press `o` in Makina to open a task list, Makina performs **plan auto-discovery**:
+Discovery is read-only. It loads committed source when available, validates the bundle and root roll-up, and reports:
 
-1. **Scan** — Makina scans `repo_root/docs/plans/*/` for directories containing **both** `SCOPE.md` and `ARCHITECTURE.md`.
-2. **Discover** — Each matching directory is discovered as a plan and displayed in a sortable list (sorted by directory name, so `0001-…` precedes `0027-…`).
-3. **Activate** — Press `↑`/`↓` (or `j`/`k`) to navigate the list and `Enter` to open a plan.
+- `AwaitingCommit`: the bundle exists only in working-tree bytes and cannot be registered or run.
+- `Unregistered`: a valid committed bundle has no exact Phase-R registration.
+- `Ready`: registration binds the exact source/ref and immutable validation-base OID; at least one ungated dependency-ready task can be considered for execution.
+- invalid, active, blocked, retained, or complete states derived from typed source and coordinator-owned Git evidence.
 
-If Makina discovers plans under `docs/plans/`, those discovered plans become the **default open target** instead of the bare file browser. This surfaces the recommended structure as the primary workflow.
+Opening a plan projects immutable task documents into a runtime graph and overlays only compatible volatile checkpoint state. Starting rereads source, refs, worktrees, and checkpoints while holding the repository lease, closing the open-to-start race. JSON-only completion is ignored.
 
-### Routing by `has_tasks`
+## UI and API identity
 
-Each discovered plan is marked with a `has_tasks` flag based on the presence of a `TASKS.md` file:
+Discovery results, commands, events, run metadata, tabs, and runtime paths carry `plan_dir`/`PlanKey`. Task source paths remain useful navigation metadata but are not plan identities. Equal task IDs in different plans cannot collide because refs, worktrees, runs, and checkpoints are plan-qualified.
 
-- **`has_tasks=true`** — The plan contains a `TASKS.md` file. Pressing `Enter` opens the plan via `OpenRun`, reading and interpreting the task list normally. Status: `Interpreting {slug}…`.
-- **`has_tasks=false`** — The plan **lacks** a `TASKS.md` file (e.g., authoring in progress). Pressing `Enter` routes to the planner-generate path instead of `OpenRun`, allowing you to generate the task graph from the `SCOPE.md` and `ARCHITECTURE.md` alone. Status: `{slug}: no TASKS.md — planner will generate the graph`.
-
-This allows in-flight authoring workflows: write your `SCOPE.md` and `ARCHITECTURE.md`, then have Makina generate the task graph before you manually author it.
-
-### Browser Fallback
-
-If your repository **does not** have a `docs/plans/` directory or has one with no plan directories inside it, Makina falls back to the traditional file browser behavior: press `o` and browse the current working directory to select a task-list file. This ensures compatibility with non-convention repositories.
-
-## Implementation
-
-Plan auto-discovery is implemented via:
-
-- **`discover_plans(repo_root)`** — A pure scan helper in `makina_core::orchestrator` that returns `Vec<PlanEntry>`. See the implementation for details.
-- **`PlanEntry`** — A struct in `makina_core::orchestrator` holding:
-  - `dir: PathBuf` — the plan directory path
-  - `slug: String` — the plan slug (derived from `plan_slug`)
-  - `has_tasks: bool` — whether `dir/TASKS.md` exists
-
-Both symbols are public exports from `makina-core` and can be reused by other consumers (CLI, tests, etc.) that need to discover plans programmatically.
-
-## Cross-references
-
-- **Plan 0027** — ["Plan Auto-Discovery"](../plans/0027-Plan-Auto-Discovery/) covers the full scope, architecture, and task graph for this feature.
-- **Slug derivation** — See `run_slug` and `plan_slug` in `crates/makina-core/src/orchestrator.rs` for how plan identity is derived from directory names.
-- **Structured text convention** — See [`docs/spec/structured-text-convention.md`](spec/structured-text-convention.md) for the full grammar of task lists.
+See [the authoring contract](plans/README.md) for the bundle schema.

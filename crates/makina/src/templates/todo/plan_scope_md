@@ -1,15 +1,15 @@
 # Scope — Plan 0001
 
-> Teach junior Makina users three core Rust patterns — task state mutation, iteration, and aggregation — via a runnable todo list starter project.
+> Add a small, verifiable state transition to the runnable todo starter.
 
 ## Why this plan
 
-This starter plan introduces newcomers to the Makina task-driven workflow with three hands-on exercises. Each task teaches one pattern: toggling (state), counting (aggregation), and building on prior work (dependencies). By the end, a junior contributor has written production-grade Rust in a real plan, understood how Makina task sequences work, and shipped their first `cargo test / clippy / fmt` clean feature.
+The starter demonstrates Makina's per-task plan workflow with one bounded Rust change.
 
 ## In scope
 
-- **0001 — Todo Core.** Three implementation tasks: `add-task-toggle` (mutation), `add-task-count` (aggregation), `print-open-summary` (composition).
+- **0001 — Todo Core.** Add and test a method that toggles a task's completion state.
 
 ## Out of scope
 
-- Concurrency, persistence, or networking — this is a learning plan focused on single-threaded Rust fundamentals.
+- Persistence, networking, and changes outside `src/main.rs`.

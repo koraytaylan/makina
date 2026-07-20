@@ -368,15 +368,16 @@ pub fn compact_paths(s: &str, repo_root: &Path) -> String {
     let mut out = s.to_string();
 
     // 1. Strip relocated worktree prefix: state_root/worktrees/<name>/ → ""
-    let state_root = makina_core::paths::state_root(repo_root);
-    let relocated_wt = format!("{}/worktrees/", state_root.display());
-    if let Some(i) = out.find(&*relocated_wt)
-        && let Some(rel_start) = out[i + relocated_wt.len()..].find('/')
-    {
-        let cut = i + relocated_wt.len() + rel_start + 1;
-        out.replace_range(i..cut, "");
-        // No further stripping needed — the relocated path is outside repo_root.
-        return out;
+    if let Ok(state_root) = makina_core::paths::state_root(repo_root) {
+        let relocated_wt = format!("{}/worktrees/", state_root.display());
+        if let Some(i) = out.find(&*relocated_wt)
+            && let Some(rel_start) = out[i + relocated_wt.len()..].find('/')
+        {
+            let cut = i + relocated_wt.len() + rel_start + 1;
+            out.replace_range(i..cut, "");
+            // No further stripping needed — the relocated path is outside repo_root.
+            return out;
+        }
     }
 
     // 2. Strip legacy in-repo worktree prefix: <root>/.makina/worktrees/<name>/ → ""

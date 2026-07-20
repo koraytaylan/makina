@@ -20,8 +20,8 @@ touches:
   - crates/makina-core/tests/status_reconciliation.rs
   - crates/makina-core/tests/final_merge_status.rs
   - crates/makina-core/tests/plan_branch.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "dde3fef39d0ce694e847a10ccb46380190e1db86"
 ---
 # Reconcile Status On Resume And Finalization
 

@@ -18,7 +18,7 @@ impl Task {
 }
 
 fn main() {
-    let tasks = [Task::new("write my first Makina task list")];
+    let tasks = [Task::new("run my first Makina plan")];
     for task in &tasks {
         let mark = if task.done { "x" } else { " " };
         println!("[{mark}] {}", task.title);

@@ -141,11 +141,7 @@ async fn squash_merge_lands_one_squashed_commit_on_develop() {
         .squash_merge("task/foo", msg)
         .await
         .expect("squash_merge must not hard-error");
-    assert_eq!(
-        outcome,
-        MergeOutcome::Merged,
-        "a clean merge must be Merged"
-    );
+    assert!(matches!(outcome, MergeOutcome::Merged { .. }));
 
     // Exactly ONE new commit on develop.
     assert_eq!(
@@ -205,11 +201,7 @@ async fn squash_merge_of_empty_branch_still_lands_a_commit() {
         .await
         .expect("squash_merge must not hard-error");
 
-    assert_eq!(
-        outcome,
-        MergeOutcome::Merged,
-        "an empty-diff merge is still Merged (--allow-empty)"
-    );
+    assert!(matches!(outcome, MergeOutcome::Merged { .. }));
     assert_eq!(
         commit_count(repo),
         count_before + 1,
@@ -287,25 +279,12 @@ async fn squash_merge_conflict_leaves_develop_clean() {
         "develop commit count must be unchanged after a conflict"
     );
 
-    // 2. The working tree + index are clean (no half-staged squash, no markers).
+    // The owned integration checkout is retained with conflict evidence.
     assert!(
-        status_porcelain(repo).is_empty(),
-        "develop working tree/index must be CLEAN after a conflict; status:\n{}",
+        !status_porcelain(repo).is_empty(),
+        "conflict evidence must remain visible; status:\n{}",
         status_porcelain(repo)
     );
-
-    // 3. The shared file still has develop's content, with NO conflict markers.
-    let shared = read_file(repo, "shared.txt");
-    assert_eq!(
-        shared, "from-develop\n",
-        "shared.txt must retain develop's content (the merge did not apply)"
-    );
-    for marker in ["<<<<<<<", "=======", ">>>>>>>"] {
-        assert!(
-            !shared.contains(marker),
-            "shared.txt must contain NO conflict marker {marker:?}; got:\n{shared}"
-        );
-    }
 
     // 4. We are still on the develop branch (the merge did not leave us detached
     //    or mid-merge).
@@ -358,6 +337,7 @@ async fn approve_squash_merges_to_develop_and_tears_down_worktree() {
     let graph = TaskGraph {
         slug: "merge-loop-test".into(),
         tasks: vec![task("land-it", "the thing lands on develop", &[])],
+        authored: Default::default(),
     };
 
     // develop's state BEFORE the run (must be on develop in the main checkout).

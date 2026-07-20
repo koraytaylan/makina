@@ -15,7 +15,8 @@ use makina::ui;
 use makina_core::api::{
     Api, ApiError, Command, CommandOutcome, EventStream, RunId, RunView, TaskId,
 };
-use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
+mod plan_fixture;
+use plan_fixture::{Task as PlanTaskPreview, entry as plan_entry};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -49,11 +50,10 @@ fn make_app_with_plan() -> App {
     let mut app = App::new(api, vec![], PathBuf::from("."));
 
     // Add a discovered plan with all sections
-    let plan = PlanEntry {
-        slug: "0034-test-plan".to_string(),
-        dir: PathBuf::from("docs/plans/0034-test"),
-        has_tasks: true,
-        tasks: vec![
+    let plan = plan_entry(
+        PathBuf::from("docs/plans/0034-test"),
+        "0034-test-plan".to_string(),
+        vec![
             PlanTaskPreview {
                 id: "task-1".to_string(),
                 title: "First task".to_string(),
@@ -69,10 +69,7 @@ fn make_app_with_plan() -> App {
                 body: String::new(),
             },
         ],
-        scope_text: Some("This plan implements tab-based focus navigation.".to_string()),
-        architecture_text: Some("Architecture involves extending the focus model.".to_string()),
-        status_text: Some("Status: Complete.".to_string()),
-    };
+    );
     app.discovered_plans.push(plan);
 
     app

@@ -18,9 +18,9 @@
 # to write a starter global config for your machine. See `docs/trial/e2e-run.md` for
 # the full setup + run recipe.
 
-# The branch new task branches (`task/{id}`) are cut from, and the branch
-# approved work is squash-merged back into. Makina never commits to it directly
-# except via the squash-merge of an approved, gate-passing task branch.
+# The durable base selected for plan registration and finalization. Task
+# landings first enter the retained plan ref through coordinator-owned A/B
+# commits; P/F/C then integrate and complete the plan onto this branch.
 base_branch = "develop"
 
 # How many tasks may run concurrently (each in its own worktree). Default 2 is a

@@ -23,8 +23,8 @@ touches:
   - crates/makina/src/log.rs
   - crates/makina/tests/**
   - crates/makina-acp/tests/**
-status: planned
-merged_as: ""
+status: done
+merged_as: "986e6f3940b7088972e5f70ce2710bc710246a10"
 ---
 # Make The Plan Directory The Application Identity
 

@@ -1,83 +1,28 @@
 {
-  "slug": "sample-run",
+  "schema_version": 1,
+  "identity": {
+    "plan_dir": "docs/plans/0048-per-task-plan-documents",
+    "executable_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "task_ids": ["define-schema", "project-runtime"],
+    "task_source_paths": [
+      "docs/plans/0048-per-task-plan-documents/tasks/0101-define-schema.md",
+      "docs/plans/0048-per-task-plan-documents/tasks/0201-project-runtime.md"
+    ]
+  },
   "tasks": [
     {
-      "id": "workspace-scaffold",
-      "title": "Scaffold the workspace",
-      "description": "Set up the Cargo workspace with the initial crate layout, .gitignore, and CI configuration.",
-      "done_when": "cargo build passes from the workspace root and CI is green.",
-      "depends_on": [],
-      "section": "0002",
+      "id": "define-schema",
       "state": "done",
       "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-01T09:00:00Z",
-      "updated_at": "2026-05-01T14:30:00Z",
-      "started_at": "2026-05-01T09:15:00Z",
-      "finished_at": "2026-05-01T14:30:00Z"
+      "review_iterations": 0
     },
     {
-      "id": "task-model",
-      "title": "Task and task-graph types",
-      "description": "Define the Rust domain types for Task, TaskId, TaskState, and TaskGraph with full serde support. Timestamps use chrono RFC3339. Optional fields use skip_serializing_if.",
-      "done_when": "A sample task graph round-trips through serde_json serialize/deserialize and TaskGraph::validate() returns Ok.",
-      "depends_on": [
-        "workspace-scaffold"
-      ],
-      "section": "0003",
-      "state": "done",
-      "gate_iterations": 1,
-      "review_iterations": 0,
-      "created_at": "2026-05-01T09:00:00Z",
-      "updated_at": "2026-05-03T11:00:00Z",
-      "started_at": "2026-05-02T08:00:00Z",
-      "finished_at": "2026-05-03T11:00:00Z"
-    },
-    {
-      "id": "agent-backend-trait",
-      "title": "Agent backend trait",
-      "description": "Define the AgentBackend async trait that abstracts over LLM provider integrations, with a mock implementation for testing.",
-      "done_when": "The AgentBackend trait is defined, a MockBackend is provided, and unit tests pass against it.",
-      "depends_on": [
-        "workspace-scaffold"
-      ],
-      "section": "0002",
-      "state": "in-progress",
-      "gate_iterations": 2,
-      "review_iterations": 1,
-      "created_at": "2026-05-01T09:00:00Z",
-      "updated_at": "2026-05-04T09:30:00Z",
-      "started_at": "2026-05-03T08:00:00Z"
-    },
-    {
-      "id": "core-api-surface",
-      "title": "Core API surface",
-      "description": "Expose the stable public API for makina-core: re-export key types, write doc-tests, and publish a crate-level lib.rs documentation comment.",
-      "done_when": "cargo doc --no-deps builds without warnings and the public API surface is documented.",
-      "depends_on": [
-        "workspace-scaffold"
-      ],
-      "section": "0002",
+      "id": "project-runtime",
       "state": "ready",
       "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-01T09:00:00Z",
-      "updated_at": "2026-05-01T09:00:00Z"
-    },
-    {
-      "id": "planner-actor",
-      "title": "Planner actor",
-      "description": "Implement the Planner kameo actor that reads a structured-text task list, infers dependency edges, and writes the initial .tasks/{slug}.json artifact.",
-      "done_when": "Given a well-formed TASKS.md, the Planner actor produces a valid .tasks/{slug}.json that passes TaskGraph::validate().",
-      "depends_on": [
-        "task-model",
-        "core-api-surface"
-      ],
-      "state": "new",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-01T09:00:00Z",
-      "updated_at": "2026-05-01T09:00:00Z"
+      "review_iterations": 0
     }
-  ]
+  ],
+  "active_refs": [],
+  "active_worktrees": []
 }

@@ -13,7 +13,8 @@ use makina_core::api::{
     Api, ApiError, Command, CommandOutcome, EventStream, RunId, RunStatus, RunView, TaskId,
     TaskState, TaskView,
 };
-use makina_core::orchestrator::{PlanEntry, PlanTaskPreview};
+mod plan_fixture;
+use plan_fixture::{Task as PlanTaskPreview, entry as plan_entry};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -47,11 +48,12 @@ fn make_app_with_tasks() -> App {
     let run = RunView {
         id: RunId(1),
         run_uid: "run1".to_string(),
-        task_list_path: PathBuf::from("tasks.md"),
+        plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
         status: RunStatus::Running,
         project: "test-project".to_string(),
         tasks: vec![
             TaskView {
+                authored: None,
                 id: TaskId::new("task-1"),
                 title: "First Task".into(),
                 state: TaskState::InProgress,
@@ -64,6 +66,7 @@ fn make_app_with_tasks() -> App {
                 entry_text: String::new(),
             },
             TaskView {
+                authored: None,
                 id: TaskId::new("task-2"),
                 title: "Second Task".into(),
                 state: TaskState::Ready,
@@ -87,10 +90,11 @@ fn make_app_with_tasks_and_plans() -> App {
     let run = RunView {
         id: RunId(1),
         run_uid: "run1".to_string(),
-        task_list_path: PathBuf::from("tasks.md"),
+        plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
         status: RunStatus::Running,
         project: "test-project".to_string(),
         tasks: vec![TaskView {
+            authored: None,
             id: TaskId::new("task-1"),
             title: "First Task".into(),
             state: TaskState::InProgress,
@@ -107,15 +111,11 @@ fn make_app_with_tasks_and_plans() -> App {
     let mut app = App::new(api, vec![run], PathBuf::from("."));
 
     // Add a discovered plan
-    let plan = PlanEntry {
-        slug: "0001-test-plan".to_string(),
-        dir: PathBuf::from("docs/plans/0001-test"),
-        has_tasks: true,
-        tasks: vec![],
-        scope_text: Some("This is a test plan.".to_string()),
-        architecture_text: Some("Architecture details.".to_string()),
-        status_text: Some("Status: complete.".to_string()),
-    };
+    let plan = plan_entry(
+        PathBuf::from("docs/plans/0001-test"),
+        "0001-test-plan".to_string(),
+        vec![],
+    );
     app.discovered_plans.push(plan);
 
     app
@@ -311,11 +311,10 @@ fn plan_tabs_render_accordion_sections_without_panic() {
     let api = Arc::new(TestApi);
     let mut app = App::new(api, vec![], PathBuf::from("."));
 
-    let plan = PlanEntry {
-        slug: "0031-test".to_string(),
-        dir: PathBuf::from("docs/plans/0031"),
-        has_tasks: true,
-        tasks: vec![
+    let plan = plan_entry(
+        PathBuf::from("docs/plans/0031"),
+        "0031-test".to_string(),
+        vec![
             PlanTaskPreview {
                 id: "task-1".to_string(),
                 title: "First task".to_string(),
@@ -331,10 +330,7 @@ fn plan_tabs_render_accordion_sections_without_panic() {
                 body: String::new(),
             },
         ],
-        scope_text: Some("This plan improves sidebar navigation.".to_string()),
-        architecture_text: Some("Three workstreams...".to_string()),
-        status_text: Some("✅ Complete.".to_string()),
-    };
+    );
     app.discovered_plans.push(plan);
     let plan = discovered_plan(&app);
 
@@ -385,16 +381,12 @@ fn plan_tabs_render_accordion_sections_without_panic() {
 /// that task's detail. This is the behaviour that was missing — previously a
 /// plan-task click resolved to the single plan tab, so no new tabs appeared.
 #[test]
-fn opening_plan_tasks_creates_distinct_task_tabs() {
+fn opening_plan_creates_distinct_task_tabs() {
     use makina::app::{AppEvent, TreeNode};
 
     let api: Arc<dyn Api> = Arc::new(TestApi);
     let mut app = App::new(api, vec![], PathBuf::from("."));
-    app.discovered_plans.push(PlanEntry {
-        slug: "0007-demo".to_string(),
-        dir: PathBuf::from("docs/plans/0007"),
-        has_tasks: true,
-        tasks: vec![
+    app.discovered_plans.push(plan_entry(PathBuf::from("docs/plans/0007"), "0007-demo".to_string(), vec![
             PlanTaskPreview {
                 id: "wire-thing".to_string(),
                 title: "Wire the thing".to_string(),
@@ -410,11 +402,7 @@ fn opening_plan_tasks_creates_distinct_task_tabs() {
                 depends_on: vec!["wire-thing".to_string()],
                 body: String::new(),
             },
-        ],
-        scope_text: Some("scope".to_string()),
-        architecture_text: None,
-        status_text: None,
-    });
+        ]));
 
     // Visible nodes: [Plan, PlanTask(wire), PlanTask(gate)] (plan expanded).
     let nodes = app.visible_tree_nodes();
@@ -456,7 +444,7 @@ fn opening_plan_tasks_creates_distinct_task_tabs() {
 
     // Render: the active task tab's content pane shows the task detail, and the
     // tab bar lists every open tab.
-    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
     terminal.draw(|frame| ui::render(&app, frame)).unwrap();
     let screen = screen_of(&terminal);
     assert!(
@@ -472,10 +460,10 @@ fn opening_plan_tasks_creates_distinct_task_tabs() {
         "tab bar shows the other task tab"
     );
     assert!(screen.contains("0007-demo"), "tab bar shows the plan tab");
-    // The FULL task body from TASKS.md is rendered (not just id/title).
+    // The full authored task-document body is rendered (not just id/title).
     assert!(
         screen.contains("Connect the widget to the bus"),
-        "active task tab renders the full task body from TASKS.md"
+        "active task tab renders the full authored task body"
     );
     assert!(
         screen.contains("[-] Scope") && screen.contains("[-] Execution"),

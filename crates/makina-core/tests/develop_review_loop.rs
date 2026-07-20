@@ -104,6 +104,7 @@ async fn single_task_runs_end_to_end_to_done() {
     let graph = TaskGraph {
         slug: "loop-test".into(),
         tasks: vec![task("build-thing", "the thing builds", &[])],
+        authored: Default::default(),
     };
 
     // Sanity: the worktree/branch do NOT exist before the run.
@@ -210,6 +211,7 @@ async fn reject_then_approve_relays_feedback_and_finishes_done() {
     let graph = TaskGraph {
         slug: "reject-test".into(),
         tasks: vec![task("fix-bug", "the bug is fixed", &[])],
+        authored: Default::default(),
     };
 
     let (report, graph_ref) = common::run_graph_in_repo(
@@ -289,6 +291,7 @@ async fn dependency_chain_runs_a_then_b() {
             task("task-b", "b is done", &["task-a"]),
             task("task-a", "a is done", &[]),
         ],
+        authored: Default::default(),
     };
     graph.validate().expect("chain graph must validate");
 

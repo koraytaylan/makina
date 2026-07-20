@@ -206,6 +206,7 @@ async fn gate_cap_drives_task_to_failed() {
     let graph = TaskGraph {
         slug: "gate-cap".into(),
         tasks: vec![task("doomed-gate")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),
@@ -299,6 +300,7 @@ async fn reviewer_cap_drives_task_to_failed() {
     let graph = TaskGraph {
         slug: "reviewer-cap".into(),
         tasks: vec![task("doomed-review")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),
@@ -489,6 +491,7 @@ async fn wall_clock_cap_drives_task_to_failed() {
     let graph = TaskGraph {
         slug: "wall-clock-cap".into(),
         tasks: vec![task("doomed-slow")],
+        authored: Default::default(),
     };
     let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),
@@ -588,6 +591,7 @@ async fn dependents_of_failed_task_are_skipped() {
             task_with_deps("c", &["a"]),
             task_with_deps("d", &["b"]),
         ],
+        authored: Default::default(),
     };
     let (report, graph_ref) = run_with_timeout(
         repo_root.clone(),

@@ -2,12 +2,4 @@
 
 ## 0001 — Todo Core
 
-All three tasks make edits to `src/main.rs`:
-
-1. **add-task-toggle:** Add a `Task::toggle(&mut self)` method that flips the `done` boolean. Include a unit test `#[test] fn task_toggle_flips_done()`.
-
-2. **add-task-count:** Add a free function `fn count_open(tasks: &[Task]) -> usize` that returns the count of tasks with `done == false`. Include a unit test `#[test] fn count_open_sums_incomplete_tasks()`.
-
-3. **print-open-summary:** In `main()`, call `count_open(&tasks)` and print a summary line like `"N task(s) open"` after the task list.
-
-Each task is independently verifiable: the unit tests pass locally, `cargo fmt --check` confirms formatting, and `cargo clippy -- -D warnings` flags any violations.
+Add `Task::toggle(&mut self)` and a focused unit test in `src/main.rs`. The task's authored `touches` footprint is the complete mutation boundary.

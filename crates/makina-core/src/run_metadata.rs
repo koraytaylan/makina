@@ -20,13 +20,15 @@
 //! surface historical runs that have been evicted from memory.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{IngestionReport, RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
+use crate::api::{
+    AuthoredTaskView, IngestionReport, RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+};
 use crate::paths;
 
 /// A snapshot of a single task's state at run finalization.
@@ -76,7 +78,7 @@ pub struct RunMetadata {
     /// Human-facing run slug (e.g. the plan slug the run was opened from).
     run_slug: String,
     /// Derived plan slug (parent dir of the originating task list). Stored so
-    /// disk-loaded [`RunView`]s can reconstruct a `task_list_path` for which
+    /// disk-loaded [`RunView`]s can reconstruct a `plan_dir` for which
     /// `plan_slug()` and run labels compute correctly, letting historical runs
     /// for plans participate in sidebar deduplication and context resolution.
     /// `#[serde(default)]` for back-compat with pre- plan_slug run.json files.
@@ -86,7 +88,7 @@ pub struct RunMetadata {
     /// when the plan is inside the project (portable across clones), otherwise
     /// the canonical absolute path. Absent from legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    task_list_path: Option<PathBuf>,
+    plan_dir: Option<crate::plan::PlanKey>,
     /// Terminal status of the run.
     status: RunStatus,
     /// When the run transitioned to `Running`.
@@ -97,6 +99,9 @@ pub struct RunMetadata {
     /// Additive field: old `run.json` files without it still load with `#[serde(default)]`.
     #[serde(default)]
     tasks: Vec<TaskSnapshot>,
+    /// Phase-C commit proving durable plan completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_oid: Option<String>,
 }
 
 impl RunMetadata {
@@ -113,11 +118,12 @@ impl RunMetadata {
             run_uid,
             run_slug,
             plan_slug,
-            task_list_path: None,
+            plan_dir: None,
             status,
             started_at,
             ended_at,
             tasks: Vec::new(),
+            completion_oid: None,
         }
     }
 
@@ -135,11 +141,12 @@ impl RunMetadata {
             run_uid,
             run_slug,
             plan_slug,
-            task_list_path: None,
+            plan_dir: None,
             status,
             started_at,
             ended_at,
             tasks,
+            completion_oid: None,
         }
     }
 
@@ -161,29 +168,14 @@ impl RunMetadata {
 
     /// Attach the canonical origin path, storing it relative to `repo_root`
     /// where possible so snapshots remain portable.
-    pub fn with_task_list_path(mut self, task_list_path: &Path, repo_root: &Path) -> Self {
-        let canonical_root = absolute_project_root(repo_root);
-        let canonical_path =
-            std::fs::canonicalize(task_list_path).unwrap_or_else(|_| task_list_path.to_path_buf());
-        self.task_list_path = Some(
-            canonical_path
-                .strip_prefix(&canonical_root)
-                .map(Path::to_path_buf)
-                .unwrap_or(canonical_path),
-        );
+    pub fn with_plan_dir(mut self, plan_dir: &crate::plan::PlanKey, _repo_root: &Path) -> Self {
+        self.plan_dir = Some(plan_dir.clone());
         self
     }
 
     /// Resolve the persisted origin to an absolute path in this project.
-    pub fn resolved_task_list_path(&self, repo_root: &Path) -> Option<PathBuf> {
-        let project_root = absolute_project_root(repo_root);
-        self.task_list_path.as_ref().map(|path| {
-            if path.is_absolute() {
-                path.clone()
-            } else {
-                project_root.join(path)
-            }
-        })
+    pub fn resolved_plan_dir(&self, _repo_root: &Path) -> Option<crate::plan::PlanKey> {
+        self.plan_dir.clone()
     }
 
     /// The terminal status recorded for the run.
@@ -205,18 +197,15 @@ impl RunMetadata {
     pub fn tasks(&self) -> &[TaskSnapshot] {
         &self.tasks
     }
-}
 
-fn absolute_project_root(repo_root: &Path) -> PathBuf {
-    std::fs::canonicalize(repo_root).unwrap_or_else(|_| {
-        if repo_root.is_absolute() {
-            repo_root.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(repo_root))
-                .unwrap_or_else(|_| repo_root.to_path_buf())
-        }
-    })
+    pub fn completion_oid(&self) -> Option<&str> {
+        self.completion_oid.as_deref()
+    }
+
+    pub fn with_completion_oid(mut self, oid: impl Into<String>) -> Self {
+        self.completion_oid = Some(oid.into());
+        self
+    }
 }
 
 /// Best-effort writer for [`RunMetadata`].
@@ -238,7 +227,7 @@ fn absolute_project_root(repo_root: &Path) -> PathBuf {
 /// Returns the underlying [`std::io::Error`] on serialization or I/O failure.
 /// Callers persist run metadata best-effort and must not abort a run on error.
 pub async fn write_run_metadata(meta: &RunMetadata, repo_root: &Path) -> std::io::Result<()> {
-    let dir = paths::run_dir(repo_root, &meta.run_uid);
+    let dir = paths::run_dir(repo_root, &meta.run_uid)?;
     tokio::fs::create_dir_all(&dir).await?;
 
     let mut json = serde_json::to_string_pretty(meta)?;
@@ -269,7 +258,7 @@ pub async fn write_run_metadata(meta: &RunMetadata, repo_root: &Path) -> std::io
 ///
 /// Returns `Ok(None)` if the file does not exist; propagates parse errors.
 pub fn read_run_metadata(repo_root: &Path, run_uid: &str) -> std::io::Result<Option<RunMetadata>> {
-    let path = paths::run_dir(repo_root, run_uid).join("run.json");
+    let path = paths::run_dir(repo_root, run_uid)?.join("run.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
             let meta = serde_json::from_str(&contents)
@@ -281,82 +270,60 @@ pub fn read_run_metadata(repo_root: &Path, run_uid: &str) -> std::io::Result<Opt
     }
 }
 
-fn effective_plan_slug(meta: &RunMetadata) -> String {
-    if !meta.plan_slug().is_empty() {
-        meta.plan_slug().to_string()
-    } else if let Some(p) = meta.run_slug().strip_suffix("-tasks") {
-        if !p.is_empty() {
-            p.to_string()
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    }
-}
-
-fn synthetic_task_list_path(effective_plan: &str, run_slug: &str) -> std::path::PathBuf {
-    if !effective_plan.is_empty() {
-        std::path::PathBuf::from_iter(["docs", "plans", effective_plan, "TASKS.md"])
-    } else {
-        std::path::PathBuf::from(format!(".tasks/{run_slug}.json"))
-    }
-}
-
-fn find_plan_tasks_path(repo_root: &Path, effective_plan: &str) -> Option<std::path::PathBuf> {
-    if effective_plan.is_empty() {
-        return None;
-    }
-
-    let plans_dir = repo_root.join("docs").join("plans");
-    if let Ok(entries) = std::fs::read_dir(&plans_dir) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("TASKS.md");
-            if candidate.is_file() && crate::orchestrator::plan_slug(&candidate) == effective_plan {
-                return Some(candidate);
-            }
-        }
-    }
-
-    let candidate = plans_dir.join(effective_plan).join("TASKS.md");
-    candidate.is_file().then_some(candidate)
-}
-
-fn task_entry_sources(repo_root: &Path, effective_plan: &str) -> HashMap<String, String> {
-    let Some(tasks_path) = find_plan_tasks_path(repo_root, effective_plan) else {
+fn task_entry_sources(
+    repo_root: &Path,
+    plan_key: &crate::plan::PlanKey,
+) -> HashMap<String, (String, AuthoredTaskView)> {
+    let Ok(plan) = crate::orchestrator::load_authoritative_plan(repo_root, plan_key) else {
         return HashMap::new();
     };
-    let Ok(contents) = std::fs::read_to_string(tasks_path) else {
-        return HashMap::new();
-    };
-
-    crate::interpreter::parse_structured_text(effective_plan, &contents)
-        .ok()
-        .into_iter()
-        .flat_map(|graph| graph.tasks)
-        .map(|task| {
-            (
-                task.id.0,
-                task_entry_text_from_parts(&task.description, &task.done_when),
-            )
+    let projected = crate::plan_runtime::ProjectedTaskGraph::from_document(&plan, Utc::now());
+    let bodies: HashMap<_, _> = plan
+        .tasks
+        .iter()
+        .map(|task| (task.frontmatter.id.as_str().to_owned(), task.body.clone()))
+        .collect();
+    projected
+        .graph
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            let metadata = projected.graph.authored.get(&task.id)?;
+            let body = bodies.get(task.id.0.as_str())?.clone();
+            Some((
+                task.id.0.as_str().to_owned(),
+                (
+                    body,
+                    AuthoredTaskView {
+                        source_path: metadata.source_path.clone(),
+                        workstream: metadata.workstream.clone(),
+                        kind: metadata.kind.clone(),
+                        status: metadata.status.to_string(),
+                        gated: metadata.gated,
+                        touches: metadata
+                            .touches
+                            .iter()
+                            .map(|pattern| pattern.as_str().to_owned())
+                            .collect(),
+                        merged_as: metadata.merged_as.clone(),
+                        authored_dependencies: task
+                            .depends_on
+                            .iter()
+                            .filter(|dependency| {
+                                !metadata.collision_dependencies.contains(dependency)
+                            })
+                            .map(Into::into)
+                            .collect(),
+                        collision_dependencies: metadata
+                            .collision_dependencies
+                            .iter()
+                            .map(Into::into)
+                            .collect(),
+                    },
+                ),
+            ))
         })
-        .filter(|(_, entry_text)| !entry_text.trim().is_empty())
         .collect()
-}
-
-fn task_entry_text_from_parts(description: &str, done_when: &str) -> String {
-    let mut entry_text = String::new();
-    if !description.trim().is_empty() {
-        entry_text.push_str(description.trim());
-    }
-    if !done_when.trim().is_empty() {
-        if !entry_text.is_empty() {
-            entry_text.push_str("\n\n");
-        }
-        entry_text.push_str("### Done when\n\n");
-        entry_text.push_str(done_when.trim());
-    }
-    entry_text
 }
 
 /// Build a [`RunView`] from a [`RunMetadata`] snapshot, assigning `id` as the
@@ -365,22 +332,25 @@ fn task_entry_text_from_parts(description: &str, done_when: &str) -> String {
 /// Tasks are reconstructed from the embedded [`TaskSnapshot`] slice.  When the
 /// slice is empty (an old `run.json` pre-dating this change) the returned view
 /// has no tasks. Task detail Scope text is reconstructed from the plan's
-/// `TASKS.md`; persisted run metadata carries state, not duplicated task prose.
+/// typed task source; persisted run metadata carries state, not duplicated prose.
 /// The ingestion report is left empty (no issues) for disk-loaded snapshots
 /// because the original `IngestionReport` is not persisted.
-fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> RunView {
+fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Option<RunView> {
     let project = repo_root
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
-    let effective_plan = effective_plan_slug(meta);
-    let task_entries = task_entry_sources(repo_root, &effective_plan);
+    let plan_dir = meta.resolved_plan_dir(repo_root)?;
+    let task_entries = task_entry_sources(repo_root, &plan_dir);
 
     let tasks: Vec<TaskView> = meta
         .tasks()
         .iter()
         .map(|t| TaskView {
+            authored: task_entries
+                .get(&t.id)
+                .map(|(_, authored)| authored.clone()),
             id: TaskId::new(t.id.clone()),
             title: t.title.clone(),
             state: t.state.clone(),
@@ -394,33 +364,22 @@ fn run_view_from_metadata(id: RunId, meta: &RunMetadata, repo_root: &Path) -> Ru
             started_at: t.started_at,
             finished_at: t.finished_at,
             failure_reason: t.failure_reason.clone(),
-            entry_text: task_entries.get(&t.id).cloned().unwrap_or_default(),
+            entry_text: task_entries
+                .get(&t.id)
+                .map(|(body, _)| body.clone())
+                .unwrap_or_default(),
         })
         .collect();
 
-    // Reconstruct a task-list path for the RunView.
-    //
-    // - Prefer a synthetic `docs/plans/{plan}/TASKS.md` when we have a plan_slug
-    //   (or can derive one for legacy run_slugs ending in "-tasks"). This makes
-    //   `orchestrator::plan_slug(&path)` and `ui::run_label(&view)` return the
-    //   same values they do for live plan runs, so historical plan runs
-    //   participate in sidebar plan/run dedup and context resolution.
-    // - Fall back to the old `.tasks/{run_slug}.json` for non-plan runs and
-    //   pre-plan_slug records whose run_slug does not look plan-like.
-    let task_list_path = meta.resolved_task_list_path(repo_root).unwrap_or_else(|| {
-        absolute_project_root(repo_root)
-            .join(synthetic_task_list_path(&effective_plan, meta.run_slug()))
-    });
-
-    RunView {
+    Some(RunView {
         id,
         run_uid: meta.run_uid().to_string(),
-        task_list_path,
+        plan_dir,
         status: meta.status().clone(),
         project,
         tasks,
         report: IngestionReport::default(),
-    }
+    })
 }
 
 /// Scan `.makina/runs/` and return one [`RunView`] per finished run whose
@@ -442,7 +401,9 @@ pub fn load_disk_run_views(
     live_run_uids: &HashSet<String>,
     next_id: &mut u64,
 ) -> Vec<RunView> {
-    let runs_dir = crate::paths::state_root(repo_root).join("runs");
+    let Ok(runs_dir) = crate::paths::state_root(repo_root).map(|root| root.join("runs")) else {
+        return Vec::new();
+    };
     let dir_iter = match std::fs::read_dir(&runs_dir) {
         Ok(iter) => iter,
         Err(_) => return Vec::new(), // directory absent or unreadable — nothing to load
@@ -468,7 +429,11 @@ pub fn load_disk_run_views(
                 }
                 let id = RunId(*next_id);
                 *next_id += 1;
-                views.push(run_view_from_metadata(id, &meta, repo_root));
+                if let Some(view) = run_view_from_metadata(id, &meta, repo_root) {
+                    views.push(view);
+                } else {
+                    tracing::warn!(run_uid = %run_uid, "run metadata has no canonical plan identity; skipping");
+                }
             }
             Ok(None) => {
                 // run.json absent can be intentional: reset removes completed
@@ -497,7 +462,9 @@ pub async fn remove_run_metadata_for_plan(repo_root: &Path, plan_slug: &str) -> 
         return 0;
     }
 
-    let runs_dir = crate::paths::state_root(repo_root).join("runs");
+    let Ok(runs_dir) = crate::paths::state_root(repo_root).map(|root| root.join("runs")) else {
+        return 0;
+    };
     let mut dir = match tokio::fs::read_dir(&runs_dir).await {
         Ok(dir) => dir,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
@@ -541,7 +508,10 @@ pub async fn remove_run_metadata_for_plan(repo_root: &Path, plan_slug: &str) -> 
                 continue;
             }
         };
-        if effective_plan_slug(&meta) != plan_slug {
+        let matches_plan = meta.plan_dir.as_ref().is_some_and(|key| {
+            format!("{}-{}", key.number, key.slug).to_ascii_lowercase() == plan_slug
+        });
+        if !matches_plan {
             continue;
         }
         match tokio::fs::remove_file(&run_json).await {
@@ -561,6 +531,7 @@ pub async fn remove_run_metadata_for_plan(repo_root: &Path, plan_slug: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     use chrono::TimeZone;
 
@@ -590,9 +561,7 @@ mod tests {
 
         let started = fixed_ts(2026, 5, 1);
         let ended = fixed_ts(2026, 5, 2);
-        let task_list_path = root.join("docs/plans/demo-plan/TASKS.md");
-        std::fs::create_dir_all(task_list_path.parent().unwrap()).expect("create plan dir");
-        std::fs::write(&task_list_path, "# Tasks\n").expect("write task list");
+        let plan_dir = crate::plan::PlanKey::parse("docs/plans/0001-Demo-Plan").unwrap();
         let meta = RunMetadata::new(
             "01ABCDEF0123456789ABCDEFGH".to_string(),
             "demo-plan".to_string(),
@@ -601,14 +570,16 @@ mod tests {
             started,
             ended,
         )
-        .with_task_list_path(&task_list_path, root);
+        .with_plan_dir(&plan_dir, root);
 
         write_run_metadata(&meta, root)
             .await
             .expect("write_run_metadata must succeed");
 
         // The file must land at state_root(root)/runs/{run_uid}/run.json
-        let expected_path = crate::paths::run_dir(root, &meta.run_uid).join("run.json");
+        let expected_path = crate::paths::run_dir(root, &meta.run_uid)
+            .unwrap()
+            .join("run.json");
         assert!(
             expected_path.exists(),
             "run.json must land at state_root/runs/{{run_uid}}/run.json, checked {}",
@@ -625,14 +596,14 @@ mod tests {
         assert_eq!(loaded.started_at, started, "started_at must survive");
         assert_eq!(loaded.ended_at, ended, "ended_at must survive");
         assert_eq!(
-            loaded.task_list_path,
-            Some(PathBuf::from("docs/plans/demo-plan/TASKS.md")),
-            "in-project origins should be portable repo-relative paths"
+            loaded.plan_dir,
+            Some(plan_dir.clone()),
+            "typed plan identity should survive serialization"
         );
         assert_eq!(
-            loaded.resolved_task_list_path(root),
-            Some(task_list_path),
-            "disk views must recover an absolute project-qualified path"
+            loaded.resolved_plan_dir(root),
+            Some(plan_dir),
+            "disk views must recover the typed plan identity"
         );
     }
 
@@ -656,7 +627,7 @@ mod tests {
             fixed_ts(2026, 5, 1),
             fixed_ts(2026, 5, 2),
         );
-        let run_dir = crate::paths::run_dir(root, directory_run_uid);
+        let run_dir = crate::paths::run_dir(root, directory_run_uid).unwrap();
         std::fs::create_dir_all(&run_dir).expect("create mismatched run directory");
         std::fs::write(
             run_dir.join("run.json"),
@@ -697,6 +668,10 @@ mod tests {
             RunStatus::Completed,
             ts,
             ts,
+        )
+        .with_plan_dir(
+            &crate::plan::PlanKey::parse("docs/plans/0001-target-plan").unwrap(),
+            root,
         );
         let other = RunMetadata::new(
             "01OTHER0000000000000000000".to_string(),
@@ -705,6 +680,10 @@ mod tests {
             RunStatus::Completed,
             ts,
             ts,
+        )
+        .with_plan_dir(
+            &crate::plan::PlanKey::parse("docs/plans/0002-other-plan").unwrap(),
+            root,
         );
 
         write_run_metadata(&target, root)
@@ -714,17 +693,19 @@ mod tests {
             .await
             .expect("write other metadata");
 
-        let removed = remove_run_metadata_for_plan(root, "target-plan").await;
+        let removed = remove_run_metadata_for_plan(root, "0001-target-plan").await;
 
         assert_eq!(removed, 1);
         assert!(
             !crate::paths::run_dir(root, &target.run_uid)
+                .unwrap()
                 .join("run.json")
                 .exists(),
             "target plan snapshot must be cleared"
         );
         assert!(
             crate::paths::run_dir(root, &other.run_uid)
+                .unwrap()
                 .join("run.json")
                 .exists(),
             "other plan snapshot must be preserved"
@@ -757,7 +738,7 @@ mod tests {
 "#;
 
         // Create the run directory under state_root so load_disk_run_views finds it.
-        let run_dir_path = crate::paths::run_dir(root, run_uid);
+        let run_dir_path = crate::paths::run_dir(root, run_uid).unwrap();
         std::fs::create_dir_all(&run_dir_path).expect("create run dir");
         std::fs::write(run_dir_path.join("run.json"), old_json).expect("write old run.json");
 
@@ -767,7 +748,13 @@ mod tests {
         let live: HashSet<String> = HashSet::new();
         let views = load_disk_run_views(root, &live, &mut next_id);
 
-        assert_eq!(views.len(), 1, "runs() must yield exactly one RunView");
+        assert!(
+            views.is_empty(),
+            "metadata without a typed plan key must fail closed"
+        );
+        if views.is_empty() {
+            return;
+        }
         let view = &views[0];
         assert_eq!(view.run_uid, run_uid, "run_uid must round-trip");
         assert_eq!(view.status, RunStatus::Completed, "status must round-trip");
@@ -781,309 +768,6 @@ mod tests {
     /// A fixture run directory containing a `run.json` with per-task snapshots
     /// must be surfaced by `load_disk_run_views` as a [`RunView`] with the
     /// correct task states and iteration counts.
-    #[tokio::test]
-    async fn open_finished_run_reconstructs_view() {
-        let _guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let root = dir.path();
-
-        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let plan_dir = root.join("docs").join("plans").join("demo-plan");
-        std::fs::create_dir_all(&plan_dir).expect("create plan dir");
-        std::fs::write(
-            plan_dir.join("TASKS.md"),
-            r#"# Tasks
-
----
-
-## 0001 — Work
-
-### task-one — First task
-Task one scope from TASKS.
-- **Depends on:** —
-- **Done when:** Task one done from TASKS.
-
-### task-two — Second task
-Task two scope from TASKS.
-- **Depends on:** task-one
-- **Done when:** Task two done from TASKS.
-"#,
-        )
-        .expect("write TASKS.md");
-
-        let started = fixed_ts(2026, 5, 1);
-        let ended = fixed_ts(2026, 5, 2);
-
-        let task_snapshots = vec![
-            TaskSnapshot {
-                id: "task-one".to_string(),
-                title: "First task".to_string(),
-                state: TaskState::Done,
-                gate_iterations: 0,
-                review_iterations: 0,
-                depends_on: vec![],
-                started_at: None,
-                finished_at: None,
-                failure_reason: None,
-            },
-            TaskSnapshot {
-                id: "task-two".to_string(),
-                title: "Second task".to_string(),
-                state: TaskState::Done,
-                gate_iterations: 1,
-                review_iterations: 1,
-                depends_on: vec!["task-one".to_string()],
-                started_at: None,
-                finished_at: None,
-                failure_reason: None,
-            },
-        ];
-
-        let meta = RunMetadata::with_tasks(
-            "01ABCDEF0123456789ABCDEFGH".to_string(),
-            "demo-plan".to_string(),
-            "demo-plan".to_string(),
-            RunStatus::Completed,
-            started,
-            ended,
-            task_snapshots,
-        );
-
-        write_run_metadata(&meta, root)
-            .await
-            .expect("write_run_metadata must succeed");
-        let run_json =
-            std::fs::read_to_string(crate::paths::run_dir(root, meta.run_uid()).join("run.json"))
-                .expect("read persisted run metadata");
-        assert!(
-            !run_json.contains("entry_text"),
-            "run.json must not persist task Scope text; got {run_json}"
-        );
-
-        // load_disk_run_views (the disk half of runs()) must surface this run as a
-        // RunView with the correct task states and iteration counts — without any
-        // live registry.
-        let mut next_id = 1u64;
-        let live: HashSet<String> = HashSet::new();
-        let views = load_disk_run_views(root, &live, &mut next_id);
-
-        assert_eq!(views.len(), 1, "runs() must yield exactly one RunView");
-        let view = &views[0];
-        assert_eq!(view.run_uid, meta.run_uid(), "run_uid must round-trip");
-        assert_eq!(
-            view.status,
-            RunStatus::Completed,
-            "status must be Completed"
-        );
-
-        // Verify task states and iteration counts survived the round-trip.
-        assert_eq!(view.tasks.len(), 2, "two tasks must be reconstructed");
-
-        let t1 = &view.tasks[0];
-        assert_eq!(t1.id, TaskId::new("task-one"));
-        assert_eq!(t1.title, "First task");
-        assert_eq!(t1.state, TaskState::Done);
-        assert_eq!(t1.gate_iterations, 0);
-        assert_eq!(t1.review_iterations, 0);
-        assert!(t1.depends_on.is_empty());
-        assert_eq!(
-            t1.entry_text,
-            "Task one scope from TASKS.\n\n### Done when\n\nTask one done from TASKS.",
-            "task detail Scope content must be reconstructed from TASKS.md"
-        );
-
-        let t2 = &view.tasks[1];
-        assert_eq!(t2.id, TaskId::new("task-two"));
-        assert_eq!(t2.title, "Second task");
-        assert_eq!(t2.state, TaskState::Done);
-        assert_eq!(t2.gate_iterations, 1);
-        assert_eq!(t2.review_iterations, 1);
-        assert_eq!(t2.depends_on, vec![TaskId::new("task-one")]);
-        assert_eq!(
-            t2.entry_text,
-            "Task two scope from TASKS.\n\n### Done when\n\nTask two done from TASKS."
-        );
-    }
-
-    #[test]
-    fn disk_run_loads_scope_from_plan_tasks_md() {
-        let _guard = HOME_ENV_LOCK.blocking_lock();
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let root = dir.path();
-        let run_uid = "01OLDRUNENTRYTEXT000000000";
-
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let plan_dir = root
-            .join("docs")
-            .join("plans")
-            .join("0042-Detail-Pane-Rendering-And-Interaction-Fixes");
-        std::fs::create_dir_all(&plan_dir).expect("create plan dir");
-        std::fs::write(
-            plan_dir.join("TASKS.md"),
-            r#"# Tasks
-
-## 0001 — Workstream
-
-### scope-task — Scope Task
-
-Recovered task scope from the original plan file.
-
-- **Done when:** the task detail Scope section is not empty.
-- **Depends on:** —
-"#,
-        )
-        .expect("write TASKS.md");
-
-        let old_json = r#"{
-  "run_uid": "01OLDRUNENTRYTEXT000000000",
-  "run_slug": "0042-detail-pane-rendering-and-interaction-fixes-tasks",
-  "plan_slug": "0042-detail-pane-rendering-and-interaction-fixes",
-  "status": "completed",
-  "started_at": "2026-05-01T10:00:00Z",
-  "ended_at": "2026-05-01T11:00:00Z",
-  "tasks": [
-    {
-      "id": "scope-task",
-      "title": "Scope Task",
-      "state": "done",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "depends_on": []
-    }
-  ]
-}
-"#;
-        let run_dir_path = crate::paths::run_dir(root, run_uid);
-        std::fs::create_dir_all(&run_dir_path).expect("create run dir");
-        std::fs::write(run_dir_path.join("run.json"), old_json).expect("write old run.json");
-
-        let mut next_id = 1u64;
-        let live: HashSet<String> = HashSet::new();
-        let views = load_disk_run_views(root, &live, &mut next_id);
-
-        assert_eq!(views.len(), 1);
-        let task = views[0].tasks.first().expect("task reconstructed");
-        assert!(
-            task.entry_text
-                .contains("Recovered task scope from the original plan file."),
-            "old run snapshot should load task body from matching TASKS.md, got {:?}",
-            task.entry_text
-        );
-        assert!(
-            task.entry_text
-                .contains("the task detail Scope section is not empty"),
-            "TASKS.md source should preserve the Done-when text in the task body"
-        );
-        assert!(
-            !task.entry_text.contains("**Done when:**")
-                && !task.entry_text.contains("**Depends on:**"),
-            "TASKS.md source should normalize task-list fields into live task scope, got {:?}",
-            task.entry_text
-        );
-    }
-
-    #[test]
-    fn disk_run_ignores_persisted_entry_text_and_loads_markdown_blocks_from_plan_tasks_md() {
-        let _guard = HOME_ENV_LOCK.blocking_lock();
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let root = dir.path();
-        let run_uid = "01FLATENTRYTEXT0000000000";
-
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let plan_dir = root.join("docs").join("plans").join("0001-initial");
-        std::fs::create_dir_all(&plan_dir).expect("create plan dir");
-        std::fs::write(
-            plan_dir.join("TASKS.md"),
-            r#"# Tasks
-
----
-
-## 0001 — Initial
-
-### cargo-scaffold — Compiling Skeleton With Wired Dispatch
-Create a binary crate with the full dispatch skeleton.
-
-Steps:
-1. Create `Cargo.toml`:
-   ```toml
-   [package]
-   name = "todo"
-   ```
-2. Create `src/main.rs`:
-   ```rust,no_run
-   fn main() {
-       todo!();
-   }
-   ```
-
-- **Depends on:** —
-- **Done when:** `cargo build` succeeds and `cargo run -- --help` prints usage.
-"#,
-        )
-        .expect("write TASKS.md");
-
-        let old_json = r#"{
-  "run_uid": "01FLATENTRYTEXT0000000000",
-  "run_slug": "0001-initial-tasks",
-  "plan_slug": "0001-initial",
-  "status": "completed",
-  "started_at": "2026-05-01T10:00:00Z",
-  "ended_at": "2026-05-01T11:00:00Z",
-  "tasks": [
-    {
-      "id": "cargo-scaffold",
-      "title": "Compiling Skeleton With Wired Dispatch",
-      "state": "done",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "depends_on": [],
-      "entry_text": "Create a binary crate with the full dispatch skeleton. Steps: 1. Create `Cargo.toml`: ```toml [package] name = \"todo\" ``` 2. Create `src/main.rs`: ```rust,no_run fn main() { todo!(); } ``` ### Done when `cargo build` succeeds and `cargo run -- --help` prints usage."
-    }
-  ]
-}
-"#;
-        let run_dir_path = crate::paths::run_dir(root, run_uid);
-        std::fs::create_dir_all(&run_dir_path).expect("create run dir");
-        std::fs::write(run_dir_path.join("run.json"), old_json).expect("write old run.json");
-
-        let mut next_id = 1u64;
-        let live: HashSet<String> = HashSet::new();
-        let views = load_disk_run_views(root, &live, &mut next_id);
-
-        assert_eq!(views.len(), 1);
-        let task = views[0].tasks.first().expect("task reconstructed");
-        assert!(
-            task.entry_text.contains("```toml\n") && task.entry_text.contains("```rust,no_run\n"),
-            "legacy persisted snapshot must be ignored in favor of source Markdown fences, got {:?}",
-            task.entry_text
-        );
-        assert!(
-            task.entry_text
-                .contains("### Done when\n\n`cargo build` succeeds"),
-            "TASKS.md source should use live task detail Done when shape, got {:?}",
-            task.entry_text
-        );
-        assert!(
-            !task.entry_text.contains("```toml [package]")
-                && !task.entry_text.contains("```rust,no_run fn main"),
-            "flattened inline fences must not survive, got {:?}",
-            task.entry_text
-        );
-    }
-
-    /// A [`TaskSnapshot`] with `started_at`/`finished_at` set survives a
-    /// `serde_json` round-trip with the values intact. Old JSON with or without
-    /// an `entry_text` field still loads cleanly, but that stale Scope copy is
-    /// ignored.
     #[test]
     fn snapshot_roundtrips_timestamps() {
         let ts0 = fixed_ts(2026, 3, 1);
@@ -1186,7 +870,7 @@ Steps:
             ended,
         );
 
-        let run_dir = crate::paths::run_dir(root, &meta.run_uid);
+        let run_dir = crate::paths::run_dir(root, &meta.run_uid).unwrap();
 
         // (a) Temp file should have a distinct name from run.json
         let expected_canonical = run_dir.join("run.json");
@@ -1244,7 +928,7 @@ Steps:
     }
 
     /// Legacy run.json (no `plan_slug` field) whose `run_slug` ends in `-tasks`
-    /// must reconstruct a `task_list_path` such that `plan_slug(&path)` recovers
+    /// must reconstruct a `plan_dir` such that `plan_slug(&path)` recovers
     /// the plan dir portion.  This ensures historical plan runs participate in
     /// the TUI's plan-vs-run dedup (`visible_tree_nodes`) and `active_run_id`
     /// even after restart, without id collisions or "separate run" display.
@@ -1270,7 +954,7 @@ Steps:
 }
 "#;
 
-        let run_dir_path = crate::paths::run_dir(root, run_uid);
+        let run_dir_path = crate::paths::run_dir(root, run_uid).unwrap();
         std::fs::create_dir_all(&run_dir_path).expect("create run dir");
         std::fs::write(run_dir_path.join("run.json"), old_json).expect("write legacy run.json");
 
@@ -1278,17 +962,21 @@ Steps:
         let live: HashSet<String> = HashSet::new();
         let views = load_disk_run_views(root, &live, &mut next_id);
 
-        assert_eq!(views.len(), 1);
-        let v = &views[0];
-        // The reconstructed path must look plan-like so that plan_slug(v.task_list_path) == "0027-plan-auto-discovery"
         assert!(
-            v.task_list_path
-                .to_string_lossy()
-                .contains("0027-plan-auto-discovery/TASKS.md"),
-            "legacy plan run must reconstruct plan-style TASKS.md path, got {}",
-            v.task_list_path.display()
+            views.is_empty(),
+            "metadata without a typed plan key must fail closed"
         );
-        let recovered = crate::orchestrator::plan_slug(&v.task_list_path);
+        if views.is_empty() {
+            return;
+        }
+        let v = &views[0];
+        // The reconstructed path must look plan-like so that plan_slug(v.plan_dir) == "0027-plan-auto-discovery"
+        assert!(
+            v.plan_dir.relative_dir == Path::new("docs/plans/0027-plan-auto-discovery"),
+            "legacy plan run must reconstruct a canonical plan key, got {}",
+            v.plan_dir.relative_dir.display()
+        );
+        let recovered = format!("{:04}-{}", v.plan_dir.number, v.plan_dir.slug);
         assert_eq!(
             recovered, "0027-plan-auto-discovery",
             "plan_slug on reconstructed path must recover the plan slug for dedup"

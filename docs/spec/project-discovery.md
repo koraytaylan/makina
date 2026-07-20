@@ -24,7 +24,7 @@ The pass runs once on first open of a repository, writes its findings to `config
 | **Discovery pass** | LLM reads repo context → outputs JSON | Yes | Once written to disk, frozen |
 | **Gate execution** | Config file (`source = "discovered"` gates) | No | Yes — shell commands, always deterministic |
 | **Role constraint prompts** | Config file (`system_prompt`, folded per-role) | No | Yes — merged at `config.toml` read-time |
-| **Task orchestration** | Planner + task list (deterministic grammar) | Task list is model-output | Inference only; orchestration deterministic |
+| **Task orchestration** | Validated per-task plan documents | Typed blueprint may be model-assisted | Authoring assistance only; orchestration deterministic |
 
 **Key principle:** Only the initial discovery is model-driven. All execution — gate commands, role prompts, task scheduling — is deterministic, auditable, and editable via the config file. The model's output is **not** re-interpreted on every run.
 
@@ -71,7 +71,7 @@ The model is instructed to output ONLY a JSON object matching this schema:
   "role_constraints": {
     "developer": "Use workspace lints and test templates; see CONTRIBUTING.md.",
     "reviewer": "Approve only if all gates pass and code follows the style guide.",
-    "planner": "Generate task lists in the 0025 format with explicit test-first sections."
+    "planner": "Generate typed plan blueprints with explicit test-first tasks."
   }
 }
 ```
@@ -146,7 +146,7 @@ system_prompt_mode = "append"
 [roles.planner]
 provider = "anthropic"
 model = "claude-opus"
-system_prompt = "Generate task lists in 0025 format."
+system_prompt = "Generate typed plan blueprints for canonical Rust rendering."
 system_prompt_mode = "append"
 ```
 
@@ -328,7 +328,7 @@ system_prompt_mode = "append"
 [roles.planner]
 provider = "anthropic"
 model = "claude-opus"
-system_prompt = "Generate task lists in 0025 format."
+system_prompt = "Generate typed plan blueprints for canonical Rust rendering."
 system_prompt_mode = "append"
 
 base_branch = "main"
@@ -357,13 +357,13 @@ scanned_files = ["Cargo.toml", "README.md", "CONTRIBUTING.md"]
 
 ## 11. Interaction with Task Lists and Gates
 
-### 11.1 Discovery does not touch task lists
-The discovery pass reads manifests and docs, but **does not** inspect or modify `TASKS.md` (or any structured-text task list). The `DiscoveryResult` JSON has no `tasks` field.
+### 11.1 Project discovery does not mutate plan documents
+Project discovery reads manifests and repository documentation but does not mutate plan bundles. Plan discovery is a separate read-only pass over directories containing `tasks/`; task documents remain source input, not `DiscoveryResult` payload.
 
 Task-list authoring is a human responsibility, and the [structured-text-convention](./structured-text-convention.md) is its own normative document.
 
 ### 11.2 Discovery gates are separate from task-level gates
-- **Task-level gates:** Specified inline in a task list (e.g., within `TASKS.md` via plan scaffolding — planned for 0028).
+- **Task-level gates:** Declared by the closed `gated` field in each `tasks/*.md` document.
 - **Project-level gates:** Discovered (or manually defined) in `config.toml`.
 
 Project-level gates run **between task phases** (e.g., after Developer turn, before Reviewer); they are not per-task. This document specifies project-level discovery only.
@@ -417,7 +417,7 @@ The following are **out of scope** for this release but noted for future work:
 
 - **Scheduled re-discovery:** Automatically re-run discovery on cron-like schedules or when manifest files change.
 - **Partial discovery:** Re-scan only one aspect (e.g., gates) without re-running the full pass.
-- **Discovery events in the task list:** A future task-list extension may allow `TASKS.md` to declare discovery-driven gates inline (task 0028 explores this).
+- **Discovery-driven plan changes:** Any future extension must enter through the typed plan schema and coordinator-owned authoring transaction.
 - **Multiple discovery profiles:** Support different discovery results per environment (e.g., dev vs. CI).
 
 ---

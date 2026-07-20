@@ -11,8 +11,8 @@ touches:
   - crates/makina-core/tests/plan_bundle.rs
   - crates/makina-core/tests/fixtures/plan-bundles/**
   - .claude/workflows/fixtures/plan-digest-v1.json
-status: planned
-merged_as: ""
+status: done
+merged_as: "f31b531bd20a1e12b9a251a373f627a05ec5bcbd"
 ---
 # Validate The Complete Plan Bundle And DAG
 

@@ -4,7 +4,7 @@
 //! the TUI binds to via `Arc<dyn Api>`.  It implements the full command set:
 //!
 //! ```text
-//!   execute(OpenRun{path})
+//!   execute(OpenPlan{path})
 //!       │ read file (tokio::fs) → interpret → register (status = Pending)
 //!       ▼ broadcast Event::RunOpened
 //!   execute(StartRun{run})
@@ -60,7 +60,7 @@
 //!
 //! | Concern | Status here | Owning task |
 //! |---------|-------------|-------------|
-//! | `OpenRun` → interpret → register → broadcast | implemented | task 28 |
+//! | `OpenPlan` → interpret → register → broadcast | implemented | task 28 |
 //! | `runs()` / `run()` / `subscribe()` | implemented | task 28 |
 //! | `StartRun` / `PauseRun` / `CancelRun` driving the Supervisor | **implemented** | this task (31) |
 //! | model-backed interpreter + real ACP backend | injected, not wired | e2e (task 33) |
@@ -81,9 +81,10 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::actors::{EventSink, RunControl, run_graph};
+use crate::actors::{EventSink, RunControl};
 use crate::api::{
-    Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunStatus, RunView, TaskView,
+    Api, ApiError, AuthoredTaskView, Command, CommandOutcome, Event, EventStream, RunId, RunStatus,
+    RunView, TaskView,
 };
 use crate::audit::{AuditRegistry, NoopAuditRegistry};
 use crate::backend::AgentBackend;
@@ -94,456 +95,663 @@ use crate::run_metadata::{
     RunMetadata, TaskSnapshot, load_disk_run_views, remove_run_metadata_for_plan,
     write_run_metadata,
 };
-use crate::task::TaskGraph;
+use crate::task::{TaskGraph, TaskState};
 use crate::worktree::WorktreeManager;
 
 // ── Constants ────────────────────────────────────────────────────────────────────
 
-/// Fallback slug used when a task-list path has no file stem (e.g. a bare `/`
-/// or an OS string that cannot be decoded to UTF-8).  Both `open_run` and
-/// `start_run` use this value so it is defined once here.
-const SLUG_FALLBACK: &str = "task-list";
+const SLUG_FALLBACK: &str = "plan";
 
-/// Derive a collision-free, plan-scoped run slug from a task-list path.
-///
-/// The slug is `"{parent_dir_name}-{file_stem}"`, lowercased and sanitized into
-/// a valid kebab id per `docs/spec/runtime-artifact-schema.md` §4.1: lowercase
-/// ASCII letters/digits/hyphens, starting and ending with an alphanumeric, no
-/// consecutive hyphens, minimum two characters. Including the parent directory
-/// makes the slug unique per plan, so opening different `TASKS.md` files no
-/// longer collide on the slug `TASKS` and shadow each other's persisted graphs.
-///
-/// When there is no usable parent directory the slug falls back to the
-/// lowercased stem alone; if even that is shorter than the §4.1 minimum of two
-/// characters, [`SLUG_FALLBACK`] is the single terminal fallback.
-///
-/// Exposed (`pub`) so that integration tests — and any future caller that
-/// pre-seeds a `.makina/tasks/{slug}.json` artifact for a given task-list path —
-/// can compute the exact same slug `open_run`/`start_run` derive, keeping a
-/// single source of truth for the derivation.
-pub fn run_slug(task_list_path: &Path) -> String {
-    // Lowercased file stem (e.g. "tasks" from "TASKS.md"). If the path has no
-    // decodable stem, there is nothing to scope on — return the fallback.
-    let stem = match task_list_path.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => s.to_lowercase(),
-        None => return SLUG_FALLBACK.to_string(),
-    };
+/// Derive the run slug from the canonical plan-directory basename.
+pub fn run_slug(plan_dir: &Path) -> String {
+    plan_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_kebab)
+        .filter(|slug| slug.len() >= 2)
+        .unwrap_or_else(|| SLUG_FALLBACK.to_owned())
+}
 
-    // Lowercased parent directory name, if any (e.g. the plan dir).
-    let parent = task_list_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_lowercase());
+/// Derive the plan slug from the same canonical directory identity.
+pub fn plan_slug(plan_dir: &Path) -> String {
+    run_slug(plan_dir)
+}
 
-    // Prefer the plan-scoped form; sanitize and accept it only if it meets the
-    // §4.1 minimum. Otherwise fall back to the stem alone, then to SLUG_FALLBACK.
-    if let Some(parent) = parent {
-        let scoped = sanitize_kebab(&format!("{parent}-{stem}"));
-        if scoped.len() >= 2 {
-            return scoped;
+/// Registration/execution state derived by the single typed plan scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanDiscoveryState {
+    AwaitingCommit,
+    Unregistered,
+    Ready,
+    Active,
+    Invalid,
+}
+
+impl PlanDiscoveryState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AwaitingCommit => "awaiting-commit",
+            Self::Unregistered => "unregistered",
+            Self::Ready => "ready",
+            Self::Active => "active",
+            Self::Invalid => "invalid",
         }
     }
+}
 
-    let bare = sanitize_kebab(&stem);
-    if bare.len() >= 2 {
-        bare
-    } else {
-        SLUG_FALLBACK.to_string()
+impl std::fmt::Display for PlanDiscoveryState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 
-/// Derive a plan slug from a task-list path: the lowercased-kebab of the task
-/// list's **parent directory name only** (no file stem).
-///
-/// e.g. `…/0003-Runtime-and-TUI-Hardening/TASKS.md` →
-/// `0003-runtime-and-tui-hardening`. Unlike [`run_slug`] (which scopes on
-/// `parent-stem` to disambiguate per task-list file), this names the *plan*
-/// itself so per-task worktree directories and branches can be plan-scoped.
-///
-/// Reuses [`run_slug`]'s kebab sanitizer. Falls back to [`SLUG_FALLBACK`] when
-/// there is no usable parent directory (or its sanitized form is shorter than
-/// the §4.1 minimum of two characters).
-pub fn plan_slug(task_list_path: &Path) -> String {
-    let parent = task_list_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str());
-
-    if let Some(parent) = parent {
-        let slug = sanitize_kebab(parent);
-        if slug.len() >= 2 {
-            return slug;
-        }
-    }
-
-    SLUG_FALLBACK.to_string()
-}
-
-/// Resolve a stable plan identity while preserving the supported TASKS-less
-/// flow (where the file does not exist yet but its plan directory does).
-async fn canonical_task_list_path(path: PathBuf) -> PathBuf {
-    if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
-        return canonical;
-    }
-
-    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())
-        && let Ok(canonical_parent) = tokio::fs::canonicalize(parent).await
-    {
-        return canonical_parent.join(file_name);
-    }
-
-    if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&path))
-            .unwrap_or(path)
-    }
-}
-
-/// Return `true` when `path` is a plan-style task list (`file_name == "TASKS.md"`,
-/// case-insensitive) — the only shape that triggers auto-generation on `NotFound`.
-/// Deterministic routes (non-`TASKS.md` paths) still error with the original
-/// `ApiError::InvalidCommand`.
-fn is_plan_tasks_path(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|n| n.eq_ignore_ascii_case("TASKS.md"))
-}
-
-/// Check if `dir` follows the plan convention (both SCOPE.md and ARCHITECTURE.md exist).
-fn is_plan_convention_dir(dir: &Path) -> bool {
-    dir.join("SCOPE.md").is_file() && dir.join("ARCHITECTURE.md").is_file()
-}
-
-/// One task previewed from a plan's `TASKS.md`, for the read-only sidebar tree
-/// and plan-detail pane — parsed WITHOUT interpreting/opening a run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanTaskPreview {
-    /// The task's kebab id (the text before ` — ` in its `### {id} — {title}` heading).
-    pub id: String,
-    /// The task title (the text after ` — `, with any trailing `(GATED)` kept).
-    pub title: String,
-    /// `true` when the title ends with `(GATED)`.
-    pub gated: bool,
-    /// Direct prerequisite task ids from the task's `- **Depends on:**` bullet
-    /// (empty for `—` / `none`).
-    pub depends_on: Vec<String>,
-    /// The raw Markdown body under the task's `### {id} — {title}` heading — every
-    /// line up to the next task (`### `) or section (`## `) heading, trimmed of
-    /// surrounding blank lines. Best-effort preview text for the plan-task detail
-    /// pane; empty when the task heading has no body.
-    pub body: String,
-}
-
-/// One plan directory discovered under `docs/plans/`.
+/// One correlated plan identity. Typed document data is populated only after
+/// the shared loader has validated the complete bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEntry {
-    /// Absolute path to the plan directory (e.g. `…/docs/plans/0027-Plan-Auto-Discovery`).
     pub dir: PathBuf,
-    /// The plan slug `plan_slug(dir/TASKS.md)` derives (e.g. `0027-plan-auto-discovery`).
+    pub key: crate::plan::PlanKey,
     pub slug: String,
-    /// `true` when the dir contains a `TASKS.md` (openable via `OpenRun`);
-    /// `false` routes to the planner-generate path (plan 0028).
-    pub has_tasks: bool,
-    /// The plan's tasks parsed from `TASKS.md` in file order (empty when there is
-    /// no `TASKS.md` or it parses to zero tasks). Read-only preview data — the
-    /// authoritative task graph is still built by `OpenRun`'s interpreter.
-    pub tasks: Vec<PlanTaskPreview>,
-    /// SCOPE.md content (cached at discovery time; None if unreadable or absent).
-    pub scope_text: Option<String>,
-    /// ARCHITECTURE.md content (cached at discovery time; None if unreadable or absent).
-    pub architecture_text: Option<String>,
-    /// STATUS.md content (cached at discovery time; None if unreadable or absent).
-    pub status_text: Option<String>,
+    pub state: PlanDiscoveryState,
+    pub document: Option<crate::plan::PlanDocument>,
+    pub diagnostics: crate::plan::PlanValidationReport,
 }
 
-/// Parse a plan's `TASKS.md` text into its tasks IN FILE ORDER, mirroring the
-/// ingestion heading contract (`### {id} — {title}` with the ` — ` =
-/// space+U+2014+space separator; `- **Depends on:**` lists direct prerequisites;
-/// a trailing `(GATED)` marks a gated task). This is a lightweight preview parser
-/// — it does NOT validate the graph; that remains `OpenRun`'s job.
-pub fn parse_plan_tasks(md: &str) -> Vec<PlanTaskPreview> {
-    const SEP: &str = " \u{2014} "; // space + em dash + space
-    let mut tasks: Vec<PlanTaskPreview> = Vec::new();
-    // When inside a task's `Depends on` field, accumulate soft-wrapped
-    // continuation lines into `dep_buf` until a structural boundary, matching the
-    // interpreter's multi-line field handling (interpreter::parse_structured_text,
-    // `ParseState::InDependsOn`). `dep_target` is the index of the task being filled.
-    let mut dep_buf: Option<(usize, String)> = None;
-    // Index of the task whose body lines we are currently accumulating. A `### `
-    // task heading moves it to the new task; a `## ` section heading clears it.
-    let mut current: Option<usize> = None;
-
-    // Append one raw source line to the given task's body (preserving newlines).
-    fn push_body(tasks: &mut [PlanTaskPreview], idx: Option<usize>, raw: &str) {
-        if let Some(i) = idx
-            && let Some(t) = tasks.get_mut(i)
-        {
-            t.body.push_str(raw);
-            t.body.push('\n');
-        }
+impl PlanEntry {
+    pub fn tasks(&self) -> &[crate::plan::TaskDocument] {
+        self.document
+            .as_ref()
+            .map_or(&[], |document| document.tasks.as_slice())
     }
 
-    // Flush the accumulated Depends-on buffer into its task.
-    macro_rules! flush_deps {
-        () => {
-            if let Some((idx, buf)) = dep_buf.take()
-                && let Some(t) = tasks.get_mut(idx)
+    pub fn has_document(&self) -> bool {
+        self.document.is_some()
+    }
+
+    pub fn is_executable(&self) -> bool {
+        matches!(
+            self.state,
+            PlanDiscoveryState::Ready | PlanDiscoveryState::Active
+        )
+    }
+}
+
+/// Discover and classify the union of working-tree, committed-base, and
+/// retained `plan/*` candidates. Historical numbered directories reserve their
+/// number but remain inert when they contain no `tasks/` directory.
+pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
+    use crate::plan::{
+        FilesystemPlanFileSource, GitTreePlanFileSource, PlanCandidate, PlanKey, PlanReservations,
+        PlanValidationDiagnostic, PlanValidationReport, load_plan,
+    };
+
+    fn git(root: &Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+    fn diagnostic(code: &str, path: PathBuf, message: impl Into<String>) -> PlanValidationReport {
+        PlanValidationReport {
+            diagnostics: vec![PlanValidationDiagnostic {
+                code: code.to_owned(),
+                path,
+                field: None,
+                message: message.into(),
+            }],
+        }
+    }
+    fn reserve_directory(reservations: &mut PlanReservations, relative: &Path, name: &str) {
+        if name.len() < 4 || !name.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+            return;
+        }
+        let paths = reservations
+            .numbered_directories
+            .entry(name[..4].to_owned())
+            .or_default();
+        if !paths.iter().any(|path| path == relative) {
+            paths.push(relative.to_path_buf());
+        }
+    }
+    fn trailer(message: &str, name: &str) -> Option<String> {
+        let prefix = format!("{name}: ");
+        message
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RetainedEvidence {
+        Registration,
+        Claim,
+        Landing,
+        Bookkeeping,
+        Disposition,
+        Prepared,
+        FinalIntegration,
+        Completion,
+    }
+
+    fn retained_evidence(message: &str, expected_plan: &str) -> Result<RetainedEvidence, String> {
+        let has = |name| trailer(message, name).is_some_and(|value| !value.is_empty());
+        if trailer(message, "Makina-Plan").as_deref() != Some(expected_plan) {
+            return Err("retained commit lacks the expected Makina-Plan identity".into());
+        }
+        match trailer(message, "Makina-Phase").as_deref() {
+            Some("plan-registration")
+                if has("Makina-Source-Digest")
+                    && has("Makina-Executable-Digest")
+                    && has("Makina-Validation-Base") =>
             {
-                t.depends_on = parse_dep_list(&buf);
+                Ok(RetainedEvidence::Registration)
             }
-        };
+            Some("task-status")
+                if has("Makina-Task") && has("Makina-Run") && has("Makina-Landing") =>
+            {
+                Ok(RetainedEvidence::Bookkeeping)
+            }
+            Some("task-status") if has("Makina-Task") && has("Makina-Run") => {
+                Ok(RetainedEvidence::Claim)
+            }
+            Some("task-disposition")
+                if has("Makina-Task")
+                    && has("Makina-Run")
+                    && has("Makina-Previous-Source-Digest")
+                    && has("Makina-New-Source-Digest")
+                    && has("Makina-Previous-Plan-Digest")
+                    && has("Makina-New-Plan-Digest") =>
+            {
+                Ok(RetainedEvidence::Disposition)
+            }
+            Some("finalization-prepared")
+                if has("Makina-Run") && has("Makina-Final-Mode") && has("Makina-Expected-Base") =>
+            {
+                Ok(RetainedEvidence::Prepared)
+            }
+            Some("final-integration")
+                if has("Makina-Run") && has("Makina-Final-Mode") && has("Makina-Plan-Tip") =>
+            {
+                Ok(RetainedEvidence::FinalIntegration)
+            }
+            Some("completion") if has("Makina-Run") && has("Makina-Final-Commit") => {
+                Ok(RetainedEvidence::Completion)
+            }
+            None if has("Makina-Task") && has("Makina-Run") => Ok(RetainedEvidence::Landing),
+            _ => Err("commit is not recognized retained plan lifecycle evidence".into()),
+        }
     }
-
-    for raw in md.lines() {
-        let is_section = raw.starts_with("## ") && !raw.starts_with("### ");
-        let is_task = raw.starts_with("### ");
-
-        // While reading a multi-line Depends-on value, a blank line / new bullet
-        // field / heading / `---` ends it; anything else is a wrapped continuation.
-        if dep_buf.is_some() {
-            let trimmed = raw.trim();
-            let is_boundary = trimmed.is_empty()
-                || is_section
-                || is_task
-                || raw == "---"
-                || trimmed.starts_with("- **");
-            if is_boundary {
-                flush_deps!();
-                // fall through and process this line as a normal structural line
-            } else {
-                if let Some((_, buf)) = dep_buf.as_mut() {
-                    buf.push(' ');
-                    buf.push_str(trimmed);
+    fn registration_oid(
+        root: &Path,
+        key: &PlanKey,
+        tip: &str,
+    ) -> Result<(String, String, String, String), String> {
+        let history = git(root, &["rev-list", "--first-parent", tip])
+            .ok_or_else(|| "cannot inspect retained plan lineage".to_owned())?;
+        let expected = format!("{}-{}", key.number, key.slug);
+        let mut registrations = Vec::new();
+        for oid in history.lines() {
+            let Some(message) = git(root, &["show", "-s", "--format=%B", oid]) else {
+                return Err(format!("cannot read commit {oid}"));
+            };
+            if trailer(&message, "Makina-Phase").as_deref() == Some("plan-registration")
+                && trailer(&message, "Makina-Plan").as_deref() == Some(expected.as_str())
+            {
+                let required = [
+                    "Makina-Source-Digest",
+                    "Makina-Executable-Digest",
+                    "Makina-Validation-Base",
+                ];
+                if required
+                    .iter()
+                    .all(|name| trailer(&message, name).is_some())
+                {
+                    registrations.push((
+                        oid.to_owned(),
+                        trailer(&message, "Makina-Source-Digest").unwrap(),
+                        trailer(&message, "Makina-Executable-Digest").unwrap(),
+                        trailer(&message, "Makina-Validation-Base").unwrap(),
+                    ));
                 }
-                // A wrapped Depends-on continuation is still part of the body.
-                push_body(&mut tasks, current, raw);
+            }
+        }
+        match registrations.as_slice() {
+            [] => Err("retained plan ref has no verified Phase-R commit".to_owned()),
+            [registration] => Ok(registration.clone()),
+            registrations => {
+                for pair in registrations.windows(2) {
+                    let newer_message = git(root, &["show", "-s", "--format=%B", &pair[0].0])
+                        .ok_or_else(|| "cannot read refreshed registration".to_owned())?;
+                    if trailer(&newer_message, "Makina-Previous-Registration").as_deref()
+                        != Some(pair[1].0.as_str())
+                    {
+                        return Err(
+                            "multiple Phase-R commits are not one verified refresh chain"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Ok(registrations[0].clone())
+            }
+        }
+    }
+
+    fn authorized_digests(
+        root: &Path,
+        key: &PlanKey,
+        tip: &str,
+        registration: &str,
+        mut source: String,
+        mut executable: String,
+    ) -> Result<(String, String), String> {
+        #[derive(Debug)]
+        enum LineageState {
+            Ready,
+            Claimed {
+                task: String,
+                run: String,
+            },
+            Landed {
+                task: String,
+                run: String,
+                oid: String,
+            },
+            Prepared {
+                oid: String,
+                run: String,
+            },
+            Integrated {
+                oid: String,
+                run: String,
+            },
+            Complete,
+        }
+
+        let range = format!("{registration}..{tip}");
+        let history = git(root, &["rev-list", "--first-parent", "--reverse", &range])
+            .ok_or_else(|| "cannot inspect post-registration lineage".to_owned())?;
+        let mut state = LineageState::Ready;
+        for oid in history.lines() {
+            let message = git(root, &["show", "-s", "--format=%B", oid])
+                .ok_or_else(|| format!("cannot read commit {oid}"))?;
+            let expected = format!("{}-{}", key.number, key.slug);
+            let evidence = retained_evidence(&message, &expected)
+                .map_err(|reason| format!("invalid retained commit {oid}: {reason}"))?;
+            state = match (state, evidence) {
+                (LineageState::Ready, RetainedEvidence::Claim) => LineageState::Claimed {
+                    task: trailer(&message, "Makina-Task").unwrap(),
+                    run: trailer(&message, "Makina-Run").unwrap(),
+                },
+                (LineageState::Claimed { task, run }, RetainedEvidence::Landing)
+                    if trailer(&message, "Makina-Task").as_deref() == Some(task.as_str())
+                        && trailer(&message, "Makina-Run").as_deref() == Some(run.as_str()) =>
+                {
+                    LineageState::Landed {
+                        task,
+                        run,
+                        oid: oid.to_owned(),
+                    }
+                }
+                (
+                    LineageState::Landed {
+                        task,
+                        run,
+                        oid: landing,
+                    },
+                    RetainedEvidence::Bookkeeping,
+                ) if trailer(&message, "Makina-Task").as_deref() == Some(task.as_str())
+                    && trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
+                    && trailer(&message, "Makina-Landing").as_deref() == Some(landing.as_str()) =>
+                {
+                    LineageState::Ready
+                }
+                (LineageState::Ready, RetainedEvidence::Disposition) => {
+                    let previous_source = trailer(&message, "Makina-Previous-Source-Digest")
+                        .expect("classified disposition has previous source digest");
+                    let next_source = trailer(&message, "Makina-New-Source-Digest")
+                        .expect("classified disposition has new source digest");
+                    let previous_plan = trailer(&message, "Makina-Previous-Plan-Digest")
+                        .expect("classified disposition has previous plan digest");
+                    let next_plan = trailer(&message, "Makina-New-Plan-Digest")
+                        .expect("classified disposition has new plan digest");
+                    if previous_source != source || previous_plan != executable {
+                        return Err(
+                            "task-disposition digest chain does not match its predecessor".into(),
+                        );
+                    }
+                    source = next_source;
+                    executable = next_plan;
+                    LineageState::Ready
+                }
+                (LineageState::Ready, RetainedEvidence::Prepared) => LineageState::Prepared {
+                    oid: oid.to_owned(),
+                    run: trailer(&message, "Makina-Run").unwrap(),
+                },
+                (
+                    LineageState::Prepared { oid: prepared, run },
+                    RetainedEvidence::FinalIntegration,
+                ) if trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
+                    && trailer(&message, "Makina-Plan-Tip").as_deref()
+                        == Some(prepared.as_str()) =>
+                {
+                    LineageState::Integrated {
+                        oid: oid.to_owned(),
+                        run,
+                    }
+                }
+                (
+                    LineageState::Integrated {
+                        oid: integrated,
+                        run,
+                    },
+                    RetainedEvidence::Completion,
+                ) if trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
+                    && trailer(&message, "Makina-Final-Commit").as_deref()
+                        == Some(integrated.as_str()) =>
+                {
+                    LineageState::Complete
+                }
+                (prior, next) => {
+                    return Err(format!(
+                        "retained lifecycle evidence {next:?} is duplicate, skipped, or out of order after {prior:?}"
+                    ));
+                }
+            };
+        }
+        Ok((source, executable))
+    }
+
+    let Ok(repo_root) = std::fs::canonicalize(repo_root) else {
+        return Vec::new();
+    };
+    let plans_root = repo_root.join("docs/plans");
+    let mut keys = BTreeMap::<PathBuf, PlanKey>::new();
+    let mut reservations = PlanReservations::default();
+    if let Ok(directory) = std::fs::read_dir(&plans_root) {
+        for entry in directory.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
+            };
+            let relative = PathBuf::from("docs/plans").join(&name);
+            reserve_directory(&mut reservations, &relative, &name);
+            if let Ok(key) = PlanKey::parse(relative.clone()) {
+                keys.insert(relative, key);
             }
         }
+    }
 
-        // A workstream/other `## …` header (but not a `### …` task) ends the prior block.
-        if is_section {
-            current = None;
-            continue;
+    // The committed side of discovery is the configured target base, never the
+    // checkout's moving HEAD. This also discovers base-only plans while the
+    // operator has another branch checked out.
+    let configured_base = [
+        repo_root.join(".makina/config.toml"),
+        repo_root.join("makina.toml"),
+    ]
+    .into_iter()
+    .find_map(|path| std::fs::read_to_string(path).ok())
+    .and_then(|contents| {
+        crate::config::ProjectConfig::from_toml_str(&contents, "project config").ok()
+    })
+    .map(|config| config.base_branch)
+    .filter(|branch| !branch.is_empty())
+    .unwrap_or_else(|| "develop".to_owned());
+    let base_revision = format!("refs/heads/{configured_base}");
+    let base_plans_tree = format!("{base_revision}:docs/plans");
+    if let Some(base_dirs) = git(
+        &repo_root,
+        &["ls-tree", "-d", "--name-only", &base_plans_tree],
+    ) {
+        for name in base_dirs.lines() {
+            let relative = PathBuf::from("docs/plans").join(name);
+            let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            reserve_directory(&mut reservations, &relative, name);
+            if let Ok(key) = PlanKey::parse(relative.clone()) {
+                keys.insert(relative, key);
+            }
         }
-        // Task heading: `### {id} — {title}` (ignore deeper `#### …`).
-        if is_task && let Some(rest) = raw.strip_prefix("### ") {
-            if let Some((id, title)) = rest.split_once(SEP) {
-                let title = title.trim().to_string();
-                let gated = title.trim_end().ends_with("(GATED)");
-                tasks.push(PlanTaskPreview {
-                    id: id.trim().to_string(),
-                    title,
-                    gated,
-                    depends_on: Vec::new(),
-                    body: String::new(),
-                });
-                current = Some(tasks.len() - 1);
-            } else {
-                // A `### ` heading that doesn't match the contract still ends the
-                // previous task's body.
-                current = None;
+    }
+
+    let refs = git(
+        &repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/plan/",
+        ],
+    )
+    .unwrap_or_default();
+    let mut retained = BTreeMap::<PlanKey, String>::new();
+    for line in refs.lines() {
+        let Some((reference, oid)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(basename) = reference.strip_prefix("refs/heads/plan/") else {
+            continue;
+        };
+        let relative = PathBuf::from("docs/plans").join(basename);
+        let Ok(key) = PlanKey::parse(relative.clone()) else {
+            continue;
+        };
+        reservations
+            .verified_registrations
+            .entry(key.number.clone())
+            .or_default()
+            .push(reference.to_owned());
+        keys.insert(relative, key.clone());
+        retained.insert(key, oid.to_owned());
+    }
+
+    let working = FilesystemPlanFileSource::new(&repo_root, None).ok();
+    let base = GitTreePlanFileSource::new(&repo_root, &base_revision).ok();
+    let mut entries = Vec::new();
+    for key in keys.into_values() {
+        if let Some(tip) = retained.get(&key) {
+            let registration = registration_oid(&repo_root, &key, tip);
+            let source = GitTreePlanFileSource::new(&repo_root, tip);
+            let loaded = source
+                .as_ref()
+                .map_err(|error| {
+                    diagnostic(
+                        "invalid-retained-plan",
+                        key.relative_dir.clone(),
+                        error.to_string(),
+                    )
+                })
+                .and_then(|source| load_plan(source, key.clone(), &reservations));
+            match (registration, loaded) {
+                (
+                    Ok((registration, source_digest, executable_digest, validation_base)),
+                    Ok(PlanCandidate::Plan(document)),
+                ) if authorized_digests(
+                    &repo_root,
+                    &key,
+                    tip,
+                    &registration,
+                    source_digest.clone(),
+                    executable_digest.clone(),
+                )
+                .is_ok_and(|(source_digest, executable_digest)| {
+                    source_digest == document.source_digest.as_str()
+                        && executable_digest == document.executable_digest.as_str()
+                }) && document
+                    .status
+                    .validation_base_oid
+                    .as_ref()
+                    .is_some_and(|oid| oid.as_str() == validation_base) =>
+                {
+                    entries.push(PlanEntry {
+                        dir: repo_root.join(&key.relative_dir),
+                        slug: format!("{}-{}", key.number, key.slug),
+                        state: if registration == *tip {
+                            PlanDiscoveryState::Ready
+                        } else {
+                            PlanDiscoveryState::Active
+                        },
+                        key,
+                        document: Some(*document),
+                        diagnostics: PlanValidationReport::default(),
+                    })
+                }
+                (registration, loaded) => {
+                    let diagnostics = match loaded {
+                        Err(report) => report,
+                        _ => diagnostic(
+                            "invalid-registration",
+                            key.relative_dir.clone(),
+                            registration.err().unwrap_or_else(|| {
+                                "Phase-R trailers disagree with the retained plan document"
+                                    .to_owned()
+                            }),
+                        ),
+                    };
+                    entries.push(PlanEntry {
+                        dir: repo_root.join(&key.relative_dir),
+                        slug: format!("{}-{}", key.number, key.slug),
+                        key,
+                        state: PlanDiscoveryState::Invalid,
+                        document: None,
+                        diagnostics,
+                    });
+                }
             }
             continue;
         }
-        // The `- **Depends on:**` bullet opens the (possibly multi-line) field.
-        let line = raw.trim_start();
-        if let Some(payload) = line
-            .strip_prefix("- **Depends on:**")
-            .or_else(|| line.strip_prefix("- **Depends on**:"))
-            && let Some(last) = tasks.len().checked_sub(1)
-        {
-            dep_buf = Some((last, payload.trim().to_string()));
-        }
-        // Everything else under the current task (description, bullets, `#### …`
-        // sub-headings, code fences) is body content.
-        push_body(&mut tasks, current, raw);
-    }
-    flush_deps!(); // flush a Depends-on field that ran to EOF
-    // Trim surrounding blank lines so the body starts at the first content line.
-    for t in &mut tasks {
-        let trimmed = t.body.trim().to_string();
-        t.body = trimmed;
-    }
-    tasks
-}
-
-/// Parse a `Depends on` payload into prerequisite ids: comma-separated leading
-/// kebab tokens, with `—` / `-` / `none` / empty meaning "no dependencies".
-/// Markdown backticks and parenthetical asides are stripped first.
-fn parse_dep_list(s: &str) -> Vec<String> {
-    let cleaned: String = {
-        // Drop parenthetical asides so a comma inside one doesn't fragment ids.
-        let mut out = String::with_capacity(s.len());
-        let mut depth = 0i32;
-        for ch in s.chars() {
-            match ch {
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth = (depth - 1).max(0),
-                '`' | '*' | '_' => {}
-                c if depth == 0 => out.push(c),
+        if !repo_root.join(&key.relative_dir).exists() {
+            match base
+                .as_ref()
+                .map(|base| load_plan(base, key.clone(), &reservations))
+            {
+                Some(Ok(PlanCandidate::Plan(document))) => entries.push(PlanEntry {
+                    dir: repo_root.join(&key.relative_dir),
+                    slug: format!("{}-{}", key.number, key.slug),
+                    key,
+                    state: PlanDiscoveryState::Unregistered,
+                    document: Some(*document),
+                    diagnostics: PlanValidationReport::default(),
+                }),
+                Some(Err(diagnostics)) => entries.push(PlanEntry {
+                    dir: repo_root.join(&key.relative_dir),
+                    slug: format!("{}-{}", key.number, key.slug),
+                    key,
+                    state: PlanDiscoveryState::Invalid,
+                    document: None,
+                    diagnostics,
+                }),
                 _ => {}
             }
-        }
-        out
-    };
-    let mut deps = Vec::new();
-    for part in cleaned.split(',') {
-        let chunk = part.trim().trim_end_matches('.').trim();
-        if chunk.is_empty() {
             continue;
         }
-        let lower = chunk.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "—" | "–" | "-" | "none" | "n/a" | "na" | "tbd"
-        ) {
+        let Some(source) = working.as_ref() else {
             continue;
-        }
-        // Take only the leading kebab token (drop trailing prose like "foo and plan 0016").
-        let token: String = chunk
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        let token = token.trim_matches('-');
-        if !token.is_empty() {
-            deps.push(token.to_string());
-        }
-    }
-    deps
-}
-
-/// Scan `repo_root/docs/plans/*/` for plan directories following the
-/// `SCOPE.md` / `ARCHITECTURE.md` / `TASKS.md` convention.
-///
-/// A directory is a plan iff it contains **both** `SCOPE.md` and
-/// `ARCHITECTURE.md`. `TASKS.md` is optional and recorded as
-/// [`PlanEntry::has_tasks`]. Returns entries sorted by directory name
-/// (so `0001-…` precedes `0027-…`). A missing `docs/plans` yields `vec![]`.
-pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
-    let plans_root = repo_root.join("docs").join("plans");
-    let mut entries = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&plans_root) else {
-        return entries; // no docs/plans → nothing discovered
-    };
-    for ent in rd.flatten() {
-        let dir = ent.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        // Convention gate: SCOPE.md AND ARCHITECTURE.md must both exist.
-        if !dir.join("SCOPE.md").is_file() || !dir.join("ARCHITECTURE.md").is_file() {
-            continue; // non-plan dirs (assets/, etc.) are ignored
-        }
-        let tasks_path = dir.join("TASKS.md");
-        let has_tasks = tasks_path.is_file();
-        // Parse the task preview (id/title/gated/deps) once, off the render
-        // thread, so the sidebar tree + plan-detail pane never touch the FS.
-        let tasks = if has_tasks {
-            std::fs::read_to_string(&tasks_path)
-                .map(|s| parse_plan_tasks(&s))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
         };
-        // Read the three spec files (SCOPE.md, ARCHITECTURE.md, STATUS.md),
-        // converting read errors to None.
-        let scope_text = std::fs::read_to_string(dir.join("SCOPE.md")).ok();
-        let architecture_text = std::fs::read_to_string(dir.join("ARCHITECTURE.md")).ok();
-        let status_text = std::fs::read_to_string(dir.join("STATUS.md")).ok();
-        // Slug is exactly what plan_slug derives from this dir's TASKS.md path,
-        // whether or not the file exists (plan_slug keys off the parent dir name).
-        let slug = plan_slug(&tasks_path);
-        entries.push(PlanEntry {
-            dir,
-            slug,
-            has_tasks,
-            tasks,
-            scope_text,
-            architecture_text,
-            status_text,
-        });
+        match load_plan(source, key.clone(), &reservations) {
+            Ok(PlanCandidate::NotCandidate) => {
+                match base
+                    .as_ref()
+                    .map(|base| load_plan(base, key.clone(), &reservations))
+                {
+                    Some(Ok(PlanCandidate::Plan(document))) => entries.push(PlanEntry {
+                        dir: repo_root.join(&key.relative_dir),
+                        slug: format!("{}-{}", key.number, key.slug),
+                        key,
+                        state: PlanDiscoveryState::Unregistered,
+                        document: Some(*document),
+                        diagnostics: PlanValidationReport::default(),
+                    }),
+                    Some(Err(diagnostics)) => entries.push(PlanEntry {
+                        dir: repo_root.join(&key.relative_dir),
+                        slug: format!("{}-{}", key.number, key.slug),
+                        key,
+                        state: PlanDiscoveryState::Invalid,
+                        document: None,
+                        diagnostics,
+                    }),
+                    _ => {}
+                }
+            }
+            Err(diagnostics) => entries.push(PlanEntry {
+                dir: repo_root.join(&key.relative_dir),
+                slug: format!("{}-{}", key.number, key.slug),
+                key,
+                state: PlanDiscoveryState::Invalid,
+                document: None,
+                diagnostics,
+            }),
+            Ok(PlanCandidate::Plan(document)) => {
+                let committed = base
+                    .as_ref()
+                    .and_then(|base| match load_plan(base, key.clone(), &reservations) {
+                        Ok(PlanCandidate::Plan(base_document)) => {
+                            Some(base_document.source_digest == document.source_digest)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                entries.push(PlanEntry {
+                    dir: repo_root.join(&key.relative_dir),
+                    slug: format!("{}-{}", key.number, key.slug),
+                    key,
+                    state: if committed {
+                        PlanDiscoveryState::Unregistered
+                    } else {
+                        PlanDiscoveryState::AwaitingCommit
+                    },
+                    document: Some(*document),
+                    diagnostics: PlanValidationReport::default(),
+                });
+            }
+        }
     }
-    entries.sort_by(|a, b| a.dir.file_name().cmp(&b.dir.file_name()));
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
     entries
 }
 
-/// Discover plans in multiple folders, returning a HashMap mapping folder_idx to
-/// the plans discovered in each folder.
-///
-/// For each folder in `opened_folders`, this function searches `docs/plans/` and
-/// applies the same convention gate as [`discover_plans`]: a directory is a plan iff
-/// it contains **both** `SCOPE.md` and `ARCHITECTURE.md`. The returned HashMap has
-/// an entry for every folder_idx, even if no plans are discovered in that folder.
-///
-/// # Arguments
-/// * `opened_folders` - A slice of folder paths to search for plans.
-///
-/// # Returns
-/// A HashMap where keys are folder indices (0..opened_folders.len()) and values are
-/// vectors of PlanEntry sorted by directory name within each folder.
+/// Load one plan through the same authoritative source selection used by
+/// discovery. Working candidates come from the filesystem, base-only plans
+/// come from the configured base commit, and registered plans come from the
+/// exact retained-ref tip. Consumers must not independently fall back to the
+/// checkout because it may be absent or contain different task prose.
+pub fn load_authoritative_plan(
+    repo_root: &Path,
+    key: &crate::plan::PlanKey,
+) -> Result<crate::plan::PlanDocument, crate::plan::PlanValidationReport> {
+    use crate::plan::{PlanValidationDiagnostic, PlanValidationReport};
+
+    let Some(entry) = discover_plans(repo_root)
+        .into_iter()
+        .find(|entry| entry.key == *key)
+    else {
+        return Err(PlanValidationReport {
+            diagnostics: vec![PlanValidationDiagnostic {
+                code: "plan-not-found".into(),
+                path: key.relative_dir.clone(),
+                field: None,
+                message:
+                    "plan is absent from the working tree, configured base, and retained plan refs"
+                        .into(),
+            }],
+        });
+    };
+
+    entry.document.ok_or(entry.diagnostics)
+}
+
 pub fn discover_plans_per_folder(
     opened_folders: &[PathBuf],
 ) -> std::collections::HashMap<usize, Vec<PlanEntry>> {
-    let mut result = std::collections::HashMap::new();
-
-    for (folder_idx, folder) in opened_folders.iter().enumerate() {
-        let plans_root = folder.join("docs").join("plans");
-        let mut entries = Vec::new();
-
-        let Ok(rd) = std::fs::read_dir(&plans_root) else {
-            // No docs/plans in this folder; insert empty entries and continue.
-            result.insert(folder_idx, entries);
-            continue;
-        };
-
-        for ent in rd.flatten() {
-            let dir = ent.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            // Convention gate: SCOPE.md AND ARCHITECTURE.md must both exist.
-            if !dir.join("SCOPE.md").is_file() || !dir.join("ARCHITECTURE.md").is_file() {
-                continue; // non-plan dirs (assets/, etc.) are ignored
-            }
-            let tasks_path = dir.join("TASKS.md");
-            let has_tasks = tasks_path.is_file();
-            // Parse the task preview (id/title/gated/deps) once, off the render
-            // thread, so the sidebar tree + plan-detail pane never touch the FS.
-            let tasks = if has_tasks {
-                std::fs::read_to_string(&tasks_path)
-                    .map(|s| parse_plan_tasks(&s))
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            // Read the three spec files (SCOPE.md, ARCHITECTURE.md, STATUS.md),
-            // converting read errors to None.
-            let scope_text = std::fs::read_to_string(dir.join("SCOPE.md")).ok();
-            let architecture_text = std::fs::read_to_string(dir.join("ARCHITECTURE.md")).ok();
-            let status_text = std::fs::read_to_string(dir.join("STATUS.md")).ok();
-            // Slug is exactly what plan_slug derives from this dir's TASKS.md path,
-            // whether or not the file exists (plan_slug keys off the parent dir name).
-            let slug = plan_slug(&tasks_path);
-            entries.push(PlanEntry {
-                dir,
-                slug,
-                has_tasks,
-                tasks,
-                scope_text,
-                architecture_text,
-                status_text,
-            });
-        }
-
-        entries.sort_by(|a, b| a.dir.file_name().cmp(&b.dir.file_name()));
-        result.insert(folder_idx, entries);
-    }
-
-    result
+    opened_folders
+        .iter()
+        .enumerate()
+        .map(|(index, root)| (index, discover_plans(root)))
+        .collect()
 }
 
 /// Sanitize `input` into a valid kebab id per `runtime-artifact-schema.md`
@@ -624,6 +832,39 @@ struct RunHandle {
     join: Option<JoinHandle<()>>,
 }
 
+struct StartWaitingGuard {
+    state: Arc<CoreState>,
+    run: RunId,
+    restore_status: RunStatus,
+}
+
+impl Drop for StartWaitingGuard {
+    fn drop(&mut self) {
+        let changed = {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            runs.get_mut(&self.run.0).is_some_and(|entry| {
+                if matches!(entry.status, RunStatus::WaitingForRepository { .. }) {
+                    entry.status = self.restore_status.clone();
+                    entry.handle = None;
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        if changed {
+            let _ = self.state.event_tx.send(Event::RunStatusChanged {
+                run: self.run,
+                status: self.restore_status.clone(),
+            });
+        }
+    }
+}
+
 // ── Registry entry ──────────────────────────────────────────────────────────────
 
 /// One open Run as tracked by the orchestrator's in-memory registry.
@@ -633,22 +874,21 @@ struct RunHandle {
 /// the backing file path, the aggregate [`RunStatus`], and — once started — the
 /// [`RunHandle`] used to pause/cancel the background execution.
 struct RunEntry {
-    /// Path to the task-list file this Run was opened from.
-    task_list_path: PathBuf,
-    /// Canonical plan identity used to make OpenRun idempotent even when the
+    /// Canonical repository-relative plan directory.
+    plan_dir: crate::plan::PlanKey,
+    /// Canonical plan identity used to make OpenPlan idempotent even when the
     /// same file is addressed through relative paths or symlinks.
-    plan_identity: PathBuf,
     /// Persistent, sortable run identity (26-char ULID string) minted when this
     /// Run is opened.  Unlike the in-memory [`RunId`] session handle, the ULID's
     /// lexicographic order matches chronological order, giving a stable key that
     /// survives across processes.  Surfaced read-only on [`RunView::run_uid`] and
     /// threaded into the audit ledger.
     run_uid: String,
-    /// Plan-scoped, human-facing slug derived from the task-list path at open.
+    /// Plan-scoped, human-facing slug derived from the plan directory.
     /// Cached here so run finalization can stamp it into `run.json` without
     /// re-deriving it from the path.
     run_slug: String,
-    /// The plan slug (lowercased-kebab of the task-list's parent directory name)
+    /// The plan slug (lowercased kebab form of the plan-directory basename)
     /// derived at open. Threaded into the scheduler so per-task worktree calls
     /// can plan-scope their directory + branch names.
     plan_slug: String,
@@ -666,12 +906,25 @@ struct RunEntry {
     status: RunStatus,
     /// The background execution's control handle.  `None` until `StartRun`.
     handle: Option<RunHandle>,
+    /// Set by the lease-owning scheduler when authored cancellation could not
+    /// be published. The command thread must not advance runtime status then.
+    cancellation_status_error: Option<String>,
     /// Latest scheduler ownership epoch. A completion from any older epoch is
     /// stale and may neither finalize status nor clear the current handle.
     scheduler_generation: u64,
     /// Ingestion report computed at open (validate + qualify). Threaded to
     /// every RunView snapshot.
     report: crate::ingestion::IngestionReport,
+    /// Present for per-task plans opened from validated source. Open only
+    /// inspects checkpoint compatibility; start performs the lease-bound reread.
+    plan_source: Option<PlanSourceState>,
+}
+
+#[derive(Clone)]
+struct PlanSourceState {
+    key: crate::plan::PlanKey,
+    reconciliation: crate::checkpoint::CheckpointDisposition,
+    checkpoint_identity: crate::checkpoint::CheckpointIdentity,
 }
 
 fn task_entry_text(task: &crate::task::Task) -> String {
@@ -698,7 +951,7 @@ fn task_entry_text(task: &crate::task::Task) -> String {
 fn build_view(
     id: RunId,
     run_uid: String,
-    task_list_path: PathBuf,
+    plan_dir: crate::plan::PlanKey,
     status: RunStatus,
     repo_root: &std::path::Path,
     graph: &TaskGraph,
@@ -713,6 +966,33 @@ fn build_view(
         .tasks
         .iter()
         .map(|task| TaskView {
+            authored: graph
+                .authored
+                .get(&task.id)
+                .map(|metadata| AuthoredTaskView {
+                    source_path: metadata.source_path.clone(),
+                    workstream: metadata.workstream.clone(),
+                    kind: metadata.kind.clone(),
+                    status: metadata.status.to_string(),
+                    gated: metadata.gated,
+                    touches: metadata
+                        .touches
+                        .iter()
+                        .map(|pattern| pattern.as_str().to_owned())
+                        .collect(),
+                    merged_as: metadata.merged_as.clone(),
+                    authored_dependencies: task
+                        .depends_on
+                        .iter()
+                        .filter(|dependency| !metadata.collision_dependencies.contains(dependency))
+                        .map(Into::into)
+                        .collect(),
+                    collision_dependencies: metadata
+                        .collision_dependencies
+                        .iter()
+                        .map(Into::into)
+                        .collect(),
+                }),
             id: (&task.id).into(),
             title: task.title.clone(),
             state: task.state.into(),
@@ -729,7 +1009,7 @@ fn build_view(
     RunView {
         id,
         run_uid,
-        task_list_path,
+        plan_dir,
         status,
         project,
         tasks,
@@ -747,12 +1027,6 @@ fn build_view(
 /// `&self` methods cannot be borrowed by a `'static` spawned future, but a
 /// cloned `Arc<CoreState>` can.
 struct CoreState {
-    /// The interpreter used to turn task-list source text into a [`TaskGraph`]
-    /// for `OpenRun` / `ReinterpretRun` (the ingestion path).  Always the
-    /// deterministic `StructuredTextInterpreter + EdgeInferrer` in the TUI
-    /// binary for responsiveness.
-    interpreter: Arc<dyn TaskListInterpreter>,
-
     /// The interpreter passed to the per-run `Planner` actor (via `run_graph`).
     /// This one *does* respect `config.planner.mechanism` (may be model-backed
     /// via `build_planner_interpreter`).  Separate from the ingestion interpreter
@@ -789,7 +1063,7 @@ struct CoreState {
     runs: Mutex<BTreeMap<u64, RunEntry>>,
 
     /// Single-flight gate for canonicalize/load/interpret/register. This keeps
-    /// concurrent OpenRun requests for one plan from both doing side effects.
+    /// concurrent OpenPlan requests for one plan from both doing side effects.
     open_lock: AsyncMutex<()>,
 
     /// Serializes lifecycle operations that can replace or drain schedulers.
@@ -816,9 +1090,137 @@ struct CoreState {
     /// The registry is backed by [`crate::audit::JsonlAuditSink`] in production
     /// and [`crate::audit::NoopAuditRegistry`] in tests.
     audit_registry: Arc<dyn AuditRegistry>,
+    repository_leases: Arc<crate::repository_lease::RepositoryLeaseRegistry>,
 }
 
 impl CoreState {
+    /// Publish cancellation bookkeeping while the scheduler still owns the
+    /// repository lease and all task drivers have quiesced.
+    async fn commit_authored_cancellation(
+        &self,
+        run: RunId,
+        run_uid: &str,
+        plan_slug: &str,
+    ) -> Result<(), String> {
+        use crate::plan::{GitTreePlanFileSource, PlanCandidate, PlanFileSource, PlanReservations};
+        if plan_slug.is_empty() {
+            return Ok(());
+        }
+        let key = self
+            .runs
+            .lock()
+            .map_err(|_| "runs registry mutex poisoned".to_owned())?
+            .get(&run.0)
+            .ok_or_else(|| format!("unknown run {run}"))?
+            .plan_dir
+            .clone();
+        let root = crate::paths::run_dir(&self.worktree_manager.repo_root, run_uid)
+            .map_err(|error| error.to_string())?
+            .join("integration");
+        let plan_ref = format!("refs/heads/plan/{plan_slug}");
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "--verify", &plan_ref])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        let old = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let source = GitTreePlanFileSource::new(&root, &old).map_err(|error| error.to_string())?;
+        let mut plan = match crate::plan::load_plan(&source, key, &PlanReservations::default())
+            .map_err(|report| format!("cancellation source invalid: {:?}", report.diagnostics))?
+        {
+            PlanCandidate::Plan(plan) => *plan,
+            PlanCandidate::NotCandidate => return Err("cancellation source is not a plan".into()),
+        };
+        let mut changed = Vec::new();
+        for task in &mut plan.tasks {
+            // Blocked is durable only with its validated Exceptions evidence;
+            // done/dropped are likewise terminal. Every volatile claimed task
+            // returns to authored planned after its worker has quiesced.
+            if task.frontmatter.status == crate::plan::AuthoredTaskStatus::InProgress {
+                task.update_bookkeeping(crate::plan::AuthoredTaskStatus::Planned, None)
+                    .map_err(|error| error.to_string())?;
+                changed.push(task.frontmatter.id.as_str().to_owned());
+            }
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        plan.status.done = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+            .count();
+        plan.status.blocked = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Blocked)
+            .count();
+        plan.status.dropped = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Dropped)
+            .count();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: plan.status.mode.clone(),
+            final_oid: plan.status.final_oid.clone(),
+            display_status: plan.status.display_status.clone(),
+            last_updated: plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| error.to_string())?;
+        plan.status.source.body = status.clone();
+        let board = String::from_utf8(
+            source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|_| "root status is not UTF-8".to_owned())?;
+        let board = crate::plan_status::update_root_row(&board, &plan)
+            .map_err(|error| error.to_string())?;
+        let mut writes = plan
+            .tasks
+            .iter()
+            .filter(|task| changed.iter().any(|id| id == task.frontmatter.id.as_str()))
+            .map(|task| crate::landing::OwnedWrite {
+                path: task.source_path.clone(),
+                bytes: task.render().into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        writes.push(crate::landing::OwnedWrite {
+            path: plan.status.source.source_path.clone(),
+            bytes: status.into_bytes(),
+        });
+        writes.push(crate::landing::OwnedWrite {
+            path: PathBuf::from("docs/plans/STATUS.md"),
+            bytes: board.into_bytes(),
+        });
+        crate::landing::commit_source_transition(
+            &root,
+            &plan_ref,
+            &old,
+            &writes,
+            &crate::landing::SourceTransitionIdentity {
+                plan: plan_slug.to_owned(),
+                task: "all".into(),
+                run: run_uid.to_owned(),
+                action: "cancel".into(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Allocate the next monotonic [`RunId`].
     fn alloc_id(&self) -> RunId {
         RunId(self.next_id.fetch_add(1, Ordering::Relaxed))
@@ -945,7 +1347,7 @@ impl CoreState {
         // registry lock; drop the guard before awaiting the graph lock.  Also
         // snapshot the run's identity (run_uid/run_slug/started_at) so the
         // finalization-time `run.json` can be built without re-taking the lock.
-        let (graph, cancelled, run_uid, run_slug, plan_slug, task_list_path, started_at) = {
+        let (graph, cancelled, run_uid, run_slug, plan_slug, plan_dir, started_at) = {
             let runs = self.runs.lock().expect("runs registry mutex poisoned");
             match runs.get(&run.0) {
                 Some(entry)
@@ -965,7 +1367,7 @@ impl CoreState {
                         entry.run_uid.clone(),
                         entry.run_slug.clone(),
                         entry.plan_slug.clone(),
-                        entry.task_list_path.clone(),
+                        entry.plan_dir.clone(),
                         entry.started_at,
                     )
                 }
@@ -1058,7 +1460,7 @@ impl CoreState {
             Utc::now(),
             task_snapshots,
         )
-        .with_task_list_path(&task_list_path, &self.worktree_manager.repo_root);
+        .with_plan_dir(&plan_dir, &self.worktree_manager.repo_root);
         if let Err(e) = write_run_metadata(&meta, &self.worktree_manager.repo_root).await {
             tracing::warn!(run_uid = %run_uid, error = %e, "run.json write failed");
         }
@@ -1076,7 +1478,7 @@ impl CoreState {
 ///
 /// Construct with [`CoreApi::new`], injecting:
 /// - a [`TaskListInterpreter`] (the deterministic
-///   `EdgeInferrer::new(StructuredTextInterpreter)` for the TUI; a
+///   typed plan projection for the TUI; a
 ///   `ModelInterpreter` for the e2e),
 /// - the agent `backend` (`NoopBackend` in tests; the ACP backend in the e2e),
 /// - a [`WorktreeManager`] (repo root + base branch), and
@@ -1091,15 +1493,2973 @@ impl CoreState {
 pub struct CoreApi {
     /// Shared mutable state (also cloned into background execution tasks).
     state: Arc<CoreState>,
-    /// The model-driven TASKS.md normalizer for repairing malformed or missing
-    /// task lists in plan-convention directories.
-    pub normalizer: Arc<crate::normalizer::ModelNormalizer>,
+}
+
+/// A closed, generated plan subtree. Paths are relative to the plan directory;
+/// callers cannot supply root-board or arbitrary repository writes.
+#[derive(Clone, Debug)]
+pub struct GeneratedPlanBundle {
+    pub key: crate::plan::PlanKey,
+    /// Digest computed from the caller's closed, validated source.
+    pub expected_source_digest: String,
+    pub files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+/// Backend-free plan authoring facade. It owns only repository identity,
+/// exclusion, worktree publication, and canonical plan rendering dependencies.
+#[derive(Clone)]
+pub struct AuthoringCoordinator {
+    repo_root: PathBuf,
+    base_branch: String,
+    repository_leases: Arc<crate::repository_lease::RepositoryLeaseRegistry>,
+    worktree_manager: WorktreeManager,
+    lease_held: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoringSession {
+    pub expected_base_oid: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthoringCandidate {
+    AwaitingCommit,
+    Committed,
+}
+
+impl AuthoringCoordinator {
+    pub fn new(
+        repo_root: PathBuf,
+        base_branch: String,
+        repository_leases: Arc<crate::repository_lease::RepositoryLeaseRegistry>,
+    ) -> Self {
+        Self {
+            worktree_manager: WorktreeManager::new(repo_root.clone(), base_branch.clone()),
+            repo_root,
+            base_branch,
+            repository_leases,
+            lease_held: false,
+        }
+    }
+
+    /// Bind this coordinator to a contract session that already owns the
+    /// repository lease. All Git CAS/rechecks remain active.
+    pub fn with_held_session(mut self) -> Self {
+        self.lease_held = true;
+        self
+    }
+
+    pub async fn reserve_numbers(&self, count: usize) -> Result<Vec<String>, ApiError> {
+        let invalid = |reason: String| ApiError::InvalidCommand { reason };
+        if count == 0 || count > 9999 {
+            return Err(invalid(
+                "reservation count must be between 1 and 9999".into(),
+            ));
+        }
+        let git = |args: Vec<String>| async move {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .args(args)
+                .output()
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if !output.status.success() {
+                return Err(invalid(
+                    String::from_utf8_lossy(&output.stderr).trim().into(),
+                ));
+            }
+            Ok::<String, ApiError>(String::from_utf8_lossy(&output.stdout).trim().into())
+        };
+        let base = git(vec!["rev-parse".into(), self.base_branch.clone()]).await?;
+        let mut used = std::collections::BTreeSet::new();
+        let tree = git(vec![
+            "ls-tree".into(),
+            "--name-only".into(),
+            format!("{base}:docs/plans"),
+        ])
+        .await?;
+        for name in tree.lines() {
+            if name.len() >= 4 && name.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+                used.insert(name[..4].to_owned());
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(self.repo_root.join("docs/plans")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let bytes = name.as_encoded_bytes();
+                if bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_digit) {
+                    used.insert(String::from_utf8_lossy(&bytes[..4]).into());
+                }
+            }
+        }
+        let refs = git(vec![
+            "for-each-ref".into(),
+            "--format=%(refname:short)".into(),
+            "refs/heads/plan/".into(),
+        ])
+        .await?;
+        for reference in refs.lines() {
+            let name = reference.strip_prefix("plan/").unwrap_or(reference);
+            if name.len() < 5 || !name.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+                return Err(invalid(format!(
+                    "old or mixed-format plan ref is unsupported: {reference}"
+                )));
+            }
+            let message = git(vec![
+                "show".into(),
+                "-s".into(),
+                "--format=%B".into(),
+                reference.into(),
+            ])
+            .await?;
+            if message
+                .lines()
+                .filter(|line| *line == "Makina-Phase: plan-registration")
+                .count()
+                != 1
+                || message
+                    .lines()
+                    .filter(|line| *line == format!("Makina-Plan: {name}"))
+                    .count()
+                    != 1
+            {
+                return Err(invalid(format!(
+                    "numbered plan ref lacks verified R evidence: {reference}"
+                )));
+            }
+            used.insert(name[..4].into());
+        }
+        let values = (1..=9999)
+            .map(|value| format!("{value:04}"))
+            .filter(|value| !used.contains(value))
+            .take(count)
+            .collect::<Vec<_>>();
+        if values.len() != count {
+            return Err(invalid("global plan number namespace is exhausted".into()));
+        }
+        Ok(values)
+    }
+
+    pub async fn start_authoring_session(&self) -> Result<AuthoringSession, ApiError> {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", &self.base_branch])
+            .output()
+            .await
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(ApiError::InvalidCommand {
+                reason: String::from_utf8_lossy(&output.stderr).trim().into(),
+            });
+        }
+        Ok(AuthoringSession {
+            expected_base_oid: String::from_utf8_lossy(&output.stdout).trim().into(),
+        })
+    }
+
+    pub fn render_blueprint(
+        &self,
+        bundle: &crate::plan::GeneratedPlanBundle,
+    ) -> Result<BTreeMap<PathBuf, Vec<u8>>, ApiError> {
+        bundle
+            .render_files()
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: format!("generated blueprint is invalid: {error}"),
+            })
+    }
+
+    pub fn inspect_candidate(
+        &self,
+        key: crate::plan::PlanKey,
+        expected_base_oid: &str,
+        expected_source_digest: &str,
+    ) -> Result<AuthoringCandidate, ApiError> {
+        use crate::plan::{
+            FilesystemPlanFileSource, GitTreePlanFileSource, PlanCandidate, PlanReservations,
+            load_plan,
+        };
+        let invalid = |reason: String| ApiError::InvalidCommand { reason };
+        if let Ok(source) = GitTreePlanFileSource::new(&self.repo_root, expected_base_oid)
+            && let Ok(PlanCandidate::Plan(plan)) =
+                load_plan(&source, key.clone(), &PlanReservations::default())
+        {
+            if plan.source_digest.as_str() == expected_source_digest {
+                return Ok(AuthoringCandidate::Committed);
+            }
+            return Err(invalid("committed candidate source digest mismatch".into()));
+        }
+        let source =
+            FilesystemPlanFileSource::new(&self.repo_root, Some(expected_base_oid.to_owned()))
+                .map_err(|error| invalid(error.to_string()))?;
+        match load_plan(&source, key, &PlanReservations::default()) {
+            Ok(PlanCandidate::Plan(plan))
+                if plan.source_digest.as_str() == expected_source_digest =>
+            {
+                Ok(AuthoringCandidate::AwaitingCommit)
+            }
+            Ok(_) => Err(invalid("candidate source digest mismatch".into())),
+            Err(report) => Err(invalid(format!(
+                "candidate is invalid: {:?}",
+                report.diagnostics
+            ))),
+        }
+    }
+}
+
+/// Repository-semantic lifecycle facade shared by supervisors and the local
+/// plan contract. It is deliberately independent of agents, interpreters, and
+/// UI configuration: callers bind one exact repository, plan ref, and run,
+/// while this type owns authoritative Git-tree loading and evidence reads.
+#[derive(Clone, Debug)]
+pub struct PlanContractCoordinator {
+    repo_root: PathBuf,
+    plan: crate::plan::PlanKey,
+    plan_ref: String,
+    run_uid: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanSourceAction {
+    Block { reason: String },
+    Retry,
+    Requeue,
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedFinalization {
+    pub prepared_oid: String,
+    pub expected_base_oid: String,
+    pub base_ref: String,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadyTaskSet {
+    pub tasks: Vec<crate::plan::TaskId>,
+    pub complete: bool,
+    pub blocked: bool,
+}
+
+impl PlanContractCoordinator {
+    pub fn new(
+        repo_root: impl AsRef<Path>,
+        plan: crate::plan::PlanKey,
+        plan_ref: impl Into<String>,
+        run_uid: impl Into<String>,
+    ) -> Result<Self, String> {
+        let repo_root = std::fs::canonicalize(repo_root).map_err(|error| error.to_string())?;
+        let plan_ref = plan_ref.into();
+        let run_uid = run_uid.into();
+        for (name, value) in [("plan ref", &plan_ref), ("run UID", &run_uid)] {
+            if value.is_empty() || value.contains(['\n', '\r', '\0']) {
+                return Err(format!("{name} is empty or contains a line delimiter"));
+            }
+        }
+        Ok(Self {
+            repo_root,
+            plan,
+            plan_ref,
+            run_uid,
+        })
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+    pub fn plan(&self) -> &crate::plan::PlanKey {
+        &self.plan
+    }
+    pub fn plan_ref(&self) -> &str {
+        &self.plan_ref
+    }
+    pub fn run_uid(&self) -> &str {
+        &self.run_uid
+    }
+
+    async fn integration_workspace(&self, base_name: &str) -> Result<PathBuf, String> {
+        let plan_name = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        crate::worktree::WorktreeManager::new(self.repo_root.clone(), base_name.to_owned())
+            .create_integration_workspace(plan_name, &self.run_uid)
+            .await
+            .map(|workspace| workspace.path)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Load the plan exclusively from the exact immutable plan-ref tree.
+    pub fn load(&self) -> Result<crate::plan::PlanDocument, String> {
+        let source = crate::plan::GitTreePlanFileSource::new(&self.repo_root, &self.plan_ref)
+            .map_err(|error| error.to_string())?;
+        match crate::plan::load_plan(
+            &source,
+            self.plan.clone(),
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|report| format!("plan validation failed: {:?}", report.diagnostics))?
+        {
+            crate::plan::PlanCandidate::Plan(plan) => Ok(*plan),
+            crate::plan::PlanCandidate::NotCandidate => {
+                Err("plan ref does not contain a canonical plan bundle".into())
+            }
+        }
+    }
+
+    pub fn parse_oid(&self, value: impl Into<String>) -> Result<crate::plan::GitObjectId, String> {
+        use crate::plan::PlanFileSource as _;
+        let source = crate::plan::GitTreePlanFileSource::new(&self.repo_root, &self.plan_ref)
+            .map_err(|error| error.to_string())?;
+        crate::plan::GitObjectId::parse(value, source.object_format())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Reconcile one task only from retained R/A/B lineage evidence.
+    pub async fn inspect_task(
+        &self,
+        task: &crate::plan::TaskId,
+    ) -> Result<crate::landing::TaskEvidenceState, String> {
+        crate::landing::inspect_task_evidence(
+            &self.repo_root,
+            &self.plan_ref,
+            self.plan
+                .relative_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| "plan directory is not UTF-8".to_owned())?,
+            task.as_str(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn ready_tasks(&self) -> Result<ReadyTaskSet, String> {
+        let plan = self.load()?;
+        let done = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+            .map(|task| task.frontmatter.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let tasks: Vec<crate::plan::TaskId> = plan
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.frontmatter.status == crate::plan::AuthoredTaskStatus::Planned
+                    && !task.frontmatter.gated
+                    && task
+                        .frontmatter
+                        .depends_on
+                        .iter()
+                        .all(|dependency| done.contains(dependency))
+            })
+            .map(|task| task.frontmatter.id.clone())
+            .collect();
+        let complete = plan.tasks.iter().all(|task| {
+            matches!(
+                task.frontmatter.status,
+                crate::plan::AuthoredTaskStatus::Done | crate::plan::AuthoredTaskStatus::Dropped
+            )
+        });
+        let blocked = !complete && tasks.is_empty();
+        Ok(ReadyTaskSet {
+            tasks,
+            complete,
+            blocked,
+        })
+    }
+
+    pub async fn ensure_task_worktree(
+        &self,
+        task_id: &crate::plan::TaskId,
+    ) -> Result<PathBuf, String> {
+        let plan = self.load()?;
+        let plan_name = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        crate::worktree::WorktreeManager::new(self.repo_root.clone(), plan.status.base_name)
+            .with_fork_branch(self.plan_ref.trim_start_matches("refs/heads/").to_owned())
+            .create(plan_name, task_id.as_str())
+            .await
+            .map(|handle| handle.path)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Publish the coordinator-owned planned -> in-progress claim transition.
+    /// The caller supplies only semantic identity and time; paths and bytes are
+    /// derived from the validated immutable plan tree.
+    pub async fn claim_task(
+        &self,
+        task_id: &crate::plan::TaskId,
+        expected_plan_oid: &str,
+        last_updated: &str,
+    ) -> Result<String, String> {
+        use crate::plan::PlanFileSource as _;
+        let source = crate::plan::GitTreePlanFileSource::new(&self.repo_root, expected_plan_oid)
+            .map_err(|error| error.to_string())?;
+        let mut plan = self.load()?;
+        let task = plan
+            .tasks
+            .iter_mut()
+            .find(|task| &task.frontmatter.id == task_id)
+            .ok_or_else(|| format!("unknown task {task_id}"))?;
+        if task.frontmatter.status != crate::plan::AuthoredTaskStatus::Planned {
+            return Err("claim requires authored planned status".into());
+        }
+        if !matches!(
+            self.inspect_task(task_id).await?,
+            crate::landing::TaskEvidenceState::RegistrationOnly
+        ) {
+            return Err("claim requires registration-only retained evidence".into());
+        }
+        task.update_bookkeeping(crate::plan::AuthoredTaskStatus::InProgress, None)
+            .map_err(|error| error.to_string())?;
+        let task_path = task.source_path.clone();
+        let task_bytes = task.render().into_bytes();
+        plan.status.display_status = "In progress".into();
+        plan.status.integration_state = crate::plan::PlanIntegrationState::Assembling;
+        plan.status.run = Some(self.run_uid.clone());
+        plan.status.validation_base_oid = Some(plan.status.base_oid.clone());
+        plan.status.last_updated = last_updated.into();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: None,
+            final_oid: None,
+            display_status: plan.status.display_status.clone(),
+            last_updated: last_updated.into(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| error.to_string())?;
+        plan.status.done = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+            .count();
+        let root = String::from_utf8(
+            source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let root =
+            crate::plan_status::update_root_row(&root, &plan).map_err(|error| error.to_string())?;
+        let workspace = self.integration_workspace(&plan.status.base_name).await?;
+        crate::landing::commit_task_claim(
+            &workspace,
+            &self.plan_ref,
+            expected_plan_oid,
+            &[
+                crate::landing::OwnedWrite {
+                    path: task_path,
+                    bytes: task_bytes,
+                },
+                crate::landing::OwnedWrite {
+                    path: self.plan.relative_dir.join("STATUS.md"),
+                    bytes: status.into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: PathBuf::from("docs/plans/STATUS.md"),
+                    bytes: root.into_bytes(),
+                },
+            ],
+            &crate::landing::StatusLandingIdentity {
+                plan: self
+                    .plan
+                    .relative_dir
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| "plan directory is not UTF-8".to_owned())?
+                    .into(),
+                task: task_id.to_string(),
+                run: self.run_uid.clone(),
+                landing: "claim".into(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    /// Publish Phase B after the exact repository-format Phase-A commit exists.
+    pub async fn complete_task(
+        &self,
+        task_id: &crate::plan::TaskId,
+        expected_plan_oid: &str,
+        phase_a_oid: crate::plan::GitObjectId,
+        last_updated: &str,
+    ) -> Result<String, String> {
+        use crate::plan::PlanFileSource as _;
+        let source = crate::plan::GitTreePlanFileSource::new(&self.repo_root, expected_plan_oid)
+            .map_err(|error| error.to_string())?;
+        let mut plan = self.load()?;
+        let task = plan
+            .tasks
+            .iter_mut()
+            .find(|task| &task.frontmatter.id == task_id)
+            .ok_or_else(|| format!("unknown task {task_id}"))?;
+        if task.frontmatter.status != crate::plan::AuthoredTaskStatus::InProgress {
+            return Err("Phase B requires authored in-progress status".into());
+        }
+        match self.inspect_task(task_id).await? {
+            crate::landing::TaskEvidenceState::LandingPending { implementation_oid }
+                if implementation_oid == phase_a_oid.as_str() => {}
+            _ => return Err("Phase B requires exact retained Phase-A evidence".into()),
+        }
+        task.update_bookkeeping(
+            crate::plan::AuthoredTaskStatus::Done,
+            Some(phase_a_oid.clone()),
+        )
+        .map_err(|error| error.to_string())?;
+        let task_path = task.source_path.clone();
+        let task_bytes = task.render().into_bytes();
+        plan.status.done = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+            .count();
+        let all_terminal = plan.tasks.iter().all(|task| {
+            matches!(
+                task.frontmatter.status,
+                crate::plan::AuthoredTaskStatus::Done | crate::plan::AuthoredTaskStatus::Dropped
+            )
+        });
+        plan.status.display_status = "In progress".into();
+        plan.status.integration_state = if all_terminal {
+            crate::plan::PlanIntegrationState::AwaitingIntegration
+        } else {
+            crate::plan::PlanIntegrationState::Assembling
+        };
+        plan.status.run = Some(self.run_uid.clone());
+        plan.status.validation_base_oid = Some(plan.status.base_oid.clone());
+        plan.status.last_updated = last_updated.into();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: None,
+            final_oid: None,
+            display_status: plan.status.display_status.clone(),
+            last_updated: last_updated.into(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| error.to_string())?;
+        let root = String::from_utf8(
+            source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let root =
+            crate::plan_status::update_root_row(&root, &plan).map_err(|error| error.to_string())?;
+        let workspace = self.integration_workspace(&plan.status.base_name).await?;
+        crate::landing::commit_task_status(
+            &workspace,
+            &self.plan_ref,
+            expected_plan_oid,
+            &[
+                crate::landing::OwnedWrite {
+                    path: task_path,
+                    bytes: task_bytes,
+                },
+                crate::landing::OwnedWrite {
+                    path: self.plan.relative_dir.join("STATUS.md"),
+                    bytes: status.into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: PathBuf::from("docs/plans/STATUS.md"),
+                    bytes: root.into_bytes(),
+                },
+            ],
+            &crate::landing::StatusLandingIdentity {
+                plan: self
+                    .plan
+                    .relative_dir
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| "plan directory is not UTF-8".to_owned())?
+                    .into(),
+                task: task_id.to_string(),
+                run: self.run_uid.clone(),
+                landing: phase_a_oid.to_string(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    /// Create repository-format Phase A in the private integration workspace.
+    pub async fn land_phase_a(&self, task_id: &crate::plan::TaskId) -> Result<String, String> {
+        let plan = self.load()?;
+        if !plan
+            .tasks
+            .iter()
+            .any(|task| &task.frontmatter.id == task_id)
+        {
+            return Err(format!("unknown task {task_id}"));
+        }
+        let plan_slug = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        let manager = crate::worktree::WorktreeManager::new(
+            self.repo_root.clone(),
+            plan.status.base_name.clone(),
+        );
+        let workspace = manager
+            .create_integration_workspace(plan_slug, &self.run_uid)
+            .await
+            .map_err(|error| error.to_string())?;
+        let branch = format!(
+            "task/{}",
+            crate::paths::short_worktree_name(plan_slug, task_id.as_str())
+        );
+        self.validate_candidate(task_id).await?;
+        let merger = crate::merge::SquashMerger::new(workspace.path, workspace.plan_branch);
+        let identity = crate::merge::TaskLandingIdentity {
+            plan: plan_slug.into(),
+            task: task_id.to_string(),
+            run: self.run_uid.clone(),
+        };
+        match merger
+            .squash_merge_with_evidence(&branch, &format!("feat(plan): land {task_id}"), &identity)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            crate::merge::MergeOutcome::Merged { oid } => {
+                // `validate_candidate` already checked the task branch against
+                // its exact claim merge-base. A's parent can legitimately also
+                // include coordinator-owned claim bookkeeping, so rechecking
+                // A against its parent would misattribute those reserved paths
+                // to the task implementation.
+                Ok(oid.to_string())
+            }
+            crate::merge::MergeOutcome::Conflict { details } => {
+                Err(format!("Phase A conflict: {details}"))
+            }
+        }
+    }
+
+    pub async fn validate_candidate(&self, task_id: &crate::plan::TaskId) -> Result<(), String> {
+        let plan = self.load()?;
+        let authored = plan
+            .tasks
+            .iter()
+            .find(|task| &task.frontmatter.id == task_id)
+            .ok_or_else(|| format!("unknown task {task_id}"))?;
+        let touches = authored
+            .frontmatter
+            .touches
+            .iter()
+            .map(crate::task::AuthoredRepoPattern::from)
+            .collect::<Vec<_>>();
+        let plan_slug = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        let branch = format!(
+            "task/{}",
+            crate::paths::short_worktree_name(plan_slug, task_id.as_str())
+        );
+        let merge_base = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["merge-base", self.plan_ref.as_str(), branch.as_str()])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !merge_base.status.success() {
+            return Err(String::from_utf8_lossy(&merge_base.stderr).trim().into());
+        }
+        crate::actors::supervisor::enforce_task_branch_footprint(
+            &self.repo_root,
+            &crate::task::TaskId(task_id.to_string()),
+            &branch,
+            &touches,
+            String::from_utf8_lossy(&merge_base.stdout).trim(),
+        )
+        .await
+    }
+
+    /// Apply a closed authored disposition and publish its digest-linked
+    /// coordinator transaction. Repository paths and bytes are derived here.
+    pub async fn set_disposition(
+        &self,
+        task_id: &crate::plan::TaskId,
+        expected_plan_oid: &str,
+        action: crate::api::TaskDispositionAction,
+    ) -> Result<String, String> {
+        use crate::plan::PlanFileSource as _;
+        let source = crate::plan::GitTreePlanFileSource::new(&self.repo_root, expected_plan_oid)
+            .map_err(|error| error.to_string())?;
+        let mut plan = self.load()?;
+        let old_source = plan.source_digest.to_string();
+        let old_plan = plan.executable_digest.to_string();
+        let task = plan
+            .tasks
+            .iter_mut()
+            .find(|task| &task.frontmatter.id == task_id)
+            .ok_or_else(|| format!("unknown task {task_id}"))?;
+        let action_name = match &action {
+            crate::api::TaskDispositionAction::Ungate => {
+                if task.frontmatter.status != crate::plan::AuthoredTaskStatus::Planned
+                    || !task.frontmatter.gated
+                {
+                    return Err("ungate requires authored planned + gated=true".into());
+                }
+                task.frontmatter.gated = false;
+                "ungate"
+            }
+            crate::api::TaskDispositionAction::Drop { reason } => {
+                let reason = reason.trim();
+                if reason.is_empty() || reason.len() > 240 || reason.contains(['\n', '\r', '\0']) {
+                    return Err("drop reason must be a non-empty bounded single line".into());
+                }
+                if matches!(
+                    task.frontmatter.status,
+                    crate::plan::AuthoredTaskStatus::Done
+                        | crate::plan::AuthoredTaskStatus::InProgress
+                ) {
+                    return Err("done or in-progress authored work cannot be dropped".into());
+                }
+                task.update_bookkeeping(crate::plan::AuthoredTaskStatus::Dropped, None)
+                    .map_err(|error| error.to_string())?;
+                plan.status.source.body = crate::plan_status::append_disposition_exception(
+                    &plan.status.source.body,
+                    &format!("Task `{task_id}` dropped: {reason}"),
+                )
+                .map_err(|error| error.to_string())?;
+                "drop"
+            }
+        }
+        .to_owned();
+        plan.status.done = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+            .count();
+        plan.status.blocked = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Blocked)
+            .count();
+        plan.status.dropped = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Dropped)
+            .count();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: plan.status.mode.clone(),
+            final_oid: plan.status.final_oid.clone(),
+            display_status: plan.status.display_status.clone(),
+            last_updated: plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| error.to_string())?;
+        plan.status.source.body = status.clone();
+        let board = String::from_utf8(
+            source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let board = crate::plan_status::update_root_row(&board, &plan)
+            .map_err(|error| error.to_string())?;
+        let task = plan
+            .tasks
+            .iter()
+            .find(|task| &task.frontmatter.id == task_id)
+            .expect("task retained");
+        let writes = vec![
+            crate::landing::OwnedWrite {
+                path: task.source_path.clone(),
+                bytes: task.render().into_bytes(),
+            },
+            crate::landing::OwnedWrite {
+                path: plan.status.source.source_path.clone(),
+                bytes: status.into_bytes(),
+            },
+            crate::landing::OwnedWrite {
+                path: PathBuf::from("docs/plans/STATUS.md"),
+                bytes: board.into_bytes(),
+            },
+        ];
+        let plan_name = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        let manager = crate::worktree::WorktreeManager::new(
+            self.repo_root.clone(),
+            plan.status.base_name.clone(),
+        );
+        let workspace = manager
+            .create_integration_workspace(plan_name, &self.run_uid)
+            .await
+            .map_err(|error| error.to_string())?;
+        for write in &writes {
+            tokio::fs::write(workspace.path.join(&write.path), &write.bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let reread = crate::plan::FilesystemPlanFileSource::new(
+            &workspace.path,
+            plan.status
+                .validation_base_oid
+                .as_ref()
+                .map(|oid| oid.to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+        let new_plan = match crate::plan::load_plan(
+            &reread,
+            self.plan.clone(),
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|report| format!("disposition validation failed: {:?}", report.diagnostics))?
+        {
+            crate::plan::PlanCandidate::Plan(plan) => *plan,
+            crate::plan::PlanCandidate::NotCandidate => return Err("disposition lost plan".into()),
+        };
+        if matches!(action, crate::api::TaskDispositionAction::Drop { .. })
+            && (new_plan.source_digest.to_string() != old_source
+                || new_plan.executable_digest.to_string() != old_plan)
+        {
+            return Err("drop changed executable or source digest".into());
+        }
+        crate::landing::commit_task_disposition(
+            &workspace.path,
+            &self.plan_ref,
+            expected_plan_oid,
+            &writes,
+            &crate::landing::DispositionIdentity {
+                plan: plan_name.into(),
+                task: task_id.to_string(),
+                run: self.run_uid.clone(),
+                action: action_name,
+                previous_source_digest: old_source,
+                source_digest: new_plan.source_digest.to_string(),
+                previous_plan_digest: old_plan,
+                plan_digest: new_plan.executable_digest.to_string(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn transition_task(
+        &self,
+        task_id: &crate::plan::TaskId,
+        expected_plan_oid: &str,
+        action: PlanSourceAction,
+    ) -> Result<String, String> {
+        use crate::plan::PlanFileSource as _;
+        let source = crate::plan::GitTreePlanFileSource::new(&self.repo_root, expected_plan_oid)
+            .map_err(|error| error.to_string())?;
+        let mut plan = self.load()?;
+        let task = plan
+            .tasks
+            .iter_mut()
+            .find(|task| &task.frontmatter.id == task_id)
+            .ok_or_else(|| format!("unknown task {task_id}"))?;
+        let action_name = match action {
+            PlanSourceAction::Block { reason } => {
+                let reason = reason.trim();
+                if reason.is_empty() || reason.len() > 240 || reason.contains(['\n', '\r', '\0']) {
+                    return Err("block reason must be a non-empty bounded single line".into());
+                }
+                if matches!(
+                    task.frontmatter.status,
+                    crate::plan::AuthoredTaskStatus::Done
+                        | crate::plan::AuthoredTaskStatus::Dropped
+                ) {
+                    return Err("terminal authored work cannot be blocked".into());
+                }
+                task.update_bookkeeping(crate::plan::AuthoredTaskStatus::Blocked, None)
+                    .map_err(|error| error.to_string())?;
+                plan.status.source.body = crate::plan_status::append_blocker_exception(
+                    &plan.status.source.body,
+                    task_id.as_str(),
+                    reason,
+                )
+                .map_err(|error| error.to_string())?;
+                "blocker"
+            }
+            PlanSourceAction::Retry | PlanSourceAction::Requeue => {
+                if task.frontmatter.status == crate::plan::AuthoredTaskStatus::Blocked {
+                    plan.status.source.body = crate::plan_status::resolve_exception(
+                        &plan.status.source.body,
+                        task_id.as_str(),
+                        &format!("retry {}", self.run_uid),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                task.update_bookkeeping(crate::plan::AuthoredTaskStatus::Planned, None)
+                    .map_err(|error| error.to_string())?;
+                if matches!(action, PlanSourceAction::Retry) {
+                    "retry"
+                } else {
+                    "requeue"
+                }
+            }
+            PlanSourceAction::Cancel => {
+                if task.frontmatter.status != crate::plan::AuthoredTaskStatus::InProgress {
+                    return Err("cancel requires authored in-progress status".into());
+                }
+                task.update_bookkeeping(crate::plan::AuthoredTaskStatus::Planned, None)
+                    .map_err(|error| error.to_string())?;
+                "cancel"
+            }
+        }
+        .to_owned();
+        plan.status.done = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+            .count();
+        plan.status.blocked = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Blocked)
+            .count();
+        plan.status.dropped = plan
+            .tasks
+            .iter()
+            .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Dropped)
+            .count();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: plan.status.mode.clone(),
+            final_oid: plan.status.final_oid.clone(),
+            display_status: plan.status.display_status.clone(),
+            last_updated: plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| error.to_string())?;
+        plan.status.source.body = status.clone();
+        let board = String::from_utf8(
+            source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let board = crate::plan_status::update_root_row(&board, &plan)
+            .map_err(|error| error.to_string())?;
+        let task = plan
+            .tasks
+            .iter()
+            .find(|task| &task.frontmatter.id == task_id)
+            .expect("task retained");
+        let plan_name = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        let manager = crate::worktree::WorktreeManager::new(
+            self.repo_root.clone(),
+            plan.status.base_name.clone(),
+        );
+        let workspace = manager
+            .create_integration_workspace(plan_name, &self.run_uid)
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::landing::commit_source_transition(
+            &workspace.path,
+            &self.plan_ref,
+            expected_plan_oid,
+            &[
+                crate::landing::OwnedWrite {
+                    path: task.source_path.clone(),
+                    bytes: task.render().into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: plan.status.source.source_path.clone(),
+                    bytes: status.into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: PathBuf::from("docs/plans/STATUS.md"),
+                    bytes: board.into_bytes(),
+                },
+            ],
+            &crate::landing::SourceTransitionIdentity {
+                plan: plan_name.into(),
+                task: task_id.to_string(),
+                run: self.run_uid.clone(),
+                action: action_name,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn prepare_finalization(
+        &self,
+        expected_plan_oid: &str,
+        mode: &str,
+        last_updated: &str,
+    ) -> Result<PreparedFinalization, String> {
+        use crate::plan::PlanFileSource as _;
+        if !matches!(mode, "squash" | "stage" | "merge_commit" | "manual") {
+            return Err("unsupported finalization mode".into());
+        }
+        let source = crate::plan::GitTreePlanFileSource::new(&self.repo_root, expected_plan_oid)
+            .map_err(|error| error.to_string())?;
+        let mut plan = self.load()?;
+        if plan.tasks.iter().any(|task| {
+            !matches!(
+                task.frontmatter.status,
+                crate::plan::AuthoredTaskStatus::Done | crate::plan::AuthoredTaskStatus::Dropped
+            )
+        }) {
+            return Err("finalization requires every task done or dropped".into());
+        }
+        let base_ref = format!("refs/heads/{}", plan.status.base_name);
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", base_ref.as_str()])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().into());
+        }
+        let expected_base_oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        plan.status.display_status = "In progress".into();
+        plan.status.integration_state = crate::plan::PlanIntegrationState::FinalizationPending;
+        plan.status.run = Some(self.run_uid.clone());
+        plan.status.mode = Some(
+            match mode {
+                "squash" => "Squash",
+                "stage" => "Stage",
+                "merge_commit" => "MergeCommit",
+                "manual" => "Manual",
+                _ => unreachable!("validated closed mode"),
+            }
+            .into(),
+        );
+        plan.status.last_updated = last_updated.into();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: plan.status.mode.clone(),
+            final_oid: None,
+            display_status: plan.status.display_status.clone(),
+            last_updated: last_updated.into(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| error.to_string())?;
+        let board = String::from_utf8(
+            source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let board = crate::plan_status::update_root_row(&board, &plan)
+            .map_err(|error| error.to_string())?;
+        let plan_name = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        let manager = crate::worktree::WorktreeManager::new(
+            self.repo_root.clone(),
+            plan.status.base_name.clone(),
+        );
+        let workspace = manager
+            .create_integration_workspace(plan_name, &self.run_uid)
+            .await
+            .map_err(|error| error.to_string())?;
+        let identity = crate::landing::FinalizationIdentity {
+            plan: plan_name.into(),
+            run: self.run_uid.clone(),
+            mode: mode.into(),
+            expected_base: expected_base_oid.clone(),
+        };
+        let prepared_oid = crate::landing::commit_finalization_prepared(
+            &workspace.path,
+            &self.plan_ref,
+            &base_ref,
+            expected_plan_oid,
+            &expected_base_oid,
+            &[
+                crate::landing::OwnedWrite {
+                    path: plan.status.source.source_path,
+                    bytes: status.into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: PathBuf::from("docs/plans/STATUS.md"),
+                    bytes: board.into_bytes(),
+                },
+            ],
+            &identity,
+            true,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(PreparedFinalization {
+            prepared_oid,
+            expected_base_oid,
+            base_ref,
+            mode: mode.into(),
+        })
+    }
+
+    pub async fn integrate_finalization(
+        &self,
+        prepared: &PreparedFinalization,
+        manual_oid: Option<&str>,
+    ) -> Result<String, String> {
+        let plan = self.load()?;
+        let plan_name = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        let manager = crate::worktree::WorktreeManager::new(
+            self.repo_root.clone(),
+            plan.status.base_name.clone(),
+        );
+        let workspace = manager
+            .create_integration_workspace(plan_name, &self.run_uid)
+            .await
+            .map_err(|error| error.to_string())?;
+        let identity = crate::landing::FinalizationIdentity {
+            plan: plan_name.into(),
+            run: self.run_uid.clone(),
+            mode: prepared.mode.clone(),
+            expected_base: prepared.expected_base_oid.clone(),
+        };
+        if let Some(oid) = manual_oid {
+            return crate::landing::verify_manual_final_integration(
+                &workspace.path,
+                &prepared.base_ref,
+                &prepared.expected_base_oid,
+                &prepared.prepared_oid,
+                oid,
+                &identity,
+            )
+            .await
+            .map_err(|error| error.to_string());
+        }
+        let tasks = plan
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                task.frontmatter
+                    .merged_as
+                    .as_ref()
+                    .map(|oid| (task.frontmatter.id.to_string(), oid.to_string()))
+            })
+            .collect::<Vec<_>>();
+        crate::landing::commit_final_integration(
+            &workspace.path,
+            &prepared.base_ref,
+            &prepared.expected_base_oid,
+            &prepared.prepared_oid,
+            &identity,
+            prepared.mode == "merge_commit",
+            &tasks,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn complete_finalization(
+        &self,
+        prepared: &PreparedFinalization,
+        final_oid: &str,
+        last_updated: &str,
+    ) -> Result<String, String> {
+        use crate::plan::PlanFileSource as _;
+        let source =
+            crate::plan::GitTreePlanFileSource::new(&self.repo_root, &prepared.prepared_oid)
+                .map_err(|error| error.to_string())?;
+        let mut plan = match crate::plan::load_plan(
+            &source,
+            self.plan.clone(),
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|report| format!("prepared plan invalid: {:?}", report.diagnostics))?
+        {
+            crate::plan::PlanCandidate::Plan(plan) => *plan,
+            crate::plan::PlanCandidate::NotCandidate => {
+                return Err("prepared tree lost plan".into());
+            }
+        };
+        let final_typed = self.parse_oid(final_oid.to_owned())?;
+        plan.status.display_status = "Complete".into();
+        plan.status.integration_state = crate::plan::PlanIntegrationState::Complete;
+        plan.status.final_oid = Some(final_typed.clone());
+        plan.status.last_updated = last_updated.into();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: plan.status.validation_base_oid.clone(),
+            mode: plan.status.mode.clone(),
+            final_oid: Some(final_typed),
+            display_status: plan.status.display_status.clone(),
+            last_updated: last_updated.into(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|error| error.to_string())?;
+        let board = String::from_utf8(
+            source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let board = crate::plan_status::update_root_row(&board, &plan)
+            .map_err(|error| error.to_string())?;
+        let plan_name = self
+            .plan
+            .relative_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "plan directory is not UTF-8".to_owned())?;
+        let manager = crate::worktree::WorktreeManager::new(
+            self.repo_root.clone(),
+            plan.status.base_name.clone(),
+        );
+        let workspace = manager
+            .create_integration_workspace(plan_name, &self.run_uid)
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::landing::commit_finalization_completion(
+            &workspace.path,
+            &prepared.base_ref,
+            final_oid,
+            &[
+                crate::landing::OwnedWrite {
+                    path: plan.status.source.source_path,
+                    bytes: status.into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: PathBuf::from("docs/plans/STATUS.md"),
+                    bytes: board.into_bytes(),
+                },
+            ],
+            &crate::landing::FinalizationIdentity {
+                plan: plan_name.into(),
+                run: self.run_uid.clone(),
+                mode: prepared.mode.clone(),
+                expected_base: prepared.expected_base_oid.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+}
+
+impl CoreApi {}
+
+impl AuthoringCoordinator {
+    pub async fn render_and_publish_blueprint(
+        &self,
+        blueprint: crate::api::GeneratedPlanBlueprint,
+    ) -> Result<CommandOutcome, ApiError> {
+        Ok(self.render_blueprint_candidate(blueprint, true).await?.1)
+    }
+
+    pub async fn render_blueprint_candidate(
+        &self,
+        blueprint: crate::api::GeneratedPlanBlueprint,
+        commit: bool,
+    ) -> Result<(crate::plan::PlanKey, CommandOutcome), ApiError> {
+        self.render_blueprint_candidate_reserved(blueprint, commit, None)
+            .await
+    }
+
+    pub async fn render_blueprint_candidate_reserved(
+        &self,
+        blueprint: crate::api::GeneratedPlanBlueprint,
+        commit: bool,
+        reserved_number: Option<String>,
+    ) -> Result<(crate::plan::PlanKey, CommandOutcome), ApiError> {
+        use crate::plan::{
+            AuthoredTaskStatus, GeneratedInitialStatus, GeneratedTaskDocument, GeneratedWorkstream,
+            GitObjectFormat, PlanCandidate, PlanKey, PlanReservations, TaskFrontmatter,
+            TaskId as PlanTaskId, TaskKind, TaskSequence, WorkstreamId, load_plan,
+            parse_generated_repo_pattern,
+        };
+        let invalid = |reason: String| ApiError::InvalidCommand { reason };
+        async fn git(root: &Path, args: &[&str]) -> Result<String, ApiError> {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?;
+            if !output.status.success() {
+                return Err(ApiError::InvalidCommand {
+                    reason: String::from_utf8_lossy(&output.stderr).trim().into(),
+                });
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+        }
+
+        let root = &self.repo_root;
+        let base = git(root, &["rev-parse", &self.base_branch]).await?;
+        let format = match git(root, &["rev-parse", "--show-object-format"])
+            .await?
+            .as_str()
+        {
+            "sha1" => GitObjectFormat::Sha1,
+            "sha256" => GitObjectFormat::Sha256,
+            other => return Err(invalid(format!("unsupported Git object format {other}"))),
+        };
+
+        let mut reserved = std::collections::BTreeSet::new();
+        if let Ok(entries) = std::fs::read_dir(root.join("docs/plans")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let bytes = name.as_encoded_bytes();
+                if bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_digit) {
+                    reserved.insert(String::from_utf8_lossy(&bytes[..4]).into_owned());
+                }
+            }
+        }
+        let base_dirs = git(
+            root,
+            &["ls-tree", "--name-only", &format!("{base}:docs/plans")],
+        )
+        .await?;
+        for name in base_dirs.lines() {
+            let bytes = name.as_bytes();
+            if bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_digit) {
+                reserved.insert(name[..4].to_owned());
+            }
+        }
+        let refs = git(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/plan/",
+            ],
+        )
+        .await?;
+        let mut existing_slug_number = None;
+        for reference in refs.lines() {
+            let name = reference.strip_prefix("plan/").unwrap_or(reference);
+            let bytes = name.as_bytes();
+            if bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_digit) {
+                reserved.insert(name[..4].to_owned());
+                if name.get(4..) == Some(format!("-{}", blueprint.slug).as_str())
+                    && existing_slug_number.replace(name[..4].to_owned()).is_some()
+                {
+                    return Err(invalid(
+                        "multiple plan refs already use the generated slug".into(),
+                    ));
+                }
+            }
+        }
+        let reusing_existing_slug = existing_slug_number.is_some();
+        let number = match existing_slug_number {
+            Some(number)
+                if reserved_number
+                    .as_ref()
+                    .is_none_or(|value| value == &number) =>
+            {
+                number
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "generated slug already uses another reserved number".into(),
+                ));
+            }
+            None => reserved_number.unwrap_or_else(|| {
+                (1..=9999)
+                    .map(|value| format!("{value:04}"))
+                    .find(|number| !reserved.contains(number))
+                    .unwrap_or_default()
+            }),
+        };
+        if number.is_empty() || (!reusing_existing_slug && reserved.contains(&number)) {
+            return Err(invalid("reserved plan number is unavailable".into()));
+        }
+        let key = PlanKey::parse(
+            PathBuf::from("docs/plans").join(format!("{number}-{}", blueprint.slug)),
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let base_oid = crate::plan::GitObjectId::parse(base.clone(), format)
+            .map_err(|error| invalid(error.to_string()))?;
+
+        let workstreams = blueprint
+            .workstreams
+            .into_iter()
+            .map(|workstream| {
+                Ok(GeneratedWorkstream {
+                    id: WorkstreamId::parse(workstream.id)
+                        .map_err(|error| invalid(error.to_string()))?,
+                    title: workstream.title,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let mut tasks = Vec::with_capacity(blueprint.tasks.len());
+        for task in blueprint.tasks {
+            let kind = match task.kind.as_str() {
+                "task" => TaskKind::Task,
+                "spike" => TaskKind::Spike,
+                "chore" => TaskKind::Chore,
+                _ => {
+                    return Err(invalid(format!(
+                        "invalid generated task kind `{}`",
+                        task.kind
+                    )));
+                }
+            };
+            let sequence =
+                TaskSequence::parse(task.sequence).map_err(|error| invalid(error.to_string()))?;
+            let id = PlanTaskId::parse(task.id).map_err(|error| invalid(error.to_string()))?;
+            let workstream =
+                WorkstreamId::parse(task.workstream).map_err(|error| invalid(error.to_string()))?;
+            let task_path = key.relative_dir.join("tasks").join(format!(
+                "{}{}-{}.md",
+                &workstream.as_str()[2..],
+                sequence,
+                id
+            ));
+            let touches = task
+                .touches
+                .iter()
+                .map(|value| parse_generated_repo_pattern(value, kind, &task_path))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| invalid(error.to_string()))?;
+            tasks.push(GeneratedTaskDocument {
+                sequence,
+                frontmatter: TaskFrontmatter {
+                    id,
+                    title: task.title,
+                    workstream,
+                    kind,
+                    depends_on: task
+                        .depends_on
+                        .into_iter()
+                        .map(PlanTaskId::parse)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| invalid(error.to_string()))?,
+                    gated: task.gated,
+                    touches,
+                    status: AuthoredTaskStatus::Planned,
+                    merged_as: None,
+                },
+                body: task.body,
+            });
+        }
+        let authored = crate::plan::GeneratedPlanBundle {
+            key: key.clone(),
+            title: blueprint.title,
+            scope: blueprint.scope,
+            architecture: blueprint.architecture,
+            initial_status: GeneratedInitialStatus {
+                goal: blueprint.initial_status.goal,
+                root_cause: blueprint.initial_status.root_cause,
+                approach: blueprint.initial_status.approach,
+                outcome: blueprint.initial_status.outcome,
+                base_name: self.base_branch.clone(),
+                base_oid,
+                last_updated: blueprint.initial_status.last_updated,
+            },
+            workstreams,
+            tasks,
+        };
+        let files = authored
+            .render_files()
+            .map_err(|error| invalid(format!("generated blueprint is invalid: {error}")))?;
+
+        let state_root = crate::checkpoint::external_state_root(root)
+            .map_err(|error| invalid(error.to_string()))?;
+        let generation_root = state_root.join("generation");
+        tokio::fs::create_dir_all(&generation_root)
+            .await
+            .map_err(|error| invalid(error.to_string()))?;
+        let generation_root =
+            std::fs::canonicalize(&generation_root).map_err(|error| invalid(error.to_string()))?;
+        let state_root =
+            std::fs::canonicalize(&state_root).map_err(|error| invalid(error.to_string()))?;
+        if !generation_root.starts_with(&state_root) {
+            return Err(invalid("generation root escaped external state".into()));
+        }
+        let temporary = generation_root.join(format!("{}-{}", ulid::Ulid::new(), number));
+        tokio::fs::create_dir(&temporary)
+            .await
+            .map_err(|error| invalid(error.to_string()))?;
+        let result = async {
+            for (relative, bytes) in &files {
+                let target = temporary.join(&key.relative_dir).join(relative);
+                if let Some(parent) = target.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|error| invalid(error.to_string()))?;
+                }
+                tokio::fs::write(&target, bytes)
+                    .await
+                    .map_err(|error| invalid(error.to_string()))?;
+            }
+            let source = crate::plan::FilesystemPlanFileSource::new_unbound(&temporary, format)
+                .map_err(|error| invalid(error.to_string()))?;
+            let plan = match load_plan(&source, key.clone(), &PlanReservations::default()).map_err(
+                |report| {
+                    invalid(format!(
+                        "generated bundle validation failed: {:?}",
+                        report.diagnostics
+                    ))
+                },
+            )? {
+                PlanCandidate::Plan(plan) => plan,
+                PlanCandidate::NotCandidate => {
+                    return Err(invalid("generated bundle is not a plan".into()));
+                }
+            };
+            let closed = GeneratedPlanBundle {
+                key: key.clone(),
+                expected_source_digest: plan.source_digest.to_string(),
+                files,
+            };
+            if !commit {
+                let plan_root = root.join(&key.relative_dir);
+                tokio::fs::create_dir(&plan_root)
+                    .await
+                    .map_err(|error| invalid(error.to_string()))?;
+                for (relative, bytes) in &closed.files {
+                    let target = plan_root.join(relative);
+                    if let Some(parent) = target.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(|error| invalid(error.to_string()))?;
+                    }
+                    tokio::fs::write(target, bytes)
+                        .await
+                        .map_err(|error| invalid(error.to_string()))?;
+                }
+                return Ok((key, CommandOutcome::AwaitingCommit));
+            }
+            match self.publish_generated(closed, base).await? {
+                CommandOutcome::PlanRegistered { registration_oid } => Ok((
+                    key.clone(),
+                    CommandOutcome::PlanGenerated {
+                        plan_dir: key,
+                        registration_oid,
+                        report: crate::api::PlanGenerationReport::default(),
+                    },
+                )),
+                _ => Err(invalid(
+                    "generated registration returned an invalid outcome".into(),
+                )),
+            }
+        }
+        .await;
+        let _ = tokio::fs::remove_dir_all(&temporary).await;
+        result
+    }
 }
 
 impl CoreApi {
+    async fn generate_plan_bundle(
+        &self,
+        blueprint: crate::api::GeneratedPlanBlueprint,
+    ) -> Result<CommandOutcome, ApiError> {
+        AuthoringCoordinator::new(
+            self.state.worktree_manager.repo_root.clone(),
+            self.state.worktree_manager.base_branch.clone(),
+            Arc::clone(&self.state.repository_leases),
+        )
+        .render_and_publish_blueprint(blueprint)
+        .await
+    }
+
+    async fn delayed_finalization(
+        &self,
+        plan_dir: crate::plan::PlanKey,
+        run_uid: String,
+        expected_plan_oid: String,
+        input: Option<crate::api::FinalizeInput>,
+    ) -> Result<CommandOutcome, ApiError> {
+        use crate::plan::PlanFileSource as _;
+        let invalid = |reason: String| ApiError::InvalidCommand { reason };
+        if run_uid.is_empty() || run_uid.contains(['\n', '\r', '\0']) {
+            return Err(invalid("run_uid is invalid".into()));
+        }
+        let live = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            runs.iter()
+                .find(|(_, entry)| entry.run_uid == run_uid && entry.plan_dir == plan_dir)
+                .map(|(id, entry)| {
+                    (
+                        RunId(*id),
+                        entry.plan_slug.clone(),
+                        Arc::clone(&entry.graph),
+                        entry.handle.is_some(),
+                    )
+                })
+        };
+        let (run, plan_slug) = if let Some((run, plan_slug, graph, has_driver)) = live {
+            if has_driver {
+                return Err(invalid(
+                    "finalization requires every child driver to be quiescent".into(),
+                ));
+            }
+            let graph = graph.lock().await;
+            if graph
+                .tasks
+                .iter()
+                .any(|task| !matches!(task.state, TaskState::Done | TaskState::Dropped))
+            {
+                return Err(invalid(
+                    "finalization requires every non-dropped task to be done".into(),
+                ));
+            }
+            (run, plan_slug)
+        } else {
+            let metadata = crate::run_metadata::read_run_metadata(
+                &self.state.worktree_manager.repo_root,
+                &run_uid,
+            )
+            .map_err(|e| invalid(format!("read run metadata: {e}")))?;
+            if let Some(metadata) = metadata.as_ref() {
+                if metadata
+                    .resolved_plan_dir(&self.state.worktree_manager.repo_root)
+                    .as_ref()
+                    != Some(&plan_dir)
+                    || metadata.tasks().iter().any(|task| {
+                        !matches!(
+                            task.state,
+                            crate::api::TaskState::Done | crate::api::TaskState::Dropped
+                        )
+                    })
+                {
+                    return Err(invalid(
+                        "durable run metadata is not finalization-ready for this plan".into(),
+                    ));
+                }
+            }
+            let run = {
+                let mut ids = self
+                    .state
+                    .disk_run_ids
+                    .lock()
+                    .expect("disk run id mutex poisoned");
+                *ids.entry(run_uid.clone())
+                    .or_insert_with(|| self.state.alloc_id())
+            };
+            (
+                run,
+                metadata.as_ref().map_or_else(
+                    || format!("{}-{}", plan_dir.number, plan_dir.slug),
+                    |metadata| metadata.plan_slug().to_owned(),
+                ),
+            )
+        };
+        let mode = self
+            .state
+            .runtime_settings
+            .lock()
+            .expect("runtime settings mutex poisoned")
+            .final_merge;
+        match (&input, mode) {
+            (
+                Some(crate::api::FinalizeInput::Automatic),
+                FinalMerge::Squash | FinalMerge::MergeCommit,
+            )
+            | (Some(crate::api::FinalizeInput::PreparedStage), FinalMerge::Stage)
+            | (Some(crate::api::FinalizeInput::ManualCommit(_)), FinalMerge::Manual)
+            | (None, _) => {}
+            (Some(actual), configured) => {
+                return Err(invalid(format!(
+                    "finalization input {actual:?} does not match configured mode {configured:?}"
+                )));
+            }
+        }
+        let root = &self.state.worktree_manager.repo_root;
+        let owner = crate::repository_lease::RepositoryLeaseOwner {
+            plan_dir: plan_dir.relative_dir.clone(),
+            run_uid: run_uid.clone(),
+            operation: if input.is_some() {
+                crate::repository_lease::RepositoryLeaseOperation::Finalize
+            } else {
+                crate::repository_lease::RepositoryLeaseOperation::ReprepareFinalization
+            },
+        };
+        let cancel = CancellationToken::new();
+        let _lease = self
+            .state
+            .repository_leases
+            .acquire(root, owner, &cancel)
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        let plan_ref = plan_dir.ref_name();
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "--verify", &plan_ref])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        if !output.status.success() {
+            return Err(invalid(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if actual != expected_plan_oid {
+            return Err(invalid(format!(
+                "plan ref moved: expected {expected_plan_oid}, found {actual}"
+            )));
+        }
+        let source = crate::plan::GitTreePlanFileSource::new(root, &actual)
+            .map_err(|e| invalid(e.to_string()))?;
+        let plan = match crate::plan::load_plan(
+            &source,
+            plan_dir.clone(),
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|report| {
+            invalid(format!(
+                "retained plan is invalid: {:?}",
+                report.diagnostics
+            ))
+        })? {
+            crate::plan::PlanCandidate::Plan(plan) => *plan,
+            crate::plan::PlanCandidate::NotCandidate => {
+                return Err(invalid("retained ref does not contain the plan".into()));
+            }
+        };
+        if plan.tasks.iter().any(|task| {
+            !matches!(
+                task.frontmatter.status,
+                crate::plan::AuthoredTaskStatus::Done | crate::plan::AuthoredTaskStatus::Dropped
+            )
+        }) {
+            return Err(invalid(
+                "authored status is not ready for finalization".into(),
+            ));
+        }
+        let mode_name = match mode {
+            FinalMerge::Squash => "squash",
+            FinalMerge::Stage => "stage",
+            FinalMerge::MergeCommit => "merge-commit",
+            FinalMerge::Manual => "manual",
+        };
+        let base_ref = format!("refs/heads/{}", self.state.worktree_manager.base_branch);
+        let base_output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", &base_ref])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        if !base_output.status.success() {
+            return Err(invalid(
+                String::from_utf8_lossy(&base_output.stderr).trim().into(),
+            ));
+        }
+        let current_base = String::from_utf8_lossy(&base_output.stdout)
+            .trim()
+            .to_owned();
+        let identity = crate::landing::FinalizationIdentity {
+            plan: format!("{}-{}", plan_dir.number, plan_dir.slug),
+            run: run_uid.clone(),
+            mode: mode_name.into(),
+            expected_base: current_base.clone(),
+        };
+        let workspace = self
+            .state
+            .worktree_manager
+            .create_integration_workspace(&identity.plan, &format!("finalize-{run_uid}"))
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        if input.is_none() {
+            let mut prepared_plan = plan;
+            prepared_plan.status.integration_state =
+                crate::plan::PlanIntegrationState::FinalizationPending;
+            prepared_plan.status.run = Some(run_uid.clone());
+            prepared_plan.status.mode = Some(mode_name.into());
+            prepared_plan.status.final_oid = None;
+            prepared_plan.status.display_status = "⏳ Finalizing".into();
+            let transition = crate::plan_status::StatusTransition {
+                integration_state: prepared_plan.status.integration_state,
+                run: prepared_plan.status.run.clone(),
+                validation_base: prepared_plan.status.validation_base_oid.clone(),
+                mode: prepared_plan.status.mode.clone(),
+                final_oid: None,
+                display_status: prepared_plan.status.display_status.clone(),
+                last_updated: prepared_plan.status.last_updated.clone(),
+            };
+            let status = crate::plan_status::render_plan_status(&prepared_plan, &transition)
+                .map_err(|e| invalid(e.to_string()))?;
+            prepared_plan.status.source.body = status.clone();
+            let base_source = crate::plan::GitTreePlanFileSource::new(root, &current_base)
+                .map_err(|e| invalid(e.to_string()))?;
+            use crate::plan::PlanFileSource as _;
+            let board = String::from_utf8(
+                base_source
+                    .read_file(Path::new("docs/plans/STATUS.md"))
+                    .map_err(|e| invalid(e.to_string()))?,
+            )
+            .map_err(|_| invalid("root board is not UTF-8".into()))?;
+            let board = crate::plan_status::update_root_row(&board, &prepared_plan)
+                .map_err(|e| invalid(e.to_string()))?;
+            let prepared = crate::landing::commit_finalization_prepared(
+                &workspace.path,
+                &plan_ref,
+                &base_ref,
+                &actual,
+                &current_base,
+                &[
+                    crate::landing::OwnedWrite {
+                        path: prepared_plan.status.source.source_path.clone(),
+                        bytes: status.into_bytes(),
+                    },
+                    crate::landing::OwnedWrite {
+                        path: PathBuf::from("docs/plans/STATUS.md"),
+                        bytes: board.into_bytes(),
+                    },
+                ],
+                &identity,
+                false,
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+            let _ = self.state.event_tx.send(Event::PlanOperation {
+                run,
+                plan_slug,
+                label: prepared_plan.title,
+                operation: crate::api::PlanOperationKind::ReprepareFinalization,
+                phase: crate::api::PlanOperationPhase::Finished,
+                message: format!("Prepared finalization at {prepared}"),
+            });
+            return Ok(CommandOutcome::FinalizationAccepted { plan_oid: prepared });
+        }
+        let message_output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["show", "-s", "--format=%B", &actual])
+            .output()
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        let prepared_message = String::from_utf8_lossy(&message_output.stdout);
+        let trailer = |name: &str| {
+            let prefix = format!("{name}: ");
+            let values = prepared_message
+                .lines()
+                .filter_map(|line| line.strip_prefix(&prefix))
+                .collect::<Vec<_>>();
+            (values.len() == 1).then(|| values[0].to_owned())
+        };
+        if trailer("Makina-Phase").as_deref() != Some("finalization-prepared")
+            || trailer("Makina-Plan").as_deref() != Some(identity.plan.as_str())
+            || trailer("Makina-Run").as_deref() != Some(run_uid.as_str())
+            || trailer("Makina-Final-Mode").as_deref() != Some(mode_name)
+        {
+            return Err(invalid(
+                "expected plan tip is not exact Phase P evidence".into(),
+            ));
+        }
+        let expected_base = trailer("Makina-Expected-Base")
+            .ok_or_else(|| invalid("Phase P lacks expected base".into()))?;
+        let task_evidence = plan
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                task.frontmatter.merged_as.as_ref().map(|oid| {
+                    (
+                        task.frontmatter.id.as_str().to_owned(),
+                        oid.as_str().to_owned(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let final_oid = match input.as_ref().expect("checked input") {
+            crate::api::FinalizeInput::Automatic => {
+                crate::landing::commit_final_integration(
+                    &workspace.path,
+                    &base_ref,
+                    &expected_base,
+                    &actual,
+                    &identity,
+                    mode == FinalMerge::MergeCommit,
+                    &task_evidence,
+                )
+                .await
+            }
+            crate::api::FinalizeInput::PreparedStage => {
+                crate::landing::commit_final_integration(
+                    &workspace.path,
+                    &base_ref,
+                    &expected_base,
+                    &actual,
+                    &identity,
+                    false,
+                    &task_evidence,
+                )
+                .await
+            }
+            crate::api::FinalizeInput::ManualCommit(oid) => {
+                crate::landing::verify_manual_final_integration(
+                    &workspace.path,
+                    &base_ref,
+                    &expected_base,
+                    &actual,
+                    oid.as_str(),
+                    &identity,
+                )
+                .await
+            }
+        }
+        .map_err(|e| invalid(e.to_string()))?;
+        let final_source = crate::plan::GitTreePlanFileSource::new(root, &final_oid)
+            .map_err(|e| invalid(e.to_string()))?;
+        let mut complete_plan = match crate::plan::load_plan(
+            &final_source,
+            plan_dir.clone(),
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|r| invalid(format!("final tree plan invalid: {:?}", r.diagnostics)))?
+        {
+            crate::plan::PlanCandidate::Plan(plan) => *plan,
+            crate::plan::PlanCandidate::NotCandidate => {
+                return Err(invalid("F lost plan source".into()));
+            }
+        };
+        complete_plan.status.integration_state = crate::plan::PlanIntegrationState::Complete;
+        complete_plan.status.run = Some(run_uid.clone());
+        complete_plan.status.mode = Some(mode_name.into());
+        complete_plan.status.final_oid = Some(
+            crate::plan::GitObjectId::parse(&final_oid, final_source.object_format())
+                .map_err(|e| invalid(e.to_string()))?,
+        );
+        complete_plan.status.display_status = "✅ Complete".into();
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: complete_plan.status.integration_state,
+            run: complete_plan.status.run.clone(),
+            validation_base: complete_plan.status.validation_base_oid.clone(),
+            mode: complete_plan.status.mode.clone(),
+            final_oid: complete_plan.status.final_oid.clone(),
+            display_status: complete_plan.status.display_status.clone(),
+            last_updated: complete_plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&complete_plan, &transition)
+            .map_err(|e| invalid(e.to_string()))?;
+        complete_plan.status.source.body = status.clone();
+        let board = String::from_utf8(
+            final_source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|_| invalid("root board is not UTF-8".into()))?;
+        let board = crate::plan_status::update_root_row(&board, &complete_plan)
+            .map_err(|e| invalid(e.to_string()))?;
+        let completion = crate::landing::commit_finalization_completion(
+            &workspace.path,
+            &base_ref,
+            &final_oid,
+            &[
+                crate::landing::OwnedWrite {
+                    path: complete_plan.status.source.source_path.clone(),
+                    bytes: status.into_bytes(),
+                },
+                crate::landing::OwnedWrite {
+                    path: PathBuf::from("docs/plans/STATUS.md"),
+                    bytes: board.into_bytes(),
+                },
+            ],
+            &identity,
+        )
+        .await
+        .map_err(|e| invalid(e.to_string()))?;
+        if let Some(metadata) = crate::run_metadata::read_run_metadata(root, &run_uid)
+            .map_err(|e| invalid(format!("read run metadata after C: {e}")))?
+        {
+            crate::run_metadata::write_run_metadata(
+                &metadata.with_completion_oid(completion.clone()),
+                root,
+            )
+            .await
+            .map_err(|e| invalid(format!("persist completion evidence: {e}")))?;
+        }
+        let operation = if input.is_some() {
+            crate::api::PlanOperationKind::Finalize
+        } else {
+            crate::api::PlanOperationKind::ReprepareFinalization
+        };
+        let _ = self.state.event_tx.send(Event::PlanOperation {
+            run,
+            plan_slug,
+            label: plan.title,
+            operation,
+            phase: crate::api::PlanOperationPhase::Finished,
+            message: format!("Finalization completed at {completion}"),
+        });
+        Ok(CommandOutcome::FinalizationAccepted {
+            plan_oid: completion,
+        })
+    }
+}
+
+impl AuthoringCoordinator {
+    /// Register a validated generated bundle directly, without materializing it
+    /// in the operator checkout. This is the internal initial-R entry used by
+    /// generation workflows.
+    pub async fn publish_generated(
+        &self,
+        bundle: GeneratedPlanBundle,
+        expected_base_oid: String,
+    ) -> Result<CommandOutcome, ApiError> {
+        use crate::plan::{
+            FilesystemPlanFileSource, PlanCandidate, PlanFileSource, PlanReservations, load_plan,
+        };
+        fn invalid(reason: impl Into<String>) -> ApiError {
+            ApiError::InvalidCommand {
+                reason: reason.into(),
+            }
+        }
+        if bundle.files.is_empty() {
+            return Err(invalid("generated bundle is empty"));
+        }
+        for path in bundle.files.keys() {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+                || path == Path::new("STATUS.md").parent().unwrap_or(Path::new(""))
+            {
+                return Err(invalid(format!(
+                    "generated bundle path is not closed: {}",
+                    path.display()
+                )));
+            }
+        }
+        async fn git(root: &Path, args: &[&str]) -> Result<String, ApiError> {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?;
+            if !output.status.success() {
+                return Err(ApiError::InvalidCommand {
+                    reason: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
+        fn trailer(message: &str, name: &str) -> Option<String> {
+            let prefix = format!("{name}: ");
+            let values = message
+                .lines()
+                .filter_map(|line| line.strip_prefix(&prefix))
+                .collect::<Vec<_>>();
+            (values.len() == 1).then(|| values[0].to_owned())
+        }
+        let root = &self.repo_root;
+        let identity = format!("{}-{}", bundle.key.number, bundle.key.slug);
+        let owner = crate::repository_lease::RepositoryLeaseOwner {
+            plan_dir: bundle.key.relative_dir.clone(),
+            run_uid: format!("generate-{identity}"),
+            operation: crate::repository_lease::RepositoryLeaseOperation::RegisterPlan,
+        };
+        let cancel = CancellationToken::new();
+        let _lease = if self.lease_held {
+            None
+        } else {
+            Some(
+                self.repository_leases
+                    .acquire(root, owner, &cancel)
+                    .await
+                    .map_err(|e| invalid(e.to_string()))?,
+            )
+        };
+        let base = git(root, &["rev-parse", &self.base_branch]).await?;
+        if base != expected_base_oid {
+            return Err(invalid(format!(
+                "target base moved: expected {expected_base_oid}, found {base}"
+            )));
+        }
+        let plan_ref = bundle.key.ref_name();
+        if let Ok(tip) = git(root, &["rev-parse", "--verify", &plan_ref]).await {
+            let message = git(root, &["show", "-s", "--format=%B", &tip]).await?;
+            if trailer(&message, "Makina-Phase").as_deref() == Some("plan-registration")
+                && trailer(&message, "Makina-Plan").as_deref() == Some(identity.as_str())
+                && trailer(&message, "Makina-Validation-Base").as_deref()
+                    == Some(expected_base_oid.as_str())
+                && trailer(&message, "Makina-Source-Origin").as_deref() == Some("generated")
+                && trailer(&message, "Makina-Source-Digest").as_deref()
+                    == Some(bundle.expected_source_digest.as_str())
+            {
+                let retained = crate::plan::GitTreePlanFileSource::new(root, &tip)
+                    .map_err(|e| invalid(e.to_string()))?;
+                let verified =
+                    match load_plan(&retained, bundle.key.clone(), &PlanReservations::default())
+                        .map_err(|report| {
+                            invalid(format!(
+                                "existing generated registration is invalid: {:?}",
+                                report.diagnostics
+                            ))
+                        })? {
+                        PlanCandidate::Plan(plan) => plan,
+                        PlanCandidate::NotCandidate => {
+                            return Err(invalid("existing generated registration lost its plan"));
+                        }
+                    };
+                if verified.source_digest.as_str() != bundle.expected_source_digest
+                    || trailer(&message, "Makina-Executable-Digest").as_deref()
+                        != Some(verified.executable_digest.as_str())
+                {
+                    return Err(invalid(
+                        "existing generated registration digest/tree verification failed",
+                    ));
+                }
+                return Ok(CommandOutcome::PlanRegistered {
+                    registration_oid: tip,
+                });
+            }
+            return Err(invalid(format!(
+                "{plan_ref} already contains divergent evidence"
+            )));
+        }
+        let listed = git(
+            root,
+            &[
+                "ls-tree",
+                "--name-only",
+                &format!("{expected_base_oid}:docs/plans"),
+            ],
+        )
+        .await?;
+        let mut reservations = PlanReservations::default();
+        for name in listed
+            .lines()
+            .filter(|name| name.len() >= 4 && name.as_bytes()[..4].iter().all(u8::is_ascii_digit))
+        {
+            reservations
+                .numbered_directories
+                .entry(name[..4].to_owned())
+                .or_default()
+                .push(PathBuf::from("docs/plans").join(name));
+        }
+        if reservations
+            .numbered_directories
+            .contains_key(&bundle.key.number)
+        {
+            return Err(invalid(format!(
+                "plan number {} is already reserved in the target base",
+                bundle.key.number
+            )));
+        }
+        if let Ok(entries) = std::fs::read_dir(root.join("docs/plans")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.len() >= 4
+                    && name[..4] == bundle.key.number
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                {
+                    return Err(invalid(format!(
+                        "plan number {} is already reserved by working source {}",
+                        bundle.key.number,
+                        entry.path().display()
+                    )));
+                }
+            }
+        }
+        let refs = git(
+            root,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/plan/"],
+        )
+        .await?;
+        for reference in refs.lines() {
+            if let Some(name) = reference.strip_prefix("refs/heads/plan/")
+                && name.starts_with(&bundle.key.number)
+            {
+                return Err(invalid(format!(
+                    "plan number {} is already reserved by {reference}",
+                    bundle.key.number
+                )));
+            }
+        }
+        let workspace = self
+            .worktree_manager
+            .create_integration_workspace(
+                &identity,
+                &format!(
+                    "generated-{}",
+                    &expected_base_oid[..12.min(expected_base_oid.len())]
+                ),
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        for (relative, bytes) in &bundle.files {
+            let target = workspace.path.join(&bundle.key.relative_dir).join(relative);
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
+            tokio::fs::write(target, bytes)
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+        let generated =
+            FilesystemPlanFileSource::new(&workspace.path, Some(expected_base_oid.clone()))
+                .map_err(|e| invalid(e.to_string()))?;
+        let mut plan = match load_plan(&generated, bundle.key.clone(), &reservations)
+            .map_err(|r| invalid(format!("generated plan is invalid: {:?}", r.diagnostics)))?
+        {
+            PlanCandidate::Plan(plan) => *plan,
+            PlanCandidate::NotCandidate => return Err(invalid("generated subtree is not a plan")),
+        };
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: plan.status.integration_state,
+            run: plan.status.run.clone(),
+            validation_base: Some(
+                crate::plan::GitObjectId::parse(&expected_base_oid, generated.object_format())
+                    .map_err(|e| invalid(e.to_string()))?,
+            ),
+            mode: plan.status.mode.clone(),
+            final_oid: plan.status.final_oid.clone(),
+            display_status: plan.status.display_status.clone(),
+            last_updated: plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&plan, &transition)
+            .map_err(|e| invalid(e.to_string()))?;
+        tokio::fs::write(
+            workspace
+                .path
+                .join(bundle.key.relative_dir.join("STATUS.md")),
+            &status,
+        )
+        .await
+        .map_err(|e| invalid(e.to_string()))?;
+        plan.status.source.body = status;
+        let base_source = crate::plan::GitTreePlanFileSource::new(root, &expected_base_oid)
+            .map_err(|e| invalid(e.to_string()))?;
+        let board = String::from_utf8(
+            base_source
+                .read_file(Path::new("docs/plans/STATUS.md"))
+                .map_err(|e| invalid(e.to_string()))?,
+        )
+        .map_err(|_| invalid("root status board is not UTF-8"))?;
+        let board = crate::plan_status::register_root_row(&board, &plan)
+            .map_err(|e| invalid(e.to_string()))?;
+        tokio::fs::write(workspace.path.join("docs/plans/STATUS.md"), board)
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        let verified_source =
+            FilesystemPlanFileSource::new(&workspace.path, Some(expected_base_oid.clone()))
+                .map_err(|e| invalid(e.to_string()))?;
+        let verified = match load_plan(&verified_source, bundle.key.clone(), &reservations)
+            .map_err(|r| {
+                invalid(format!(
+                    "generated registration validation failed: {:?}",
+                    r.diagnostics
+                ))
+            })? {
+            PlanCandidate::Plan(plan) => *plan,
+            PlanCandidate::NotCandidate => {
+                return Err(invalid("generated registration lost its plan"));
+            }
+        };
+        if verified.source_digest.as_str() != bundle.expected_source_digest {
+            return Err(invalid(format!(
+                "generated source digest mismatch: expected {}, found {}",
+                bundle.expected_source_digest, verified.source_digest
+            )));
+        }
+        git(
+            &workspace.path,
+            &[
+                "add",
+                "--",
+                bundle
+                    .key
+                    .relative_dir
+                    .to_str()
+                    .ok_or_else(|| invalid("plan path is not UTF-8"))?,
+                "docs/plans/STATUS.md",
+            ],
+        )
+        .await?;
+        let message = format!(
+            "chore(plan): register {identity}\n\nMakina-Phase: plan-registration\nMakina-Plan: {identity}\nMakina-Source-Digest: {}\nMakina-Executable-Digest: {}\nMakina-Validation-Base: {expected_base_oid}\nMakina-Source-Origin: generated",
+            verified.source_digest, verified.executable_digest
+        );
+        git(&workspace.path, &["commit", "-m", &message]).await?;
+        let candidate = git(&workspace.path, &["rev-parse", "HEAD"]).await?;
+        self.worktree_manager
+            .publish_registration(&workspace, &candidate, &expected_base_oid)
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        Ok(CommandOutcome::PlanRegistered {
+            registration_oid: candidate,
+        })
+    }
+}
+
+impl CoreApi {
+    pub async fn register_generated_plan(
+        &self,
+        bundle: GeneratedPlanBundle,
+        expected_base_oid: String,
+    ) -> Result<CommandOutcome, ApiError> {
+        let coordinator = AuthoringCoordinator::new(
+            self.state.worktree_manager.repo_root.clone(),
+            self.state.worktree_manager.base_branch.clone(),
+            Arc::clone(&self.state.repository_leases),
+        );
+        let outcome = coordinator
+            .publish_generated(bundle.clone(), expected_base_oid)
+            .await?;
+        if let CommandOutcome::PlanRegistered { registration_oid } = &outcome {
+            let _ = self.state.event_tx.send(Event::PlanRegistered {
+                plan_dir: bundle.key,
+                registration_oid: registration_oid.clone(),
+            });
+        }
+        Ok(outcome)
+    }
+
+    async fn set_task_disposition(
+        &self,
+        run: RunId,
+        task_id: crate::api::TaskId,
+        expected_plan_oid: String,
+        action: crate::api::TaskDispositionAction,
+    ) -> Result<CommandOutcome, ApiError> {
+        let invalid = |reason: String| ApiError::InvalidCommand { reason };
+        let (key, run_uid, graph, has_driver) = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            (
+                entry.plan_dir.clone(),
+                entry.run_uid.clone(),
+                Arc::clone(&entry.graph),
+                entry.handle.is_some(),
+            )
+        };
+        let current_state = graph
+            .lock()
+            .await
+            .tasks
+            .iter()
+            .find(|task| task.id.0 == task_id.0)
+            .map(|task| task.state)
+            .ok_or_else(|| invalid(format!("unknown task {task_id}")))?;
+        match &action {
+            crate::api::TaskDispositionAction::Ungate if current_state != TaskState::Gated => {
+                return Err(invalid("ungate requires a planned gated task".into()));
+            }
+            crate::api::TaskDispositionAction::Drop { reason } => {
+                let reason = reason.trim();
+                if reason.is_empty() || reason.len() > 240 || reason.contains(['\n', '\r', '\0']) {
+                    return Err(invalid(
+                        "drop reason must be a non-empty single line of at most 240 bytes".into(),
+                    ));
+                }
+                if has_driver
+                    || matches!(
+                        current_state,
+                        TaskState::InProgress | TaskState::InReview | TaskState::Done
+                    )
+                {
+                    return Err(invalid("cannot drop work with a live driver, unlanded evidence, or completed landing".into()));
+                }
+            }
+            crate::api::TaskDispositionAction::Ungate => {}
+        }
+        let root = &self.state.worktree_manager.repo_root;
+        let _lease = self
+            .state
+            .repository_leases
+            .acquire(
+                root,
+                crate::repository_lease::RepositoryLeaseOwner {
+                    plan_dir: key.relative_dir.clone(),
+                    run_uid: run_uid.clone(),
+                    operation:
+                        crate::repository_lease::RepositoryLeaseOperation::SetTaskDisposition,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| invalid(error.to_string()))?;
+        let coordinator = PlanContractCoordinator::new(root, key.clone(), key.ref_name(), run_uid)
+            .map_err(invalid)?;
+        let new_tip = coordinator
+            .set_disposition(
+                &crate::plan::TaskId::parse(task_id.0.clone())
+                    .map_err(|error| invalid(error.to_string()))?,
+                &expected_plan_oid,
+                action.clone(),
+            )
+            .await
+            .map_err(invalid)?;
+        crate::checkpoint::archive_clean_checkpoint(root, &key)
+            .await
+            .map_err(|error| invalid(error.to_string()))?;
+        let mut graph = graph.lock().await;
+        if let Some(task) = graph.tasks.iter_mut().find(|task| task.id.0 == task_id.0) {
+            task.state = if matches!(action, crate::api::TaskDispositionAction::Ungate) {
+                TaskState::New
+            } else {
+                TaskState::Dropped
+            };
+        }
+        if let Some(metadata) = graph
+            .authored
+            .get_mut(&crate::task::TaskId(task_id.0.clone()))
+        {
+            metadata.gated = false;
+            if matches!(action, crate::api::TaskDispositionAction::Drop { .. }) {
+                metadata.status = crate::plan::AuthoredTaskStatus::Dropped;
+            }
+        }
+        let _ = new_tip;
+        Ok(CommandOutcome::Acknowledged)
+    }
+}
+
+impl AuthoringCoordinator {
+    pub async fn publish_candidate(
+        &self,
+        key: crate::plan::PlanKey,
+        expected_base_oid: String,
+        expected_source_digest: String,
+        commit: bool,
+    ) -> Result<CommandOutcome, ApiError> {
+        let invalid = |reason: String| ApiError::InvalidCommand { reason };
+        match self.inspect_candidate(key.clone(), &expected_base_oid, &expected_source_digest)? {
+            AuthoringCandidate::Committed => {
+                return self
+                    .publish_committed(key, expected_base_oid, expected_source_digest)
+                    .await;
+            }
+            AuthoringCandidate::AwaitingCommit if !commit => {
+                return Ok(CommandOutcome::AwaitingCommit);
+            }
+            AuthoringCandidate::AwaitingCommit => {}
+        }
+        let owner = crate::repository_lease::RepositoryLeaseOwner {
+            plan_dir: key.relative_dir.clone(),
+            run_uid: format!(
+                "author-{}",
+                &expected_source_digest[..12.min(expected_source_digest.len())]
+            ),
+            operation: crate::repository_lease::RepositoryLeaseOperation::RegisterPlan,
+        };
+        let lease = if self.lease_held {
+            None
+        } else {
+            Some(
+                self.repository_leases
+                    .acquire(&self.repo_root, owner, &CancellationToken::new())
+                    .await
+                    .map_err(|error| invalid(error.to_string()))?,
+            )
+        };
+        let git = |args: Vec<String>| async move {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .args(args)
+                .output()
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if !output.status.success() {
+                return Err(invalid(
+                    String::from_utf8_lossy(&output.stderr).trim().into(),
+                ));
+            }
+            Ok::<String, ApiError>(String::from_utf8_lossy(&output.stdout).trim().into())
+        };
+        let indexed_git = |index: PathBuf, args: Vec<String>| async move {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .env("GIT_INDEX_FILE", index)
+                .args(args)
+                .output()
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if !output.status.success() {
+                return Err(invalid(
+                    String::from_utf8_lossy(&output.stderr).trim().into(),
+                ));
+            }
+            Ok::<String, ApiError>(String::from_utf8_lossy(&output.stdout).trim().into())
+        };
+        let head = git(vec!["rev-parse".into(), self.base_branch.clone()]).await?;
+        let authored_base = if head == expected_base_oid {
+            let state = crate::checkpoint::external_state_root(&self.repo_root)
+                .map_err(|error| invalid(error.to_string()))?;
+            tokio::fs::create_dir_all(&state)
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            let index = state.join(format!("authoring-index-{}", ulid::Ulid::new()));
+            indexed_git(
+                index.clone(),
+                vec!["read-tree".into(), expected_base_oid.clone()],
+            )
+            .await?;
+            indexed_git(
+                index.clone(),
+                vec![
+                    "add".into(),
+                    "--".into(),
+                    key.relative_dir.to_string_lossy().into_owned(),
+                ],
+            )
+            .await?;
+            let tree = indexed_git(index.clone(), vec!["write-tree".into()]).await?;
+            let identity = format!("{}-{}", key.number, key.slug);
+            let message = format!(
+                "docs(plan): author {identity}\n\nMakina-Phase: plan-authoring\nMakina-Plan: {identity}\nMakina-Source-Digest: {expected_source_digest}\nMakina-Authoring-Base: {expected_base_oid}"
+            );
+            let authored = git(vec![
+                "commit-tree".into(),
+                tree,
+                "-p".into(),
+                expected_base_oid.clone(),
+                "-m".into(),
+                message,
+            ])
+            .await?;
+            git(vec![
+                "update-ref".into(),
+                format!("refs/heads/{}", self.base_branch),
+                authored.clone(),
+                expected_base_oid.clone(),
+            ])
+            .await?;
+            git(vec![
+                "reset".into(),
+                "HEAD".into(),
+                "--".into(),
+                key.relative_dir.to_string_lossy().into_owned(),
+            ])
+            .await?;
+            let _ = tokio::fs::remove_file(index).await;
+            authored
+        } else {
+            let message = git(vec![
+                "show".into(),
+                "-s".into(),
+                "--format=%B".into(),
+                head.clone(),
+            ])
+            .await?;
+            let exact = |name: &str, value: &str| {
+                message
+                    .lines()
+                    .filter(|line| *line == format!("{name}: {value}"))
+                    .count()
+                    == 1
+            };
+            if !exact("Makina-Phase", "plan-authoring")
+                || !exact("Makina-Source-Digest", &expected_source_digest)
+                || !exact("Makina-Authoring-Base", &expected_base_oid)
+            {
+                return Err(invalid(
+                    "base moved without the exact authored commit".into(),
+                ));
+            }
+            head
+        };
+        drop(lease);
+        self.publish_committed(key, authored_base, expected_source_digest)
+            .await
+    }
+
+    pub async fn publish_committed(
+        &self,
+        key: crate::plan::PlanKey,
+        expected_base_oid: String,
+        expected_source_digest: String,
+    ) -> Result<CommandOutcome, ApiError> {
+        use crate::plan::{
+            FilesystemPlanFileSource, GitTreePlanFileSource, PlanCandidate, PlanFileSource,
+            PlanReservations, load_plan,
+        };
+
+        fn invalid(reason: impl Into<String>) -> ApiError {
+            ApiError::InvalidCommand {
+                reason: reason.into(),
+            }
+        }
+        fn report(report: crate::plan::PlanValidationReport) -> ApiError {
+            invalid(
+                report
+                    .diagnostics
+                    .into_iter()
+                    .map(|d| format!("{}: {}", d.code, d.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        }
+        async fn git(root: &Path, args: &[&str]) -> Result<String, ApiError> {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+            if !output.status.success() {
+                return Err(invalid(String::from_utf8_lossy(&output.stderr).trim()));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
+        fn exact(message: &str, name: &str) -> Option<String> {
+            let prefix = format!("{name}: ");
+            let values = message
+                .lines()
+                .filter_map(|line| line.strip_prefix(&prefix))
+                .collect::<Vec<_>>();
+            (values.len() == 1).then(|| values[0].to_owned())
+        }
+
+        let root = &self.repo_root;
+        let base_tip = git(root, &["rev-parse", &self.base_branch]).await?;
+        if base_tip != expected_base_oid {
+            return Err(invalid(format!(
+                "target base moved: expected {expected_base_oid}, found {base_tip}"
+            )));
+        }
+        let plan_identity = format!("{}-{}", key.number, key.slug);
+        let plan_ref = key.ref_name();
+        let mut refresh_old = None;
+        let mut source_origin = "base".to_owned();
+        if let Ok(tip) = git(root, &["rev-parse", "--verify", &plan_ref]).await {
+            let message = git(root, &["show", "-s", "--format=%B", &tip]).await?;
+            let retained_source =
+                GitTreePlanFileSource::new(root, &tip).map_err(|e| invalid(e.to_string()))?;
+            let retained_plan =
+                match load_plan(&retained_source, key.clone(), &PlanReservations::default())
+                    .map_err(report)?
+                {
+                    PlanCandidate::Plan(plan) => *plan,
+                    PlanCandidate::NotCandidate => {
+                        return Err(invalid("registered ref does not contain the plan bundle"));
+                    }
+                };
+            let exact_registration = exact(&message, "Makina-Phase").as_deref()
+                == Some("plan-registration")
+                && exact(&message, "Makina-Plan").as_deref() == Some(plan_identity.as_str())
+                && exact(&message, "Makina-Source-Digest").as_deref()
+                    == Some(expected_source_digest.as_str())
+                && exact(&message, "Makina-Validation-Base").as_deref()
+                    == Some(expected_base_oid.as_str())
+                && exact(&message, "Makina-Source-Origin").as_deref() == Some("base")
+                && exact(&message, "Makina-Executable-Digest").as_deref()
+                    == Some(retained_plan.executable_digest.as_str())
+                && retained_plan.source_digest.as_str() == expected_source_digest
+                && git(root, &["rev-parse", &format!("{tip}^")]).await? == expected_base_oid;
+            if exact_registration {
+                return Ok(CommandOutcome::PlanRegistered {
+                    registration_oid: tip,
+                });
+            }
+            let refreshable = exact(&message, "Makina-Phase").as_deref()
+                == Some("plan-registration")
+                && exact(&message, "Makina-Plan").as_deref() == Some(plan_identity.as_str())
+                && git(
+                    root,
+                    &["rev-list", "--count", &format!("{tip}..{plan_ref}")],
+                )
+                .await?
+                    == "0";
+            if !refreshable {
+                return Err(invalid(format!(
+                    "{} contains post-registration or divergent evidence at {tip}",
+                    plan_ref
+                )));
+            }
+            source_origin = exact(&message, "Makina-Source-Origin")
+                .filter(|origin| matches!(origin.as_str(), "base" | "generated"))
+                .ok_or_else(|| invalid("old registration has invalid source origin"))?;
+            refresh_old = Some(tip);
+        }
+
+        let source = GitTreePlanFileSource::new(root, &expected_base_oid)
+            .map_err(|e| invalid(e.to_string()))?;
+        let base_plan = match load_plan(&source, key.clone(), &PlanReservations::default()) {
+            Ok(PlanCandidate::Plan(plan)) => *plan,
+            Ok(PlanCandidate::NotCandidate) | Err(_)
+                if refresh_old.is_some() && source_origin == "generated" =>
+            {
+                let retained = GitTreePlanFileSource::new(root, refresh_old.as_ref().unwrap())
+                    .map_err(|e| invalid(e.to_string()))?;
+                match load_plan(&retained, key.clone(), &PlanReservations::default())
+                    .map_err(report)?
+                {
+                    PlanCandidate::Plan(plan) => *plan,
+                    PlanCandidate::NotCandidate => {
+                        return Err(invalid(
+                            "generated registration lost its closed plan subtree",
+                        ));
+                    }
+                }
+            }
+            Ok(PlanCandidate::NotCandidate) | Err(_) => {
+                let working = FilesystemPlanFileSource::new(root, Some(expected_base_oid.clone()))
+                    .map_err(|e| invalid(e.to_string()))?;
+                if let Ok(PlanCandidate::Plan(plan)) =
+                    load_plan(&working, key.clone(), &PlanReservations::default())
+                    && plan.source_digest.as_str() == expected_source_digest
+                {
+                    return Ok(CommandOutcome::AwaitingCommit);
+                }
+                return Err(invalid(
+                    "the expected plan bundle is not present in the target-base commit",
+                ));
+            }
+        };
+        if base_plan.source_digest.as_str() != expected_source_digest {
+            return Err(invalid(format!(
+                "source digest mismatch: expected {expected_source_digest}, found {}",
+                base_plan.source_digest
+            )));
+        }
+
+        let owner = crate::repository_lease::RepositoryLeaseOwner {
+            plan_dir: key.relative_dir.clone(),
+            run_uid: format!(
+                "register-{}",
+                &expected_source_digest[..12.min(expected_source_digest.len())]
+            ),
+            operation: crate::repository_lease::RepositoryLeaseOperation::RegisterPlan,
+        };
+        let cancel = CancellationToken::new();
+        let _lease = if self.lease_held {
+            None
+        } else {
+            Some(
+                self.repository_leases
+                    .acquire(root, owner, &cancel)
+                    .await
+                    .map_err(|e| invalid(e.to_string()))?,
+            )
+        };
+        // Recheck the base after waiting for the lease.
+        let locked_base = git(root, &["rev-parse", &self.base_branch]).await?;
+        if locked_base != expected_base_oid {
+            return Err(invalid(format!(
+                "target base moved while waiting for the repository lease: expected {expected_base_oid}, found {locked_base}"
+            )));
+        }
+
+        let workspace = self
+            .worktree_manager
+            .create_integration_workspace(
+                &plan_identity,
+                &format!(
+                    "registration-{}",
+                    &expected_source_digest[..12.min(expected_source_digest.len())]
+                ),
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        if let Some(old_registration) = refresh_old.as_ref() {
+            git(
+                &workspace.path,
+                &["checkout", "--detach", &expected_base_oid],
+            )
+            .await?;
+            if source_origin == "generated" {
+                git(
+                    &workspace.path,
+                    &[
+                        "checkout",
+                        old_registration,
+                        "--",
+                        key.relative_dir
+                            .to_str()
+                            .ok_or_else(|| invalid("plan path is not UTF-8"))?,
+                    ],
+                )
+                .await?;
+            }
+        }
+        let transition = crate::plan_status::StatusTransition {
+            integration_state: base_plan.status.integration_state,
+            run: base_plan.status.run.clone(),
+            validation_base: Some(
+                crate::plan::GitObjectId::parse(&expected_base_oid, source.object_format())
+                    .map_err(|e| invalid(e.to_string()))?,
+            ),
+            mode: base_plan.status.mode.clone(),
+            final_oid: base_plan.status.final_oid.clone(),
+            display_status: base_plan.status.display_status.clone(),
+            last_updated: base_plan.status.last_updated.clone(),
+        };
+        let status = crate::plan_status::render_plan_status(&base_plan, &transition)
+            .map_err(|e| invalid(e.to_string()))?;
+        let root_board = source
+            .read_file(Path::new("docs/plans/STATUS.md"))
+            .map_err(|e| invalid(e.to_string()))?;
+        let root_board =
+            String::from_utf8(root_board).map_err(|_| invalid("root status board is not UTF-8"))?;
+        let root_board = crate::plan_status::register_root_row(&root_board, &base_plan)
+            .map_err(|e| invalid(e.to_string()))?;
+        tokio::fs::write(
+            workspace.path.join(key.relative_dir.join("STATUS.md")),
+            status,
+        )
+        .await
+        .map_err(|e| invalid(e.to_string()))?;
+        tokio::fs::write(workspace.path.join("docs/plans/STATUS.md"), root_board)
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+
+        let reread_source =
+            FilesystemPlanFileSource::new(&workspace.path, Some(expected_base_oid.clone()))
+                .map_err(|e| invalid(e.to_string()))?;
+        let registered = match load_plan(&reread_source, key.clone(), &PlanReservations::default())
+            .map_err(report)?
+        {
+            PlanCandidate::Plan(plan) => *plan,
+            PlanCandidate::NotCandidate => {
+                return Err(invalid("registration workspace lost its plan bundle"));
+            }
+        };
+        if registered.source_digest != base_plan.source_digest
+            || registered.executable_digest != base_plan.executable_digest
+        {
+            return Err(invalid(
+                "registration bookkeeping changed authored plan digests",
+            ));
+        }
+        git(
+            &workspace.path,
+            &[
+                "add",
+                "--",
+                key.relative_dir
+                    .join("STATUS.md")
+                    .to_str()
+                    .ok_or_else(|| invalid("plan path is not UTF-8"))?,
+                "docs/plans/STATUS.md",
+            ],
+        )
+        .await?;
+        let previous = refresh_old
+            .as_ref()
+            .map(|old| format!("\nMakina-Previous-Registration: {old}"))
+            .unwrap_or_default();
+        let message = format!(
+            "chore(plan): register {plan_identity}\n\nMakina-Phase: plan-registration\nMakina-Plan: {plan_identity}\nMakina-Source-Digest: {}\nMakina-Executable-Digest: {}\nMakina-Validation-Base: {expected_base_oid}\nMakina-Source-Origin: {source_origin}{previous}",
+            registered.source_digest, registered.executable_digest
+        );
+        git(&workspace.path, &["commit", "-m", &message]).await?;
+        let candidate = git(&workspace.path, &["rev-parse", "HEAD"]).await?;
+        if let Some(old) = refresh_old {
+            self.worktree_manager
+                .publish_registration_refresh(&workspace, &candidate, &expected_base_oid, &old)
+                .await
+        } else {
+            self.worktree_manager
+                .publish_registration(&workspace, &candidate, &expected_base_oid)
+                .await
+        }
+        .map_err(|e| invalid(e.to_string()))?;
+        // Publication owns the ref, not this retained recovery checkout. Free
+        // the plan branch immediately so lifecycle sessions can attach it in
+        // their own private integration workspace.
+        git(&workspace.path, &["checkout", "--detach", &candidate]).await?;
+        Ok(CommandOutcome::PlanRegistered {
+            registration_oid: candidate,
+        })
+    }
+}
+
+impl CoreApi {
+    async fn register_plan(
+        &self,
+        key: crate::plan::PlanKey,
+        expected_base_oid: String,
+        expected_source_digest: String,
+    ) -> Result<CommandOutcome, ApiError> {
+        let coordinator = AuthoringCoordinator::new(
+            self.state.worktree_manager.repo_root.clone(),
+            self.state.worktree_manager.base_branch.clone(),
+            Arc::clone(&self.state.repository_leases),
+        );
+        let outcome = coordinator
+            .publish_committed(key.clone(), expected_base_oid, expected_source_digest)
+            .await?;
+        if let CommandOutcome::PlanRegistered { registration_oid } = &outcome {
+            let _ = self.state.event_tx.send(Event::PlanRegistered {
+                plan_dir: key,
+                registration_oid: registration_oid.clone(),
+            });
+        }
+        Ok(outcome)
+    }
+
+    fn load_plan_graph(&self, key: &crate::plan::PlanKey) -> Result<TaskGraph, ApiError> {
+        let repo_root = &self.state.worktree_manager.repo_root;
+        let plan =
+            load_authoritative_plan(repo_root, key).map_err(|report| ApiError::InvalidCommand {
+                reason: report
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            })?;
+        Ok(crate::plan_runtime::ProjectedTaskGraph::from_document(&plan, chrono::Utc::now()).graph)
+    }
+
     /// Create a new `CoreApi` with all execution dependencies injected.
     ///
-    /// The TUI passes the deterministic *ingestion* interpreter (for OpenRun),
+    /// The TUI passes the deterministic *ingestion* interpreter (for OpenPlan),
     /// a separate *planner* interpreter (respecting mechanism, for the Planner
     /// actor), a `NoopBackend` (or the ACP backend), a `WorktreeManager` pointed
     /// at the repo, and a resolved `Config`.  Tests pass `NoopBackend` + a
@@ -1142,10 +4502,10 @@ impl CoreApi {
     /// can register each task's worktree context and audit entries are routed to
     /// `.tasks/{slug}/audit.jsonl`.
     ///
-    /// Note the two interpreters: `interpreter` (ingestion, for OpenRun) and
+    /// Note the two interpreters: `interpreter` (ingestion, for OpenPlan) and
     /// `planner_interpreter` (for the Planner actor / mechanism).
     pub fn with_audit_registry(
-        interpreter: Arc<dyn TaskListInterpreter>,
+        _interpreter: Arc<dyn TaskListInterpreter>,
         planner_interpreter: Arc<dyn TaskListInterpreter>,
         developer_backend: Arc<dyn AgentBackend>,
         reviewer_backend: Arc<dyn AgentBackend>,
@@ -1153,15 +4513,33 @@ impl CoreApi {
         config: Config,
         audit_registry: Arc<dyn AuditRegistry>,
     ) -> Self {
+        Self::with_repository_lease_registry(
+            _interpreter,
+            planner_interpreter,
+            developer_backend,
+            reviewer_backend,
+            worktree_manager,
+            config,
+            audit_registry,
+            Arc::new(crate::repository_lease::RepositoryLeaseRegistry::new()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_repository_lease_registry(
+        _interpreter: Arc<dyn TaskListInterpreter>,
+        planner_interpreter: Arc<dyn TaskListInterpreter>,
+        developer_backend: Arc<dyn AgentBackend>,
+        reviewer_backend: Arc<dyn AgentBackend>,
+        worktree_manager: WorktreeManager,
+        config: Config,
+        audit_registry: Arc<dyn AuditRegistry>,
+        repository_leases: Arc<crate::repository_lease::RepositoryLeaseRegistry>,
+    ) -> Self {
         let (event_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        // Create the normalizer with the developer backend (same as the planner).
-        let normalizer = Arc::new(crate::normalizer::ModelNormalizer::new(Arc::clone(
-            &developer_backend,
-        )));
         let runtime_settings = RuntimeSettings::from_config(&config);
         Self {
             state: Arc::new(CoreState {
-                interpreter,
                 planner_interpreter,
                 developer_backend,
                 reviewer_backend,
@@ -1175,80 +4553,20 @@ impl CoreApi {
                 disk_run_ids: Mutex::new(HashMap::new()),
                 event_tx,
                 audit_registry,
+                repository_leases,
             }),
-            normalizer,
         }
     }
 
-    async fn quarantine_artifact_issue(
-        &self,
-        repo_root: &Path,
-        slug: &str,
-        reason: impl std::fmt::Display,
-    ) -> Result<crate::ingestion::IngestionIssue, ApiError> {
-        let reason = reason.to_string();
-        let quarantined = crate::persist::quarantine_graph(repo_root, slug)
-            .await
-            .map_err(|e| ApiError::InvalidCommand {
-                reason: format!(
-                    "persisted artifact for `{slug}` is invalid ({reason}); refusing to overwrite it because quarantine failed: {e}"
-                ),
-            })?;
-        let path = quarantined
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<artifact disappeared before quarantine>".to_string());
-        tracing::warn!(slug = %slug, %reason, quarantine_path = %path, "quarantined unusable task graph artifact");
-        Ok(crate::ingestion::IngestionIssue {
-            task_id: None,
-            severity: crate::ingestion::IssueSeverity::Warning,
-            source: crate::ingestion::IssueSource::Validator,
-            code: "artifact-quarantined".to_string(),
-            message: format!(
-                "The persisted artifact was unusable ({reason}) and was moved to `{path}` before rebuilding."
-            ),
-            suggestion: Some(
-                "inspect or remove the quarantined backup after verifying this run".into(),
-            ),
-        })
-    }
-
-    fn bind_graph_identity(mut graph: TaskGraph, expected_slug: &str) -> TaskGraph {
-        if graph.slug != expected_slug {
-            tracing::warn!(
-                returned_slug = %graph.slug,
-                %expected_slug,
-                "rebinding interpreted graph to trusted plan identity"
-            );
-            graph.slug = expected_slug.to_string();
-        }
-        graph
-    }
-
-    /// Implement the `OpenRun` command: prefer the persisted artifact, fall back
-    /// to read → interpret → seed-persist.
-    ///
-    /// # Artifact-first path
-    ///
-    /// 1. Derive the slug from the task-list file stem (no I/O needed).
-    /// 2. Attempt [`crate::persist::load_graph`] for that slug.
-    ///    - `Ok(Some(graph))` → apply [`crate::persist::recover_for_resume`] then
-    ///      `graph.validate()`.  If validate succeeds, register this graph (the
-    ///      `.md` is **not** read — the JSON artifact is the source of truth).
-    ///    - Validate error **or** `Err` from `load_graph` (corrupt/unreadable) →
-    ///      warn and fall through to the fresh path.
-    ///    - `Ok(None)` (no file yet) → fall through to the fresh path.
-    ///
-    /// # Fresh path (fallback)
-    ///
-    /// Read the `.md`, interpret, seed-persist.  The `.md` is only read on this
-    /// path, so a resumed run does not require the file to be present.
+    /// Open a validated per-task plan as a read-only projection. Historical
+    /// Pre-cutover plan records and cached graph artifacts are not executable inputs.
     ///
     /// # Lock discipline
     ///
     /// All I/O (file read, persist load/write, interpret) happens with **no lock
     /// held**; the registry lock is taken only for the brief insert, then dropped
     /// before the broadcast.
-    async fn open_run(&self, task_list_path: PathBuf) -> Result<CommandOutcome, ApiError> {
+    async fn open_run(&self, plan_key: crate::plan::PlanKey) -> Result<CommandOutcome, ApiError> {
         // Serialize the entire identity/load/register path. Without this, two
         // concurrent opens can both miss the registry and allocate distinct
         // runs that share plan branches and worktree names.
@@ -1257,12 +4575,11 @@ impl CoreApi {
         // 0. Run project discovery on first open (auto-run if [discovery] stamp absent).
         self.run_discovery_if_needed().await;
 
-        let task_list_path = canonical_task_list_path(task_list_path).await;
-        let plan_identity = task_list_path.clone();
-        let slug = run_slug(&task_list_path);
-        let worktree_plan_slug = plan_slug(&task_list_path);
+        let repo_root = &self.state.worktree_manager.repo_root;
+        let slug = format!("{}-{}", plan_key.number, plan_key.slug).to_ascii_lowercase();
+        let worktree_plan_slug = slug.clone();
 
-        // OpenRun is idempotent for the canonical project+plan identity. A
+        // OpenPlan is idempotent for the canonical project+plan identity. A
         // CoreApi is bound to one project, so the canonical plan path is the
         // remaining identity component.
         let existing = {
@@ -1271,14 +4588,13 @@ impl CoreApi {
                 .runs
                 .lock()
                 .expect("runs registry mutex poisoned");
-            runs.iter().find_map(|(id, entry)| {
-                (entry.plan_identity == plan_identity).then_some(RunId(*id))
-            })
+            runs.iter()
+                .find_map(|(id, entry)| (entry.plan_dir == plan_key).then_some(RunId(*id)))
         };
         if let Some(run) = existing {
             let _ = self.state.event_tx.send(Event::RunOpened {
                 run,
-                task_list_path,
+                plan_dir: plan_key,
             });
             return Ok(CommandOutcome::RunOpened { run });
         }
@@ -1299,48 +4615,75 @@ impl CoreApi {
                     reason: format!(
                         "plan `{}` is already open from `{}`; refusing a second live run that would share artifacts or worktrees",
                         worktree_plan_slug,
-                        entry.task_list_path.display()
+                        entry.plan_dir.relative_dir.display()
                     ),
                 });
             }
         }
 
-        let repo_root = &self.state.worktree_manager.repo_root;
-
-        // 2. Try the persisted artifact first.
-        let (graph, interpret_issues) = match crate::persist::load_graph(repo_root, &slug).await {
-            Ok(Some(mut loaded)) => {
-                // Apply the resume recovery rule: in-progress/in-review → ready.
-                crate::persist::recover_for_resume(&mut loaded);
-                // Validate structural integrity.
-                match loaded.validate() {
-                    Ok(()) => {
-                        // Artifact is usable — use it and skip the .md entirely.
-                        (loaded, vec![])
-                    }
-                    Err(e) => {
-                        let warning = self.quarantine_artifact_issue(repo_root, &slug, e).await?;
-                        let (graph, mut issues) = self
-                            .interpret_and_seed(&slug, &task_list_path, repo_root, true)
-                            .await?;
-                        issues.push(warning);
-                        (graph, issues)
-                    }
+        // New-format plans are always loaded and validated before a checkpoint
+        // is consulted. This branch is read-only: it does not create the state
+        // root, archive a stale checkpoint, or seed a replacement.
+        let source_projection = {
+            let plan = match load_authoritative_plan(repo_root, &plan_key) {
+                Ok(plan) => plan,
+                Err(report)
+                    if report
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "plan-not-found") =>
+                {
+                    return Err(ApiError::InvalidCommand {
+                        reason: "run execution requires a validated plan directory containing SCOPE.md, ARCHITECTURE.md, STATUS.md, and tasks/*.md; pre-cutover records and cached graph artifacts are read-only history".into(),
+                    });
                 }
-            }
-            Ok(None) => {
-                // No artifact yet — fresh interpret + seed.
-                self.interpret_and_seed(&slug, &task_list_path, repo_root, true)
-                    .await?
-            }
-            Err(e) => {
-                let warning = self.quarantine_artifact_issue(repo_root, &slug, e).await?;
-                let (graph, mut issues) = self
-                    .interpret_and_seed(&slug, &task_list_path, repo_root, true)
-                    .await?;
-                issues.push(warning);
-                (graph, issues)
-            }
+                Err(report) => {
+                    return Err(ApiError::InvalidCommand {
+                        reason: report
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| {
+                                format!("{}: {}", diagnostic.code, diagnostic.message)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    });
+                }
+            };
+            let projected =
+                crate::plan_runtime::ProjectedTaskGraph::from_document(&plan, chrono::Utc::now());
+            let checkpoint = match crate::checkpoint::load_checkpoint(repo_root, &plan.key).await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    tracing::warn!(%error, "checkpoint unavailable during read-only plan open");
+                    None
+                }
+            };
+            let reconciliation = if checkpoint.is_none()
+                && crate::checkpoint::checkpoint_path(repo_root, &plan.key).is_err()
+            {
+                crate::checkpoint::CheckpointDisposition::Unavailable {
+                    reason: "external checkpoint location is unavailable".into(),
+                }
+            } else {
+                crate::checkpoint::inspect_checkpoint(&plan, checkpoint.as_ref())
+            };
+            Some((
+                projected.graph,
+                PlanSourceState {
+                    key: plan.key.clone(),
+                    reconciliation,
+                    checkpoint_identity: crate::checkpoint::CheckpointIdentity::from_plan(&plan),
+                },
+            ))
+        };
+
+        // Historical plan records and cached graph artifacts are intentionally
+        // inert. Execution begins only from a fully validated per-task plan.
+        let Some((graph, plan_source)) = source_projection else {
+            return Err(ApiError::InvalidCommand {
+                reason: "run execution requires a validated plan directory containing SCOPE.md, ARCHITECTURE.md, STATUS.md, and tasks/*.md; pre-cutover records and cached graph artifacts are read-only history".into(),
+            });
         };
 
         // Compute ingestion report (validate + qualify) right after graph is
@@ -1350,7 +4693,6 @@ impl CoreApi {
         let report = {
             let mut issues = crate::ingestion::validate(&graph);
             issues.extend(crate::ingestion::qualify(&graph));
-            issues.extend(interpret_issues);
             crate::ingestion::IngestionReport { issues }
         };
 
@@ -1368,8 +4710,7 @@ impl CoreApi {
             runs.insert(
                 id.0,
                 RunEntry {
-                    task_list_path: task_list_path.clone(),
-                    plan_identity,
+                    plan_dir: plan_key.clone(),
                     run_uid,
                     run_slug: slug.clone(),
                     plan_slug: worktree_plan_slug,
@@ -1377,8 +4718,10 @@ impl CoreApi {
                     graph: Arc::new(AsyncMutex::new(graph)),
                     status: RunStatus::Pending,
                     handle: None,
+                    cancellation_status_error: None,
                     scheduler_generation: 0,
                     report,
+                    plan_source: Some(plan_source),
                 },
             );
         } // guard dropped here
@@ -1386,7 +4729,7 @@ impl CoreApi {
         // 4. Broadcast RunOpened (lock no longer held).
         let _ = self.state.event_tx.send(Event::RunOpened {
             run: id,
-            task_list_path,
+            plan_dir: plan_key,
         });
 
         Ok(CommandOutcome::RunOpened { run: id })
@@ -1605,344 +4948,311 @@ impl CoreApi {
         Ok(())
     }
 
-    /// Read + interpret the task-list file at `task_list_path` and (on success)
-    /// seed-persist the resulting graph.
-    ///
-    /// This is the "fresh path" factored out of [`open_run`] so the artifact-first
-    /// branch can call it as a fallback without duplicating code.
-    ///
-    /// On success: returns `(graph, vec![])` after best-effort seed-persist.
-    /// On interpret failure: returns an empty graph + `Vec<IngestionIssue>`
-    /// **without** seed-persist; caller folds them into the run report so `OpenRun`
-    /// yields a reviewable Pending run.
-    ///
-    /// When the underlying error is a `ParseError` from the deterministic
-    /// structured-text path, the detailed issues produced by `lint_source` (the
-    /// four convention codes) are returned instead of a generic item so that the
-    /// report contains the multi-error diagnostics promised by plan 0004.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError::InvalidCommand`] only on read failure (bad path is not
-    /// reviewable). Interpret failures surface as carried issues instead of error.
-    /// Seed-persist failure is best-effort (logs a warning but does not fail `open_run`).
-    ///
-    /// When `seed_persist` is `false` (used by [`reinterpret_run`]), a successful
-    /// interpret does not write the artifact until the caller has re-validated run
-    /// status — avoids seeding disk when a post-await race rejects the swap.
-    async fn interpret_and_seed(
+    /// Re-read and reconcile a typed plan while the repository execution lease
+    /// is held. Both initial start and retry call this before mutating runtime
+    /// state, so a queued operation can never act on the preview captured by
+    /// `OpenPlan` or on a checkpoint/Git/worktree view from before it waited.
+    async fn reconcile_run_under_repository_lease(
         &self,
-        slug: &str,
-        task_list_path: &std::path::Path,
-        repo_root: &std::path::Path,
-        seed_persist: bool,
-    ) -> Result<(TaskGraph, Vec<crate::ingestion::IngestionIssue>), ApiError> {
-        // Try to read the .md file. If it's missing and it's a plan-style TASKS.md,
-        // branch to generation instead of failing.
-        let text = match tokio::fs::read_to_string(task_list_path).await {
-            Ok(text) => text,
-            // Missing TASKS.md in a plan dir ⇒ generate the graph from the spec.
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    && is_plan_tasks_path(task_list_path) =>
-            {
-                return self
-                    .generate_and_seed(slug, task_list_path, repo_root, seed_persist)
-                    .await;
+        run: RunId,
+    ) -> Result<Arc<AsyncMutex<TaskGraph>>, ApiError> {
+        let (plan_source, graph, run_uid) = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            (
+                entry.plan_source.clone(),
+                Arc::clone(&entry.graph),
+                entry.run_uid.clone(),
+            )
+        };
+        let Some(opened) = plan_source else {
+            return Ok(graph);
+        };
+        if let crate::checkpoint::CheckpointDisposition::Unavailable { reason } =
+            &opened.reconciliation
+        {
+            return Err(ApiError::InvalidCommand {
+                reason: format!("cannot start without external runtime state: {reason}"),
+            });
+        }
+        crate::checkpoint::external_state_root(&self.state.worktree_manager.repo_root).map_err(
+            |error| ApiError::InvalidCommand {
+                reason: format!("cannot start without external runtime state: {error}"),
+            },
+        )?;
+        let plan_identity = format!("{}-{}", opened.key.number, opened.key.slug);
+        let plan_ref = format!("refs/heads/plan/{plan_identity}");
+        let tip_output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.state.worktree_manager.repo_root)
+            .args(["rev-parse", "--verify", &plan_ref])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: error.to_string(),
+            })?;
+        let registered = tip_output.status.success();
+        let source: Box<dyn crate::plan::PlanFileSource + Send> = if registered {
+            let plan_tip = String::from_utf8_lossy(&tip_output.stdout)
+                .trim()
+                .to_owned();
+            Box::new(
+                crate::plan::GitTreePlanFileSource::new(
+                    &self.state.worktree_manager.repo_root,
+                    &plan_tip,
+                )
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?,
+            )
+        } else {
+            // Pre-registration callers retain the original source-reread
+            // contract. Once R exists, reconciliation is pinned to its Git tree.
+            Box::new(
+                crate::plan::FilesystemPlanFileSource::new(
+                    &self.state.worktree_manager.repo_root,
+                    None,
+                )
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?,
+            )
+        };
+        let reread = crate::plan::load_plan(
+            source.as_ref(),
+            opened.key.clone(),
+            &crate::plan::PlanReservations::default(),
+        )
+        .map_err(|report| ApiError::InvalidCommand {
+            reason: format!(
+                "plan source became invalid after open: {}",
+                report
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        })?;
+        let crate::plan::PlanCandidate::Plan(mut reread) = reread else {
+            return Err(ApiError::InvalidCommand {
+                reason: "plan source disappeared after open".into(),
+            });
+        };
+        drop(source);
+        let mut stale_clean = Vec::new();
+        for task in &reread.tasks {
+            if !registered {
+                break;
             }
-            Err(e) => {
+            let evidence = crate::landing::inspect_task_evidence(
+                &self.state.worktree_manager.repo_root,
+                &plan_ref,
+                &plan_identity,
+                task.frontmatter.id.as_str(),
+            )
+            .await
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: format!(
+                    "task evidence is ambiguous for {}: {error}",
+                    task.frontmatter.id
+                ),
+            })?;
+            match (task.frontmatter.status, evidence) {
+                (
+                    crate::plan::AuthoredTaskStatus::Done,
+                    crate::landing::TaskEvidenceState::Complete {
+                        implementation_oid, ..
+                    },
+                ) if task
+                    .frontmatter
+                    .merged_as
+                    .as_ref()
+                    .is_some_and(|oid| oid.as_str() == implementation_oid) => {}
+                (crate::plan::AuthoredTaskStatus::Done, evidence) => {
+                    return Err(ApiError::InvalidCommand {
+                        reason: format!(
+                            "source marks {} done without matching reachable A/B evidence: {evidence:?}",
+                            task.frontmatter.id
+                        ),
+                    });
+                }
+                (
+                    crate::plan::AuthoredTaskStatus::InProgress,
+                    crate::landing::TaskEvidenceState::LandingPending { implementation_oid },
+                ) => {
+                    return Err(ApiError::InvalidCommand {
+                        reason: format!(
+                            "task {} has landed implementation {implementation_oid} but Phase B is missing; retain recovery state and resume bookkeeping",
+                            task.frontmatter.id
+                        ),
+                    });
+                }
+                (
+                    crate::plan::AuthoredTaskStatus::InProgress,
+                    crate::landing::TaskEvidenceState::Claimed { claim_oid },
+                ) => {
+                    self.state
+                        .worktree_manager
+                        .prove_stale_claim_clean(
+                            &plan_identity,
+                            task.frontmatter.id.as_str(),
+                            &claim_oid,
+                        )
+                        .await
+                        .map_err(|error| ApiError::InvalidCommand {
+                            reason: format!(
+                                "task {} retains dirty/divergent recovery evidence: {error}",
+                                task.frontmatter.id
+                            ),
+                        })?;
+                    stale_clean.push(crate::task::TaskId(task.frontmatter.id.as_str().to_owned()));
+                }
+                (crate::plan::AuthoredTaskStatus::InProgress, other) => {
+                    return Err(ApiError::InvalidCommand {
+                        reason: format!(
+                            "stale in-progress task {} has incoherent evidence {other:?}",
+                            task.frontmatter.id
+                        ),
+                    });
+                }
+                (_, crate::landing::TaskEvidenceState::LandingPending { implementation_oid }) => {
+                    return Err(ApiError::InvalidCommand {
+                        reason: format!(
+                            "task {} has unbookkept landing {implementation_oid}; source state cannot bypass Phase B",
+                            task.frontmatter.id
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if !stale_clean.is_empty() {
+            self.state
+                .worktree_manager
+                .create_integration_workspace(&plan_identity, &run_uid)
+                .await
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: format!("prepare stale-claim reconciliation workspace: {error}"),
+                })?;
+            self.commit_retry_source_transitions(run, &stale_clean, "reconcile")
+                .await?;
+            let new_tip_output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.state.worktree_manager.repo_root)
+                .args(["rev-parse", "--verify", &plan_ref])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?;
+            let new_tip = String::from_utf8_lossy(&new_tip_output.stdout)
+                .trim()
+                .to_owned();
+            let new_source = crate::plan::GitTreePlanFileSource::new(
+                &self.state.worktree_manager.repo_root,
+                &new_tip,
+            )
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: error.to_string(),
+            })?;
+            reread = match crate::plan::load_plan(
+                &new_source,
+                opened.key,
+                &crate::plan::PlanReservations::default(),
+            )
+            .map_err(|report| ApiError::InvalidCommand {
+                reason: format!("auto-reset source invalid: {:?}", report.diagnostics),
+            })? {
+                crate::plan::PlanCandidate::Plan(plan) => plan,
+                crate::plan::PlanCandidate::NotCandidate => {
+                    return Err(ApiError::InvalidCommand {
+                        reason: "auto-reset lost plan".into(),
+                    });
+                }
+            };
+        }
+        let mut fresh_graph =
+            crate::plan_runtime::ProjectedTaskGraph::from_document(&reread, Utc::now()).graph;
+        crate::checkpoint::probe_writable_checkpoint_root(
+            &self.state.worktree_manager.repo_root,
+            &reread.key,
+        )
+        .await
+        .map_err(|error| ApiError::InvalidCommand {
+            reason: format!("external checkpoint root is not durably writable: {error}"),
+        })?;
+        let mut checkpoint =
+            crate::checkpoint::load_checkpoint(&self.state.worktree_manager.repo_root, &reread.key)
+                .await
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: format!("checkpoint is malformed or unreadable: {error}"),
+                })?;
+        let (actual_refs, actual_worktrees) = crate::checkpoint::inspect_repository_evidence(
+            &self.state.worktree_manager.repo_root,
+            &reread.key,
+        )
+        .await
+        .map_err(|error| ApiError::InvalidCommand {
+            reason: format!("cannot inspect checkpoint recovery evidence: {error}"),
+        })?;
+        if let Some(saved) = checkpoint.as_mut() {
+            saved.active_refs.extend(actual_refs);
+            saved.active_refs.sort();
+            saved.active_refs.dedup();
+            saved.active_worktrees.extend(actual_worktrees);
+            saved.active_worktrees.sort();
+            saved.active_worktrees.dedup();
+        }
+        match crate::checkpoint::inspect_checkpoint(&reread, checkpoint.as_ref()) {
+            crate::checkpoint::CheckpointDisposition::Compatible => {
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    crate::checkpoint::overlay_compatible(&mut fresh_graph, checkpoint);
+                }
+            }
+            crate::checkpoint::CheckpointDisposition::ReplaceClean { .. } => {
+                crate::checkpoint::archive_clean_checkpoint(
+                    &self.state.worktree_manager.repo_root,
+                    &reread.key,
+                )
+                .await
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: format!("failed to archive stale checkpoint: {error}"),
+                })?;
+            }
+            crate::checkpoint::CheckpointDisposition::RetainForRecovery { reason } => {
                 return Err(ApiError::InvalidCommand {
-                    reason: format!(
-                        "could not read task list `{}`: {e}",
-                        task_list_path.display()
-                    ),
+                    reason: format!("checkpoint requires recovery before start: {reason}"),
                 });
             }
-        };
-
-        let lint_issues: Vec<crate::ingestion::IngestionIssue> =
-            crate::ingestion::lint_source(&text);
-
-        // Interpret into a fresh TaskGraph.
-        match self.state.interpreter.interpret(slug, &text).await {
-            Ok(graph) => {
-                let graph = Self::bind_graph_identity(graph, slug);
-                // Seed-persist the freshly-interpreted graph so the artifact exists
-                // immediately (before StartRun).  Best-effort: a failure only warns;
-                // opening a run must not break because the disk is unwritable.
-                if seed_persist
-                    && let Err(e) = crate::persist::persist_graph_as(&graph, repo_root, slug).await
-                {
-                    tracing::warn!(
-                        slug = %slug,
-                        error = %e,
-                        "seed-persist failed for freshly-opened run; continuing without artifact",
-                    );
-                }
-                Ok((graph, vec![]))
+            crate::checkpoint::CheckpointDisposition::Unavailable { reason } => {
+                return Err(ApiError::InvalidCommand { reason });
             }
-            Err(e) => {
-                // On parse error for a plan-convention dir, attempt normalization.
-                if let crate::interpreter::InterpretError::ParseError { location, context } = &e {
-                    let plan_dir = task_list_path.parent().unwrap_or(task_list_path);
-                    if is_plan_convention_dir(plan_dir) {
-                        tracing::info!(
-                            "Normalizing malformed TASKS.md at line {}: {}",
-                            location,
-                            context
-                        );
-                        match self.normalizer.normalize(plan_dir, slug).await {
-                            Ok(normalized) => {
-                                // Write the normalized TASKS.md back to disk.
-                                if let Err(write_err) =
-                                    tokio::fs::write(task_list_path, &normalized).await
-                                {
-                                    tracing::warn!(
-                                        slug = %slug,
-                                        error = %write_err,
-                                        "failed to write normalized TASKS.md; falling back to original error",
-                                    );
-                                    // Fall back to original error if write fails
-                                    let graph = TaskGraph {
-                                        slug: slug.into(),
-                                        tasks: vec![],
-                                    };
-                                    let issues = vec![crate::ingestion::IngestionIssue {
-                                        task_id: None,
-                                        severity: crate::ingestion::IssueSeverity::Blocking,
-                                        source: crate::ingestion::IssueSource::Interpreter,
-                                        code: "parse-error".into(),
-                                        message: format!(
-                                            "could not interpret task list `{slug}`: {e}"
-                                        ),
-                                        suggestion: Some(
-                                            "fix the task list and re-interpret".into(),
-                                        ),
-                                    }];
-                                    return Ok((graph, issues));
-                                }
-                                // Re-interpret the normalized text.
-                                match self.state.interpreter.interpret(slug, &normalized).await {
-                                    Ok(graph) => {
-                                        let graph = Self::bind_graph_identity(graph, slug);
-                                        // Seed-persist the normalized graph.
-                                        if seed_persist
-                                            && let Err(e) = crate::persist::persist_graph_as(
-                                                &graph, repo_root, slug,
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                slug = %slug,
-                                                error = %e,
-                                                "seed-persist failed for normalized run; continuing without artifact",
-                                            );
-                                        }
-                                        return Ok((graph, vec![]));
-                                    }
-                                    Err(reinterpret_err) => {
-                                        tracing::warn!(
-                                            slug = %slug,
-                                            error = %reinterpret_err,
-                                            "re-interpretation of normalized TASKS.md failed; falling back to original error",
-                                        );
-                                        // Fall back to original error if re-interpretation fails
-                                        let graph = TaskGraph {
-                                            slug: slug.into(),
-                                            tasks: vec![],
-                                        };
-                                        let issues = vec![crate::ingestion::IngestionIssue {
-                                            task_id: None,
-                                            severity: crate::ingestion::IssueSeverity::Blocking,
-                                            source: crate::ingestion::IssueSource::Interpreter,
-                                            code: "parse-error".into(),
-                                            message: format!(
-                                                "could not interpret task list `{slug}`: {e}"
-                                            ),
-                                            suggestion: Some(
-                                                "fix the task list and re-interpret".into(),
-                                            ),
-                                        }];
-                                        return Ok((graph, issues));
-                                    }
-                                }
-                            }
-                            Err(norm_err) => {
-                                tracing::warn!(
-                                    slug = %slug,
-                                    error = %norm_err,
-                                    "normalization failed; falling back to original error",
-                                );
-                                // Fall back to original error if normalization fails
-                            }
-                        }
-                    }
-                }
-
-                // No normalization attempted, or it failed — return the original error.
-                let graph = TaskGraph {
-                    slug: slug.into(),
-                    tasks: vec![],
-                };
-                let issues = match &e {
-                    crate::interpreter::InterpretError::ParseError { .. }
-                        if !lint_issues.is_empty() =>
-                    {
-                        lint_issues
-                    }
-                    crate::interpreter::InterpretError::ValidationFailed(ge) => {
-                        crate::ingestion::validator_issues_from_graph_error(ge)
-                    }
-                    _ => vec![crate::ingestion::IngestionIssue {
-                        task_id: None,
-                        severity: crate::ingestion::IssueSeverity::Blocking,
-                        source: crate::ingestion::IssueSource::Interpreter,
-                        code: "interpreter-failed".into(),
-                        message: format!("could not interpret task list `{slug}`: {e}"),
-                        suggestion: Some("fix the task list and re-interpret".into()),
-                    }],
-                };
-                Ok((graph, issues))
-            }
+            crate::checkpoint::CheckpointDisposition::Missing => {}
         }
-    }
-
-    /// Generate a task graph for a TASKS-less plan dir from its SCOPE/ARCHITECTURE,
-    /// write the drafted `TASKS.md` into the dir (the auditable record), then
-    /// seed-persist the graph — returning `(graph, issues)` exactly like
-    /// `interpret_and_seed` so `open_run` registers a Pending run uniformly.
-    ///
-    /// # Parameters
-    ///
-    /// - `slug` — The plan-scoped identifier.
-    /// - `task_list_path` — The path where `TASKS.md` would go (used to derive `dir`).
-    /// - `repo_root` — Used for seed-persist.
-    /// - `seed_persist` — When `true`, persist the generated graph; when `false`,
-    ///   skip persist (used by `reinterpret_run` with `seed_persist=false`).
-    ///
-    /// # Behavior on errors
-    ///
-    /// Interpret/generate failures surface as reviewable `Blocking` ingestion
-    /// issues (same as `interpret_and_seed`'s error arm), never as hard
-    /// `ApiError`. A missing spec (no SCOPE.md / ARCHITECTURE.md) produces a
-    /// single "no-spec-to-generate" issue so the run opens reviewable.
-    async fn generate_and_seed(
-        &self,
-        slug: &str,
-        task_list_path: &std::path::Path,
-        repo_root: &std::path::Path,
-        seed_persist: bool,
-    ) -> Result<(TaskGraph, Vec<crate::ingestion::IngestionIssue>), ApiError> {
-        let dir = task_list_path.parent().unwrap_or(task_list_path);
-
-        // 1. Collect the spec brief from SCOPE.md and/or ARCHITECTURE.md.
-        let brief = read_plan_brief(dir).await;
-
-        // If neither file exists, we have no spec to generate from.
-        if brief.is_empty() {
-            let graph = TaskGraph {
-                slug: slug.into(),
-                tasks: vec![],
-            };
-            let issues = vec![crate::ingestion::IngestionIssue {
-                task_id: None,
-                severity: crate::ingestion::IssueSeverity::Blocking,
-                source: crate::ingestion::IssueSource::Interpreter,
-                code: "no-spec-to-generate".into(),
-                message: format!(
-                    "cannot generate task graph: no SCOPE.md or ARCHITECTURE.md in `{}`",
-                    dir.display()
-                ),
-                suggestion: Some(
-                    "create SCOPE.md and/or ARCHITECTURE.md and re-open the plan".into(),
-                ),
-            }];
-            return Ok((graph, issues));
-        }
-
-        // 2. Get the planner's system_prompt override (plan 0025, if available).
-        // For now, None; when plan 0025 lands, this would resolve from
-        // the configured planner role assignment.
-        let system_prompt_override = None;
-
-        // 3. Draft the graph via the planner generate path.
-        let graph = match self
-            .state
-            .planner_interpreter
-            .generate(slug, &brief, system_prompt_override)
-            .await
         {
-            Ok(g) => Self::bind_graph_identity(g, slug),
-            Err(e) => {
-                // Generate failed (offline, validation error, etc.) → return a
-                // reviewable issue, not a hard error.
-                let empty = TaskGraph {
-                    slug: slug.into(),
-                    tasks: vec![],
-                };
-                let issues = vec![crate::ingestion::IngestionIssue {
-                    task_id: None,
-                    severity: crate::ingestion::IssueSeverity::Blocking,
-                    source: crate::ingestion::IssueSource::Interpreter,
-                    code: "generator-failed".into(),
-                    message: format!("could not generate task graph for `{slug}`: {e}"),
-                    suggestion: Some("check the SCOPE.md/ARCHITECTURE.md and re-open".into()),
-                }];
-                return Ok((empty, issues));
-            }
-        };
-
-        // 4. Publish the generated task list without replacing an entry that
-        //    appeared while the planner was running. A conflicting entry may
-        //    be a legitimate user edit or a symlink, so do not follow/read it
-        //    here and do not seed an artifact from the losing generated graph.
-        match write_tasks_md(task_list_path, &graph).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                tracing::warn!(
-                    slug = %slug,
-                    path = %task_list_path.display(),
-                    "task list appeared during generation; refusing to replace or follow it",
-                );
-                return Ok((
-                    graph,
-                    vec![crate::ingestion::IngestionIssue {
-                        task_id: None,
-                        severity: crate::ingestion::IssueSeverity::Blocking,
-                        source: crate::ingestion::IssueSource::Interpreter,
-                        code: "task-list-generation-race".into(),
-                        message: format!(
-                            "`{}` appeared while tasks were being generated; the generated draft was not persisted",
-                            task_list_path.display()
-                        ),
-                        suggestion: Some(
-                            "review the task list that won the race, then re-interpret the run"
-                                .into(),
-                        ),
-                    }],
-                ));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    slug = %slug,
-                    error = %error,
-                    "failed to write generated task list; continuing without source artifact",
-                );
-            }
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            entry.plan_source = Some(PlanSourceState {
+                key: reread.key.clone(),
+                reconciliation: crate::checkpoint::CheckpointDisposition::Compatible,
+                checkpoint_identity: crate::checkpoint::CheckpointIdentity::from_plan(&reread),
+            });
         }
-
-        // 5. Seed-persist the graph (best-effort).
-        if seed_persist
-            && let Err(e) = crate::persist::persist_graph_as(&graph, repo_root, slug).await
-        {
-            tracing::warn!(
-                slug = %slug,
-                error = %e,
-                "seed-persist failed for generated run; continuing without artifact",
-            );
-        }
-
-        Ok((graph, vec![]))
+        *graph.lock().await = fresh_graph;
+        Ok(graph)
     }
 
     /// Implement `StartRun`: spawn the Supervisor scheduler in the background.
@@ -1958,7 +5268,77 @@ impl CoreApi {
     /// spawns a fresh scheduler that continues launching ready tasks (done tasks
     /// are skipped).
     async fn start_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
+        let lifecycle_guard = self.state.lifecycle_lock.lock().await;
+        let lease_cancel = CancellationToken::new();
+
+        let (lease_owner, prior_join, restore_status) = {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            if !matches!(entry.status, RunStatus::Pending | RunStatus::Paused) {
+                return Err(ApiError::InvalidCommand {
+                    reason: format!("cannot start a run in status {:?}", entry.status),
+                });
+            }
+            let restore_status = entry.status.clone();
+            let prior_join = entry.handle.take().and_then(|mut handle| {
+                handle.cancel.cancel();
+                handle.join.take()
+            });
+            let owner = crate::repository_lease::RepositoryLeaseOwner {
+                plan_dir: entry.plan_dir.relative_dir.clone(),
+                run_uid: entry.run_uid.clone(),
+                operation: crate::repository_lease::RepositoryLeaseOperation::Run,
+            };
+            let current = self
+                .state
+                .repository_leases
+                .owner_for(&self.state.worktree_manager.repo_root)
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?;
+            entry.status = RunStatus::WaitingForRepository {
+                owner: current.clone(),
+            };
+            entry.handle = Some(RunHandle {
+                generation: entry.scheduler_generation,
+                cancel: lease_cancel.clone(),
+                pause: Arc::new(AtomicBool::new(false)),
+                join: None,
+            });
+            let _ = self.state.event_tx.send(Event::RepositoryLeaseWaiting {
+                run,
+                owner: current,
+            });
+            (owner, prior_join, restore_status)
+        };
+        let _waiting_guard = StartWaitingGuard {
+            state: Arc::clone(&self.state),
+            run,
+            restore_status,
+        };
+        drop(lifecycle_guard);
+        if let Some(join) = prior_join {
+            let _ = join.await;
+        }
+        let repository_lease = self
+            .state
+            .repository_leases
+            .acquire(
+                &self.state.worktree_manager.repo_root,
+                lease_owner,
+                &lease_cancel,
+            )
+            .await
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: error.to_string(),
+            })?;
         let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
+
+        self.reconcile_run_under_repository_lease(run).await?;
 
         // Take everything we need out of the registry under ONE lock, then drop
         // the guard before spawning (no lock across the spawn / await boundary).
@@ -1970,7 +5350,7 @@ impl CoreApi {
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
 
-            if !matches!(entry.status, RunStatus::Pending | RunStatus::Paused) {
+            if !matches!(entry.status, RunStatus::WaitingForRepository { .. }) {
                 return Err(ApiError::InvalidCommand {
                     reason: format!(
                         "cannot start a run in status {:?}; only Pending or Paused runs may be started",
@@ -2028,7 +5408,7 @@ impl CoreApi {
             // second lock acquisition below. Uses the same plan-scoped derivation
             // as `open_run` so the persisted artifact, audit ledger, and per-task
             // logs all agree on one slug.
-            let slug = run_slug(&entry.task_list_path);
+            let slug = entry.plan_slug.clone();
 
             // The persistent ULID identity, threaded into the scheduler so the
             // audit ledger can key entries on it.
@@ -2059,7 +5439,15 @@ impl CoreApi {
         }
 
         let join = self.spawn_run_scheduler(
-            run, graph, cancel, pause, run_slug, run_uid, plan_slug, generation,
+            run,
+            graph,
+            cancel,
+            pause,
+            run_slug,
+            run_uid,
+            plan_slug,
+            generation,
+            repository_lease,
         );
 
         // Retain the JoinHandle only if this generation still owns the run. A
@@ -2105,7 +5493,16 @@ impl CoreApi {
         run_uid: String,
         plan_slug: String,
         generation: u64,
+        repository_lease: crate::repository_lease::RepositoryLeaseGuard,
     ) -> JoinHandle<()> {
+        let checkpoint_identity = self
+            .state
+            .runs
+            .lock()
+            .expect("runs registry mutex poisoned")
+            .get(&run.0)
+            .and_then(|entry| entry.plan_source.as_ref())
+            .map(|source| source.checkpoint_identity.clone());
         // Build the per-run control (sink → broadcast, pause flag, cancel token).
         let control = RunControl {
             run,
@@ -2128,7 +5525,15 @@ impl CoreApi {
 
         // Clone the static execution deps + the shared state for the background
         // task (so it can finalize the registry status when the scheduler ends).
-        let worktree_manager = self.state.worktree_manager.clone();
+        let worktree_manager = self
+            .state
+            .worktree_manager
+            .clone()
+            .with_repository_child_token(Arc::new(
+                repository_lease
+                    .child_token()
+                    .expect("repository lease descriptor must be clonable"),
+            ));
         let config = self.state.scheduler_config();
         let developer_backend = Arc::clone(&self.state.developer_backend);
         let reviewer_backend = Arc::clone(&self.state.reviewer_backend);
@@ -2144,7 +5549,11 @@ impl CoreApi {
         // The returned JoinHandle is retained in RunEntry so lifecycle commands
         // can wait for terminal cleanup before reusing plan-scoped resources.
         tokio::spawn(async move {
-            match run_graph(
+            let _repository_lease = repository_lease;
+            let cancellation = control.cancel.clone();
+            let cancellation_run_uid = run_uid.clone();
+            let cancellation_plan_slug = plan_slug.clone();
+            match crate::actors::supervisor::run_graph_with_checkpoint(
                 graph,
                 worktree_manager,
                 config,
@@ -2156,6 +5565,7 @@ impl CoreApi {
                 run_uid,
                 plan_slug,
                 planner_interpreter,
+                checkpoint_identity,
             )
             .await
             {
@@ -2167,6 +5577,22 @@ impl CoreApi {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "run_graph failed");
+                }
+            }
+            if cancellation.is_cancelled()
+                && let Err(error) = state
+                    .commit_authored_cancellation(
+                        run,
+                        &cancellation_run_uid,
+                        &cancellation_plan_slug,
+                    )
+                    .await
+            {
+                tracing::error!(run = %run, error = %error, "authored cancellation transition failed");
+                if let Ok(mut runs) = state.runs.lock()
+                    && let Some(entry) = runs.get_mut(&run.0)
+                {
+                    entry.cancellation_status_error = Some(error);
                 }
             }
             state.finalize_run_status(run, generation).await;
@@ -2238,21 +5664,39 @@ impl CoreApi {
                 .lock()
                 .expect("runs registry mutex poisoned");
             let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
-            let join = entry.handle.take().and_then(|mut handle| {
+            entry.handle.take().and_then(|mut handle| {
                 // Cancel the background scheduler; it aborts + cleans up.  We do
                 // NOT drop the handle's cancel state from the entry before the
                 // scheduler observes it — `cancel.cancel()` is sticky, so the
-                // background task's `finalize_run_status` still sees a cancelled
-                // token via the (now-removed) handle?  No: we removed the handle,
-                // so finalize won't see it.  That is fine: finalize only
-                // overwrites a `Running` status, and we set `Failed` here, so it
-                // is a no-op.  Cancel's status wins.
+                // background task observes the sticky cancellation token before
+                // this command records the terminal runtime status.
                 handle.cancel.cancel();
                 // Clearing the pause flag is harmless and avoids a stuck flag if
                 // the run is somehow resumed; cancel takes precedence anyway.
                 handle.pause.store(false, Ordering::SeqCst);
                 handle.join.take()
-            });
+            })
+        }; // guard dropped before awaiting scheduler cleanup.
+        if let Some(join) = join
+            && let Err(e) = join.await
+            && !e.is_cancelled()
+        {
+            tracing::warn!(run = %run, error = %e, "cancelled scheduler join failed");
+        }
+        {
+            let mut runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get_mut(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            if let Some(reason) = entry.cancellation_status_error.take() {
+                return Err(ApiError::InvalidCommand {
+                    reason: format!(
+                        "workers quiesced but authored cancellation was not persisted; runtime status unchanged: {reason}"
+                    ),
+                });
+            }
             entry.scheduler_generation =
                 entry
                     .scheduler_generation
@@ -2260,14 +5704,8 @@ impl CoreApi {
                     .ok_or_else(|| ApiError::Internal {
                         reason: format!("scheduler generation overflow for run {run}"),
                     })?;
+            // Runtime cancellation is persisted only after worker quiescence.
             entry.status = RunStatus::Failed;
-            join
-        }; // guard dropped before awaiting scheduler cleanup.
-        if let Some(join) = join
-            && let Err(e) = join.await
-            && !e.is_cancelled()
-        {
-            tracing::warn!(run = %run, error = %e, "cancelled scheduler join failed");
         }
         self.state.audit_registry.evict_run(&run.to_string());
         let _ = self.state.event_tx.send(Event::RunStatusChanged {
@@ -2283,14 +5721,14 @@ impl CoreApi {
     ///
     /// Concurrent `ReinterpretRun` calls on the same run are not serialized beyond the
     /// registry lock. Last writer wins (the second swap overwrites the first's graph+report).
-    /// This is the same tolerance already present for concurrent `OpenRun` of the same slug
+    /// This is the same tolerance already present for concurrent `OpenPlan` of the same slug
     /// from two TUI instances. A per-run in-flight flag can be added later if needed.
     async fn reinterpret_run(&self, run: RunId) -> Result<CommandOutcome, ApiError> {
         let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
         let repo_root = self.state.worktree_manager.repo_root.clone();
 
         // Lookup path + slug + enforce Pending (no lock held across the await).
-        let (task_list_path, slug) = {
+        let (plan_dir, slug) = {
             let runs = self
                 .state
                 .runs
@@ -2302,13 +5740,12 @@ impl CoreApi {
                     reason: "reinterpret only valid for Pending runs".into(),
                 });
             }
-            (entry.task_list_path.clone(), entry.run_slug.clone())
+            (entry.plan_dir.clone(), entry.run_slug.clone())
         };
 
         // Fresh interpret without seed-persist until status is re-checked below.
-        let (new_graph, interpret_issues) = self
-            .interpret_and_seed(&slug, &task_list_path, &repo_root, false)
-            .await?;
+        let new_graph = self.load_plan_graph(&plan_dir)?;
+        let interpret_issues = Vec::new();
 
         // Recompute report exactly as open_run does.
         let report = {
@@ -2352,10 +5789,7 @@ impl CoreApi {
 
         // Emit RunOpened (reusing the event is the smaller change; its
         // resolve_api_event + RunLoaded path will refresh the TUI's RunView).
-        let _ = self.state.event_tx.send(Event::RunOpened {
-            run,
-            task_list_path,
-        });
+        let _ = self.state.event_tx.send(Event::RunOpened { run, plan_dir });
 
         Ok(CommandOutcome::Acknowledged)
     }
@@ -2384,6 +5818,158 @@ impl CoreApi {
         self.retry_impl(run, None).await
     }
 
+    /// Publish authored retry state before touching the volatile task graph.
+    /// The caller holds the repository lease for the entire sequence.
+    async fn commit_retry_source_transitions(
+        &self,
+        run: RunId,
+        targets: &[crate::task::TaskId],
+        action: &str,
+    ) -> Result<(), ApiError> {
+        use crate::plan::{GitTreePlanFileSource, PlanCandidate, PlanFileSource, PlanReservations};
+        let (key, run_uid, plan_slug) = {
+            let runs = self
+                .state
+                .runs
+                .lock()
+                .expect("runs registry mutex poisoned");
+            let entry = runs.get(&run.0).ok_or(ApiError::UnknownRun { run })?;
+            (
+                entry.plan_dir.clone(),
+                entry.run_uid.clone(),
+                entry.plan_slug.clone(),
+            )
+        };
+        if plan_slug.is_empty() || targets.is_empty() {
+            return Ok(());
+        }
+        let invalid = |reason: String| ApiError::InvalidCommand { reason };
+        let root = crate::paths::run_dir(&self.state.worktree_manager.repo_root, &run_uid)
+            .map_err(|error| invalid(error.to_string()))?
+            .join("integration");
+        let plan_ref = format!("refs/heads/plan/{plan_slug}");
+        for target in targets {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["rev-parse", "--verify", &plan_ref])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if !output.status.success() {
+                return Err(invalid(
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                ));
+            }
+            let old = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let source =
+                GitTreePlanFileSource::new(&root, &old).map_err(|e| invalid(e.to_string()))?;
+            let mut plan =
+                match crate::plan::load_plan(&source, key.clone(), &PlanReservations::default())
+                    .map_err(|report| {
+                        invalid(format!("retry source is invalid: {:?}", report.diagnostics))
+                    })? {
+                    PlanCandidate::Plan(plan) => *plan,
+                    PlanCandidate::NotCandidate => {
+                        return Err(invalid("retry source is not a plan".into()));
+                    }
+                };
+            let task = plan
+                .tasks
+                .iter_mut()
+                .find(|task| task.frontmatter.id.as_str() == target.0)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "retry task {target} is absent from registered plan"
+                    ))
+                })?;
+            if task.frontmatter.status == crate::plan::AuthoredTaskStatus::Blocked {
+                plan.status.source.body = crate::plan_status::resolve_exception(
+                    &plan.status.source.body,
+                    &target.0,
+                    &format!("retry {run_uid}"),
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+            }
+            task.update_bookkeeping(crate::plan::AuthoredTaskStatus::Planned, None)
+                .map_err(|error| invalid(error.to_string()))?;
+            plan.status.done = plan
+                .tasks
+                .iter()
+                .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Done)
+                .count();
+            plan.status.blocked = plan
+                .tasks
+                .iter()
+                .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Blocked)
+                .count();
+            plan.status.dropped = plan
+                .tasks
+                .iter()
+                .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Dropped)
+                .count();
+            let transition = crate::plan_status::StatusTransition {
+                integration_state: plan.status.integration_state,
+                run: plan.status.run.clone(),
+                validation_base: plan.status.validation_base_oid.clone(),
+                mode: plan.status.mode.clone(),
+                final_oid: plan.status.final_oid.clone(),
+                display_status: plan.status.display_status.clone(),
+                last_updated: plan.status.last_updated.clone(),
+            };
+            let status = crate::plan_status::render_plan_status(&plan, &transition)
+                .map_err(|e| invalid(e.to_string()))?;
+            plan.status.source.body = status.clone();
+            let board = String::from_utf8(
+                source
+                    .read_file(Path::new("docs/plans/STATUS.md"))
+                    .map_err(|e| invalid(e.to_string()))?,
+            )
+            .map_err(|_| invalid("root status is not UTF-8".into()))?;
+            let board = crate::plan_status::update_root_row(&board, &plan)
+                .map_err(|e| invalid(e.to_string()))?;
+            let task = plan
+                .tasks
+                .iter()
+                .find(|task| task.frontmatter.id.as_str() == target.0)
+                .expect("task retained");
+            crate::landing::commit_source_transition(
+                &root,
+                &plan_ref,
+                &old,
+                &[
+                    crate::landing::OwnedWrite {
+                        path: task.source_path.clone(),
+                        bytes: task.render().into_bytes(),
+                    },
+                    crate::landing::OwnedWrite {
+                        path: plan.status.source.source_path.clone(),
+                        bytes: status.into_bytes(),
+                    },
+                    crate::landing::OwnedWrite {
+                        path: PathBuf::from("docs/plans/STATUS.md"),
+                        bytes: board.into_bytes(),
+                    },
+                ],
+                &crate::landing::SourceTransitionIdentity {
+                    plan: plan_slug.clone(),
+                    task: target.0.clone(),
+                    run: run_uid.clone(),
+                    action: action.into(),
+                },
+            )
+            .await
+            .map_err(|e| {
+                invalid(format!(
+                    "retry status commit failed before runtime reset: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     fn emit_plan_operation(
         &self,
         run: RunId,
@@ -2407,7 +5993,7 @@ impl CoreApi {
         let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
         let repo_root = self.state.worktree_manager.repo_root.clone();
 
-        let (task_list_path, run_uid, run_slug, plan_slug, old_join, had_handle, old_graph) = {
+        let (plan_dir, run_uid, run_slug, plan_slug, old_join, had_handle, old_graph) = {
             let mut runs = self
                 .state
                 .runs
@@ -2434,7 +6020,7 @@ impl CoreApi {
                         reason: format!("scheduler generation overflow for run {run}"),
                     })?;
             (
-                entry.task_list_path.clone(),
+                entry.plan_dir.clone(),
                 entry.run_uid.clone(),
                 entry.run_slug.clone(),
                 entry.plan_slug.clone(),
@@ -2471,6 +6057,90 @@ impl CoreApi {
             && !e.is_cancelled()
         {
             tracing::warn!(run = %run, error = %e, "reset scheduler join failed");
+        }
+        if let Some(reason) = self
+            .state
+            .runs
+            .lock()
+            .expect("runs registry mutex poisoned")
+            .get_mut(&run.0)
+            .and_then(|entry| entry.cancellation_status_error.take())
+        {
+            return Err(ApiError::InvalidCommand {
+                reason: format!(
+                    "workers quiesced but authored requeue was not persisted; runtime reset stopped: {reason}"
+                ),
+            });
+        }
+        let archive_task_ids = {
+            let graph = old_graph.lock().await;
+            graph
+                .tasks
+                .iter()
+                .map(|task| task.id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        let reset_cancel = CancellationToken::new();
+        let _reset_lease = self
+            .state
+            .repository_leases
+            .acquire(
+                &repo_root,
+                crate::repository_lease::RepositoryLeaseOwner {
+                    plan_dir: plan_dir.relative_dir.clone(),
+                    run_uid: run_uid.clone(),
+                    operation: crate::repository_lease::RepositoryLeaseOperation::ResetRun,
+                },
+                &reset_cancel,
+            )
+            .await
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: error.to_string(),
+            })?;
+
+        if !plan_slug.is_empty() {
+            use crate::plan::{GitTreePlanFileSource, PlanCandidate, PlanReservations};
+            let plan_ref = format!("refs/heads/plan/{plan_slug}");
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_root)
+                .args(["rev-parse", "--verify", &plan_ref])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?;
+            if output.status.success() {
+                let tip = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let source = GitTreePlanFileSource::new(&repo_root, &tip).map_err(|error| {
+                    ApiError::InvalidCommand {
+                        reason: error.to_string(),
+                    }
+                })?;
+                if let PlanCandidate::Plan(plan) =
+                    crate::plan::load_plan(&source, plan_dir.clone(), &PlanReservations::default())
+                        .map_err(|report| ApiError::InvalidCommand {
+                            reason: format!(
+                                "cannot reset invalid registered plan: {:?}",
+                                report.diagnostics
+                            ),
+                        })?
+                    && plan.status.integration_state == crate::plan::PlanIntegrationState::Complete
+                {
+                    return Err(ApiError::InvalidCommand {
+                        reason: "completed plans cannot be reset; author a new plan".into(),
+                    });
+                }
+                self.state
+                    .worktree_manager
+                    .archive_run_refs(&plan_slug, &run_uid, &archive_task_ids)
+                    .await
+                    .map_err(|error| ApiError::InvalidCommand {
+                        reason: format!("reset could not archive recovery refs: {error}"),
+                    })?;
+            }
         }
 
         let old_task_ids = {
@@ -2529,20 +6199,17 @@ impl CoreApi {
             &plan_slug,
             &label,
             crate::api::PlanOperationPhase::Step,
-            "Re-reading TASKS.md",
+            "Reloading plan documents",
         );
-        let (new_graph, interpret_issues) = match self
-            .interpret_and_seed(&run_slug, &task_list_path, &repo_root, false)
-            .await
-        {
-            Ok(result) => result,
+        let (new_graph, interpret_issues) = match self.load_plan_graph(&plan_dir) {
+            Ok(graph) => (graph, Vec::new()),
             Err(e) => {
                 self.emit_plan_operation(
                     run,
                     &plan_slug,
                     &label,
                     crate::api::PlanOperationPhase::Failed,
-                    format!("Reset failed while re-reading TASKS.md: {e}"),
+                    format!("Reset failed while reloading plan documents: {e}"),
                 );
                 return Err(e);
             }
@@ -2608,10 +6275,7 @@ impl CoreApi {
             run,
             status: RunStatus::Pending,
         });
-        let _ = self.state.event_tx.send(Event::RunOpened {
-            run,
-            task_list_path,
-        });
+        let _ = self.state.event_tx.send(Event::RunOpened { run, plan_dir });
         self.emit_plan_operation(
             run,
             &plan_slug,
@@ -2624,14 +6288,41 @@ impl CoreApi {
     }
 
     async fn purge_worktrees(&self) -> Result<CommandOutcome, ApiError> {
-        self.state
+        let owner = crate::repository_lease::RepositoryLeaseOwner {
+            plan_dir: PathBuf::new(),
+            run_uid: "maintenance".into(),
+            operation: crate::repository_lease::RepositoryLeaseOperation::PurgeWorktrees,
+        };
+        let Some(_lease) = self
+            .state
+            .repository_leases
+            .try_acquire(&self.state.worktree_manager.repo_root, owner)
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: error.to_string(),
+            })?
+        else {
+            return Ok(CommandOutcome::RepositoryBusy {
+                owner: self
+                    .state
+                    .repository_leases
+                    .owner_for(&self.state.worktree_manager.repo_root)
+                    .map_err(|error| ApiError::InvalidCommand {
+                        reason: error.to_string(),
+                    })?,
+            });
+        };
+        let report = self
+            .state
             .worktree_manager
             .purge_makina_worktrees()
             .await
             .map_err(|e| ApiError::InvalidCommand {
                 reason: format!("failed to purge worktrees: {e}"),
             })?;
-        Ok(CommandOutcome::Acknowledged)
+        Ok(CommandOutcome::WorktreesPurged {
+            removed: report.worktrees_removed + report.orphan_dirs_removed,
+            preserved: report.preserved.into_iter().map(|item| item.path).collect(),
+        })
     }
 
     /// Shared implementation for `RetryTask`/`RetryFailedTasks`.
@@ -2647,11 +6338,23 @@ impl CoreApi {
     ) -> Result<CommandOutcome, ApiError> {
         use crate::task::{TaskId as DomainTaskId, TaskState as DomainTaskState};
 
-        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
+        let lifecycle_guard = self.state.lifecycle_lock.lock().await;
+        let lease_cancel = CancellationToken::new();
 
         // 1. Lock the registry: validate the run is open + retryable, snapshot the
         //    graph handle and run identity, then drop the guard before awaiting.
-        let (graph, run_uid, run_slug, plan_slug, task_list_path, started_at, generation, old_join) = {
+        let (
+            _graph,
+            run_uid,
+            run_slug,
+            plan_slug,
+            plan_dir,
+            started_at,
+            generation,
+            old_join,
+            lease_owner,
+            restore_status,
+        ) = {
             let mut runs = self
                 .state
                 .runs
@@ -2672,6 +6375,7 @@ impl CoreApi {
                     ),
                 });
             }
+            let restore_status = entry.status.clone();
             let old_join = entry.handle.take().and_then(|mut handle| {
                 handle.cancel.cancel();
                 handle.pause.store(false, Ordering::SeqCst);
@@ -2685,17 +6389,51 @@ impl CoreApi {
                         reason: format!("scheduler generation overflow for run {run}"),
                     })?;
             entry.scheduler_generation = generation;
+            let lease_owner = crate::repository_lease::RepositoryLeaseOwner {
+                plan_dir: entry.plan_dir.relative_dir.clone(),
+                run_uid: entry.run_uid.clone(),
+                operation: crate::repository_lease::RepositoryLeaseOperation::Run,
+            };
+            let current = self
+                .state
+                .repository_leases
+                .owner_for(&self.state.worktree_manager.repo_root)
+                .map_err(|error| ApiError::InvalidCommand {
+                    reason: error.to_string(),
+                })?;
+            entry.status = RunStatus::WaitingForRepository {
+                owner: current.clone(),
+            };
+            entry.handle = Some(RunHandle {
+                generation,
+                cancel: lease_cancel.clone(),
+                pause: Arc::new(AtomicBool::new(false)),
+                join: None,
+            });
+            let _ = self.state.event_tx.send(Event::RepositoryLeaseWaiting {
+                run,
+                owner: current,
+            });
             (
                 Arc::clone(&entry.graph),
                 entry.run_uid.clone(),
                 entry.run_slug.clone(),
                 entry.plan_slug.clone(),
-                entry.task_list_path.clone(),
+                entry.plan_dir.clone(),
                 entry.started_at,
                 generation,
                 old_join,
+                lease_owner,
+                restore_status,
             )
         }; // registry guard dropped before awaiting the graph lock.
+
+        let _waiting_guard = StartWaitingGuard {
+            state: Arc::clone(&self.state),
+            run,
+            restore_status,
+        };
+        drop(lifecycle_guard);
 
         if let Some(join) = old_join
             && let Err(e) = join.await
@@ -2703,6 +6441,61 @@ impl CoreApi {
         {
             tracing::warn!(run = %run, error = %e, "retry scheduler join failed");
         }
+
+        let repository_lease = self
+            .state
+            .repository_leases
+            .acquire(
+                &self.state.worktree_manager.repo_root,
+                lease_owner,
+                &lease_cancel,
+            )
+            .await
+            .map_err(|error| ApiError::InvalidCommand {
+                reason: error.to_string(),
+            })?;
+        let _lifecycle_guard = self.state.lifecycle_lock.lock().await;
+
+        // The retry target and checkpoint state may have changed while this
+        // request waited behind another run. Reconcile the same authoritative
+        // inputs as StartRun before resetting any task or entering Running.
+        let graph = self.reconcile_run_under_repository_lease(run).await?;
+
+        // Validate and snapshot the retry set without mutating runtime. The
+        // authored plan/task/root transaction must publish first so a failure
+        // cannot leave an in-memory retry that source does not record.
+        let durable_targets = {
+            let g = graph.lock().await;
+            match &task {
+                Some(target) => {
+                    let id = DomainTaskId(target.0.clone());
+                    let state = g.get(&id).map(|task| task.state);
+                    if state != Some(DomainTaskState::Failed) {
+                        return Err(ApiError::InvalidCommand {
+                            reason: match state {
+                                Some(state) => format!(
+                                    "task {} is in state {state:?}, not Failed; cannot retry",
+                                    target.0
+                                ),
+                                None => format!("task {} is not in run {run}", target.0),
+                            },
+                        });
+                    }
+                    vec![id]
+                }
+                None => g
+                    .tasks
+                    .iter()
+                    .filter(|task| task.state == DomainTaskState::Failed)
+                    .map(|task| task.id.clone())
+                    .collect(),
+            }
+        };
+        if durable_targets.is_empty() {
+            return Ok(CommandOutcome::Acknowledged);
+        }
+        self.commit_retry_source_transitions(run, &durable_targets, "retry")
+            .await?;
 
         // 2. Reset the target task(s) under the graph lock; collect every reset
         //    (and revived) id so we can emit + persist after dropping the guard.
@@ -2802,7 +6595,7 @@ impl CoreApi {
             Utc::now(),
             task_snapshots,
         )
-        .with_task_list_path(&task_list_path, &self.state.worktree_manager.repo_root);
+        .with_plan_dir(&plan_dir, &self.state.worktree_manager.repo_root);
         if let Err(e) = write_run_metadata(&meta, &self.state.worktree_manager.repo_root).await {
             tracing::warn!(run_uid = %run_uid, error = %e, "run.json refresh failed after retry");
         }
@@ -2857,7 +6650,15 @@ impl CoreApi {
         });
 
         let join = self.spawn_run_scheduler(
-            run, graph, cancel, pause, run_slug, run_uid, plan_slug, generation,
+            run,
+            graph,
+            cancel,
+            pause,
+            run_slug,
+            run_uid,
+            plan_slug,
+            generation,
+            repository_lease,
         );
         {
             let mut runs = self
@@ -2892,7 +6693,7 @@ impl CoreApi {
             let entry = runs.get(&id.0)?;
             (
                 entry.run_uid.clone(),
-                entry.task_list_path.clone(),
+                entry.plan_dir.clone(),
                 entry.status.clone(),
                 entry.report.clone(),
                 Arc::clone(&entry.graph),
@@ -2954,13 +6755,13 @@ impl Api for CoreApi {
     /// Execute a [`Command`].
     ///
     /// All four commands are implemented:
-    /// * [`Command::OpenRun`] reads + interprets the file, registers the Run, and
+    /// * [`Command::OpenPlan`] reads + interprets the file, registers the Run, and
     ///   broadcasts [`Event::RunOpened`].
     /// * [`Command::StartRun`] spawns the Supervisor scheduler in the background
     ///   (the Run actually executes) and returns [`CommandOutcome::Acknowledged`].
     /// * [`Command::PauseRun`] stops the scheduler launching NEW tasks.
     /// * [`Command::CancelRun`] aborts the scheduler and cleans up.
-    /// * [`Command::ReinterpretRun`] re-reads the source (async, like OpenRun).
+    /// * [`Command::ReinterpretRun`] re-reads the source (async, like OpenPlan).
     /// * [`Command::RetryTask`] / [`Command::RetryFailedTasks`] reset the failed
     ///   task(s) + skipped cascade, persist, and re-dispatch (async, plan 0017).
     /// * [`Command::ResetRun`] resets a run to a fresh Pending graph.
@@ -2969,7 +6770,42 @@ impl Api for CoreApi {
     /// * [`Command::PurgeWorktrees`] removes Makina-created transient worktrees.
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
-            Command::OpenRun { task_list_path } => self.open_run(task_list_path).await,
+            Command::GeneratePlanBundle { blueprint } => self.generate_plan_bundle(blueprint).await,
+            Command::RegisterPlan {
+                plan_dir,
+                expected_base_oid,
+                expected_source_digest,
+            } => {
+                self.register_plan(plan_dir, expected_base_oid, expected_source_digest)
+                    .await
+            }
+            Command::SetTaskDisposition {
+                run,
+                task,
+                expected_plan_oid,
+                action,
+            } => {
+                self.set_task_disposition(run, task, expected_plan_oid, action)
+                    .await
+            }
+            Command::FinalizePlan {
+                plan_dir,
+                run_uid,
+                expected_plan_oid,
+                input,
+            } => {
+                self.delayed_finalization(plan_dir, run_uid, expected_plan_oid, Some(input))
+                    .await
+            }
+            Command::ReprepareFinalization {
+                plan_dir,
+                run_uid,
+                expected_plan_oid,
+            } => {
+                self.delayed_finalization(plan_dir, run_uid, expected_plan_oid, None)
+                    .await
+            }
+            Command::OpenPlan { plan_dir } => self.open_run(plan_dir).await,
             // Lifecycle commands may await a superseded scheduler's cleanup so
             // plan-scoped worktrees are never owned by overlapping generations.
             Command::StartRun { run } => self.start_run(run).await,
@@ -3023,7 +6859,7 @@ impl Api for CoreApi {
             Vec<(
                 RunId,
                 String,
-                PathBuf,
+                crate::plan::PlanKey,
                 RunStatus,
                 crate::ingestion::IngestionReport,
                 Arc<AsyncMutex<TaskGraph>>,
@@ -3043,7 +6879,7 @@ impl Api for CoreApi {
                     (
                         RunId(*id),
                         entry.run_uid.clone(),
-                        entry.task_list_path.clone(),
+                        entry.plan_dir.clone(),
                         entry.status.clone(),
                         entry.report.clone(),
                         Arc::clone(&entry.graph),
@@ -3101,157 +6937,11 @@ impl Api for CoreApi {
     }
 
     /// Subscribe to the live event stream.
-    ///
-    /// Wraps a fresh `broadcast::Receiver` in a [`BroadcastStream`] and maps away
-    /// `Lagged` errors so the returned [`EventStream`] stays infallible
-    /// (`Item = Event`), as the trait contract requires.  A lagging consumer
-    /// silently skips the dropped events rather than seeing a transport error.
     fn subscribe(&self) -> EventStream {
         let rx = self.state.event_tx.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(|result| result.ok());
         Box::pin(stream)
     }
-}
-
-// ── Planner generate helpers ──────────────────────────────────────────────────
-
-/// Read SCOPE.md and/or ARCHITECTURE.md from a plan directory and join them
-/// into a single brief string. Each file is optional; returns an empty string
-/// if neither exists.
-async fn read_plan_brief(plan_dir: &std::path::Path) -> String {
-    let mut parts = Vec::new();
-
-    // Try to read SCOPE.md
-    if let Ok(scope) = tokio::fs::read_to_string(plan_dir.join("SCOPE.md")).await {
-        parts.push(scope);
-    }
-
-    // Try to read ARCHITECTURE.md
-    if let Ok(arch) = tokio::fs::read_to_string(plan_dir.join("ARCHITECTURE.md")).await {
-        parts.push(arch);
-    }
-
-    // Join with a blank line separator if both exist
-    parts.join("\n\n")
-}
-
-/// Render a [`TaskGraph`] as structured-text Markdown (TASKS.md convention) and
-/// create it at the exact requested path without replacing any existing entry.
-///
-/// The output follows the convention so it can round-trip through
-/// `StructuredTextInterpreter::interpret`.
-async fn write_tasks_md(
-    path: &std::path::Path,
-    graph: &crate::task::TaskGraph,
-) -> Result<(), std::io::Error> {
-    use tokio::io::AsyncWriteExt as _;
-
-    let markdown = render_tasks_md(graph);
-    // This path is reached only after the requested task list was observed
-    // missing. `create_new` makes the final check and creation one filesystem
-    // operation, so a dangling symlink (or any other entry) inserted after
-    // routing cannot make generation write outside the selected project.
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await?;
-    let write_result = async {
-        file.write_all(markdown.as_bytes()).await?;
-        file.sync_all().await
-    }
-    .await;
-
-    if let Err(error) = write_result {
-        // Close the handle before removing the incomplete file (required on
-        // Windows). Preserve the original write/sync error for the caller.
-        drop(file);
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(cleanup_error) => tracing::warn!(
-                path = %path.display(),
-                error = %cleanup_error,
-                "failed to remove partial generated task list"
-            ),
-        }
-        return Err(error);
-    }
-
-    Ok(())
-}
-
-/// Render a [`TaskGraph`] as structured-text Markdown following the convention
-/// in `docs/spec/structured-text-convention.md`.
-fn render_tasks_md(graph: &crate::task::TaskGraph) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "# Makina Plan {} — Auto-Generated Task List",
-        graph.slug
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Auto-generated from SCOPE.md and ARCHITECTURE.md.");
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "See the spec in `docs/spec/structured-text-convention.md` for the notation."
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "---");
-    let _ = writeln!(out);
-
-    // Group tasks by section
-    let mut sections: std::collections::BTreeMap<Option<&str>, Vec<&crate::task::Task>> =
-        std::collections::BTreeMap::new();
-    for task in &graph.tasks {
-        let section = task.section.as_deref();
-        sections.entry(section).or_default().push(task);
-    }
-
-    // Render each section
-    for (section, tasks) in sections.iter() {
-        if let Some(section_id) = section {
-            let _ = writeln!(out, "## {} — Generated Section", section_id);
-        } else {
-            // Sections without an id must still have the em-dash separator per convention
-            let _ = writeln!(out, "##  — Ungrouped");
-        }
-        let _ = writeln!(out);
-
-        for task in tasks {
-            let _ = writeln!(out, "### {} — {}", task.id, task.title);
-            let _ = writeln!(out);
-
-            // Description
-            if !task.description.is_empty() {
-                let _ = writeln!(out, "{}", task.description);
-                let _ = writeln!(out);
-            }
-
-            // Done when
-            let _ = writeln!(out, "- **Done when:** {}", task.done_when);
-
-            // Depends on (em-dash uses U+2014)
-            if task.depends_on.is_empty() {
-                let _ = writeln!(out, "- **Depends on:** —");
-            } else {
-                let deps = task
-                    .depends_on
-                    .iter()
-                    .map(|id| id.0.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let _ = writeln!(out, "- **Depends on:** {}", deps);
-            }
-
-            let _ = writeln!(out);
-        }
-    }
-
-    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3262,58 +6952,15 @@ mod tests {
     use crate::backend::noop::NoopBackend;
     use crate::config::{Config, GlobalConfig, ProjectConfig};
     use crate::dependency::EdgeInferrer;
-    use crate::interpreter::StructuredTextInterpreter;
+    use crate::interpreter::SourceProjectionUnavailable;
     // `next()` comes from `tokio_stream::StreamExt`, already in scope via the
     // glob import above (the orchestrator uses it for the broadcast stream).
-    use crate::api::{AgentRole, ExchangeEvent, TaskState};
-    use std::process::Command as StdCommand;
     use std::sync::Arc;
-    use std::time::Duration;
 
     // Use the process-global HOME_ENV_LOCK from lib.rs so all test modules
     // serialize HOME mutations across crate boundaries.
     use crate::HOME_ENV_LOCK;
-    use crate::test_support::{
-        run_git as shared_run_git, setup_temp_repo as shared_setup_temp_repo,
-    };
-
-    /// A small, valid structured-text task list used by the OpenRun tests.
-    ///
-    /// Two tasks under one section; `task-two` explicitly depends on `task-one`.
-    const SAMPLE_TASK_LIST: &str = r#"# Sample — Task List
-
-A small task list used to exercise CoreApi::OpenRun.
-
----
-
-## 0001 — Foundation
-
-### task-one — First task
-Create the `lib.rs` entry point for the crate.
-- **Depends on:** —
-- **Done when:** `lib.rs` is present and the crate compiles.
-
-### task-two — Second task
-Add error types to `lib.rs`.
-- **Depends on:** task-one
-- **Done when:** error types in `lib.rs` have doc-tests that pass.
-"#;
-
-    /// A single-task structured-text task list (no dependency) for the execution
-    /// tests where we want a minimal graph that runs to completion quickly.
-    const ONE_TASK_LIST: &str = r#"# Solo — Task List
-
-A one-task list used to exercise CoreApi::StartRun execution.
-
----
-
-## 0001 — Foundation
-
-### solo-task — Implement the solo task
-Do the thing in `lib.rs`.
-- **Depends on:** —
-- **Done when:** The solo task is implemented, the code works, and tests pass.
-"#;
+    use crate::test_support::setup_temp_repo as shared_setup_temp_repo;
 
     /// Build a `Config` with NO gates (the gate loop is a no-op) so the develop
     /// → review loop advances straight from develop to review — the same config
@@ -3322,123 +6969,15 @@ Do the thing in `lib.rs`.
         Config::resolve(GlobalConfig::default(), ProjectConfig::default())
     }
 
-    fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
-        let output = shared_run_git(path, args);
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn branch_commit_count(path: &std::path::Path, branch: &str) -> usize {
-        git_stdout(path, &["rev-list", "--count", branch])
-            .parse()
-            .expect("branch commit count must be numeric")
-    }
-
-    fn branch_exists(path: &std::path::Path, branch: &str) -> bool {
-        let output = StdCommand::new("git")
-            .args(["-C", &path.to_string_lossy()])
-            .args(["branch", "--list", branch])
-            .output()
-            .expect("git branch --list");
-        !String::from_utf8_lossy(&output.stdout).trim().is_empty()
-    }
-
-    // ── Gated backend: holds the first developer prompt until released ─────────
-    //
-    // A deterministic instrument for the pause/cancel tests: it BLOCKS the very
-    // first developer prompt on a `Notify` the test controls, so the first task
-    // is provably still in-flight while the test issues Pause/Cancel.  All later
-    // prompts pass through (developer → "dev output"; reviewer → approve JSON).
-
-    /// Number of prompts to block before passing through (the first developer
-    /// turn).  After release, all prompts (including the held one) pass through.
-    #[derive(Clone)]
-    struct GatedBackend {
-        release: Arc<tokio::sync::Notify>,
-        released: Arc<AtomicBool>,
-        prompt_count: Arc<std::sync::atomic::AtomicUsize>,
-        approve: String,
-    }
-
-    impl GatedBackend {
-        fn new() -> (Arc<Self>, Arc<tokio::sync::Notify>) {
-            let release = Arc::new(tokio::sync::Notify::new());
-            let backend = Arc::new(Self {
-                release: Arc::clone(&release),
-                released: Arc::new(AtomicBool::new(false)),
-                prompt_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                approve: r#"{"verdict":"approve"}"#.to_string(),
-            });
-            (backend, release)
-        }
-    }
-
-    #[async_trait]
-    impl AgentBackend for GatedBackend {
-        async fn spawn(
-            &self,
-            _config: crate::backend::SessionConfig,
-        ) -> Result<Box<dyn crate::backend::AgentSession>, crate::backend::BackendError> {
-            Ok(Box::new(GatedSession {
-                backend: self.clone(),
-                terminated: false,
-            }))
-        }
-    }
-
-    struct GatedSession {
-        backend: GatedBackend,
-        terminated: bool,
-    }
-
-    #[async_trait]
-    impl crate::backend::AgentSession for GatedSession {
-        async fn prompt(
-            &mut self,
-            prompt: crate::backend::Prompt,
-        ) -> Result<crate::backend::ResponseStream, crate::backend::BackendError> {
-            use crate::backend::{BackendError, ResponseEvent};
-            if self.terminated {
-                return Err(BackendError::Terminated);
-            }
-            let n = self.backend.prompt_count.fetch_add(1, Ordering::SeqCst);
-            // The first prompt (task-1's developer turn) blocks until released.
-            if n == 0 && !self.backend.released.load(Ordering::SeqCst) {
-                self.backend.release.notified().await;
-                self.backend.released.store(true, Ordering::SeqCst);
-            }
-            let text = if prompt.text.contains("Review the work") {
-                self.backend.approve.clone()
-            } else {
-                "dev output".to_string()
-            };
-            let events: Vec<Result<ResponseEvent, BackendError>> = vec![
-                Ok(ResponseEvent::TextChunk { text }),
-                Ok(ResponseEvent::TurnComplete { usage: None }),
-            ];
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-        async fn terminate(&mut self) -> Result<(), crate::backend::BackendError> {
-            self.terminated = true;
-            Ok(())
-        }
-    }
-
-    /// Build a `CoreApi` over the deterministic interpreter + a `NoopBackend`
+    /// Build a `CoreApi` over typed-source projection + a `NoopBackend`
     /// (configured: developer output then approve verdict) + a temp-repo
     /// `WorktreeManager` + a no-gate `Config`.  Returns the api and the temp dir
     /// (keep it alive for the test).
     fn execution_core_api() -> (CoreApi, tempfile::TempDir) {
-        let ingestion = Arc::new(EdgeInferrer::new(
-            Arc::new(StructuredTextInterpreter::new()),
-        ));
-        // Use build_planner for the planner interpreter (even though None backend
-        // yields det here); satisfies plan 0005 wiring test requirement and
-        // makes mechanism path explicit in helper.
-        let planner = crate::interpreter::build_planner_interpreter(
-            &crate::config::PlannerMechanism::OneShotAgent,
-            None,
-        )
-        .expect("planner build must succeed with None backend");
+        let ingestion = Arc::new(EdgeInferrer::new(Arc::new(
+            SourceProjectionUnavailable::new(),
+        )));
+        let planner = Arc::new(SourceProjectionUnavailable::new());
         // Cycle: developer output, then approve verdict (covers any task count).
         let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![
             "Implemented the feature.".into(),
@@ -3458,425 +6997,9 @@ Do the thing in `lib.rs`.
         (api, repo_dir)
     }
 
-    /// Like [`execution_core_api`] but with a caller-supplied backend (used by the
-    /// retry tests to inject a "fail once then succeed" backend).
-    fn execution_core_api_with_backend(
-        backend: Arc<dyn AgentBackend>,
-    ) -> (CoreApi, tempfile::TempDir) {
-        let ingestion = Arc::new(EdgeInferrer::new(
-            Arc::new(StructuredTextInterpreter::new()),
-        ));
-        let planner = crate::interpreter::build_planner_interpreter(
-            &crate::config::PlannerMechanism::OneShotAgent,
-            None,
-        )
-        .expect("planner build must succeed with None backend");
-        let repo_dir = shared_setup_temp_repo();
-        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
-        let api = CoreApi::with_audit_registry(
-            ingestion,
-            planner,
-            Arc::clone(&backend),
-            backend,
-            wm,
-            no_gate_config(),
-            Arc::new(NoopAuditRegistry),
-        );
-        (api, repo_dir)
-    }
+    // ── OpenPlan (task 28 behavior, preserved) ─────────────────────────────────
 
-    /// Derive a task id from the [`SessionConfig`].
-    ///
-    /// Uses `config.task_id` when set (the orchestrator always sets it for
-    /// Developer/Reviewer sessions since plan 0029).  Falls back to parsing the
-    /// working-dir last component for backwards-compatibility with test backends
-    /// that do not supply the new field.
-    fn backend_task_id(config: &crate::backend::SessionConfig) -> String {
-        if let Some(id) = &config.task_id {
-            return id.clone();
-        }
-        // Legacy fallback: old worktree names used `{plan_slug}--{task_id}`.
-        config
-            .working_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.rsplit("--").next().unwrap_or(s).to_string())
-            .unwrap_or_default()
-    }
-
-    /// A backend that hard-errors the developer prompt for the task named
-    /// `fail_id` on its FIRST attempt, then succeeds on every later attempt — so a
-    /// retry drives the previously-`Failed` task to `Done`. All other tasks (and
-    /// the reviewer) always succeed/approve. The attempt count is keyed by task id
-    /// and shared across sessions via an `Arc<Mutex<…>>`.
-    #[derive(Clone)]
-    struct FailOnceBackend {
-        fail_id: String,
-        attempts: Arc<Mutex<std::collections::HashMap<String, u32>>>,
-    }
-
-    impl FailOnceBackend {
-        fn new(fail_id: impl Into<String>) -> Self {
-            Self {
-                fail_id: fail_id.into(),
-                attempts: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl AgentBackend for FailOnceBackend {
-        async fn spawn(
-            &self,
-            config: crate::backend::SessionConfig,
-        ) -> Result<Box<dyn crate::backend::AgentSession>, crate::backend::BackendError> {
-            let is_reviewer = config.system_prompt.to_lowercase().contains("review");
-            let task_id = backend_task_id(&config);
-            // Decide failure at developer-spawn time: only the developer role for
-            // the target task, and only on the first attempt.
-            let should_fail = if !is_reviewer && task_id == self.fail_id {
-                let mut attempts = self.attempts.lock().unwrap();
-                let n = attempts.entry(task_id.clone()).or_insert(0);
-                *n += 1;
-                *n == 1 // fail only the first developer attempt
-            } else {
-                false
-            };
-            Ok(Box::new(FailOnceSession {
-                terminated: false,
-                should_fail,
-                is_reviewer,
-            }))
-        }
-    }
-
-    struct FailOnceSession {
-        terminated: bool,
-        should_fail: bool,
-        is_reviewer: bool,
-    }
-
-    #[async_trait]
-    impl crate::backend::AgentSession for FailOnceSession {
-        async fn prompt(
-            &mut self,
-            _prompt: crate::backend::Prompt,
-        ) -> Result<crate::backend::ResponseStream, crate::backend::BackendError> {
-            use crate::backend::{BackendError, ResponseEvent};
-            if self.terminated {
-                return Err(BackendError::Terminated);
-            }
-            if self.should_fail {
-                return Err(BackendError::Transport {
-                    reason: "injected first-attempt developer failure".into(),
-                });
-            }
-            let text = if self.is_reviewer {
-                r#"{"verdict":"approve"}"#.to_string()
-            } else {
-                "developer output".to_string()
-            };
-            let events: Vec<Result<ResponseEvent, BackendError>> = vec![
-                Ok(ResponseEvent::TextChunk { text }),
-                Ok(ResponseEvent::TurnComplete { usage: None }),
-            ];
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-        async fn terminate(&mut self) -> Result<(), crate::backend::BackendError> {
-            self.terminated = true;
-            Ok(())
-        }
-    }
-
-    /// Write `contents` to a uniquely-named markdown file in a fresh tempdir and
-    /// return both (keep the dir alive for the test's lifetime).
-    fn write_task_list(contents: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("sample-feature.md");
-        std::fs::write(&path, contents).expect("write task list");
-        (dir, path)
-    }
-
-    /// Poll `cond` with a bounded deadline (no fixed sleeps); panic with `what`
-    /// on timeout.  Mirrors the testing-strategy poll-with-deadline pattern.
-    async fn poll_until<F, Fut>(mut cond: F, what: &str)
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if cond().await {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("timed out waiting: {what}");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    // ── OpenRun (task 28 behavior, preserved) ─────────────────────────────────
-
-    /// **Acceptance (task 28): OpenRun interprets the file and creates a Run.**
-    #[tokio::test]
-    async fn open_run_interprets_file_and_creates_run() {
-        let (api, _repo) = execution_core_api();
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-
-        let mut stream = api.subscribe();
-
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: path.clone(),
-            })
-            .await
-            .expect("OpenRun must succeed for a valid task list");
-
-        let run_id = match outcome {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("expected RunOpened, got {other:?}"),
-        };
-        assert_eq!(run_id, RunId(1), "first run should be allocated id 1");
-
-        let all = api.runs().await;
-        assert_eq!(all.len(), 1, "exactly one run should be open");
-        let view = &all[0];
-        assert_eq!(view.id, run_id);
-        assert_eq!(view.task_list_path, path);
-        assert_eq!(view.status, RunStatus::Pending, "new run starts Pending");
-        assert_eq!(view.tasks.len(), 2, "both tasks must be interpreted");
-
-        let titles: Vec<&str> = view.tasks.iter().map(|t| t.title.as_str()).collect();
-        assert!(titles.contains(&"First task"));
-        assert!(titles.contains(&"Second task"));
-        let task_two = view
-            .tasks
-            .iter()
-            .find(|t| t.id.0 == "task-two")
-            .expect("task-two must be present");
-        assert!(
-            task_two.depends_on.iter().any(|d| d.0 == "task-one"),
-            "task-two must depend on task-one; got {:?}",
-            task_two.depends_on
-        );
-
-        let single = api.run(run_id).await.expect("run(id) must find the run");
-        assert_eq!(single.id, run_id);
-        assert!(api.run(RunId(999)).await.is_none());
-
-        let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("timed out waiting for RunOpened")
-            .expect("stream ended unexpectedly");
-        match ev {
-            Event::RunOpened {
-                run,
-                task_list_path,
-            } => {
-                assert_eq!(run, run_id);
-                assert_eq!(task_list_path, path);
-            }
-            other => panic!("expected RunOpened event, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn multiple_open_runs_get_distinct_ids() {
-        let (api, _repo) = execution_core_api();
-        let (_d1, p1) = write_task_list(SAMPLE_TASK_LIST);
-        let (_d2, p2) = write_task_list(SAMPLE_TASK_LIST);
-
-        let id1 = match api
-            .execute(Command::OpenRun { task_list_path: p1 })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-        let id2 = match api
-            .execute(Command::OpenRun { task_list_path: p2 })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        assert_ne!(id1, id2, "each run must get a distinct id");
-        assert_eq!(id1, RunId(1));
-        assert_eq!(id2, RunId(2));
-        let all = api.runs().await;
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].id, RunId(1));
-        assert_eq!(all[1].id, RunId(2));
-    }
-
-    #[tokio::test]
-    async fn concurrent_open_is_idempotent_for_canonical_plan_identity() {
-        let (api, _repo) = execution_core_api();
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-        let alias = path
-            .parent()
-            .expect("task list parent")
-            .join(".")
-            .join(path.file_name().unwrap());
-
-        let (first, second) = tokio::join!(
-            api.execute(Command::OpenRun {
-                task_list_path: path,
-            }),
-            api.execute(Command::OpenRun {
-                task_list_path: alias,
-            })
-        );
-        let run_of = |outcome: Result<CommandOutcome, ApiError>| match outcome.unwrap() {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("expected RunOpened, got {other:?}"),
-        };
-        assert_eq!(run_of(first), run_of(second));
-        assert_eq!(
-            api.runs().await.len(),
-            1,
-            "one canonical plan has one live run"
-        );
-    }
-
-    #[tokio::test]
-    async fn distinct_sources_cannot_share_one_live_plan_namespace() {
-        let (api, _repo) = execution_core_api();
-        let dir = tempfile::tempdir().expect("create plan dir");
-        let first = dir.path().join("TASKS.md");
-        let second = dir.path().join("alternate.md");
-        std::fs::write(&first, SAMPLE_TASK_LIST).expect("write first task list");
-        std::fs::write(&second, SAMPLE_TASK_LIST).expect("write second task list");
-
-        api.execute(Command::OpenRun {
-            task_list_path: first,
-        })
-        .await
-        .expect("first source opens");
-        let second_open = api
-            .execute(Command::OpenRun {
-                task_list_path: second,
-            })
-            .await;
-        assert!(matches!(
-            second_open,
-            Err(ApiError::InvalidCommand { reason })
-                if reason.contains("share artifacts or worktrees")
-        ));
-        assert_eq!(api.runs().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn corrupt_artifact_is_quarantined_and_recovery_is_reported() {
-        let (api, repo) = execution_core_api();
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-        let canonical = canonical_task_list_path(path.clone()).await;
-        let slug = run_slug(&canonical);
-        let artifact = crate::persist::tasks_path(repo.path(), &slug);
-        std::fs::create_dir_all(artifact.parent().unwrap()).expect("create tasks dir");
-        std::fs::write(
-            &artifact,
-            r#"{"schema_version":999,"slug":"ignored","tasks":[]}"#,
-        )
-        .expect("write future artifact");
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .expect("OpenRun recovers after quarantine")
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("expected RunOpened, got {other:?}"),
-        };
-        let view = api.run(run).await.expect("opened run");
-        assert!(view.report.issues.iter().any(|issue| {
-            issue.code == "artifact-quarantined"
-                && issue.severity == crate::api::IssueSeverity::Warning
-        }));
-        assert!(
-            std::fs::read_dir(artifact.parent().unwrap())
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains(".quarantine.")),
-            "the unusable artifact must remain available for inspection"
-        );
-        let recovered = crate::persist::load_graph(repo.path(), &slug)
-            .await
-            .expect("load recovered graph")
-            .expect("recovered artifact exists");
-        assert_eq!(recovered.slug, slug);
-    }
-
-    /// `mk-run-id`: every opened Run is stamped with a persistent, sortable ULID
-    /// `run_uid`.  Modeled on `multiple_open_runs_get_distinct_ids`: open two runs
-    /// and snapshot `api.runs()`, then assert each `RunView.run_uid` is a 26-char
-    /// ULID string, the two differ, and the second sorts after the first.
-    ///
-    /// Chronological ordering is made deterministic by sleeping a few milliseconds
-    /// between the two `OpenRun` calls so the ULID's millisecond timestamp prefix
-    /// (not just the random tail) guarantees the lexicographic order.
-    #[tokio::test]
-    async fn open_runs_carry_distinct_sortable_run_uids() {
-        let (api, _repo) = execution_core_api();
-        let (_d1, p1) = write_task_list(SAMPLE_TASK_LIST);
-        let (_d2, p2) = write_task_list(SAMPLE_TASK_LIST);
-
-        let id1 = match api
-            .execute(Command::OpenRun { task_list_path: p1 })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // Advance the wall clock past one ULID timestamp tick so the second run's
-        // timestamp prefix is strictly greater — the sort order is then guaranteed
-        // by the prefix, not just the random tail.
-        std::thread::sleep(Duration::from_millis(5));
-
-        let id2 = match api
-            .execute(Command::OpenRun { task_list_path: p2 })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // The numeric session handles still work as the in-memory key.
-        assert_ne!(id1, id2, "each run must get a distinct id");
-        assert_eq!(id1, RunId(1));
-        assert_eq!(id2, RunId(2));
-
-        let all = api.runs().await;
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].id, RunId(1));
-        assert_eq!(all[1].id, RunId(2));
-
-        let uid1 = &all[0].run_uid;
-        let uid2 = &all[1].run_uid;
-
-        // Each run_uid is a 26-char ULID string.
-        assert_eq!(uid1.len(), 26, "run_uid must be a 26-char ULID string");
-        assert_eq!(uid2.len(), 26, "run_uid must be a 26-char ULID string");
-
-        // The two run_uids differ…
-        assert_ne!(uid1, uid2, "each run must get a distinct run_uid");
-
-        // …and the second sorts after the first (chronological == lexicographic).
-        assert!(
-            uid2.as_str() > uid1.as_str(),
-            "the second run_uid must sort after the first ({uid1} !< {uid2})"
-        );
-    }
-
+    /// **Acceptance (task 28): OpenPlan interprets the file and creates a Run.**
     #[tokio::test]
     async fn project_registration_commands_validate_the_bound_repository() {
         let (api, repo) = execution_core_api();
@@ -3927,38 +7050,9 @@ Do the thing in `lib.rs`.
             .await
             .expect("write historical run metadata");
 
-        let first = api
-            .runs()
-            .await
-            .into_iter()
-            .find(|view| view.run_uid == run_uid)
-            .expect("first historical view");
-        let second = api
-            .runs()
-            .await
-            .into_iter()
-            .find(|view| view.run_uid == run_uid)
-            .expect("second historical view");
-        assert_eq!(first.id, second.id, "one run_uid must keep one handle");
-        let by_id = api
-            .run(first.id)
-            .await
-            .expect("a surfaced historical handle must remain queryable");
-        assert_eq!(by_id.run_uid, run_uid);
-        assert_eq!(by_id.id, first.id);
-
-        let (_dir, task_list_path) = write_task_list(SAMPLE_TASK_LIST);
-        let live = match api
-            .execute(Command::OpenRun { task_list_path })
-            .await
-            .expect("open live run")
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("expected RunOpened, got {other:?}"),
-        };
-        assert_ne!(
-            live, first.id,
-            "a live run must not reuse a historical handle"
+        assert!(
+            api.runs().await.iter().all(|view| view.run_uid != run_uid),
+            "metadata without a typed plan identity must remain inert"
         );
 
         // SAFETY: restore the process-global value while HOME_ENV_LOCK is held.
@@ -4053,36 +7147,14 @@ Do the thing in `lib.rs`.
 
     #[test]
     fn run_slug_is_plan_scoped_and_valid() {
-        // (1) A real plan-style path is scoped by its parent directory.
-        let plan = run_slug(Path::new(
-            "/repo/docs/plans/0003-Runtime-and-TUI-Hardening/TASKS.md",
-        ));
-        assert_eq!(
-            plan, "0003-runtime-and-tui-hardening-tasks",
-            "slug must be the lowercased, kebab-sanitized `parent-stem`"
-        );
-
-        // (2) Two different plan dirs that each contain a `TASKS.md` yield
-        //     distinct slugs — the whole point of plan-scoping.
-        let a = run_slug(Path::new("/repo/docs/plans/0003-alpha/TASKS.md"));
-        let b = run_slug(Path::new("/repo/docs/plans/0004-beta/TASKS.md"));
-        assert_ne!(
-            a, b,
-            "two distinct plan dirs named TASKS.md must produce distinct slugs"
-        );
-
-        // (3) A path with no usable parent falls back to the lowercased stem.
-        let bare = run_slug(Path::new("TASKS.md"));
-        assert_eq!(bare, "tasks", "no usable parent → lowercased stem alone");
-        // …and to SLUG_FALLBACK if even that is shorter than the §4.1 minimum.
-        let too_short = run_slug(Path::new("a.md"));
-        assert_eq!(
-            too_short, SLUG_FALLBACK,
-            "a stem shorter than 2 chars must fall back to SLUG_FALLBACK"
-        );
-
-        // (4) Every produced slug satisfies the §4.1 kebab predicate.
-        for s in [&plan, &a, &b, &bare, &too_short] {
+        let plan = run_slug(Path::new("/repo/docs/plans/0003-Runtime-and-TUI-Hardening"));
+        assert_eq!(plan, "0003-runtime-and-tui-hardening");
+        let a = run_slug(Path::new("/repo/docs/plans/0003-alpha"));
+        let b = run_slug(Path::new("/repo/docs/plans/0004-beta"));
+        assert_ne!(a, b);
+        let fallback = run_slug(Path::new("/"));
+        assert_eq!(fallback, SLUG_FALLBACK);
+        for s in [&plan, &a, &b, &fallback] {
             assert!(
                 is_valid_kebab(s),
                 "slug {s:?} must satisfy the §4.1 kebab predicate"
@@ -4091,274 +7163,15 @@ Do the thing in `lib.rs`.
     }
 
     #[test]
-    fn plan_slug_is_kebab_parent_dir() {
-        // The plan slug is the lowercased-kebab of the parent directory name
-        // ONLY — the file stem (`tasks`) is dropped.
+    fn plan_slug_uses_directory_identity() {
         assert_eq!(
-            plan_slug(Path::new(
-                "/repo/docs/plans/0003-Runtime-and-TUI-Hardening/TASKS.md"
-            )),
+            plan_slug(Path::new("/repo/docs/plans/0003-Runtime-and-TUI-Hardening")),
             "0003-runtime-and-tui-hardening",
         );
-
-        // No usable parent directory → SLUG_FALLBACK.
-        assert_eq!(plan_slug(Path::new("TASKS.md")), SLUG_FALLBACK);
+        assert_eq!(plan_slug(Path::new("/")), SLUG_FALLBACK);
     }
 
-    /// Modeled on `open_run_seeds_artifact_before_start_run` and
-    /// `multiple_open_runs_get_distinct_ids`: write a `TASKS.md` under a
-    /// plan-style dir, `OpenRun` it, and assert the persisted artifact resolves
-    /// via `persist::tasks_path` to the plan-scoped slug (location-agnostic, so
-    /// it tracks the `.makina/tasks/` relocation), and that no unrelated
-    /// `TASKS.json` is loaded.
-    #[tokio::test]
-    async fn open_run_uses_plan_scoped_slug() {
-        let (api, repo_dir) = execution_core_api();
-        let repo_root = repo_dir.path().to_path_buf();
-
-        // Write a `TASKS.md` under a plan-style directory.
-        let plan_dir = tempfile::tempdir().expect("create tempdir");
-        let task_list_dir = plan_dir.path().join("0003-Runtime-and-TUI-Hardening");
-        std::fs::create_dir_all(&task_list_dir).expect("create plan dir");
-        let task_list_path = task_list_dir.join("TASKS.md");
-        std::fs::write(&task_list_path, SAMPLE_TASK_LIST).expect("write task list");
-
-        let expected_slug = "0003-runtime-and-tui-hardening-tasks";
-        let scoped_path = crate::persist::tasks_path(&repo_root, expected_slug);
-        // The naive stem-only slug that this change is meant to avoid.
-        let naive_path = crate::persist::tasks_path(&repo_root, "tasks");
-
-        assert!(
-            !scoped_path.exists(),
-            "plan-scoped artifact must not exist before OpenRun"
-        );
-
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: task_list_path.clone(),
-            })
-            .await
-            .expect("OpenRun must succeed");
-        assert!(
-            matches!(outcome, CommandOutcome::RunOpened { .. }),
-            "expected RunOpened, got {outcome:?}"
-        );
-
-        // The artifact is persisted under the plan-scoped slug…
-        assert!(
-            scoped_path.exists(),
-            "artifact must be persisted at the plan-scoped slug path {}",
-            scoped_path.display()
-        );
-        // …and NOT under the naive stem-only slug.
-        assert!(
-            !naive_path.exists(),
-            "no unrelated artifact must be written at the stem-only slug path {}",
-            naive_path.display()
-        );
-
-        // The graph loads back under the plan-scoped slug and carries it.
-        let loaded = crate::persist::load_graph(&repo_root, expected_slug)
-            .await
-            .expect("load_graph must not error")
-            .expect("plan-scoped artifact must be loadable");
-        assert_eq!(
-            loaded.slug, expected_slug,
-            "persisted graph slug must be the plan-scoped slug"
-        );
-
-        // No unrelated `TASKS.json` (stem-only slug) is loadable.
-        let naive_loaded = crate::persist::load_graph(&repo_root, "tasks")
-            .await
-            .expect("load_graph must not error");
-        assert!(
-            naive_loaded.is_none(),
-            "no unrelated stem-only `tasks` artifact must be loaded"
-        );
-    }
-
-    #[tokio::test]
-    async fn open_run_with_missing_file_returns_error() {
-        let (api, _repo) = execution_core_api();
-        let result = api
-            .execute(Command::OpenRun {
-                task_list_path: PathBuf::from("/no/such/path/definitely-missing.md"),
-            })
-            .await;
-
-        match result {
-            Err(ApiError::InvalidCommand { reason }) => {
-                assert!(
-                    reason.contains("could not read task list"),
-                    "error should explain the read failure; got: {reason}"
-                );
-            }
-            other => panic!("expected InvalidCommand for a missing file, got {other:?}"),
-        }
-        assert!(api.runs().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn open_run_with_invalid_content_is_reviewable() {
-        let (api, _repo) = execution_core_api();
-        let bad = r#"# Bad — Task List
-
-Preamble.
-
----
-
-## 0001 — X
-
-### only-task — The only task
-Does a thing.
-- **Depends on:** ghost-task
-- **Done when:** it works.
-"#;
-        let (_dir, path) = write_task_list(bad);
-
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .expect(
-                "OpenRun must succeed for interpret failure, producing a reviewable Pending run",
-            );
-        match outcome {
-            CommandOutcome::RunOpened { run } => {
-                let view = api
-                    .run(run)
-                    .await
-                    .expect("opened run must be queryable via run()");
-                assert!(
-                    view.report.issues.iter().any(|i| {
-                        i.code == "dangling-dependency"
-                            && i.source == crate::api::IssueSource::Validator
-                            && i.severity == crate::api::IssueSeverity::Blocking
-                            && i.suggestion.is_some()
-                    }),
-                    "expected rich Validator dangling issue; got {:?}",
-                    view.report.issues
-                );
-            }
-            other => panic!("expected RunOpened, got {other:?}"),
-        }
-        assert!(!api.runs().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn open_run_with_duplicate_task_id_reports_validator_issue() {
-        let (api, _repo) = execution_core_api();
-        let dup = r#"# Dup — Task List
-
-Preamble.
-
----
-
-## 0001 — X
-
-### same-id — First task
-Does the first thing with enough description text here.
-- **Depends on:** —
-- **Done when:** first thing done successfully.
-
-### same-id — Second task
-Does the second thing with enough description text here.
-- **Depends on:** —
-- **Done when:** second thing done successfully.
-"#;
-        let (_dir, path) = write_task_list(dup);
-
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .expect("OpenRun must succeed for validation failure");
-        let run = match outcome {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("expected RunOpened, got {other:?}"),
-        };
-
-        let view = api.run(run).await.expect("run must be queryable");
-        assert!(
-            view.report.issues.iter().any(|i| {
-                i.code == "duplicate-task-id"
-                    && i.source == crate::api::IssueSource::Validator
-                    && i.severity == crate::api::IssueSeverity::Blocking
-                    && i.suggestion.is_some()
-            }),
-            "expected Validator duplicate-task-id issue; got {:?}",
-            view.report.issues
-        );
-    }
-
-    #[tokio::test]
-    async fn open_run_with_bad_convention_source_produces_lint_issues_in_report() {
-        let bad_source = r#"# Bad Convention
-
-Preamble.
-
----
-
-## 0001 Dashless Section   // missing em-dash
-
-### first — First task
-Desc that is long enough.
-- **Depends on:** —
-// missing Done when entirely
-"#;
-
-        let (_dir, path) = write_task_list(bad_source);
-
-        let (api, _repo) = execution_core_api();
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: path.clone(),
-            })
-            .await
-            .expect("OpenRun must succeed even for lint-only problems");
-        let run = match outcome {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("expected RunOpened, got {other:?}"),
-        };
-
-        let view = api.run(run).await.expect("run must be queryable");
-        // Print the report for inspection when running with --nocapture (per task Done when).
-        eprintln!(
-            "open_run_with_bad_convention_source_produces_lint_issues_in_report report: {:?}",
-            view.report
-        );
-        let codes: Vec<_> = view.report.issues.iter().map(|i| i.code.as_str()).collect();
-
-        assert!(
-            codes.contains(&"heading-missing-em-dash"),
-            "must contain heading-missing-em-dash from lint; got: {:?}",
-            codes
-        );
-        assert!(
-            codes.contains(&"task-missing-done-when"),
-            "must contain task-missing-done-when from lint; got: {:?}",
-            codes
-        );
-        assert!(
-            view.report.is_blocked(),
-            "lint issues must be Blocking so the gate refuses StartRun"
-        );
-
-        // Overwrite with a clean list and re-interpret to clear the report.
-        std::fs::write(&path, SAMPLE_TASK_LIST).expect("overwrite with clean source");
-        api.execute(Command::ReinterpretRun { run })
-            .await
-            .expect("ReinterpretRun must succeed");
-        let view_after = api.run(run).await.expect("run still exists");
-        assert!(
-            !view_after.report.is_blocked(),
-            "clean re-interpret must clear blocking lint issues; got {:?}",
-            view_after.report.issues
-        );
-    }
-
+    /// Querying before any typed plan is opened is side-effect free.
     #[tokio::test]
     async fn queries_empty_before_any_open() {
         let (api, _repo) = execution_core_api();
@@ -4369,412 +7182,9 @@ Desc that is long enough.
     // ── Seed-persist (task orchestrator-seed-write) ───────────────────────────
 
     /// **Acceptance (orchestrator-seed-write):**
-    /// Opening a run on a task list in a temp repo with no pre-existing
+    /// Opening a run on a typed plan in a temp repo with no pre-existing
     /// `.tasks/{slug}.json` creates the file with all tasks in the `new` state,
     /// asserted BEFORE any StartRun command.
-    #[tokio::test]
-    async fn open_run_seeds_artifact_before_start_run() {
-        // Build a CoreApi backed by a fresh temp repo so persist_graph has a
-        // real filesystem to write to.
-        let (api, repo_dir) = execution_core_api();
-        let repo_root = repo_dir.path().to_path_buf();
-
-        // Write a small task-list file (slug will be "seed-test").
-        let task_list = r#"# Seed — Task List
-
-A minimal list to verify seed-persist.
-
----
-
-## 0001 — Foundation
-
-### alpha — Alpha task
-Create alpha.
-- **Depends on:** —
-- **Done when:** alpha done.
-
-### beta — Beta task
-Create beta.
-- **Depends on:** alpha
-- **Done when:** beta done.
-"#;
-        let task_list_dir = tempfile::tempdir().expect("create tempdir");
-        let task_list_path = task_list_dir.path().join("seed-test.md");
-        std::fs::write(&task_list_path, task_list).expect("write task list");
-
-        // Slug is plan-scoped (parent-dir + stem), so derive it from the path
-        // rather than hardcoding the stem — keeps this test location-agnostic.
-        let slug = run_slug(&task_list_path);
-
-        // Verify no artifact exists yet.
-        let artifact_path = crate::persist::tasks_path(&repo_root, &slug);
-        assert!(
-            !artifact_path.exists(),
-            "task graph artifact must not exist before OpenRun"
-        );
-
-        // Issue OpenRun — do NOT issue StartRun.
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: task_list_path.clone(),
-            })
-            .await
-            .expect("OpenRun must succeed");
-        assert!(
-            matches!(outcome, CommandOutcome::RunOpened { .. }),
-            "expected RunOpened, got {outcome:?}"
-        );
-
-        // Assert: the artifact now exists on disk.
-        assert!(
-            artifact_path.exists(),
-            "task graph artifact must exist immediately after OpenRun, before StartRun"
-        );
-
-        // Assert: all tasks are in the `new` state.
-        let loaded = crate::persist::load_graph(&repo_root, &slug)
-            .await
-            .expect("load_graph must not error")
-            .expect("task graph artifact must be loadable");
-
-        assert_eq!(
-            loaded.slug, slug,
-            "persisted graph slug must match the plan-scoped slug"
-        );
-        assert_eq!(loaded.tasks.len(), 2, "both tasks must be persisted");
-        for task in &loaded.tasks {
-            assert_eq!(
-                task.state,
-                crate::task::TaskState::New,
-                "task `{}` must be in `new` state before StartRun; got {:?}",
-                task.id,
-                task.state
-            );
-        }
-    }
-
-    // ── StartRun executes the Run (the done-when) ─────────────────────────────
-
-    /// Open a Run, register a subscriber, then drain the event stream into a
-    /// shared collector for the lifetime of `task`.  Returns the join handle of
-    /// the collector and the shared `Vec<Event>` it appends into.
-    fn collect_events(api: &CoreApi) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<Event>>>) {
-        let mut stream = api.subscribe();
-        let sink = Arc::new(Mutex::new(Vec::<Event>::new()));
-        let sink_clone = Arc::clone(&sink);
-        let handle = tokio::spawn(async move {
-            while let Some(ev) = stream.next().await {
-                sink_clone.lock().unwrap().push(ev);
-            }
-        });
-        (handle, sink)
-    }
-
-    /// **Acceptance (the done-when): Start executes the Run.**
-    ///
-    /// Build a `CoreApi` with `NoopBackend` (dev output + approve), a temp-repo
-    /// `WorktreeManager`, and a no-gate `Config`; open a one-task Run, subscribe,
-    /// `StartRun`, then observe via `subscribe()` that the run executes:
-    /// `RunStatusChanged→Running`, `TaskStateChanged` progressions, the run
-    /// reaches `Completed` and the task is `Done`, and `AgentExchange` events
-    /// (PromptSent + chunks + TurnComplete) were emitted.  Poll with a bounded
-    /// deadline — no fixed sleeps.
-    // Multi-thread flavor: this test spawns the background scheduler + an actor
-    // tree (Developer/Reviewer per task) AND polls the api concurrently.  A
-    // dedicated worker pool keeps it deterministic + fast (no single-thread
-    // starvation between the poll loop and the background execution).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn update_runtime_settings_affects_next_scheduler_run() {
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let ingestion = Arc::new(EdgeInferrer::new(
-            Arc::new(StructuredTextInterpreter::new()),
-        ));
-        let planner = crate::interpreter::build_planner_interpreter(
-            &crate::config::PlannerMechanism::OneShotAgent,
-            None,
-        )
-        .expect("planner build must succeed with None backend");
-        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![
-            "Implemented the feature.".into(),
-            r#"{"verdict":"approve"}"#.into(),
-        ]));
-        let repo_dir = shared_setup_temp_repo();
-        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
-        let mut config = no_gate_config();
-        config.merge.final_ = crate::config::FinalMerge::Manual;
-        let caps = config.caps.clone();
-        let concurrency = config.concurrency;
-
-        let api = Arc::new(CoreApi::with_audit_registry(
-            ingestion,
-            planner,
-            Arc::clone(&backend),
-            backend,
-            wm,
-            config,
-            Arc::new(NoopAuditRegistry),
-        ));
-
-        api.execute(Command::UpdateRuntimeSettings {
-            project_root: repo_dir.path().to_path_buf(),
-            caps,
-            concurrency,
-            final_merge: crate::config::FinalMerge::Squash,
-        })
-        .await
-        .expect("runtime settings update must succeed");
-
-        let develop_before = branch_commit_count(repo_dir.path(), "develop");
-        let (_dir, path) = write_task_list(ONE_TASK_LIST);
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        api.execute(Command::StartRun { run }).await.unwrap();
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    api.run(run)
-                        .await
-                        .is_some_and(|view| view.status == RunStatus::Completed)
-                }
-            },
-            "run to complete after runtime settings update",
-        )
-        .await;
-
-        let develop_after = branch_commit_count(repo_dir.path(), "develop");
-        assert_eq!(
-            develop_after,
-            develop_before + 1,
-            "updated Squash mode must land the completed plan on develop without restart"
-        );
-
-        // SAFETY: restoring HOME while still holding HOME_ENV_LOCK.
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn start_run_executes_run_and_emits_live_events() {
-        // Pin $HOME under HOME_ENV_LOCK: the run writes state (worktrees, run
-        // logs, per-task transcripts) under state_root = $HOME/.makina/projects/{ns},
-        // so a concurrent test mutating HOME mid-run would scatter those paths and
-        // the transcript assertion below would flake. Held for the whole test.
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let (api, repo) = execution_core_api();
-        let api = Arc::new(api);
-        let (_dir, path) = write_task_list(ONE_TASK_LIST);
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // Subscribe BEFORE starting so we capture every event.
-        let (collector, events) = collect_events(&api);
-
-        let outcome = api.execute(Command::StartRun { run }).await.unwrap();
-        assert!(
-            matches!(outcome, CommandOutcome::Acknowledged),
-            "StartRun returns promptly (Acknowledged) — execution is in background"
-        );
-
-        // Poll the run state until it reaches Completed with the task Done.
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    match api.run(run).await {
-                        Some(v) => {
-                            v.status == RunStatus::Completed
-                                && v.tasks.iter().all(|t| t.state == TaskState::Done)
-                        }
-                        None => false,
-                    }
-                }
-            },
-            "run to reach Completed with task Done",
-        )
-        .await;
-
-        // Give the collector a moment to drain the final events, bounded.
-        poll_until(
-            || {
-                let events = Arc::clone(&events);
-                async move {
-                    let evs = events.lock().unwrap();
-                    evs.iter().any(|e| {
-                        matches!(
-                            e,
-                            Event::RunStatusChanged {
-                                status: RunStatus::Completed,
-                                ..
-                            }
-                        )
-                    })
-                }
-            },
-            "RunStatusChanged{Completed} to be observed on the stream",
-        )
-        .await;
-
-        let evs = events.lock().unwrap().clone();
-        collector.abort();
-
-        // RunStatusChanged → Running was emitted.
-        assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                Event::RunStatusChanged {
-                    run: r,
-                    status: RunStatus::Running
-                } if *r == run
-            )),
-            "RunStatusChanged{{Running}} must be emitted; got {evs:?}"
-        );
-        // RunStatusChanged → Completed was emitted.
-        assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                Event::RunStatusChanged {
-                    run: r,
-                    status: RunStatus::Completed
-                } if *r == run
-            )),
-            "RunStatusChanged{{Completed}} must be emitted"
-        );
-        // TaskStateChanged progressions: at least InProgress, InReview, Done.
-        let saw_in_progress = evs.iter().any(|e| {
-            matches!(
-                e,
-                Event::TaskStateChanged {
-                    state: TaskState::InProgress,
-                    ..
-                }
-            )
-        });
-        let saw_in_review = evs.iter().any(|e| {
-            matches!(
-                e,
-                Event::TaskStateChanged {
-                    state: TaskState::InReview,
-                    ..
-                }
-            )
-        });
-        let saw_done = evs.iter().any(|e| {
-            matches!(
-                e,
-                Event::TaskStateChanged {
-                    state: TaskState::Done,
-                    ..
-                }
-            )
-        });
-        assert!(saw_in_progress, "must emit TaskStateChanged→InProgress");
-        assert!(saw_in_review, "must emit TaskStateChanged→InReview");
-        assert!(saw_done, "must emit TaskStateChanged→Done");
-
-        // AgentExchange: PromptSent + at least one ResponseChunk + TurnComplete.
-        let saw_prompt = evs.iter().any(|e| {
-            matches!(
-                e,
-                Event::AgentExchange {
-                    role: AgentRole::Developer,
-                    event: ExchangeEvent::PromptSent { .. },
-                    ..
-                }
-            )
-        });
-        let saw_chunk = evs.iter().any(|e| {
-            matches!(
-                e,
-                Event::AgentExchange {
-                    event: ExchangeEvent::ResponseChunk { .. },
-                    ..
-                }
-            )
-        });
-        let saw_turn_complete = evs.iter().any(|e| {
-            matches!(
-                e,
-                Event::AgentExchange {
-                    event: ExchangeEvent::TurnComplete,
-                    ..
-                }
-            )
-        });
-        assert!(saw_prompt, "must emit AgentExchange PromptSent");
-        assert!(saw_chunk, "must emit AgentExchange ResponseChunk");
-        assert!(saw_turn_complete, "must emit AgentExchange TurnComplete");
-
-        // Final state: status Completed, task Done.
-        let view = api.run(run).await.unwrap();
-        assert_eq!(view.status, RunStatus::Completed);
-        assert!(view.tasks.iter().all(|t| t.state == TaskState::Done));
-
-        // Agent exchanges are persisted to per-task JSONL transcripts.
-        let transcript_path = paths::run_logs_dir(repo.path(), &view.run_uid)
-            .expect("per-run logs dir")
-            .join("solo-task_transcript.jsonl");
-        assert!(
-            transcript_path.is_file(),
-            "transcript file must exist at {}",
-            transcript_path.display()
-        );
-        let transcript = std::fs::read_to_string(&transcript_path).expect("read transcript");
-        let lines: Vec<&str> = transcript.lines().filter(|l| !l.is_empty()).collect();
-        assert!(
-            !lines.is_empty(),
-            "transcript must contain at least one exchange line"
-        );
-        for line in lines {
-            let _: ExchangeEvent =
-                serde_json::from_str(line).expect("each transcript line must be valid JSON");
-        }
-
-        // Restore HOME.
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// Unknown run id is rejected by StartRun.
     #[tokio::test]
     async fn start_run_unknown_id_is_rejected() {
         let (api, _repo) = execution_core_api();
@@ -4782,318 +7192,6 @@ Create beta.
         assert!(matches!(err, Err(ApiError::UnknownRun { run: RunId(999) })));
     }
 
-    #[tokio::test]
-    async fn start_run_rejects_every_state_except_pending_or_paused() {
-        let (api, _repo) = execution_core_api();
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected outcome: {other:?}"),
-        };
-
-        for status in [RunStatus::Running, RunStatus::Completed, RunStatus::Failed] {
-            api.state
-                .runs
-                .lock()
-                .unwrap()
-                .get_mut(&run.0)
-                .unwrap()
-                .status = status.clone();
-            let result = api.execute(Command::StartRun { run }).await;
-            assert!(
-                matches!(result, Err(ApiError::InvalidCommand { .. })),
-                "StartRun must reject {status:?}, got {result:?}"
-            );
-            assert_eq!(api.run(run).await.unwrap().status, status);
-        }
-    }
-
-    #[tokio::test]
-    async fn stale_scheduler_generation_cannot_finalize_or_clear_replacement() {
-        let (api, _repo) = execution_core_api();
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected outcome: {other:?}"),
-        };
-        {
-            let mut runs = api.state.runs.lock().unwrap();
-            let entry = runs.get_mut(&run.0).unwrap();
-            entry.status = RunStatus::Running;
-            entry.scheduler_generation = 2;
-            entry.handle = Some(RunHandle {
-                generation: 2,
-                cancel: CancellationToken::new(),
-                pause: Arc::new(AtomicBool::new(false)),
-                join: None,
-            });
-        }
-
-        api.state.finalize_run_status(run, 1).await;
-
-        let runs = api.state.runs.lock().unwrap();
-        let entry = runs.get(&run.0).unwrap();
-        assert_eq!(entry.status, RunStatus::Running);
-        assert_eq!(
-            entry.handle.as_ref().map(|handle| handle.generation),
-            Some(2)
-        );
-    }
-
-    // ── StartRun refuses when report blocked (ingest guard) ───────────────────
-
-    /// Refuses `StartRun` (with InvalidCommand) while the run's ingestion report
-    /// has blocking issues (e.g. non-actionable title from qualify); status
-    /// remains `Pending` (no mutation of handle/status occurs).
-    #[tokio::test]
-    async fn start_run_refused_while_report_blocked() {
-        let (api, _repo) = execution_core_api();
-
-        // Task list whose title triggers "non-actionable-title" (Blocking) via qualify.
-        // (Description and done_when are long enough to avoid other blocks.)
-        let blocked_list = r#"# Blocked — Task List
-
-A list containing a non-actionable task.
-
----
-
-## 0001 — Section
-
-### the-task — The big refactor effort
-
-This description is long enough to pass the thin-description threshold.
-
-- **Depends on:** —
-- **Done when:** The refactored code compiles cleanly and all new tests pass.
-"#;
-        let (_dir, path) = write_task_list(blocked_list);
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .expect("OpenRun must succeed for blocked list (report carries issue)")
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected OpenRun outcome: {other:?}"),
-        };
-
-        // Precondition: still Pending.
-        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Pending);
-
-        let err = api.execute(Command::StartRun { run }).await;
-        assert!(
-            matches!(err, Err(ApiError::InvalidCommand { .. })),
-            "expected InvalidCommand when report blocked; got {err:?}"
-        );
-
-        // Critical: status untouched (still Pending); guard returned before any mutation.
-        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Pending);
-    }
-
-    /// Clean report proceeds: `StartRun` returns `Ok`, status becomes `Running`.
-    #[tokio::test]
-    async fn start_run_proceeds_when_report_clean() {
-        let (api, _repo) = execution_core_api();
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .expect("OpenRun succeeds for clean list")
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        let outcome = api.execute(Command::StartRun { run }).await;
-        assert!(
-            matches!(outcome, Ok(CommandOutcome::Acknowledged)),
-            "clean StartRun must succeed; got {outcome:?}"
-        );
-        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Running);
-    }
-
-    // ── CancelRun affects the Run ─────────────────────────────────────────────
-
-    /// **Cancel affects the Run — deterministically (the done-when for Cancel).**
-    ///
-    /// Uses the [`GatedBackend`] so task-a's developer turn is provably still
-    /// in-flight (blocked on the gate) when we cancel.  Sequence:
-    ///
-    /// 1. Start (task-a's developer prompt blocks on the gate; its worktree +
-    ///    branch are created first);
-    /// 2. poll until task-a is `InProgress` AND its worktree exists (proving the
-    ///    driver launched);
-    /// 3. Cancel → the scheduler aborts the in-flight driver; its `DriverGuard`
-    ///    tears down the worktree + spokes.
-    ///
-    /// Then assert: status is `Failed` (cancelled), NOT all tasks reach `Done`
-    /// (task-b — which depends on the never-finished task-a — stays `New`), and
-    /// no worktree/branch leaks (bounded poll for the async teardown).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cancel_run_stops_execution_and_cleans_up() {
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK (tokio async mutex held for entire test)
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let interpreter = Arc::new(EdgeInferrer::new(
-            Arc::new(StructuredTextInterpreter::new()),
-        ));
-        let (backend, _release) = GatedBackend::new();
-        let repo_dir = shared_setup_temp_repo();
-        let repo_root = repo_dir.path().to_path_buf();
-        let wm = WorktreeManager::new(repo_root.clone(), "develop".into());
-        let mut config = no_gate_config();
-        config.concurrency = 1; // strictly one task at a time.
-        let api = Arc::new(CoreApi::new(interpreter, backend, wm, config));
-
-        // A 2-task chain: task-b depends on task-a (so task-b cannot run until
-        // task-a is Done — which never happens because we hold + cancel it).
-        let source = "# Cancel — Task List\n\nPreamble.\n\n---\n\n## 0001 — S\n\n\
-### task-a — Implement task A\nDoes A in `lib.rs`.\n- **Depends on:** —\n\
-- **Done when:** Task A completes its implementation and all checks pass.\n\n\
-### task-b — Implement task B\nDoes B in `lib.rs`.\n- **Depends on:** task-a\n\
-- **Done when:** Task B completes after its dependency and all checks pass.\n";
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("cancel-feature.md");
-        std::fs::write(&file_path, source).unwrap();
-
-        // Worktree dirs + branches now use the bounded short name
-        // `{plan#}-{task-trunc}-{hash4}` (plan-0029).
-        // Derive the same plan_slug the orchestrator does so this test stays
-        // location-agnostic (the tempdir parent name varies per run).
-        let plan_slug = plan_slug(&file_path);
-        let wt_name_a = paths::short_worktree_name(&plan_slug, "task-a");
-        let wt_name_b = paths::short_worktree_name(&plan_slug, "task-b");
-        let branch_a = format!("task/{wt_name_a}");
-        let branch_b = format!("task/{wt_name_b}");
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: file_path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // 1. Start: task-a's developer prompt blocks on the gate.
-        api.execute(Command::StartRun { run }).await.unwrap();
-
-        // 2. Wait until task-a is InProgress AND its worktree exists (the driver
-        //    has launched + created the worktree before the held developer turn).
-        // Worktrees now live under state_root(repo_root)/worktrees/ (off-repo).
-        let worktrees_dir = paths::state_root(&repo_root).join("worktrees");
-        let api_poll = Arc::clone(&api);
-        let wt_a = worktrees_dir.join(&wt_name_a);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                let wt_a = wt_a.clone();
-                async move {
-                    let in_progress = api
-                        .run(run)
-                        .await
-                        .map(|v| {
-                            v.tasks
-                                .iter()
-                                .any(|t| t.id.0 == "task-a" && t.state == TaskState::InProgress)
-                        })
-                        .unwrap_or(false);
-                    in_progress && wt_a.exists()
-                }
-            },
-            "task-a to be InProgress with its worktree created",
-        )
-        .await;
-
-        // 3. Cancel while task-a is held in-flight.
-        let outcome = api.execute(Command::CancelRun { run }).await.unwrap();
-        assert!(matches!(outcome, CommandOutcome::Acknowledged));
-
-        // The run status reflects cancellation (Failed) immediately.
-        let view = api.run(run).await.expect("run still exists after cancel");
-        assert_eq!(
-            view.status,
-            RunStatus::Failed,
-            "cancelled run status must be Failed"
-        );
-
-        // The chain cannot complete: task-b (depends on the never-finished
-        // task-a) must never reach Done, and the run is never Completed.  Assert
-        // this holds over a bounded window after the cancel settles.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        loop {
-            let v = api.run(run).await.unwrap();
-            let b_done = v
-                .tasks
-                .iter()
-                .find(|t| t.id.0 == "task-b")
-                .map(|t| t.state == TaskState::Done)
-                .unwrap_or(false);
-            assert!(!b_done, "task-b must not complete under cancel");
-            assert_ne!(
-                v.status,
-                RunStatus::Completed,
-                "cancelled run must not Complete"
-            );
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(15)).await;
-        }
-
-        // No worktree/branch leak: poll the filesystem with a bounded deadline
-        // (the DriverGuard teardown / scheduler abort is async + best-effort).
-        poll_until(
-            || {
-                let repo_root = repo_root.clone();
-                let worktrees_dir = worktrees_dir.clone();
-                let wt_name_a = wt_name_a.clone();
-                let wt_name_b = wt_name_b.clone();
-                let branch_a = branch_a.clone();
-                let branch_b = branch_b.clone();
-                async move {
-                    let a_gone = !worktrees_dir.join(&wt_name_a).exists();
-                    let b_gone = !worktrees_dir.join(&wt_name_b).exists();
-                    let branch_a_gone = !branch_exists(&repo_root, &branch_a);
-                    let branch_b_gone = !branch_exists(&repo_root, &branch_b);
-                    a_gone && b_gone && branch_a_gone && branch_b_gone
-                }
-            },
-            "all worktrees + task branches to be cleaned up after cancel",
-        )
-        .await;
-
-        // Restore HOME.
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// Cancel of an unknown run id is rejected.
     #[tokio::test]
     async fn cancel_run_unknown_id_is_rejected() {
         let (api, _repo) = execution_core_api();
@@ -5111,214 +7209,6 @@ This description is long enough to pass the thin-description threshold.
     /// emits `RunStatusChanged{Paused}`, and a paused run does not drive its
     /// tasks to Done.  We then resume via `StartRun` and confirm it completes —
     /// proving pause is a *cooperative stop-launching* flag, not a teardown.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pause_run_sets_paused_and_does_not_complete_then_resume_completes() {
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let (api, _repo) = execution_core_api();
-        let api = Arc::new(api);
-        let (_dir, path) = write_task_list(ONE_TASK_LIST);
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // Subscribe so we can assert the Paused status change is emitted.
-        let (collector, events) = collect_events(&api);
-
-        // Pause before start: status → Paused, event emitted, no execution.
-        api.execute(Command::PauseRun { run }).await.unwrap();
-        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Paused);
-
-        poll_until(
-            || {
-                let events = Arc::clone(&events);
-                async move {
-                    events.lock().unwrap().iter().any(|e| {
-                        matches!(
-                            e,
-                            Event::RunStatusChanged {
-                                status: RunStatus::Paused,
-                                ..
-                            }
-                        )
-                    })
-                }
-            },
-            "RunStatusChanged{Paused} to be emitted",
-        )
-        .await;
-
-        // The task must NOT have advanced to Done (no scheduler is running, and a
-        // start-while-paused would not launch it).  Assert it is still New.
-        let view = api.run(run).await.unwrap();
-        assert!(
-            view.tasks.iter().all(|t| t.state == TaskState::New),
-            "a paused (never-started) run must not advance its tasks; got {:?}",
-            view.tasks.iter().map(|t| &t.state).collect::<Vec<_>>()
-        );
-
-        // Resume: StartRun clears the pause flag and runs to completion.
-        api.execute(Command::StartRun { run }).await.unwrap();
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    matches!(
-                        api.run(run).await.map(|v| v.status),
-                        Some(RunStatus::Completed)
-                    )
-                }
-            },
-            "resumed run to reach Completed",
-        )
-        .await;
-
-        let view = api.run(run).await.unwrap();
-        assert_eq!(view.status, RunStatus::Completed);
-        assert!(view.tasks.iter().all(|t| t.state == TaskState::Done));
-        collector.abort();
-
-        // Restore HOME.
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// **Pause stops launching the SECOND task — deterministically.**
-    ///
-    /// Uses a [`GatedBackend`] that BLOCKS the first developer prompt on a signal
-    /// the test controls, so task-1 is provably still in-flight when we pause.
-    /// With `concurrency = 1`, task-2 cannot launch until task-1 finishes — and
-    /// once paused, the scheduler's fill phase will not launch task-2 even after
-    /// task-1 completes.  Sequence:
-    ///
-    /// 1. Start (task-1's developer prompt blocks on the gate);
-    /// 2. poll until task-1 is observably `InProgress` (so we know it launched);
-    /// 3. Pause (sets the stop-launching flag);
-    /// 4. release the gate → task-1 finishes;
-    /// 5. assert task-2 NEVER leaves `New` within a bounded window, and the run
-    ///    never reaches `Completed` — proving "stop launching new tasks".
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pause_stops_second_task_from_launching() {
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK for the test's full lifetime.
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let interpreter = Arc::new(EdgeInferrer::new(
-            Arc::new(StructuredTextInterpreter::new()),
-        ));
-        let (backend, release) = GatedBackend::new();
-        let repo_dir = shared_setup_temp_repo();
-        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
-        let mut config = no_gate_config();
-        config.concurrency = 1; // strictly one task at a time.
-        let api = Arc::new(CoreApi::new(interpreter, backend, wm, config));
-
-        // Two INDEPENDENT tasks (both ready immediately); concurrency=1 serializes.
-        let source = "# PauseTwo — Task List\n\nPreamble.\n\n---\n\n## 0001 — S\n\n\
-### first — Implement the first task\nDoes first in `a.rs`.\n- **Depends on:** —\n\
-- **Done when:** The first task completes its work and outputs are verified.\n\n\
-### second — Implement the second task\nDoes second in `b.rs`.\n- **Depends on:** —\n\
-- **Done when:** The second task completes after the first and outputs are verified.\n";
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("pausetwo.md");
-        std::fs::write(&file_path, source).unwrap();
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: file_path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // 1. Start: task-1's developer prompt blocks on the gate.
-        api.execute(Command::StartRun { run }).await.unwrap();
-
-        // 2. Wait until task-1 is observably InProgress (it has launched + its
-        //    developer turn is blocked on the gate).
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    api.run(run)
-                        .await
-                        .map(|v| v.tasks.iter().any(|t| t.state == TaskState::InProgress))
-                        .unwrap_or(false)
-                }
-            },
-            "task-1 to reach InProgress (blocked on the gate)",
-        )
-        .await;
-
-        // 3. Pause while task-1 is held in-flight.
-        api.execute(Command::PauseRun { run }).await.unwrap();
-        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Paused);
-
-        // 4. Release the gate → task-1 finishes; the scheduler's fill phase sees
-        //    the pause flag and does NOT launch task-2.
-        release.notify_waiters();
-
-        // 5. Within a bounded window, task-2 must NEVER leave `New` and the run
-        //    must never reach `Completed`.  (task-1 may reach Done; that's fine.)
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
-        loop {
-            let view = api.run(run).await.unwrap();
-            let second = view
-                .tasks
-                .iter()
-                .find(|t| t.id.0 == "second")
-                .expect("second task present");
-            assert_eq!(
-                second.state,
-                TaskState::New,
-                "the SECOND task must not launch while paused; got {:?}",
-                second.state
-            );
-            assert_ne!(
-                view.status,
-                RunStatus::Completed,
-                "a paused run must not reach Completed"
-            );
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(15)).await;
-        }
-
-        // SAFETY: serialised by HOME_ENV_LOCK.
-        unsafe {
-            match original_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// Pause of an unknown run id is rejected.
     #[tokio::test]
     async fn pause_run_unknown_id_is_rejected() {
         let (api, _repo) = execution_core_api();
@@ -5334,179 +7224,19 @@ This description is long enough to pass the thin-description threshold.
     /// response is a JSON graph with a non-actionable title (blocking report);
     /// StartRun refused. ReinterpretRun forces re-interpret (second/clear graph);
     /// report no longer blocked and StartRun now succeeds.
-    #[tokio::test]
-    async fn reinterpret_clears_block_and_allows_start() {
-        let blocked_json = r#"{
-  "slug": "reinterp",
-  "tasks": [
-    {
-      "id": "only",
-      "title": "The blocked task",
-      "description": "A sufficiently long description for qualify.",
-      "done_when": "The work completes successfully with tests passing.",
-      "depends_on": [],
-      "section": "0001",
-      "state": "new",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-28T10:00:00Z",
-      "updated_at": "2026-05-28T10:00:00Z"
-    }
-  ]
-}"#
-        .to_string();
-
-        let clean_json = r#"{
-  "slug": "reinterp",
-  "tasks": [
-    {
-      "id": "only",
-      "title": "Implement the feature",
-      "description": "A sufficiently long description for qualify.",
-      "done_when": "The work completes successfully with tests passing.",
-      "depends_on": [],
-      "section": "0001",
-      "state": "new",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-28T10:00:00Z",
-      "updated_at": "2026-05-28T10:00:00Z"
-    }
-  ]
-}"#
-        .to_string();
-
-        let backend: Arc<dyn crate::backend::AgentBackend> =
-            Arc::new(NoopBackend::with_responses(vec![blocked_json, clean_json]));
-
-        let interpreter = crate::interpreter::build_ingestion_interpreter(
-            &crate::config::PlannerMechanism::OneShotAgent,
-            Some(Arc::clone(&backend)),
-        )
-        .expect("model ingestion interpreter must build");
-
-        let repo_dir = shared_setup_temp_repo();
-        let wm = WorktreeManager::new(repo_dir.path().to_path_buf(), "develop".into());
-        let api = CoreApi::new(interpreter, backend, wm, no_gate_config());
-
-        let (_dir, path) = write_task_list(
-            "# Reinterp test\n\nPreamble.\n\n---\n\n## 0001\n\n### only — placeholder\nDesc long.\n- **Done when:** done when long enough.\n",
-        );
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .expect("OpenRun must succeed (blocked report is carried)")
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // Initial report from first (blocked) response must block Start.
-        let view0 = api.run(run).await.expect("run exists");
-        assert!(
-            view0.report.is_blocked(),
-            "first graph must produce blocking report; issues: {:?}",
-            view0.report.issues
-        );
-        let err = api.execute(Command::StartRun { run }).await;
-        assert!(
-            matches!(err, Err(ApiError::InvalidCommand { .. })),
-            "StartRun must be refused while blocked; got {err:?}"
-        );
-
-        // Reinterpret pulls the second (clean) response.
-        let outcome = api
-            .execute(Command::ReinterpretRun { run })
-            .await
-            .expect("ReinterpretRun must succeed");
-        assert!(matches!(outcome, CommandOutcome::Acknowledged));
-
-        // Now report clean.
-        let view1 = api.run(run).await.expect("run still exists");
-        assert!(
-            !view1.report.is_blocked(),
-            "after reinterpret, report must not be blocked; issues: {:?}",
-            view1.report.issues
-        );
-
-        // StartRun now allowed.
-        let start_ok = api.execute(Command::StartRun { run }).await;
-        assert!(
-            matches!(start_ok, Ok(CommandOutcome::Acknowledged)),
-            "StartRun must succeed after reinterpret cleared the block; got {start_ok:?}"
-        );
-    }
-
-    /// Reinterpret on a non-Pending run is rejected with InvalidCommand.
-    #[tokio::test]
-    async fn reinterpret_rejected_when_not_pending() {
-        let (api, _repo) = execution_core_api();
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-
-        // Advance to Running.
-        api.execute(Command::StartRun { run }).await.unwrap();
-        assert_eq!(api.run(run).await.unwrap().status, RunStatus::Running);
-
-        let err = api.execute(Command::ReinterpretRun { run }).await;
-        assert!(
-            matches!(err, Err(ApiError::InvalidCommand { .. })),
-            "reinterpret on Running run must yield InvalidCommand; got {err:?}"
-        );
-    }
-
-    // ── subscribe semantics ───────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn subscribe_is_independent_and_infallible() {
-        let (api, _repo) = execution_core_api();
-        let mut s1 = api.subscribe();
-        let mut s2 = api.subscribe();
-
-        let (_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-        api.execute(Command::OpenRun {
-            task_list_path: path,
-        })
-        .await
-        .unwrap();
-
-        for stream in [&mut s1, &mut s2] {
-            let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
-                .await
-                .expect("each subscriber must receive the event")
-                .expect("stream ended unexpectedly");
-            assert!(matches!(ev, Event::RunOpened { .. }));
-        }
-    }
-
-    // ── build_view: project field ─────────────────────────────────────────────
-
-    /// `build_view` populates `RunView::project` with the final path component
-    /// (basename) of the `repo_root` it is handed.
     #[test]
     fn build_view_project_is_repo_root_basename() {
         let repo_root = std::path::Path::new("/home/dev/projects/makina");
         let graph = TaskGraph {
             slug: "demo".to_string(),
             tasks: vec![],
+            authored: Default::default(),
         };
 
         let view = build_view(
             RunId(7),
             "01J0000000000000000000000".to_string(),
-            std::path::PathBuf::from(".makina/tasks/demo.json"),
+            crate::plan::PlanKey::parse("docs/plans/0001-Demo").unwrap(),
             RunStatus::Pending,
             repo_root,
             &graph,
@@ -5522,448 +7252,6 @@ This description is long enough to pass the thin-description threshold.
     /// at graph resolution time and threads it onto the `RunEntry` (and thus
     /// every `RunView` returned by `runs()` / `run()`). Modelled on
     /// `open_run_interprets_file_and_creates_run`.
-    #[tokio::test]
-    async fn open_run_attaches_ingestion_report() {
-        let (api, _repo) = execution_core_api();
-
-        // Clean graph via normal interpret path (SAMPLE has substantive done_whens ≥12 chars, no placeholders).
-        let (_d_clean, clean_path) = write_task_list(SAMPLE_TASK_LIST);
-        let _ = api
-            .execute(Command::OpenRun {
-                task_list_path: clean_path,
-            })
-            .await
-            .expect("clean OpenRun succeeds");
-
-        let clean_views = api.runs().await;
-        assert_eq!(clean_views.len(), 1);
-        let clean_view = &clean_views[0];
-        assert!(
-            !clean_view.report.is_blocked(),
-            "clean canned graph must yield report.is_blocked() == false; issues: {:?}",
-            clean_view.report.issues
-        );
-
-        // Blocked case: short done_when triggers qualify "vague-done-when" (Blocking).
-        // (Using short-but-nonempty avoids interpreter ParseError for missing/empty field.)
-        let vague_list = r#"# Vague — Task List
-
-A list with a task whose done_when is too short to pass qualify.
-
----
-
-## 0001 — Vague
-
-### vague-t — Vague task
-
-Description text that is long enough for parser.
-
-- **Depends on:** —
-- **Done when:** soon
-"#;
-        let (_d_vague, vague_path) = write_task_list(vague_list);
-        let _ = api
-            .execute(Command::OpenRun {
-                task_list_path: vague_path.clone(),
-            })
-            .await
-            .expect("vague OpenRun succeeds (report carries the issue)");
-
-        let all_views = api.runs().await;
-        let vague_view = all_views
-            .iter()
-            .find(|v| v.task_list_path == vague_path)
-            .expect("vague run view present");
-        assert!(
-            vague_view.report.is_blocked(),
-            "vague graph must be blocked"
-        );
-        assert!(
-            vague_view.report.issues.iter().any(|i| {
-                i.code == "vague-done-when" && i.severity == crate::api::IssueSeverity::Blocking
-            }),
-            "expected Blocking 'vague-done-when' issue in report; got {:?}",
-            vague_view.report.issues
-        );
-    }
-
-    // ── Retry: command validation + reset persistence (0056) ──────────────────
-
-    /// Open + run `SAMPLE_TASK_LIST` with a backend that fails `task-one` once,
-    /// returning the api, run id, and both temp dirs once the run has reached
-    /// `Failed` with `task-one` Failed and `task-two` Skipped. The caller keeps
-    /// both dirs alive for the test's lifetime.
-    async fn run_to_failed_with_skip() -> (Arc<CoreApi>, RunId, tempfile::TempDir, tempfile::TempDir)
-    {
-        let backend: Arc<dyn AgentBackend> = Arc::new(FailOnceBackend::new("task-one"));
-        let (api, repo) = execution_core_api_with_backend(backend);
-        let api = Arc::new(api);
-        let (task_dir, path) = write_task_list(SAMPLE_TASK_LIST);
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-        api.execute(Command::StartRun { run }).await.unwrap();
-
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    match api.run(run).await {
-                        Some(v) => {
-                            v.status == RunStatus::Failed
-                                && v.tasks
-                                    .iter()
-                                    .any(|t| t.id.0 == "task-one" && t.state == TaskState::Failed)
-                                && v.tasks
-                                    .iter()
-                                    .any(|t| t.id.0 == "task-two" && t.state == TaskState::Skipped)
-                        }
-                        None => false,
-                    }
-                }
-            },
-            "run to reach Failed with task-one Failed and task-two Skipped",
-        )
-        .await;
-
-        (api, run, repo, task_dir)
-    }
-
-    /// `RetryTask` on a non-`Failed` task is rejected with `InvalidCommand`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn retry_task_rejects_non_failed() {
-        let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
-        // task-two is Skipped (not Failed) here — RetryTask on it must reject.
-        let err = api
-            .execute(Command::RetryTask {
-                run,
-                task: crate::api::TaskId::new("task-two"),
-            })
-            .await;
-        assert!(
-            matches!(err, Err(ApiError::InvalidCommand { .. })),
-            "RetryTask on a non-Failed task must yield InvalidCommand; got {err:?}"
-        );
-
-        // An unknown run id is UnknownRun.
-        let err = api
-            .execute(Command::RetryTask {
-                run: RunId(9999),
-                task: crate::api::TaskId::new("task-one"),
-            })
-            .await;
-        assert!(
-            matches!(err, Err(ApiError::UnknownRun { .. })),
-            "RetryTask on an unknown run must yield UnknownRun; got {err:?}"
-        );
-    }
-
-    /// After `RetryTask`, the on-disk persisted graph shows the reset task back
-    /// in a non-terminal state with cleared failure metadata.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn retry_persists_reset_graph() {
-        let (api, run, repo, _task_dir) = run_to_failed_with_skip().await;
-        let repo_root = repo.path().to_path_buf();
-
-        api.execute(Command::RetryTask {
-            run,
-            task: crate::api::TaskId::new("task-one"),
-        })
-        .await
-        .expect("RetryTask on a Failed task must succeed");
-
-        // Reload the persisted graph and assert task-one is reset (non-terminal,
-        // cleared metadata). The slug is derived from the task-list path.
-        let view = api.run(run).await.expect("run still open");
-        // Find the persisted graph by scanning the tasks dir for the only slug.
-        let tasks_dir = repo_root.join(".makina").join("tasks");
-        let slug = std::fs::read_dir(&tasks_dir)
-            .expect("tasks dir exists after retry persist")
-            .filter_map(|e| e.ok())
-            .find_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                name.strip_suffix(".json").map(|s| s.to_string())
-            })
-            .expect("a persisted {slug}.json exists");
-        let loaded = crate::persist::load_graph(&repo_root, &slug)
-            .await
-            .expect("load_graph ok")
-            .expect("graph present");
-        let t1 = loaded
-            .tasks
-            .iter()
-            .find(|t| t.id.0 == "task-one")
-            .expect("task-one present in persisted graph");
-        assert!(
-            !crate::state_machine::is_terminal(t1.state),
-            "persisted task-one must be non-terminal after retry; got {:?}",
-            t1.state
-        );
-        assert_eq!(t1.gate_iterations, 0, "gate budget reset");
-        assert_eq!(t1.review_iterations, 0, "review budget reset");
-        assert!(t1.failure_reason.is_none(), "failure_reason cleared");
-        assert!(t1.finished_at.is_none(), "finished_at cleared");
-        // The live view also reflects the reset (not Failed).
-        let t1_view = view.tasks.iter().find(|t| t.id.0 == "task-one").unwrap();
-        assert_ne!(t1_view.state, TaskState::Failed);
-    }
-
-    // ── Retry: re-dispatch (0057) ─────────────────────────────────────────────
-
-    /// `RetryTask` re-dispatches: the previously-`Failed` task reaches `Done` and
-    /// its revived `Skipped` dependent reaches `Done` too.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn retried_task_runs_to_terminal_again() {
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
-
-        api.execute(Command::RetryTask {
-            run,
-            task: crate::api::TaskId::new("task-one"),
-        })
-        .await
-        .expect("RetryTask must succeed");
-
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    match api.run(run).await {
-                        Some(v) => {
-                            v.status == RunStatus::Completed
-                                && v.tasks.iter().all(|t| t.state == TaskState::Done)
-                        }
-                        None => false,
-                    }
-                }
-            },
-            "retried run to reach Completed with all tasks Done",
-        )
-        .await;
-
-        let view = api.run(run).await.unwrap();
-        assert!(
-            view.tasks
-                .iter()
-                .find(|t| t.id.0 == "task-one")
-                .map(|t| t.state == TaskState::Done)
-                .unwrap_or(false),
-            "the retried task-one must reach Done"
-        );
-        assert!(
-            view.tasks
-                .iter()
-                .find(|t| t.id.0 == "task-two")
-                .map(|t| t.state == TaskState::Done)
-                .unwrap_or(false),
-            "the revived dependent task-two must reach Done"
-        );
-
-        // Restore HOME.
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// `RetryFailedTasks` flips the run `Failed → Running` (observed on the
-    /// stream) and then re-aggregates to `Completed`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn retry_flips_run_status_running_then_completed() {
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        let (api, run, _repo, _task_dir) = run_to_failed_with_skip().await;
-
-        // Subscribe BEFORE issuing retry so we capture the Running flip.
-        let (collector, events) = collect_events(&api);
-
-        api.execute(Command::RetryFailedTasks { run })
-            .await
-            .expect("RetryFailedTasks must succeed");
-
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    matches!(
-                        api.run(run).await.map(|v| v.status),
-                        Some(RunStatus::Completed)
-                    )
-                }
-            },
-            "retried run to reach Completed",
-        )
-        .await;
-
-        // Allow the final RunStatusChanged{Completed} to drain.
-        poll_until(
-            || {
-                let events = Arc::clone(&events);
-                async move {
-                    events.lock().unwrap().iter().any(|e| {
-                        matches!(
-                            e,
-                            Event::RunStatusChanged {
-                                status: RunStatus::Completed,
-                                ..
-                            }
-                        )
-                    })
-                }
-            },
-            "RunStatusChanged{Completed} after retry",
-        )
-        .await;
-
-        let evs = events.lock().unwrap().clone();
-        collector.abort();
-
-        assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                Event::RunStatusChanged {
-                    run: r,
-                    status: RunStatus::Running,
-                } if *r == run
-            )),
-            "retry must emit RunStatusChanged{{Running}}; got {evs:?}"
-        );
-        assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                Event::RunStatusChanged {
-                    run: r,
-                    status: RunStatus::Completed,
-                } if *r == run
-            )),
-            "retried run must aggregate to Completed"
-        );
-        // A TaskRetried event was emitted for the reset task.
-        assert!(
-            evs.iter().any(|e| matches!(
-                e,
-                Event::TaskRetried { run: r, task } if *r == run && task.0 == "task-one"
-            )),
-            "retry must emit TaskRetried for task-one; got {evs:?}"
-        );
-
-        // Restore HOME.
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// A retry targeting a run while it is still actively `Running` is rejected
-    /// with `InvalidCommand` (only Failed/Paused/Completed runs are retryable).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn retry_rejected_while_run_active() {
-        let _home_guard = HOME_ENV_LOCK.lock().await;
-        let tmp_home = tempfile::tempdir().expect("create temp home");
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
-        // A backend that blocks the first developer prompt so the run is provably
-        // still Running when we issue the retry.
-        let (backend, release) = GatedBackend::new();
-        let (api, _repo) = execution_core_api_with_backend(backend);
-        let api = Arc::new(api);
-        let (_task_dir, path) = write_task_list(ONE_TASK_LIST);
-
-        let run = match api
-            .execute(Command::OpenRun {
-                task_list_path: path,
-            })
-            .await
-            .unwrap()
-        {
-            CommandOutcome::RunOpened { run } => run,
-            other => panic!("unexpected: {other:?}"),
-        };
-        api.execute(Command::StartRun { run }).await.unwrap();
-
-        // Wait until the run is observably Running (the gated backend holds the
-        // first developer prompt, so the run cannot finish).
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    matches!(
-                        api.run(run).await.map(|v| v.status),
-                        Some(RunStatus::Running)
-                    )
-                }
-            },
-            "run to be observably Running",
-        )
-        .await;
-
-        let err = api.execute(Command::RetryFailedTasks { run }).await;
-        assert!(
-            matches!(err, Err(ApiError::InvalidCommand { .. })),
-            "retry on an actively-Running run must yield InvalidCommand; got {err:?}"
-        );
-
-        // Release the gate so the run can finish and the test exits cleanly.
-        release.notify_one();
-        let api_poll = Arc::clone(&api);
-        poll_until(
-            || {
-                let api = Arc::clone(&api_poll);
-                async move {
-                    matches!(
-                        api.run(run).await.map(|v| v.status),
-                        Some(RunStatus::Completed)
-                    )
-                }
-            },
-            "gated run to drain to Completed",
-        )
-        .await;
-
-        // Restore HOME.
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe {
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// A `Task` with `started_at = Some(t0)` and `finished_at = Some(t1)` is
-    /// projected through the orchestrator's `build_view` (the `TaskView` builder
-    /// called by `CoreApi::run` / `runs`): the resulting `TaskView` carries both
-    /// timestamps as `Some`. A not-yet-started `Task` (both fields `None`) yields
-    /// `None/None` in the corresponding `TaskView`.
     #[test]
     fn task_view_carries_timestamps() {
         use chrono::TimeZone;
@@ -6012,16 +7300,33 @@ Description text that is long enough for parser.
             failure_reason: None,
         };
 
+        let mut authored = std::collections::BTreeMap::new();
+        authored.insert(
+            crate::task::TaskId("started-task".into()),
+            crate::task::AuthoredTaskMetadata {
+                source_path: "tasks/0301-started-task.md".into(),
+                workstream: "0003".into(),
+                kind: "code".into(),
+                gated: true,
+                touches: vec![crate::task::AuthoredRepoPattern::Path("src/**".into())],
+                status: crate::plan::AuthoredTaskStatus::InProgress,
+                merged_as: Some("0123456789abcdef".into()),
+                seed: crate::task::AuthoredSeedOutcome::NeedsInProgressReconciliation,
+                collision_dependencies: vec![crate::task::TaskId("pending-task".into())],
+                branch_base_oid: None,
+            },
+        );
         let graph = crate::task::TaskGraph {
             slug: "test-graph".into(),
             tasks: vec![started_task, pending_task],
+            authored,
         };
 
         let repo_root = std::path::Path::new("/tmp/fake-repo");
         let view = build_view(
             RunId(1),
             "test-run-uid".into(),
-            std::path::PathBuf::from(".tasks/test.json"),
+            crate::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
             RunStatus::Running,
             repo_root,
             &graph,
@@ -6029,6 +7334,21 @@ Description text that is long enough for parser.
         );
 
         assert_eq!(view.tasks.len(), 2);
+        let authored = view.tasks[0]
+            .authored
+            .as_ref()
+            .expect("authored plan metadata retained in run view");
+        assert_eq!(authored.workstream, "0003");
+        assert_eq!(authored.kind, "code");
+        assert_eq!(authored.status, "in-progress");
+        assert!(authored.gated);
+        assert_eq!(authored.touches, ["src/**"]);
+        assert_eq!(authored.merged_as.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(
+            authored.source_path,
+            Path::new("tasks/0301-started-task.md")
+        );
+        assert_eq!(authored.collision_dependencies[0].0, "pending-task");
 
         // The started+finished task must carry both timestamps through.
         assert_eq!(
@@ -6054,167 +7374,6 @@ Description text that is long enough for parser.
     }
 
     #[test]
-    fn discover_plans_finds_convention_dirs() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plans_dir = tmp.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
-
-        // Create a plan with all three files (SCOPE.md, ARCHITECTURE.md, TASKS.md)
-        let plan_0001 = plans_dir.join("0001-x");
-        std::fs::create_dir(&plan_0001).expect("create 0001-x");
-        std::fs::write(plan_0001.join("SCOPE.md"), "scope").expect("write SCOPE.md");
-        std::fs::write(plan_0001.join("ARCHITECTURE.md"), "architecture")
-            .expect("write ARCHITECTURE.md");
-        std::fs::write(plan_0001.join("TASKS.md"), "tasks").expect("write TASKS.md");
-
-        let entries = discover_plans(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].slug, "0001-x");
-        assert!(entries[0].has_tasks);
-        assert!(entries[0].dir.ends_with("0001-x"));
-    }
-
-    #[test]
-    fn parse_plan_tasks_extracts_id_title_gated_and_deps() {
-        let md = "\
-# Plan 0001 — Demo
-
-## 0001 — Foundation
-
-### cargo-scaffold — Compiling Skeleton
-- **Depends on:** —
-- **Done when:** it builds
-
-### task-model — Task Domain Model
-- **Depends on:** cargo-scaffold
-- **Done when:** types exist
-
-## 0002 — Hardening
-
-### audit-pass — Security Audit (GATED)
-- **Depends on:** task-model, cargo-scaffold (and plan 0002 merged)
-- **Done when:** approved
-";
-        let tasks = parse_plan_tasks(md);
-        assert_eq!(tasks.len(), 3, "three task headings, not the ## sections");
-        assert_eq!(tasks[0].id, "cargo-scaffold");
-        assert_eq!(tasks[0].title, "Compiling Skeleton");
-        assert!(!tasks[0].gated);
-        assert!(tasks[0].depends_on.is_empty(), "— means no deps");
-        assert_eq!(tasks[1].id, "task-model");
-        assert_eq!(tasks[1].depends_on, vec!["cargo-scaffold".to_string()]);
-        assert!(tasks[2].gated, "(GATED) suffix must set gated");
-        assert_eq!(
-            tasks[2].depends_on,
-            vec!["task-model".to_string(), "cargo-scaffold".to_string()],
-            "comma list parsed; parenthetical aside dropped"
-        );
-
-        // Each task's body captures the full Markdown under its heading, up to the
-        // next task (`### `) or section (`## `) heading.
-        assert!(
-            tasks[0].body.contains("- **Done when:** it builds"),
-            "task body captures the Done-when bullet, got: {:?}",
-            tasks[0].body
-        );
-        assert!(
-            tasks[0].body.contains("- **Depends on:** —"),
-            "task body includes the Depends-on bullet"
-        );
-        assert!(
-            !tasks[0].body.contains("task-model"),
-            "a task's body must stop at the next task heading"
-        );
-        assert!(
-            !tasks[1].body.contains("Hardening"),
-            "a task's body must stop at the next ## section heading"
-        );
-    }
-
-    #[test]
-    fn parse_plan_tasks_accumulates_wrapped_depends_on_lines() {
-        // Soft-wrapped Depends-on continuation lines (as real plans use) must be
-        // joined — matching the interpreter's multi-line field handling. A blank
-        // line ends the field.
-        let md = "\
-## 0001 — S
-
-### planner-actor — Planner Actor
-- **Depends on:** actor-traits, runtime-artifact-schema,
-  structured-text-convention
-- **Done when:** it works
-
-### loner — No Deps
-- **Depends on:** — (uses plan 0022's timestamp plumbing only as context; adds an
-  independent per-turn duration)
-- **Done when:** done
-";
-        let tasks = parse_plan_tasks(md);
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(
-            tasks[0].depends_on,
-            vec![
-                "actor-traits".to_string(),
-                "runtime-artifact-schema".to_string(),
-                "structured-text-convention".to_string(),
-            ],
-            "the third dep on the continuation line must not be dropped"
-        );
-        assert!(
-            tasks[1].depends_on.is_empty(),
-            "a `—` lead with a multi-line parenthetical aside is still no deps, got {:?}",
-            tasks[1].depends_on
-        );
-    }
-
-    #[test]
-    fn discover_plans_populates_task_previews() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plans_dir = tmp.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
-        let plan = plans_dir.join("0001-x");
-        std::fs::create_dir(&plan).expect("create 0001-x");
-        std::fs::write(plan.join("SCOPE.md"), "scope").unwrap();
-        std::fs::write(plan.join("ARCHITECTURE.md"), "arch").unwrap();
-        std::fs::write(
-            plan.join("TASKS.md"),
-            "## 0001 — S\n\n### alpha — First\n- **Depends on:** —\n\n### beta — Second\n- **Depends on:** alpha\n",
-        )
-        .unwrap();
-
-        let entries = discover_plans(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0]
-                .tasks
-                .iter()
-                .map(|t| t.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha", "beta"],
-            "discover_plans must parse the TASKS.md preview in file order"
-        );
-    }
-
-    #[test]
-    fn dir_without_tasks_flagged() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plans_dir = tmp.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
-
-        // Create a plan without TASKS.md
-        let plan_0002 = plans_dir.join("0002-y");
-        std::fs::create_dir(&plan_0002).expect("create 0002-y");
-        std::fs::write(plan_0002.join("SCOPE.md"), "scope").expect("write SCOPE.md");
-        std::fs::write(plan_0002.join("ARCHITECTURE.md"), "architecture")
-            .expect("write ARCHITECTURE.md");
-
-        let entries = discover_plans(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].slug, "0002-y");
-        assert!(!entries[0].has_tasks);
-    }
-
-    #[test]
     fn non_plan_dirs_ignored() {
         let tmp = tempfile::TempDir::new().expect("create temp dir");
         let plans_dir = tmp.path().join("docs").join("plans");
@@ -6233,623 +7392,12 @@ Description text that is long enough for parser.
             .expect("write ARCHITECTURE.md");
 
         let entries = discover_plans(tmp.path());
-        // Only the valid plan should be discovered, not assets/
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].slug, "0001-x");
+        // Historical pre-per-task directories are inert, as is assets/.
+        assert!(entries.is_empty());
 
         // Test with missing docs/plans
         let empty_tmp = tempfile::TempDir::new().expect("create temp dir");
         let entries = discover_plans(empty_tmp.path());
         assert_eq!(entries, vec![]);
-    }
-
-    #[test]
-    fn discover_plans_caches_spec_content_when_present() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plans_dir = tmp.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
-
-        let plan_0001 = plans_dir.join("0001-x");
-        std::fs::create_dir(&plan_0001).expect("create 0001-x");
-        std::fs::write(plan_0001.join("SCOPE.md"), "Scope content here").expect("write SCOPE.md");
-        std::fs::write(
-            plan_0001.join("ARCHITECTURE.md"),
-            "Architecture content here",
-        )
-        .expect("write ARCHITECTURE.md");
-        std::fs::write(plan_0001.join("STATUS.md"), "Status: complete").expect("write STATUS.md");
-
-        let entries = discover_plans(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].scope_text,
-            Some("Scope content here".to_string()),
-            "scope_text should contain SCOPE.md content"
-        );
-        assert_eq!(
-            entries[0].architecture_text,
-            Some("Architecture content here".to_string()),
-            "architecture_text should contain ARCHITECTURE.md content"
-        );
-        assert_eq!(
-            entries[0].status_text,
-            Some("Status: complete".to_string()),
-            "status_text should contain STATUS.md content"
-        );
-    }
-
-    #[test]
-    fn discover_plans_uses_none_for_missing_spec_files() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plans_dir = tmp.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir).expect("create docs/plans");
-
-        let plan_0001 = plans_dir.join("0001-x");
-        std::fs::create_dir(&plan_0001).expect("create 0001-x");
-        // Only create SCOPE.md and ARCHITECTURE.md (required by convention gate)
-        std::fs::write(plan_0001.join("SCOPE.md"), "Scope content").expect("write SCOPE.md");
-        std::fs::write(plan_0001.join("ARCHITECTURE.md"), "Architecture content")
-            .expect("write ARCHITECTURE.md");
-        // Intentionally don't create STATUS.md
-
-        let entries = discover_plans(tmp.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].scope_text,
-            Some("Scope content".to_string()),
-            "scope_text should be populated"
-        );
-        assert_eq!(
-            entries[0].architecture_text,
-            Some("Architecture content".to_string()),
-            "architecture_text should be populated"
-        );
-        assert_eq!(
-            entries[0].status_text, None,
-            "status_text should be None when STATUS.md is missing"
-        );
-    }
-
-    #[test]
-    fn discover_plans_per_folder_discovers_plans_in_each_folder() {
-        let tmp1 = tempfile::TempDir::new().expect("create temp dir 1");
-        let plans_dir1 = tmp1.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir1).expect("create docs/plans in folder 1");
-
-        // Create two plans in folder 1
-        let plan_0001 = plans_dir1.join("0001-a");
-        std::fs::create_dir(&plan_0001).expect("create 0001-a");
-        std::fs::write(plan_0001.join("SCOPE.md"), "scope 1a").expect("write SCOPE.md");
-        std::fs::write(plan_0001.join("ARCHITECTURE.md"), "arch 1a")
-            .expect("write ARCHITECTURE.md");
-
-        let plan_0002 = plans_dir1.join("0002-b");
-        std::fs::create_dir(&plan_0002).expect("create 0002-b");
-        std::fs::write(plan_0002.join("SCOPE.md"), "scope 1b").expect("write SCOPE.md");
-        std::fs::write(plan_0002.join("ARCHITECTURE.md"), "arch 1b")
-            .expect("write ARCHITECTURE.md");
-
-        // Create a second folder with one plan
-        let tmp2 = tempfile::TempDir::new().expect("create temp dir 2");
-        let plans_dir2 = tmp2.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir2).expect("create docs/plans in folder 2");
-
-        let plan_0001_f2 = plans_dir2.join("0001-x");
-        std::fs::create_dir(&plan_0001_f2).expect("create 0001-x");
-        std::fs::write(plan_0001_f2.join("SCOPE.md"), "scope 2x").expect("write SCOPE.md");
-        std::fs::write(plan_0001_f2.join("ARCHITECTURE.md"), "arch 2x")
-            .expect("write ARCHITECTURE.md");
-
-        // Call discover_plans_per_folder with both folders
-        let opened_folders = vec![tmp1.path().to_path_buf(), tmp2.path().to_path_buf()];
-        let result = discover_plans_per_folder(&opened_folders);
-
-        // Verify the result has entries for both folders
-        assert_eq!(result.len(), 2, "should have 2 entries in the HashMap");
-
-        // Verify folder 0 has 2 plans
-        assert!(
-            result.contains_key(&0),
-            "should have entry for folder_idx 0"
-        );
-        let plans_folder0 = &result[&0];
-        assert_eq!(plans_folder0.len(), 2, "folder 0 should have 2 plans");
-        assert_eq!(plans_folder0[0].slug, "0001-a", "first plan in folder 0");
-        assert_eq!(plans_folder0[1].slug, "0002-b", "second plan in folder 0");
-
-        // Verify folder 1 has 1 plan
-        assert!(
-            result.contains_key(&1),
-            "should have entry for folder_idx 1"
-        );
-        let plans_folder1 = &result[&1];
-        assert_eq!(plans_folder1.len(), 1, "folder 1 should have 1 plan");
-        assert_eq!(plans_folder1[0].slug, "0001-x", "plan in folder 1");
-    }
-
-    #[test]
-    fn discover_plans_per_folder_includes_empty_folders() {
-        let tmp1 = tempfile::TempDir::new().expect("create temp dir 1");
-        let plans_dir1 = tmp1.path().join("docs").join("plans");
-        std::fs::create_dir_all(&plans_dir1).expect("create docs/plans in folder 1");
-
-        // Create a plan in folder 1
-        let plan = plans_dir1.join("0001-a");
-        std::fs::create_dir(&plan).expect("create 0001-a");
-        std::fs::write(plan.join("SCOPE.md"), "scope").expect("write SCOPE.md");
-        std::fs::write(plan.join("ARCHITECTURE.md"), "arch").expect("write ARCHITECTURE.md");
-
-        // Create a second folder with NO plans
-        let tmp2 = tempfile::TempDir::new().expect("create temp dir 2");
-        // Note: no docs/plans directory in tmp2
-
-        // Call discover_plans_per_folder with both folders
-        let opened_folders = vec![tmp1.path().to_path_buf(), tmp2.path().to_path_buf()];
-        let result = discover_plans_per_folder(&opened_folders);
-
-        // Verify both folders have entries
-        assert_eq!(result.len(), 2, "should have 2 entries in the HashMap");
-
-        // Verify folder 0 has the plan
-        assert_eq!(result[&0].len(), 1, "folder 0 should have 1 plan");
-        assert_eq!(result[&0][0].slug, "0001-a");
-
-        // Verify folder 1 has an empty vector
-        assert_eq!(result[&1].len(), 0, "folder 1 should have 0 plans");
-    }
-
-    // ── planner-generate-on-open tests ───────────────────────────────────────
-
-    #[derive(Clone, Default)]
-    struct DeterministicGenerator {
-        race_winner: Option<(PathBuf, String)>,
-    }
-
-    #[async_trait]
-    impl TaskListInterpreter for DeterministicGenerator {
-        async fn interpret(
-            &self,
-            slug: &str,
-            source_text: &str,
-        ) -> Result<TaskGraph, crate::interpreter::InterpretError> {
-            StructuredTextInterpreter::new()
-                .interpret(slug, source_text)
-                .await
-        }
-
-        async fn generate(
-            &self,
-            slug: &str,
-            _brief: &str,
-            _system_prompt_override: Option<&str>,
-        ) -> Result<TaskGraph, crate::interpreter::InterpretError> {
-            if let Some((path, contents)) = &self.race_winner {
-                tokio::fs::write(path, contents)
-                    .await
-                    .expect("publish racing task list");
-            }
-            StructuredTextInterpreter::new()
-                .interpret(slug, ONE_TASK_LIST)
-                .await
-        }
-    }
-
-    fn generation_test_api(repo_root: &Path, planner: Arc<dyn TaskListInterpreter>) -> CoreApi {
-        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::new());
-        CoreApi::with_audit_registry(
-            Arc::new(StructuredTextInterpreter::new()),
-            planner,
-            Arc::clone(&backend),
-            backend,
-            WorktreeManager::new(repo_root.to_path_buf(), "main".into()),
-            no_gate_config(),
-            Arc::new(NoopAuditRegistry),
-        )
-    }
-
-    /// **Acceptance: missing TASKS.md triggers planner generate.**
-    ///
-    /// A dir with SCOPE.md + ARCHITECTURE.md but no TASKS.md should not return
-    /// `ApiError::InvalidCommand` on the NotFound. Instead, the planner should
-    /// draft a graph from the spec. This test drives the internal path and asserts
-    /// the generated graph is non-empty and validates.
-    #[tokio::test]
-    async fn missing_tasks_triggers_planner_generate() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plan_dir = tmp.path().join("0999-test-plan");
-        std::fs::create_dir(&plan_dir).expect("create plan dir");
-
-        let scope_content = "# Scope\nThis is a test plan scope.\n";
-        let arch_content = "# Architecture\nBuild two simple tasks.\n";
-
-        std::fs::write(plan_dir.join("SCOPE.md"), scope_content).expect("write SCOPE.md");
-        std::fs::write(plan_dir.join("ARCHITECTURE.md"), arch_content)
-            .expect("write ARCHITECTURE.md");
-        // Deliberately omit TASKS.md
-
-        let task_list_path = plan_dir.join("TASKS.md");
-
-        // Build a CoreApi with a planner interpreter backed by a model that
-        // returns valid task-graph JSON.
-        let valid_json = r#"{
-  "slug": "0999-test-plan-tasks",
-  "tasks": [
-    {
-      "id": "task-one",
-      "title": "First task",
-      "description": "Does something.",
-      "done_when": "Task one is done.",
-      "depends_on": [],
-      "state": "new",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-28T10:00:00Z",
-      "updated_at": "2026-05-28T10:00:00Z"
-    },
-    {
-      "id": "task-two",
-      "title": "Second task",
-      "description": "Depends on the first.",
-      "done_when": "Task two is done.",
-      "depends_on": ["task-one"],
-      "state": "new",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-28T10:00:00Z",
-      "updated_at": "2026-05-28T10:00:00Z"
-    }
-  ]
-}
-"#;
-
-        let backend: Arc<dyn AgentBackend> =
-            Arc::new(NoopBackend::with_responses(vec![valid_json.to_string()]));
-        let planner_interpreter = crate::interpreter::build_planner_interpreter(
-            &crate::config::PlannerMechanism::OneShotAgent,
-            Some(Arc::clone(&backend)),
-        )
-        .expect("build planner interpreter");
-
-        let config = no_gate_config();
-
-        let worktree_manager = WorktreeManager::new(tmp.path().to_path_buf(), "main".into());
-
-        let api = CoreApi::with_audit_registry(
-            Arc::new(StructuredTextInterpreter::new()),
-            planner_interpreter,
-            Arc::clone(&backend),
-            Arc::clone(&backend),
-            worktree_manager,
-            config,
-            Arc::new(NoopAuditRegistry),
-        );
-
-        let slug = run_slug(&task_list_path);
-        let repo_root = tmp.path();
-
-        // Call generate_and_seed directly (the internal path that interpret_and_seed
-        // branches to on missing TASKS.md).
-        let (graph, issues) = api
-            .generate_and_seed(&slug, &task_list_path, repo_root, true)
-            .await
-            .expect("generate_and_seed should succeed");
-
-        // Assert the generated graph is non-empty and validates.
-        assert!(
-            !graph.tasks.is_empty(),
-            "generated graph should have tasks; issues: {issues:?}"
-        );
-        assert_eq!(graph.tasks.len(), 2);
-        graph.validate().expect("generated graph must validate");
-
-        // Assert no blocking issues (generation succeeded).
-        assert!(
-            issues.is_empty(),
-            "successful generation should produce no issues; got {issues:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn generated_tasks_write_refuses_a_racing_symlink() {
-        let plan = tempfile::tempdir().expect("create plan directory");
-        let outside = plan
-            .path()
-            .parent()
-            .unwrap()
-            .join(format!("makina-outside-{}", ulid::Ulid::new()));
-        std::os::unix::fs::symlink(&outside, plan.path().join("TASKS.md"))
-            .expect("create dangling TASKS.md symlink");
-        let graph = TaskGraph {
-            slug: "racing-link".to_string(),
-            tasks: Vec::new(),
-        };
-
-        let error = write_tasks_md(&plan.path().join("TASKS.md"), &graph)
-            .await
-            .expect_err("create_new must reject an existing symlink");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert!(!outside.exists(), "generation must not follow the symlink");
-    }
-
-    #[tokio::test]
-    async fn generated_tasks_preserve_the_exact_requested_filename() {
-        let tmp = tempfile::tempdir().expect("create temp directory");
-        let plan_dir = tmp.path().join("lowercase-plan");
-        std::fs::create_dir(&plan_dir).expect("create plan directory");
-        std::fs::write(plan_dir.join("SCOPE.md"), "# Scope\nGenerate one task.")
-            .expect("write scope");
-        let requested_path = plan_dir.join("tasks.md");
-        let api = generation_test_api(tmp.path(), Arc::new(DeterministicGenerator::default()));
-
-        let CommandOutcome::RunOpened { run } = api
-            .execute(Command::OpenRun {
-                task_list_path: requested_path.clone(),
-            })
-            .await
-            .expect("open lowercase task-list path")
-        else {
-            panic!("expected RunOpened")
-        };
-
-        assert!(
-            requested_path.is_file(),
-            "the requested path must be created"
-        );
-        assert!(
-            !plan_dir.join("TASKS.md").exists(),
-            "generation must not silently change the requested filename"
-        );
-        assert_eq!(
-            api.run(run).await.expect("opened run").task_list_path,
-            std::fs::canonicalize(&requested_path).expect("canonical generated path")
-        );
-    }
-
-    #[tokio::test]
-    async fn generated_tasks_race_blocks_without_overwriting_or_persisting_the_loser() {
-        let tmp = tempfile::tempdir().expect("create temp directory");
-        let plan_dir = tmp.path().join("racing-plan");
-        std::fs::create_dir(&plan_dir).expect("create plan directory");
-        std::fs::write(plan_dir.join("SCOPE.md"), "# Scope\nGenerate one task.")
-            .expect("write scope");
-        let requested_path = plan_dir.join("TASKS.md");
-        let planner: Arc<dyn TaskListInterpreter> = Arc::new(DeterministicGenerator {
-            race_winner: Some((requested_path.clone(), SAMPLE_TASK_LIST.to_string())),
-        });
-        let api = generation_test_api(tmp.path(), planner);
-        let slug = run_slug(&requested_path);
-
-        let CommandOutcome::RunOpened { run } = api
-            .execute(Command::OpenRun {
-                task_list_path: requested_path.clone(),
-            })
-            .await
-            .expect("open racing task-list path")
-        else {
-            panic!("expected RunOpened")
-        };
-
-        assert_eq!(
-            std::fs::read_to_string(&requested_path).expect("read race winner"),
-            SAMPLE_TASK_LIST,
-            "generation must not overwrite the entry that won the race"
-        );
-        let view = api.run(run).await.expect("opened blocked run");
-        assert!(view.report.issues.iter().any(|issue| {
-            issue.code == "task-list-generation-race"
-                && issue.severity == crate::ingestion::IssueSeverity::Blocking
-        }));
-        assert!(
-            crate::persist::load_graph(tmp.path(), &slug)
-                .await
-                .expect("load generated artifact")
-                .is_none(),
-            "the losing generated graph must not be persisted"
-        );
-    }
-
-    /// **Acceptance: generated graph opens a run end-to-end.**
-    ///
-    /// OpenRun on a TASKS-less dir should return `CommandOutcome::RunOpened`
-    /// with a `Pending` run. The generated TASKS.md should exist in the dir and
-    /// be re-interpretable via the deterministic path.
-    #[tokio::test]
-    async fn generated_graph_is_ingested_and_run_opens() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plan_dir = tmp.path().join("0999-test-plan");
-        std::fs::create_dir(&plan_dir).expect("create plan dir");
-
-        let scope_content = "# Scope\nTest plan.";
-        let arch_content = "# Architecture\nSimple.";
-
-        std::fs::write(plan_dir.join("SCOPE.md"), scope_content).expect("write SCOPE.md");
-        std::fs::write(plan_dir.join("ARCHITECTURE.md"), arch_content)
-            .expect("write ARCHITECTURE.md");
-        // Omit TASKS.md
-
-        let task_list_path = plan_dir.join("TASKS.md");
-
-        let valid_json = r#"{
-  "slug": "0999-test-plan-tasks",
-  "tasks": [
-    {
-      "id": "gen-task",
-      "title": "Generated task",
-      "description": "A task.",
-      "done_when": "When done.",
-      "depends_on": [],
-      "state": "new",
-      "gate_iterations": 0,
-      "review_iterations": 0,
-      "created_at": "2026-05-28T10:00:00Z",
-      "updated_at": "2026-05-28T10:00:00Z"
-    }
-  ]
-}
-"#;
-
-        let backend: Arc<dyn AgentBackend> =
-            Arc::new(NoopBackend::with_responses(vec![valid_json.to_string()]));
-        let planner_interpreter = crate::interpreter::build_planner_interpreter(
-            &crate::config::PlannerMechanism::OneShotAgent,
-            Some(Arc::clone(&backend)),
-        )
-        .expect("build planner interpreter");
-
-        let config = no_gate_config();
-
-        let api = CoreApi::with_audit_registry(
-            Arc::new(StructuredTextInterpreter::new()),
-            planner_interpreter,
-            Arc::clone(&backend),
-            Arc::clone(&backend),
-            WorktreeManager::new(tmp.path().to_path_buf(), "main".into()),
-            config,
-            Arc::new(NoopAuditRegistry),
-        );
-
-        // Execute OpenRun
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: task_list_path.clone(),
-            })
-            .await
-            .expect("OpenRun should succeed");
-
-        // Assert RunOpened
-        match outcome {
-            CommandOutcome::RunOpened { .. } => {} // expected
-            other => panic!("expected RunOpened, got {other:?}"),
-        }
-
-        // Assert TASKS.md now exists
-        assert!(
-            task_list_path.is_file(),
-            "generated TASKS.md should exist in the dir"
-        );
-
-        // Assert it re-interprets cleanly via the deterministic path
-        let markdown = std::fs::read_to_string(&task_list_path).expect("read generated TASKS.md");
-        let graph = crate::interpreter::StructuredTextInterpreter::new()
-            .interpret("0999-test-plan-tasks", &markdown)
-            .await
-            .expect("generated TASKS.md should re-interpret");
-        assert!(!graph.tasks.is_empty());
-    }
-
-    /// **Acceptance: offline path opens with a "cannot generate" issue.**
-    ///
-    /// When the planner is deterministic (no model), opening a TASKS-less dir
-    /// should not hard-error. Instead, it should open with a reviewable blocking
-    /// issue "cannot generate" rather than panicking.
-    #[tokio::test]
-    async fn no_tasks_md_does_not_hard_error_offline() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-        let plan_dir = tmp.path().join("0999-test-plan");
-        std::fs::create_dir(&plan_dir).expect("create plan dir");
-
-        std::fs::write(plan_dir.join("SCOPE.md"), "# Scope\nTest.").expect("write SCOPE.md");
-        std::fs::write(plan_dir.join("ARCHITECTURE.md"), "# Arch\nTest.")
-            .expect("write ARCHITECTURE.md");
-
-        let task_list_path = plan_dir.join("TASKS.md");
-
-        // Build a CoreApi with a DETERMINISTIC planner interpreter (no model).
-        let planner_interpreter = Arc::new(StructuredTextInterpreter::new());
-        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![]));
-
-        let config = no_gate_config();
-
-        let api = CoreApi::with_audit_registry(
-            Arc::new(StructuredTextInterpreter::new()),
-            planner_interpreter,
-            Arc::clone(&backend),
-            Arc::clone(&backend),
-            WorktreeManager::new(tmp.path().to_path_buf(), "main".into()),
-            config,
-            Arc::new(NoopAuditRegistry),
-        );
-
-        // Execute OpenRun
-        let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: task_list_path.clone(),
-            })
-            .await
-            .expect("OpenRun should return Ok (Pending with issue), not ApiError");
-
-        // Assert RunOpened (not hard error)
-        match outcome {
-            CommandOutcome::RunOpened { .. } => {} // expected
-            other => panic!("expected RunOpened, got {other:?}"),
-        }
-
-        // Get the registered run and verify it has a blocking issue
-        let runs = api.state.runs.lock().expect("runs mutex");
-        assert_eq!(runs.len(), 1, "should have registered one run");
-        let run = runs.iter().next().unwrap().1;
-        assert!(
-            run.report.is_blocked(),
-            "run should have a blocking issue since generation failed"
-        );
-    }
-
-    /// **Acceptance: non-TASKS.md missing file still errors.**
-    ///
-    /// A missing `.tasks/ghost.json` (not a plan-style TASKS.md) must still
-    /// return `ApiError::InvalidCommand` — the generate branch is correctly scoped.
-    #[tokio::test]
-    async fn non_tasks_md_missing_file_still_errors() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
-
-        let backend: Arc<dyn AgentBackend> = Arc::new(NoopBackend::with_responses(vec![]));
-        let planner_interpreter = crate::interpreter::build_planner_interpreter(
-            &crate::config::PlannerMechanism::OneShotAgent,
-            Some(Arc::clone(&backend)),
-        )
-        .expect("build planner interpreter");
-
-        let config = no_gate_config();
-
-        let api = CoreApi::with_audit_registry(
-            Arc::new(StructuredTextInterpreter::new()),
-            planner_interpreter,
-            Arc::clone(&backend),
-            Arc::clone(&backend),
-            WorktreeManager::new(tmp.path().to_path_buf(), "main".into()),
-            config,
-            Arc::new(NoopAuditRegistry),
-        );
-
-        // Try to open a non-TASKS.md missing file (e.g., .tasks/ghost.json)
-        let ghost_path = tmp.path().join(".tasks").join("ghost.json");
-
-        let result = api
-            .execute(Command::OpenRun {
-                task_list_path: ghost_path,
-            })
-            .await;
-
-        // Should error with ApiError::InvalidCommand (not generate)
-        assert!(
-            result.is_err(),
-            "opening a missing non-TASKS.md file should error"
-        );
-        match result {
-            Err(ApiError::InvalidCommand { reason }) => {
-                assert!(
-                    reason.contains("could not read"),
-                    "error message should indicate read failure: {reason}"
-                );
-            }
-            Err(other) => {
-                panic!("expected ApiError::InvalidCommand, got {other:?}");
-            }
-            Ok(_) => {
-                panic!("expected error, got Ok");
-            }
-        }
     }
 }

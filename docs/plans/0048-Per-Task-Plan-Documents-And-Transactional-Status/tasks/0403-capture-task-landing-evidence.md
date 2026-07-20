@@ -11,8 +11,8 @@ touches:
   - crates/makina-core/src/task.rs
   - crates/makina-core/tests/squash_merge.rs
   - crates/makina-core/tests/task_landing_evidence.rs
-status: planned
-merged_as: ""
+status: done
+merged_as: "a997f4b09ebe89be9cffdd067f26be79f2045d9c"
 ---
 # Capture Verifiable Task Landing Evidence
 

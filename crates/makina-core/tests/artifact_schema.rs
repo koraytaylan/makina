@@ -1,192 +1,145 @@
-//! Integration test: the canonical sample artifact round-trips through
-//! `TaskGraph` deserialization and passes `TaskGraph::validate()`.
+//! Regression tests for the checkpoint-only sample artifact.
 //!
-//! This test loads the committed sample from
-//! `docs/spec/examples/sample-run.tasks.json` via `include_str!`, which
-//! resolves the path at compile time relative to this source file.
+//! Plan documents remain authoritative; this JSON contains only compatible
+//! volatile scheduler and recovery state.
 
-use makina_core::task::{TaskGraph, TaskId, TaskState};
+use std::path::PathBuf;
 
-/// The canonical sample artifact embedded at compile time.
+use makina_core::checkpoint::PlanCheckpoint;
+use makina_core::task::TaskState;
+
 const SAMPLE_JSON: &str = include_str!("../../../docs/spec/examples/sample-run.tasks.json");
 
-/// Parse the sample artifact and confirm it deserializes without error.
-#[test]
-fn sample_artifact_deserializes() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON)
-        .expect("sample-run.tasks.json must deserialize into TaskGraph");
-
-    assert_eq!(graph.slug, "sample-run", "slug must match file stem");
-    assert_eq!(graph.tasks.len(), 5, "sample must contain exactly 5 tasks");
+fn sample() -> PlanCheckpoint {
+    serde_json::from_str(SAMPLE_JSON)
+        .expect("sample-run.tasks.json must deserialize into PlanCheckpoint")
 }
 
-/// `TaskGraph::validate()` must return `Ok` for the sample artifact.
 #[test]
-fn sample_artifact_passes_validate() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
-
-    graph
-        .validate()
-        .expect("sample-run.tasks.json must pass TaskGraph::validate()");
-}
-
-/// The `in-progress` task must parse its state correctly and have non-zero
-/// `gate_iterations`, confirming that the iteration-count field survives
-/// the round-trip.
-#[test]
-fn in_progress_task_has_correct_state_and_gate_iterations() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
-
-    let id = TaskId::new("agent-backend-trait");
-    let task = graph
-        .get(&id)
-        .expect("agent-backend-trait must be present in the sample");
-
+fn sample_is_a_versioned_plan_checkpoint() {
+    let checkpoint = sample();
+    assert_eq!(checkpoint.schema_version, 1);
     assert_eq!(
-        task.state,
-        TaskState::InProgress,
-        "agent-backend-trait state must be InProgress"
+        checkpoint.identity.plan_dir,
+        PathBuf::from("docs/plans/0048-per-task-plan-documents")
     );
+    assert_eq!(checkpoint.identity.executable_digest.len(), 64);
     assert!(
-        task.gate_iterations > 0,
-        "agent-backend-trait gate_iterations must be > 0 in the sample"
+        checkpoint
+            .identity
+            .executable_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
 }
 
-/// A `depends_on` edge must resolve via `TaskGraph::get()`.
 #[test]
-fn depends_on_edge_resolves_via_get() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
+fn identity_names_exact_ordered_tasks_and_source_paths() {
+    let checkpoint = sample();
+    assert_eq!(
+        checkpoint.identity.task_ids,
+        ["define-schema", "project-runtime"]
+    );
+    assert_eq!(
+        checkpoint.identity.task_source_paths,
+        [
+            PathBuf::from("docs/plans/0048-per-task-plan-documents/tasks/0101-define-schema.md"),
+            PathBuf::from("docs/plans/0048-per-task-plan-documents/tasks/0201-project-runtime.md"),
+        ]
+    );
+    assert_eq!(
+        checkpoint
+            .tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        checkpoint
+            .identity
+            .task_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+}
 
-    // `core-api-surface` depends on `workspace-scaffold`.
-    let id = TaskId::new("core-api-surface");
-    let task = graph.get(&id).expect("core-api-surface must be present");
-
+#[test]
+fn tasks_contain_only_volatile_state_and_counters() {
+    let checkpoint = sample();
+    assert_eq!(checkpoint.tasks.len(), 2);
+    assert_eq!(checkpoint.tasks[0].state, TaskState::Done);
+    assert_eq!(checkpoint.tasks[1].state, TaskState::Ready);
     assert!(
-        !task.depends_on.is_empty(),
-        "core-api-surface must have at least one dependency"
+        checkpoint
+            .tasks
+            .iter()
+            .all(|task| task.gate_iterations == 0 && task.review_iterations == 0)
     );
 
-    for dep_id in &task.depends_on {
-        let resolved = graph.get(dep_id);
-        assert!(
-            resolved.is_some(),
-            "dependency '{dep_id}' of core-api-surface must resolve in the graph"
+    let value: serde_json::Value = serde_json::from_str(SAMPLE_JSON).unwrap();
+    for task in value["tasks"].as_array().unwrap() {
+        let mut keys = task
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["gate_iterations", "id", "review_iterations", "state"]
         );
     }
 }
 
-/// The `done` task must have both `started_at` and `finished_at` present.
 #[test]
-fn done_task_has_start_and_finish_timestamps() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
-
-    let id = TaskId::new("workspace-scaffold");
-    let task = graph.get(&id).expect("workspace-scaffold must be present");
-
-    assert_eq!(
-        task.state,
-        TaskState::Done,
-        "workspace-scaffold must be Done"
-    );
-    assert!(task.started_at.is_some(), "done task must have started_at");
-    assert!(
-        task.finished_at.is_some(),
-        "done task must have finished_at"
-    );
-}
-
-/// Optional fields (`section`, `started_at`, `finished_at`) are absent (not
-/// `null`) on tasks that have not reached those lifecycle points.
-#[test]
-fn optional_fields_absent_on_new_task() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
-
-    let id = TaskId::new("planner-actor");
-    let task = graph.get(&id).expect("planner-actor must be present");
-
-    assert_eq!(task.state, TaskState::New, "planner-actor must be New");
-    assert!(
-        task.section.is_none(),
-        "planner-actor section must be None (omitted in JSON)"
-    );
-    assert!(
-        task.started_at.is_none(),
-        "planner-actor started_at must be None (omitted in JSON)"
-    );
-    assert!(
-        task.finished_at.is_none(),
-        "planner-actor finished_at must be None (omitted in JSON)"
-    );
-}
-
-/// The `ready` task must have state `Ready` and no `started_at`.
-#[test]
-fn ready_task_has_correct_state_and_no_started_at() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
-
-    let id = TaskId::new("core-api-surface");
-    let task = graph.get(&id).expect("core-api-surface must be present");
-
-    assert_eq!(
-        task.state,
-        TaskState::Ready,
-        "core-api-surface must be Ready"
-    );
-    assert!(
-        task.started_at.is_none(),
-        "ready task must not yet have started_at"
-    );
-}
-
-/// The `ready` rule holds: every `ready` task has all deps in `done` state.
-#[test]
-fn ready_tasks_have_all_deps_done() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
-
-    for task in &graph.tasks {
-        if task.state == TaskState::Ready {
-            for dep_id in &task.depends_on {
-                let dep = graph.get(dep_id).expect("dependency must resolve in graph");
-                assert_eq!(
-                    dep.state,
-                    TaskState::Done,
-                    "ready task '{}' has dep '{}' in state {:?}, expected Done",
-                    task.id,
-                    dep_id,
-                    dep.state
-                );
+fn sample_contains_no_authored_narrative_dependencies_or_git_truth() {
+    let value: serde_json::Value = serde_json::from_str(SAMPLE_JSON).unwrap();
+    let forbidden = [
+        "title",
+        "description",
+        "done_when",
+        "depends_on",
+        "gated",
+        "touches",
+        "status",
+        "merged_as",
+        "source_digest",
+        "validation_base_oid",
+        "landing_oid",
+        "final_oid",
+    ];
+    fn assert_absent(value: &serde_json::Value, forbidden: &[&str]) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in forbidden {
+                    assert!(
+                        !map.contains_key(*key),
+                        "checkpoint contains forbidden `{key}`"
+                    );
+                }
+                for child in map.values() {
+                    assert_absent(child, forbidden);
+                }
             }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    assert_absent(child, forbidden);
+                }
+            }
+            _ => {}
         }
     }
+    assert_absent(&value, &forbidden);
 }
 
-/// The diamond dependency: `planner-actor` depends on both `task-model` and
-/// `core-api-surface`; since `core-api-surface` is `ready` (not `done`),
-/// `planner-actor` correctly remains `new`.
 #[test]
-fn diamond_dep_keeps_planner_actor_new() {
-    let graph: TaskGraph = serde_json::from_str(SAMPLE_JSON).expect("deserialization must succeed");
-
-    let id = TaskId::new("planner-actor");
-    let task = graph.get(&id).expect("planner-actor must be present");
-
-    assert_eq!(task.state, TaskState::New, "planner-actor must be New");
+fn sample_has_no_active_recovery_evidence_and_round_trips() {
+    let checkpoint = sample();
+    assert!(checkpoint.active_refs.is_empty());
+    assert!(checkpoint.active_worktrees.is_empty());
+    let encoded = serde_json::to_string(&checkpoint).unwrap();
     assert_eq!(
-        task.depends_on.len(),
-        2,
-        "planner-actor must have exactly 2 dependencies (diamond)"
-    );
-
-    // Confirm at least one dep is not done (which is why it stays new).
-    let any_not_done = task.depends_on.iter().any(|dep_id| {
-        graph
-            .get(dep_id)
-            .map(|d| d.state != TaskState::Done)
-            .unwrap_or(false)
-    });
-    assert!(
-        any_not_done,
-        "planner-actor should have at least one dep not yet done, keeping it new"
+        serde_json::from_str::<PlanCheckpoint>(&encoded).unwrap(),
+        checkpoint
     );
 }

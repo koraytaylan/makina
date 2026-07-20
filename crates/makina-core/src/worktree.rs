@@ -95,6 +95,8 @@ pub enum WorktreeError {
     /// whether a path exists, or removing a leftover directory).
     #[error("I/O error in worktree manager: {0}")]
     Io(#[from] std::io::Error),
+    #[error("recovery evidence retained at `{path}`: {reason}")]
+    RecoveryEvidence { path: PathBuf, reason: String },
 }
 
 // ── WorktreeHandle ────────────────────────────────────────────────────────────
@@ -117,13 +119,30 @@ pub struct WorktreeHandle {
     pub path: PathBuf,
 }
 
+/// Run-qualified coordinator checkout. It is private runtime state and is
+/// never the operator's repository checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationWorkspace {
+    pub path: PathBuf,
+    pub plan_branch: String,
+}
+
 /// Summary returned by [`WorktreeManager::purge_makina_worktrees`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreePurgeReport {
     /// Number of registered git worktrees removed.
     pub worktrees_removed: usize,
     /// Number of orphan directories removed from Makina's transient worktree root.
     pub orphan_dirs_removed: usize,
+    /// Candidates retained because deleting them could destroy recovery evidence.
+    pub preserved: Vec<PreservedWorktree>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedWorktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub reason: String,
 }
 
 // ── WorktreeManager ───────────────────────────────────────────────────────────
@@ -156,6 +175,7 @@ pub struct WorktreeManager {
     /// Branch new task branches fork from. `None` ⇒ fork from `base_branch`
     /// (legacy ask-path). The run sets this to `plan/{plan_slug}`.
     pub fork_branch: Option<String>,
+    repository_child_token: Option<Arc<crate::repository_lease::RepositoryChildToken>>,
 
     /// Serializes worktree-lifecycle git operations ([`create`](Self::create) /
     /// [`remove`](Self::remove)) across concurrent drivers running against the
@@ -179,6 +199,125 @@ pub struct WorktreeManager {
 }
 
 impl WorktreeManager {
+    /// Create immutable recovery refs for every active plan/task ref. Existing
+    /// exact refs are reused; divergent archive names fail closed.
+    pub async fn archive_run_refs(
+        &self,
+        plan_slug: &str,
+        run_uid: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<String>, WorktreeError> {
+        let plan_ref = format!("refs/heads/plan/{plan_slug}");
+        let mut requested = vec![plan_ref];
+        requested.extend(task_ids.iter().map(|task| {
+            format!(
+                "refs/heads/task/{}",
+                paths::short_worktree_name(plan_slug, task)
+            )
+        }));
+        let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)"];
+        args.extend(requested.iter().map(String::as_str));
+        let output = self
+            .run_git(&args, "enumerate refs for reset archive")
+            .await?;
+        let mut archived = Vec::new();
+        for line in output.lines().filter(|line| !line.is_empty()) {
+            let (source_ref, oid) =
+                line.split_once(' ')
+                    .ok_or_else(|| WorktreeError::GitCommandFailed {
+                        command: "parse reset archive refs".into(),
+                        stderr: format!("malformed ref record: {line}"),
+                    })?;
+            let suffix = source_ref
+                .strip_prefix("refs/heads/")
+                .expect("enumerated head ref")
+                .replace('/', "--");
+            let archive = format!("refs/makina/recovery/{plan_slug}/{run_uid}/{suffix}");
+            if self
+                .run_git(
+                    &["update-ref", &archive, oid, ""],
+                    "create reset recovery ref",
+                )
+                .await
+                .is_err()
+            {
+                let actual = self
+                    .run_git(
+                        &["rev-parse", "--verify", &archive],
+                        "verify reset recovery ref",
+                    )
+                    .await?;
+                if actual.trim() != oid {
+                    return Err(WorktreeError::RecoveryEvidence {
+                        path: self.repo_root.clone(),
+                        reason: format!("archive {archive} is divergent"),
+                    });
+                }
+            }
+            archived.push(archive);
+        }
+        Ok(archived)
+    }
+
+    /// Prove a stale claimed task has no unlanded recovery state. Absence is
+    /// clean; an existing branch must still equal the claim commit and any
+    /// registered worktree must have no tracked or untracked changes.
+    pub async fn prove_stale_claim_clean(
+        &self,
+        plan_slug: &str,
+        task_id: &str,
+        claim_oid: &str,
+    ) -> Result<(), WorktreeError> {
+        let branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
+        let path = self.worktree_path(plan_slug, task_id)?;
+        if !self.branch_exists(&branch).await? {
+            if path.exists() {
+                return Err(WorktreeError::RecoveryEvidence {
+                    path,
+                    reason: "unregistered stale task directory may contain recovery data".into(),
+                });
+            }
+            return Ok(());
+        }
+        let tip = self
+            .run_git(&["rev-parse", &branch], "inspect stale task branch")
+            .await?;
+        if tip.trim() != claim_oid {
+            return Err(WorktreeError::RecoveryEvidence {
+                path,
+                reason: format!("task branch diverged from claim {claim_oid}"),
+            });
+        }
+        if path.exists() {
+            let head = self
+                .run_git_at(
+                    &path,
+                    &["symbolic-ref", "--short", "HEAD"],
+                    "inspect stale worktree branch",
+                )
+                .await?;
+            if head.trim() != branch {
+                return Err(WorktreeError::RecoveryEvidence {
+                    path,
+                    reason: format!("worktree is attached to {head}, expected {branch}"),
+                });
+            }
+            let dirty = self
+                .run_git_at(
+                    &path,
+                    &["status", "--porcelain", "--untracked-files=all"],
+                    "inspect stale worktree dirtiness",
+                )
+                .await?;
+            if !dirty.is_empty() {
+                return Err(WorktreeError::RecoveryEvidence {
+                    path,
+                    reason: "worktree contains tracked or untracked recovery changes".into(),
+                });
+            }
+        }
+        Ok(())
+    }
     /// Create a new manager for the given repository.
     ///
     /// # Arguments
@@ -190,6 +329,7 @@ impl WorktreeManager {
             repo_root,
             base_branch,
             fork_branch: None,
+            repository_child_token: None,
             op_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -201,6 +341,20 @@ impl WorktreeManager {
     pub fn with_fork_branch(mut self, branch: String) -> Self {
         self.fork_branch = Some(branch);
         self
+    }
+
+    pub fn with_repository_child_token(
+        mut self,
+        token: Arc<crate::repository_lease::RepositoryChildToken>,
+    ) -> Self {
+        self.repository_child_token = Some(token);
+        self
+    }
+
+    pub(crate) fn repository_child_token(
+        &self,
+    ) -> Option<Arc<crate::repository_lease::RepositoryChildToken>> {
+        self.repository_child_token.clone()
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -245,7 +399,7 @@ impl WorktreeManager {
     ) -> Result<WorktreeHandle, WorktreeError> {
         validate_task_id(task_id)?;
 
-        let worktree_path = self.worktree_path(plan_slug, task_id);
+        let worktree_path = self.worktree_path(plan_slug, task_id)?;
         let branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
 
         // Serialize this whole lifecycle against any concurrent driver's
@@ -266,13 +420,10 @@ impl WorktreeManager {
         // so reset the slot fresh off the fork point (Option A — the prior attempt
         // was never merged, so its work is throwaway).
         if worktree_path.exists() || self.branch_exists(&branch).await? {
-            tracing::warn!(
-                plan_slug,
-                task_id,
-                "reclaiming stale worktree/branch from a prior interrupted run"
-            );
-            // Already holding `op_lock`: call the non-locking inner helper.
-            self.remove_inner(plan_slug, task_id).await?;
+            return Err(WorktreeError::RecoveryEvidence {
+                path: worktree_path,
+                reason: format!("task branch `{branch}` or worktree already exists"),
+            });
         }
 
         // Create the worktree + branch in one atomic git command.
@@ -292,6 +443,271 @@ impl WorktreeManager {
             branch,
             path: worktree_path,
         })
+    }
+
+    /// Create or verify the run's private integration workspace. Creation is
+    /// deliberately create-only: an existing path is inspected and retained on
+    /// any ambiguity instead of being reset, cleaned, or force-removed.
+    pub async fn create_integration_workspace(
+        &self,
+        plan_slug: &str,
+        run_uid: &str,
+    ) -> Result<IntegrationWorkspace, WorktreeError> {
+        let _op_guard = self.op_lock.lock().await;
+        let path = paths::run_dir(&self.repo_root, run_uid)?.join("integration");
+        let branch = format!("plan/{plan_slug}");
+        if path.exists() {
+            let inside = self
+                .git_command(&path)
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .output()
+                .await?;
+            if !inside.status.success() {
+                return Err(WorktreeError::GitCommandFailed {
+                    command: format!("verify retained integration workspace {}", path.display()),
+                    stderr: "existing path is not a registered Git worktree; retained for recovery"
+                        .into(),
+                });
+            }
+            let head = self
+                .git_command(&path)
+                .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .output()
+                .await?;
+            if head.status.success() && String::from_utf8_lossy(&head.stdout).trim() != branch {
+                return Err(WorktreeError::GitCommandFailed {
+                    command: format!("verify retained integration workspace {}", path.display()),
+                    stderr: "workspace is detached or attached to unexpected lineage; retained for recovery"
+                        .into(),
+                });
+            }
+            if !head.status.success() && self.branch_exists(&branch).await? {
+                self.run_git_at_checked(&path, &["checkout", &branch], "attach retained plan ref")
+                    .await?;
+            }
+            return Ok(IntegrationWorkspace {
+                path,
+                plan_branch: branch,
+            });
+        }
+        tokio::fs::create_dir_all(path.parent().expect("integration path has parent")).await?;
+        let base_oid = self
+            .run_git(
+                &["rev-parse", &self.base_branch],
+                "resolve integration base",
+            )
+            .await?
+            .trim()
+            .to_string();
+        self.run_git(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_string_lossy().as_ref(),
+                &base_oid,
+            ],
+            &format!("create detached integration workspace {}", path.display()),
+        )
+        .await?;
+        if self.branch_exists(&branch).await? {
+            let attached = self
+                .git_command(&path)
+                .args(["checkout", &branch])
+                .output()
+                .await?;
+            if !attached.status.success() {
+                return Err(WorktreeError::GitCommandFailed {
+                    command: format!("attach integration workspace to retained {branch}"),
+                    stderr: String::from_utf8_lossy(&attached.stderr).trim().into(),
+                });
+            }
+            return Ok(IntegrationWorkspace {
+                path,
+                plan_branch: branch,
+            });
+        }
+        Ok(IntegrationWorkspace {
+            path,
+            plan_branch: branch,
+        })
+    }
+
+    /// Atomically publish a fully constructed detached registration candidate.
+    /// Response-loss retries are idempotent when the ref already equals the
+    /// exact candidate. No branch is exposed before both the candidate parent
+    /// and current base match `expected_base`.
+    pub async fn publish_registration(
+        &self,
+        workspace: &IntegrationWorkspace,
+        candidate: &str,
+        expected_base: &str,
+    ) -> Result<(), WorktreeError> {
+        let parent = self
+            .run_git_at(
+                &workspace.path,
+                &["rev-parse", &format!("{candidate}^")],
+                "verify R parent",
+            )
+            .await?;
+        if parent.trim() != expected_base {
+            return Err(WorktreeError::RecoveryEvidence {
+                path: workspace.path.clone(),
+                reason: "registration candidate is not a child of the expected base".into(),
+            });
+        }
+        if self.branch_exists(&workspace.plan_branch).await? {
+            let actual = self
+                .run_git(
+                    &["rev-parse", &workspace.plan_branch],
+                    "verify published registration",
+                )
+                .await?;
+            if actual.trim() != candidate {
+                return Err(WorktreeError::RecoveryEvidence {
+                    path: workspace.path.clone(),
+                    reason: "plan ref already names different recovery evidence".into(),
+                });
+            }
+        } else {
+            let transaction = format!(
+                "start\nverify refs/heads/{} {}\ncreate refs/heads/{} {}\nprepare\ncommit\n",
+                self.base_branch, expected_base, workspace.plan_branch, candidate
+            );
+            let mut child = self.git_command(&self.repo_root);
+            child
+                .args(["update-ref", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = child.spawn()?;
+            use tokio::io::AsyncWriteExt;
+            child
+                .stdin
+                .as_mut()
+                .expect("piped stdin")
+                .write_all(transaction.as_bytes())
+                .await?;
+            let output = child.wait_with_output().await?;
+            if !output.status.success() {
+                return Err(WorktreeError::GitCommandFailed {
+                    command: "atomic registration ref transaction".into(),
+                    stderr: format!(
+                        "{}; detached candidate retained at {}",
+                        String::from_utf8_lossy(&output.stderr).trim(),
+                        workspace.path.display()
+                    ),
+                });
+            }
+        }
+        self.run_git_at_checked(
+            &workspace.path,
+            &["checkout", &workspace.plan_branch],
+            "attach published registration",
+        )
+        .await
+    }
+
+    /// Atomically archive and replace an unconsumed registration.
+    pub async fn publish_registration_refresh(
+        &self,
+        workspace: &IntegrationWorkspace,
+        candidate: &str,
+        expected_base: &str,
+        expected_old: &str,
+    ) -> Result<(), WorktreeError> {
+        let parent = self
+            .run_git_at(
+                &workspace.path,
+                &["rev-parse", &format!("{candidate}^")],
+                "verify R2 parent",
+            )
+            .await?;
+        if parent.trim() != expected_base {
+            return Err(WorktreeError::RecoveryEvidence {
+                path: workspace.path.clone(),
+                reason: "refreshed registration is not a child of expected base".into(),
+            });
+        }
+        let archive = format!(
+            "refs/makina/recovery/{}/{}",
+            workspace.plan_branch, expected_old
+        );
+        let archive_exists = self
+            .run_git(
+                &["rev-parse", "--verify", &archive],
+                "inspect registration archive",
+            )
+            .await
+            .ok();
+        if archive_exists
+            .as_deref()
+            .is_some_and(|oid| oid.trim() != expected_old)
+        {
+            return Err(WorktreeError::RecoveryEvidence {
+                path: workspace.path.clone(),
+                reason: "registration archive ref is divergent".into(),
+            });
+        }
+        let archive_command = if archive_exists.is_some() {
+            format!("verify {archive} {expected_old}\n")
+        } else {
+            format!("create {archive} {expected_old}\n")
+        };
+        let transaction = format!(
+            "start\nverify refs/heads/{} {}\n{}update refs/heads/{} {} {}\nprepare\ncommit\n",
+            self.base_branch,
+            expected_base,
+            archive_command,
+            workspace.plan_branch,
+            candidate,
+            expected_old
+        );
+        let mut child = self.git_command(&self.repo_root);
+        child
+            .args(["update-ref", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = child.spawn()?;
+        use tokio::io::AsyncWriteExt;
+        child
+            .stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(transaction.as_bytes())
+            .await?;
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            // Response loss: exact new plan ref + archive is success.
+            let plan = self
+                .run_git(
+                    &["rev-parse", &workspace.plan_branch],
+                    "verify refreshed registration",
+                )
+                .await
+                .ok();
+            let archived = self
+                .run_git(&["rev-parse", &archive], "verify registration archive")
+                .await
+                .ok();
+            if plan.as_deref().is_none_or(|oid| oid.trim() != candidate)
+                || archived
+                    .as_deref()
+                    .is_none_or(|oid| oid.trim() != expected_old)
+            {
+                return Err(WorktreeError::GitCommandFailed {
+                    command: "atomic registration refresh transaction".into(),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+                });
+            }
+        }
+        self.run_git_at_checked(
+            &workspace.path,
+            &["checkout", &workspace.plan_branch],
+            "attach refreshed registration",
+        )
+        .await
     }
 
     /// Remove the worktree and branch for `task_id` within `plan_slug`.
@@ -329,6 +745,45 @@ impl WorktreeManager {
         self.remove_inner(plan_slug, task_id).await
     }
 
+    /// Preserve the pre-transactional cleanup contract for graph-only runs.
+    pub async fn remove_legacy(&self, plan_slug: &str, task_id: &str) -> Result<(), WorktreeError> {
+        validate_task_id(task_id)?;
+        let _op_guard = self.op_lock.lock().await;
+        let worktree_path = self.worktree_path(plan_slug, task_id)?;
+        let branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
+        let path = worktree_path.to_string_lossy();
+        let removal = self
+            .run_git(
+                &["worktree", "remove", "--force", &path],
+                &format!(
+                    "git -C {} worktree remove --force {path}",
+                    self.repo_root.display()
+                ),
+            )
+            .await;
+        if let Err(WorktreeError::GitCommandFailed { ref stderr, .. }) = removal
+            && !is_not_found_stderr(stderr)
+        {
+            return removal.map(|_| ());
+        }
+        if worktree_path.exists() {
+            let _ = tokio::fs::remove_dir_all(&worktree_path).await;
+        }
+        let deletion = self
+            .run_git(
+                &["branch", "-D", &branch],
+                &format!("git -C {} branch -D {branch}", self.repo_root.display()),
+            )
+            .await;
+        if let Err(WorktreeError::GitCommandFailed { ref stderr, .. }) = deletion
+            && !is_not_found_stderr(stderr)
+        {
+            return deletion.map(|_| ());
+        }
+        let _ = self.git_worktree_prune().await;
+        Ok(())
+    }
+
     /// Purge every git worktree registered under Makina's transient worktree
     /// directory for this repository.
     ///
@@ -339,31 +794,79 @@ impl WorktreeManager {
         let _op_guard = self.op_lock.lock().await;
         self.git_worktree_prune().await?;
 
-        let worktrees_root = paths::worktrees_dir(&self.repo_root);
+        let worktrees_root = paths::worktrees_dir(&self.repo_root)?;
         let registered = self.registered_worktrees().await?;
         let mut worktrees_removed = 0usize;
 
+        let mut preserved = Vec::new();
         for registered in registered
             .into_iter()
             .filter(|wt| wt.path.starts_with(&worktrees_root))
         {
-            self.remove_worktree_path(&registered.path).await?;
-            if let Some(branch) = registered.branch.as_deref()
-                && branch.starts_with("task/")
-            {
-                self.delete_branch_if_exists(branch).await?;
+            let Some(branch) = registered.branch.as_deref() else {
+                preserved.push(PreservedWorktree {
+                    path: registered.path,
+                    branch: None,
+                    reason: "detached or unknown branch; recovery ownership is ambiguous".into(),
+                });
+                continue;
+            };
+            if !branch.starts_with("task/") {
+                preserved.push(PreservedWorktree {
+                    path: registered.path,
+                    branch: Some(branch.to_string()),
+                    reason: "worktree path and branch ownership do not agree".into(),
+                });
+                continue;
             }
+            let status = self
+                .git_command(&registered.path)
+                .args(["status", "--porcelain", "--untracked-files=normal"])
+                .output()
+                .await
+                .map_err(WorktreeError::Io)?;
+            if !status.status.success() || !status.stdout.is_empty() {
+                preserved.push(PreservedWorktree {
+                    path: registered.path,
+                    branch: Some(branch.to_string()),
+                    reason: if status.status.success() {
+                        "worktree contains tracked or untracked recovery changes".into()
+                    } else {
+                        "worktree cleanliness could not be verified".into()
+                    },
+                });
+                continue;
+            }
+            let landed = self
+                .git_command(&self.repo_root)
+                .args(["merge-base", "--is-ancestor", branch, &self.base_branch])
+                .status()
+                .await
+                .map_err(WorktreeError::Io)?;
+            if !landed.success() {
+                preserved.push(PreservedWorktree {
+                    path: registered.path,
+                    branch: Some(branch.to_string()),
+                    reason: "branch contains commits not reachable from the retained base".into(),
+                });
+                continue;
+            }
+            self.remove_worktree_path(&registered.path).await?;
+            self.delete_branch_if_exists(branch).await?;
             worktrees_removed += 1;
         }
 
-        let mut orphan_dirs_removed = 0usize;
+        let orphan_dirs_removed = 0usize;
         if worktrees_root.exists() {
             let mut entries = tokio::fs::read_dir(&worktrees_root).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                if path.is_dir() {
-                    tokio::fs::remove_dir_all(&path).await?;
-                    orphan_dirs_removed += 1;
+                if path.is_dir() && !preserved.iter().any(|item| item.path == path) {
+                    preserved.push(PreservedWorktree {
+                        path,
+                        branch: None,
+                        reason: "unregistered directory may contain recovery evidence".into(),
+                    });
                 }
             }
         }
@@ -373,6 +876,7 @@ impl WorktreeManager {
         Ok(WorktreePurgeReport {
             worktrees_removed,
             orphan_dirs_removed,
+            preserved,
         })
     }
 
@@ -386,22 +890,16 @@ impl WorktreeManager {
     async fn remove_inner(&self, plan_slug: &str, task_id: &str) -> Result<(), WorktreeError> {
         validate_task_id(task_id)?;
 
-        let worktree_path = self.worktree_path(plan_slug, task_id);
+        let worktree_path = self.worktree_path(plan_slug, task_id)?;
         let branch = format!("task/{}", paths::short_worktree_name(plan_slug, task_id));
 
         // Remove the worktree (--force handles dirty checkouts; ignore
         // "not a worktree" / "not found" so the call is idempotent).
         self.remove_worktree_path(&worktree_path).await?;
 
-        // Attempt to clean up the directory if it still exists on disk (e.g.
-        // git removed the worktree registration but left the directory).
-        if worktree_path.exists() {
-            // Best-effort: log but do not fail if this doesn't work.
-            let _ = tokio::fs::remove_dir_all(&worktree_path).await;
-        }
-
-        // Delete the branch (treat "not found" as success).
-        self.delete_branch_if_exists(&branch).await?;
+        // Retain the task ref until durable landing evidence proves its commits
+        // are recoverable elsewhere. A squash result is not ancestry proof.
+        let _ = branch;
 
         // Prune again to keep the git worktree list tidy.
         // Ignore errors here — we've already done what we can.
@@ -415,17 +913,11 @@ impl WorktreeManager {
     /// check it out (a reclaimed run resumes on the same integration branch).
     pub async fn create_plan_branch(&self, plan_slug: &str) -> Result<String, WorktreeError> {
         let branch = format!("plan/{plan_slug}");
-        if self.branch_exists(&branch).await? {
+        if !self.branch_exists(&branch).await? {
             self.run_git(
-                &["checkout", &branch],
-                &format!("git -C {} checkout {branch}", self.repo_root.display(),),
-            )
-            .await?;
-        } else {
-            self.run_git(
-                &["checkout", "-b", &branch, &self.base_branch],
+                &["branch", &branch, &self.base_branch],
                 &format!(
-                    "git -C {} checkout -b {branch} {}",
+                    "git -C {} branch {branch} {}",
                     self.repo_root.display(),
                     self.base_branch
                 ),
@@ -447,29 +939,27 @@ impl WorktreeManager {
 
     /// Delete `plan/{plan_slug}` if it exists, after restoring the base branch.
     pub async fn delete_plan_branch(&self, plan_slug: &str) -> Result<(), WorktreeError> {
-        let _op_guard = self.op_lock.lock().await;
         let branch = format!("plan/{plan_slug}");
-        if !self.branch_exists(&branch).await? {
-            return Ok(());
+        if self.branch_exists(&branch).await? {
+            tracing::warn!(branch, "retaining plan ref as recovery evidence");
         }
-        self.checkout(&self.base_branch).await?;
-        self.delete_branch_if_exists(&branch).await
+        Ok(())
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Compute the worktree path for a given plan slug + task ID.
-    fn worktree_path(&self, plan_slug: &str, task_id: &str) -> PathBuf {
-        paths::worktree(&self.repo_root, plan_slug, task_id)
+    fn worktree_path(&self, plan_slug: &str, task_id: &str) -> Result<PathBuf, WorktreeError> {
+        paths::worktree(&self.repo_root, plan_slug, task_id).map_err(WorktreeError::Io)
     }
 
     async fn remove_worktree_path(&self, worktree_path: &Path) -> Result<(), WorktreeError> {
         let wt_path_str = worktree_path.to_string_lossy();
         let remove_result = self
             .run_git(
-                &["worktree", "remove", "--force", &wt_path_str],
+                &["worktree", "remove", &wt_path_str],
                 &format!(
-                    "git -C {} worktree remove --force {wt_path_str}",
+                    "git -C {} worktree remove {wt_path_str}",
                     self.repo_root.display()
                 ),
             )
@@ -481,18 +971,14 @@ impl WorktreeManager {
             return remove_result.map(|_| ());
         }
 
-        if worktree_path.exists() {
-            let _ = tokio::fs::remove_dir_all(worktree_path).await;
-        }
-
         Ok(())
     }
 
     async fn delete_branch_if_exists(&self, branch: &str) -> Result<(), WorktreeError> {
         let delete_result = self
             .run_git(
-                &["branch", "-D", branch],
-                &format!("git -C {} branch -D {branch}", self.repo_root.display()),
+                &["branch", "-d", branch],
+                &format!("git -C {} branch -d {branch}", self.repo_root.display()),
             )
             .await;
 
@@ -559,13 +1045,16 @@ impl WorktreeManager {
     /// Returns `Ok(stdout)` on exit code 0, or [`WorktreeError::GitCommandFailed`]
     /// on non-zero exit, including the captured stderr.
     async fn run_git(&self, args: &[&str], human_command: &str) -> Result<String, WorktreeError> {
-        let output = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_root)
-            .args(args)
-            .output()
-            .await
-            .map_err(WorktreeError::Io)?;
+        self.run_git_at(&self.repo_root, args, human_command).await
+    }
+
+    async fn run_git_at(
+        &self,
+        path: &Path,
+        args: &[&str],
+        human_command: &str,
+    ) -> Result<String, WorktreeError> {
+        let output = self.git_command(path).args(args).output().await?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -575,6 +1064,25 @@ impl WorktreeManager {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             })
         }
+    }
+
+    async fn run_git_at_checked(
+        &self,
+        path: &Path,
+        args: &[&str],
+        human_command: &str,
+    ) -> Result<(), WorktreeError> {
+        self.run_git_at(path, args, human_command).await.map(|_| ())
+    }
+
+    fn git_command(&self, working_dir: &Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("git");
+        command.arg("-C").arg(working_dir).kill_on_drop(true);
+        #[cfg(unix)]
+        if let Some(token) = &self.repository_child_token {
+            token.inherit_into(&mut command);
+        }
+        command
     }
 }
 
@@ -764,7 +1272,8 @@ mod tests {
         let path = mgr.worktree_path("0003-runtime-and-tui-hardening", "sample-task");
 
         // Must be under state_root, not repo_root/.makina.
-        let state_root = crate::paths::state_root(&repo_root);
+        let state_root = crate::paths::state_root(&repo_root).unwrap();
+        let path = path.unwrap();
         assert!(
             path.starts_with(&state_root),
             "worktree_path must be under state_root ({}), got {}",

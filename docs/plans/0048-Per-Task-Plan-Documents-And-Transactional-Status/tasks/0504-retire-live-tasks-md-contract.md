@@ -21,8 +21,8 @@ touches:
   - docs/demo/README.md
   - docs/plans/README.md
   - README.md
-status: planned
-merged_as: ""
+status: done
+merged_as: "bbfc092cb70a3aa5e22477275644478d9d8ae16a"
 ---
 # Retire The Live TASKS.md Contract
 

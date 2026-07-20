@@ -39,6 +39,7 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CapsConfig, FinalMerge};
+use crate::plan::PlanKey;
 
 // Re-export ingestion report types so TUI (and other consumers) can import them
 // from `makina_core::api` alongside the other view types (RunView, TaskView, …).
@@ -49,7 +50,7 @@ pub use crate::ingestion::{IngestionIssue, IngestionReport, IssueSeverity, Issue
 /// Opaque numeric identifier for an open Run.
 ///
 /// A `RunId` is assigned by the orchestrator when a Run is opened via
-/// [`Command::OpenRun`] and remains stable until the Run is dropped from
+/// [`Command::OpenPlan`] and remains stable until the Run is dropped from
 /// memory.  It is NOT persisted across process restarts; treat it as a
 /// session-scoped handle.
 ///
@@ -139,6 +140,12 @@ pub enum TaskState {
     Failed,
     /// A prerequisite failed, so the task was never run.
     Skipped,
+    /// Authored blocker; visible but not dispatchable.
+    Blocked,
+    /// Authored omission; terminal and never dependency-satisfying.
+    Dropped,
+    /// Authored gate; visible until explicitly ungated in source.
+    Gated,
 }
 
 /// Map the domain [`crate::task::TaskState`] onto the view-level [`TaskState`].
@@ -158,6 +165,9 @@ impl From<crate::task::TaskState> for TaskState {
             Domain::Done => TaskState::Done,
             Domain::Failed => TaskState::Failed,
             Domain::Skipped => TaskState::Skipped,
+            Domain::Blocked => TaskState::Blocked,
+            Domain::Dropped => TaskState::Dropped,
+            Domain::Gated => TaskState::Gated,
         }
     }
 }
@@ -208,6 +218,20 @@ pub struct FailureReason {
     pub message: String,
 }
 
+/// Authored plan-document fields retained alongside mutable runtime state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredTaskView {
+    pub source_path: PathBuf,
+    pub workstream: String,
+    pub kind: String,
+    pub status: String,
+    pub gated: bool,
+    pub touches: Vec<String>,
+    pub merged_as: Option<String>,
+    pub authored_dependencies: Vec<TaskId>,
+    pub collision_dependencies: Vec<TaskId>,
+}
+
 /// A snapshot of one task suitable for rendering in the TUI.
 ///
 /// This is a pure DTO; it holds no behaviour.  The TUI renders `state` as a
@@ -215,6 +239,10 @@ pub struct FailureReason {
 /// and `depends_on` to draw a dependency graph or indent tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskView {
+    /// Immutable task-document metadata, absent only for legacy inert history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored: Option<AuthoredTaskView>,
+
     /// Unique kebab-case identifier within the Run.
     pub id: TaskId,
 
@@ -254,7 +282,7 @@ pub struct TaskView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<FailureReason>,
 
-    /// Raw Markdown entry for this task (title, steps, deps, notes) from TASKS.md,
+    /// Raw Markdown body from the task's typed source document,
     /// captured at parse time so rendering never touches disk.
     #[serde(default)]
     pub entry_text: String,
@@ -278,6 +306,10 @@ pub struct TaskView {
 pub enum RunStatus {
     /// Opened but not yet started.
     Pending,
+    /// Waiting for exclusive mutation ownership of the repository.
+    WaitingForRepository {
+        owner: Option<crate::repository_lease::RepositoryLeaseOwner>,
+    },
     /// Actively running — agents are being dispatched.
     Running,
     /// Explicitly paused; resumable via [`Command::StartRun`].
@@ -312,7 +344,7 @@ pub struct RunView {
 
     /// Path to the task-list file that backs this Run (e.g.
     /// `.tasks/my-feature.json`).  Displayed in the TUI title bar.
-    pub task_list_path: PathBuf,
+    pub plan_dir: PlanKey,
 
     /// The repo directory basename (the final path component of the worktree
     /// manager's `repo_root`).  Used by the TUI to render `{project}/{plan}`
@@ -326,7 +358,7 @@ pub struct RunView {
     /// file; the TUI renders them in this order.
     pub tasks: Vec<TaskView>,
 
-    /// Ingestion report (from validate + qualify) computed at `OpenRun` time
+    /// Ingestion report (from validate + qualify) computed at `OpenPlan` time
     /// and carried on the run.  Enables the TUI to render issues without
     /// re-scanning the source.
     pub report: IngestionReport,
@@ -349,20 +381,53 @@ pub struct RunView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
+    /// Author and atomically publish one complete per-task plan bundle.
+    ///
+    /// The caller proposes the human-authored content and slug only. The
+    /// repository-bound coordinator allocates the global plan number, binds
+    /// validation provenance, and publishes Phase R. This command never opens
+    /// or starts a run as a side effect.
+    GeneratePlanBundle { blueprint: GeneratedPlanBlueprint },
+    /// Publish a committed per-task plan bundle as an evidenced plan ref.
+    RegisterPlan {
+        plan_dir: PlanKey,
+        expected_base_oid: String,
+        expected_source_digest: String,
+    },
+    /// Apply an explicit coordinator-owned disposition to registered source.
+    SetTaskDisposition {
+        run: RunId,
+        task: TaskId,
+        expected_plan_oid: String,
+        action: TaskDispositionAction,
+    },
+    /// Resume delayed final integration from an exact retained plan tip.
+    FinalizePlan {
+        plan_dir: PlanKey,
+        run_uid: String,
+        expected_plan_oid: String,
+        input: FinalizeInput,
+    },
+    /// Archive stale preparation state and prepare again from the current base.
+    ReprepareFinalization {
+        plan_dir: PlanKey,
+        run_uid: String,
+        expected_plan_oid: String,
+    },
     /// Load a task-list file and create a new Run backed by it.
     ///
-    /// The orchestrator reads `task_list_path`, parses the task list, assigns a
+    /// The orchestrator reads `plan_dir`, parses the task list, assigns a
     /// fresh [`RunId`], and returns [`CommandOutcome::RunOpened`].  The Run
     /// starts in [`RunStatus::Pending`]; issue [`Command::StartRun`] to begin
     /// dispatching agents.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::InvalidCommand`] if `task_list_path` does not exist
+    /// Returns [`ApiError::InvalidCommand`] if `plan_dir` does not exist
     /// or cannot be parsed.
-    OpenRun {
+    OpenPlan {
         /// Absolute or repo-relative path to the `.tasks/{slug}.json` file.
-        task_list_path: PathBuf,
+        plan_dir: PlanKey,
     },
 
     /// Transition a [`RunStatus::Pending`] or [`RunStatus::Paused`] Run to
@@ -473,7 +538,7 @@ pub enum Command {
     ///
     /// A repository-bound CoreApi validates that the path names its own root
     /// and acknowledges the command. A multi-project router uses it to extend
-    /// its explicit workspace allowlist before accepting OpenRun paths there.
+    /// its explicit workspace allowlist before accepting OpenPlan paths there.
     RegisterProject {
         /// Project folder selected by the user.
         project_root: PathBuf,
@@ -531,11 +596,96 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskDispositionAction {
+    Ungate,
+    Drop { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "oid", rename_all = "snake_case")]
+pub enum FinalizeInput {
+    Automatic,
+    PreparedStage,
+    ManualCommit(crate::plan::GitObjectId),
+}
+
+/// Serializable authoring input for [Command::GeneratePlanBundle].
+///
+/// This deliberately keeps model-produced scalar values raw. Conversion into
+/// the validated plan domain types is coordinator-owned and fail-closed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedPlanBlueprint {
+    pub slug: String,
+    pub title: String,
+    pub scope: String,
+    pub architecture: String,
+    pub initial_status: GeneratedInitialStatusBlueprint,
+    pub workstreams: Vec<GeneratedWorkstreamBlueprint>,
+    pub tasks: Vec<GeneratedTaskBlueprint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedInitialStatusBlueprint {
+    pub goal: String,
+    pub root_cause: String,
+    pub approach: String,
+    pub outcome: String,
+    pub last_updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedWorkstreamBlueprint {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedTaskBlueprint {
+    pub sequence: String,
+    pub id: String,
+    pub title: String,
+    pub workstream: String,
+    pub kind: String,
+    pub depends_on: Vec<String>,
+    pub touches: Vec<String>,
+    pub gated: bool,
+    pub body: String,
+}
+
+/// Serializable validation diagnostic returned by bundle generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanGenerationDiagnostic {
+    pub code: String,
+    pub path: PathBuf,
+    pub field: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanGenerationReport {
+    pub diagnostics: Vec<PlanGenerationDiagnostic>,
+}
+
 /// The successful outcome of a [`Command`] executed via [`Api::execute`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandOutcome {
-    /// Returned by [`Command::OpenRun`].  The assigned [`RunId`] can be used
+    /// A generated bundle was published as an exact Phase R (or exact R was
+    /// verified after response loss).
+    PlanGenerated {
+        plan_dir: PlanKey,
+        registration_oid: String,
+        report: PlanGenerationReport,
+    },
+    /// The exact committed bundle was registered (or an exact Phase R was reused).
+    PlanRegistered { registration_oid: String },
+    /// The expected bundle exists only in the operator working tree and must be committed.
+    AwaitingCommit,
+    /// The delayed operation passed lease-bound input/evidence validation.
+    FinalizationAccepted { plan_oid: String },
+    /// Returned by [`Command::OpenPlan`].  The assigned [`RunId`] can be used
     /// for all subsequent commands and queries targeting this Run.
     RunOpened {
         /// The freshly assigned identifier for the opened Run.
@@ -548,6 +698,15 @@ pub enum CommandOutcome {
     /// The TUI should react to state changes via the [`EventStream`] rather
     /// than polling after receiving `Acknowledged`.
     Acknowledged,
+    /// A mutating maintenance command found the repository lease occupied.
+    RepositoryBusy {
+        owner: Option<crate::repository_lease::RepositoryLeaseOwner>,
+    },
+    /// Recovery-safe purge completed; preserved paths require user review.
+    WorktreesPurged {
+        removed: usize,
+        preserved: Vec<PathBuf>,
+    },
 }
 
 /// Errors returned by [`Api::execute`].
@@ -760,6 +919,8 @@ pub struct ConfigOptionChoiceView {
 pub enum PlanOperationKind {
     /// Reset a plan/run back to a fresh pending graph.
     Reset,
+    Finalize,
+    ReprepareFinalization,
 }
 
 /// Phase of a long-running plan operation.
@@ -790,6 +951,11 @@ pub enum PlanOperationPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// An evidenced Phase-R plan registration was atomically published.
+    PlanRegistered {
+        plan_dir: PlanKey,
+        registration_oid: String,
+    },
     /// A new Run was successfully opened.
     ///
     /// The TUI should add it to the sidebar and fetch an initial [`RunView`]
@@ -798,7 +964,7 @@ pub enum Event {
         /// The identifier of the newly opened Run.
         run: RunId,
         /// Path to the backing task-list file.
-        task_list_path: PathBuf,
+        plan_dir: PlanKey,
     },
 
     /// The aggregate status of a Run changed.
@@ -810,6 +976,11 @@ pub enum Event {
         run: RunId,
         /// The new aggregate status.
         status: RunStatus,
+    },
+    /// A run entered the fair repository-lease queue.
+    RepositoryLeaseWaiting {
+        run: RunId,
+        owner: Option<crate::repository_lease::RepositoryLeaseOwner>,
     },
 
     /// A task's lifecycle state changed.
@@ -1128,14 +1299,13 @@ mod tests {
     //!   1. The trait is object-safe (`Box<dyn Api>` compiles).
     //!   2. All types derive the required traits (Clone, Debug, serde, etc.).
     //!   3. A straightforward stub can implement `Api`.
-    //!   4. `execute` → `OpenRun` → `CommandOutcome::RunOpened` works end-to-end.
+    //!   4. `execute` → `OpenPlan` → `CommandOutcome::RunOpened` works end-to-end.
     //!   5. `runs()` and `run(id)` return sensible canned data.
     //!   6. `subscribe()` yields synthetic events that can be drained.
 
     use super::*;
     use futures::StreamExt;
     use futures::stream;
-    use std::path::PathBuf;
     use std::sync::Mutex;
 
     // ── Stub implementation ───────────────────────────────────────────────────
@@ -1169,15 +1339,19 @@ mod tests {
     impl Api for StubApi {
         async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
             match command {
-                Command::OpenRun { task_list_path } => {
+                Command::GeneratePlanBundle { .. } => Err(ApiError::InvalidCommand {
+                    reason: "plan generation is unavailable in StubApi".into(),
+                }),
+                Command::OpenPlan { plan_dir } => {
                     let id = self.alloc_id();
                     let view = RunView {
                         id,
                         run_uid: String::new(),
-                        task_list_path,
+                        plan_dir,
                         status: RunStatus::Pending,
                         project: String::new(),
                         tasks: vec![TaskView {
+                            authored: None,
                             id: TaskId::new("stub-task"),
                             title: "Stub task".to_string(),
                             state: TaskState::New,
@@ -1236,7 +1410,8 @@ mod tests {
                 }
                 Command::RetryTask { run, .. }
                 | Command::RetryFailedTasks { run }
-                | Command::ResetRun { run } => {
+                | Command::ResetRun { run }
+                | Command::SetTaskDisposition { run, .. } => {
                     let runs = self.runs.lock().unwrap();
                     if runs.iter().any(|r| r.id == run) {
                         Ok(CommandOutcome::Acknowledged)
@@ -1252,6 +1427,15 @@ mod tests {
                 Command::UnregisterProject { .. } => Ok(CommandOutcome::Acknowledged),
                 Command::UpdateRuntimeSettings { .. } => Ok(CommandOutcome::Acknowledged),
                 Command::PurgeWorktrees { .. } => Ok(CommandOutcome::Acknowledged),
+                Command::RegisterPlan { .. } => Ok(CommandOutcome::AwaitingCommit),
+                Command::FinalizePlan {
+                    expected_plan_oid, ..
+                }
+                | Command::ReprepareFinalization {
+                    expected_plan_oid, ..
+                } => Ok(CommandOutcome::FinalizationAccepted {
+                    plan_oid: expected_plan_oid,
+                }),
             }
         }
 
@@ -1273,7 +1457,7 @@ mod tests {
             let events = vec![
                 Event::RunOpened {
                     run: RunId(1),
-                    task_list_path: PathBuf::from(".tasks/stub.json"),
+                    plan_dir: PlanKey::parse("docs/plans/0001-Stub").unwrap(),
                 },
                 Event::TaskStateChanged {
                     run: RunId(1),
@@ -1312,11 +1496,11 @@ mod tests {
     /// Drive the full lifecycle through `Box<dyn Api>` to prove object-safety.
     async fn open_run(api: &dyn Api, path: &str) -> RunId {
         let outcome = api
-            .execute(Command::OpenRun {
-                task_list_path: PathBuf::from(path),
+            .execute(Command::OpenPlan {
+                plan_dir: PlanKey::parse(path).unwrap(),
             })
             .await
-            .expect("OpenRun must succeed");
+            .expect("OpenPlan must succeed");
         match outcome {
             CommandOutcome::RunOpened { run } => run,
             other => panic!("unexpected outcome: {other:?}"),
@@ -1328,25 +1512,28 @@ mod tests {
     #[tokio::test]
     async fn open_run_returns_run_opened_outcome() {
         let api: Box<dyn Api> = Box::new(StubApi::new());
-        let id = open_run(api.as_ref(), ".tasks/feature.json").await;
+        let id = open_run(api.as_ref(), "docs/plans/0001-Feature").await;
         assert_eq!(id, RunId(1), "first run should get id 1");
     }
 
     #[tokio::test]
     async fn runs_query_reflects_opened_run() {
         let api: Box<dyn Api> = Box::new(StubApi::new());
-        open_run(api.as_ref(), ".tasks/feature.json").await;
+        open_run(api.as_ref(), "docs/plans/0001-Feature").await;
 
         let all = api.runs().await;
         assert_eq!(all.len(), 1, "one run should be open");
         assert_eq!(all[0].status, RunStatus::Pending);
-        assert_eq!(all[0].task_list_path, PathBuf::from(".tasks/feature.json"));
+        assert_eq!(
+            all[0].plan_dir,
+            PlanKey::parse("docs/plans/0001-Feature").unwrap()
+        );
     }
 
     #[tokio::test]
     async fn run_query_by_id_returns_correct_view() {
         let api: Box<dyn Api> = Box::new(StubApi::new());
-        let id = open_run(api.as_ref(), ".tasks/feature.json").await;
+        let id = open_run(api.as_ref(), "docs/plans/0001-Feature").await;
 
         let view = api.run(id).await.expect("run should be found");
         assert_eq!(view.id, id);
@@ -1364,7 +1551,7 @@ mod tests {
     #[tokio::test]
     async fn start_run_transitions_status_to_running() {
         let api: Box<dyn Api> = Box::new(StubApi::new());
-        let id = open_run(api.as_ref(), ".tasks/feature.json").await;
+        let id = open_run(api.as_ref(), "docs/plans/0001-Feature").await;
 
         api.execute(Command::StartRun { run: id })
             .await
@@ -1377,7 +1564,7 @@ mod tests {
     #[tokio::test]
     async fn pause_run_transitions_status_to_paused() {
         let api: Box<dyn Api> = Box::new(StubApi::new());
-        let id = open_run(api.as_ref(), ".tasks/feature.json").await;
+        let id = open_run(api.as_ref(), "docs/plans/0001-Feature").await;
         api.execute(Command::StartRun { run: id }).await.unwrap();
         api.execute(Command::PauseRun { run: id })
             .await
@@ -1390,7 +1577,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_run_removes_run_from_list() {
         let api: Box<dyn Api> = Box::new(StubApi::new());
-        let id = open_run(api.as_ref(), ".tasks/feature.json").await;
+        let id = open_run(api.as_ref(), "docs/plans/0001-Feature").await;
 
         api.execute(Command::CancelRun { run: id })
             .await
@@ -1483,6 +1670,7 @@ mod tests {
     async fn all_types_are_clone_and_debug() {
         // Exercises the derives rather than just relying on compile-time checks.
         let task = TaskView {
+            authored: None,
             id: TaskId::new("t1"),
             title: "Test task".to_string(),
             state: TaskState::InProgress,
@@ -1504,7 +1692,7 @@ mod tests {
         let run_view = RunView {
             id: RunId(42),
             run_uid: String::new(),
-            task_list_path: PathBuf::from(".tasks/x.json"),
+            plan_dir: PlanKey::parse("docs/plans/0001-X").unwrap(),
             status: RunStatus::Running,
             project: String::new(),
             tasks: vec![task],
@@ -1513,8 +1701,8 @@ mod tests {
         let _run2 = run_view.clone();
         assert!(format!("{run_view:?}").contains("Running"));
 
-        let cmd = Command::OpenRun {
-            task_list_path: PathBuf::from(".tasks/x.json"),
+        let cmd = Command::OpenPlan {
+            plan_dir: PlanKey::parse("docs/plans/0001-X").unwrap(),
         };
         let _cmd2 = cmd.clone();
 
@@ -1584,8 +1772,8 @@ mod tests {
     async fn multiple_runs_tracked_independently() {
         let api: Box<dyn Api> = Box::new(StubApi::new());
 
-        let id1 = open_run(api.as_ref(), ".tasks/a.json").await;
-        let id2 = open_run(api.as_ref(), ".tasks/b.json").await;
+        let id1 = open_run(api.as_ref(), "docs/plans/0001-A").await;
+        let id2 = open_run(api.as_ref(), "docs/plans/0002-B").await;
 
         assert_ne!(id1, id2, "each run must receive a distinct id");
         assert_eq!(api.runs().await.len(), 2);
@@ -1650,4 +1838,83 @@ mod tests {
             "serialized JSON must contain output_tokens=40"
         );
     }
+}
+#[test]
+fn delayed_finalization_commands_round_trip_all_inputs() {
+    let key = PlanKey::parse("docs/plans/0048-Test").unwrap();
+    let oid = crate::plan::GitObjectId::parse("a".repeat(40), crate::plan::GitObjectFormat::Sha1)
+        .unwrap();
+    for input in [
+        FinalizeInput::Automatic,
+        FinalizeInput::PreparedStage,
+        FinalizeInput::ManualCommit(oid),
+    ] {
+        let command = Command::FinalizePlan {
+            plan_dir: key.clone(),
+            run_uid: "01FINALIZE".into(),
+            expected_plan_oid: "b".repeat(40),
+            input,
+        };
+        let encoded = serde_json::to_string(&command).unwrap();
+        let decoded: Command = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(decoded, Command::FinalizePlan { .. }));
+    }
+    let command = Command::ReprepareFinalization {
+        plan_dir: key,
+        run_uid: "01FINALIZE".into(),
+        expected_plan_oid: "c".repeat(40),
+    };
+    assert!(matches!(
+        serde_json::from_str::<Command>(&serde_json::to_string(&command).unwrap()).unwrap(),
+        Command::ReprepareFinalization { .. }
+    ));
+}
+
+#[test]
+fn generated_plan_command_and_result_are_serde_stable() {
+    let command = Command::GeneratePlanBundle {
+        blueprint: GeneratedPlanBlueprint {
+            slug: "atomic-generation".into(),
+            title: "Atomic generation".into(),
+            scope: "Scope".into(),
+            architecture: "Architecture".into(),
+            initial_status: GeneratedInitialStatusBlueprint {
+                goal: "Goal".into(),
+                root_cause: "Cause".into(),
+                approach: "Approach".into(),
+                outcome: String::new(),
+                last_updated: "2026-07-20".into(),
+            },
+            workstreams: vec![GeneratedWorkstreamBlueprint {
+                id: "0001".into(),
+                title: "Core".into(),
+            }],
+            tasks: vec![GeneratedTaskBlueprint {
+                sequence: "01".into(),
+                id: "publish-bundle".into(),
+                title: "Publish bundle".into(),
+                workstream: "0001".into(),
+                kind: "task".into(),
+                depends_on: vec![],
+                touches: vec!["crates/makina-core/**".into()],
+                gated: true,
+                body: "Publish atomically.".into(),
+            }],
+        },
+    };
+    let encoded = serde_json::to_string(&command).unwrap();
+    assert!(matches!(
+        serde_json::from_str::<Command>(&encoded).unwrap(),
+        Command::GeneratePlanBundle { .. }
+    ));
+
+    let outcome = CommandOutcome::PlanGenerated {
+        plan_dir: PlanKey::parse("docs/plans/0049-atomic-generation").unwrap(),
+        registration_oid: "a".repeat(40),
+        report: PlanGenerationReport::default(),
+    };
+    assert!(matches!(
+        serde_json::from_str::<CommandOutcome>(&serde_json::to_string(&outcome).unwrap()).unwrap(),
+        CommandOutcome::PlanGenerated { .. }
+    ));
 }

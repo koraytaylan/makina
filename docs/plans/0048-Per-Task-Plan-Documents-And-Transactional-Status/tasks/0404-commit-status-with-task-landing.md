@@ -24,8 +24,8 @@ touches:
   - crates/makina/src/ui.rs
   - crates/makina/src/placeholder.rs
   - crates/makina/tests/**
-status: planned
-merged_as: ""
+status: done
+merged_as: "e6411c73e99ba7ac36df1b9184be695fb947ffa5"
 ---
 # Commit Status With Each Task Landing
 

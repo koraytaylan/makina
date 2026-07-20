@@ -29,6 +29,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use thiserror::Error;
 
 // ── TaskId ────────────────────────────────────────────────────────────────────
@@ -47,7 +49,7 @@ use thiserror::Error;
 /// [`crate::api::TaskId`] is a separate, view-level newtype intentionally not
 /// coupled to this domain type.  A `From<task::TaskId> for api::TaskId`
 /// conversion will be added in a future task.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(pub String);
 
@@ -107,6 +109,191 @@ pub enum TaskState {
     /// via [`crate::state_machine::TaskEvent::DependencyFailed`] from any active
     /// state.  Terminal.
     Skipped,
+    /// Authored as blocked; terminal for this run until explicit retry.
+    Blocked,
+    /// Authored as dropped; terminal but never dependency-satisfying.
+    Dropped,
+    /// Authored gate; visible and non-terminal, never automatically dispatched.
+    Gated,
+}
+
+/// Evidence supplied by lease-bound reconciliation when authored state is
+/// projected into the runtime graph. Runtime checkpoints deliberately cannot
+/// manufacture either form of evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredSeedEvidence {
+    pub matching_live_driver: bool,
+    pub verified_landing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskLandingEvidence {
+    pub task: TaskId,
+    pub implementation_oid: crate::plan::GitObjectId,
+}
+
+/// Result of explicitly reconciling an authored status into scheduler state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthoredSeedOutcome {
+    Seeded(TaskState),
+    /// Visible but withheld from automatic dispatch.
+    Gated,
+    /// Terminal for this run until an explicit retry.
+    Blocked,
+    /// Terminal and never dependency-satisfying.
+    Dropped,
+    NeedsInProgressReconciliation,
+    NeedsLandingVerification,
+}
+
+impl AuthoredSeedOutcome {
+    pub fn runtime_state(self) -> Option<TaskState> {
+        match self {
+            Self::Seeded(state) => Some(state),
+            Self::Gated => Some(TaskState::Gated),
+            Self::Blocked => Some(TaskState::Blocked),
+            Self::Dropped => Some(TaskState::Dropped),
+            Self::NeedsInProgressReconciliation | Self::NeedsLandingVerification => None,
+        }
+    }
+}
+
+/// Immutable authored scheduling data retained beside volatile task state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoredTaskMetadata {
+    pub source_path: PathBuf,
+    pub workstream: String,
+    pub kind: String,
+    pub gated: bool,
+    pub touches: Vec<AuthoredRepoPattern>,
+    pub status: crate::plan::AuthoredTaskStatus,
+    pub merged_as: Option<String>,
+    pub seed: AuthoredSeedOutcome,
+    /// Collision prerequisites inferred from `touches`, distinct from the
+    /// authored dependency list carried by `Task.depends_on` before augmentation.
+    #[serde(default)]
+    pub collision_dependencies: Vec<TaskId>,
+    /// Exact task-branch starting commit captured before agent work begins.
+    #[serde(default)]
+    pub branch_base_oid: Option<String>,
+}
+
+/// Serializable runtime form of a validated repository pattern. Policy is
+/// retained so tracked `.makina` exceptions cannot degrade into ordinary paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthoredRepoPattern {
+    Path(String),
+    Glob(String),
+    TrackedMakinaConfig {
+        validation_base: String,
+    },
+    TrackedMakinaDeletion {
+        path: String,
+        validation_base: String,
+    },
+    InertCandidate(String),
+}
+
+impl AuthoredRepoPattern {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Path(value) | Self::Glob(value) | Self::InertCandidate(value) => value,
+            Self::TrackedMakinaConfig { .. } => ".makina/config.toml",
+            Self::TrackedMakinaDeletion { path, .. } => path,
+        }
+    }
+
+    pub fn to_repo_pattern(&self) -> crate::plan::RepoPattern {
+        match self {
+            Self::Path(value) => crate::plan::RepoPattern::Path(value.clone()),
+            Self::Glob(value) => crate::plan::RepoPattern::Glob(value.clone()),
+            Self::TrackedMakinaConfig { validation_base } => {
+                crate::plan::RepoPattern::TrackedMakinaConfig {
+                    validation_base: validation_base.clone(),
+                }
+            }
+            Self::TrackedMakinaDeletion {
+                path,
+                validation_base,
+            } => crate::plan::RepoPattern::TrackedMakinaDeletion {
+                path: path.clone(),
+                validation_base: validation_base.clone(),
+            },
+            Self::InertCandidate(value) if value == ".makina/config.toml" => {
+                crate::plan::RepoPattern::TrackedMakinaConfigCandidate
+            }
+            Self::InertCandidate(value) => {
+                crate::plan::RepoPattern::TrackedMakinaDeletionCandidate(value.clone())
+            }
+        }
+    }
+}
+
+impl From<&crate::plan::RepoPattern> for AuthoredRepoPattern {
+    fn from(value: &crate::plan::RepoPattern) -> Self {
+        match value {
+            crate::plan::RepoPattern::Path(value) => Self::Path(value.clone()),
+            crate::plan::RepoPattern::Glob(value) => Self::Glob(value.clone()),
+            crate::plan::RepoPattern::TrackedMakinaConfigCandidate => {
+                Self::InertCandidate(".makina/config.toml".into())
+            }
+            crate::plan::RepoPattern::TrackedMakinaDeletionCandidate(path) => {
+                Self::InertCandidate(path.clone())
+            }
+            crate::plan::RepoPattern::TrackedMakinaConfig { validation_base } => {
+                Self::TrackedMakinaConfig {
+                    validation_base: validation_base.clone(),
+                }
+            }
+            crate::plan::RepoPattern::TrackedMakinaDeletion {
+                path,
+                validation_base,
+            } => Self::TrackedMakinaDeletion {
+                path: path.clone(),
+                validation_base: validation_base.clone(),
+            },
+        }
+    }
+}
+
+/// Exhaustively seed scheduler state from authored status and external
+/// evidence. `done` and `in-progress` fail closed; enum-name coincidence and a
+/// runtime checkpoint are not evidence.
+pub fn seed_authored_state(
+    status: crate::plan::AuthoredTaskStatus,
+    gated: bool,
+    evidence: AuthoredSeedEvidence,
+) -> AuthoredSeedOutcome {
+    use crate::plan::AuthoredTaskStatus;
+
+    match status {
+        AuthoredTaskStatus::Planned if gated => AuthoredSeedOutcome::Gated,
+        AuthoredTaskStatus::Planned => AuthoredSeedOutcome::Seeded(TaskState::New),
+        AuthoredTaskStatus::InProgress if evidence.matching_live_driver => {
+            AuthoredSeedOutcome::Seeded(TaskState::InProgress)
+        }
+        AuthoredTaskStatus::InProgress => AuthoredSeedOutcome::NeedsInProgressReconciliation,
+        AuthoredTaskStatus::Done if evidence.verified_landing => {
+            AuthoredSeedOutcome::Seeded(TaskState::Done)
+        }
+        AuthoredTaskStatus::Done => AuthoredSeedOutcome::NeedsLandingVerification,
+        AuthoredTaskStatus::Blocked => AuthoredSeedOutcome::Blocked,
+        AuthoredTaskStatus::Dropped => AuthoredSeedOutcome::Dropped,
+    }
+}
+
+/// Automatic scheduler eligibility after authored seeding.
+pub fn authored_seed_is_dispatchable(outcome: AuthoredSeedOutcome) -> bool {
+    matches!(
+        outcome,
+        AuthoredSeedOutcome::Seeded(TaskState::New | TaskState::Ready)
+    )
+}
+
+/// Only a verified landing satisfies downstream `depends_on`. In particular,
+/// dropped and blocked tasks are terminal-looking but never prerequisites.
+pub fn authored_seed_satisfies_dependency(outcome: AuthoredSeedOutcome) -> bool {
+    outcome == AuthoredSeedOutcome::Seeded(TaskState::Done)
 }
 
 // ── Task ──────────────────────────────────────────────────────────────────────
@@ -200,9 +387,30 @@ pub struct TaskGraph {
 
     /// Ordered list of tasks.  Preserves authored order for display purposes.
     pub tasks: Vec<Task>,
+
+    /// Validated authored metadata keyed by task identity. Older runtime
+    /// artifacts deserialize with an empty map and must be reconciled from the
+    /// registered source before dispatch.
+    #[serde(default)]
+    pub authored: BTreeMap<TaskId, AuthoredTaskMetadata>,
 }
 
 impl TaskGraph {
+    pub fn register_authored(&mut self, id: TaskId, metadata: AuthoredTaskMetadata) {
+        self.authored.insert(id, metadata);
+    }
+
+    pub fn authored(&self, id: &TaskId) -> Option<&AuthoredTaskMetadata> {
+        self.authored.get(id)
+    }
+
+    pub fn is_authored_dispatchable(&self, id: &TaskId) -> bool {
+        self.authored.is_empty()
+            || self
+                .authored
+                .get(id)
+                .is_some_and(|metadata| authored_seed_is_dispatchable(metadata.seed))
+    }
     /// Look up a task by its [`TaskId`].
     ///
     /// Returns `None` if no task with the given ID exists in this graph.
@@ -356,6 +564,7 @@ mod tests {
                     failure_reason: None,
                 },
             ],
+            authored: BTreeMap::new(),
         }
     }
 
@@ -433,6 +642,7 @@ mod tests {
                 finished_at: None,
                 failure_reason: None,
             }],
+            authored: BTreeMap::new(),
         };
 
         let err = graph.validate().expect_err("should fail with dangling dep");
@@ -469,6 +679,7 @@ mod tests {
         let graph = TaskGraph {
             slug: "dup-graph".to_string(),
             tasks: vec![task.clone(), task],
+            authored: BTreeMap::new(),
         };
 
         let err = graph.validate().expect_err("should fail with duplicate id");

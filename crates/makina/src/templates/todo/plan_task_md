@@ -1,0 +1,22 @@
+---
+id: add-task-toggle
+title: Add A Task Toggle Method
+workstream: "0001"
+kind: task
+depends_on: []
+gated: false
+touches:
+  - src/main.rs
+status: planned
+merged_as: ""
+---
+# Add A Task Toggle Method
+
+Add `Task::toggle(&mut self)` to flip the `done` field and cover the behavior with a unit test.
+
+**Steps:**
+
+1. Implement `Task::toggle` in `src/main.rs`.
+2. Add a focused unit test and keep the configured quality gates green.
+
+- **Done when:** `Task::toggle` flips both states, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.
