@@ -2183,8 +2183,8 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     feedback = Some(reason);
                     continue;
                 }
-                if let Some((touches, Some(recorded_base))) = &authored_footprint {
-                    if let Err(reason) = enforce_task_branch_footprint(
+                if let Some((touches, Some(recorded_base))) = &authored_footprint
+                    && let Err(reason) = enforce_task_branch_footprint(
                         &ctx.worktree_manager.repo_root,
                         task_id,
                         &branch,
@@ -2192,11 +2192,10 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         recorded_base,
                     )
                     .await
-                    {
-                        return_footprint_correction(ctx, task_id, reason.clone()).await?;
-                        feedback = Some(reason);
-                        continue;
-                    }
+                {
+                    return_footprint_correction(ctx, task_id, reason.clone()).await?;
+                    feedback = Some(reason);
+                    continue;
                 }
                 #[cfg(test)]
                 if let Some(observer) = &ctx.pre_a_observer {

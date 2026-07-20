@@ -316,18 +316,18 @@ async fn resolve_io(
                     let status = format!("Interpreting {}...", stem);
                     let project_root = app.canonical_repo_root();
                     let plan_path = entry.path.parent().unwrap_or(&entry.path);
-                    if let Ok(relative) = plan_path.strip_prefix(&project_root) {
-                        if let Ok(plan_dir) = makina_core::plan::PlanKey::parse(relative) {
-                            spawn_open_run(
-                                std::sync::Arc::clone(&app.api),
-                                app.project_api.clone(),
-                                project_root,
-                                plan_dir,
-                                background_tx.clone(),
-                                false,
-                                None,
-                            );
-                        }
+                    if let Ok(relative) = plan_path.strip_prefix(&project_root)
+                        && let Ok(plan_dir) = makina_core::plan::PlanKey::parse(relative)
+                    {
+                        spawn_open_run(
+                            std::sync::Arc::clone(&app.api),
+                            app.project_api.clone(),
+                            project_root,
+                            plan_dir,
+                            background_tx.clone(),
+                            false,
+                            None,
+                        );
                     }
                     (AppEvent::CloseBrowser, Some(status))
                 }

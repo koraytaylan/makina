@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85" # edition-2024 floor; the toolchain is pinned separately in rust-toolchain.toml
+rust-version = "1.96" # match the pinned toolchain in rust-toolchain.toml
 description = "Makina — a multi-agent software-factory orchestrator (ratatui TUI)"
 repository = "https://github.com/koraytaylan/makina"
 homepage = "https://github.com/koraytaylan/makina"

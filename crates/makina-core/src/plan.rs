@@ -2286,10 +2286,9 @@ fn status_surface_errors(markdown: &str) -> Vec<String> {
     if let Some(line) = markdown
         .lines()
         .find_map(|line| line.strip_prefix("- **Integration:** "))
+        && line.split(';').count() != 6
     {
-        if line.split(';').count() != 6 {
-            errors.push("Integration must contain exactly six semicolon-delimited fields".into());
-        }
+        errors.push("Integration must contain exactly six semicolon-delimited fields".into());
     }
     let last_updated = markdown
         .lines()

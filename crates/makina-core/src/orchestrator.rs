@@ -3149,8 +3149,8 @@ impl CoreApi {
                 &run_uid,
             )
             .map_err(|e| invalid(format!("read run metadata: {e}")))?;
-            if let Some(metadata) = metadata.as_ref() {
-                if metadata
+            if let Some(metadata) = metadata.as_ref()
+                && (metadata
                     .resolved_plan_dir(&self.state.worktree_manager.repo_root)
                     .as_ref()
                     != Some(&plan_dir)
@@ -3159,12 +3159,11 @@ impl CoreApi {
                             task.state,
                             crate::api::TaskState::Done | crate::api::TaskState::Dropped
                         )
-                    })
-                {
-                    return Err(invalid(
-                        "durable run metadata is not finalization-ready for this plan".into(),
-                    ));
-                }
+                    }))
+            {
+                return Err(invalid(
+                    "durable run metadata is not finalization-ready for this plan".into(),
+                ));
             }
             let run = {
                 let mut ids = self

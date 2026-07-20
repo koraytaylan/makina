@@ -345,10 +345,10 @@ fn authored_topological_order(graph: &TaskGraph) -> Result<Vec<TaskId>, String> 
         remaining.remove(&next);
         result.push(next.clone());
         for task in &graph.tasks {
-            if task.depends_on.contains(&next) {
-                if let Some(value) = remaining.get_mut(&task.id) {
-                    *value -= 1;
-                }
+            if task.depends_on.contains(&next)
+                && let Some(value) = remaining.get_mut(&task.id)
+            {
+                *value -= 1;
             }
         }
     }
