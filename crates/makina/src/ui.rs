@@ -531,16 +531,73 @@ pub fn render(app: &App, frame: &mut Frame) {
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
                             ));
                         } else if starting {
+                            // Distinguish the sub-phases of "starting" so the
+                            // user knows what Makina is doing during the multi-
+                            // minute startup, not just a generic spinner.
+                            let phase = match &run_view.status {
+                                RunStatus::Pending => "preparing",
+                                RunStatus::WaitingForRepository { .. } => {
+                                    "waiting for repository lease"
+                                }
+                                _ => "starting",
+                            };
                             spans.push(Span::styled(
-                                "  starting",
+                                format!("  {} {}", spinner_frame(app.tick), phase),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                             ));
+                        } else if matches!(run_view.status, RunStatus::Running) {
+                            // Running: show what phase the run is in.
+                            // If no tasks are InProgress yet, the scheduler is
+                            // still setting up (creating plan branch, worktree,
+                            // spawning agent). If tasks are active, show the
+                            // progress summary.
+                            let any_active = run_view.tasks.iter().any(|t| {
+                                matches!(
+                                    t.state,
+                                    makina_core::api::TaskState::InProgress
+                                        | makina_core::api::TaskState::InReview
+                                )
+                            });
+                            if !any_active && !run_view.tasks.is_empty() {
+                                // Tasks exist but none active — the scheduler is
+                                // between phases (creating next worktree, etc.).
+                                let any_ready = run_view
+                                    .tasks
+                                    .iter()
+                                    .any(|t| t.state == makina_core::api::TaskState::Ready);
+                                if any_ready {
+                                    spans.push(Span::styled(
+                                        format!("  {} dispatching task", spinner_frame(app.tick)),
+                                        Style::default().fg(app
+                                            .active_theme
+                                            .get(crate::theme::ThemeRole::Accent)),
+                                    ));
+                                } else {
+                                    let summary = run_progress_summary(run_view);
+                                    if let Some(text) = summary {
+                                        spans.push(Span::styled(
+                                            text,
+                                            Style::default().fg(app
+                                                .active_theme
+                                                .get(crate::theme::ThemeRole::Dim)),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                let summary = run_progress_summary(run_view);
+                                if let Some(text) = summary {
+                                    spans.push(Span::styled(
+                                        text,
+                                        Style::default()
+                                            .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                                    ));
+                                }
+                            }
                         } else if matches!(
                             run_view.status,
-                            RunStatus::Running | RunStatus::Completed | RunStatus::Failed
+                            RunStatus::Completed | RunStatus::Failed
                         ) {
-                            // Compact progress summary: "· 1/3 done · 1 running"
                             let summary = run_progress_summary(run_view);
                             if let Some(text) = summary {
                                 spans.push(Span::styled(
@@ -5526,8 +5583,8 @@ mod tests {
         let screen = screen_of(&terminal);
 
         assert!(
-            screen.contains("starting"),
-            "sidebar must show a 'starting' badge on a Pending run with StartRun in flight;\nscreen was:\n{screen}"
+            screen.contains("preparing"),
+            "sidebar must show a phase label on a Pending run with StartRun in flight;\nscreen was:\n{screen}"
         );
         // The static Pending badge must NOT appear (it would look like nothing
         // is happening).
