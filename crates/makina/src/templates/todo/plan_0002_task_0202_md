@@ -1,0 +1,22 @@
+---
+id: add-render-module
+title: Add A Render Module
+workstream: "0002"
+kind: task
+depends_on: []
+gated: false
+touches:
+  - src/render.rs
+status: planned
+merged_as: ""
+---
+# Add A Render Module
+
+Replace the `src/render.rs` stub with a `render_task(task: &Task) -> String` formatter that returns `"[x] title"` or `"[ ] title"`, plus a unit test. This task has no dependencies and a single-file footprint, so it can run in parallel with the other Plan 0002 feature tasks.
+
+**Steps:**
+
+1. Replace `src/render.rs` with `pub fn render_task(task: &Task) -> String`.
+2. Add a unit test that asserts the format for both done and not-done tasks.
+
+- **Done when:** `render_task` returns the expected strings for both states, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.

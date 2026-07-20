@@ -1,0 +1,3 @@
+//! Stub for the tags module.
+//!
+//! Plan 0002 task `add-tags-module` replaces this file with a real `Tag` enum.

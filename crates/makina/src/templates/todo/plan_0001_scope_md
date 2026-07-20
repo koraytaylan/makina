@@ -1,0 +1,15 @@
+# Scope — Plan 0001
+
+> Add the core todo behavior one step at a time, so the run exercises a strictly sequential task graph.
+
+## Why this plan
+
+The first plan demonstrates Makina's default per-task workflow with a simple dependency chain: each task builds on the previous one, so the scheduler runs them one after another even though concurrency is configured higher.
+
+## In scope
+
+- **0001 — Todo Core.** Add a toggle, an open-task counter, and a summary line, each depending on the previous task.
+
+## Out of scope
+
+- Persistence, networking, and changes outside `src/main.rs`.

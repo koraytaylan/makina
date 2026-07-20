@@ -1,0 +1,22 @@
+---
+id: add-list-module
+title: Add A List Module
+workstream: "0002"
+kind: task
+depends_on: []
+gated: false
+touches:
+  - src/list.rs
+status: planned
+merged_as: ""
+---
+# Add A List Module
+
+Replace the `src/list.rs` stub with a `TaskList` wrapper around `Vec<Task>` exposing `new`, `push`, and `len`, plus a unit test. This task has no dependencies and a single-file footprint, so it can run in parallel with the other Plan 0002 feature tasks.
+
+**Steps:**
+
+1. Replace `src/list.rs` with `pub struct TaskList { tasks: Vec<Task> }`, `TaskList::new`, `TaskList::push`, and `TaskList::len`.
+2. Add a unit test that pushes two tasks and asserts `len == 2`.
+
+- **Done when:** `src/list.rs` defines `TaskList`, `len` returns the right count, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.

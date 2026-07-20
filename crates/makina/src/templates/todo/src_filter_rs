@@ -1,0 +1,3 @@
+//! Stub for the filter module.
+//!
+//! Plan 0003 task `add-filter-enum` replaces this file with a real `Filter` enum.

@@ -1,0 +1,15 @@
+# Plan 0002 — Todo Features (Parallel) — 📋 Planned
+
+The roll-up row in [../STATUS.md](../STATUS.md) must stay in sync with this file. Task-level truth lives in [tasks/](tasks/) frontmatter; Makina's integration coordinator updates both layers.
+
+- **Status:** 📋 Planned.
+
+- **Goal:** demonstrate a fully parallel Makina run with three disjoint feature modules.
+- **Root cause:** the starter has only `src/main.rs`; there are no independent feature modules to build at once.
+- **Approach:** add `list.rs`, `render.rs`, and `tags.rs` as independent tasks with no dependencies and disjoint footprints.
+- **Progress:** 0/3 tasks done; 0 blocked; 0 dropped.
+- **Integration:** `planned`; run —; base `develop` @ `{{BASE_OID}}`; validation base —; mode —; final integration —.
+- **Exceptions:** — (coordinator-owned blocked/dropped reasons are recorded here).
+- **Outcome:** The starter project gains three independent feature modules, each landed in parallel, while all configured gates remain green.
+
+_Last updated: 2026-07-20, against `develop` @ `{{BASE_SHORT_OID}}`._

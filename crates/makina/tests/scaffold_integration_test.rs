@@ -101,7 +101,7 @@ async fn scaffold_creates_runnable_todo_project() {
         "config base_branch"
     );
 
-    let plan_dir = target.join("docs/plans/0001-Todo-Starter");
+    let plan_dir = target.join("docs/plans/0001-Todo-Core");
     assert!(!plan_dir.join("TASKS.md").exists(), "no legacy TASKS.md");
     assert!(
         plan_dir.join("tasks/0101-add-task-toggle.md").exists(),
@@ -110,16 +110,39 @@ async fn scaffold_creates_runnable_todo_project() {
     assert!(plan_dir.join("SCOPE.md").exists(), "SCOPE.md");
     assert!(plan_dir.join("ARCHITECTURE.md").exists(), "ARCHITECTURE.md");
     assert!(plan_dir.join("STATUS.md").exists(), "STATUS.md");
+    assert!(
+        target
+            .join("docs/plans/0002-Todo-Features/SCOPE.md")
+            .exists(),
+        "plan 0002 SCOPE.md"
+    );
+    assert!(
+        target
+            .join("docs/plans/0003-Todo-Integration/SCOPE.md")
+            .exists(),
+        "plan 0003 SCOPE.md"
+    );
 
     let plans = discover_plans(&target);
-    assert_eq!(plans.len(), 1, "one loader-valid scaffold plan");
+    assert_eq!(plans.len(), 3, "three loader-valid scaffold plans");
+    for plan in &plans {
+        assert_eq!(
+            plan.state,
+            PlanDiscoveryState::Ready,
+            "exact R is ready for {}",
+            plan.key.relative_dir.display()
+        );
+    }
+    let plan0001 = plans
+        .iter()
+        .find(|p| p.key.number == "0001")
+        .expect("plan 0001 present");
     assert_eq!(
-        plans[0].state,
-        PlanDiscoveryState::Ready,
-        "exact R is ready"
+        plan0001.tasks().len(),
+        3,
+        "three per-task documents in plan 0001"
     );
-    assert_eq!(plans[0].tasks().len(), 1, "one per-task document");
-    let registered = run_git(&target, &["rev-parse", "refs/heads/plan/0001-Todo-Starter"]);
+    let registered = run_git(&target, &["rev-parse", "refs/heads/plan/0001-Todo-Core"]);
     let registered = String::from_utf8_lossy(&registered.stdout)
         .trim()
         .to_owned();
@@ -207,7 +230,7 @@ async fn scaffold_recovers_registration_response_loss_with_exact_r() {
     )
     .await
     .expect("response-loss recovery");
-    let plan_ref = "refs/heads/plan/0001-Todo-Starter";
+    let plan_ref = "refs/heads/plan/0001-Todo-Core";
     let r = run_git(&target, &["rev-parse", plan_ref]);
     let count = run_git(&target, &["rev-list", "--count", plan_ref]);
     assert_eq!(
@@ -215,7 +238,12 @@ async fn scaffold_recovers_registration_response_loss_with_exact_r() {
         "3",
         "bootstrap + authored + one exact R; replay minted no R+1"
     );
-    assert_eq!(discover_plans(&target)[0].state, PlanDiscoveryState::Ready);
+    let plans = discover_plans(&target);
+    let plan0001 = plans
+        .iter()
+        .find(|p| p.key.number == "0001")
+        .expect("plan 0001 present");
+    assert_eq!(plan0001.state, PlanDiscoveryState::Ready);
     assert!(!r.stdout.is_empty());
 }
 
@@ -229,11 +257,12 @@ async fn scaffold_sample_runs_claim_a_b_p_f_c_without_touching_workspace() {
         .await
         .expect("scaffold");
     let before = workspace_snapshot(&target);
-    let plan_ref = "refs/heads/plan/0001-Todo-Starter";
+    let plan_ref = "refs/heads/plan/0001-Todo-Core";
     let run = "01AAAAAAAAAAAAAAAAAAAAAAAA";
-    // Extend the starter through a separate develop worktree to two disjoint
-    // tasks, then refresh exact R. The checked-out operator workspace remains
-    // pinned to the original authored commit throughout.
+    // Extend the starter through a separate develop worktree with a fourth,
+    // independent task (disjoint footprint `src/list.rs`), then refresh exact
+    // R. The checked-out operator workspace remains pinned to the original
+    // authored commit throughout.
     let author = tmp.path().join("author");
     run_git(
         &target,
@@ -268,18 +297,18 @@ Implement the list summary independently from task toggling.
 - **Done when:** `summary` returns the implemented value.
 "#;
     std::fs::write(
-        author.join("docs/plans/0001-Todo-Starter/tasks/0102-add-list-summary.md"),
+        author.join("docs/plans/0001-Todo-Core/tasks/0104-add-list-summary.md"),
         second,
     )
     .unwrap();
     for relative in [
-        "docs/plans/0001-Todo-Starter/STATUS.md",
+        "docs/plans/0001-Todo-Core/STATUS.md",
         "docs/plans/STATUS.md",
     ] {
         let path = author.join(relative);
         let value = std::fs::read_to_string(&path)
             .unwrap()
-            .replace("0/1", "0/2");
+            .replace("0/3", "0/4");
         std::fs::write(path, value).unwrap();
     }
     run_git(&author, &["add", "."]);
@@ -290,13 +319,13 @@ Implement the list summary independently from task toggling.
     let authored = String::from_utf8_lossy(&run_git(&target, &["rev-parse", "develop"]).stdout)
         .trim()
         .to_owned();
-    let key = PlanKey::parse("docs/plans/0001-Todo-Starter").unwrap();
+    let key = PlanKey::parse("docs/plans/0001-Todo-Core").unwrap();
     let source = makina_core::plan::GitTreePlanFileSource::new(&target, &authored).unwrap();
     let makina_core::plan::PlanCandidate::Plan(authored_plan) =
         makina_core::plan::load_plan_path(&source, key.relative_dir.clone(), &Default::default())
             .unwrap()
     else {
-        panic!("two-task authored plan is invalid")
+        panic!("four-task authored plan is invalid")
     };
     let registration = AuthoringCoordinator::new(
         target.clone(),
@@ -314,7 +343,7 @@ Implement the list summary independently from task toggling.
         registration_oid: r,
     } = registration
     else {
-        panic!("two-task refresh did not publish exact R")
+        panic!("four-task refresh did not publish exact R")
     };
     run_git(&target, &["worktree", "remove", author.to_str().unwrap()]);
     let coordinator = PlanContractCoordinator::new(&target, key, plan_ref, run).unwrap();
@@ -358,6 +387,88 @@ Implement the list summary independently from task toggling.
         )
         .await
         .unwrap();
+    // Land the two sequential dependents of `add-task-toggle` so the plan can
+    // finalize. Each builds on the previous one's `src/main.rs` edit.
+    let count_task = TaskId::parse("add-count-open").unwrap();
+    let count_claim = coordinator
+        .claim_task(
+            &count_task,
+            &b,
+            "_Last updated: 2026-07-20, sequential task claimed._",
+        )
+        .await
+        .unwrap();
+    let count_worktree = coordinator.ensure_task_worktree(&count_task).await.unwrap();
+    {
+        let main_path = count_worktree.join("src/main.rs");
+        let main = std::fs::read_to_string(&main_path).unwrap();
+        std::fs::write(
+            &main_path,
+            main.replace(
+                "fn main() {",
+                "pub fn count_open(tasks: &[Task]) -> usize {\n    tasks.iter().filter(|t| !t.done).count()\n}\n\nfn main() {",
+            ),
+        )
+        .unwrap();
+        run_git(&count_worktree, &["add", "src/main.rs"]);
+        run_git(&count_worktree, &["commit", "-m", "feat: add count_open"]);
+    }
+    let count_a = coordinator.land_phase_a(&count_task).await.unwrap();
+    let count_a_typed = coordinator.parse_oid(count_a.clone()).unwrap();
+    let count_b = coordinator
+        .complete_task(
+            &count_task,
+            &count_a,
+            count_a_typed,
+            "_Last updated: 2026-07-20, sequential task landed._",
+        )
+        .await
+        .unwrap();
+    let _ = count_claim;
+
+    let summary_task = TaskId::parse("add-print-summary").unwrap();
+    let summary_claim = coordinator
+        .claim_task(
+            &summary_task,
+            &count_b,
+            "_Last updated: 2026-07-20, sequential task claimed._",
+        )
+        .await
+        .unwrap();
+    let summary_worktree = coordinator
+        .ensure_task_worktree(&summary_task)
+        .await
+        .unwrap();
+    {
+        let main_path = summary_worktree.join("src/main.rs");
+        let main = std::fs::read_to_string(&main_path).unwrap();
+        std::fs::write(
+            &main_path,
+            main.replace(
+                "fn main() {",
+                "pub fn print_summary(tasks: &[Task]) {\n    println!(\"{} open / {} total\", count_open(tasks), tasks.len());\n}\n\nfn main() {",
+            ),
+        )
+        .unwrap();
+        run_git(&summary_worktree, &["add", "src/main.rs"]);
+        run_git(
+            &summary_worktree,
+            &["commit", "-m", "feat: add print_summary"],
+        );
+    }
+    let summary_a = coordinator.land_phase_a(&summary_task).await.unwrap();
+    let summary_a_typed = coordinator.parse_oid(summary_a.clone()).unwrap();
+    let summary_b = coordinator
+        .complete_task(
+            &summary_task,
+            &summary_a,
+            summary_a_typed,
+            "_Last updated: 2026-07-20, sequential task landed._",
+        )
+        .await
+        .unwrap();
+    let _ = summary_claim;
+
     let second_path = second_worktree.join("src/list.rs");
     std::fs::write(&second_path, "pub fn summary() -> usize { 1 }\n").unwrap();
     run_git(&second_worktree, &["add", "src/list.rs"]);
@@ -410,6 +521,8 @@ Implement the list summary independently from task toggling.
     for (oid, phase) in [
         (claim, "task-claim"),
         (b, "task-status"),
+        (count_b, "task-status"),
+        (summary_b, "task-status"),
         (second_claim, "task-claim"),
         (second_b, "task-status"),
         (p, "finalization-prepared"),
@@ -426,7 +539,7 @@ Implement the list summary independently from task toggling.
     let final_source = makina_core::plan::GitTreePlanFileSource::new(&target, &c).unwrap();
     let makina_core::plan::PlanCandidate::Plan(final_plan) = makina_core::plan::load_plan_path(
         &final_source,
-        "docs/plans/0001-Todo-Starter",
+        "docs/plans/0001-Todo-Core",
         &Default::default(),
     )
     .unwrap() else {
@@ -444,7 +557,7 @@ Implement the list summary independently from task toggling.
     );
     let final_root = run_git(&target, &["show", &format!("{c}:docs/plans/STATUS.md")]);
     let final_root = String::from_utf8_lossy(&final_root.stdout);
-    assert!(final_root.contains("| 0001 | Todo Starter | Complete | 2/2 |"));
+    assert!(final_root.contains("| 0001 | Todo Core (Sequential) | Complete | 4/4 |"));
     assert_eq!(
         workspace_snapshot(&target),
         before,

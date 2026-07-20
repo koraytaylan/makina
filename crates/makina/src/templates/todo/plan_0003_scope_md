@@ -1,0 +1,15 @@
+# Scope — Plan 0003
+
+> Combine parallel and sequential scheduling so the run exercises a mixed task graph.
+
+## Why this plan
+
+The third plan demonstrates a fan-out/fan-in shape: one task creates a shared type, two independent tasks build on it in parallel, and a final task depends on both. This is the most common real-plan shape.
+
+## In scope
+
+- **0003 — Todo Integration.** Add a `Filter` enum, two parallel filter implementations, and a final wiring task that depends on both.
+
+## Out of scope
+
+- Persistence, networking, and changes outside `src/filter.rs`, `src/by_status.rs`, `src/by_title.rs`, and `src/main.rs`.

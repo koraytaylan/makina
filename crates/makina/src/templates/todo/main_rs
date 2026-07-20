@@ -1,4 +1,20 @@
 //! A tiny todo list — the Makina `todo` starter project.
+//!
+//! This crate is the playground for the three starter plans:
+//! - Plan 0001 adds core task behavior, one step after another (sequential).
+//! - Plan 0002 adds independent feature modules in parallel.
+//! - Plan 0003 combines sequential and parallel work with a fan-out/fan-in graph.
+//!
+//! The module stubs below are declared up front so each plan can fill one in
+//! without touching `src/main.rs` (keeping parallel footprints disjoint). Each
+//! stub compiles as an empty module; the plan tasks replace the stub body.
+
+mod by_status;
+mod by_title;
+mod filter;
+mod list;
+mod render;
+mod tags;
 
 /// A single todo item.
 #[derive(Debug, Clone, PartialEq, Eq)]

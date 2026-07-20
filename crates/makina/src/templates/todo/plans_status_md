@@ -4,4 +4,6 @@ One row per plan. Task status is authored in each plan's `tasks/*.md` frontmatte
 
 | Plan | Title | Status | Tasks | Outcome | Status doc |
 |---|---|---|---|---|---|
-| 0001 | Todo Starter | 📋 Planned | 0/1 | The starter project gains a tested task-state toggle while all configured gates remain green. | [status](0001-Todo-Starter/STATUS.md) |
+| 0001 | Todo Core (Sequential) | 📋 Planned | 0/3 | The starter project gains a toggle, an open-task counter, and a summary printer, each landed in order, while all configured gates remain green. | [status](0001-Todo-Core/STATUS.md) |
+| 0002 | Todo Features (Parallel) | 📋 Planned | 0/3 | The starter project gains three independent feature modules, each landed in parallel, while all configured gates remain green. | [status](0002-Todo-Features/STATUS.md) |
+| 0003 | Todo Integration (Mixed) | 📋 Planned | 0/4 | The starter project gains a shared filter type, two parallel filter implementations, and a final wiring commit, while all configured gates remain green. | [status](0003-Todo-Integration/STATUS.md) |

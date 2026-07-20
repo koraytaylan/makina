@@ -1,0 +1,11 @@
+# Architecture — Plan 0001
+
+## 0001 — Todo Core
+
+Three sequential edits to `src/main.rs`:
+
+1. `Task::toggle(&mut self)` flips `done` (task `0101`).
+2. `count_open` counts not-done tasks (task `0102`, depends on `0101`).
+3. `print_summary` prints a one-line open-task summary (task `0103`, depends on `0102`).
+
+Each task's `touches` footprint is `src/main.rs` and the dependency chain makes them serialize, so the run is a straight line even with `concurrency = 2`.

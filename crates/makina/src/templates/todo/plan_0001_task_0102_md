@@ -1,0 +1,22 @@
+---
+id: add-count-open
+title: Add A Count Open Helper
+workstream: "0001"
+kind: task
+depends_on: [add-task-toggle]
+gated: false
+touches:
+  - src/main.rs
+status: planned
+merged_as: ""
+---
+# Add A Count Open Helper
+
+Add a free function `count_open(tasks: &[Task]) -> usize` that returns the number of tasks whose `done` field is false, with a unit test using `toggle`. It depends on `add-task-toggle` so the chain stays sequential.
+
+**Steps:**
+
+1. Add `count_open` in `src/main.rs` after the `impl Task` block.
+2. Add a unit test that builds a small list, toggles one task, and asserts the open count.
+
+- **Done when:** `count_open` returns the right number after toggling, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.

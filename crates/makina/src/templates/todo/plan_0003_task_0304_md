@@ -1,0 +1,22 @@
+---
+id: wire-filters-into-main
+title: Wire Filters Into Main
+workstream: "0003"
+kind: task
+depends_on: [add-by-status-filter, add-by-title-filter]
+gated: false
+touches:
+  - src/main.rs
+status: planned
+merged_as: ""
+---
+# Wire Filters Into Main
+
+Wire `by_status` and `by_title` into `main` by calling them on the starter list and printing the filtered results, plus a unit test for the wiring helper. This task depends on both parallel filter implementations, so it runs last in the mixed graph.
+
+**Steps:**
+
+1. In `src/main.rs`, replace the body of `main` to call `by_status(&tasks, false)` and `by_title(&tasks, "run")` and print the counts.
+2. Add a unit test that asserts the wiring helper returns the expected filtered slices.
+
+- **Done when:** `main` prints the filtered open-task and title-match counts, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.

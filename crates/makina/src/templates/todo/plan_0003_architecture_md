@@ -1,0 +1,12 @@
+# Architecture — Plan 0003
+
+## 0003 — Todo Integration
+
+A mixed fan-out/fan-in graph:
+
+1. `src/filter.rs` — define `Filter` (task `0301`, root).
+2. `src/by_status.rs` — implement `by_status` (task `0302`, depends on `0301`).
+3. `src/by_title.rs` — implement `by_title` (task `0303`, depends on `0301`).
+4. `src/main.rs` — wire both filters into `main` (task `0304`, depends on `0302` and `0303`).
+
+Tasks `0302` and `0303` run in parallel after `0301`; task `0304` runs only after both finish.

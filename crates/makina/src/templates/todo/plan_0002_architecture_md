@@ -1,0 +1,11 @@
+# Architecture — Plan 0002
+
+## 0002 — Todo Features
+
+Three independent modules added in parallel:
+
+1. `src/list.rs` — a `TaskList` wrapper with `push` and `open` (task `0201`).
+2. `src/render.rs` — a `render_task` formatter (task `0202`).
+3. `src/tags.rs` — a `Tag` enum and `Task::with_tag` builder (task `0203`).
+
+None of these tasks depend on each other and each `touches` a distinct file, so the scheduler runs them concurrently. Plan 0003 later wires them into `main`.

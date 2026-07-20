@@ -1,5 +1,0 @@
-# Architecture — Plan 0001
-
-## 0001 — Todo Core
-
-Add `Task::toggle(&mut self)` and a focused unit test in `src/main.rs`. The task's authored `touches` footprint is the complete mutation boundary.

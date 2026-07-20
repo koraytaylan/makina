@@ -1,0 +1,15 @@
+# Scope — Plan 0002
+
+> Add three independent todo features at once, so the run exercises a fully parallel task graph.
+
+## Why this plan
+
+The second plan shows that when tasks have no dependencies and disjoint footprints, Makina dispatches them concurrently up to the configured `concurrency` limit. All three tasks land independently and merge without ordering constraints.
+
+## In scope
+
+- **0002 — Todo Features.** Add a list module, a render module, and a tags module — each in its own file, each with no dependencies.
+
+## Out of scope
+
+- Wiring the new modules into `main` (that belongs to Plan 0003) and any change to `src/main.rs`.

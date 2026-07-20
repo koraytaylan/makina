@@ -1,0 +1,22 @@
+---
+id: add-by-title-filter
+title: Add A By Title Filter
+workstream: "0003"
+kind: task
+depends_on: [add-filter-enum]
+gated: false
+touches:
+  - src/by_title.rs
+status: planned
+merged_as: ""
+---
+# Add A By Title Filter
+
+Replace the `src/by_title.rs` stub with `pub fn by_title(tasks: &[Task], needle: &str) -> Vec<&Task>` that returns tasks whose `title` contains `needle`, plus a unit test. It depends on `add-filter-enum` and runs in parallel with `add-by-status-filter`.
+
+**Steps:**
+
+1. Replace `src/by_title.rs` with `pub fn by_title(tasks: &[Task], needle: &str) -> Vec<&Task>`.
+2. Add a unit test that filters a small list by a substring.
+
+- **Done when:** `by_title` returns the right subset, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.

@@ -1,0 +1,22 @@
+---
+id: add-tags-module
+title: Add A Tags Module
+workstream: "0002"
+kind: task
+depends_on: []
+gated: false
+touches:
+  - src/tags.rs
+status: planned
+merged_as: ""
+---
+# Add A Tags Module
+
+Replace the `src/tags.rs` stub with a `Tag` enum (`Work`, `Home`, `Other`) and a `tag_label(Tag) -> &'static str` helper, plus a unit test. This task has no dependencies and a single-file footprint, so it can run in parallel with the other Plan 0002 feature tasks.
+
+**Steps:**
+
+1. Replace `src/tags.rs` with `pub enum Tag { Work, Home, Other }` and `pub fn tag_label(tag: Tag) -> &'static str`.
+2. Add a unit test that asserts `tag_label` returns the right label for each variant.
+
+- **Done when:** `src/tags.rs` defines `Tag` and `tag_label`, the helper returns the right labels, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.

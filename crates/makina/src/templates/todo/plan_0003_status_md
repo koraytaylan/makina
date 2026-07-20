@@ -1,0 +1,15 @@
+# Plan 0003 — Todo Integration (Mixed) — 📋 Planned
+
+The roll-up row in [../STATUS.md](../STATUS.md) must stay in sync with this file. Task-level truth lives in [tasks/](tasks/) frontmatter; Makina's integration coordinator updates both layers.
+
+- **Status:** 📋 Planned.
+
+- **Goal:** demonstrate a mixed parallel+sequential Makina run with a fan-out/fan-in graph.
+- **Root cause:** the features added in Plans 0001 and 0002 are not yet composable through a shared filter type.
+- **Approach:** add a shared `Filter` enum, implement two filters in parallel, then wire both into `main` in a final sequential task.
+- **Progress:** 0/4 tasks done; 0 blocked; 0 dropped.
+- **Integration:** `planned`; run —; base `develop` @ `{{BASE_OID}}`; validation base —; mode —; final integration —.
+- **Exceptions:** — (coordinator-owned blocked/dropped reasons are recorded here).
+- **Outcome:** The starter project gains a shared filter type, two parallel filter implementations, and a final wiring commit, while all configured gates remain green.
+
+_Last updated: 2026-07-20, against `develop` @ `{{BASE_SHORT_OID}}`._

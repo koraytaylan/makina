@@ -1,0 +1,23 @@
+---
+id: add-print-summary
+title: Add A Print Summary Helper
+workstream: "0001"
+kind: task
+depends_on: [add-count-open]
+gated: false
+touches:
+  - src/main.rs
+status: planned
+merged_as: ""
+---
+# Add A Print Summary Helper
+
+Add a free function `print_summary(tasks: &[Task])` that prints `N open / M total` using `count_open`, and call it from `main`. It depends on `add-count-open` so the three-task chain lands in order.
+
+**Steps:**
+
+1. Add `print_summary` in `src/main.rs` after `count_open`.
+2. Call `print_summary(&tasks)` at the end of `main`.
+3. Add a unit test that captures the summary line (e.g. assert the format string via `format!`).
+
+- **Done when:** `print_summary` emits `N open / M total` for the starter list, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.

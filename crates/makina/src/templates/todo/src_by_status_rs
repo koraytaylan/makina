@@ -1,0 +1,3 @@
+//! Stub for the by_status module.
+//!
+//! Plan 0003 task `add-by-status-filter` replaces this file with a real `by_status` filter.

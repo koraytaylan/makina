@@ -42,6 +42,24 @@ pub struct ScaffoldTestHooks {
 const TODO_FILES: &[(&str, &str)] = &[
     ("Cargo.toml", include_str!("templates/todo/cargo_toml")),
     ("src/main.rs", include_str!("templates/todo/main_rs")),
+    ("src/list.rs", include_str!("templates/todo/src_list_rs")),
+    (
+        "src/render.rs",
+        include_str!("templates/todo/src_render_rs"),
+    ),
+    ("src/tags.rs", include_str!("templates/todo/src_tags_rs")),
+    (
+        "src/filter.rs",
+        include_str!("templates/todo/src_filter_rs"),
+    ),
+    (
+        "src/by_status.rs",
+        include_str!("templates/todo/src_by_status_rs"),
+    ),
+    (
+        "src/by_title.rs",
+        include_str!("templates/todo/src_by_title_rs"),
+    ),
     (
         "docs/plans/STATUS.md",
         include_str!("templates/todo/plans_status_md"),
@@ -50,22 +68,92 @@ const TODO_FILES: &[(&str, &str)] = &[
         ".makina/config.toml",
         include_str!("templates/todo/makina_config_toml"),
     ),
+    // Plan 0001 — sequential chain.
     (
-        "docs/plans/0001-Todo-Starter/SCOPE.md",
-        include_str!("templates/todo/plan_scope_md"),
+        "docs/plans/0001-Todo-Core/SCOPE.md",
+        include_str!("templates/todo/plan_0001_scope_md"),
     ),
     (
-        "docs/plans/0001-Todo-Starter/ARCHITECTURE.md",
-        include_str!("templates/todo/plan_architecture_md"),
+        "docs/plans/0001-Todo-Core/ARCHITECTURE.md",
+        include_str!("templates/todo/plan_0001_architecture_md"),
     ),
     (
-        "docs/plans/0001-Todo-Starter/tasks/0101-add-task-toggle.md",
-        include_str!("templates/todo/plan_task_md"),
+        "docs/plans/0001-Todo-Core/STATUS.md",
+        include_str!("templates/todo/plan_0001_status_md"),
     ),
     (
-        "docs/plans/0001-Todo-Starter/STATUS.md",
-        include_str!("templates/todo/plan_status_md"),
+        "docs/plans/0001-Todo-Core/tasks/0101-add-task-toggle.md",
+        include_str!("templates/todo/plan_0001_task_0101_md"),
     ),
+    (
+        "docs/plans/0001-Todo-Core/tasks/0102-add-count-open.md",
+        include_str!("templates/todo/plan_0001_task_0102_md"),
+    ),
+    (
+        "docs/plans/0001-Todo-Core/tasks/0103-add-print-summary.md",
+        include_str!("templates/todo/plan_0001_task_0103_md"),
+    ),
+    // Plan 0002 — three independent parallel tasks.
+    (
+        "docs/plans/0002-Todo-Features/SCOPE.md",
+        include_str!("templates/todo/plan_0002_scope_md"),
+    ),
+    (
+        "docs/plans/0002-Todo-Features/ARCHITECTURE.md",
+        include_str!("templates/todo/plan_0002_architecture_md"),
+    ),
+    (
+        "docs/plans/0002-Todo-Features/STATUS.md",
+        include_str!("templates/todo/plan_0002_status_md"),
+    ),
+    (
+        "docs/plans/0002-Todo-Features/tasks/0201-add-list-module.md",
+        include_str!("templates/todo/plan_0002_task_0201_md"),
+    ),
+    (
+        "docs/plans/0002-Todo-Features/tasks/0202-add-render-module.md",
+        include_str!("templates/todo/plan_0002_task_0202_md"),
+    ),
+    (
+        "docs/plans/0002-Todo-Features/tasks/0203-add-tags-module.md",
+        include_str!("templates/todo/plan_0002_task_0203_md"),
+    ),
+    // Plan 0003 — mixed fan-out/fan-in.
+    (
+        "docs/plans/0003-Todo-Integration/SCOPE.md",
+        include_str!("templates/todo/plan_0003_scope_md"),
+    ),
+    (
+        "docs/plans/0003-Todo-Integration/ARCHITECTURE.md",
+        include_str!("templates/todo/plan_0003_architecture_md"),
+    ),
+    (
+        "docs/plans/0003-Todo-Integration/STATUS.md",
+        include_str!("templates/todo/plan_0003_status_md"),
+    ),
+    (
+        "docs/plans/0003-Todo-Integration/tasks/0301-add-filter-enum.md",
+        include_str!("templates/todo/plan_0003_task_0301_md"),
+    ),
+    (
+        "docs/plans/0003-Todo-Integration/tasks/0302-add-by-status-filter.md",
+        include_str!("templates/todo/plan_0003_task_0302_md"),
+    ),
+    (
+        "docs/plans/0003-Todo-Integration/tasks/0303-add-by-title-filter.md",
+        include_str!("templates/todo/plan_0003_task_0303_md"),
+    ),
+    (
+        "docs/plans/0003-Todo-Integration/tasks/0304-wire-filters-into-main.md",
+        include_str!("templates/todo/plan_0003_task_0304_md"),
+    ),
+];
+
+/// Plan directories scaffolded by the `todo` template, in registration order.
+const TODO_PLAN_DIRS: &[&str] = &[
+    "docs/plans/0001-Todo-Core",
+    "docs/plans/0002-Todo-Features",
+    "docs/plans/0003-Todo-Integration",
 ];
 
 /// Run a git command in the given directory.
@@ -221,51 +309,68 @@ async fn scaffold_owned(
         ));
     }
     let authored_oid = git_output(target, &["rev-parse", "develop"])?;
-    let key = PlanKey::parse("docs/plans/0001-Todo-Starter").map_err(|e| e.to_string())?;
-    let source = FilesystemPlanFileSource::new(target, Some(authored_oid.clone()))
-        .map_err(|e| e.to_string())?;
-    let plan = match load_plan(&source, key.clone(), &PlanReservations::default())
-        .map_err(|report| format!("scaffold plan is invalid: {:?}", report.diagnostics))?
-    {
-        PlanCandidate::Plan(plan) => *plan,
-        PlanCandidate::NotCandidate => return Err("scaffold plan is not a candidate".into()),
-    };
     let coordinator = AuthoringCoordinator::new(
         target.to_path_buf(),
         "develop".into(),
         Arc::new(RepositoryLeaseRegistry::new()),
     );
-    let registration = coordinator
-        .publish_committed(key, authored_oid.clone(), plan.source_digest.to_string())
-        .await
-        .map_err(|e| format!("failed to register scaffold plan: {e}"))?;
-    let CommandOutcome::PlanRegistered { registration_oid } = registration else {
-        return Err("scaffold plan was not committed before registration".into());
-    };
-    if lose_registration_response {
-        // The first successful response is deliberately discarded. Recovery
-        // repeats the exact request and must observe the already-published R.
-        let replay = coordinator
-            .publish_committed(
-                PlanKey::parse("docs/plans/0001-Todo-Starter").map_err(|e| e.to_string())?,
-                authored_oid.clone(),
-                plan.source_digest.to_string(),
-            )
+    let mut registration_oids = Vec::with_capacity(TODO_PLAN_DIRS.len());
+    for (index, plan_dir) in TODO_PLAN_DIRS.iter().enumerate() {
+        let key = PlanKey::parse(plan_dir).map_err(|e| e.to_string())?;
+        let source = FilesystemPlanFileSource::new(target, Some(authored_oid.clone()))
+            .map_err(|e| e.to_string())?;
+        let plan = match load_plan(&source, key.clone(), &PlanReservations::default()).map_err(
+            |report| {
+                format!(
+                    "scaffold plan {plan_dir} is invalid: {:?}",
+                    report.diagnostics
+                )
+            },
+        )? {
+            PlanCandidate::Plan(plan) => *plan,
+            PlanCandidate::NotCandidate => {
+                return Err(format!("scaffold plan {plan_dir} is not a candidate"));
+            }
+        };
+        let registration = coordinator
+            .publish_committed(key, authored_oid.clone(), plan.source_digest.to_string())
             .await
-            .map_err(|e| format!("failed to recover lost scaffold registration response: {e}"))?;
-        if !matches!(
-            replay,
-            CommandOutcome::PlanRegistered {
-                registration_oid: replay_oid
-            } if replay_oid == registration_oid
-        ) {
-            return Err("registration response-loss recovery did not return exact R".into());
+            .map_err(|e| format!("failed to register scaffold plan {plan_dir}: {e}"))?;
+        let CommandOutcome::PlanRegistered { registration_oid } = registration else {
+            return Err(format!(
+                "scaffold plan {plan_dir} was not committed before registration"
+            ));
+        };
+        if index == 0 && lose_registration_response {
+            // The first successful response is deliberately discarded. Recovery
+            // repeats the exact request and must observe the already-published R.
+            let replay = coordinator
+                .publish_committed(
+                    PlanKey::parse(plan_dir).map_err(|e| e.to_string())?,
+                    authored_oid.clone(),
+                    plan.source_digest.to_string(),
+                )
+                .await
+                .map_err(|e| {
+                    format!("failed to recover lost scaffold registration response: {e}")
+                })?;
+            if !matches!(
+                replay,
+                CommandOutcome::PlanRegistered {
+                    registration_oid: replay_oid
+                } if replay_oid == registration_oid
+            ) {
+                return Err("registration response-loss recovery did not return exact R".into());
+            }
         }
+        registration_oids.push(registration_oid);
     }
     run_git(target, &["branch", "workspace", &authored_oid])?;
     run_git(target, &["checkout", "workspace"])?;
     let instructions = format!(
-        "\nCreated exact registration {registration_oid} for the develop base.\nThe workspace branch is checked out at the authored scaffold commit; Makina may advance develop safely.\n\nNext:\n  cd {} && makina\n",
+        "\nCreated {} exact registrations ({}) for the develop base.\nThe workspace branch is checked out at the authored scaffold commit; Makina may advance develop safely.\n\nNext:\n  cd {} && makina\n",
+        registration_oids.len(),
+        registration_oids.join(", "),
         target.display()
     );
     Ok(ScaffoldReport {

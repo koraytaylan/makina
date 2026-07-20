@@ -1,0 +1,22 @@
+---
+id: add-by-status-filter
+title: Add A By Status Filter
+workstream: "0003"
+kind: task
+depends_on: [add-filter-enum]
+gated: false
+touches:
+  - src/by_status.rs
+status: planned
+merged_as: ""
+---
+# Add A By Status Filter
+
+Replace the `src/by_status.rs` stub with `pub fn by_status(tasks: &[Task], done: bool) -> Vec<&Task>` that returns tasks whose `done` field matches `done`, plus a unit test. It depends on `add-filter-enum` and runs in parallel with `add-by-title-filter`.
+
+**Steps:**
+
+1. Replace `src/by_status.rs` with `pub fn by_status(tasks: &[Task], done: bool) -> Vec<&Task>`.
+2. Add a unit test that filters a small list for both done and not-done.
+
+- **Done when:** `by_status` returns the right subset for both states, its unit test passes, and `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` succeed.
