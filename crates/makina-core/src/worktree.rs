@@ -518,12 +518,24 @@ impl WorktreeManager {
             .await?
             .trim()
             .to_string();
+        // Canonicalize the worktree path to an absolute form before passing it
+        // to `git worktree add`. When repo_root is a relative path (e.g. the
+        // scaffold passes `target` as a relative CWD-relative dir), git resolves
+        // the worktree path relative to the `-C repo_root` dir, not CWD — which
+        // double-prefixes the path. An absolute path avoids this ambiguity.
+        let absolute_path = path.canonicalize().unwrap_or_else(|_| {
+            // canonicalize fails if the path doesn't exist yet (the parent was
+            // just created_dir_all'd but the leaf doesn't exist). Fall back to
+            // joining CWD.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            cwd.join(&path)
+        });
         self.run_git(
             &[
                 "worktree",
                 "add",
                 "--detach",
-                path.to_string_lossy().as_ref(),
+                absolute_path.to_string_lossy().as_ref(),
                 &base_oid,
             ],
             &format!("create detached integration workspace {}", path.display()),
