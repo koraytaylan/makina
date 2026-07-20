@@ -1918,9 +1918,14 @@ impl App {
     }
 
     /// Flatten discovered plans + open runs + the tasks of expanded runs into the visible-node
-    /// order shown in the sidebar (plans first, then runs and their tasks if expanded, repeat).
+    /// order shown in the sidebar. Runs replace their discovered-plan node in place so the
+    /// sidebar order stays stable when a plan is started (a run for plan 0001 stays where
+    /// plan 0001 was, not shifted to the bottom).
     pub fn visible_tree_nodes(&self) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
+        // Track which run indices were already emitted in Steps 1-2 so Step 3
+        // only appends the ones that did not match a discovered plan.
+        let mut emitted_runs: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Project-scoped plans that already have an open Run (any status, deduped to
         // latest below). Such a plan is rendered as its Run node — NOT also as
@@ -1931,8 +1936,10 @@ impl App {
             .map(|run| self.plan_identity_for_run(run))
             .collect();
 
-        // Step 1: Add discovered folders and their plans.
-        // These use the new PlanInFolder/PlanTaskInFolder variants.
+        // Step 1: Add discovered folders and their plans, interleaving run nodes
+        // in place of discovered plans that have an open Run. This keeps the
+        // sidebar order stable when a plan is started: the run node appears
+        // exactly where the discovered-plan node was, not at the bottom.
         for folder_idx in 0..self.opened_folders.len() {
             nodes.push(TreeNode::Folder { folder_idx });
 
@@ -1941,10 +1948,16 @@ impl App {
                 && let Some(plans) = self.plans_by_folder.get(&folder_idx)
             {
                 for (local_plan_idx, plan) in plans.iter().enumerate() {
-                    // Skip if this plan has an open Run (same dedup as before).
                     let target =
                         self.plan_identity_for_entry(&self.opened_folders[folder_idx], plan);
                     if run_plans.contains(&target) {
+                        // This plan has an open Run: render the run node in place
+                        // (instead of the discovered-plan node) so the sidebar
+                        // order does not shift.
+                        if let Some(run_idx) = self.run_index_for_plan(&target) {
+                            emitted_runs.insert(run_idx);
+                            self.push_run_node(&mut nodes, run_idx);
+                        }
                         continue;
                     }
                     nodes.push(TreeNode::PlanInFolder {
@@ -1969,11 +1982,15 @@ impl App {
             }
         }
 
-        // Step 2: Add legacy discovered plans (for backward compat).
-        // These use the legacy Plan/PlanTask variants.
+        // Step 2: Add legacy discovered plans (for backward compat), interleaving
+        // run nodes in place just like Step 1.
         for (plan_idx, plan) in self.discovered_plans.iter().enumerate() {
             let target = self.plan_identity_for_entry(&self.repo_root, plan);
             if run_plans.contains(&target) {
+                if let Some(run_idx) = self.run_index_for_plan(&target) {
+                    emitted_runs.insert(run_idx);
+                    self.push_run_node(&mut nodes, run_idx);
+                }
                 continue;
             }
             nodes.push(TreeNode::Plan { plan_idx });
@@ -1984,27 +2001,54 @@ impl App {
             }
         }
 
-        // Step 3: Add open runs and their expanded tasks (unchanged).
+        // Step 3: Add any remaining open runs that were not emitted in Steps 1-2
+        // (e.g. historical disk runs whose plan is no longer discovered, or runs
+        // from a closed folder). These appear after the discovered plans.
         for (run_idx, run) in self.runs.iter().enumerate() {
-            let target = self.plan_identity_for_run(run);
-            let add_this = self
-                .latest_run_for_plan(&target)
-                .is_some_and(|latest| latest.id == run.id);
-            if add_this {
-                nodes.push(TreeNode::Run { run: run_idx });
-                // Only include tasks if this run is expanded (not in collapsed_runs).
-                if !self.collapsed_runs.contains(&run.id) {
-                    for task_idx in 0..run.tasks.len() {
-                        nodes.push(TreeNode::Task {
-                            run: run_idx,
-                            task: task_idx,
-                        });
-                    }
-                }
+            if emitted_runs.contains(&run_idx) {
+                continue;
             }
+            // Dedup: skip non-latest runs for the same plan (mirror the old logic).
+            let target = self.plan_identity_for_run(run);
+            if self
+                .latest_run_for_plan(&target)
+                .is_some_and(|latest| latest.id != run.id)
+            {
+                continue;
+            }
+            emitted_runs.insert(run_idx);
+            self.push_run_node(&mut nodes, run_idx);
         }
 
         nodes
+    }
+
+    /// Push a `TreeNode::Run` (and its expanded `TreeNode::Task` children) for
+    /// `run_idx` onto `nodes`. Used by [`visible_tree_nodes`].
+    fn push_run_node(&self, nodes: &mut Vec<TreeNode>, run_idx: usize) {
+        nodes.push(TreeNode::Run { run: run_idx });
+        if let Some(run) = self.runs.get(run_idx)
+            && !self.collapsed_runs.contains(&run.id)
+        {
+            for task_idx in 0..run.tasks.len() {
+                nodes.push(TreeNode::Task {
+                    run: run_idx,
+                    task: task_idx,
+                });
+            }
+        }
+    }
+
+    /// Return the index into `self.runs` for the latest run matching `target`,
+    /// or `None` if no run matches. Used by [`visible_tree_nodes`] to interleave
+    /// run nodes in place of discovered-plan nodes.
+    fn run_index_for_plan(&self, target: &PlanIdentity) -> Option<usize> {
+        self.runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| self.plan_identity_for_run(run) == *target)
+            .max_by_key(|(_, run)| &run.run_uid)
+            .map(|(idx, _)| idx)
     }
 
     /// The node currently under the tree cursor, if any.
@@ -10545,6 +10589,94 @@ mod tests {
         assert!(
             !nodes2.iter().any(|n| matches!(n, TreeNode::Plan { .. })),
             "plan stub still hidden"
+        );
+    }
+
+    /// Regression test: when a run is opened for the FIRST of several discovered
+    /// plans, the run node must appear in the SAME position as the discovered
+    /// plan (not shifted to the bottom of the sidebar). Before the fix, the
+    /// sidebar order changed from [Plan-0001, Plan-0002, Plan-0003] to
+    /// [Plan-0002, Plan-0003, Run-0001] when plan 0001 was started, which looked
+    /// like plan 0001 "moved to the bottom."
+    #[test]
+    fn started_plan_run_stays_in_plan_order_position() {
+        use makina_core::api::{RunId, RunStatus, RunView};
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.discovered_plans = vec![
+            test_plan_entry(
+                PathBuf::from("docs/plans/0001-todo"),
+                "0001-todo".to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            ),
+            test_plan_entry(
+                PathBuf::from("docs/plans/0002-todo"),
+                "0002-todo".to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            ),
+            test_plan_entry(
+                PathBuf::from("docs/plans/0003-todo"),
+                "0003-todo".to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        // Before starting: [Plan-0001, Plan-0002, Plan-0003].
+        let nodes_before = app.visible_tree_nodes();
+        let plan_slugs_before: Vec<&str> = nodes_before
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Plan { plan_idx } => Some(app.discovered_plans[*plan_idx].slug.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            plan_slugs_before,
+            vec!["0001-todo", "0002-todo", "0003-todo"],
+            "before starting, plans must be in discovery order"
+        );
+
+        // Start plan 0001: open a Run for it.
+        app.runs = vec![RunView {
+            id: RunId(1),
+            run_uid: "uid-1".to_string(),
+            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-todo").unwrap(),
+            status: RunStatus::Running,
+            project: String::new(),
+            tasks: vec![],
+            report: makina_core::api::IngestionReport::default(),
+        }];
+
+        let nodes_after = app.visible_tree_nodes();
+        // The first node must be the Run for 0001 (not Plan-0002).
+        assert!(
+            matches!(nodes_after[0], TreeNode::Run { run: 0 }),
+            "first node must be the Run for plan 0001, not a Plan; got {:?}",
+            nodes_after[0]
+        );
+        // The remaining nodes must be Plan-0002 and Plan-0003 in order.
+        let remaining_slugs: Vec<&str> = nodes_after
+            .iter()
+            .skip(1)
+            .filter_map(|n| match n {
+                TreeNode::Plan { plan_idx } => Some(app.discovered_plans[*plan_idx].slug.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            remaining_slugs,
+            vec!["0002-todo", "0003-todo"],
+            "remaining plans must stay in discovery order after plan 0001 is started; got {:?}",
+            nodes_after
         );
     }
 

@@ -351,10 +351,13 @@ async fn main() {
     // There is no prior `tracing_subscriber` usage in the repo; this is the
     // first install.
     let log_rx = {
+        use tracing_subscriber::EnvFilter;
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
         let (tui_layer, log_rx) = log::tui_log_channel();
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         tracing_subscriber::registry()
+            .with(filter)
             .with(log::RunFileLayer::new(repo_root.clone()))
             .with(tui_layer)
             .init();

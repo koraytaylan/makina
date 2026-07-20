@@ -626,6 +626,17 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
                             ));
+                        } else if app.opening_plans.contains(&target) {
+                            // A background OpenPlan (and auto-StartRun) is in
+                            // flight for this plan. Show an animated "starting"
+                            // badge so the user sees immediate feedback the
+                            // moment they start a plan, before the RunOpened
+                            // event arrives and the node transitions to a Run.
+                            line_spans.push(Span::styled(
+                                format!("  {} starting", spinner_frame(app.tick)),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
+                            ));
                         }
                         ListItem::new(Line::from(line_spans))
                     }
@@ -781,6 +792,17 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 format!("  {} resetting", spinner_frame(app.tick)),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
+                            ));
+                        } else if app.opening_plans.contains(&target) {
+                            // A background OpenPlan (and auto-StartRun) is in
+                            // flight for this plan. Show an animated "starting"
+                            // badge so the user sees immediate feedback the
+                            // moment they start a plan, before the RunOpened
+                            // event arrives and the node transitions to a Run.
+                            line_spans.push(Span::styled(
+                                format!("  {} starting", spinner_frame(app.tick)),
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                             ));
                         }
 
@@ -5362,6 +5384,45 @@ mod tests {
         assert!(
             screen.contains("0001-initial"),
             "sidebar must show the discovered plan slug even with no open runs;\nscreen was:\n{screen}"
+        );
+    }
+
+    /// Regression test: when a plan is being started (a background OpenPlan +
+    /// auto-StartRun is in flight), the sidebar must show an animated "starting"
+    /// badge on the plan node so the user sees immediate feedback. Before the
+    /// fix, the sidebar showed no visual change until the RunOpened event
+    /// arrived asynchronously, which looked like "nothing happened."
+    #[test]
+    fn render_plan_in_opening_state_shows_starting_badge() {
+        let mut terminal = make_terminal(160, 24);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        // Widen the sidebar so the "starting" badge is not clipped.
+        app.sidebar_width_percent = 40;
+        app.discovered_plans = vec![test_plan_entry(
+            PathBuf::from("/repo/docs/plans/0001-Initial"),
+            "0001-initial".to_string(),
+            vec![TestPlanTask {
+                id: "cargo-scaffold".to_string(),
+                title: "Compiling Skeleton".to_string(),
+                gated: false,
+                body: String::new(),
+                depends_on: Vec::new(),
+            }],
+        )];
+        // Collapse the plan so only the plan row (not its task children) is
+        // rendered — the "starting" badge is on the plan row itself.
+        let target = discovered_plan_identity(&app, 0);
+        app.collapsed_plans
+            .insert(crate::app::CollapseKey::Plan(target.clone()));
+        app.opening_plans.insert(target);
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("starting"),
+            "sidebar must show a 'starting' badge when a plan is being opened/started;\nscreen was:\n{screen}"
         );
     }
 

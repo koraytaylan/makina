@@ -436,6 +436,14 @@ pub async fn probe_writable_checkpoint_root(
 /// Overlay volatile scheduler fields only. `Done` is deliberately never
 /// restored from JSON; Git/status reconciliation owns that proof.
 pub fn overlay_compatible(graph: &mut TaskGraph, checkpoint: &PlanCheckpoint) {
+    // Build a lookup of saved states by task id so we can inspect dependency
+    // states when deciding whether a Skipped task should be un-skipped.
+    let saved_states: std::collections::HashMap<&str, TaskState> = checkpoint
+        .tasks
+        .iter()
+        .map(|saved| (saved.id.as_str(), saved.state))
+        .collect();
+
     for task in &mut graph.tasks {
         let Some(saved) = checkpoint.tasks.iter().find(|saved| saved.id == task.id.0) else {
             continue;
@@ -456,8 +464,62 @@ pub fn overlay_compatible(graph: &mut TaskGraph, checkpoint: &PlanCheckpoint) {
         task.state = match saved.state {
             TaskState::Done => task.state,
             TaskState::InProgress | TaskState::InReview => TaskState::Ready,
+            // A Skipped task is only meaningful within a single run: it means a
+            // dependency failed. On resume, if no dependency is still Failed or
+            // Skipped (in the checkpoint), the task should be un-skipped back
+            // to New so the scheduler can run it once its dependencies complete.
+            // Otherwise the task stays Skipped forever even after the blocking
+            // task is reset to Ready — which is the "first task ready, other two
+            // skipped" regression.
+            TaskState::Skipped => {
+                let any_dep_failed = task.depends_on.iter().any(|dep| {
+                    matches!(
+                        saved_states.get(dep.0.as_str()),
+                        Some(TaskState::Failed | TaskState::Skipped)
+                    )
+                });
+                if any_dep_failed {
+                    TaskState::Skipped
+                } else {
+                    task.state
+                }
+            }
             state => state,
         };
+    }
+
+    // Second pass: un-skip transitive chains. A Skipped task whose dependency
+    // was ALSO Skipped in the checkpoint (and is now being un-skipped by the
+    // first pass) must itself be un-skipped. The first pass only checks the
+    // checkpoint state of dependencies, but a dependency that was Skipped in
+    // the checkpoint may have been un-skipped to New by the first pass (because
+    // ITS dependencies were not failed). So we re-scan: any Skipped task whose
+    // dependencies are all non-Failed/non-Skipped in the POST-overlay graph
+    // state is un-skipped to New. We iterate to a fixed point to handle
+    // arbitrarily deep chains.
+    loop {
+        // Collect the ids to un-skip this pass (avoid borrowing graph.tasks
+        // mutably while also reading dependency states from the same graph).
+        let to_unskip: Vec<usize> = graph
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.state == TaskState::Skipped)
+            .filter(|(_, task)| {
+                task.depends_on.iter().all(|dep| {
+                    graph
+                        .get(dep)
+                        .is_none_or(|d| !matches!(d.state, TaskState::Failed | TaskState::Skipped))
+                })
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        if to_unskip.is_empty() {
+            break;
+        }
+        for idx in to_unskip {
+            graph.tasks[idx].state = TaskState::New;
+        }
     }
 }
 

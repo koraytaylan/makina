@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -11,8 +12,9 @@ use makina_core::plan::{
     FilesystemPlanFileSource, PlanCandidate, PlanKey, PlanReservations, load_plan,
 };
 use makina_core::plan_runtime::ProjectedTaskGraph;
-use makina_core::task::TaskState;
-use makina_core::task::{AuthoredSeedOutcome, AuthoredTaskMetadata};
+use makina_core::task::{
+    AuthoredSeedOutcome, AuthoredTaskMetadata, Task, TaskGraph, TaskId, TaskState,
+};
 
 #[test]
 fn projection_preserves_authored_identity_order_dependencies_and_metadata() {
@@ -205,6 +207,224 @@ async fn clean_mismatch_can_be_archived_without_overwriting_recovery_evidence() 
             .is_none()
     );
     restore_home(old);
+}
+
+/// Regression test: a `Skipped` task in a compatible checkpoint must be
+/// un-skipped back to `New` when its dependencies are no longer `Failed` or
+/// `Skipped`. Otherwise a task whose dependency was reset (e.g. from
+/// `InProgress` to `Ready` by `overlay_compatible`) stays `Skipped` forever,
+/// producing the "first task ready, other two skipped" regression.
+#[test]
+fn compatible_checkpoint_unskips_dependents_when_blocking_task_is_not_failed() {
+    let now = Utc::now();
+    let mut graph = TaskGraph {
+        slug: "test-plan".into(),
+        tasks: vec![
+            Task {
+                id: TaskId::new("root"),
+                title: "Root".into(),
+                description: String::new(),
+                done_when: String::new(),
+                depends_on: vec![],
+                section: None,
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                created_at: now,
+                updated_at: now,
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            },
+            Task {
+                id: TaskId::new("dep-a"),
+                title: "Dep A".into(),
+                description: String::new(),
+                done_when: String::new(),
+                depends_on: vec![TaskId::new("root")],
+                section: None,
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                created_at: now,
+                updated_at: now,
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            },
+            Task {
+                id: TaskId::new("dep-b"),
+                title: "Dep B".into(),
+                description: String::new(),
+                done_when: String::new(),
+                depends_on: vec![TaskId::new("dep-a")],
+                section: None,
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                created_at: now,
+                updated_at: now,
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            },
+        ],
+        authored: BTreeMap::new(),
+    };
+
+    // Checkpoint from a prior run where root was InProgress (stuck), dep-a and
+    // dep-b were Skipped (because root had Failed at some point during that run,
+    // skipping its dependents transitively, then root was retried back to
+    // InProgress before the checkpoint was written).
+    let checkpoint = PlanCheckpoint {
+        schema_version: 1,
+        identity: CheckpointIdentity {
+            plan_dir: std::path::PathBuf::from("docs/plans/test-plan"),
+            executable_digest: "0".repeat(64),
+            task_ids: vec!["root".into(), "dep-a".into(), "dep-b".into()],
+            task_source_paths: vec![],
+        },
+        tasks: vec![
+            RuntimeTaskCheckpoint {
+                id: "root".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+            },
+            RuntimeTaskCheckpoint {
+                id: "dep-a".into(),
+                state: TaskState::Skipped,
+                gate_iterations: 0,
+                review_iterations: 0,
+            },
+            RuntimeTaskCheckpoint {
+                id: "dep-b".into(),
+                state: TaskState::Skipped,
+                gate_iterations: 0,
+                review_iterations: 0,
+            },
+        ],
+        active_refs: vec![],
+        active_worktrees: vec![],
+    };
+
+    overlay_compatible(&mut graph, &checkpoint);
+
+    // root: InProgress → Ready (standard overlay reset).
+    assert_eq!(
+        graph.tasks.iter().find(|t| t.id.0 == "root").unwrap().state,
+        TaskState::Ready,
+        "root (was InProgress) must be reset to Ready"
+    );
+    // dep-a: Skipped → New (un-skipped because root is no longer Failed/Skipped).
+    assert_eq!(
+        graph
+            .tasks
+            .iter()
+            .find(|t| t.id.0 == "dep-a")
+            .unwrap()
+            .state,
+        TaskState::New,
+        "dep-a must be un-skipped to New because its dependency (root) is no longer Failed/Skipped"
+    );
+    // dep-b: Skipped → New (un-skipped because dep-a is no longer Failed/Skipped).
+    assert_eq!(
+        graph
+            .tasks
+            .iter()
+            .find(|t| t.id.0 == "dep-b")
+            .unwrap()
+            .state,
+        TaskState::New,
+        "dep-b must be un-skipped to New because its dependency (dep-a) is no longer Failed/Skipped"
+    );
+}
+
+/// A `Skipped` task whose dependency is still `Failed` in the checkpoint must
+/// STAY `Skipped` (the un-skip must not fire when the blocker is genuinely
+/// still failed).
+#[test]
+fn compatible_checkpoint_keeps_skipped_when_blocking_task_is_still_failed() {
+    let now = Utc::now();
+    let mut graph = TaskGraph {
+        slug: "test-plan".into(),
+        tasks: vec![
+            Task {
+                id: TaskId::new("root"),
+                title: "Root".into(),
+                description: String::new(),
+                done_when: String::new(),
+                depends_on: vec![],
+                section: None,
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                created_at: now,
+                updated_at: now,
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            },
+            Task {
+                id: TaskId::new("dep"),
+                title: "Dep".into(),
+                description: String::new(),
+                done_when: String::new(),
+                depends_on: vec![TaskId::new("root")],
+                section: None,
+                state: TaskState::New,
+                gate_iterations: 0,
+                review_iterations: 0,
+                created_at: now,
+                updated_at: now,
+                started_at: None,
+                finished_at: None,
+                failure_reason: None,
+            },
+        ],
+        authored: BTreeMap::new(),
+    };
+
+    let checkpoint = PlanCheckpoint {
+        schema_version: 1,
+        identity: CheckpointIdentity {
+            plan_dir: std::path::PathBuf::from("docs/plans/test-plan"),
+            executable_digest: "0".repeat(64),
+            task_ids: vec!["root".into(), "dep".into()],
+            task_source_paths: vec![],
+        },
+        tasks: vec![
+            RuntimeTaskCheckpoint {
+                id: "root".into(),
+                state: TaskState::Failed,
+                gate_iterations: 5,
+                review_iterations: 0,
+            },
+            RuntimeTaskCheckpoint {
+                id: "dep".into(),
+                state: TaskState::Skipped,
+                gate_iterations: 0,
+                review_iterations: 0,
+            },
+        ],
+        active_refs: vec![],
+        active_worktrees: vec![],
+    };
+
+    overlay_compatible(&mut graph, &checkpoint);
+
+    // root: Failed stays Failed (the `state => state` arm preserves it).
+    assert_eq!(
+        graph.tasks.iter().find(|t| t.id.0 == "root").unwrap().state,
+        TaskState::Failed,
+        "root must stay Failed"
+    );
+    // dep: Skipped stays Skipped because root is still Failed.
+    assert_eq!(
+        graph.tasks.iter().find(|t| t.id.0 == "dep").unwrap().state,
+        TaskState::Skipped,
+        "dep must stay Skipped because its dependency (root) is still Failed"
+    );
 }
 
 fn load_fixture() -> (tempfile::TempDir, Box<makina_core::plan::PlanDocument>) {
