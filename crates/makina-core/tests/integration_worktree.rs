@@ -81,21 +81,23 @@ async fn private_integration_workspace_preserves_poisoned_operator_checkout() {
 }
 
 #[tokio::test]
-async fn integration_workspace_fails_before_git_mutation_without_external_state() {
+async fn integration_workspace_succeeds_without_home() {
+    // With the in-repo state layout, $HOME is no longer required.
+    // create_integration_workspace must succeed even when HOME is unset.
     let _guard = makina_core::HOME_ENV_LOCK.lock().await;
     let old_home = std::env::var_os("HOME");
     unsafe { std::env::remove_var("HOME") };
     let repo = setup_temp_repo();
-    let before = git(repo.path(), &["show-ref"]);
     let manager = WorktreeManager::new(repo.path().to_owned(), "develop".into());
+    let workspace = manager
+        .create_integration_workspace("0048-isolation", "01NOHOME")
+        .await
+        .expect("must succeed without HOME (in-repo state)");
     assert!(
-        manager
-            .create_integration_workspace("0048-isolation", "01NOHOME")
-            .await
-            .is_err()
+        workspace.path.starts_with(repo.path().join(".makina")),
+        "integration workspace must be under repo/.makina, got {}",
+        workspace.path.display()
     );
-    assert_eq!(git(repo.path(), &["show-ref"]), before);
-    assert!(!repo.path().join(".makina/runs").exists());
     if let Some(value) = old_home {
         unsafe { std::env::set_var("HOME", value) };
     }

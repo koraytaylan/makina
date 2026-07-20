@@ -106,24 +106,13 @@ pub fn inspect_checkpoint(
     }
 }
 
-/// Resolve without creating anything. Existing ancestors are canonicalized so
-/// a HOME symlink into the repository cannot bypass containment.
+/// Resolve the state root for checkpoint storage. With the in-repo state
+/// layout this is simply `repo_root/.makina/` — always available, no `$HOME`
+/// dependency, no containment check needed.
 pub fn external_state_root(repo_root: &Path) -> Result<PathBuf, CheckpointError> {
-    crate::paths::state_root(repo_root).map_err(|source| match source.kind() {
-        std::io::ErrorKind::NotFound if source.to_string().contains("HOME") => {
-            CheckpointError::StateUnavailable
-        }
-        std::io::ErrorKind::InvalidInput
-            if source
-                .to_string()
-                .contains("runtime state root resolves inside repository") =>
-        {
-            CheckpointError::StateInsideRepository(repo_root.to_path_buf())
-        }
-        _ => CheckpointError::Io {
-            path: repo_root.to_path_buf(),
-            source,
-        },
+    crate::paths::state_root(repo_root).map_err(|source| CheckpointError::Io {
+        path: repo_root.to_path_buf(),
+        source,
     })
 }
 
@@ -528,56 +517,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_home_fails_without_repository_fallback() {
-        let _guard = crate::HOME_ENV_LOCK.blocking_lock();
+    fn state_root_is_in_repo_makina_dir() {
         let repo = tempfile::tempdir().unwrap();
-        let old = std::env::var_os("HOME");
-        unsafe { std::env::remove_var("HOME") };
-        let result = external_state_root(repo.path());
-        if let Some(value) = old {
-            unsafe { std::env::set_var("HOME", value) }
-        }
-        assert!(matches!(result, Err(CheckpointError::StateUnavailable)));
-    }
-
-    #[test]
-    fn home_symlink_into_repository_fails_containment() {
-        let _guard = crate::HOME_ENV_LOCK.blocking_lock();
-        let repo = tempfile::tempdir().unwrap();
-        let link_parent = tempfile::tempdir().unwrap();
-        let home_link = link_parent.path().join("home");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(repo.path(), &home_link).unwrap();
-        let old = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &home_link) };
-        let result = external_state_root(repo.path());
-        if let Some(value) = old {
-            unsafe { std::env::set_var("HOME", value) }
-        } else {
-            unsafe { std::env::remove_var("HOME") }
-        }
-        assert!(matches!(
+        let result = external_state_root(repo.path()).unwrap();
+        assert_eq!(
             result,
-            Err(CheckpointError::StateInsideRepository(_))
-        ));
+            repo.path().join(".makina"),
+            "state root must be repo/.makina"
+        );
     }
 
     #[test]
-    fn checkpoint_path_is_external_and_plan_qualified() {
-        let _guard = crate::HOME_ENV_LOCK.blocking_lock();
+    fn checkpoint_path_is_in_repo_and_plan_qualified() {
         let repo = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let old = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", home.path()) };
         let key = PlanKey::parse("docs/plans/0048-Example").unwrap();
         let path = checkpoint_path(repo.path(), &key).unwrap();
-        if let Some(value) = old {
-            unsafe { std::env::set_var("HOME", value) }
-        } else {
-            unsafe { std::env::remove_var("HOME") }
-        }
-        assert!(path.starts_with(home.path()));
-        assert!(!path.starts_with(repo.path()));
+        // Path must be under repo/.makina/checkpoints/
+        assert!(
+            path.starts_with(repo.path().join(".makina").join("checkpoints")),
+            "checkpoint path must be under repo/.makina/checkpoints, got {}",
+            path.display()
+        );
         assert_eq!(path.file_name().unwrap(), "checkpoint.json");
         assert_eq!(path.parent().unwrap().file_name().unwrap().len(), 64);
     }

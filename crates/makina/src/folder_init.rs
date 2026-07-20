@@ -85,6 +85,24 @@ pub fn initialize_folder(folder: &Path) -> Result<(), String> {
             .map_err(|e| format!("failed to write docs/plans/README.md: {e}"))?;
     }
 
+    // 5. Ensure .makina/.gitignore exists so transient runtime state (runs,
+    //    worktrees, checkpoints) is never committed accidentally. Only creates
+    //    the file if it doesn't already exist; never overwrites a user's
+    //    custom rules.
+    let makina_dir = folder.join(".makina");
+    std::fs::create_dir_all(&makina_dir).map_err(|e| format!("failed to create .makina: {e}"))?;
+    let gitignore = makina_dir.join(".gitignore");
+    if !gitignore.exists() {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&gitignore)
+            .map_err(|e| format!("failed to create .makina/.gitignore: {e}"))?;
+        file.write_all(b"/runs/\n/worktrees/\n/checkpoints/\n")
+            .map_err(|e| format!("failed to write .makina/.gitignore: {e}"))?;
+    }
+
     Ok(())
 }
 

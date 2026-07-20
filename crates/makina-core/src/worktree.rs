@@ -2,7 +2,7 @@
 //!
 //! The [`WorktreeManager`] creates and tears down git worktrees and their
 //! associated branches on behalf of the Supervisor.  Each task gets an
-//! isolated checkout at `~/.makina/projects/{project_ns}/worktrees/{short_worktree_name}/`
+//! isolated checkout at `repo_root/.makina/worktrees/{short_worktree_name}/`
 //! on branch `task/{short_worktree_name}`, branched off the configured base
 //! branch (typically `develop`).  The `short_worktree_name` is a bounded,
 //! deterministic `{plan#}-{task-trunc}-{hash4}` form (see
@@ -26,8 +26,9 @@
 //!
 //! # Transient storage
 //!
-//! Worktrees live under `~/.makina/projects/{project_ns}/worktrees/` (off-repo)
-//! so they are never committed and never need a gitignore rule in the project.
+//! Worktrees live under `repo_root/.makina/worktrees/` (in-repo, gitignored)
+//! so they are never committed accidentally. The `.makina/.gitignore` file
+//! lists `/worktrees/`, `/runs/`, and `/checkpoints/` as transient.
 //! `.makina/tasks/` (the task artifact directory) IS committed and is NOT
 //! ignored.
 //!
@@ -448,6 +449,12 @@ impl WorktreeManager {
     /// Create or verify the run's private integration workspace. Creation is
     /// deliberately create-only: an existing path is inspected and retained on
     /// any ambiguity instead of being reset, cleaned, or force-removed.
+    /// However, if the path exists but git no longer recognizes it as a
+    /// worktree (e.g. the worktree was pruned from git's registry but the
+    /// directory survived on disk — a stale artifact from a previous
+    /// interrupted run or scaffold), the orphaned directory is removed and a
+    /// fresh worktree is created. There is nothing to recover from an
+    /// unregistered directory: git has no record of it.
     pub async fn create_integration_workspace(
         &self,
         plan_slug: &str,
@@ -463,32 +470,44 @@ impl WorktreeManager {
                 .output()
                 .await?;
             if !inside.status.success() {
-                return Err(WorktreeError::GitCommandFailed {
-                    command: format!("verify retained integration workspace {}", path.display()),
-                    stderr: "existing path is not a registered Git worktree; retained for recovery"
-                        .into(),
-                });
-            }
-            let head = self
-                .git_command(&path)
-                .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-                .output()
-                .await?;
-            if head.status.success() && String::from_utf8_lossy(&head.stdout).trim() != branch {
-                return Err(WorktreeError::GitCommandFailed {
-                    command: format!("verify retained integration workspace {}", path.display()),
-                    stderr: "workspace is detached or attached to unexpected lineage; retained for recovery"
-                        .into(),
-                });
-            }
-            if !head.status.success() && self.branch_exists(&branch).await? {
-                self.run_git_at_checked(&path, &["checkout", &branch], "attach retained plan ref")
+                // The path exists on disk but git does not recognize it as a
+                // worktree. This is a stale artifact (e.g. from a previous
+                // interrupted run/scaffold whose worktree was pruned from
+                // git's registry). The directory is orphaned — git has no
+                // record of it, so there is nothing to recover. Remove it
+                // and fall through to create a fresh worktree.
+                tokio::fs::remove_dir_all(&path).await.map_err(|e| {
+                    WorktreeError::GitCommandFailed {
+                        command: format!("remove stale integration workspace {}", path.display()),
+                        stderr: e.to_string(),
+                    }
+                })?;
+            } else {
+                let head = self
+                    .git_command(&path)
+                    .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+                    .output()
                     .await?;
+                if head.status.success() && String::from_utf8_lossy(&head.stdout).trim() != branch {
+                    return Err(WorktreeError::GitCommandFailed {
+                        command: format!("verify retained integration workspace {}", path.display()),
+                        stderr: "workspace is detached or attached to unexpected lineage; retained for recovery"
+                            .into(),
+                    });
+                }
+                if !head.status.success() && self.branch_exists(&branch).await? {
+                    self.run_git_at_checked(
+                        &path,
+                        &["checkout", &branch],
+                        "attach retained plan ref",
+                    )
+                    .await?;
+                }
+                return Ok(IntegrationWorkspace {
+                    path,
+                    plan_branch: branch,
+                });
             }
-            return Ok(IntegrationWorkspace {
-                path,
-                plan_branch: branch,
-            });
         }
         tokio::fs::create_dir_all(path.parent().expect("integration path has parent")).await?;
         let base_oid = self
@@ -1256,33 +1275,24 @@ mod tests {
     // ── WorktreeManager::worktree_path ────────────────────────────────────────
 
     /// The worktree path leaf must use the short name format
-    /// `{plan#}-{task-trunc}-{hash4}` and resolve under `state_root`, not
-    /// under `repo_root/.makina`.
+    /// `{plan#}-{task-trunc}-{hash4}` and resolve under `repo/.makina/worktrees/`.
     #[test]
     fn worktree_path_uses_short_name() {
-        let _guard = HOME_ENV_LOCK.blocking_lock();
-        let tmp_home = tempfile::tempdir().expect("create temp home");
         let tmp_repo = tempfile::tempdir().expect("create temp repo");
         let repo_root = tmp_repo.path().to_path_buf();
 
-        // SAFETY: serialised by HOME_ENV_LOCK
-        unsafe { std::env::set_var("HOME", tmp_home.path()) };
-
         let mgr = WorktreeManager::new(repo_root.clone(), "develop".into());
-        let path = mgr.worktree_path("0003-runtime-and-tui-hardening", "sample-task");
+        let path = mgr
+            .worktree_path("0003-runtime-and-tui-hardening", "sample-task")
+            .unwrap();
 
-        // Must be under state_root, not repo_root/.makina.
+        // Must be under repo/.makina/worktrees/ (the in-repo state root).
         let state_root = crate::paths::state_root(&repo_root).unwrap();
-        let path = path.unwrap();
         assert!(
             path.starts_with(&state_root),
             "worktree_path must be under state_root ({}), got {}",
             state_root.display(),
             path.display()
-        );
-        assert!(
-            !path.starts_with(repo_root.join(".makina")),
-            "worktree_path must NOT be under repo_root/.makina"
         );
 
         // Leaf must be the short name (not the old plan--task form).
@@ -1304,9 +1314,9 @@ mod tests {
     // ── module doc-comment layout invariant ───────────────────────────────────
 
     /// Regression guard: the module-level doc-comments must describe the
-    /// shipped `~/.makina/projects/{project_ns}/worktrees/{short_worktree_name}`
-    /// layout with the new short-name scheme, never the old
-    /// `.makina/worktrees/{plan_slug}--{task_id}/` in-repo paths.
+    /// in-repo `repo_root/.makina/worktrees/{short_worktree_name}` layout,
+    /// never the old `~/.makina/projects/` external layout or the
+    /// `.makina/worktrees/{plan_slug}--{task_id}/` old in-repo format.
     #[test]
     fn module_doc_describes_makina_plan_scoped_layout() {
         let src = include_str!("worktree.rs");
@@ -1320,16 +1330,21 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Relocated layout must be present with the new short-name form.
+        // In-repo layout must be present with the new short-name form.
         assert!(
-            module_doc.contains("~/.makina/projects/{project_ns}/worktrees/"),
-            "module doc must reference the relocated `~/.makina/projects/` layout"
+            module_doc.contains("repo_root/.makina/worktrees/{short_worktree_name}"),
+            "module doc must reference the in-repo `repo_root/.makina/worktrees/` layout"
         );
         assert!(
             module_doc.contains("short_worktree_name"),
             "module doc must reference short_worktree_name"
         );
 
+        // Old external layout must NOT appear in the module doc.
+        assert!(
+            !module_doc.contains("~/.makina/projects/"),
+            "module doc must not reference the old external ~/.makina/projects/ layout"
+        );
         // Old in-repo plan--task format must NOT appear in the module doc.
         assert!(
             !module_doc.contains(".makina/worktrees/{plan_slug}--{task_id}"),

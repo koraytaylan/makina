@@ -40,7 +40,17 @@ fn workspace_snapshot(
         for entry in std::fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
+            // Skip .git (version control internals) and transient Makina
+            // runtime state (runs/, worktrees/, checkpoints/) which now lives
+            // in-repo under .makina/ but is gitignored and must not appear in
+            // the workspace comparison.
             if path == root.join(".git") {
+                continue;
+            }
+            if path == root.join(".makina").join("runs")
+                || path == root.join(".makina").join("worktrees")
+                || path == root.join(".makina").join("checkpoints")
+            {
                 continue;
             }
             if path.is_dir() {
@@ -571,27 +581,19 @@ Implement the list summary independently from task toggling.
     )
     .await
     .unwrap();
-    let external_checkpoint = checkpoint_path(&target, &final_plan.key).unwrap();
-    assert!(external_checkpoint.starts_with(tmp.path().join("home")));
-    let poison = target.join(".makina/checkpoints/checkpoint.json");
-    std::fs::create_dir_all(poison.parent().unwrap()).unwrap();
-    std::fs::write(&poison, br#"{"schema_version":1,"tasks":[]}"#).unwrap();
+    // Checkpoints now live in-repo under .makina/checkpoints/.
+    let checkpoint = checkpoint_path(&target, &final_plan.key).unwrap();
+    assert!(
+        checkpoint.starts_with(target.join(".makina").join("checkpoints")),
+        "checkpoint must be under repo/.makina/checkpoints, got {}",
+        checkpoint.display()
+    );
     assert!(
         load_checkpoint(&target, &final_plan.key)
             .await
             .unwrap()
             .is_some(),
-        "repo-local checkpoint poison is ignored"
-    );
-    let refs_before_unavailable = run_git(&target, &["show-ref"]);
-    let saved_home = std::env::var_os("HOME");
-    unsafe { std::env::remove_var("HOME") };
-    assert!(checkpoint_path(&target, &final_plan.key).is_err());
-    unsafe { std::env::set_var("HOME", saved_home.unwrap()) };
-    assert_eq!(
-        run_git(&target, &["show-ref"]).stdout,
-        refs_before_unavailable.stdout,
-        "unavailable external state fails before repository mutation"
+        "checkpoint must be loadable from its in-repo path"
     );
 }
 

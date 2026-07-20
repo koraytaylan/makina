@@ -767,24 +767,12 @@ mod tests {
 
     // ── Test 6: .gitignore commit-policy invariants ───────────────────────────
 
-    /// Assert the `.makina/` commit-only policy after runtime state relocation:
-    /// `config.toml` and `tasks/` remain committable under `.makina/`, while
-    /// runtime state (`worktrees/`, `runs/`) now lives outside the repo under
-    /// `~/.makina/projects/{ns}/`. The root `.gitignore` does not ignore `.makina/`
-    /// itself, and no in-repo `.gitignore` rule is required to exclude Makina's
-    /// runtime state since it is relocated off-repo (under `~/.makina` when `$HOME`
-    /// is set). The root `/.worktrees/` rule covers the implement-plan dev engine's
-    /// in-repo task worktrees, not Makina runtime state.
-    ///
-    /// This test reads the `.gitignore` files (the root one two levels above
-    /// `CARGO_MANIFEST_DIR`, plus `.makina/.gitignore`) and checks the rules by
-    /// simple string matching. It is intentionally kept to string-level checks
-    /// rather than spawning `git check-ignore` so that it works in any
-    /// environment (including CI sandboxes without a full git context).
+    /// Assert the `.makina/` commit policy: `config.toml` and `tasks/` remain
+    /// committable under `.makina/`, while transient runtime state (`/runs/`,
+    /// `/worktrees/`, `/checkpoints/`) is gitignored via `.makina/.gitignore`.
+    /// The root `.gitignore` does not ignore `.makina/` itself.
     #[test]
-    fn committed_artifacts_not_ignored_runtime_state_relocated() {
-        // CARGO_MANIFEST_DIR = .../crates/makina-core
-        // Repo root           = ../..
+    fn committed_artifacts_not_ignored_runtime_state_gitignored() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let repo_root = manifest
             .parent()
@@ -797,21 +785,13 @@ mod tests {
         let contents = std::fs::read_to_string(&gitignore_path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", gitignore_path.display()));
 
-        // Makina's own task worktrees are relocated off-repo, but the repo's
-        // implement-plan dev engine (.claude/workflows/) checks task worktrees
-        // out under /.worktrees/ in-repo; the rule keeps failed-task leftovers
-        // (embedded repos) out of accidental `git add -A` staging.
         assert!(
             contents.lines().any(|l| l.trim() == "/.worktrees/"),
             "/.worktrees/ must be listed in the root .gitignore — found:\n{contents}"
         );
 
-        // No rule that would ignore .makina/ or .makina should be present
-        // (config + tasks are committed).
         let makina_ignored = contents.lines().any(|l| {
             let l = l.trim();
-            // Reject any non-comment line that would swallow .makina paths:
-            // e.g. ".makina", ".makina/", "/.makina", "/.makina/"
             !l.starts_with('#')
                 && (l == ".makina" || l == ".makina/" || l == "/.makina" || l == "/.makina/")
         });
@@ -820,25 +800,23 @@ mod tests {
             ".makina must NOT be in the root .gitignore — found an ignoring rule in:\n{contents}"
         );
 
-        // ── .makina/.gitignore: no runtime-state rules required ────────────────
-        // Runtime state (/runs/, /worktrees/) is relocated to ~/.makina/projects/{ns}/,
-        // so .makina/.gitignore no longer needs to list them. The .makina/ directory
-        // now contains only committed artifacts (config.toml and tasks/).
+        // ── .makina/.gitignore: transient state IS ignored ────────────────────
         let makina_gitignore_path = repo_root.join(".makina").join(".gitignore");
-        if makina_gitignore_path.exists() {
-            let makina_contents = std::fs::read_to_string(&makina_gitignore_path)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", makina_gitignore_path.display()));
+        let makina_contents = std::fs::read_to_string(&makina_gitignore_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", makina_gitignore_path.display()));
 
-            // /runs/ and /worktrees/ rules should NOT be present (runtime state is off-repo).
-            assert!(
-                !makina_contents.lines().any(|l| l.trim() == "/runs/"),
-                "/runs/ must NOT be listed in .makina/.gitignore — found:\n{makina_contents}"
-            );
-            assert!(
-                !makina_contents.lines().any(|l| l.trim() == "/worktrees/"),
-                "/worktrees/ must NOT be listed in .makina/.gitignore — found:\n{makina_contents}"
-            );
-        }
+        assert!(
+            makina_contents.lines().any(|l| l.trim() == "/runs/"),
+            "/runs/ must be listed in .makina/.gitignore — found:\n{makina_contents}"
+        );
+        assert!(
+            makina_contents.lines().any(|l| l.trim() == "/worktrees/"),
+            "/worktrees/ must be listed in .makina/.gitignore — found:\n{makina_contents}"
+        );
+        assert!(
+            makina_contents.lines().any(|l| l.trim() == "/checkpoints/"),
+            "/checkpoints/ must be listed in .makina/.gitignore — found:\n{makina_contents}"
+        );
     }
 
     // ── Tests for recover_for_resume ──────────────────────────────────────────

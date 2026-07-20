@@ -1,0 +1,6 @@
+# Transient Makina runtime state — never committed.
+# Runs (logs, audit, integration worktrees), task worktrees, and
+# plan checkpoints are created and destroyed by the orchestrator.
+/runs/
+/worktrees/
+/checkpoints/
