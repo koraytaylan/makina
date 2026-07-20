@@ -1895,7 +1895,7 @@ pub fn digest_records_v1(domain: &str, records: &[(&str, Vec<u8>)]) -> String {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value);
     }
-    format!("{:x}", hasher.finalize())
+    crate::json::hex_encode(&hasher.finalize())
 }
 
 pub fn digest_list_v1(domain: &str, tag: &str, items: &[Vec<u8>]) -> String {

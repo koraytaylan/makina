@@ -40,16 +40,14 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
-# Compatibility pin for ratatui-widgets 0.3.x: time 0.3.48 introduced a
-# coherence conflict with its blanket From<T> impls during fresh installs.
-time = "=0.3.47"
-pulldown-cmark = { version = "0.12", default-features = false }
+# Markdown rendering (pulldown-cmark + ansi-to-tui + syntect + two-face).
+pulldown-cmark = { version = "0.13", default-features = false }
 ansi-to-tui = "8"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "fancy-regex", "metadata"] }
-two-face = "0.2"
+two-face = "0.5"
 # JSON serialization for replay module (reading transcripts)
 serde_json = { workspace = true }
-# Chrono for DateTime<Utc> / Utc::now() in the Gantt Timeline render.
+# Date/time for the Gantt Timeline render.
 chrono = { workspace = true }
 # TOML serialization for writing provider/role config back to disk (task 0041)
 toml = { workspace = true }

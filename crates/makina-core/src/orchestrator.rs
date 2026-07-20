@@ -3009,7 +3009,11 @@ impl AuthoringCoordinator {
         if !generation_root.starts_with(&state_root) {
             return Err(invalid("generation root escaped external state".into()));
         }
-        let temporary = generation_root.join(format!("{}-{}", ulid::Ulid::new(), number));
+        let temporary = generation_root.join(format!(
+            "{}-{}",
+            ulid::Ulid::from_datetime(std::time::SystemTime::now()),
+            number
+        ));
         tokio::fs::create_dir(&temporary)
             .await
             .map_err(|error| invalid(error.to_string()))?;
@@ -4039,7 +4043,10 @@ impl AuthoringCoordinator {
             tokio::fs::create_dir_all(&state)
                 .await
                 .map_err(|error| invalid(error.to_string()))?;
-            let index = state.join(format!("authoring-index-{}", ulid::Ulid::new()));
+            let index = state.join(format!(
+                "authoring-index-{}",
+                ulid::Ulid::from_datetime(std::time::SystemTime::now())
+            ));
             indexed_git(
                 index.clone(),
                 vec!["read-tree".into(), expected_base_oid.clone()],
@@ -4699,7 +4706,7 @@ impl CoreApi {
         //    the Run.  Lock → insert → DROP guard before any further
         //    await/broadcast.
         let id = self.state.alloc_id();
-        let run_uid = ulid::Ulid::new().to_string();
+        let run_uid = ulid::Ulid::from_datetime(std::time::SystemTime::now()).to_string();
         {
             let mut runs = self
                 .state
@@ -7035,7 +7042,7 @@ mod tests {
         unsafe { std::env::set_var("HOME", tmp_home.path()) };
 
         let (api, repo) = execution_core_api();
-        let run_uid = ulid::Ulid::new().to_string();
+        let run_uid = ulid::Ulid::from_datetime(std::time::SystemTime::now()).to_string();
         let now = Utc::now();
         let metadata = RunMetadata::new(
             run_uid.clone(),

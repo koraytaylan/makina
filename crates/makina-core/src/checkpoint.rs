@@ -119,7 +119,7 @@ pub fn external_state_root(repo_root: &Path) -> Result<PathBuf, CheckpointError>
 pub fn checkpoint_path(repo_root: &Path, key: &PlanKey) -> Result<PathBuf, CheckpointError> {
     let mut hash = Sha256::new();
     hash.update(key.relative_dir.to_string_lossy().as_bytes());
-    let encoded = format!("{:x}", hash.finalize());
+    let encoded = crate::json::hex_encode(&hash.finalize());
     Ok(external_state_root(repo_root)?
         .join("checkpoints")
         .join(encoded)

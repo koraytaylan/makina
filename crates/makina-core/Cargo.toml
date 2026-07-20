@@ -35,7 +35,7 @@ chrono = { workspace = true }
 # `ulid` mints the persistent, sortable 26-char run identity (`run_uid`) stamped
 # on every Run when it is opened (mk-run-id).  The lexicographic order of the
 # string matches chronological order, giving a stable cross-process run key.
-ulid = "1"
+ulid = "3"
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]

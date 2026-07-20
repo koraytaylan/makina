@@ -35,7 +35,7 @@ pub fn windows_pipe_name(endpoint: &Path, auth_token: &str) -> String {
             }
         })
         .collect::<String>();
-    let digest = format!("{:x}", Sha256::digest(auth_token.as_bytes()));
+    let digest = crate::json::hex_encode(&Sha256::digest(auth_token.as_bytes()));
     format!(r"\\.\pipe\makina-{label}-{}", &digest[..24])
 }
 
@@ -674,7 +674,7 @@ fn artifact_digest(path: &Path) -> Result<String, String> {
     }
     let mut hash = Sha256::new();
     visit(path, Path::new("."), &mut hash)?;
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(crate::json::hex_encode(&hash.finalize()))
 }
 
 fn retention_manifest_with_digests(
@@ -696,7 +696,7 @@ fn retention_manifest_with_digests(
         root,
         paths,
         file_digests,
-        digest: format!("{:x}", hash.finalize()),
+        digest: crate::json::hex_encode(&hash.finalize()),
     }
 }
 
@@ -712,7 +712,7 @@ pub fn handoff_artifact(
     Ok(HandoffArtifact {
         build_source_oid,
         executable,
-        sha256: format!("{:x}", Sha256::digest(bytes)),
+        sha256: crate::json::hex_encode(&Sha256::digest(bytes)),
     })
 }
 
@@ -976,7 +976,7 @@ fn spawn_lease_sentinel(
         .ok_or_else(|| "contract endpoint has no parent".to_owned())?
         .join("sentinels");
     std::fs::create_dir_all(&metadata_root).map_err(|error| error.to_string())?;
-    let key = format!("{:x}", Sha256::digest(format!("{kind}\0{id}").as_bytes()));
+    let key = crate::json::hex_encode(&Sha256::digest(format!("{kind}\0{id}").as_bytes()));
     let metadata = metadata_root.join(format!("{kind}-{key}.json"));
     let record = SentinelMetadata {
         pid: child.id(),
@@ -2464,10 +2464,9 @@ fn validate_authoring_mutation(
 }
 
 fn authoring_digest(value: &impl Serialize) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(value).expect("closed authoring payload serializes"))
-    )
+    crate::json::hex_encode(&Sha256::digest(
+        serde_json::to_vec(value).expect("closed authoring payload serializes"),
+    ))
 }
 
 fn error(code: &str, message: &str) -> Response {
@@ -2576,7 +2575,7 @@ fn mint_token(auth: &str, nonce: u64, oid: &str) -> String {
     hash.update(now.to_le_bytes());
     hash.update(std::process::id().to_le_bytes());
     hash.update(oid.as_bytes());
-    format!("{:x}", hash.finalize())
+    crate::json::hex_encode(&hash.finalize())
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {

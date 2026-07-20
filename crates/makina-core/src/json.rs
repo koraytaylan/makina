@@ -4,6 +4,17 @@
 //! reviewer role parser to robustly pull the outermost JSON object out of model
 //! text that may contain prose or Markdown fences.
 
+/// Format a byte slice as a lowercase hex string. Replaces the `{:x}` format
+/// on sha2 `Output` which was removed in sha2 v0.11 (the `LowerHex` impl on
+/// `GenericArray`/`Array` was dropped).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// Find and return the first outermost `{ … }` JSON object substring in `text`.
 ///
 /// Strips leading/trailing prose and ` ```json … ``` ` code fences. Handles
