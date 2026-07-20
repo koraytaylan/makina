@@ -510,10 +510,6 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 app.active_theme.get(crate::theme::ThemeRole::Warning),
                             )
                         } else if starting {
-                            // A StartRun is in flight but the run is still
-                            // Pending (no Running/WaitingForRepository event
-                            // yet). Animate the badge so the user sees
-                            // immediate feedback instead of a static [·].
                             (
                                 spinner_frame(app.tick),
                                 app.active_theme.get(crate::theme::ThemeRole::Accent),
@@ -540,6 +536,19 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                             ));
+                        } else if matches!(
+                            run_view.status,
+                            RunStatus::Running | RunStatus::Completed | RunStatus::Failed
+                        ) {
+                            // Compact progress summary: "· 1/3 done · 1 running"
+                            let summary = run_progress_summary(run_view);
+                            if let Some(text) = summary {
+                                spans.push(Span::styled(
+                                    text,
+                                    Style::default()
+                                        .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                                ));
+                            }
                         }
                         let line = Line::from(spans);
                         ListItem::new(line)
@@ -5169,6 +5178,50 @@ fn run_label(run: &makina_core::api::RunView) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(run.plan_dir.slug.as_str())
         .to_owned()
+}
+
+/// Compact one-line progress summary for a run, shown in the sidebar next to
+/// the run name. Format: `· 1/3 done · 1 running` (only non-zero categories
+/// are shown). Returns `None` when the run has no tasks yet (e.g. still
+/// Pending before the graph is loaded).
+fn run_progress_summary(run: &makina_core::api::RunView) -> Option<String> {
+    use makina_core::api::TaskState;
+    if run.tasks.is_empty() {
+        return None;
+    }
+    let total = run.tasks.len();
+    let done = run
+        .tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Done)
+        .count();
+    let running = run
+        .tasks
+        .iter()
+        .filter(|t| matches!(t.state, TaskState::InProgress | TaskState::InReview))
+        .count();
+    let failed = run
+        .tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Failed)
+        .count();
+    let skipped = run
+        .tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Skipped)
+        .count();
+
+    let mut parts = vec![format!("{done}/{total} done")];
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    Some(format!("  · {}", parts.join(" · ")))
 }
 
 /// Return the short status badge text and its display colour for a [`RunStatus`].
