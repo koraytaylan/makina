@@ -10,9 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use makina_core::api::{
-    AgentRole, Api, ConfigOptionView, Event, RunId, RunView, SessionModes, TaskId,
-};
+use makina_core::api::{AgentRole, Api, Event, RunId, RunView, TaskId};
 #[cfg(test)]
 use makina_core::config::RoleAssignment;
 use makina_core::config::{FinalMerge, ProviderConfig, RolesConfig};
@@ -413,8 +411,6 @@ pub enum Mode {
     FileBrowser,
     /// The modal directory browser for picking a folder to open or initialize.
     FolderBrowser { purpose: FolderBrowserPurpose },
-    /// The modal provider/role configuration editor.
-    ProviderConfig,
     /// The modal doctor health-check overlay.
     Doctor,
     /// The command palette modal (task 0069).
@@ -522,10 +518,6 @@ impl CommandPalette {
             PaletteAction::Regular {
                 label: "Purge Makina worktrees",
                 event: Box::new(AppEvent::PurgeWorktrees),
-            },
-            PaletteAction::Regular {
-                label: "Configure providers & roles",
-                event: Box::new(AppEvent::OpenProviderEditor),
             },
             PaletteAction::Regular {
                 label: "Settings",
@@ -826,68 +818,6 @@ fn cycle_model_setting(current: &mut Option<usize>, available: &[String], direct
     *current = Some(next);
 }
 
-/// Cycle the model of the role currently focused in the provider editor.
-/// `direction` is 1 for next, -1 for previous. Uses the discovered model
-/// options from `available_config_options` (populated when a live session
-/// advertises its capabilities). If no models are discovered, this is a no-op.
-fn cycle_role_model(editor: &mut ProviderEditor, direction: i32) {
-    // Collect available model values from the discovered config options.
-    let model_values: Vec<String> = editor
-        .available_config_options
-        .iter()
-        .find(|o| o.category == "model")
-        .map(|o| o.options.iter().map(|c| c.value.clone()).collect())
-        .unwrap_or_default();
-    if model_values.is_empty() {
-        return;
-    }
-    // Determine which role is focused: selection_index maps to
-    // [0..providers.len()] = providers, then 3 role rows.
-    let role_idx = match editor.selection_index.checked_sub(editor.providers.len()) {
-        Some(idx) if idx < 3 => idx,
-        _ => return, // Not focused on a role row.
-    };
-    let role = match role_idx {
-        0 => &mut editor.roles.developer,
-        1 => &mut editor.roles.reviewer,
-        2 => &mut editor.roles.planner,
-        _ => return,
-    };
-    let Some(role) = role.as_mut() else {
-        return;
-    };
-    // Find the current model's index, or start at -1 (will become 0).
-    let current_idx = role
-        .model
-        .as_ref()
-        .and_then(|m| model_values.iter().position(|v| v == m))
-        .map(|i| i as i32)
-        .unwrap_or(-1);
-    let next_idx = ((current_idx + direction) + model_values.len() as i32)
-        .rem_euclid(model_values.len() as i32) as usize;
-    role.model = Some(model_values[next_idx].clone());
-}
-
-// ── Provider configuration editor ──────────────────────────────────────────────
-
-/// A read-only view of the current providers and role assignments.
-/// Edit paths (add/remove provider, reassign roles, change model/effort) are deferred to a future plan.
-#[derive(Debug, Clone)]
-pub struct ProviderEditor {
-    /// The editable list of providers.
-    pub providers: Vec<ProviderConfig>,
-    /// Role assignments to providers.
-    pub roles: RolesConfig,
-    /// Available session modes, if discovered from a live session.
-    pub available_modes: Option<SessionModes>,
-    /// Available configuration options, if discovered from a live session.
-    pub available_config_options: Vec<ConfigOptionView>,
-    /// Index of the currently selected provider in `providers`.
-    pub selected_provider: Option<usize>,
-    /// Which role/selection is currently focused: provider list, or a role's mode/model/effort.
-    pub selection_index: usize,
-}
-
 /// Which dependency-view overlay (if any) the TUI renders above the exchange
 /// pane for the selected task.
 ///
@@ -1136,29 +1066,7 @@ pub enum AppEvent {
     /// - Run nodes without an associated plan are unaffected (just remain selected).
     OpenFocusedNode,
 
-    // ── Provider configuration editor (task 0041) ──────────────────────────────
-    /// User requested to open the provider configuration editor (e.g. pressed `g`).
-    OpenProviderEditor,
-    /// Move the editor selection one row up.
-    ProviderEditorUp,
-    /// Move the editor selection one row down.
-    ProviderEditorDown,
-    /// Cycle the focused role's model to the next discovered option.
-    ProviderEditorCycleModel,
-    /// Cycle the focused role's model to the previous discovered option.
-    ProviderEditorCycleModelBack,
-    /// Close the provider editor and return to the normal view (Esc).
-    CloseProviderEditor,
-    /// Commit the edited configuration back to the config file.
-    ProviderEditorCommit,
-
     // ── Run control (task 31) ─────────────────────────────────────────────────
-    //
-    // Start/Pause/Cancel are INTENT signals (like the browser intents): the IO
-    // layer in [`crate::event`] performs the async `api.execute(...)` for
-    // `app.selected_run()`'s `RunId` and feeds the result back as a
-    // [`AppEvent::StatusMessage`].  `update` itself does nothing for these
-    // variants (it cannot issue the async command), keeping `update` pure.
     /// Start (or resume) the selected Run.
     StartRun,
     /// Publish a model-authored bundle, refresh discovery, then explicitly
@@ -1620,10 +1528,6 @@ pub struct App {
     /// The purpose of the current folder browser, if one is active.
     /// Set when opening a folder browser; cleared when closing.
     pub folder_browser_purpose: Option<FolderBrowserPurpose>,
-
-    /// Provider/role configuration editor state.  `Some` only while
-    /// [`App::mode`] is [`Mode::ProviderConfig`].
-    pub provider_editor: Option<ProviderEditor>,
 
     /// Most recent session capabilities (modes + config options) discovered from
     /// a live agent. Used to seed/refresh the provider editor with what the agent
@@ -2613,7 +2517,7 @@ impl App {
             dependency_view: DependencyViewMode::Off,
             browser: None,
             folder_browser_purpose: None,
-            provider_editor: None,
+
             discovered_capabilities: None,
             providers: Vec::new(),
             roles: RolesConfig::default(),
@@ -2866,11 +2770,6 @@ impl App {
             Mode::FolderBrowser { purpose } => Some(purpose),
             _ => None,
         }
-    }
-
-    /// Whether the provider configuration editor is currently active.
-    pub fn is_editing_providers(&self) -> bool {
-        self.mode == Mode::ProviderConfig
     }
 
     /// Whether the doctor health-check overlay is currently active.
@@ -4308,74 +4207,6 @@ impl App {
                 true
             }
 
-            // ── Provider configuration editor (task 0041) ──────────────────────
-            AppEvent::OpenProviderEditor => {
-                // Open the provider editor modal, seeded from the app's current
-                // providers/roles (loaded from config at startup).
-                let (available_modes, available_config_options) = self
-                    .discovered_capabilities
-                    .as_ref()
-                    .map(|c| (c.modes.clone(), c.config_options.clone()))
-                    .unwrap_or((None, vec![]));
-                self.provider_editor = Some(ProviderEditor {
-                    providers: self.providers.clone(),
-                    roles: self.roles.clone(),
-                    available_modes,
-                    available_config_options,
-                    selected_provider: if self.providers.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    },
-                    selection_index: 0,
-                });
-                self.mode = Mode::ProviderConfig;
-                true
-            }
-            AppEvent::ProviderEditorUp => {
-                if let Some(editor) = self.provider_editor.as_mut() {
-                    editor.selection_index = editor.selection_index.saturating_sub(1);
-                }
-                true
-            }
-            AppEvent::ProviderEditorDown => {
-                if let Some(editor) = self.provider_editor.as_mut() {
-                    // Navigate through: providers list + 3 role rows.
-                    let total_items = editor.providers.len() + 3;
-                    editor.selection_index =
-                        (editor.selection_index + 1).min(total_items.saturating_sub(1));
-                }
-                true
-            }
-            AppEvent::ProviderEditorCycleModel => {
-                if let Some(editor) = self.provider_editor.as_mut() {
-                    cycle_role_model(editor, 1);
-                }
-                true
-            }
-            AppEvent::ProviderEditorCycleModelBack => {
-                if let Some(editor) = self.provider_editor.as_mut() {
-                    cycle_role_model(editor, -1);
-                }
-                true
-            }
-            AppEvent::CloseProviderEditor => {
-                self.mode = Mode::Normal;
-                self.provider_editor = None;
-                true
-            }
-            AppEvent::ProviderEditorCommit => {
-                // The IO layer (resolve_io in event.rs) writes the config to disk.
-                // Here we apply the editor's final state back to app.providers/roles
-                // and close the editor so the TUI returns to normal mode.
-                if let Some(editor) = self.provider_editor.take() {
-                    self.providers = editor.providers;
-                    self.roles = editor.roles;
-                }
-                self.mode = Mode::Normal;
-                true
-            }
-
             // ── Run control (task 31) ─────────────────────────────────────────
             // Start/Pause/Cancel are IO-layer intents: the event loop issues the
             // async `api.execute(...)` for the selected run and feeds back a
@@ -5574,13 +5405,8 @@ impl App {
                 capabilities,
             } => {
                 self.discovered_capabilities = Some(capabilities.clone());
-                if let Some(editor) = self.provider_editor.as_mut() {
-                    editor.available_modes = capabilities.modes.clone();
-                    editor.available_config_options = capabilities.config_options.clone();
-                }
             }
-            // An autonomous mode switch: reflect it in the stored capabilities and
-            // in any open editor.
+            // An autonomous mode switch: reflect it in the stored capabilities.
             Event::CurrentModeUpdate {
                 run: _,
                 task: _,
@@ -5591,13 +5417,6 @@ impl App {
                     .discovered_capabilities
                     .as_mut()
                     .and_then(|c| c.modes.as_mut())
-                {
-                    modes.current_mode_id = current_mode_id.clone();
-                }
-                if let Some(modes) = self
-                    .provider_editor
-                    .as_mut()
-                    .and_then(|e| e.available_modes.as_mut())
                 {
                     modes.current_mode_id = current_mode_id.clone();
                 }
@@ -7786,92 +7605,6 @@ mod tests {
 
     // ── Provider configuration editor (task 0041) ──────────────────────────────
 
-    /// Pressing `g` dispatches `OpenProviderEditor`, which must set
-    /// `mode = Mode::ProviderConfig` and populate `provider_editor` from the
-    /// app's current providers/roles.
-    #[test]
-    fn provider_editor_opens_and_lists_providers() {
-        use crate::placeholder::PlaceholderApi;
-
-        // Build an app pre-seeded with two providers (simulates what main.rs does
-        // after loading config).
-        let api = Arc::new(PlaceholderApi::new());
-        let providers = vec![
-            ProviderConfig {
-                name: "default".into(),
-                command: "acp-cli".into(),
-                args: vec![],
-                env: Default::default(),
-            },
-            ProviderConfig {
-                name: "grok".into(),
-                command: "grok".into(),
-                args: vec!["agent".into()],
-                env: Default::default(),
-            },
-        ];
-        let roles = RolesConfig {
-            developer: Some(RoleAssignment {
-                provider: "default".into(),
-                mode: None,
-                model: None,
-                effort: None,
-                system_prompt: None,
-                system_prompt_mode: None,
-            }),
-            ..Default::default()
-        };
-        let mut app = App::with_config(
-            api,
-            vec![],
-            PathBuf::from("."),
-            providers.clone(),
-            roles.clone(),
-            vec![],
-            makina_core::config::ConfigPaths {
-                global: None,
-                project: None,
-            },
-            false,
-            makina_core::config::CapsConfig::default(),
-            3,
-            FinalMerge::Squash,
-            vec![],
-            crate::workspace::Workspace::new(),
-        );
-
-        // Sanity: starts in Normal mode with no editor open.
-        assert_eq!(app.mode, Mode::Normal);
-        assert!(app.provider_editor.is_none());
-
-        // Dispatch the OpenProviderEditor event (the same path `g` triggers via
-        // translate_key in event.rs).
-        let redraw = app.update(AppEvent::OpenProviderEditor);
-
-        // The mode must switch and the editor must be populated.
-        assert!(redraw, "OpenProviderEditor must trigger a redraw");
-        assert_eq!(app.mode, Mode::ProviderConfig);
-        assert!(app.is_editing_providers());
-        assert!(
-            app.provider_editor.is_some(),
-            "provider_editor must be Some"
-        );
-
-        let editor = app.provider_editor.as_ref().unwrap();
-        assert_eq!(
-            editor.providers.len(),
-            2,
-            "editor must list both configured providers"
-        );
-        assert_eq!(editor.providers[0].name, "default");
-        assert_eq!(editor.providers[1].name, "grok");
-        assert_eq!(
-            editor.selected_provider,
-            Some(0),
-            "first provider must be pre-selected"
-        );
-    }
-
     // ── prompt-answer-stream (task 30) ────────────────────────────────────────
 
     /// Helper: build a run with tasks A and B, and an App focused on it.
@@ -9707,8 +9440,8 @@ mod tests {
         let palette = app.command_palette.as_ref().unwrap();
         assert_eq!(
             palette.filtered().len(),
-            16,
-            "full list must have 16 actions"
+            15,
+            "full list must have 15 actions"
         );
         for label in [
             "Start run",
@@ -9759,7 +9492,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            16,
+            15,
             "full list restored after filter cleared"
         );
     }

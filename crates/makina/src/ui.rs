@@ -1061,7 +1061,6 @@ pub fn render(app: &App, frame: &mut Frame) {
     // the whole screen as one pane so selection spans it without column clipping.
     // See `crate::selection`.
     let overlay_active = app.is_browsing()
-        || app.is_editing_providers()
         || app.is_viewing_doctor()
         || app.is_command_palette()
         || app.is_settings()
@@ -1106,7 +1105,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     // ── Model configuration warning banner ────────────────────────────────
     // When providers exist (auto-detected) but no role has a model configured,
     // show a prominent warning at the top of the content area so the user
-    // knows to press [g] before starting a run. Only shown when providers are
+    // knows to open Settings (Ctrl+P) before starting a run. Only shown when providers are
     // non-empty (so test apps with no providers don't trigger it).
     let content_area = if !overlay_active && !app.providers.is_empty() {
         let any_model_configured = app
@@ -1125,7 +1124,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             let warning = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(vec![Span::styled(
-                    " ⚠ No model configured — press [g] to configure providers & roles",
+                    " ⚠ No model configured — open Settings (Ctrl+P) to select a model",
                     Style::default()
                         .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
                         .add_modifier(Modifier::BOLD),
@@ -1480,13 +1479,6 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // ── Provider configuration editor overlay ──────────────────────────────────
     // Drawn after the file browser so it sits on top when both might be open
-    // (task 0041).
-    if app.is_editing_providers()
-        && let Some(editor) = app.provider_editor.as_ref()
-    {
-        render_provider_editor(app, editor, frame, area);
-    }
-
     // ── Doctor health-check overlay (task 0046) ──────────────────────────────────
     // Drawn before the help overlay. Both call Clear() first and are toggled by
     // distinct keys, so at most one is open at a time.
@@ -4273,177 +4265,6 @@ fn render_file_browser(
         "[Enter] open/enter  [Backspace] up  [↑↓/jk] move  [Esc] cancel",
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
-    frame.render_widget(footer, footer_area);
-}
-
-/// Render the provider configuration editor modal.
-fn render_provider_editor(
-    app: &App,
-    editor: &crate::app::ProviderEditor,
-    frame: &mut Frame,
-    area: Rect,
-) {
-    // Centre a box ~85% wide / 85% tall.
-    let popup = centered_rect(85, 85, area);
-
-    // Clear the region first so the popup is opaque.
-    frame.render_widget(Clear, popup);
-
-    let title = " Configure Providers & Roles ";
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Thick)
-        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
-        .padding(Padding::horizontal(1));
-
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    // Split the popup into list area + footer
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(2)])
-        .split(inner);
-    let list_area = chunks[0];
-    let footer_area = chunks[1];
-
-    // Build the list of items: providers + roles
-    let mut items: Vec<ListItem> = vec![];
-
-    // Add providers section
-    for (idx, provider) in editor.providers.iter().enumerate() {
-        let style = if editor.selected_provider == Some(idx) {
-            Style::default()
-                .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
-        };
-        let line = Line::from(vec![Span::styled(
-            format!("  Provider: {}", provider.name),
-            style,
-        )]);
-        items.push(ListItem::new(line));
-    }
-
-    // Add role assignments section
-    let roles_header = Line::from(vec![Span::styled(
-        "  Roles:",
-        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
-    )]);
-    items.push(ListItem::new(roles_header));
-
-    // Helper: format a role assignment as "    {label}: {provider} ({model} · {effort})".
-    // The `name · effort` format is as requested by the spec (model shown with effort level).
-    let fmt_role = |label: &str, assignment: &makina_core::config::RoleAssignment| -> String {
-        let model_effort = match (&assignment.model, &assignment.effort) {
-            (Some(model), Some(effort)) => format!("{} · {}", model, effort),
-            (Some(model), None) => model.clone(),
-            (None, Some(effort)) => effort.clone(),
-            (None, None) => String::new(),
-        };
-        if model_effort.is_empty() {
-            format!("    {}: {}", label, assignment.provider)
-        } else {
-            format!("    {}: {} ({})", label, assignment.provider, model_effort)
-        }
-    };
-
-    for (label, assignment_opt) in [
-        ("Developer", &editor.roles.developer),
-        ("Reviewer", &editor.roles.reviewer),
-        ("Planner", &editor.roles.planner),
-    ] {
-        if let Some(assignment) = assignment_opt {
-            let detail = fmt_role(label, assignment);
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                detail,
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-            )])));
-        }
-    }
-
-    // Discovered section: what the live agent actually advertises (modes +
-    // model/effort options), distinct from the declared config above. Only shown
-    // once a session has reported its capabilities.
-    let has_discovered =
-        editor.available_modes.is_some() || !editor.available_config_options.is_empty();
-    if has_discovered {
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            "  Discovered (live agent):",
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
-        )])));
-
-        if let Some(modes) = &editor.available_modes {
-            let names: Vec<String> = modes
-                .available_modes
-                .iter()
-                .map(|m| {
-                    if m.id == modes.current_mode_id {
-                        format!("[{}]", m.id)
-                    } else {
-                        m.id.clone()
-                    }
-                })
-                .collect();
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                format!("    modes: {}", names.join("  ")),
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success)),
-            )])));
-        }
-
-        // List each advertised model, annotated with the available effort
-        // (thought_level) choices, as "model · {effort options}".
-        let effort_choices: Vec<String> = editor
-            .available_config_options
-            .iter()
-            .find(|o| o.category == "thought_level")
-            .map(|o| o.options.iter().map(|c| c.value.clone()).collect())
-            .unwrap_or_default();
-        let effort_hint = if effort_choices.is_empty() {
-            String::new()
-        } else {
-            format!(" · {{{}}}", effort_choices.join("|"))
-        };
-        for opt in editor
-            .available_config_options
-            .iter()
-            .filter(|o| o.category == "model")
-        {
-            for choice in &opt.options {
-                items.push(ListItem::new(Line::from(vec![Span::styled(
-                    format!("    model: {}{}", choice.value, effort_hint),
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success)),
-                )])));
-            }
-        }
-    }
-
-    let highlight_style = Style::default()
-        .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
-        .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
-        .add_modifier(Modifier::BOLD);
-
-    let list = List::new(items)
-        .highlight_style(highlight_style)
-        .highlight_symbol("▶ ");
-
-    let mut state = ListState::default();
-    state.select(Some(editor.selection_index.min(editor.providers.len() + 3)));
-    frame.render_stateful_widget(list, list_area, &mut state);
-
-    // Footer with hints
-    let footer = Paragraph::new(vec![
-        Line::from(vec![Span::styled(
-            "[Enter] commit  [↑↓/jk] navigate  [←→/hl] cycle model  [Esc] cancel",
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-        )]),
-        Line::from(vec![Span::styled(
-            "Navigate to a role row and press ←/→ to select its model",
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-        )]),
-    ]);
     frame.render_widget(footer, footer_area);
 }
 
@@ -13526,43 +13347,6 @@ mod tests {
         assert!(
             !screen.contains("Makina"),
             "title bar 'Makina' must NOT appear in small-terminal fallback; got: {:?}",
-            screen,
-        );
-    }
-
-    // ── Provider editor rename (plan 0039) ──────────────────────────────────
-
-    #[test]
-    fn test_provider_editor_title_is_view_not_configure() {
-        let mut terminal = make_terminal(80, 24);
-        let api = Arc::new(PlaceholderApi::new());
-        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-
-        // Open the provider editor by dispatching the OpenProviderEditor event.
-        let _ = app.update(crate::app::AppEvent::OpenProviderEditor);
-
-        // Render the frame.
-        terminal.draw(|f| render(&app, f)).unwrap();
-
-        // Collect all text rendered into the buffer.
-        let buffer = terminal.backend().buffer().clone();
-        let screen: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol().chars().next().unwrap_or(' '))
-            .collect();
-
-        // Assert the title contains "Configure" (the editor is now editable).
-        assert!(
-            screen.contains("Configure Providers & Roles"),
-            "provider editor modal title must contain 'Configure Providers & Roles'; got: {:?}",
-            screen,
-        );
-
-        // Assert the cycle model hint is present in the footer.
-        assert!(
-            screen.contains("cycle model"),
-            "provider editor footer must contain 'cycle model' hint; got: {:?}",
             screen,
         );
     }

@@ -134,7 +134,6 @@ pub async fn run(
     loop {
         let modal = ModalState {
             browsing: app.is_browsing(),
-            editing_providers: app.is_editing_providers(),
             viewing_doctor: app.is_viewing_doctor(),
             help_mode_active: app.help_mode_active,
             command_palette: app.is_command_palette(),
@@ -683,16 +682,7 @@ async fn resolve_io(
             start_reset_confirmed(app, confirmation, background_tx).await
         }
         AppEvent::PurgeWorktrees => (AppEvent::Tick, purge_worktrees(app).await),
-        // ── Provider configuration editor commit (task 0041) ──────────────────
-        // Write the editor's current providers + roles back to the project config
-        // file (`{repo_root}/.makina/config.toml`).  Best-effort: on IO/serialise
-        // error push an error-pane message rather than crashing.  The actual state
-        // update (closing the editor, updating app.providers/roles) is handled by
-        // App::update after this returns.
-        AppEvent::ProviderEditorCommit => {
-            let status = commit_provider_config(app).await;
-            (AppEvent::ProviderEditorCommit, status)
-        }
+
         // ── Settings commit (plan 0070) ──────────────────────────────────────
         // Write the edited caps, concurrency, and finalization mode back to the config file
         // (`{repo_root}/.makina/config.toml`). Validates all fields first;
@@ -978,60 +968,6 @@ fn resolve_plan_to_open(app: &App) -> Option<PlanOpen> {
         label: target.slug.clone(),
         target,
     })
-}
-
-/// Write the provider/role configuration from the editor back to
-/// `{repo_root}/.makina/config.toml`, best-effort.
-///
-/// Returns `Some(msg)` with a success/error description (surfaced in the status
-/// bar), or `None` if there is no active editor to commit.
-async fn commit_provider_config(app: &App) -> Option<String> {
-    use makina_core::config::GlobalConfig;
-    use makina_core::paths::config_file;
-
-    let editor = app.provider_editor.as_ref()?;
-
-    // Read the current on-disk config (if any) so we don't lose fields we
-    // don't manage (e.g. gates, caps, base_branch).  On read failure start
-    // from a default so we can still write back the providers/roles.
-    let config_path = config_file(&app.repo_root);
-    let existing_global: GlobalConfig = if config_path.exists() {
-        match tokio::fs::read_to_string(&config_path).await {
-            Ok(s) => toml::from_str::<GlobalConfig>(&s).unwrap_or_default(),
-            Err(_) => GlobalConfig::default(),
-        }
-    } else {
-        GlobalConfig::default()
-    };
-
-    // Build the updated global config: preserve all existing fields but
-    // replace providers and roles with the editor's current state.
-    let updated = GlobalConfig {
-        providers: editor.providers.clone(),
-        roles: editor.roles.clone(),
-        ..existing_global
-    };
-
-    // Serialise to TOML.
-    let toml_str = match toml::to_string_pretty(&updated) {
-        Ok(s) => s,
-        Err(e) => {
-            return Some(format!("Config serialise error: {e}"));
-        }
-    };
-
-    // Ensure the parent directory exists.
-    if let Some(parent) = config_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
-    {
-        return Some(format!("Config write error: {e}"));
-    }
-
-    // Write the file.
-    match tokio::fs::write(&config_path, toml_str).await {
-        Ok(()) => Some("Config saved".to_string()),
-        Err(e) => Some(format!("Config write error: {e}")),
-    }
 }
 
 /// Commit edited settings (caps, concurrency, and final merge mode) to the project config file.
@@ -1783,7 +1719,6 @@ fn spawn_read_dir_folders_only(dir: std::path::PathBuf, background_tx: mpsc::Sen
 #[derive(Clone, Copy, Default)]
 struct ModalState {
     browsing: bool,
-    editing_providers: bool,
     viewing_doctor: bool,
     help_mode_active: bool,
     command_palette: bool,
@@ -1905,7 +1840,6 @@ fn translate_key(
 ) -> AppEvent {
     let ModalState {
         browsing,
-        editing_providers,
         viewing_doctor,
         help_mode_active,
         command_palette,
@@ -2001,21 +1935,6 @@ fn translate_key(
                 _ => AppEvent::Tick,
             }
         }
-    } else if editing_providers {
-        // ── Provider editor keymap ────────────────────────────────────────────
-        // Esc closes the editor; Enter commits; j/k/arrows navigate;
-        // Left/Right cycle the model for the focused role.
-        match key.code {
-            KeyCode::Esc => AppEvent::CloseProviderEditor,
-            KeyCode::Enter => AppEvent::ProviderEditorCommit,
-            KeyCode::Up | KeyCode::Char('k') => AppEvent::ProviderEditorUp,
-            KeyCode::Down | KeyCode::Char('j') => AppEvent::ProviderEditorDown,
-            KeyCode::Left | KeyCode::Char('h') => AppEvent::ProviderEditorCycleModelBack,
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
-                AppEvent::ProviderEditorCycleModel
-            }
-            _ => AppEvent::Tick,
-        }
     } else if settings {
         // ── Settings modal keymap ────────────────────────────────────────────
         // Esc closes without saving; Enter commits; Up/Down navigate fields;
@@ -2078,8 +1997,6 @@ fn translate_key(
             }
             // Open the browser to pick a plan directory.
             KeyCode::Char('o') | KeyCode::Char('O') => AppEvent::OpenBrowser,
-            // Open the provider/role configuration editor.
-            KeyCode::Char('g') | KeyCode::Char('G') => AppEvent::OpenProviderEditor,
             // Toggle the help overlay showing all keybindings.
             KeyCode::Char('?') => AppEvent::ToggleHelpMode,
             // Open the doctor health-check overlay.
@@ -4892,99 +4809,6 @@ mod tests {
     /// This proves the async data-flow: `Event::RunOpened` → `resolve_api_event`
     /// → fetch full `RunView` → `AppEvent::RunLoaded` → `App::update` → tasks
     /// populated in `app.runs`.
-    #[tokio::test]
-    async fn provider_editor_commit_writes_config() {
-        use crate::app::{App, AppEvent, Mode, ProviderEditor};
-        use crate::placeholder::PlaceholderApi;
-        use makina_core::config::{ProviderConfig, RoleAssignment, RolesConfig};
-        use std::sync::Arc;
-
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let repo_root = tmp.path().to_path_buf();
-
-        let providers = vec![ProviderConfig {
-            name: "fast".into(),
-            command: "grok".into(),
-            args: vec!["agent".into()],
-            env: Default::default(),
-        }];
-        let roles = RolesConfig {
-            developer: Some(RoleAssignment {
-                provider: "fast".into(),
-                mode: Some("code".into()),
-                model: Some("grok-3".into()),
-                effort: Some("high".into()),
-                system_prompt: None,
-                system_prompt_mode: None,
-            }),
-            ..Default::default()
-        };
-
-        let api = Arc::new(PlaceholderApi::empty());
-        let mut app = App::new(
-            Arc::clone(&api) as Arc<dyn makina_core::api::Api>,
-            vec![],
-            repo_root.clone(),
-        );
-        // Seed the editor (as if the user opened it and made edits).
-        app.provider_editor = Some(ProviderEditor {
-            providers: providers.clone(),
-            roles: roles.clone(),
-            available_modes: None,
-            available_config_options: vec![],
-            selected_provider: Some(0),
-            selection_index: 0,
-        });
-        app.mode = Mode::ProviderConfig;
-
-        // Run the IO layer commit.
-        let (resolved_event, status) =
-            resolve_io_for_test(&mut app, AppEvent::ProviderEditorCommit).await;
-        assert!(
-            matches!(resolved_event, AppEvent::ProviderEditorCommit),
-            "commit must return ProviderEditorCommit for App::update to close the editor"
-        );
-        let msg = status.expect("commit must produce a status message");
-        assert!(
-            msg.contains("saved") || msg.contains("Config"),
-            "status must mention config write; got {msg:?}"
-        );
-
-        // The config file must have been written.
-        let config_path = repo_root.join(".makina").join("config.toml");
-        assert!(
-            config_path.exists(),
-            "config.toml must exist after commit; path: {}",
-            config_path.display()
-        );
-
-        // Round-trip: read back and parse.
-        let written = std::fs::read_to_string(&config_path).expect("read config");
-        let parsed: makina_core::config::GlobalConfig =
-            toml::from_str(&written).expect("config.toml must be valid TOML");
-
-        // Assert the providers were persisted.
-        assert_eq!(
-            parsed.providers.len(),
-            1,
-            "one provider must be written; got {}",
-            parsed.providers.len()
-        );
-        assert_eq!(parsed.providers[0].name, "fast");
-        assert_eq!(parsed.providers[0].command, "grok");
-
-        // Assert the role assignment was persisted.
-        let dev = parsed
-            .roles
-            .developer
-            .as_ref()
-            .expect("developer role must be written");
-        assert_eq!(dev.provider, "fast");
-        assert_eq!(dev.mode.as_deref(), Some("code"));
-        assert_eq!(dev.model.as_deref(), Some("grok-3"));
-        assert_eq!(dev.effort.as_deref(), Some("high"));
-    }
-
     /// Simulate the exact construction that main.rs performs for the api
     /// (using the same typed-source projection literals).
     /// Then create a CoreApi and assert that an OpenPlan of a known-good sample
