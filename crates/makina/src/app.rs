@@ -603,14 +603,12 @@ pub struct Settings {
     pub idle_secs: String, // "" ⇒ None
     pub concurrency: String,
     pub final_merge: FinalMerge,
-    /// Available model values discovered from a live agent session.
-    pub available_models: Vec<String>,
-    /// Developer role model index into available_models, or None.
-    pub developer_model: Option<usize>,
-    /// Reviewer role model index into available_models, or None.
-    pub reviewer_model: Option<usize>,
-    /// Planner role model index into available_models, or None.
-    pub planner_model: Option<usize>,
+    /// Developer model text buffer (typed by the user).
+    pub developer_model: String,
+    /// Reviewer model text buffer.
+    pub reviewer_model: String,
+    /// Planner model text buffer.
+    pub planner_model: String,
     pub focused: SettingsField,
     /// Last validation error (rendered under the field), or `None`.
     pub error: Option<String>,
@@ -804,18 +802,6 @@ fn previous_settings_final_merge(mode: FinalMerge) -> FinalMerge {
         FinalMerge::Stage => FinalMerge::Squash,
         FinalMerge::MergeCommit | FinalMerge::Manual => FinalMerge::Stage,
     }
-}
-
-/// Cycle a model index through the available models list. `direction` is
-/// 1 for next, -1 for previous. If the current index is None, starts at 0.
-fn cycle_model_setting(current: &mut Option<usize>, available: &[String], direction: i32) {
-    if available.is_empty() {
-        return;
-    }
-    let idx = current.unwrap_or(0) as i32;
-    let next =
-        ((idx + direction) + available.len() as i32).rem_euclid(available.len() as i32) as usize;
-    *current = Some(next);
 }
 
 /// Which dependency-view overlay (if any) the TUI renders above the exchange
@@ -4491,19 +4477,11 @@ impl App {
                             )),
                         ),
                     };
-                // Collect discovered model options from the live agent's
-                // SessionCapabilities (if a session has reported them).
-                let available_models: Vec<String> = self
-                    .discovered_capabilities
-                    .as_ref()
-                    .and_then(|c| c.config_options.iter().find(|o| o.category == "model"))
-                    .map(|o| o.options.iter().map(|c| c.value.clone()).collect())
-                    .unwrap_or_default();
-                // Resolve current model selections to indices.
-                let find_model = |role: &Option<makina_core::config::RoleAssignment>| {
+                // Seed model text buffers from current role assignments.
+                let model_of = |role: &Option<makina_core::config::RoleAssignment>| {
                     role.as_ref()
-                        .and_then(|r| r.model.as_ref())
-                        .and_then(|m| available_models.iter().position(|v| v == m))
+                        .and_then(|r| r.model.clone())
+                        .unwrap_or_default()
                 };
                 self.settings = Some(Settings {
                     project_root,
@@ -4513,10 +4491,9 @@ impl App {
                     idle_secs: caps.idle_secs.map(|s| s.to_string()).unwrap_or_default(),
                     concurrency: concurrency.to_string(),
                     final_merge,
-                    available_models: available_models.clone(),
-                    developer_model: find_model(&self.roles.developer),
-                    reviewer_model: find_model(&self.roles.reviewer),
-                    planner_model: find_model(&self.roles.planner),
+                    developer_model: model_of(&self.roles.developer),
+                    reviewer_model: model_of(&self.roles.reviewer),
+                    planner_model: model_of(&self.roles.planner),
                     focused: SettingsField::GateIterations,
                     error,
                 });
@@ -4560,100 +4537,121 @@ impl App {
             }
 
             AppEvent::SettingsInput(c) => {
-                if let Some(settings) = &mut self.settings
-                    && c.is_ascii_digit()
-                {
-                    match settings.focused {
-                        SettingsField::GateIterations => {
-                            settings.gate_iterations.push(c);
-                        }
-                        SettingsField::ReviewerIterations => {
-                            settings.reviewer_iterations.push(c);
-                        }
-                        SettingsField::WallClockSecs => {
-                            settings.wall_clock_secs.push(c);
-                        }
-                        SettingsField::IdleSecs => {
-                            settings.idle_secs.push(c);
-                        }
-                        SettingsField::Concurrency => {
-                            settings.concurrency.push(c);
-                        }
-                        SettingsField::FinalMerge => {}
+                if let Some(settings) = &mut self.settings {
+                    // Numeric fields accept digits; model fields accept
+                    // alphanumeric + dash + dot + underscore (model name chars).
+                    let is_numeric_field = matches!(
+                        settings.focused,
+                        SettingsField::GateIterations
+                            | SettingsField::ReviewerIterations
+                            | SettingsField::WallClockSecs
+                            | SettingsField::IdleSecs
+                            | SettingsField::Concurrency
+                    );
+                    let is_model_field = matches!(
+                        settings.focused,
                         SettingsField::DeveloperModel
-                        | SettingsField::ReviewerModel
-                        | SettingsField::PlannerModel => {}
-                    }
-                    // Re-validate the focused field inline.
-                    settings.error = None;
-                    match settings.focused {
-                        SettingsField::GateIterations => {
-                            if let Ok(val) = settings.gate_iterations.parse::<u32>() {
-                                if val < 1 {
-                                    settings.error =
-                                        Some("caps.gate_iterations must be at least 1".to_string());
-                                }
-                            } else if !settings.gate_iterations.is_empty() {
-                                settings.error = Some(
-                                    "caps.gate_iterations must be a positive integer".to_string(),
-                                );
+                            | SettingsField::ReviewerModel
+                            | SettingsField::PlannerModel
+                    );
+                    if is_numeric_field && c.is_ascii_digit() {
+                        match settings.focused {
+                            SettingsField::GateIterations => settings.gate_iterations.push(c),
+                            SettingsField::ReviewerIterations => {
+                                settings.reviewer_iterations.push(c)
                             }
+                            SettingsField::WallClockSecs => settings.wall_clock_secs.push(c),
+                            SettingsField::IdleSecs => settings.idle_secs.push(c),
+                            SettingsField::Concurrency => settings.concurrency.push(c),
+                            _ => {}
                         }
-                        SettingsField::ReviewerIterations => {
-                            if let Ok(val) = settings.reviewer_iterations.parse::<u32>() {
-                                if val < 1 {
+                        // Re-validate the focused field inline.
+                        settings.error = None;
+                        match settings.focused {
+                            SettingsField::GateIterations => {
+                                if let Ok(val) = settings.gate_iterations.parse::<u32>() {
+                                    if val < 1 {
+                                        settings.error = Some(
+                                            "caps.gate_iterations must be at least 1".to_string(),
+                                        );
+                                    }
+                                } else if !settings.gate_iterations.is_empty() {
                                     settings.error = Some(
-                                        "caps.reviewer_iterations must be at least 1".to_string(),
+                                        "caps.gate_iterations must be a positive integer"
+                                            .to_string(),
                                     );
                                 }
-                            } else if !settings.reviewer_iterations.is_empty() {
-                                settings.error = Some(
-                                    "caps.reviewer_iterations must be a positive integer"
-                                        .to_string(),
-                                );
                             }
-                        }
-                        SettingsField::WallClockSecs => {
-                            if let Ok(val) = settings.wall_clock_secs.parse::<u64>() {
-                                if val < 1 {
-                                    settings.error =
-                                        Some("caps.wall_clock_secs must be at least 1".to_string());
+                            SettingsField::ReviewerIterations => {
+                                if let Ok(val) = settings.reviewer_iterations.parse::<u32>() {
+                                    if val < 1 {
+                                        settings.error = Some(
+                                            "caps.reviewer_iterations must be at least 1"
+                                                .to_string(),
+                                        );
+                                    }
+                                } else if !settings.reviewer_iterations.is_empty() {
+                                    settings.error = Some(
+                                        "caps.reviewer_iterations must be a positive integer"
+                                            .to_string(),
+                                    );
                                 }
-                            } else if !settings.wall_clock_secs.is_empty() {
-                                settings.error = Some(
-                                    "caps.wall_clock_secs must be a positive integer".to_string(),
-                                );
                             }
-                        }
-                        SettingsField::IdleSecs => {
-                            if !settings.idle_secs.is_empty() {
-                                if let Ok(val) = settings.idle_secs.parse::<u64>() {
+                            SettingsField::WallClockSecs => {
+                                if let Ok(val) = settings.wall_clock_secs.parse::<u64>() {
+                                    if val < 1 {
+                                        settings.error = Some(
+                                            "caps.wall_clock_secs must be at least 1".to_string(),
+                                        );
+                                    }
+                                } else if !settings.wall_clock_secs.is_empty() {
+                                    settings.error = Some(
+                                        "caps.wall_clock_secs must be a positive integer"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            SettingsField::IdleSecs => {
+                                if !settings.idle_secs.is_empty() {
+                                    if let Ok(val) = settings.idle_secs.parse::<u64>() {
+                                        if val < 1 {
+                                            settings.error = Some(
+                                                "caps.idle_secs must be at least 1".to_string(),
+                                            );
+                                        }
+                                    } else {
+                                        settings.error = Some(
+                                            "caps.idle_secs must be a positive integer".to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            SettingsField::Concurrency => {
+                                if let Ok(val) = settings.concurrency.parse::<usize>() {
                                     if val < 1 {
                                         settings.error =
-                                            Some("caps.idle_secs must be at least 1".to_string());
+                                            Some("concurrency must be at least 1".to_string());
                                     }
-                                } else {
-                                    settings.error = Some(
-                                        "caps.idle_secs must be a positive integer".to_string(),
-                                    );
-                                }
-                            }
-                        }
-                        SettingsField::Concurrency => {
-                            if let Ok(val) = settings.concurrency.parse::<usize>() {
-                                if val < 1 {
+                                } else if !settings.concurrency.is_empty() {
                                     settings.error =
-                                        Some("concurrency must be at least 1".to_string());
+                                        Some("concurrency must be a positive integer".to_string());
                                 }
-                            } else if !settings.concurrency.is_empty() {
-                                settings.error =
-                                    Some("concurrency must be a positive integer".to_string());
                             }
+                            _ => {}
                         }
-                        SettingsField::FinalMerge => {}
-                        SettingsField::DeveloperModel
-                        | SettingsField::ReviewerModel
-                        | SettingsField::PlannerModel => {}
+                    } else if is_model_field
+                        && (c.is_ascii_alphanumeric()
+                            || c == '-'
+                            || c == '.'
+                            || c == '_'
+                            || c == '/')
+                    {
+                        match settings.focused {
+                            SettingsField::DeveloperModel => settings.developer_model.push(c),
+                            SettingsField::ReviewerModel => settings.reviewer_model.push(c),
+                            SettingsField::PlannerModel => settings.planner_model.push(c),
+                            _ => {}
+                        }
                     }
                 }
                 true
@@ -4678,9 +4676,15 @@ impl App {
                             settings.concurrency.pop();
                         }
                         SettingsField::FinalMerge => {}
-                        SettingsField::DeveloperModel
-                        | SettingsField::ReviewerModel
-                        | SettingsField::PlannerModel => {}
+                        SettingsField::DeveloperModel => {
+                            settings.developer_model.pop();
+                        }
+                        SettingsField::ReviewerModel => {
+                            settings.reviewer_model.pop();
+                        }
+                        SettingsField::PlannerModel => {
+                            settings.planner_model.pop();
+                        }
                     }
                     // Re-validate the focused field inline.
                     settings.error = None;
@@ -4749,79 +4753,36 @@ impl App {
                             }
                         }
                         SettingsField::FinalMerge => {}
-                        SettingsField::DeveloperModel
-                        | SettingsField::ReviewerModel
-                        | SettingsField::PlannerModel => {}
+                        SettingsField::DeveloperModel => {
+                            settings.developer_model.pop();
+                        }
+                        SettingsField::ReviewerModel => {
+                            settings.reviewer_model.pop();
+                        }
+                        SettingsField::PlannerModel => {
+                            settings.planner_model.pop();
+                        }
                     }
                 }
                 true
             }
 
             AppEvent::SettingsPreviousOption => {
-                if let Some(settings) = &mut self.settings {
-                    match settings.focused {
-                        SettingsField::FinalMerge => {
-                            settings.final_merge =
-                                previous_settings_final_merge(settings.final_merge);
-                            settings.error = None;
-                        }
-                        SettingsField::DeveloperModel => {
-                            cycle_model_setting(
-                                &mut settings.developer_model,
-                                &settings.available_models,
-                                -1,
-                            );
-                        }
-                        SettingsField::ReviewerModel => {
-                            cycle_model_setting(
-                                &mut settings.reviewer_model,
-                                &settings.available_models,
-                                -1,
-                            );
-                        }
-                        SettingsField::PlannerModel => {
-                            cycle_model_setting(
-                                &mut settings.planner_model,
-                                &settings.available_models,
-                                -1,
-                            );
-                        }
-                        _ => {}
-                    }
+                if let Some(settings) = &mut self.settings
+                    && settings.focused == SettingsField::FinalMerge
+                {
+                    settings.final_merge = previous_settings_final_merge(settings.final_merge);
+                    settings.error = None;
                 }
                 true
             }
 
             AppEvent::SettingsNextOption => {
-                if let Some(settings) = &mut self.settings {
-                    match settings.focused {
-                        SettingsField::FinalMerge => {
-                            settings.final_merge = next_settings_final_merge(settings.final_merge);
-                            settings.error = None;
-                        }
-                        SettingsField::DeveloperModel => {
-                            cycle_model_setting(
-                                &mut settings.developer_model,
-                                &settings.available_models,
-                                1,
-                            );
-                        }
-                        SettingsField::ReviewerModel => {
-                            cycle_model_setting(
-                                &mut settings.reviewer_model,
-                                &settings.available_models,
-                                1,
-                            );
-                        }
-                        SettingsField::PlannerModel => {
-                            cycle_model_setting(
-                                &mut settings.planner_model,
-                                &settings.available_models,
-                                1,
-                            );
-                        }
-                        _ => {}
-                    }
+                if let Some(settings) = &mut self.settings
+                    && settings.focused == SettingsField::FinalMerge
+                {
+                    settings.final_merge = next_settings_final_merge(settings.final_merge);
+                    settings.error = None;
                 }
                 true
             }
@@ -4857,22 +4818,26 @@ impl App {
                 // Apply model selections from the settings modal to the app's
                 // role assignments so subsequent runs use the chosen models.
                 if let Some(settings) = self.settings.as_ref() {
-                    let resolve = |idx: Option<usize>| {
-                        idx.and_then(|i| settings.available_models.get(i).cloned())
+                    let resolve = |s: &str| {
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
                     };
-                    if let Some(model) = resolve(settings.developer_model) {
+                    if let Some(model) = resolve(&settings.developer_model) {
                         self.roles
                             .developer
                             .get_or_insert_with(Default::default)
                             .model = Some(model);
                     }
-                    if let Some(model) = resolve(settings.reviewer_model) {
+                    if let Some(model) = resolve(&settings.reviewer_model) {
                         self.roles
                             .reviewer
                             .get_or_insert_with(Default::default)
                             .model = Some(model);
                     }
-                    if let Some(model) = resolve(settings.planner_model) {
+                    if let Some(model) = resolve(&settings.planner_model) {
                         self.roles
                             .planner
                             .get_or_insert_with(Default::default)

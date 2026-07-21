@@ -4412,16 +4412,6 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
         crate::app::final_merge_label(settings.final_merge)
     );
 
-    // Helper to display a model field value.
-    let model_display = |idx: Option<usize>| -> String {
-        match idx {
-            Some(i) if i < settings.available_models.len() => {
-                format!("< {} >", settings.available_models[i])
-            }
-            _ => "< — (no model) >".to_string(),
-        }
-    };
-
     let fields: Vec<(&str, String, crate::app::SettingsField)> = vec![
         (
             "Gate iterations",
@@ -4455,17 +4445,17 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
         ),
         (
             "Developer model",
-            model_display(settings.developer_model),
+            settings.developer_model.clone(),
             crate::app::SettingsField::DeveloperModel,
         ),
         (
             "Reviewer model",
-            model_display(settings.reviewer_model),
+            settings.reviewer_model.clone(),
             crate::app::SettingsField::ReviewerModel,
         ),
         (
             "Planner model",
-            model_display(settings.planner_model),
+            settings.planner_model.clone(),
             crate::app::SettingsField::PlannerModel,
         ),
     ];
@@ -10656,10 +10646,9 @@ mod tests {
             idle_secs: "".to_string(),
             concurrency: "4".to_string(),
             final_merge: makina_core::config::FinalMerge::Squash,
-            available_models: vec![],
-            developer_model: None,
-            reviewer_model: None,
-            planner_model: None,
+            developer_model: String::new(),
+            reviewer_model: String::new(),
+            planner_model: String::new(),
             focused: crate::app::SettingsField::GateIterations,
             error: None,
         });
