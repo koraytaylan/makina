@@ -803,6 +803,48 @@ fn previous_settings_final_merge(mode: FinalMerge) -> FinalMerge {
     }
 }
 
+/// Cycle the model of the role currently focused in the provider editor.
+/// `direction` is 1 for next, -1 for previous. Uses the discovered model
+/// options from `available_config_options` (populated when a live session
+/// advertises its capabilities). If no models are discovered, this is a no-op.
+fn cycle_role_model(editor: &mut ProviderEditor, direction: i32) {
+    // Collect available model values from the discovered config options.
+    let model_values: Vec<String> = editor
+        .available_config_options
+        .iter()
+        .find(|o| o.category == "model")
+        .map(|o| o.options.iter().map(|c| c.value.clone()).collect())
+        .unwrap_or_default();
+    if model_values.is_empty() {
+        return;
+    }
+    // Determine which role is focused: selection_index maps to
+    // [0..providers.len()] = providers, then 3 role rows.
+    let role_idx = match editor.selection_index.checked_sub(editor.providers.len()) {
+        Some(idx) if idx < 3 => idx,
+        _ => return, // Not focused on a role row.
+    };
+    let role = match role_idx {
+        0 => &mut editor.roles.developer,
+        1 => &mut editor.roles.reviewer,
+        2 => &mut editor.roles.planner,
+        _ => return,
+    };
+    let Some(role) = role.as_mut() else {
+        return;
+    };
+    // Find the current model's index, or start at -1 (will become 0).
+    let current_idx = role
+        .model
+        .as_ref()
+        .and_then(|m| model_values.iter().position(|v| v == m))
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    let next_idx = ((current_idx + direction) + model_values.len() as i32)
+        .rem_euclid(model_values.len() as i32) as usize;
+    role.model = Some(model_values[next_idx].clone());
+}
+
 // ── Provider configuration editor ──────────────────────────────────────────────
 
 /// A read-only view of the current providers and role assignments.
@@ -1078,6 +1120,10 @@ pub enum AppEvent {
     ProviderEditorUp,
     /// Move the editor selection one row down.
     ProviderEditorDown,
+    /// Cycle the focused role's model to the next discovered option.
+    ProviderEditorCycleModel,
+    /// Cycle the focused role's model to the previous discovered option.
+    ProviderEditorCycleModelBack,
     /// Close the provider editor and return to the normal view (Esc).
     CloseProviderEditor,
     /// Commit the edited configuration back to the config file.
@@ -4271,11 +4317,22 @@ impl App {
             }
             AppEvent::ProviderEditorDown => {
                 if let Some(editor) = self.provider_editor.as_mut() {
-                    // Calculate total number of selectable items:
-                    // providers list + 3 roles (each with mode/model/effort selections)
+                    // Navigate through: providers list + 3 role rows.
                     let total_items = editor.providers.len() + 3;
                     editor.selection_index =
                         (editor.selection_index + 1).min(total_items.saturating_sub(1));
+                }
+                true
+            }
+            AppEvent::ProviderEditorCycleModel => {
+                if let Some(editor) = self.provider_editor.as_mut() {
+                    cycle_role_model(editor, 1);
+                }
+                true
+            }
+            AppEvent::ProviderEditorCycleModelBack => {
+                if let Some(editor) = self.provider_editor.as_mut() {
+                    cycle_role_model(editor, -1);
                 }
                 true
             }

@@ -4289,7 +4289,7 @@ fn render_provider_editor(
     // Clear the region first so the popup is opaque.
     frame.render_widget(Clear, popup);
 
-    let title = " View Providers & Roles ";
+    let title = " Configure Providers & Roles ";
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -4436,11 +4436,11 @@ fn render_provider_editor(
     // Footer with hints
     let footer = Paragraph::new(vec![
         Line::from(vec![Span::styled(
-            "[Enter] commit  [↑↓/jk] navigate  [Esc] cancel",
+            "[Enter] commit  [↑↓/jk] navigate  [←→/hl] cycle model  [Esc] cancel",
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         )]),
         Line::from(vec![Span::styled(
-            "(Read-only; edits via .makina/config.toml)",
+            "Navigate to a role row and press ←/→ to select its model",
             Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
         )]),
     ]);
@@ -13522,22 +13522,17 @@ mod tests {
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        // Assert the title contains "View" and not "Configure".
+        // Assert the title contains "Configure" (the editor is now editable).
         assert!(
-            screen.contains("View Providers & Roles"),
-            "provider editor modal title must contain 'View Providers & Roles'; got: {:?}",
-            screen,
-        );
-        assert!(
-            !screen.contains("Configure Providers & Roles"),
-            "provider editor modal title must NOT contain 'Configure Providers & Roles'; got: {:?}",
+            screen.contains("Configure Providers & Roles"),
+            "provider editor modal title must contain 'Configure Providers & Roles'; got: {:?}",
             screen,
         );
 
-        // Assert the read-only hint is present in the footer.
+        // Assert the cycle model hint is present in the footer.
         assert!(
-            screen.contains("Read-only"),
-            "provider editor footer must contain 'Read-only' hint; got: {:?}",
+            screen.contains("cycle model"),
+            "provider editor footer must contain 'cycle model' hint; got: {:?}",
             screen,
         );
     }

@@ -1983,12 +1983,17 @@ fn translate_key(
         }
     } else if editing_providers {
         // ── Provider editor keymap ────────────────────────────────────────────
-        // Esc closes the editor; Enter commits; j/k/arrows navigate.
+        // Esc closes the editor; Enter commits; j/k/arrows navigate;
+        // Left/Right cycle the model for the focused role.
         match key.code {
             KeyCode::Esc => AppEvent::CloseProviderEditor,
             KeyCode::Enter => AppEvent::ProviderEditorCommit,
             KeyCode::Up | KeyCode::Char('k') => AppEvent::ProviderEditorUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::ProviderEditorDown,
+            KeyCode::Left | KeyCode::Char('h') => AppEvent::ProviderEditorCycleModelBack,
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                AppEvent::ProviderEditorCycleModel
+            }
             _ => AppEvent::Tick,
         }
     } else if settings {
