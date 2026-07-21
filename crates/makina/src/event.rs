@@ -1987,7 +1987,6 @@ fn translate_key(
         // 0-9 and Backspace edit numeric fields; Left/Right/Space cycle dropdowns.
         match key.code {
             KeyCode::Esc => AppEvent::CloseSettings,
-            KeyCode::Enter => AppEvent::SettingsCommit,
             KeyCode::Up => AppEvent::SettingsUp,
             KeyCode::Down => AppEvent::SettingsDown,
             KeyCode::Left => AppEvent::SettingsPreviousOption,

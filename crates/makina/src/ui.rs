@@ -4495,19 +4495,6 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
         items.push(ListItem::new(line));
     }
 
-    // Show discovered models as a hint line when available.
-    if !settings.discovered_models.is_empty() {
-        let hint = format!(
-            "  Available models: {}",
-            settings.discovered_models.join(", ")
-        );
-        let hint_style =
-            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success));
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            hint, hint_style,
-        )])));
-    }
-
     let list = List::new(items);
     frame.render_widget(list, list_area);
 
@@ -4583,7 +4570,20 @@ fn render_model_picker(app: &App, picker: &crate::app::ModelPicker, frame: &mut 
         .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
         .add_modifier(Modifier::BOLD);
 
-    if filtered.is_empty() {
+    if filtered.is_empty() && picker.all_models.is_empty() {
+        // Probe hasn't completed yet.
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                format!(
+                    "  {} Discovering available models…",
+                    spinner_frame(app.tick)
+                ),
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
+            )]),
+        ]);
+        frame.render_widget(hint, list_area);
+    } else if filtered.is_empty() {
         let hint = Paragraph::new("  No models found")
             .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)));
         frame.render_widget(hint, list_area);
