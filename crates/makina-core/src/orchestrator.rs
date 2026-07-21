@@ -1118,9 +1118,17 @@ impl CoreState {
             .map_err(|error| error.to_string())?
             .join("integration");
         let plan_ref = format!("refs/heads/plan/{plan_slug}");
+        // Try the integration worktree first; if it doesn't exist (e.g.
+        // already cleaned up), fall back to the main repo root.
+        let git_cwd: std::path::PathBuf =
+            if root.join(".git").exists() || root.join(".git").is_file() {
+                root.clone()
+            } else {
+                self.worktree_manager.repo_root.clone()
+            };
         let output = tokio::process::Command::new("git")
             .arg("-C")
-            .arg(&root)
+            .arg(&git_cwd)
             .args(["rev-parse", "--verify", &plan_ref])
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -1131,7 +1139,8 @@ impl CoreState {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
         let old = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let source = GitTreePlanFileSource::new(&root, &old).map_err(|error| error.to_string())?;
+        let source =
+            GitTreePlanFileSource::new(&git_cwd, &old).map_err(|error| error.to_string())?;
         let mut plan = match crate::plan::load_plan(&source, key, &PlanReservations::default())
             .map_err(|report| format!("cancellation source invalid: {:?}", report.diagnostics))?
         {

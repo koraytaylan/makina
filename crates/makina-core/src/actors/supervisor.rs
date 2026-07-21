@@ -865,17 +865,24 @@ impl DriverContext {
         let result = if let Some(identity) = self.checkpoint_identity.clone() {
             let key = crate::plan::PlanKey::parse(identity.plan_dir.clone())
                 .map_err(|error| error.to_string());
-            let evidence = match key {
-                Ok(key) => crate::checkpoint::inspect_repository_evidence(repo_root, &key)
-                    .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error),
-            };
-            let (active_refs, active_worktrees) = match evidence {
-                Ok(evidence) => evidence,
+            // Best-effort evidence collection: if git fails (e.g. the
+            // integration worktree was already cleaned up, or a transient
+            // git state issue), persist the checkpoint WITHOUT evidence
+            // rather than failing the run. The checkpoint's task states are
+            // the important part; the evidence is supplementary.
+            let (active_refs, active_worktrees) = match key {
+                Ok(key) => {
+                    match crate::checkpoint::inspect_repository_evidence(repo_root, &key).await {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            tracing::warn!(%error, "checkpoint evidence collection failed; persisting without evidence");
+                            (vec![], vec![])
+                        }
+                    }
+                }
                 Err(error) => {
-                    self.fail_for_persistence(error).await;
-                    return;
+                    tracing::warn!(%error, "checkpoint key parse failed; persisting without evidence");
+                    (vec![], vec![])
                 }
             };
             crate::checkpoint::persist_checkpoint_with_evidence(
