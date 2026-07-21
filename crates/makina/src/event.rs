@@ -696,6 +696,16 @@ async fn resolve_io(
         AppEvent::OpenSettings => {
             if let Some(backend) = app.developer_backend.clone() {
                 let tx = background_tx.clone();
+                let agent_name = app
+                    .providers
+                    .first()
+                    .map(|p| p.command.clone())
+                    .unwrap_or_default();
+                let provider_name = app
+                    .providers
+                    .first()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
                 tokio::spawn(async move {
                     use makina_core::backend::{AgentBackend, SessionConfig};
                     let config = SessionConfig {
@@ -714,7 +724,17 @@ async fn resolve_io(
                                 .capabilities()
                                 .and_then(|c| {
                                     c.config_options.iter().find(|o| o.category == "model").map(
-                                        |o| o.options.iter().map(|c| c.value.clone()).collect(),
+                                        |o| {
+                                            o.options
+                                                .iter()
+                                                .map(|c| {
+                                                    format!(
+                                                        "{agent_name}/{provider_name}/{}",
+                                                        c.value
+                                                    )
+                                                })
+                                                .collect()
+                                        },
                                     )
                                 })
                                 .unwrap_or_default();
@@ -1986,7 +2006,7 @@ fn translate_key(
         // Esc closes without saving; Enter commits; Up/Down navigate fields;
         // 0-9 and Backspace edit numeric fields; Left/Right/Space cycle dropdowns.
         match key.code {
-            KeyCode::Esc => AppEvent::CloseSettings,
+            KeyCode::Esc => AppEvent::SettingsCommit,
             KeyCode::Up => AppEvent::SettingsUp,
             KeyCode::Down => AppEvent::SettingsDown,
             KeyCode::Left => AppEvent::SettingsPreviousOption,
@@ -5684,8 +5704,8 @@ final = "squash"
     }
 
     #[test]
-    fn settings_esc_closes() {
-        // Esc in settings must map to CloseSettings.
+    fn settings_esc_saves() {
+        // Esc in settings must map to SettingsCommit (auto-save on close).
         let app = test_app();
         let ev = key_press(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(
@@ -5699,14 +5719,23 @@ final = "squash"
                 false,
                 &app
             ),
-            AppEvent::CloseSettings
+            AppEvent::SettingsCommit
         ));
     }
 
     #[test]
-    fn settings_enter_commits() {
-        // Enter in settings must map to SettingsCommit.
-        let app = test_app();
+    fn settings_enter_on_model_field_opens_picker() {
+        // Enter on a model field opens the model picker (not SettingsCommit).
+        let mut app = test_app();
+        app.update(crate::app::AppEvent::OpenSettings);
+        // Navigate to Developer model (7th Down from GateIterations).
+        for _ in 0..6 {
+            app.update(crate::app::AppEvent::SettingsDown);
+        }
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            crate::app::SettingsField::DeveloperModel
+        );
         let ev = key_press(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(
             translate_terminal_event(
@@ -5719,7 +5748,7 @@ final = "squash"
                 false,
                 &app
             ),
-            AppEvent::SettingsCommit
+            crate::app::AppEvent::OpenModelPicker
         ));
     }
 

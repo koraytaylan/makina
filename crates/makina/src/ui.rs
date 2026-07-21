@@ -4508,7 +4508,7 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
 
     // Footer with hints
     let footer = Paragraph::new(Line::from(vec![Span::styled(
-        "↑/↓ field · 0-9/a-z edit · ←/→ option · Enter save · Esc cancel",
+        "↑/↓ field · 0-9/a-z edit · ←/→ option · Enter pick model · Esc save & close",
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
