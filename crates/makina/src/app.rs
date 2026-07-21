@@ -1199,6 +1199,8 @@ pub enum AppEvent {
     SettingsSaveFailed { reason: String },
     /// Close the settings screen without saving.
     CloseSettings,
+    /// Agent model probe completed — discovered models are available.
+    ModelsDiscovered { models: Vec<String> },
 
     // ── Folder operations (plan 0043) ────────────────────────────────────────
     /// User requested to open a folder via palette action.
@@ -1489,6 +1491,10 @@ pub struct App {
     /// Workspace router used only for project-qualified plan opens. Other
     /// commands continue through `api` and its global run-id routing.
     pub project_api: Option<Arc<crate::project_api::ProjectApiRouter>>,
+
+    /// The developer agent backend, used to probe available models when
+    /// Settings opens. Set by main.rs after building the project API.
+    pub developer_backend: Option<Arc<dyn makina_core::backend::AgentBackend>>,
 
     /// The panel that currently owns keyboard focus.
     pub focused_panel: Panel,
@@ -2497,6 +2503,7 @@ impl App {
             should_quit: false,
             api,
             project_api: None,
+            developer_backend: None,
             focused_panel: Panel::Sidebar,
             focused_section: None,
             mode: Mode::Normal,
@@ -4790,6 +4797,25 @@ impl App {
             AppEvent::CloseSettings => {
                 self.mode = Mode::Normal;
                 self.settings = None;
+                true
+            }
+
+            AppEvent::ModelsDiscovered { models } => {
+                // Update the settings modal's available models if it's open.
+                if let Some(settings) = &mut self.settings {
+                    if !models.is_empty() {
+                        // Auto-select the first model for roles that have none.
+                        if settings.developer_model.is_empty() {
+                            settings.developer_model = models[0].clone();
+                        }
+                        if settings.reviewer_model.is_empty() {
+                            settings.reviewer_model = models[0].clone();
+                        }
+                        if settings.planner_model.is_empty() {
+                            settings.planner_model = models[0].clone();
+                        }
+                    }
+                }
                 true
             }
 

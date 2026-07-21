@@ -690,6 +690,47 @@ async fn resolve_io(
         // project fields and updates CoreApi's live runtime settings; App::update
         // then closes the modal and applies the same values to local TUI state.
         AppEvent::SettingsCommit => commit_settings(app).await,
+        // ── Agent model probe ─────────────────────────────────────────────────
+        // Spawn a throwaway session to discover available models, then send
+        // ModelsDiscovered back so the Settings modal can populate model fields.
+        AppEvent::OpenSettings => {
+            if let Some(backend) = app.developer_backend.clone() {
+                let tx = background_tx.clone();
+                tokio::spawn(async move {
+                    use makina_core::backend::{AgentBackend, SessionConfig};
+                    let config = SessionConfig {
+                        working_dir: std::path::PathBuf::from("/"),
+                        system_prompt: String::new(),
+                        mode: None,
+                        model: None,
+                        effort: None,
+                        extra: None,
+                        task_id: None,
+                        run_id: String::new(),
+                    };
+                    match backend.spawn(config).await {
+                        Ok(mut session) => {
+                            let models: Vec<String> = session
+                                .capabilities()
+                                .and_then(|c| {
+                                    c.config_options.iter().find(|o| o.category == "model").map(
+                                        |o| o.options.iter().map(|c| c.value.clone()).collect(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let _ = session.terminate().await;
+                            let _ = tx.send(AppEvent::ModelsDiscovered { models }).await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(AppEvent::StatusMessage(format!("Model probe failed: {e}")))
+                                .await;
+                        }
+                    }
+                });
+            }
+            (AppEvent::OpenSettings, None)
+        }
         // ── Doctor scaffold (task 0046) ──────────────────────────────────────
         // Write starter config templates to both config paths if neither exists.
         // Never overwrite existing files; re-check and refuse if present.

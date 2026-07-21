@@ -57,11 +57,13 @@ fn resolve_role_backend(
 /// audit registry must all agree on this root. The project router calls this
 /// once per opened Git repository instead of reusing the launch repository's
 /// dependencies for every folder.
+///
+/// Returns the API and the developer backend (for model probing).
 fn build_project_api(
     repo_root: &std::path::Path,
     config: Config,
     repository_leases: Arc<makina_core::repository_lease::RepositoryLeaseRegistry>,
-) -> Arc<dyn Api> {
+) -> (Arc<dyn Api>, Arc<dyn AgentBackend>) {
     let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.to_path_buf()));
 
     let mut provider_backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
@@ -141,16 +143,17 @@ fn build_project_api(
     let worktree_manager =
         WorktreeManager::new(repo_root.to_path_buf(), config.base_branch.clone());
 
-    Arc::new(CoreApi::with_repository_lease_registry(
+    let api = Arc::new(CoreApi::with_repository_lease_registry(
         ingestion_interpreter,
         planner_interpreter,
-        developer_backend,
+        Arc::clone(&developer_backend),
         reviewer_backend,
         worktree_manager,
         config,
         audit_sink as Arc<dyn makina_core::audit::AuditRegistry>,
         repository_leases,
-    ))
+    ));
+    (api, developer_backend)
 }
 
 /// Run the headless `--doctor` preflight check.
@@ -393,7 +396,13 @@ async fn main() {
     let final_merge_for_app = config.merge.final_;
     let theme_name_for_app = config.theme_name.clone();
 
-    let repository_leases = Arc::new(makina_core::repository_lease::RepositoryLeaseRegistry::new());
+    let repository_leases_for_factory =
+        Arc::new(makina_core::repository_lease::RepositoryLeaseRegistry::new());
+    let repository_leases = Arc::clone(&repository_leases_for_factory);
+    // Keep a reference to the launch project's developer backend for model
+    // probing in Settings. Other projects get their own backends via the
+    // factory, but the launch project is the one shown in Settings.
+    let mut launch_developer_backend: Option<Arc<dyn AgentBackend>> = None;
     let factory: ProjectApiFactory = Arc::new(move |project_root| {
         let (result, _paths) = Config::load_for_repo_with_paths(project_root);
         let project_config = result.map_err(|error| ApiError::InvalidCommand {
@@ -402,11 +411,12 @@ async fn main() {
                 project_root.display()
             ),
         })?;
-        Ok(build_project_api(
+        let (api, _dev_backend) = build_project_api(
             project_root,
             project_config,
-            Arc::clone(&repository_leases),
-        ))
+            Arc::clone(&repository_leases_for_factory),
+        );
+        Ok(api)
     });
     let project_api = Arc::new(ProjectApiRouter::new(opened_folders.clone(), factory));
 
@@ -424,6 +434,15 @@ async fn main() {
         }
     }
     let api: Arc<dyn Api> = project_api.clone();
+
+    // Build the launch project's API directly to get the developer backend
+    // for model probing in Settings. The project_api router holds its own
+    // copy; this one is just for the backend reference.
+    if let Ok(launch_config) = Config::load_for_repo_with_paths(&repo_root).0 {
+        let (_launch_api, dev_backend) =
+            build_project_api(&repo_root, launch_config, repository_leases.clone());
+        launch_developer_backend = Some(dev_backend);
+    }
 
     // ── Initial state ─────────────────────────────────────────────────────────
     let initial_runs = api.runs().await;
@@ -444,6 +463,7 @@ async fn main() {
         workspace,
     );
     app.project_api = Some(project_api);
+    app.developer_backend = launch_developer_backend;
 
     // Restore theme from GlobalConfig; unknown/absent names fall back to Ayu Dark with no panic.
     let active_theme = makina::theme::Theme::builtin_themes()
