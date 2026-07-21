@@ -163,7 +163,7 @@ pub struct PreservedWorktree {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorktreeManager {
     /// Absolute path to the repository root.  All `git -C {repo_root}` calls
     /// use this as the working directory so the manager is correct regardless
@@ -177,6 +177,12 @@ pub struct WorktreeManager {
     /// (legacy ask-path). The run sets this to `plan/{plan_slug}`.
     pub fork_branch: Option<String>,
     repository_child_token: Option<Arc<crate::repository_lease::RepositoryChildToken>>,
+
+    /// Optional callback fired before each git command, carrying the command
+    /// string and working dir. Set by the supervisor so the TUI can display a
+    /// live execution log. Cloned (Arc) so it survives `with_fork_branch` etc.
+    #[allow(clippy::type_complexity)]
+    command_sink: Option<Arc<dyn Fn(&str, &std::path::Path) + Send + Sync>>,
 
     /// Serializes worktree-lifecycle git operations ([`create`](Self::create) /
     /// [`remove`](Self::remove)) across concurrent drivers running against the
@@ -331,6 +337,7 @@ impl WorktreeManager {
             base_branch,
             fork_branch: None,
             repository_child_token: None,
+            command_sink: None,
             op_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -349,6 +356,17 @@ impl WorktreeManager {
         token: Arc<crate::repository_lease::RepositoryChildToken>,
     ) -> Self {
         self.repository_child_token = Some(token);
+        self
+    }
+
+    /// Set a callback that fires before each git command, carrying the command
+    /// string and working dir. Used by the supervisor to emit `RunCommand`
+    /// events so the TUI can display a live execution log.
+    pub fn with_command_sink(
+        mut self,
+        sink: Arc<dyn Fn(&str, &std::path::Path) + Send + Sync>,
+    ) -> Self {
+        self.command_sink = Some(sink);
         self
     }
 
@@ -1085,6 +1103,11 @@ impl WorktreeManager {
         args: &[&str],
         human_command: &str,
     ) -> Result<String, WorktreeError> {
+        // Fire the command sink so the TUI can display what's being executed.
+        if let Some(sink) = &self.command_sink {
+            let cmd_str = format!("git -C {} {}", path.display(), args.join(" "));
+            sink(&cmd_str, path);
+        }
         let output = self.git_command(path).args(args).output().await?;
 
         if output.status.success() {

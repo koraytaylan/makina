@@ -144,6 +144,15 @@ impl RouterEvents {
                 run: map(run),
                 phase,
             },
+            Event::RunCommand {
+                run,
+                command,
+                working_dir,
+            } => Event::RunCommand {
+                run: map(run),
+                command,
+                working_dir,
+            },
             Event::TaskStateChanged { run, task, state } => Event::TaskStateChanged {
                 run: map(run),
                 task,

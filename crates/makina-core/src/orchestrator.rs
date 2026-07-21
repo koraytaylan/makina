@@ -4656,7 +4656,7 @@ impl CoreApi {
                     });
                 }
             };
-            let projected =
+            let mut projected =
                 crate::plan_runtime::ProjectedTaskGraph::from_document(&plan, chrono::Utc::now());
             let checkpoint = match crate::checkpoint::load_checkpoint(repo_root, &plan.key).await {
                 Ok(checkpoint) => checkpoint,
@@ -4665,6 +4665,21 @@ impl CoreApi {
                     None
                 }
             };
+            // Apply the checkpoint overlay at open time so the graph reflects
+            // the latest runtime state (e.g. Done tasks stay Done, InProgress
+            // tasks reset to Ready, stale Skipped dependents are un-skipped).
+            // Without this, the TUI shows all tasks as New until StartRun's
+            // reconcile_run_under_repository_lease applies the overlay — and if
+            // a stale checkpoint has Skipped dependents, the user sees them as
+            // Skipped even though they will run.
+            if let Some(ref cp) = checkpoint
+                && matches!(
+                    crate::checkpoint::inspect_checkpoint(&plan, Some(cp)),
+                    crate::checkpoint::CheckpointDisposition::Compatible
+                )
+            {
+                crate::checkpoint::overlay_compatible(&mut projected.graph, cp);
+            }
             let reconciliation = if checkpoint.is_none()
                 && crate::checkpoint::checkpoint_path(repo_root, &plan.key).is_err()
             {
@@ -5537,6 +5552,8 @@ impl CoreApi {
 
         // Clone the static execution deps + the shared state for the background
         // task (so it can finalize the registry status when the scheduler ends).
+        let run_id_for_sink = run;
+        let event_tx_for_sink = self.state.event_tx.clone();
         let worktree_manager = self
             .state
             .worktree_manager
@@ -5545,7 +5562,14 @@ impl CoreApi {
                 repository_lease
                     .child_token()
                     .expect("repository lease descriptor must be clonable"),
-            ));
+            ))
+            .with_command_sink(Arc::new(move |cmd: &str, cwd: &std::path::Path| {
+                let _ = event_tx_for_sink.send(Event::RunCommand {
+                    run: run_id_for_sink,
+                    command: cmd.to_string(),
+                    working_dir: cwd.display().to_string(),
+                });
+            }));
         let config = self.state.scheduler_config();
         let developer_backend = Arc::clone(&self.state.developer_backend);
         let reviewer_backend = Arc::clone(&self.state.reviewer_backend);

@@ -999,6 +999,20 @@ pub enum Event {
         phase: String,
     },
 
+    /// A shell/git command was executed by the orchestrator.
+    ///
+    /// Emitted BEFORE every git/shell command the orchestrator runs so the TUI
+    /// can display a live execution log — the user sees exactly what Makina is
+    /// doing, not just a spinner. Carries the command string and working dir.
+    RunCommand {
+        /// The Run whose orchestrator executed the command.
+        run: RunId,
+        /// The command that is about to run (e.g. "git worktree add --detach ...").
+        command: String,
+        /// The working directory the command runs in (display only).
+        working_dir: String,
+    },
+
     /// A task's lifecycle state changed.
     ///
     /// Emitted whenever a task advances (or regresses) in the state machine.

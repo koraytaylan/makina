@@ -5322,6 +5322,14 @@ impl App {
             Event::RunProgress { run, phase } => {
                 self.run_progress.insert(*run, phase.clone());
             }
+            Event::RunCommand {
+                run,
+                command,
+                working_dir: _,
+            } => {
+                // Show the actual command being executed.
+                self.run_progress.insert(*run, format!("$ {command}"));
+            }
             Event::TaskStateChanged { run, task, state } => {
                 if let Some(rv) = self.runs.iter_mut().find(|r| r.id == *run)
                     && let Some(tv) = rv.tasks.iter_mut().find(|t| t.id == *task)
@@ -5420,6 +5428,32 @@ impl App {
                 // Update last-activity tick whenever an exchange event arrives.
                 self.task_last_activity_tick
                     .insert((*run, task.clone()), self.tick);
+                // Update run_progress so the sidebar shows what the agent is
+                // doing — the user sees "agent: <latest text chunk>" instead
+                // of a generic "dispatching task" spinner.
+                match exchange_ev {
+                    makina_core::api::ExchangeEvent::PromptSent { .. } => {
+                        self.run_progress
+                            .insert(*run, format!("agent reading task: {task}"));
+                    }
+                    makina_core::api::ExchangeEvent::ResponseChunk { text } => {
+                        let snippet: String = text.chars().take(60).collect();
+                        let suffix = if text.len() > 60 { "…" } else { "" };
+                        self.run_progress
+                            .insert(*run, format!("agent: {snippet}{suffix}"));
+                    }
+                    makina_core::api::ExchangeEvent::ToolCall { title, .. } => {
+                        self.run_progress
+                            .insert(*run, format!("agent tool: {title}"));
+                    }
+                    makina_core::api::ExchangeEvent::ToolCallUpdate { title, .. } => {
+                        if let Some(title) = title {
+                            self.run_progress
+                                .insert(*run, format!("agent tool: {title}"));
+                        }
+                    }
+                    _ => {}
+                }
             }
             // Idle watchdog event: a task stalled with no output for idle_secs.
             // Record the idle_secs config for styling the idle indicator in the
