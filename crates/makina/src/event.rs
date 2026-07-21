@@ -1995,6 +1995,36 @@ fn translate_key(
             KeyCode::Backspace => AppEvent::SettingsBackspace,
             KeyCode::Char(' ') => AppEvent::SettingsNextOption,
             KeyCode::Char(c) => AppEvent::SettingsInput(c),
+            // Enter on a model field opens the searchable model picker;
+            // Enter on other fields commits settings.
+            KeyCode::Enter => {
+                if let Some(settings) = app.settings.as_ref() {
+                    if matches!(
+                        settings.focused,
+                        crate::app::SettingsField::DeveloperModel
+                            | crate::app::SettingsField::ReviewerModel
+                            | crate::app::SettingsField::PlannerModel
+                    ) {
+                        AppEvent::OpenModelPicker
+                    } else {
+                        AppEvent::SettingsCommit
+                    }
+                } else {
+                    AppEvent::SettingsCommit
+                }
+            }
+            _ => AppEvent::Tick,
+        }
+    } else if app.mode == crate::app::Mode::ModelPicker {
+        // ── Model picker keymap ─────────────────────────────────────────────
+        // Esc cancels; Enter selects; j/k/arrows navigate; type to filter.
+        match key.code {
+            KeyCode::Esc => AppEvent::CloseModelPicker,
+            KeyCode::Enter => AppEvent::ModelPickerSelect,
+            KeyCode::Up | KeyCode::Char('k') => AppEvent::ModelPickerUp,
+            KeyCode::Down | KeyCode::Char('j') => AppEvent::ModelPickerDown,
+            KeyCode::Backspace => AppEvent::ModelPickerBackspace,
+            KeyCode::Char(c) => AppEvent::ModelPickerInput(c),
             _ => AppEvent::Tick,
         }
     } else if help_mode_active {

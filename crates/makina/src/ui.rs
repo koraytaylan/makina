@@ -1064,6 +1064,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         || app.is_viewing_doctor()
         || app.is_command_palette()
         || app.is_settings()
+        || app.mode == crate::app::Mode::ModelPicker
         || app.is_confirming_reset()
         || app.is_operation_notice();
     app.set_selection_panes(if overlay_active {
@@ -1507,6 +1508,13 @@ pub fn render(app: &App, frame: &mut Frame) {
         && let Some(s) = app.settings.as_ref()
     {
         render_settings(app, s, frame, area);
+    }
+
+    // ── Model picker overlay ──────────────────────────────────────────────────
+    if app.mode == crate::app::Mode::ModelPicker
+        && let Some(picker) = app.model_picker.as_ref()
+    {
+        render_model_picker(app, picker, frame, area);
     }
 
     if app.is_confirming_reset()
@@ -4516,6 +4524,92 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
         "↑/↓ field · 0-9/a-z edit · ←/→ option · Enter save · Esc cancel",
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
+    frame.render_widget(footer, footer_area);
+}
+
+/// Render the searchable model picker overlay.
+fn render_model_picker(app: &App, picker: &crate::app::ModelPicker, frame: &mut Frame, area: Rect) {
+    // Centre a box ~50% wide / 60% tall.
+    let popup = centered_rect(50, 60, area);
+    frame.render_widget(Clear, popup);
+
+    let field_label = match picker.target_field {
+        crate::app::SettingsField::DeveloperModel => "Developer Model",
+        crate::app::SettingsField::ReviewerModel => "Reviewer Model",
+        crate::app::SettingsField::PlannerModel => "Planner Model",
+        _ => "Model",
+    };
+    let title = format!(" Select {field_label} — type to filter ");
+    let block = Block::default()
+        .title(title.as_str())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split into filter input + list + footer.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let filter_area = chunks[0];
+    let list_area = chunks[1];
+    let footer_area = chunks[2];
+
+    // Render the filter input.
+    let filter_text = if picker.filter.is_empty() {
+        "  Search models…".to_string()
+    } else {
+        format!("  {}▏", picker.filter)
+    };
+    let filter_style = if picker.filter.is_empty() {
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+    } else {
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
+    };
+    frame.render_widget(Paragraph::new(filter_text).style(filter_style), filter_area);
+
+    // Build the filtered list.
+    let filtered = picker.filtered();
+    let highlight_style = Style::default()
+        .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
+        .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
+        .add_modifier(Modifier::BOLD);
+
+    if filtered.is_empty() {
+        let hint = Paragraph::new("  No models found")
+            .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)));
+        frame.render_widget(hint, list_area);
+    } else {
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .map(|m| {
+                ListItem::new(Line::from(vec![Span::styled(
+                    format!("  {m}"),
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+                )]))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(highlight_style)
+            .highlight_symbol("▶ ");
+        let mut state = ListState::default()
+            .with_selected(Some(picker.selected.min(filtered.len().saturating_sub(1))));
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    // Footer hints.
+    let footer = Paragraph::new(vec![Line::from(vec![Span::styled(
+        "Type to filter · ↑↓ navigate · Enter select · Esc cancel",
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+    )])]);
     frame.render_widget(footer, footer_area);
 }
 

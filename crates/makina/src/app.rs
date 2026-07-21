@@ -421,6 +421,8 @@ pub enum Mode {
     ResetConfirm,
     /// Modal explaining why an operation-gated command is unavailable.
     OperationNotice,
+    /// Searchable model picker overlay (opened from Settings).
+    ModelPicker,
 }
 
 /// The purpose of the folder browser modal — determines which event is emitted on selection.
@@ -1203,6 +1205,20 @@ pub enum AppEvent {
     CloseSettings,
     /// Agent model probe completed — discovered models are available.
     ModelsDiscovered { models: Vec<String> },
+    /// Open the searchable model picker for the focused Settings field.
+    OpenModelPicker,
+    /// Close the model picker without selecting.
+    CloseModelPicker,
+    /// Select the highlighted model from the picker.
+    ModelPickerSelect,
+    /// Type in the model picker filter.
+    ModelPickerInput(char),
+    /// Backspace in the model picker filter.
+    ModelPickerBackspace,
+    /// Navigate up in the model picker.
+    ModelPickerUp,
+    /// Navigate down in the model picker.
+    ModelPickerDown,
 
     // ── Folder operations (plan 0043) ────────────────────────────────────────
     /// User requested to open a folder via palette action.
@@ -1471,6 +1487,35 @@ pub struct PanelGeometry {
 
 /// All mutable TUI state.
 ///
+/// Searchable model picker overlay state.
+#[derive(Debug, Clone)]
+pub struct ModelPicker {
+    /// All discovered models (e.g. ["opencode/claude-sonnet-4-20250514", ...]).
+    pub all_models: Vec<String>,
+    /// Filter text (typed by the user).
+    pub filter: String,
+    /// Selected index in the filtered list.
+    pub selected: usize,
+    /// Which Settings field this picker is for.
+    pub target_field: SettingsField,
+}
+
+impl ModelPicker {
+    /// Filtered model list (case-insensitive substring match).
+    pub fn filtered(&self) -> Vec<&str> {
+        if self.filter.is_empty() {
+            self.all_models.iter().map(|s| s.as_str()).collect()
+        } else {
+            let f = self.filter.to_lowercase();
+            self.all_models
+                .iter()
+                .filter(|m| m.to_lowercase().contains(&f))
+                .map(|s| s.as_str())
+                .collect()
+        }
+    }
+}
+
 /// # Arc<dyn Api>
 ///
 /// The App holds a shared reference to the api surface so that the IO loop can
@@ -1497,6 +1542,9 @@ pub struct App {
     /// The developer agent backend, used to probe available models when
     /// Settings opens. Set by main.rs after building the project API.
     pub developer_backend: Option<Arc<dyn makina_core::backend::AgentBackend>>,
+
+    /// Searchable model picker state (open from Settings model fields).
+    pub model_picker: Option<ModelPicker>,
 
     /// The panel that currently owns keyboard focus.
     pub focused_panel: Panel,
@@ -2506,6 +2554,7 @@ impl App {
             api,
             project_api: None,
             developer_backend: None,
+            model_picker: None,
             focused_panel: Panel::Sidebar,
             focused_section: None,
             mode: Mode::Normal,
@@ -4804,15 +4853,106 @@ impl App {
             }
 
             AppEvent::ModelsDiscovered { models } => {
-                // Store discovered models so the Settings modal can display
-                // them as hints. Do NOT auto-select — the user must explicitly
-                // choose a model to avoid accidentally using an expensive one.
-                if !models.is_empty() {
-                    // Store the discovered models on the settings struct for
-                    // display as a hint line under the model fields.
-                    if let Some(settings) = &mut self.settings {
-                        settings.discovered_models = models.clone();
+                if !models.is_empty()
+                    && let Some(settings) = &mut self.settings
+                {
+                    settings.discovered_models = models.clone();
+                }
+                true
+            }
+
+            AppEvent::OpenModelPicker => {
+                if let Some(settings) = &self.settings {
+                    let target_field = settings.focused;
+                    // Only open for model fields.
+                    if matches!(
+                        target_field,
+                        SettingsField::DeveloperModel
+                            | SettingsField::ReviewerModel
+                            | SettingsField::PlannerModel
+                    ) {
+                        self.model_picker = Some(ModelPicker {
+                            all_models: settings.discovered_models.clone(),
+                            filter: String::new(),
+                            selected: 0,
+                            target_field,
+                        });
+                        self.mode = Mode::ModelPicker;
                     }
+                }
+                true
+            }
+
+            AppEvent::CloseModelPicker => {
+                self.model_picker = None;
+                self.mode = Mode::Settings;
+                true
+            }
+
+            AppEvent::ModelPickerSelect => {
+                if let Some(picker) = self.model_picker.take() {
+                    let filtered = picker.filtered();
+                    if let Some(model) = filtered.get(picker.selected)
+                        && let Some(settings) = &mut self.settings
+                    {
+                        match picker.target_field {
+                            SettingsField::DeveloperModel => {
+                                settings.developer_model = model.to_string()
+                            }
+                            SettingsField::ReviewerModel => {
+                                settings.reviewer_model = model.to_string()
+                            }
+                            SettingsField::PlannerModel => {
+                                settings.planner_model = model.to_string()
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                self.mode = Mode::Settings;
+                true
+            }
+
+            AppEvent::ModelPickerInput(c) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    let c = if c.is_ascii_alphanumeric()
+                        || c == '-'
+                        || c == '.'
+                        || c == '_'
+                        || c == '/'
+                        || c == ' '
+                    {
+                        Some(c)
+                    } else {
+                        None
+                    };
+                    if let Some(c) = c {
+                        picker.filter.push(c);
+                        picker.selected = 0;
+                    }
+                }
+                true
+            }
+
+            AppEvent::ModelPickerBackspace => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.filter.pop();
+                    picker.selected = 0;
+                }
+                true
+            }
+
+            AppEvent::ModelPickerUp => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                true
+            }
+
+            AppEvent::ModelPickerDown => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    let max = picker.filtered().len().saturating_sub(1);
+                    picker.selected = (picker.selected + 1).min(max);
                 }
                 true
             }
