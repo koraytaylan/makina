@@ -609,6 +609,8 @@ pub struct Settings {
     pub reviewer_model: String,
     /// Planner model text buffer.
     pub planner_model: String,
+    /// Models discovered by probing the agent (shown as hints, not auto-selected).
+    pub discovered_models: Vec<String>,
     pub focused: SettingsField,
     /// Last validation error (rendered under the field), or `None`.
     pub error: Option<String>,
@@ -4501,6 +4503,7 @@ impl App {
                     developer_model: model_of(&self.roles.developer),
                     reviewer_model: model_of(&self.roles.reviewer),
                     planner_model: model_of(&self.roles.planner),
+                    discovered_models: vec![],
                     focused: SettingsField::GateIterations,
                     error,
                 });
@@ -4801,19 +4804,14 @@ impl App {
             }
 
             AppEvent::ModelsDiscovered { models } => {
-                // Update the settings modal's available models if it's open.
-                if let Some(settings) = &mut self.settings {
-                    if !models.is_empty() {
-                        // Auto-select the first model for roles that have none.
-                        if settings.developer_model.is_empty() {
-                            settings.developer_model = models[0].clone();
-                        }
-                        if settings.reviewer_model.is_empty() {
-                            settings.reviewer_model = models[0].clone();
-                        }
-                        if settings.planner_model.is_empty() {
-                            settings.planner_model = models[0].clone();
-                        }
+                // Store discovered models so the Settings modal can display
+                // them as hints. Do NOT auto-select — the user must explicitly
+                // choose a model to avoid accidentally using an expensive one.
+                if !models.is_empty() {
+                    // Store the discovered models on the settings struct for
+                    // display as a hint line under the model fields.
+                    if let Some(settings) = &mut self.settings {
+                        settings.discovered_models = models.clone();
                     }
                 }
                 true

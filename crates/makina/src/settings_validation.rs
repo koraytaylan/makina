@@ -132,6 +132,7 @@ mod tests {
             developer_model: String::new(),
             reviewer_model: String::new(),
             planner_model: String::new(),
+            discovered_models: vec![],
             focused: SettingsField::GateIterations,
             error: None,
         }

@@ -4487,6 +4487,19 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
         items.push(ListItem::new(line));
     }
 
+    // Show discovered models as a hint line when available.
+    if !settings.discovered_models.is_empty() {
+        let hint = format!(
+            "  Available models: {}",
+            settings.discovered_models.join(", ")
+        );
+        let hint_style =
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success));
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            hint, hint_style,
+        )])));
+    }
+
     let list = List::new(items);
     frame.render_widget(list, list_area);
 
@@ -4500,7 +4513,7 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
 
     // Footer with hints
     let footer = Paragraph::new(Line::from(vec![Span::styled(
-        "↑/↓ field · 0-9 edit · ←/→ option · Enter save · Esc cancel",
+        "↑/↓ field · 0-9/a-z edit · ←/→ option · Enter save · Esc cancel",
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
@@ -10649,6 +10662,7 @@ mod tests {
             developer_model: String::new(),
             reviewer_model: String::new(),
             planner_model: String::new(),
+            discovered_models: vec![],
             focused: crate::app::SettingsField::GateIterations,
             error: None,
         });
