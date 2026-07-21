@@ -4590,45 +4590,71 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
         "< {} >",
         crate::app::final_merge_label(settings.final_merge)
     );
-    let fields = vec![
+
+    // Helper to display a model field value.
+    let model_display = |idx: Option<usize>| -> String {
+        match idx {
+            Some(i) if i < settings.available_models.len() => {
+                format!("< {} >", settings.available_models[i])
+            }
+            _ => "< — (no model) >".to_string(),
+        }
+    };
+
+    let fields: Vec<(&str, String, crate::app::SettingsField)> = vec![
         (
             "Gate iterations",
-            settings.gate_iterations.as_str(),
+            settings.gate_iterations.clone(),
             crate::app::SettingsField::GateIterations,
         ),
         (
             "Reviewer iterations",
-            settings.reviewer_iterations.as_str(),
+            settings.reviewer_iterations.clone(),
             crate::app::SettingsField::ReviewerIterations,
         ),
         (
             "Wall-clock (s)",
-            settings.wall_clock_secs.as_str(),
+            settings.wall_clock_secs.clone(),
             crate::app::SettingsField::WallClockSecs,
         ),
         (
             "Idle (s)",
-            settings.idle_secs.as_str(),
+            settings.idle_secs.clone(),
             crate::app::SettingsField::IdleSecs,
         ),
         (
             "Concurrency",
-            settings.concurrency.as_str(),
+            settings.concurrency.clone(),
             crate::app::SettingsField::Concurrency,
         ),
         (
             "When work finishes",
-            final_merge_value.as_str(),
+            final_merge_value,
             crate::app::SettingsField::FinalMerge,
+        ),
+        (
+            "Developer model",
+            model_display(settings.developer_model),
+            crate::app::SettingsField::DeveloperModel,
+        ),
+        (
+            "Reviewer model",
+            model_display(settings.reviewer_model),
+            crate::app::SettingsField::ReviewerModel,
+        ),
+        (
+            "Planner model",
+            model_display(settings.planner_model),
+            crate::app::SettingsField::PlannerModel,
         ),
     ];
 
-    for (label, value, field) in fields {
-        let is_focused = field == settings.focused;
+    for (label, value, field) in &fields {
+        let is_focused = *field == settings.focused;
         let display_value = if value.is_empty() {
             "—".to_string()
         } else {
-            value.to_string()
+            value.clone()
         };
 
         let text = if is_focused {
@@ -10809,6 +10835,10 @@ mod tests {
             idle_secs: "".to_string(),
             concurrency: "4".to_string(),
             final_merge: makina_core::config::FinalMerge::Squash,
+            available_models: vec![],
+            developer_model: None,
+            reviewer_model: None,
+            planner_model: None,
             focused: crate::app::SettingsField::GateIterations,
             error: None,
         });

@@ -129,6 +129,10 @@ mod tests {
             idle_secs: idle_secs.to_string(),
             concurrency: concurrency.to_string(),
             final_merge: FinalMerge::Squash,
+            available_models: vec![],
+            developer_model: None,
+            reviewer_model: None,
+            planner_model: None,
             focused: SettingsField::GateIterations,
             error: None,
         }

@@ -593,6 +593,9 @@ pub enum SettingsField {
     IdleSecs, // empty buffer ⇒ None (disabled)
     Concurrency,
     FinalMerge,
+    DeveloperModel,
+    ReviewerModel,
+    PlannerModel,
 }
 
 /// State for the settings modal: an editable text buffer per numeric field,
@@ -608,6 +611,14 @@ pub struct Settings {
     pub idle_secs: String, // "" ⇒ None
     pub concurrency: String,
     pub final_merge: FinalMerge,
+    /// Available model values discovered from a live agent session.
+    pub available_models: Vec<String>,
+    /// Developer role model index into available_models, or None.
+    pub developer_model: Option<usize>,
+    /// Reviewer role model index into available_models, or None.
+    pub reviewer_model: Option<usize>,
+    /// Planner role model index into available_models, or None.
+    pub planner_model: Option<usize>,
     pub focused: SettingsField,
     /// Last validation error (rendered under the field), or `None`.
     pub error: Option<String>,
@@ -801,6 +812,18 @@ fn previous_settings_final_merge(mode: FinalMerge) -> FinalMerge {
         FinalMerge::Stage => FinalMerge::Squash,
         FinalMerge::MergeCommit | FinalMerge::Manual => FinalMerge::Stage,
     }
+}
+
+/// Cycle a model index through the available models list. `direction` is
+/// 1 for next, -1 for previous. If the current index is None, starts at 0.
+fn cycle_model_setting(current: &mut Option<usize>, available: &[String], direction: i32) {
+    if available.is_empty() {
+        return;
+    }
+    let idx = current.unwrap_or(0) as i32;
+    let next =
+        ((idx + direction) + available.len() as i32).rem_euclid(available.len() as i32) as usize;
+    *current = Some(next);
 }
 
 /// Cycle the model of the role currently focused in the provider editor.
@@ -4637,6 +4660,20 @@ impl App {
                             )),
                         ),
                     };
+                // Collect discovered model options from the live agent's
+                // SessionCapabilities (if a session has reported them).
+                let available_models: Vec<String> = self
+                    .discovered_capabilities
+                    .as_ref()
+                    .and_then(|c| c.config_options.iter().find(|o| o.category == "model"))
+                    .map(|o| o.options.iter().map(|c| c.value.clone()).collect())
+                    .unwrap_or_default();
+                // Resolve current model selections to indices.
+                let find_model = |role: &Option<makina_core::config::RoleAssignment>| {
+                    role.as_ref()
+                        .and_then(|r| r.model.as_ref())
+                        .and_then(|m| available_models.iter().position(|v| v == m))
+                };
                 self.settings = Some(Settings {
                     project_root,
                     gate_iterations: caps.gate_iterations.to_string(),
@@ -4645,6 +4682,10 @@ impl App {
                     idle_secs: caps.idle_secs.map(|s| s.to_string()).unwrap_or_default(),
                     concurrency: concurrency.to_string(),
                     final_merge,
+                    available_models: available_models.clone(),
+                    developer_model: find_model(&self.roles.developer),
+                    reviewer_model: find_model(&self.roles.reviewer),
+                    planner_model: find_model(&self.roles.planner),
                     focused: SettingsField::GateIterations,
                     error,
                 });
@@ -4656,12 +4697,15 @@ impl App {
             AppEvent::SettingsUp => {
                 if let Some(settings) = &mut self.settings {
                     settings.focused = match settings.focused {
-                        SettingsField::GateIterations => SettingsField::FinalMerge,
+                        SettingsField::GateIterations => SettingsField::PlannerModel,
                         SettingsField::ReviewerIterations => SettingsField::GateIterations,
                         SettingsField::WallClockSecs => SettingsField::ReviewerIterations,
                         SettingsField::IdleSecs => SettingsField::WallClockSecs,
                         SettingsField::Concurrency => SettingsField::IdleSecs,
                         SettingsField::FinalMerge => SettingsField::Concurrency,
+                        SettingsField::DeveloperModel => SettingsField::FinalMerge,
+                        SettingsField::ReviewerModel => SettingsField::DeveloperModel,
+                        SettingsField::PlannerModel => SettingsField::ReviewerModel,
                     };
                 }
                 true
@@ -4675,7 +4719,10 @@ impl App {
                         SettingsField::WallClockSecs => SettingsField::IdleSecs,
                         SettingsField::IdleSecs => SettingsField::Concurrency,
                         SettingsField::Concurrency => SettingsField::FinalMerge,
-                        SettingsField::FinalMerge => SettingsField::GateIterations,
+                        SettingsField::FinalMerge => SettingsField::DeveloperModel,
+                        SettingsField::DeveloperModel => SettingsField::ReviewerModel,
+                        SettingsField::ReviewerModel => SettingsField::PlannerModel,
+                        SettingsField::PlannerModel => SettingsField::GateIterations,
                     };
                 }
                 true
@@ -4702,6 +4749,9 @@ impl App {
                             settings.concurrency.push(c);
                         }
                         SettingsField::FinalMerge => {}
+                        SettingsField::DeveloperModel
+                        | SettingsField::ReviewerModel
+                        | SettingsField::PlannerModel => {}
                     }
                     // Re-validate the focused field inline.
                     settings.error = None;
@@ -4770,6 +4820,9 @@ impl App {
                             }
                         }
                         SettingsField::FinalMerge => {}
+                        SettingsField::DeveloperModel
+                        | SettingsField::ReviewerModel
+                        | SettingsField::PlannerModel => {}
                     }
                 }
                 true
@@ -4794,6 +4847,9 @@ impl App {
                             settings.concurrency.pop();
                         }
                         SettingsField::FinalMerge => {}
+                        SettingsField::DeveloperModel
+                        | SettingsField::ReviewerModel
+                        | SettingsField::PlannerModel => {}
                     }
                     // Re-validate the focused field inline.
                     settings.error = None;
@@ -4862,27 +4918,79 @@ impl App {
                             }
                         }
                         SettingsField::FinalMerge => {}
+                        SettingsField::DeveloperModel
+                        | SettingsField::ReviewerModel
+                        | SettingsField::PlannerModel => {}
                     }
                 }
                 true
             }
 
             AppEvent::SettingsPreviousOption => {
-                if let Some(settings) = &mut self.settings
-                    && settings.focused == SettingsField::FinalMerge
-                {
-                    settings.final_merge = previous_settings_final_merge(settings.final_merge);
-                    settings.error = None;
+                if let Some(settings) = &mut self.settings {
+                    match settings.focused {
+                        SettingsField::FinalMerge => {
+                            settings.final_merge =
+                                previous_settings_final_merge(settings.final_merge);
+                            settings.error = None;
+                        }
+                        SettingsField::DeveloperModel => {
+                            cycle_model_setting(
+                                &mut settings.developer_model,
+                                &settings.available_models,
+                                -1,
+                            );
+                        }
+                        SettingsField::ReviewerModel => {
+                            cycle_model_setting(
+                                &mut settings.reviewer_model,
+                                &settings.available_models,
+                                -1,
+                            );
+                        }
+                        SettingsField::PlannerModel => {
+                            cycle_model_setting(
+                                &mut settings.planner_model,
+                                &settings.available_models,
+                                -1,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 true
             }
 
             AppEvent::SettingsNextOption => {
-                if let Some(settings) = &mut self.settings
-                    && settings.focused == SettingsField::FinalMerge
-                {
-                    settings.final_merge = next_settings_final_merge(settings.final_merge);
-                    settings.error = None;
+                if let Some(settings) = &mut self.settings {
+                    match settings.focused {
+                        SettingsField::FinalMerge => {
+                            settings.final_merge = next_settings_final_merge(settings.final_merge);
+                            settings.error = None;
+                        }
+                        SettingsField::DeveloperModel => {
+                            cycle_model_setting(
+                                &mut settings.developer_model,
+                                &settings.available_models,
+                                1,
+                            );
+                        }
+                        SettingsField::ReviewerModel => {
+                            cycle_model_setting(
+                                &mut settings.reviewer_model,
+                                &settings.available_models,
+                                1,
+                            );
+                        }
+                        SettingsField::PlannerModel => {
+                            cycle_model_setting(
+                                &mut settings.planner_model,
+                                &settings.available_models,
+                                1,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 true
             }
@@ -4914,6 +5022,31 @@ impl App {
                     self.caps.idle_secs = values.idle_secs;
                     self.concurrency = values.concurrency;
                     self.final_merge = values.final_merge;
+                }
+                // Apply model selections from the settings modal to the app's
+                // role assignments so subsequent runs use the chosen models.
+                if let Some(settings) = self.settings.as_ref() {
+                    let resolve = |idx: Option<usize>| {
+                        idx.and_then(|i| settings.available_models.get(i).cloned())
+                    };
+                    if let Some(model) = resolve(settings.developer_model) {
+                        self.roles
+                            .developer
+                            .get_or_insert_with(Default::default)
+                            .model = Some(model);
+                    }
+                    if let Some(model) = resolve(settings.reviewer_model) {
+                        self.roles
+                            .reviewer
+                            .get_or_insert_with(Default::default)
+                            .model = Some(model);
+                    }
+                    if let Some(model) = resolve(settings.planner_model) {
+                        self.roles
+                            .planner
+                            .get_or_insert_with(Default::default)
+                            .model = Some(model);
+                    }
                 }
                 self.mode = Mode::Normal;
                 self.settings = None;
@@ -10277,6 +10410,27 @@ mod tests {
             SettingsField::FinalMerge
         );
 
+        // Down again -> DeveloperModel.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::DeveloperModel
+        );
+
+        // Down again -> ReviewerModel.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::ReviewerModel
+        );
+
+        // Down again -> PlannerModel.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::PlannerModel
+        );
+
         // Down again -> wraps to GateIterations.
         app.update(AppEvent::SettingsDown);
         assert_eq!(
@@ -10288,12 +10442,12 @@ mod tests {
         app.update(AppEvent::SettingsUp);
         assert_eq!(
             app.settings.as_ref().unwrap().focused,
-            SettingsField::FinalMerge
+            SettingsField::PlannerModel
         );
         app.update(AppEvent::SettingsUp);
         assert_eq!(
             app.settings.as_ref().unwrap().focused,
-            SettingsField::Concurrency
+            SettingsField::ReviewerModel
         );
     }
 

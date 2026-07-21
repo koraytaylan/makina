@@ -1087,6 +1087,26 @@ async fn commit_settings(app: &App) -> (AppEvent, Option<String>) {
         cfg.merge = Some(MergeConfig {
             final_: valid.final_merge,
         });
+        // Write model selections for each role.
+        if let Some(settings) = app.settings.as_ref() {
+            let resolve =
+                |idx: Option<usize>| idx.and_then(|i| settings.available_models.get(i).cloned());
+            if let Some(model) = resolve(settings.developer_model) {
+                cfg.roles
+                    .developer
+                    .get_or_insert_with(Default::default)
+                    .model = Some(model);
+            }
+            if let Some(model) = resolve(settings.reviewer_model) {
+                cfg.roles
+                    .reviewer
+                    .get_or_insert_with(Default::default)
+                    .model = Some(model);
+            }
+            if let Some(model) = resolve(settings.planner_model) {
+                cfg.roles.planner.get_or_insert_with(Default::default).model = Some(model);
+            }
+        }
     })
     .await
     {
