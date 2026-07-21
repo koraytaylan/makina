@@ -1795,6 +1795,12 @@ pub struct App {
     /// plan, instead of a static `[·] Pending` that looks like nothing happened.
     pub starting_runs: HashSet<makina_core::api::RunId>,
 
+    /// Latest human-readable progress phase for each run, updated by
+    /// `RunProgress` events. Displayed in the sidebar so the user can see what
+    /// Makina is doing during startup/setup. Cleared when the run reaches
+    /// `Running` with active tasks.
+    pub run_progress: HashMap<makina_core::api::RunId, String>,
+
     /// State for the tabbed main content pane.
     pub tabs: TabState,
 
@@ -2588,6 +2594,7 @@ impl App {
             plan_operations: HashMap::new(),
             opening_plans: HashSet::new(),
             starting_runs: HashSet::new(),
+            run_progress: HashMap::new(),
             verbose_mode: false,
             active_theme: crate::theme::ayu_dark(),
             role_metrics: HashMap::new(),
@@ -5311,6 +5318,9 @@ impl App {
                         owner: owner.clone(),
                     };
                 }
+            }
+            Event::RunProgress { run, phase } => {
+                self.run_progress.insert(*run, phase.clone());
             }
             Event::TaskStateChanged { run, task, state } => {
                 if let Some(rv) = self.runs.iter_mut().find(|r| r.id == *run)

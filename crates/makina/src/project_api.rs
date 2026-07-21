@@ -140,6 +140,10 @@ impl RouterEvents {
                 run: map(run),
                 owner,
             },
+            Event::RunProgress { run, phase } => Event::RunProgress {
+                run: map(run),
+                phase,
+            },
             Event::TaskStateChanged { run, task, state } => Event::TaskStateChanged {
                 run: map(run),
                 task,

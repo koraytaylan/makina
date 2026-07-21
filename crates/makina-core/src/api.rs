@@ -983,6 +983,22 @@ pub enum Event {
         owner: Option<crate::repository_lease::RepositoryLeaseOwner>,
     },
 
+    /// Human-readable progress update for a run's startup/setup phase.
+    ///
+    /// Emitted at key orchestration milestones (acquiring lease, creating plan
+    /// branch, creating task worktree, spawning agent) so the TUI can show the
+    /// user what Makina is doing during the multi-second setup window between
+    /// `StartRun` and the first `TaskStateChanged{InProgress}`. Once tasks are
+    /// actively running, the per-task badges provide enough detail and these
+    /// events stop.
+    RunProgress {
+        /// The Run whose progress changed.
+        run: RunId,
+        /// Short human-readable phase label (e.g. "acquiring repository lease",
+        /// "creating task worktree", "dispatching agent").
+        phase: String,
+    },
+
     /// A task's lifecycle state changed.
     ///
     /// Emitted whenever a task advances (or regresses) in the state machine.

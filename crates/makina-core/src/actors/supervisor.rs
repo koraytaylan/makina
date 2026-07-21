@@ -1057,6 +1057,10 @@ async fn run_graph_inner(
     // 1. Create + check out the per-plan integration branch off base_branch.
     // (Skip for ask path with empty plan_slug — keep legacy behavior with fork_branch: None.)
     let (plan_branch, integration_root, worktree_manager) = if !plan_slug.is_empty() {
+        control.emit(api::Event::RunProgress {
+            run: control.run,
+            phase: "creating integration workspace".into(),
+        });
         let mut workspace = worktree_manager
             .create_integration_workspace(&plan_slug, &run_uid)
             .await
@@ -1969,6 +1973,10 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     // A worktree-create failure happens while the task is still `Ready` (before
     // the Developer is ever dispatched).  `Ready --HardError--> Failed` (task 25)
     // moves it to a terminal state cleanly rather than leaving it stuck `Ready`.
+    ctx.control.emit(api::Event::RunProgress {
+        run: ctx.control.run,
+        phase: format!("creating worktree for {task_id}"),
+    });
     let worktree = match ctx
         .worktree_manager
         .create(&ctx.plan_slug, &task_id.0)
@@ -2496,6 +2504,10 @@ async fn develop_until_gates_pass(
 
     loop {
         // ── Developer turn: make (or fix) the changes ──────────────────────────
+        ctx.control.emit(api::Event::RunProgress {
+            run: ctx.control.run,
+            phase: format!("agent working on {task_id}"),
+        });
         let task = {
             let graph = ctx.graph.lock().await;
             task_clone_locked(&graph, task_id)?

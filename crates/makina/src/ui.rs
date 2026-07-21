@@ -531,27 +531,23 @@ pub fn render(app: &App, frame: &mut Frame) {
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
                             ));
                         } else if starting {
-                            // Distinguish the sub-phases of "starting" so the
-                            // user knows what Makina is doing during the multi-
-                            // minute startup, not just a generic spinner.
-                            let phase = match &run_view.status {
-                                RunStatus::Pending => "preparing",
-                                RunStatus::WaitingForRepository { .. } => {
-                                    "waiting for repository lease"
-                                }
-                                _ => "starting",
-                            };
+                            let phase = app
+                                .run_progress
+                                .get(&run_view.id)
+                                .map(|s| s.as_str())
+                                .unwrap_or(match &run_view.status {
+                                    RunStatus::Pending => "preparing",
+                                    RunStatus::WaitingForRepository { .. } => {
+                                        "waiting for repository lease"
+                                    }
+                                    _ => "starting",
+                                });
                             spans.push(Span::styled(
                                 format!("  {} {}", spinner_frame(app.tick), phase),
                                 Style::default()
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
                             ));
                         } else if matches!(run_view.status, RunStatus::Running) {
-                            // Running: show what phase the run is in.
-                            // If no tasks are InProgress yet, the scheduler is
-                            // still setting up (creating plan branch, worktree,
-                            // spawning agent). If tasks are active, show the
-                            // progress summary.
                             let any_active = run_view.tasks.iter().any(|t| {
                                 matches!(
                                     t.state,
@@ -560,30 +556,16 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 )
                             });
                             if !any_active && !run_view.tasks.is_empty() {
-                                // Tasks exist but none active — the scheduler is
-                                // between phases (creating next worktree, etc.).
-                                let any_ready = run_view
-                                    .tasks
-                                    .iter()
-                                    .any(|t| t.state == makina_core::api::TaskState::Ready);
-                                if any_ready {
-                                    spans.push(Span::styled(
-                                        format!("  {} dispatching task", spinner_frame(app.tick)),
-                                        Style::default().fg(app
-                                            .active_theme
-                                            .get(crate::theme::ThemeRole::Accent)),
-                                    ));
-                                } else {
-                                    let summary = run_progress_summary(run_view);
-                                    if let Some(text) = summary {
-                                        spans.push(Span::styled(
-                                            text,
-                                            Style::default().fg(app
-                                                .active_theme
-                                                .get(crate::theme::ThemeRole::Dim)),
-                                        ));
-                                    }
-                                }
+                                let phase = app
+                                    .run_progress
+                                    .get(&run_view.id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("dispatching task");
+                                spans.push(Span::styled(
+                                    format!("  {} {}", spinner_frame(app.tick), phase),
+                                    Style::default()
+                                        .fg(app.active_theme.get(crate::theme::ThemeRole::Accent)),
+                                ));
                             } else {
                                 let summary = run_progress_summary(run_view);
                                 if let Some(text) = summary {
@@ -5377,6 +5359,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::RunOpened { .. } => "RunOpened",
         Event::RunStatusChanged { .. } => "RunStatusChanged",
         Event::RepositoryLeaseWaiting { .. } => "RepositoryLeaseWaiting",
+        Event::RunProgress { .. } => "RunProgress",
         Event::TaskStateChanged { .. } => "TaskStateChanged",
         Event::TaskIterationsUpdated { .. } => "TaskIterationsUpdated",
         Event::SessionCapabilities { .. } => "SessionCapabilities",

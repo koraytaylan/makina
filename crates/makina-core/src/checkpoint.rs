@@ -433,6 +433,11 @@ pub fn overlay_compatible(graph: &mut TaskGraph, checkpoint: &PlanCheckpoint) {
         .map(|saved| (saved.id.as_str(), saved.state))
         .collect();
 
+    tracing::info!(
+        tasks = ?checkpoint.tasks.iter().map(|t| (&t.id, t.state)).collect::<Vec<_>>(),
+        "overlay_compatible: applying checkpoint"
+    );
+
     for task in &mut graph.tasks {
         let Some(saved) = checkpoint.tasks.iter().find(|saved| saved.id == task.id.0) else {
             continue;
@@ -506,6 +511,11 @@ pub fn overlay_compatible(graph: &mut TaskGraph, checkpoint: &PlanCheckpoint) {
         if to_unskip.is_empty() {
             break;
         }
+        tracing::info!(
+            count = to_unskip.len(),
+            ids = ?to_unskip.iter().map(|&i| &graph.tasks[i].id).collect::<Vec<_>>(),
+            "overlay_compatible: un-skipping stale dependents"
+        );
         for idx in to_unskip {
             graph.tasks[idx].state = TaskState::New;
         }

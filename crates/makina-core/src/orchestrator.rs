@@ -5220,11 +5220,13 @@ impl CoreApi {
         }
         match crate::checkpoint::inspect_checkpoint(&reread, checkpoint.as_ref()) {
             crate::checkpoint::CheckpointDisposition::Compatible => {
+                tracing::info!(run = %run, "checkpoint disposition: compatible — overlaying");
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     crate::checkpoint::overlay_compatible(&mut fresh_graph, checkpoint);
                 }
             }
             crate::checkpoint::CheckpointDisposition::ReplaceClean { .. } => {
+                tracing::info!(run = %run, "checkpoint disposition: replace-clean — archiving stale");
                 crate::checkpoint::archive_clean_checkpoint(
                     &self.state.worktree_manager.repo_root,
                     &reread.key,
@@ -5318,6 +5320,10 @@ impl CoreApi {
             let _ = self.state.event_tx.send(Event::RepositoryLeaseWaiting {
                 run,
                 owner: current,
+            });
+            let _ = self.state.event_tx.send(Event::RunProgress {
+                run,
+                phase: "acquiring repository lease".into(),
             });
             (owner, prior_join, restore_status)
         };
