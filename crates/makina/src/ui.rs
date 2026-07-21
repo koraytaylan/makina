@@ -1103,6 +1103,43 @@ pub fn render(app: &App, frame: &mut Frame) {
     let content_area = main_split[0];
     let error_area = main_split[1];
 
+    // ── Model configuration warning banner ────────────────────────────────
+    // When providers exist (auto-detected) but no role has a model configured,
+    // show a prominent warning at the top of the content area so the user
+    // knows to press [g] before starting a run. Only shown when providers are
+    // non-empty (so test apps with no providers don't trigger it).
+    let content_area = if !overlay_active && !app.providers.is_empty() {
+        let any_model_configured = app
+            .roles
+            .developer
+            .as_ref()
+            .or(app.roles.reviewer.as_ref())
+            .or(app.roles.planner.as_ref())
+            .is_some_and(|role| role.model.is_some());
+        if !any_model_configured {
+            let warning_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(3)])
+                .split(content_area);
+            let warning_area = warning_split[0];
+            let warning = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    " ⚠ No model configured — press [g] to configure providers & roles",
+                    Style::default()
+                        .fg(app.active_theme.get(crate::theme::ThemeRole::Warning))
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            ]);
+            frame.render_widget(warning, warning_area);
+            warning_split[1]
+        } else {
+            content_area
+        }
+    } else {
+        content_area
+    };
+
     // Content precedence: an active plan tab is rendered via
     // render_plan_accordion_pane; an active task detail tab (live or preview) is
     // rendered via the task-entry pane; otherwise the selected run's view;
