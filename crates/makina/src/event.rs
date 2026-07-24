@@ -690,6 +690,18 @@ async fn resolve_io(
         // project fields and updates CoreApi's live runtime settings; App::update
         // then closes the modal and applies the same values to local TUI state.
         AppEvent::SettingsCommit => commit_settings(app).await,
+        // ── Auto-save: after any settings change, enqueue a SettingsCommit
+        // so the IO layer writes to disk on the next tick. The change is
+        // applied by App::update first (it runs after resolve_io returns),
+        // then the enqueued SettingsCommit reads the updated settings.
+        AppEvent::SettingsInput(_) | AppEvent::SettingsBackspace => {
+            let _ = background_tx.send(AppEvent::SettingsCommit).await;
+            (event, None)
+        }
+        AppEvent::ModelPickerSelect => {
+            let _ = background_tx.send(AppEvent::SettingsCommit).await;
+            (event, None)
+        }
         // ── Agent model probe ─────────────────────────────────────────────────
         // Spawn a throwaway session to discover available models, then send
         // ModelsDiscovered back so the Settings modal can populate model fields.
@@ -702,7 +714,7 @@ async fn resolve_io(
                     .map(|p| p.command.clone())
                     .unwrap_or_default();
                 tokio::spawn(async move {
-                    use makina_core::backend::{AgentBackend, SessionConfig};
+                    use makina_core::backend::SessionConfig;
                     let config = SessionConfig {
                         working_dir: std::path::PathBuf::from("/"),
                         system_prompt: String::new(),
