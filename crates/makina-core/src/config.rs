@@ -1161,24 +1161,31 @@ fn merge_project_role_prompts(roles: &mut RolesConfig, project_roles: &RolesConf
     merge_role_prompt(&mut roles.reviewer, &project_roles.reviewer);
 }
 
-/// Apply a project-level role's `system_prompt`/`system_prompt_mode` onto a
-/// resolved (global) role assignment.
+/// Apply a project-level role's overrides onto a resolved (global) role
+/// assignment.
 ///
-/// If the project role has a `system_prompt`, it overrides the global value for
-/// that field. The provider/mode/model/effort fields come only from the global layer.
+/// The project config can carry `system_prompt`/`system_prompt_mode`
+/// (written by discovery) and `model` (written by the Settings modal).
+/// Both are merged on top of the global-layer assignment. Provider/mode/
+/// effort remain global-only unless set via the project layer.
 fn merge_role_prompt(resolved: &mut Option<RoleAssignment>, project: &Option<RoleAssignment>) {
     let Some(proj) = project else {
-        return; // No project-level override for this role.
-    };
-    let Some(ref proj_prompt) = proj.system_prompt else {
-        return; // Project role has no system_prompt to merge.
+        return;
     };
 
-    // Apply the project-level system_prompt onto the resolved assignment.
-    // If there's no resolved assignment yet, create a default one.
     let resolved_assignment = resolved.get_or_insert_with(RoleAssignment::default);
-    resolved_assignment.system_prompt = Some(proj_prompt.clone());
-    resolved_assignment.system_prompt_mode = proj.system_prompt_mode.clone();
+
+    // Merge system_prompt.
+    if let Some(ref proj_prompt) = proj.system_prompt {
+        resolved_assignment.system_prompt = Some(proj_prompt.clone());
+        resolved_assignment.system_prompt_mode = proj.system_prompt_mode.clone();
+    }
+
+    // Merge model — the Settings modal writes the model to the project
+    // config, so it must be read back here.
+    if let Some(ref proj_model) = proj.model {
+        resolved_assignment.model = Some(proj_model.clone());
+    }
 }
 
 /// Resolve the project config path under `repo_root`, applying the precedence
@@ -2257,6 +2264,38 @@ mod tests {
         assert_eq!(
             config_mirage.theme_name, "Ayu Mirage",
             "theme_name='Ayu Mirage' should round-trip"
+        );
+    }
+
+    #[test]
+    fn project_role_model_is_merged_into_resolved_config() {
+        let global = GlobalConfig {
+            roles: RolesConfig {
+                developer: Some(RoleAssignment {
+                    provider: "default".into(),
+                    model: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let project = ProjectConfig {
+            roles: RolesConfig {
+                developer: Some(RoleAssignment {
+                    provider: "default".into(),
+                    model: Some("my-model".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = Config::resolve(global, project);
+        assert_eq!(
+            config.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("my-model"),
+            "project-level model must be merged into the resolved config"
         );
     }
 }
