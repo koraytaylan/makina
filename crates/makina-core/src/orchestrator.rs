@@ -5248,6 +5248,16 @@ impl CoreApi {
                 if let Some(checkpoint) = checkpoint.as_ref() {
                     crate::checkpoint::overlay_compatible(&mut fresh_graph, checkpoint);
                 }
+                // Write the reconciled graph back to the checkpoint immediately
+                // so the stale Skipped state doesn't survive even if the scheduler
+                // never starts (e.g. the run fails after reconcile).
+                let identity = crate::checkpoint::CheckpointIdentity::from_plan(&reread);
+                let _ = crate::checkpoint::persist_checkpoint(
+                    &self.state.worktree_manager.repo_root,
+                    identity,
+                    &fresh_graph,
+                )
+                .await;
             }
             crate::checkpoint::CheckpointDisposition::ReplaceClean { .. } => {
                 tracing::info!(run = %run, "checkpoint disposition: replace-clean — archiving stale");
