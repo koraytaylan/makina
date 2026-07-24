@@ -1203,6 +1203,8 @@ pub enum AppEvent {
     SettingsSaveFailed { reason: String },
     /// Close the settings screen without saving.
     CloseSettings,
+    /// Save settings but keep the modal open (auto-save during editing).
+    SettingsAutoSave,
     /// Agent model probe completed — discovered models are available.
     /// Each entry is "agent_name/provider_name/model_name".
     ModelsDiscovered { models: Vec<String> },
@@ -4953,8 +4955,14 @@ impl App {
             }
 
             AppEvent::SettingsCommit => {
-                // Validate; the actual write happens in resolve_io
-                // (commit_settings in event.rs).
+                // Intercepted by resolve_io (commit_settings). This handler
+                // is only reached if resolve_io passes it through, which it
+                // doesn't. Kept as a no-op for exhaustiveness.
+                true
+            }
+
+            AppEvent::SettingsAutoSave => {
+                // Auto-save during editing: validate but don't close.
                 if let Some(settings) = &mut self.settings {
                     use crate::settings_validation::validate_settings;
                     if let Err(message) = validate_settings(settings) {
@@ -5019,8 +5027,13 @@ impl App {
                             .model = Some(model);
                     }
                 }
-                self.mode = Mode::Normal;
-                self.settings = None;
+                // Only close the modal if SettingsCommit triggered the save
+                // (Esc). Auto-save (SettingsAutoSave) keeps the modal open.
+                // SettingsCommit sets mode to Normal before the IO layer
+                // returns SettingsSaved; auto-save keeps mode as Settings.
+                if self.mode != Mode::Settings {
+                    self.settings = None;
+                }
                 true
             }
 
@@ -10473,7 +10486,9 @@ mod tests {
             FinalMerge::Stage
         );
 
-        // Apply the IO layer's successful persistence result.
+        // Commit (Esc) — in the real flow, resolve_io calls commit_settings
+        // which writes to disk and sets mode to Normal. Simulate that here.
+        app.mode = Mode::Normal;
         let project_root = app.settings.as_ref().unwrap().project_root.clone();
         let values = crate::settings_validation::validate_settings(
             app.settings.as_ref().expect("settings open"),
@@ -10526,7 +10541,8 @@ mod tests {
         assert_eq!(app.settings.as_ref().unwrap().idle_secs, "");
         assert_eq!(app.settings.as_ref().unwrap().error, None);
 
-        // Apply the IO layer's successful persistence result.
+        // Commit then apply the IO layer's successful persistence result.
+        app.mode = Mode::Normal;
         let project_root = app.settings.as_ref().unwrap().project_root.clone();
         let values = crate::settings_validation::validate_settings(
             app.settings.as_ref().expect("settings open"),

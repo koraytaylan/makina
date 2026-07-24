@@ -689,17 +689,21 @@ async fn resolve_io(
         // on any error, returns the reason without writing. The writer preserves
         // project fields and updates CoreApi's live runtime settings; App::update
         // then closes the modal and applies the same values to local TUI state.
-        AppEvent::SettingsCommit => commit_settings(app).await,
-        // ── Auto-save: after any settings change, enqueue a SettingsCommit
+        AppEvent::SettingsCommit => commit_settings(app, true).await,
+        // SettingsAutoSave goes through the same commit_settings path but
+        // App::update keeps the modal open (doesn't set mode to Normal).
+        AppEvent::SettingsAutoSave => commit_settings(app, false).await,
+        // ── Auto-save: after any settings change, enqueue a SettingsAutoSave
         // so the IO layer writes to disk on the next tick. The change is
         // applied by App::update first (it runs after resolve_io returns),
-        // then the enqueued SettingsCommit reads the updated settings.
+        // then the enqueued SettingsAutoSave reads the updated settings.
+        // Unlike SettingsCommit (Esc), SettingsAutoSave keeps the modal open.
         AppEvent::SettingsInput(_) | AppEvent::SettingsBackspace => {
-            let _ = background_tx.send(AppEvent::SettingsCommit).await;
+            let _ = background_tx.send(AppEvent::SettingsAutoSave).await;
             (event, None)
         }
         AppEvent::ModelPickerSelect => {
-            let _ = background_tx.send(AppEvent::SettingsCommit).await;
+            let _ = background_tx.send(AppEvent::SettingsAutoSave).await;
             (event, None)
         }
         // ── Agent model probe ─────────────────────────────────────────────────
@@ -1039,7 +1043,7 @@ fn resolve_plan_to_open(app: &App) -> Option<PlanOpen> {
 /// `[[gates]]`, discovery stamps, and role prompts) survive the round-trip. On a
 /// successful write it also updates the live CoreApi runtime settings so a
 /// restart is not required before the next scheduler run observes the new mode.
-async fn commit_settings(app: &App) -> (AppEvent, Option<String>) {
+async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String>) {
     use crate::settings_validation::validate_settings;
     use makina_core::api::Command;
     use makina_core::config::{CapsOverride, MergeConfig, write_project_config};
@@ -1136,6 +1140,9 @@ async fn commit_settings(app: &App) -> (AppEvent, Option<String>) {
         Ok(_) => "Settings saved".to_string(),
         Err(e) => format!("Settings saved; runtime update failed: {e}"),
     };
+    if close {
+        app.mode = crate::app::Mode::Normal;
+    }
     (
         AppEvent::SettingsSaved {
             project_root,
