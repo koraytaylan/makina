@@ -658,7 +658,7 @@ impl ProjectConfigWrite {
 /// [`Config::load`] (which reads real files) or by composing
 /// [`GlobalConfig::from_toml_str`] + [`ProjectConfig::from_toml_str`] +
 /// [`Config::resolve`] + [`Config::validate`] (testable without I/O).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// The agent backend CLI command and arguments (legacy field; use `providers` instead).
     pub backend: BackendConfig,
@@ -862,7 +862,7 @@ impl Config {
     ///
     /// Returns [`ConfigError::Validation`] with a precise `reason` string on
     /// the first violation found.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&mut self) -> Result<(), ConfigError> {
         // Validate providers.
         let mut seen_names = std::collections::HashSet::new();
 
@@ -882,31 +882,31 @@ impl Config {
             }
         }
 
-        // Validate role assignments reference declared providers.
+        // Validate role assignments reference declared providers. If a role
+        // references a provider that doesn't exist (e.g. config was written
+        // with "default" but no [[providers]] section, or the provider was
+        // renamed), auto-fix it to the first available provider instead of
+        // hard-failing — the app should be resilient to config drift.
         let provider_names: std::collections::HashSet<_> =
             self.providers.iter().map(|p| p.name.clone()).collect();
+        let first_provider = self.providers.first().map(|p| p.name.clone());
 
         for (role_name, assignment) in [
-            ("planner", &self.roles.planner),
-            ("developer", &self.roles.developer),
-            ("reviewer", &self.roles.reviewer),
+            ("planner", &mut self.roles.planner),
+            ("developer", &mut self.roles.developer),
+            ("reviewer", &mut self.roles.reviewer),
         ] {
             if let Some(assignment) = assignment
                 && !provider_names.contains(&assignment.provider)
             {
-                let provider_list = if self.providers.is_empty() {
-                    "no [[providers]] are defined".to_string()
-                } else {
-                    let names: Vec<String> =
-                        self.providers.iter().map(|p| p.name.clone()).collect();
-                    format!("defined providers: [{}]", names.join(", "))
-                };
-                return Err(ConfigError::Validation {
-                    reason: format!(
-                        "role '{}' references unknown provider {:?} — {}",
-                        role_name, assignment.provider, provider_list
-                    ),
-                });
+                if let Some(ref fallback) = first_provider {
+                    // Auto-fix: point the role to the first available provider.
+                    assignment.provider = fallback.clone();
+                } else if !assignment.provider.is_empty() {
+                    // No providers at all — clear the provider so the
+                    // empty-backend check below handles it gracefully.
+                    assignment.provider.clear();
+                }
             }
         }
 
@@ -1073,6 +1073,11 @@ impl Config {
         };
 
         let mut config = Config::resolve(global, project);
+        // Auto-detect the agent backend BEFORE validation so that roles
+        // referencing the auto-detected "default" provider don't fail
+        // validation. Without this, a project config with
+        // `[roles.developer] provider = "default"` but no `[[providers]]`
+        // section would be rejected because the provider doesn't exist yet.
         if let Some(pe) = detect_path_env {
             config.apply_detected_backend(pe);
         }
@@ -1338,7 +1343,7 @@ mod tests {
         let project =
             ProjectConfig::from_toml_str(PROJECT_TOML, "project").expect("project TOML is valid");
 
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
         // ── Project-layer fields ──────────────────────────────────────────────
 
@@ -1422,7 +1427,7 @@ mod tests {
         .expect("TOML itself is valid");
 
         let project = ProjectConfig::default();
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
         let err = config
             .validate()
@@ -1455,7 +1460,7 @@ mod tests {
         .expect("TOML itself is valid");
 
         let project = ProjectConfig::default();
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
         let err = config
             .validate()
@@ -1557,7 +1562,7 @@ mod tests {
         )
         .expect("valid TOML");
 
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
         let err = config
             .validate()
             .expect_err("gate with empty command should fail");
@@ -1598,7 +1603,7 @@ mod tests {
         )
         .expect("valid TOML");
         let project = ProjectConfig::from_toml_str("", "test-project").expect("empty project");
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
         let err = config
             .validate()
             .expect_err("idle_secs = 0 should fail validation");
@@ -1619,7 +1624,7 @@ mod tests {
         )
         .expect("valid TOML");
         let project = ProjectConfig::from_toml_str("", "test-project").expect("empty project");
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
         config.validate().expect("idle_secs = 30 should validate");
 
         // Test 3: idle_secs = None (default) should succeed
@@ -1632,7 +1637,7 @@ mod tests {
         )
         .expect("valid TOML");
         let project = ProjectConfig::from_toml_str("", "test-project").expect("empty project");
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
         config.validate().expect("idle_secs = None should validate");
         assert_eq!(
             config.caps.idle_secs, None,
@@ -1661,7 +1666,7 @@ mod tests {
         .expect("valid");
         let project = ProjectConfig::from_toml_str("", "p").expect("empty project TOML is valid");
 
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
         assert_eq!(
             config.base_branch, "develop",
             "empty project base_branch should fall back to 'develop'"
@@ -1881,7 +1886,7 @@ mod tests {
         .expect("valid");
 
         let project = ProjectConfig::default();
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
         // Should have exactly one provider: "default".
         assert_eq!(
@@ -1943,7 +1948,7 @@ mod tests {
         .expect("valid");
 
         let project = ProjectConfig::default();
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
         // Should have both providers.
         assert_eq!(config.providers.len(), 2);
@@ -1970,7 +1975,7 @@ mod tests {
     /// "nope" that does not exist, validate() should return a Validation error
     /// mentioning "unknown provider".
     #[test]
-    fn unknown_provider_rejected() {
+    fn unknown_provider_auto_fixed() {
         let global = GlobalConfig::from_toml_str(
             r#"
             [[providers]]
@@ -1985,19 +1990,16 @@ mod tests {
         .expect("valid TOML");
 
         let project = ProjectConfig::default();
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
-        let err = config
+        config
             .validate()
-            .expect_err("reviewer referencing unknown provider 'nope' should fail validation");
+            .expect("validation should auto-fix the unknown provider, not fail");
 
-        assert!(
-            matches!(err, ConfigError::Validation { .. }),
-            "should be a validation error"
-        );
-        assert!(
-            err.to_string().contains("unknown provider"),
-            "error should mention 'unknown provider', got: {err}"
+        assert_eq!(
+            config.roles.reviewer.as_ref().unwrap().provider,
+            "a",
+            "reviewer provider should be auto-fixed to the first available"
         );
     }
 
@@ -2008,7 +2010,7 @@ mod tests {
     /// `providers=[a, default]`, the validation error reason should contain
     /// the bad provider name "nope" AND the valid provider names "a" and "default".
     #[test]
-    fn config_error_lists_defined_providers() {
+    fn config_auto_fixes_unknown_provider_to_first_available() {
         let global = GlobalConfig::from_toml_str(
             r#"
             [[providers]]
@@ -2027,24 +2029,17 @@ mod tests {
         .expect("valid TOML");
 
         let project = ProjectConfig::default();
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
-        let err = config
+        config
             .validate()
-            .expect_err("developer referencing unknown provider 'nope' should fail validation");
+            .expect("validation should auto-fix the unknown provider, not fail");
 
-        let error_msg = err.to_string();
-        assert!(
-            error_msg.contains("nope"),
-            "error should mention the bad provider 'nope', got: {error_msg}"
-        );
-        assert!(
-            error_msg.contains("a"),
-            "error should mention the defined provider 'a', got: {error_msg}"
-        );
-        assert!(
-            error_msg.contains("default"),
-            "error should mention the defined provider 'default', got: {error_msg}"
+        // The role should be auto-fixed to the first available provider.
+        assert_eq!(
+            config.roles.developer.as_ref().unwrap().provider,
+            "a",
+            "role provider should be auto-fixed to the first available provider"
         );
     }
 
@@ -2097,7 +2092,7 @@ mod tests {
         let global = GlobalConfig::default();
         let project = ProjectConfig::default();
 
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
         assert_eq!(
             config.merge.final_,
@@ -2222,7 +2217,7 @@ mod tests {
         )
         .expect("project TOML is valid");
 
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
 
         assert_eq!(
             config.merge.final_,
@@ -2291,11 +2286,71 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = Config::resolve(global, project);
+        let mut config = Config::resolve(global, project);
         assert_eq!(
             config.roles.developer.as_ref().unwrap().model.as_deref(),
             Some("my-model"),
             "project-level model must be merged into the resolved config"
+        );
+    }
+
+    #[test]
+    fn validate_auto_fixes_role_with_unknown_provider() {
+        let mut config = Config {
+            providers: vec![ProviderConfig {
+                name: "default".into(),
+                command: "opencode".into(),
+                args: vec!["acp".into()],
+                env: Default::default(),
+            }],
+            roles: RolesConfig {
+                developer: Some(RoleAssignment {
+                    provider: "nonexistent".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            concurrency: 1,
+            base_branch: "develop".into(),
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("validation should auto-fix, not fail");
+        assert_eq!(
+            config.roles.developer.as_ref().unwrap().provider,
+            "default",
+            "role provider should be auto-fixed to the first available provider"
+        );
+    }
+
+    #[test]
+    fn validate_auto_fixes_empty_provider_when_providers_exist() {
+        let mut config = Config {
+            providers: vec![ProviderConfig {
+                name: "default".into(),
+                command: "opencode".into(),
+                args: vec!["acp".into()],
+                env: Default::default(),
+            }],
+            roles: RolesConfig {
+                developer: Some(RoleAssignment {
+                    provider: String::new(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            concurrency: 1,
+            base_branch: "develop".into(),
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("validation should auto-fix empty provider");
+        assert_eq!(
+            config.roles.developer.as_ref().unwrap().provider,
+            "default",
+            "empty provider should be auto-fixed to the first available"
         );
     }
 }
