@@ -147,12 +147,8 @@ fn mismatched_checkpoint_with_active_evidence_is_retained() {
 }
 
 #[tokio::test]
-async fn plan_checkpoint_persists_externally_and_never_writes_repo_local_artifact() {
-    let _guard = makina_core::HOME_ENV_LOCK.lock().await;
+async fn plan_checkpoint_persists_in_repo_makina_dir() {
     let (repo, plan) = load_fixture();
-    let home = tempfile::tempdir().unwrap();
-    let old = std::env::var_os("HOME");
-    unsafe { std::env::set_var("HOME", home.path()) };
     let projected = ProjectedTaskGraph::from_document(&plan, Utc::now());
     persist_checkpoint(
         repo.path(),
@@ -162,28 +158,188 @@ async fn plan_checkpoint_persists_externally_and_never_writes_repo_local_artifac
     .await
     .unwrap();
     let path = checkpoint_path(repo.path(), &plan.key).unwrap();
-    assert!(path.starts_with(home.path()));
+    assert!(
+        path.starts_with(repo.path().join(".makina").join("checkpoints")),
+        "checkpoint must be under repo/.makina/checkpoints, got {}",
+        path.display()
+    );
     assert!(
         load_checkpoint(repo.path(), &plan.key)
             .await
             .unwrap()
             .is_some()
     );
-    assert!(!repo.path().join(".makina/tasks").exists());
-    if let Some(value) = old {
-        unsafe { std::env::set_var("HOME", value) }
-    } else {
-        unsafe { std::env::remove_var("HOME") }
+}
+
+/// Regression test for the "first task ready, other two skipped" bug.
+///
+/// This tests the FULL round-trip that was failing:
+/// 1. A stale checkpoint exists with task[0]=InProgress, task[1]=Skipped, task[2]=Skipped
+/// 2. overlay_compatible is called (as reconcile_run_under_repository_lease does)
+/// 3. The reconciled graph is persisted to disk
+/// 4. The checkpoint is reloaded from disk
+/// 5. NO task should be Skipped — they should all be New or Ready
+///
+/// This is the exact sequence that happens on every StartRun. If this
+/// test passes, the stale-skipped checkpoint bug cannot recur.
+#[tokio::test]
+async fn stale_skipped_checkpoint_is_fixed_by_overlay_and_persist_round_trip() {
+    let now = Utc::now();
+    // Build a 3-task sequential chain: root → dep-a → dep-b.
+    let tasks = vec![
+        Task {
+            id: TaskId::new("root"),
+            title: "Root".into(),
+            description: String::new(),
+            done_when: String::new(),
+            depends_on: vec![],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        },
+        Task {
+            id: TaskId::new("dep-a"),
+            title: "Dep A".into(),
+            description: String::new(),
+            done_when: String::new(),
+            depends_on: vec![TaskId::new("root")],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        },
+        Task {
+            id: TaskId::new("dep-b"),
+            title: "Dep B".into(),
+            description: String::new(),
+            done_when: String::new(),
+            depends_on: vec![TaskId::new("dep-a")],
+            section: None,
+            state: TaskState::New,
+            gate_iterations: 0,
+            review_iterations: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            failure_reason: None,
+        },
+    ];
+
+    // Simulate a stale checkpoint from a previous failed run:
+    // root was InProgress (stuck), dep-a and dep-b were Skipped.
+    let stale_checkpoint = PlanCheckpoint {
+        schema_version: 1,
+        identity: CheckpointIdentity {
+            plan_dir: std::path::PathBuf::from("docs/plans/0001-test-plan"),
+            executable_digest: "0".repeat(64),
+            task_ids: vec!["root".into(), "dep-a".into(), "dep-b".into()],
+            task_source_paths: vec![],
+        },
+        tasks: vec![
+            RuntimeTaskCheckpoint {
+                id: "root".into(),
+                state: TaskState::InProgress,
+                gate_iterations: 0,
+                review_iterations: 0,
+            },
+            RuntimeTaskCheckpoint {
+                id: "dep-a".into(),
+                state: TaskState::Skipped,
+                gate_iterations: 0,
+                review_iterations: 0,
+            },
+            RuntimeTaskCheckpoint {
+                id: "dep-b".into(),
+                state: TaskState::Skipped,
+                gate_iterations: 0,
+                review_iterations: 0,
+            },
+        ],
+        active_refs: vec![],
+        active_worktrees: vec![],
+    };
+
+    // Build a fresh graph (all tasks New) and overlay the stale checkpoint.
+    let mut fresh_graph = TaskGraph {
+        slug: "test".into(),
+        tasks: tasks.clone(),
+        authored: BTreeMap::new(),
+    };
+    overlay_compatible(&mut fresh_graph, &stale_checkpoint);
+
+    // After overlay: root should be Ready (InProgress→Ready), dep-a and dep-b
+    // should be New (un-skipped because their dependencies are not Failed).
+    assert_eq!(
+        fresh_graph
+            .tasks
+            .iter()
+            .find(|t| t.id.0 == "root")
+            .unwrap()
+            .state,
+        TaskState::Ready,
+        "root (was InProgress) must be reset to Ready"
+    );
+    assert_ne!(
+        fresh_graph
+            .tasks
+            .iter()
+            .find(|t| t.id.0 == "dep-a")
+            .unwrap()
+            .state,
+        TaskState::Skipped,
+        "dep-a must NOT be Skipped after overlay"
+    );
+    assert_ne!(
+        fresh_graph
+            .tasks
+            .iter()
+            .find(|t| t.id.0 == "dep-b")
+            .unwrap()
+            .state,
+        TaskState::Skipped,
+        "dep-b must NOT be Skipped after overlay"
+    );
+
+    // Now persist the reconciled graph to a temp repo and verify the
+    // checkpoint on disk has no Skipped tasks.
+    let repo = tempfile::tempdir().unwrap();
+    let identity = stale_checkpoint.identity.clone();
+    persist_checkpoint(repo.path(), identity, &fresh_graph)
+        .await
+        .expect("persist_checkpoint must succeed");
+
+    // Reload and verify no Skipped tasks in the persisted checkpoint.
+    let key = makina_core::plan::PlanKey::parse("docs/plans/0001-test-plan").unwrap();
+    let reloaded = load_checkpoint(repo.path(), &key)
+        .await
+        .unwrap()
+        .expect("checkpoint must exist after persist");
+    for task in &reloaded.tasks {
+        assert_ne!(
+            task.state,
+            TaskState::Skipped,
+            "task {} must not be Skipped in the persisted checkpoint — \
+             this is the bug that caused 'first task ready, other two skipped'",
+            task.id
+        );
     }
 }
 
 #[tokio::test]
 async fn clean_mismatch_can_be_archived_without_overwriting_recovery_evidence() {
-    let _guard = makina_core::HOME_ENV_LOCK.lock().await;
     let (repo, plan) = load_fixture();
-    let home = tempfile::tempdir().unwrap();
-    let old = std::env::var_os("HOME");
-    unsafe { std::env::set_var("HOME", home.path()) };
     let projected = ProjectedTaskGraph::from_document(&plan, Utc::now());
     persist_checkpoint(
         repo.path(),
@@ -206,7 +362,6 @@ async fn clean_mismatch_can_be_archived_without_overwriting_recovery_evidence() 
             .unwrap()
             .is_none()
     );
-    restore_home(old);
 }
 
 /// Regression test: a `Skipped` task in a compatible checkpoint must be
@@ -279,7 +434,7 @@ fn compatible_checkpoint_unskips_dependents_when_blocking_task_is_not_failed() {
     let checkpoint = PlanCheckpoint {
         schema_version: 1,
         identity: CheckpointIdentity {
-            plan_dir: std::path::PathBuf::from("docs/plans/test-plan"),
+            plan_dir: std::path::PathBuf::from("docs/plans/0001-test-plan"),
             executable_digest: "0".repeat(64),
             task_ids: vec!["root".into(), "dep-a".into(), "dep-b".into()],
             task_source_paths: vec![],
@@ -388,9 +543,9 @@ fn compatible_checkpoint_keeps_skipped_when_blocking_task_is_still_failed() {
     let checkpoint = PlanCheckpoint {
         schema_version: 1,
         identity: CheckpointIdentity {
-            plan_dir: std::path::PathBuf::from("docs/plans/test-plan"),
+            plan_dir: std::path::PathBuf::from("docs/plans/0001-test-plan"),
             executable_digest: "0".repeat(64),
-            task_ids: vec!["root".into(), "dep".into()],
+            task_ids: vec!["root".into(), "dep-a".into(), "dep-b".into()],
             task_source_paths: vec![],
         },
         tasks: vec![
