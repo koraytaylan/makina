@@ -701,11 +701,6 @@ async fn resolve_io(
                     .first()
                     .map(|p| p.command.clone())
                     .unwrap_or_default();
-                let provider_name = app
-                    .providers
-                    .first()
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
                 tokio::spawn(async move {
                     use makina_core::backend::{AgentBackend, SessionConfig};
                     let config = SessionConfig {
@@ -727,12 +722,7 @@ async fn resolve_io(
                                         |o| {
                                             o.options
                                                 .iter()
-                                                .map(|c| {
-                                                    format!(
-                                                        "{agent_name}/{provider_name}/{}",
-                                                        c.value
-                                                    )
-                                                })
+                                                .map(|c| format!("{agent_name}/{}", c.value))
                                                 .collect()
                                         },
                                     )
