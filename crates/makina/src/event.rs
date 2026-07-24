@@ -1090,16 +1090,45 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         cfg.merge = Some(MergeConfig {
             final_: valid.final_merge,
         });
-        // Write model selections for each role.
+        // Write model selections for each role. Strip the "tool/" prefix
+        // from the picker format — the config stores just the model name.
         if let Some(settings) = app.settings.as_ref() {
             let resolve = |s: &str| {
                 if s.is_empty() {
                     None
                 } else {
-                    Some(s.to_string())
+                    let model = s.split('/').skip(1).collect::<Vec<_>>().join("/");
+                    Some(if model.is_empty() {
+                        s.to_string()
+                    } else {
+                        model
+                    })
                 }
             };
+            // Preserve the existing provider name — don't overwrite with empty.
+            let dev_provider = app
+                .roles
+                .developer
+                .as_ref()
+                .map(|r| r.provider.clone())
+                .unwrap_or_else(|| "default".to_string());
+            let rev_provider = app
+                .roles
+                .reviewer
+                .as_ref()
+                .map(|r| r.provider.clone())
+                .unwrap_or_else(|| "default".to_string());
+            let plan_provider = app
+                .roles
+                .planner
+                .as_ref()
+                .map(|r| r.provider.clone())
+                .unwrap_or_else(|| "default".to_string());
             if let Some(model) = resolve(&settings.developer_model) {
+                cfg.roles
+                    .developer
+                    .get_or_insert_with(Default::default)
+                    .provider = dev_provider;
                 cfg.roles
                     .developer
                     .get_or_insert_with(Default::default)
@@ -1109,9 +1138,17 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
                 cfg.roles
                     .reviewer
                     .get_or_insert_with(Default::default)
+                    .provider = rev_provider;
+                cfg.roles
+                    .reviewer
+                    .get_or_insert_with(Default::default)
                     .model = Some(model);
             }
             if let Some(model) = resolve(&settings.planner_model) {
+                cfg.roles
+                    .planner
+                    .get_or_insert_with(Default::default)
+                    .provider = plan_provider;
                 cfg.roles.planner.get_or_insert_with(Default::default).model = Some(model);
             }
         }
@@ -5671,6 +5708,64 @@ final = "squash"
                 .and_then(|role| role.system_prompt.as_deref()),
             Some("Follow the repository style."),
             "project role prompt must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_selection_strips_tool_prefix_and_preserves_provider() {
+        use crate::placeholder::PlaceholderApi;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path();
+        let config_path = repo_root.join(".makina").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"base_branch = "develop"
+concurrency = 2
+
+[roles.developer]
+provider = "default"
+"#,
+        )
+        .unwrap();
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], repo_root.to_path_buf());
+        // Simulate auto-detected providers.
+        app.providers = vec![makina_core::config::ProviderConfig {
+            name: "default".into(),
+            command: "opencode".into(),
+            args: vec!["acp".into()],
+            env: Default::default(),
+        }];
+        app.roles.developer = Some(makina_core::config::RoleAssignment {
+            provider: "default".into(),
+            ..Default::default()
+        });
+
+        app.update(AppEvent::OpenSettings);
+        // Set the developer model to the picker format "opencode/my-model".
+        app.settings.as_mut().unwrap().developer_model = "opencode/my-model".to_string();
+
+        // Commit settings.
+        let (resolved, _) = resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+        app.update(resolved);
+
+        // Read back the config.
+        let written = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            written.contains("model = \"my-model\""),
+            "config must contain the clean model name without tool prefix; got:\n{written}"
+        );
+        assert!(
+            written.contains("provider = \"default\""),
+            "config must preserve the provider name; got:\n{written}"
+        );
+        // Verify the app's role assignment has the clean model.
+        assert_eq!(
+            app.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("my-model"),
+            "app role must have the clean model name"
         );
     }
 

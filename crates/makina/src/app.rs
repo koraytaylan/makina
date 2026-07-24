@@ -5000,12 +5000,18 @@ impl App {
                 }
                 // Apply model selections from the settings modal to the app's
                 // role assignments so subsequent runs use the chosen models.
+                // Strip the "tool/" prefix — the app stores just the model name.
                 if let Some(settings) = self.settings.as_ref() {
                     let resolve = |s: &str| {
                         if s.is_empty() {
                             None
                         } else {
-                            Some(s.to_string())
+                            let model = s.split('/').skip(1).collect::<Vec<_>>().join("/");
+                            Some(if model.is_empty() {
+                                s.to_string()
+                            } else {
+                                model
+                            })
                         }
                     };
                     if let Some(model) = resolve(&settings.developer_model) {
