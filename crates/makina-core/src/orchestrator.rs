@@ -4688,6 +4688,18 @@ impl CoreApi {
                 )
             {
                 crate::checkpoint::overlay_compatible(&mut projected.graph, cp);
+                // Persist the reconciled graph immediately so the stale
+                // Skipped state is overwritten on disk. Without this, if
+                // StartRun's reconcile fails (e.g. RetainForRecovery), the
+                // stale checkpoint with Skipped tasks survives and the user
+                // sees "first task ready, other two skipped" on every attempt.
+                let identity = crate::checkpoint::CheckpointIdentity::from_plan(&plan);
+                if let Err(e) =
+                    crate::checkpoint::persist_checkpoint(repo_root, identity, &projected.graph)
+                        .await
+                {
+                    tracing::warn!(error = %e, "failed to persist reconciled checkpoint during open_run");
+                }
             }
             let reconciliation = if checkpoint.is_none()
                 && crate::checkpoint::checkpoint_path(repo_root, &plan.key).is_err()
