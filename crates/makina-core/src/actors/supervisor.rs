@@ -1972,7 +1972,28 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
     // worker session. Exact claim evidence makes response-loss retry safe.
     if ctx.checkpoint_identity.is_some() {
         let _merge_guard = ctx.merge_lock.lock().await;
-        ctx.commit_claim(task_id).await?;
+        if let Err(e) = ctx.commit_claim(task_id).await {
+            // The claim failed — move the task to Failed before returning Err.
+            // Without this, the task stays Ready and the scheduler's error
+            // handler marks dependents as Skipped even though the task was
+            // never actually Failed in the graph. This is the root cause of
+            // the "first task ready, other two skipped" bug.
+            let msg = format!("durable claim failed for {task_id}: {e}");
+            {
+                let mut graph = ctx.graph.lock().await;
+                let _ = apply_event_locked(&mut graph, task_id, TaskEvent::HardError);
+                mark_finished_locked(&mut graph, task_id);
+                set_failure_reason_locked(
+                    &mut graph,
+                    task_id,
+                    api::FailureKind::HardError,
+                    msg.clone(),
+                );
+            }
+            ctx.persist().await;
+            guard.worktree_removed = true;
+            return Err(msg);
+        }
     }
 
     // ── Step 2: create the worktree, then Ready → InProgress (Dispatched) ──────
