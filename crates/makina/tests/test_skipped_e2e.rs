@@ -118,6 +118,32 @@ async fn todo_plan_first_run_no_skipped_tasks() {
     }
     println!("Run status: {:?}", view.status);
 
+    // The first task must be Failed (not Ready) and must have a failure_reason
+    // that explains WHY it failed. This is what the TUI's Logs pane shows.
+    let failed_task = view
+        .tasks
+        .iter()
+        .find(|t| t.id.0 == "add-task-toggle")
+        .expect("add-task-toggle must exist");
+    assert_eq!(
+        failed_task.state,
+        TaskState::Failed,
+        "add-task-toggle must be Failed, not Ready — \
+         if it's Ready the commit_claim error wasn't handled properly"
+    );
+    let reason = failed_task
+        .failure_reason
+        .as_ref()
+        .expect("failed task must have a failure_reason — the TUI Logs pane shows this");
+    println!(
+        "Failure reason: kind={:?} message={}",
+        reason.kind, reason.message
+    );
+    assert!(
+        !reason.message.is_empty(),
+        "failure reason message must not be empty"
+    );
+
     // The NoopBackend responds to every prompt. The gates (cargo test/clippy/fmt)
     // will likely fail since NoopBackend doesn't actually edit files. But the
     // key assertion is: a task should only be Skipped if a transitive
@@ -154,4 +180,92 @@ async fn todo_plan_first_run_no_skipped_tasks() {
             );
         }
     }
+}
+
+/// Test that the TUI Logs pane shows the failure reason for a failed task.
+/// This verifies the UI rendering path, not just the API data.
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_logs_pane_shows_failure_reason_for_failed_task() {
+    use makina::app::{App, AppEvent, OutputTab, Panel};
+    use makina_core::api::{
+        Api, ApiError, Command, CommandOutcome, Event, EventStream, FailureKind, FailureReason,
+        RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::Arc;
+
+    // Minimal mock API that returns a run with a failed task.
+    struct MockApi;
+    #[async_trait::async_trait]
+    impl Api for MockApi {
+        async fn execute(&self, _command: Command) -> Result<CommandOutcome, ApiError> {
+            Ok(CommandOutcome::Acknowledged)
+        }
+        async fn runs(&self) -> Vec<RunView> {
+            vec![]
+        }
+        async fn run(&self, _id: RunId) -> Option<RunView> {
+            Some(RunView {
+                id: RunId(1),
+                run_uid: String::new(),
+                plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
+                status: RunStatus::Failed,
+                project: String::new(),
+                tasks: vec![TaskView {
+                    authored: None,
+                    id: TaskId::new("add-task-toggle"),
+                    title: "Add A Task Toggle Method".into(),
+                    state: TaskState::Failed,
+                    gate_iterations: 0,
+                    review_iterations: 0,
+                    depends_on: vec![],
+                    started_at: None,
+                    finished_at: None,
+                    failure_reason: Some(FailureReason {
+                        kind: FailureKind::HardError,
+                        message: "durable claim failed: git rev-parse failed".into(),
+                    }),
+                    entry_text: String::new(),
+                }],
+                report: makina_core::api::IngestionReport::default(),
+            })
+        }
+        fn subscribe(&self) -> EventStream {
+            let (_, rx) = tokio::sync::broadcast::channel::<Event>(1);
+            Box::pin(futures::stream::iter(Vec::new()))
+        }
+    }
+
+    let api: Arc<dyn Api> = Arc::new(MockApi);
+    let run = api.run(RunId(1)).await.unwrap();
+    let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
+    app.collapsed_runs.clear();
+    app.selected_run = Some(0);
+    app.selected_task = Some(0);
+    app.focused_panel = Panel::Main;
+    app.output_tab = OutputTab::Logs;
+
+    // Open a task tab so the main pane renders the task detail.
+    app.update(AppEvent::OpenTab(makina::app::TabContent::Task {
+        plan: makina::app::PlanIdentity::legacy("0001-Test"),
+        run: RunId(1),
+        task_id: TaskId::new("add-task-toggle"),
+    }));
+
+    // Render and check the screen.
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|f| makina::ui::render(&app, f)).unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let screen: String = buffer
+        .content()
+        .iter()
+        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+        .collect();
+
+    assert!(
+        screen.contains("durable claim failed"),
+        "Logs pane must show the failure reason message; screen was:\n{screen}"
+    );
 }

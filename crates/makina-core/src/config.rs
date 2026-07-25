@@ -891,7 +891,7 @@ impl Config {
             self.providers.iter().map(|p| p.name.clone()).collect();
         let first_provider = self.providers.first().map(|p| p.name.clone());
 
-        for (role_name, assignment) in [
+        for (_role_name, assignment) in [
             ("planner", &mut self.roles.planner),
             ("developer", &mut self.roles.developer),
             ("reviewer", &mut self.roles.reviewer),
