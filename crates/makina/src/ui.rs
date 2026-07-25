@@ -1721,6 +1721,7 @@ fn wrap_plain_line(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
 
 fn log_tab_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+    let error_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error));
     if let Some(op) = app.context_operation_log()
         && !op.log.is_empty()
     {
@@ -1749,20 +1750,57 @@ fn log_tab_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         }
         return lines;
     }
-    match app
-        .log_pane_target()
-        .and_then(|(run, task)| app.exchange_logs.get(&(run, task)))
-    {
-        Some(log) if !log.entries.is_empty() => log
-            .entries
+    // Get the focused task's run view + task view.
+    let target = app.log_pane_target();
+    let exchange_log = target
+        .as_ref()
+        .and_then(|(run, task)| app.exchange_logs.get(&(*run, task.clone())));
+
+    // Collect failure reason from the focused task (if any).
+    let failure_reason = target.as_ref().and_then(|(run, task_id)| {
+        app.runs
             .iter()
-            .flat_map(|e| exchange_entry_lines(e, app, width))
-            .collect(),
-        Some(_) => vec![Line::from(vec![Span::styled(
+            .find(|r| r.id == *run)
+            .and_then(|rv| rv.tasks.iter().find(|t| t.id == *task_id))
+            .and_then(|t| t.failure_reason.as_ref())
+    });
+
+    match (exchange_log, failure_reason) {
+        (Some(log), _) if !log.entries.is_empty() => {
+            let mut lines: Vec<Line> = log
+                .entries
+                .iter()
+                .flat_map(|e| exchange_entry_lines(e, app, width))
+                .collect();
+            // If the task also has a failure reason, append it at the end.
+            if let Some(reason) = failure_reason {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  Failure: {}", reason.message),
+                    error_style,
+                )]));
+            }
+            lines
+        }
+        (Some(_), Some(reason)) => {
+            // No exchange entries but the task has a failure reason — show it.
+            vec![Line::from(vec![Span::styled(
+                format!("  Task failed: {}", reason.message),
+                error_style,
+            )])]
+        }
+        (Some(_), None) => vec![Line::from(vec![Span::styled(
             "  No log entries yet for this task.",
             dim,
         )])],
-        None => vec![Line::from(vec![Span::styled(
+        (None, Some(reason)) => {
+            // No exchange log at all but the task has a failure reason.
+            vec![Line::from(vec![Span::styled(
+                format!("  Task failed: {}", reason.message),
+                error_style,
+            )])]
+        }
+        (None, None) => vec![Line::from(vec![Span::styled(
             "  Select a task (open a task tab or pick one in the sidebar) to see its log.",
             dim,
         )])],
