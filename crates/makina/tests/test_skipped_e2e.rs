@@ -2,7 +2,7 @@
 //!
 //! This test simulates the EXACT scenario the user reports:
 //! 1. A todo template project is created
-//! 2. A run is opened for plan 0001-Todo-Core
+//! 2. A run is opened for plan 0001-todo-core
 //! 3. The run is started
 //! 4. The agent backend (NoopBackend) responds "done" to everything
 //! 5. We observe: why do tasks 2 and 3 show as "skipped"?
@@ -55,8 +55,8 @@ async fn todo_plan_first_run_no_skipped_tasks() {
         Arc::new(RepositoryLeaseRegistry::new()),
     );
 
-    // ── Step 3: Open plan 0001-Todo-Core ────────────────────────────────────
-    let plan_key = PlanKey::parse("docs/plans/0001-Todo-Core").unwrap();
+    // ── Step 3: Open plan 0001-todo-core ────────────────────────────────────
+    let plan_key = PlanKey::parse("docs/plans/0001-todo-core").unwrap();
     let outcome = api
         .execute(Command::OpenPlan {
             plan_dir: plan_key.clone(),

@@ -70,90 +70,90 @@ const TODO_FILES: &[(&str, &str)] = &[
     ),
     // Plan 0001 — sequential chain.
     (
-        "docs/plans/0001-Todo-Core/SCOPE.md",
+        "docs/plans/0001-todo-core/SCOPE.md",
         include_str!("templates/todo/plan_0001_scope_md"),
     ),
     (
-        "docs/plans/0001-Todo-Core/ARCHITECTURE.md",
+        "docs/plans/0001-todo-core/ARCHITECTURE.md",
         include_str!("templates/todo/plan_0001_architecture_md"),
     ),
     (
-        "docs/plans/0001-Todo-Core/STATUS.md",
+        "docs/plans/0001-todo-core/STATUS.md",
         include_str!("templates/todo/plan_0001_status_md"),
     ),
     (
-        "docs/plans/0001-Todo-Core/tasks/0101-add-task-toggle.md",
+        "docs/plans/0001-todo-core/tasks/0101-add-task-toggle.md",
         include_str!("templates/todo/plan_0001_task_0101_md"),
     ),
     (
-        "docs/plans/0001-Todo-Core/tasks/0102-add-count-open.md",
+        "docs/plans/0001-todo-core/tasks/0102-add-count-open.md",
         include_str!("templates/todo/plan_0001_task_0102_md"),
     ),
     (
-        "docs/plans/0001-Todo-Core/tasks/0103-add-print-summary.md",
+        "docs/plans/0001-todo-core/tasks/0103-add-print-summary.md",
         include_str!("templates/todo/plan_0001_task_0103_md"),
     ),
     // Plan 0002 — three independent parallel tasks.
     (
-        "docs/plans/0002-Todo-Features/SCOPE.md",
+        "docs/plans/0002-todo-features/SCOPE.md",
         include_str!("templates/todo/plan_0002_scope_md"),
     ),
     (
-        "docs/plans/0002-Todo-Features/ARCHITECTURE.md",
+        "docs/plans/0002-todo-features/ARCHITECTURE.md",
         include_str!("templates/todo/plan_0002_architecture_md"),
     ),
     (
-        "docs/plans/0002-Todo-Features/STATUS.md",
+        "docs/plans/0002-todo-features/STATUS.md",
         include_str!("templates/todo/plan_0002_status_md"),
     ),
     (
-        "docs/plans/0002-Todo-Features/tasks/0201-add-list-module.md",
+        "docs/plans/0002-todo-features/tasks/0201-add-list-module.md",
         include_str!("templates/todo/plan_0002_task_0201_md"),
     ),
     (
-        "docs/plans/0002-Todo-Features/tasks/0202-add-render-module.md",
+        "docs/plans/0002-todo-features/tasks/0202-add-render-module.md",
         include_str!("templates/todo/plan_0002_task_0202_md"),
     ),
     (
-        "docs/plans/0002-Todo-Features/tasks/0203-add-tags-module.md",
+        "docs/plans/0002-todo-features/tasks/0203-add-tags-module.md",
         include_str!("templates/todo/plan_0002_task_0203_md"),
     ),
     // Plan 0003 — mixed fan-out/fan-in.
     (
-        "docs/plans/0003-Todo-Integration/SCOPE.md",
+        "docs/plans/0003-todo-integration/SCOPE.md",
         include_str!("templates/todo/plan_0003_scope_md"),
     ),
     (
-        "docs/plans/0003-Todo-Integration/ARCHITECTURE.md",
+        "docs/plans/0003-todo-integration/ARCHITECTURE.md",
         include_str!("templates/todo/plan_0003_architecture_md"),
     ),
     (
-        "docs/plans/0003-Todo-Integration/STATUS.md",
+        "docs/plans/0003-todo-integration/STATUS.md",
         include_str!("templates/todo/plan_0003_status_md"),
     ),
     (
-        "docs/plans/0003-Todo-Integration/tasks/0301-add-filter-enum.md",
+        "docs/plans/0003-todo-integration/tasks/0301-add-filter-enum.md",
         include_str!("templates/todo/plan_0003_task_0301_md"),
     ),
     (
-        "docs/plans/0003-Todo-Integration/tasks/0302-add-by-status-filter.md",
+        "docs/plans/0003-todo-integration/tasks/0302-add-by-status-filter.md",
         include_str!("templates/todo/plan_0003_task_0302_md"),
     ),
     (
-        "docs/plans/0003-Todo-Integration/tasks/0303-add-by-title-filter.md",
+        "docs/plans/0003-todo-integration/tasks/0303-add-by-title-filter.md",
         include_str!("templates/todo/plan_0003_task_0303_md"),
     ),
     (
-        "docs/plans/0003-Todo-Integration/tasks/0304-wire-filters-into-main.md",
+        "docs/plans/0003-todo-integration/tasks/0304-wire-filters-into-main.md",
         include_str!("templates/todo/plan_0003_task_0304_md"),
     ),
 ];
 
 /// Plan directories scaffolded by the `todo` template, in registration order.
 const TODO_PLAN_DIRS: &[&str] = &[
-    "docs/plans/0001-Todo-Core",
-    "docs/plans/0002-Todo-Features",
-    "docs/plans/0003-Todo-Integration",
+    "docs/plans/0001-todo-core",
+    "docs/plans/0002-todo-features",
+    "docs/plans/0003-todo-integration",
 ];
 
 /// Run a git command in the given directory.

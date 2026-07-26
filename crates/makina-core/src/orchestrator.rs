@@ -5026,7 +5026,8 @@ impl CoreApi {
                 reason: format!("cannot start without external runtime state: {error}"),
             },
         )?;
-        let plan_identity = format!("{}-{}", opened.key.number, opened.key.slug);
+        let plan_identity =
+            format!("{}-{}", opened.key.number, opened.key.slug).to_ascii_lowercase();
         let plan_ref = format!("refs/heads/plan/{plan_identity}");
         let tip_output = tokio::process::Command::new("git")
             .arg("-C")

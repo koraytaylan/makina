@@ -111,7 +111,7 @@ async fn scaffold_creates_runnable_todo_project() {
         "config base_branch"
     );
 
-    let plan_dir = target.join("docs/plans/0001-Todo-Core");
+    let plan_dir = target.join("docs/plans/0001-todo-core");
     assert!(!plan_dir.join("TASKS.md").exists(), "no legacy TASKS.md");
     assert!(
         plan_dir.join("tasks/0101-add-task-toggle.md").exists(),
@@ -122,13 +122,13 @@ async fn scaffold_creates_runnable_todo_project() {
     assert!(plan_dir.join("STATUS.md").exists(), "STATUS.md");
     assert!(
         target
-            .join("docs/plans/0002-Todo-Features/SCOPE.md")
+            .join("docs/plans/0002-todo-features/SCOPE.md")
             .exists(),
         "plan 0002 SCOPE.md"
     );
     assert!(
         target
-            .join("docs/plans/0003-Todo-Integration/SCOPE.md")
+            .join("docs/plans/0003-todo-integration/SCOPE.md")
             .exists(),
         "plan 0003 SCOPE.md"
     );
@@ -152,7 +152,7 @@ async fn scaffold_creates_runnable_todo_project() {
         3,
         "three per-task documents in plan 0001"
     );
-    let registered = run_git(&target, &["rev-parse", "refs/heads/plan/0001-Todo-Core"]);
+    let registered = run_git(&target, &["rev-parse", "refs/heads/plan/0001-todo-core"]);
     let registered = String::from_utf8_lossy(&registered.stdout)
         .trim()
         .to_owned();
@@ -240,7 +240,7 @@ async fn scaffold_recovers_registration_response_loss_with_exact_r() {
     )
     .await
     .expect("response-loss recovery");
-    let plan_ref = "refs/heads/plan/0001-Todo-Core";
+    let plan_ref = "refs/heads/plan/0001-todo-core";
     let r = run_git(&target, &["rev-parse", plan_ref]);
     let count = run_git(&target, &["rev-list", "--count", plan_ref]);
     assert_eq!(
@@ -267,7 +267,7 @@ async fn scaffold_sample_runs_claim_a_b_p_f_c_without_touching_workspace() {
         .await
         .expect("scaffold");
     let before = workspace_snapshot(&target);
-    let plan_ref = "refs/heads/plan/0001-Todo-Core";
+    let plan_ref = "refs/heads/plan/0001-todo-core";
     let run = "01AAAAAAAAAAAAAAAAAAAAAAAA";
     // Extend the starter through a separate develop worktree with a fourth,
     // independent task (disjoint footprint `src/list.rs`), then refresh exact
@@ -307,12 +307,12 @@ Implement the list summary independently from task toggling.
 - **Done when:** `summary` returns the implemented value.
 "#;
     std::fs::write(
-        author.join("docs/plans/0001-Todo-Core/tasks/0104-add-list-summary.md"),
+        author.join("docs/plans/0001-todo-core/tasks/0104-add-list-summary.md"),
         second,
     )
     .unwrap();
     for relative in [
-        "docs/plans/0001-Todo-Core/STATUS.md",
+        "docs/plans/0001-todo-core/STATUS.md",
         "docs/plans/STATUS.md",
     ] {
         let path = author.join(relative);
@@ -329,7 +329,7 @@ Implement the list summary independently from task toggling.
     let authored = String::from_utf8_lossy(&run_git(&target, &["rev-parse", "develop"]).stdout)
         .trim()
         .to_owned();
-    let key = PlanKey::parse("docs/plans/0001-Todo-Core").unwrap();
+    let key = PlanKey::parse("docs/plans/0001-todo-core").unwrap();
     let source = makina_core::plan::GitTreePlanFileSource::new(&target, &authored).unwrap();
     let makina_core::plan::PlanCandidate::Plan(authored_plan) =
         makina_core::plan::load_plan_path(&source, key.relative_dir.clone(), &Default::default())
@@ -549,7 +549,7 @@ Implement the list summary independently from task toggling.
     let final_source = makina_core::plan::GitTreePlanFileSource::new(&target, &c).unwrap();
     let makina_core::plan::PlanCandidate::Plan(final_plan) = makina_core::plan::load_plan_path(
         &final_source,
-        "docs/plans/0001-Todo-Core",
+        "docs/plans/0001-todo-core",
         &Default::default(),
     )
     .unwrap() else {
