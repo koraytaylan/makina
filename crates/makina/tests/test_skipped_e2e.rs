@@ -83,28 +83,16 @@ async fn todo_plan_first_run_no_skipped_tasks() {
         );
     }
 
-    // ── Step 4: Start the run ───────────────────────────────────────────────
+    // ── Step 4: Start the run (model check is at the TUI layer, not the API) ─
     let outcome = api
         .execute(Command::StartRun { run })
         .await
-        .expect("StartRun must succeed");
-    println!("StartRun outcome: {outcome:?}");
+        .expect("StartRun must succeed at API level");
 
-    // Poll task states every 500ms to see the progression.
-    for i in 0..20 {
+    // Poll until the run reaches a terminal state.
+    for i in 0..30 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let view = api.run(run).await.expect("run must exist");
-        let states: Vec<(String, TaskState)> = view
-            .tasks
-            .iter()
-            .map(|t| (t.id.0.clone(), t.state.clone()))
-            .collect();
-        println!(
-            "[{:.1}s] status={:?} tasks={:?}",
-            i as f64 * 0.5,
-            view.status,
-            states
-        );
         if matches!(view.status, RunStatus::Completed | RunStatus::Failed) {
             break;
         }

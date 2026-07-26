@@ -611,6 +611,25 @@ async fn resolve_io(
             if let Some(event) = operation_blocked_event(app, "Start run") {
                 return (event, None);
             }
+            // Block StartRun if no model is configured for any role. Models
+            // have monetary consequences — the user must explicitly choose one.
+            let any_model = app
+                .roles
+                .developer
+                .as_ref()
+                .and_then(|r| r.model.as_ref())
+                .or_else(|| app.roles.reviewer.as_ref().and_then(|r| r.model.as_ref()))
+                .or_else(|| app.roles.planner.as_ref().and_then(|r| r.model.as_ref()))
+                .is_some();
+            if !any_model {
+                return (
+                    AppEvent::Tick,
+                    Some(
+                        "No model configured — open Settings (Ctrl+P → Settings) to select a model before starting a run"
+                            .into(),
+                    ),
+                );
+            }
             let active_run = app.active_run_id();
             if let Some(run) = active_run {
                 match app
@@ -1162,6 +1181,59 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
             },
             Some(reason),
         );
+    }
+
+    // Also write model selections to the global config (~/.makina/config.toml)
+    // so they become "last used models" that are available across projects.
+    if let Some(settings) = app.settings.as_ref() {
+        let resolve = |s: &str| {
+            if s.is_empty() {
+                None
+            } else {
+                let model = s.split('/').skip(1).collect::<Vec<_>>().join("/");
+                Some(if model.is_empty() {
+                    s.to_string()
+                } else {
+                    model
+                })
+            }
+        };
+        let global_path = dirs::home_dir().map(|h| h.join(".makina").join("config.toml"));
+        if let Some(ref global_path) = global_path
+            && let Ok(existing) = tokio::fs::read_to_string(global_path).await
+        {
+            if let Ok(mut global) = toml::from_str::<makina_core::config::GlobalConfig>(&existing)
+                .or_else(|_| Ok::<_, ()>(makina_core::config::GlobalConfig::default()))
+            {
+                if let Some(model) = resolve(&settings.developer_model) {
+                    global
+                        .roles
+                        .developer
+                        .get_or_insert_with(Default::default)
+                        .model = Some(model);
+                }
+                if let Some(model) = resolve(&settings.reviewer_model) {
+                    global
+                        .roles
+                        .reviewer
+                        .get_or_insert_with(Default::default)
+                        .model = Some(model);
+                }
+                if let Some(model) = resolve(&settings.planner_model) {
+                    global
+                        .roles
+                        .planner
+                        .get_or_insert_with(Default::default)
+                        .model = Some(model);
+                }
+                if let Ok(toml_str) = toml::to_string_pretty(&global)
+                    && let Some(parent) = global_path.parent()
+                    && tokio::fs::create_dir_all(parent).await.is_ok()
+                {
+                    let _ = tokio::fs::write(global_path, toml_str).await;
+                }
+            }
+        }
     }
 
     let status = match app
@@ -2416,7 +2488,37 @@ mod tests {
         use std::sync::Arc;
 
         let api = Arc::new(PlaceholderApi::empty());
-        App::new(api, vec![], PathBuf::from("/"))
+        let mut app = App::new(api, vec![], PathBuf::from("/"));
+        seed_test_model(&mut app);
+        app
+    }
+
+    /// Seed a test model so StartRun passes the model check.
+    fn seed_test_model(app: &mut App) {
+        use makina_core::config::{ProviderConfig, RoleAssignment, RolesConfig};
+        app.providers = vec![ProviderConfig {
+            name: "default".into(),
+            command: "test".into(),
+            args: vec![],
+            env: Default::default(),
+        }];
+        app.roles = RolesConfig {
+            developer: Some(RoleAssignment {
+                provider: "default".into(),
+                model: Some("test-model".into()),
+                ..Default::default()
+            }),
+            reviewer: Some(RoleAssignment {
+                provider: "default".into(),
+                model: Some("test-model".into()),
+                ..Default::default()
+            }),
+            planner: Some(RoleAssignment {
+                provider: "default".into(),
+                model: Some("test-model".into()),
+                ..Default::default()
+            }),
+        };
     }
 
     /// Build a crossterm mouse-wheel event of the given `kind`
@@ -3296,6 +3398,7 @@ mod tests {
             vec![run],
             std::path::PathBuf::from("."),
         );
+        seed_test_model(&mut app);
         assert_eq!(app.selected_run().unwrap().id, RunId(7));
 
         // Start.
@@ -3341,6 +3444,12 @@ mod tests {
 
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        // Seed a model so StartRun passes the model check.
+        app.roles.developer = Some(makina_core::config::RoleAssignment {
+            provider: "default".into(),
+            model: Some("test-model".into()),
+            ..Default::default()
+        });
         assert!(app.selected_run().is_none());
 
         let (ev, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
@@ -3396,6 +3505,7 @@ mod tests {
             vec![],
             std::path::PathBuf::from("."),
         );
+        seed_test_model(&mut app);
         // A discovered per-task plan surfaced via an active plan tab. No
         // Run exists for it.
         app.discovered_plans = vec![test_plan_entry(
@@ -3688,6 +3798,7 @@ mod tests {
             vec![],
             std::path::PathBuf::from("."),
         );
+        seed_test_model(&mut app);
         app.discovered_plans = vec![test_plan_entry(
             std::path::PathBuf::from("/tmp/docs/plans/0100-empty"),
             "0100-empty".to_string(),
@@ -3875,6 +3986,7 @@ mod tests {
             vec![disk_run],
             std::path::PathBuf::from("/work/repo-a"),
         );
+        seed_test_model(&mut app);
         app.opened_folders = vec![
             std::path::PathBuf::from("/work/repo-a"),
             std::path::PathBuf::from("/work/repo-b"),
@@ -5279,6 +5391,7 @@ mod tests {
             vec![run],
             std::path::PathBuf::from("."),
         );
+        seed_test_model(&mut app);
         // Retry tests navigate to a task node, which requires the run expanded.
         app.collapsed_runs.clear();
         (app, api)
