@@ -51,6 +51,7 @@ fn authoring_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
 
 fn git(repo: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(repo)
         .output()

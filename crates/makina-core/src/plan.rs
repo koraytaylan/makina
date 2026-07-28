@@ -3121,6 +3121,7 @@ mod git_tree_source_tests {
 
     fn run(root: &Path, args: &[&str]) -> Vec<u8> {
         let output = Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .current_dir(root)
             .output()

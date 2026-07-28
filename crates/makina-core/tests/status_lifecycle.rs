@@ -8,6 +8,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .output()
         .unwrap();
@@ -25,6 +26,7 @@ async fn retry_transition_is_published_before_runtime_mutation_and_reusable() {
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["config", "user.email", "t@e"]);
     git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     fs::create_dir_all(repo.path().join("docs/plans/0048-X/tasks")).unwrap();
     for path in [
         "docs/plans/STATUS.md",
@@ -86,6 +88,7 @@ async fn failed_transition_cas_leaves_source_and_runtime_decision_unchanged() {
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["config", "user.email", "t@e"]);
     git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     fs::create_dir_all(repo.path().join("docs/plans/0048-X/tasks")).unwrap();
     fs::write(
         repo.path().join("docs/plans/0048-X/tasks/0101-x.md"),
@@ -133,6 +136,7 @@ async fn cancellation_transition_commits_task_plan_and_root_as_one_restart_bound
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["config", "user.email", "t@e"]);
     git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     fs::create_dir_all(repo.path().join("docs/plans/0048-X/tasks")).unwrap();
     for (path, value) in [
         ("docs/plans/STATUS.md", "root in-progress\n"),
@@ -213,6 +217,7 @@ async fn claim_is_durable_before_dispatch_and_reusable_after_response_loss() {
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["config", "user.email", "t@e"]);
     git(repo.path(), &["config", "user.name", "T"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     fs::create_dir_all(repo.path().join("docs/plans/0048-X/tasks")).unwrap();
     for (path, bytes) in [
         ("docs/plans/STATUS.md", "root\n"),

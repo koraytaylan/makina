@@ -214,6 +214,7 @@ fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));

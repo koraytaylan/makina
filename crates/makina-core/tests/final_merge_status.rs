@@ -9,6 +9,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .output()
         .unwrap();
@@ -28,6 +29,7 @@ fn repo() -> tempfile::TempDir {
         &["config", "user.email", "final@example.invalid"],
     );
     git(repo.path(), &["config", "user.name", "Final Test"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     fs::create_dir_all(repo.path().join("docs/plans/0048-X/tasks")).unwrap();
     fs::write(repo.path().join("docs/plans/STATUS.md"), "root\n").unwrap();
     fs::write(repo.path().join("docs/plans/0048-X/STATUS.md"), "status\n").unwrap();

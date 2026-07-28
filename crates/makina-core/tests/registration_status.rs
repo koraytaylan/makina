@@ -29,7 +29,9 @@ async fn generate_command_publishes_direct_r_without_operator_files_or_run_side_
         &["config", "user.email", "generated@example.invalid"],
     );
     git(repo.path(), &["config", "user.name", "Generated Test"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
+    fs::write(repo.path().join(".gitignore"), ".makina/\n").unwrap();
     fs::write(repo.path().join("docs/plans/STATUS.md"), "# Plans\n\n| Plan | Title | Status | Progress | Outcome | Link |\n|---|---|---|---|---|---|\n").unwrap();
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-qm", "base"]);
@@ -95,7 +97,8 @@ async fn generate_command_publishes_direct_r_without_operator_files_or_run_side_
         "response-loss retry must reuse R"
     );
     assert!(!repo.path().join(&plan_dir.relative_dir).exists());
-    assert!(output(repo.path(), &["status", "--porcelain"]).is_empty());
+    let status = output(repo.path(), &["status", "--porcelain"]);
+    assert!(status.is_empty(), "working tree must stay clean: {status}");
     assert!(
         api.runs().await.is_empty(),
         "generation must not open or start a run"
@@ -112,6 +115,7 @@ async fn generated_closed_bundle_registers_without_operator_materialization_and_
         &["config", "user.email", "generated@example.invalid"],
     );
     git(repo.path(), &["config", "user.name", "Generated Test"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
     fs::write(repo.path().join("docs/plans/STATUS.md"), "# Plans\n\n| Plan | Title | Status | Progress | Outcome | Link |\n|---|---|---|---|---|---|\n").unwrap();
     git(repo.path(), &["add", "."]);
@@ -414,6 +418,7 @@ fn fixture_repo() -> tempfile::TempDir {
         &["config", "user.email", "register@example.invalid"],
     );
     git(repo.path(), &["config", "user.name", "Register Test"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     copy_tree(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/plan-bundles/valid/0049-Sample"),
@@ -443,6 +448,7 @@ fn copy_tree(source: &Path, destination: &Path) {
 fn git(repo: &Path, args: &[&str]) {
     assert!(
         std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .current_dir(repo)
             .status()
@@ -453,6 +459,7 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn output(repo: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(repo)
         .output()

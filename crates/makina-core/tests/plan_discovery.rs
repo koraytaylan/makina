@@ -366,6 +366,7 @@ fn copy_tree(source: &Path, destination: &Path) {
 fn git(repo: &Path, args: &[&str]) {
     assert!(
         std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .current_dir(repo)
             .status()
@@ -376,6 +377,7 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn git_output(repo: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(repo)
         .output()

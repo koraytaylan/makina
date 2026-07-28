@@ -5,6 +5,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .output()
         .unwrap();

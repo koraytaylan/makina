@@ -5,6 +5,7 @@ use makina_core::merge::{LandingEvidenceStatus, MergeOutcome, SquashMerger, Task
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(repo)
         .output()
@@ -35,6 +36,7 @@ fn repo(format: &str) -> Option<tempfile::TempDir> {
     }
     git(repo.path(), &["config", "user.email", "test@example.com"]);
     git(repo.path(), &["config", "user.name", "Test"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "base"]);

@@ -3157,6 +3157,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str], cwd: &Path| {
             let output = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -3172,6 +3173,7 @@ mod tests {
         git(&["init", "-b", "develop"], repo.path());
         git(&["config", "user.email", "test@example.com"], repo.path());
         git(&["config", "user.name", "Test"], repo.path());
+        git(&["config", "commit.gpgsign", "false"], repo.path());
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
         std::fs::write(repo.path().join("src/base.rs"), "base\n").unwrap();
         git(&["add", "."], repo.path());

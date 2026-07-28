@@ -39,6 +39,7 @@ fn copy_tree(source: &Path, destination: &Path) {
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(root)
         .output()
