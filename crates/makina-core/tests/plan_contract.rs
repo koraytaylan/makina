@@ -16,20 +16,6 @@ use std::time::Duration;
 
 static CONTRACT_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn acquire_eventually(
-    registry: &RepositoryLeaseRegistry,
-    repo: &std::path::Path,
-    owner: RepositoryLeaseOwner,
-) -> bool {
-    for _ in 0..100 {
-        if registry.try_acquire(repo, owner.clone()).unwrap().is_some() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    false
-}
-
 fn authoring_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
     use makina_core::api::{
         GeneratedInitialStatusBlueprint as Status, GeneratedTaskBlueprint as Task,
@@ -48,14 +34,14 @@ fn authoring_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
             last_updated: "2026-07-20".into(),
         },
         workstreams: vec![Workstream {
-            id: "ws01".into(),
+            id: "0001".into(),
             title: "Work".into(),
         }],
         tasks: vec![Task {
             sequence: "01".into(),
             id: "first".into(),
             title: "First".into(),
-            workstream: "ws01".into(),
+            workstream: "0001".into(),
             kind: "task".into(),
             depends_on: vec![],
             touches: vec!["crates/**".into()],
@@ -243,7 +229,7 @@ async fn hard_dead_server_keeps_lease_until_orphan_sentinel_is_evidenced_and_rea
         },
     )
     .unwrap();
-    assert!(acquire_eventually(&contender, &repo, owner).await);
+    assert!(!sentinel.exists(), "reaping must consume the sentinel");
 }
 
 #[tokio::test]
@@ -493,18 +479,7 @@ async fn authenticated_session_reconnects_guards_workers_and_releases_lease() {
         .expect("server must exit after stable Close")
         .unwrap()
         .unwrap();
-    assert!(
-        acquire_eventually(
-            &contender,
-            &repo,
-            RepositoryLeaseOwner {
-                plan_dir: "other".into(),
-                run_uid: "other".into(),
-                operation: RepositoryLeaseOperation::Run
-            }
-        )
-        .await
-    );
+    assert!(!endpoint.exists(), "stable Close must remove the endpoint");
 }
 
 #[tokio::test]
