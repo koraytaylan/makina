@@ -1201,8 +1201,7 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         let global_path = dirs::home_dir().map(|h| h.join(".makina").join("config.toml"));
         if let Some(ref global_path) = global_path
             && let Ok(existing) = tokio::fs::read_to_string(global_path).await
-        {
-            if let Ok(mut global) = toml::from_str::<makina_core::config::GlobalConfig>(&existing)
+            && let Ok(mut global) = toml::from_str::<makina_core::config::GlobalConfig>(&existing)
                 .or_else(|_| Ok::<_, ()>(makina_core::config::GlobalConfig::default()))
             {
                 if let Some(model) = resolve(&settings.developer_model) {
@@ -1233,7 +1232,6 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
                     let _ = tokio::fs::write(global_path, toml_str).await;
                 }
             }
-        }
     }
 
     let status = match app

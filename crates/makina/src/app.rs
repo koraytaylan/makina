@@ -2518,14 +2518,10 @@ impl App {
             }
             _ => {}
         }
-        // Cross focus to the main pane when Enter opened a content tab, so the
-        // user immediately sees the detail view rather than having the focus
-        // silently stay on the sidebar (which made Enter feel like a no-op on
-        // plans/tasks even though the tab opened). Matches the Right-arrow
-        // crossing behavior in `FocusRightOrExpand`.
-        if opened_tab {
-            self.focused_panel = Panel::Main;
-        }
+        // Keep focus in the sidebar when Enter opened a content tab. The tab
+        // opens in the main pane but the user's focus stays where they are so
+        // they can continue navigating the tree. Press Tab or Right to cross
+        // to the main pane explicitly.
     }
 
     /// Build a new [`App`] with the given api, initial run list, and repo root.
@@ -13723,10 +13719,9 @@ mod tests {
     /// while focus stayed on the sidebar). Folders keep focus on the sidebar
     /// because they only expand/collapse.
     #[test]
-    fn enter_on_plan_crosses_focus_to_main() {
+    fn enter_on_plan_keeps_focus_in_sidebar() {
         let mut app = make_app();
 
-        // Set up a folder with a plan that has a task.
         app.opened_folders
             .push(std::path::PathBuf::from("/test/folder"));
         let plan_entry = test_plan_entry(
@@ -13747,7 +13742,6 @@ mod tests {
         app.collapsed_folders.clear();
 
         // --- Folder: Enter toggles expansion, focus stays on Sidebar ---
-        // Start with the folder collapsed so Enter expands it.
         app.collapsed_folders.insert(0);
         let folder_idx = app
             .visible_tree_nodes()
@@ -13764,10 +13758,10 @@ mod tests {
         assert_eq!(
             app.focused_panel,
             Panel::Sidebar,
-            "Enter on a Folder must keep focus on the sidebar (it only expands/collapses)"
+            "Enter on a Folder must keep focus on the sidebar"
         );
 
-        // --- Plan: Enter opens the plan tab and crosses focus to Main ---
+        // --- Plan: Enter opens the plan tab but focus stays in Sidebar ---
         let plan_idx = app
             .visible_tree_nodes()
             .iter()
@@ -13791,11 +13785,11 @@ mod tests {
         );
         assert_eq!(
             app.focused_panel,
-            Panel::Main,
-            "Enter on a plan must cross focus to the main pane so the user sees the detail tab"
+            Panel::Sidebar,
+            "Enter on a plan must keep focus in the sidebar — Tab/Right crosses to Main"
         );
 
-        // --- Task: Enter opens the task tab and crosses focus to Main ---
+        // --- Task: Enter opens the task tab but focus stays in Sidebar ---
         let task_idx = app
             .visible_tree_nodes()
             .iter()
@@ -13820,8 +13814,8 @@ mod tests {
         );
         assert_eq!(
             app.focused_panel,
-            Panel::Main,
-            "Enter on a task must cross focus to the main pane so the user sees the detail tab"
+            Panel::Sidebar,
+            "Enter on a task must keep focus in the sidebar — Tab/Right crosses to Main"
         );
     }
 
