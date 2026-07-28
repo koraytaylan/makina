@@ -263,7 +263,7 @@ fn trial_config() -> Config {
     )
     .expect("trial global config must parse");
 
-    let config = Config::resolve(global, project);
+    let mut config = Config::resolve(global, project);
     config.validate().expect("trial config must validate");
     config
 }
@@ -496,6 +496,10 @@ fn log_event(ev: &Event) {
             )
         }
         Event::RunOpened { run, .. } => eprintln!("  · RunOpened {run}"),
+        Event::RunProgress { run, phase } => eprintln!("  · RunProgress {run}: {phase}"),
+        Event::RunCommand { run, command, .. } => {
+            eprintln!("  · RunCommand {run}: {command}")
+        }
         Event::RunStatusChanged { run, status } => {
             eprintln!("  · RunStatusChanged {run} → {status:?}")
         }

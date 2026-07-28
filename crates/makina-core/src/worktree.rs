@@ -181,8 +181,7 @@ pub struct WorktreeManager {
     /// Optional callback fired before each git command, carrying the command
     /// string and working dir. Set by the supervisor so the TUI can display a
     /// live execution log. Cloned (Arc) so it survives `with_fork_branch` etc.
-    #[allow(clippy::type_complexity)]
-    command_sink: Option<Arc<dyn Fn(&str, &std::path::Path) + Send + Sync>>,
+    command_sink: Option<CommandSink>,
 
     /// Serializes worktree-lifecycle git operations ([`create`](Self::create) /
     /// [`remove`](Self::remove)) across concurrent drivers running against the
@@ -204,6 +203,8 @@ pub struct WorktreeManager {
     /// dev/review work, so it does not serialize the tasks themselves.
     op_lock: Arc<Mutex<()>>,
 }
+
+type CommandSink = Arc<dyn Fn(&str, &std::path::Path) + Send + Sync>;
 
 impl WorktreeManager {
     /// Create immutable recovery refs for every active plan/task ref. Existing
@@ -362,10 +363,7 @@ impl WorktreeManager {
     /// Set a callback that fires before each git command, carrying the command
     /// string and working dir. Used by the supervisor to emit `RunCommand`
     /// events so the TUI can display a live execution log.
-    pub fn with_command_sink(
-        mut self,
-        sink: Arc<dyn Fn(&str, &std::path::Path) + Send + Sync>,
-    ) -> Self {
+    pub fn with_command_sink(mut self, sink: CommandSink) -> Self {
         self.command_sink = Some(sink);
         self
     }
@@ -1240,10 +1238,6 @@ fn is_not_found_stderr(stderr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Use the process-global HOME_ENV_LOCK from lib.rs so all test modules
-    // serialize HOME mutations across crate boundaries.
-    use crate::HOME_ENV_LOCK;
 
     // ── validate_task_id ──────────────────────────────────────────────────────
 

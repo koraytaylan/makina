@@ -1666,7 +1666,7 @@ mod tests {
         .expect("valid");
         let project = ProjectConfig::from_toml_str("", "p").expect("empty project TOML is valid");
 
-        let mut config = Config::resolve(global, project);
+        let config = Config::resolve(global, project);
         assert_eq!(
             config.base_branch, "develop",
             "empty project base_branch should fall back to 'develop'"
@@ -2092,7 +2092,7 @@ mod tests {
         let global = GlobalConfig::default();
         let project = ProjectConfig::default();
 
-        let mut config = Config::resolve(global, project);
+        let config = Config::resolve(global, project);
 
         assert_eq!(
             config.merge.final_,
@@ -2217,7 +2217,7 @@ mod tests {
         )
         .expect("project TOML is valid");
 
-        let mut config = Config::resolve(global, project);
+        let config = Config::resolve(global, project);
 
         assert_eq!(
             config.merge.final_,
@@ -2286,7 +2286,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut config = Config::resolve(global, project);
+        let config = Config::resolve(global, project);
         assert_eq!(
             config.roles.developer.as_ref().unwrap().model.as_deref(),
             Some("my-model"),

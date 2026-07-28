@@ -1161,7 +1161,7 @@ fn spawn_plan_authoring(
                     question: String,
                 },
                 Plan {
-                    blueprint: makina_core::api::GeneratedPlanBlueprint,
+                    blueprint: Box<makina_core::api::GeneratedPlanBlueprint>,
                 },
             }
             let json = answer
@@ -1186,7 +1186,7 @@ fn spawn_plan_authoring(
                     let _ = background_tx
                         .send(AppEvent::GeneratePlanBundle {
                             project_root,
-                            blueprint,
+                            blueprint: *blueprint,
                         })
                         .await;
                     break;
@@ -1386,37 +1386,35 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         let global_path = dirs::home_dir().map(|h| h.join(".makina").join("config.toml"));
         if let Some(ref global_path) = global_path
             && let Ok(existing) = tokio::fs::read_to_string(global_path).await
-        {
-            if let Ok(mut global) = toml::from_str::<makina_core::config::GlobalConfig>(&existing)
+            && let Ok(mut global) = toml::from_str::<makina_core::config::GlobalConfig>(&existing)
                 .or_else(|_| Ok::<_, ()>(makina_core::config::GlobalConfig::default()))
+        {
+            if let Some(model) = resolve(&settings.developer_model) {
+                global
+                    .roles
+                    .developer
+                    .get_or_insert_with(Default::default)
+                    .model = Some(model);
+            }
+            if let Some(model) = resolve(&settings.reviewer_model) {
+                global
+                    .roles
+                    .reviewer
+                    .get_or_insert_with(Default::default)
+                    .model = Some(model);
+            }
+            if let Some(model) = resolve(&settings.planner_model) {
+                global
+                    .roles
+                    .planner
+                    .get_or_insert_with(Default::default)
+                    .model = Some(model);
+            }
+            if let Ok(toml_str) = toml::to_string_pretty(&global)
+                && let Some(parent) = global_path.parent()
+                && tokio::fs::create_dir_all(parent).await.is_ok()
             {
-                if let Some(model) = resolve(&settings.developer_model) {
-                    global
-                        .roles
-                        .developer
-                        .get_or_insert_with(Default::default)
-                        .model = Some(model);
-                }
-                if let Some(model) = resolve(&settings.reviewer_model) {
-                    global
-                        .roles
-                        .reviewer
-                        .get_or_insert_with(Default::default)
-                        .model = Some(model);
-                }
-                if let Some(model) = resolve(&settings.planner_model) {
-                    global
-                        .roles
-                        .planner
-                        .get_or_insert_with(Default::default)
-                        .model = Some(model);
-                }
-                if let Ok(toml_str) = toml::to_string_pretty(&global)
-                    && let Some(parent) = global_path.parent()
-                    && tokio::fs::create_dir_all(parent).await.is_ok()
-                {
-                    let _ = tokio::fs::write(global_path, toml_str).await;
-                }
+                let _ = tokio::fs::write(global_path, toml_str).await;
             }
         }
     }

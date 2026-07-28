@@ -452,11 +452,3 @@ fn copy_tree(source: &Path, destination: &Path) {
         }
     }
 }
-
-fn restore_home(old: Option<std::ffi::OsString>) {
-    if let Some(value) = old {
-        unsafe { std::env::set_var("HOME", value) }
-    } else {
-        unsafe { std::env::remove_var("HOME") }
-    }
-}

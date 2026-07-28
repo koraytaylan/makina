@@ -5739,11 +5739,11 @@ impl App {
                         self.run_progress
                             .insert(*run, format!("agent tool: {title}"));
                     }
-                    makina_core::api::ExchangeEvent::ToolCallUpdate { title, .. } => {
-                        if let Some(title) = title {
-                            self.run_progress
-                                .insert(*run, format!("agent tool: {title}"));
-                        }
+                    makina_core::api::ExchangeEvent::ToolCallUpdate {
+                        title: Some(title), ..
+                    } => {
+                        self.run_progress
+                            .insert(*run, format!("agent tool: {title}"));
                     }
                     _ => {}
                 }

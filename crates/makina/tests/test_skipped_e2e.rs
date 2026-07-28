@@ -17,7 +17,6 @@ use makina_core::orchestrator::CoreApi;
 use makina_core::plan::PlanKey;
 use makina_core::repository_lease::RepositoryLeaseRegistry;
 use makina_core::worktree::WorktreeManager;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -84,13 +83,13 @@ async fn todo_plan_first_run_no_skipped_tasks() {
     }
 
     // ── Step 4: Start the run (model check is at the TUI layer, not the API) ─
-    let outcome = api
+    let _outcome = api
         .execute(Command::StartRun { run })
         .await
         .expect("StartRun must succeed at API level");
 
     // Poll until the run reaches a terminal state.
-    for i in 0..30 {
+    for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let view = api.run(run).await.expect("run must exist");
         if matches!(view.status, RunStatus::Completed | RunStatus::Failed) {
@@ -176,7 +175,7 @@ async fn todo_plan_first_run_no_skipped_tasks() {
 async fn tui_logs_pane_shows_failure_reason_for_failed_task() {
     use makina::app::{App, AppEvent, OutputTab, Panel};
     use makina_core::api::{
-        Api, ApiError, Command, CommandOutcome, Event, EventStream, FailureKind, FailureReason,
+        Api, ApiError, Command, CommandOutcome, EventStream, FailureKind, FailureReason,
         RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
     };
     use ratatui::Terminal;
@@ -220,7 +219,6 @@ async fn tui_logs_pane_shows_failure_reason_for_failed_task() {
             })
         }
         fn subscribe(&self) -> EventStream {
-            let (_, rx) = tokio::sync::broadcast::channel::<Event>(1);
             Box::pin(futures::stream::iter(Vec::new()))
         }
     }
