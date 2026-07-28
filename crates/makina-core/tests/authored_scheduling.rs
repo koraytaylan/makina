@@ -230,6 +230,7 @@ fn nul_name_status_parser_retains_both_rename_and_copy_paths() {
 
 fn git(repo: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(repo)
         .output()
