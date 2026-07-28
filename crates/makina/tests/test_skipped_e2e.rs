@@ -175,8 +175,8 @@ async fn todo_plan_first_run_no_skipped_tasks() {
 async fn tui_logs_pane_shows_failure_reason_for_failed_task() {
     use makina::app::{App, AppEvent, OutputTab, Panel};
     use makina_core::api::{
-        Api, ApiError, Command, CommandOutcome, EventStream, FailureKind, FailureReason,
-        RunId, RunStatus, RunView, TaskId, TaskState, TaskView,
+        Api, ApiError, Command, CommandOutcome, EventStream, FailureKind, FailureReason, RunId,
+        RunStatus, RunView, TaskId, TaskState, TaskView,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
