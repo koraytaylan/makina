@@ -18,6 +18,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Poison global git config (hermeticity canary)
         run: |
+          git config --global user.name "Makina CI"
+          git config --global user.email "ci@example.invalid"
           git config --global commit.gpgsign true
           git config --global init.defaultBranch main
       - run: cargo fmt --check
