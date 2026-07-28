@@ -1103,9 +1103,6 @@ pub fn render(app: &App, frame: &mut Frame) {
     let content_area = main_split[0];
     let error_area = main_split[1];
 
-    let content_area = main_split[0];
-    let error_area = main_split[1];
-
     // Content precedence: an active plan tab is rendered via
     // render_plan_accordion_pane; an active task detail tab (live or preview) is
     // rendered via the task-entry pane; otherwise the selected run's view;

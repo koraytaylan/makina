@@ -11,8 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use makina_core::api::{AgentRole, Api, Event, RunId, RunView, TaskId};
-#[cfg(test)]
-use makina_core::config::RoleAssignment;
 use makina_core::config::{FinalMerge, ProviderConfig, RolesConfig};
 use ratatui::layout::Rect;
 
