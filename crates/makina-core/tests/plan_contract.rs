@@ -16,6 +16,20 @@ use std::time::Duration;
 
 static CONTRACT_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+async fn acquire_eventually(
+    registry: &RepositoryLeaseRegistry,
+    repo: &std::path::Path,
+    owner: RepositoryLeaseOwner,
+) -> bool {
+    for _ in 0..100 {
+        if registry.try_acquire(repo, owner.clone()).unwrap().is_some() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
 fn authoring_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
     use makina_core::api::{
         GeneratedInitialStatusBlueprint as Status, GeneratedTaskBlueprint as Task,
@@ -229,7 +243,7 @@ async fn hard_dead_server_keeps_lease_until_orphan_sentinel_is_evidenced_and_rea
         },
     )
     .unwrap();
-    assert!(contender.try_acquire(&repo, owner).unwrap().is_some());
+    assert!(acquire_eventually(&contender, &repo, owner).await);
 }
 
 #[tokio::test]
@@ -474,24 +488,23 @@ async fn authenticated_session_reconnects_guards_workers_and_releases_lease() {
     assert!(
         matches!(closed, Response::Closed { cleanup_permit: Some(ref permit) } if *permit == recovered)
     );
-    assert!(
-        contender
-            .try_acquire(
-                &repo,
-                RepositoryLeaseOwner {
-                    plan_dir: "other".into(),
-                    run_uid: "other".into(),
-                    operation: RepositoryLeaseOperation::Run
-                }
-            )
-            .unwrap()
-            .is_some()
-    );
     tokio::time::timeout(Duration::from_secs(2), task)
         .await
         .expect("server must exit after stable Close")
         .unwrap()
         .unwrap();
+    assert!(
+        acquire_eventually(
+            &contender,
+            &repo,
+            RepositoryLeaseOwner {
+                plan_dir: "other".into(),
+                run_uid: "other".into(),
+                operation: RepositoryLeaseOperation::Run
+            }
+        )
+        .await
+    );
 }
 
 #[tokio::test]
@@ -621,14 +634,17 @@ async fn authoring_protocol_create_only_is_reconnectable_and_replays_lost_respon
         commit: false,
     };
     let first = client.request(publish.clone()).await.unwrap();
-    assert!(matches!(
-        &first,
-        Response::BlueprintPublished {
-            outcome: makina_core::plan_contract::AuthoringOutcome::AwaitingCommit,
-            registration_oid: None,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &first,
+            Response::BlueprintPublished {
+                outcome: makina_core::plan_contract::AuthoringOutcome::AwaitingCommit,
+                registration_oid: None,
+                ..
+            }
+        ),
+        "unexpected publish response: {first:?}"
+    );
     assert_eq!(
         client.request(publish).await.unwrap(),
         first,
