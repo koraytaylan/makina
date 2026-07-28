@@ -4136,6 +4136,36 @@ impl AuthoringCoordinator {
         expected_base_oid: String,
         expected_source_digest: String,
     ) -> Result<CommandOutcome, ApiError> {
+        self.publish_committed_inner(key, expected_base_oid, expected_source_digest, None)
+            .await
+    }
+
+    /// Publish a committed plan while pinning the registration commit to a
+    /// caller-validated Git author and committer identity.
+    pub async fn publish_committed_with_identity(
+        &self,
+        key: crate::plan::PlanKey,
+        expected_base_oid: String,
+        expected_source_digest: String,
+        name: &str,
+        email: &str,
+    ) -> Result<CommandOutcome, ApiError> {
+        self.publish_committed_inner(
+            key,
+            expected_base_oid,
+            expected_source_digest,
+            Some((name, email)),
+        )
+        .await
+    }
+
+    async fn publish_committed_inner(
+        &self,
+        key: crate::plan::PlanKey,
+        expected_base_oid: String,
+        expected_source_digest: String,
+        commit_identity: Option<(&str, &str)>,
+    ) -> Result<CommandOutcome, ApiError> {
         use crate::plan::{
             FilesystemPlanFileSource, GitTreePlanFileSource, PlanCandidate, PlanFileSource,
             PlanReservations, load_plan,
@@ -4170,6 +4200,34 @@ impl AuthoringCoordinator {
                 return Err(invalid(String::from_utf8_lossy(&output.stderr).trim()));
             }
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
+        async fn git_commit(
+            root: &Path,
+            message: &str,
+            identity: Option<(&str, &str)>,
+        ) -> Result<(), ApiError> {
+            let mut command = tokio::process::Command::new("git");
+            command
+                .arg("-C")
+                .arg(root)
+                .args(["commit", "-m", message])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            if let Some((name, email)) = identity {
+                command
+                    .env("GIT_AUTHOR_NAME", name)
+                    .env("GIT_AUTHOR_EMAIL", email)
+                    .env("GIT_COMMITTER_NAME", name)
+                    .env("GIT_COMMITTER_EMAIL", email);
+            }
+            let output = command
+                .output()
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if !output.status.success() {
+                return Err(invalid(String::from_utf8_lossy(&output.stderr).trim()));
+            }
+            Ok(())
         }
         fn exact(message: &str, name: &str) -> Option<String> {
             let prefix = format!("{name}: ");
@@ -4412,7 +4470,7 @@ impl AuthoringCoordinator {
             "chore(plan): register {plan_identity}\n\nMakina-Phase: plan-registration\nMakina-Plan: {plan_identity}\nMakina-Source-Digest: {}\nMakina-Executable-Digest: {}\nMakina-Validation-Base: {expected_base_oid}\nMakina-Source-Origin: {source_origin}{previous}",
             registered.source_digest, registered.executable_digest
         );
-        git(&workspace.path, &["commit", "-m", &message]).await?;
+        git_commit(&workspace.path, &message, commit_identity).await?;
         let candidate = git(&workspace.path, &["rev-parse", "HEAD"]).await?;
         if let Some(old) = refresh_old {
             self.worktree_manager
