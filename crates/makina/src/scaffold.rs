@@ -156,6 +156,9 @@ const TODO_PLAN_DIRS: &[&str] = &[
     "docs/plans/0003-todo-integration",
 ];
 
+const EMPTY_PROJECT_COMMIT: &str = "chore: initialize Makina project";
+const TODO_PROJECT_COMMIT: &str = "chore: scaffold todo project";
+
 /// Run a git command in the given directory.
 fn run_git(dir: &Path, args: &[&str]) -> Result<(), String> {
     let out = Command::new("git")
@@ -188,6 +191,29 @@ fn git_output(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn commit_as(
+    dir: &Path,
+    message: &str,
+    identity: &crate::folder_init::GitIdentity,
+) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_NAME", &identity.name)
+        .env("GIT_AUTHOR_EMAIL", &identity.email)
+        .env("GIT_COMMITTER_NAME", &identity.name)
+        .env("GIT_COMMITTER_EMAIL", &identity.email)
+        .current_dir(dir)
+        .output()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 fn create_file(path: &Path, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -202,9 +228,17 @@ fn create_file(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-/// Bootstrap a brand-new, immediately-runnable project at `target` from `template`.
-pub async fn scaffold_project(target: &Path, template: &str) -> Result<ScaffoldReport, String> {
+/// Bootstrap a brand-new project, optionally adding an explicit template.
+pub async fn create_project(
+    target: &Path,
+    template: Option<&str>,
+) -> Result<ScaffoldReport, String> {
     scaffold_project_inner(target, template, false, false).await
+}
+
+/// Bootstrap a brand-new, immediately-runnable project from an explicit template.
+pub async fn scaffold_project(target: &Path, template: &str) -> Result<ScaffoldReport, String> {
+    create_project(target, Some(template)).await
 }
 
 #[cfg(feature = "test-util")]
@@ -215,7 +249,7 @@ pub async fn scaffold_project_with_test_hooks(
 ) -> Result<ScaffoldReport, String> {
     scaffold_project_inner(
         target,
-        template,
+        Some(template),
         hooks.fail_before_initial_commit,
         hooks.lose_registration_response,
     )
@@ -224,11 +258,13 @@ pub async fn scaffold_project_with_test_hooks(
 
 async fn scaffold_project_inner(
     target: &Path,
-    template: &str,
+    template: Option<&str>,
     fail_before_initial_commit: bool,
     lose_registration_response: bool,
 ) -> Result<ScaffoldReport, String> {
-    if !AVAILABLE_TEMPLATES.contains(&template) {
+    if let Some(template) = template
+        && !AVAILABLE_TEMPLATES.contains(&template)
+    {
         return Err(format!(
             "unknown template '{template}'; available: {}",
             AVAILABLE_TEMPLATES.join(", ")
@@ -251,17 +287,25 @@ async fn scaffold_project_inner(
             ));
         }
     }
+    let identity = crate::folder_init::global_git_identity()?;
     let owned_destination = !target.exists();
     std::fs::create_dir_all(target)
         .map_err(|e| format!("failed to create {}: {e}", target.display()))?;
     let result = scaffold_owned(
         target,
+        template,
+        &identity,
         fail_before_initial_commit,
         lose_registration_response,
     )
     .await;
+    let published_subject = if template.is_some() {
+        TODO_PROJECT_COMMIT
+    } else {
+        EMPTY_PROJECT_COMMIT
+    };
     let published = git_output(target, &["log", "-1", "--format=%s", "develop"])
-        .is_ok_and(|subject| subject == "chore: scaffold todo project");
+        .is_ok_and(|subject| subject == published_subject);
     if result.is_err() && owned_destination && !published {
         let _ = std::fs::remove_dir_all(target);
     }
@@ -270,45 +314,58 @@ async fn scaffold_project_inner(
 
 async fn scaffold_owned(
     target: &Path,
+    template: Option<&str>,
+    identity: &crate::folder_init::GitIdentity,
     fail_before_initial_commit: bool,
     lose_registration_response: bool,
 ) -> Result<ScaffoldReport, String> {
     // Reuse the shipped bootstrap: git init, main+develop, docs/plans/README.md,
-    // and the commit.gpgsign=false shield + repo-local identity.
-    crate::folder_init::initialize_folder(target)?;
+    // and the commit.gpgsign=false shield.
+    crate::folder_init::initialize_folder_with_identity(target, Some(identity))?;
     // Put initial content on the base branch Makina drives.
     run_git(target, &["checkout", "develop"])?;
-    let template_base_oid = git_output(target, &["rev-parse", "develop"])?;
-    let template_base_short_oid = git_output(target, &["rev-parse", "--short", "develop"])?;
-    let mut created = vec![target.join("docs/plans/README.md")];
-    for (dest, contents) in TODO_FILES {
-        let path = target.join(dest);
-        let contents = contents
-            .replace("{{BASE_OID}}", &template_base_oid)
-            .replace("{{BASE_SHORT_OID}}", &template_base_short_oid);
-        create_file(&path, &contents)?;
-        created.push(path);
+    let mut created = vec![
+        target.join("docs/plans/README.md"),
+        target.join(".makina/.gitignore"),
+    ];
+    if template == Some("todo") {
+        let template_base_oid = git_output(target, &["rev-parse", "develop"])?;
+        let template_base_short_oid = git_output(target, &["rev-parse", "--short", "develop"])?;
+        for (dest, contents) in TODO_FILES {
+            let path = target.join(dest);
+            let contents = contents
+                .replace("{{BASE_OID}}", &template_base_oid)
+                .replace("{{BASE_SHORT_OID}}", &template_base_short_oid);
+            create_file(&path, &contents)?;
+            created.push(path);
+        }
     }
     if fail_before_initial_commit {
         return Err("injected pre-publication scaffold failure".into());
     }
     run_git(target, &["add", "-A"])?;
-    let out = Command::new("git")
-        .args(["commit", "-m", "chore: scaffold todo project"])
-        .env("GIT_AUTHOR_NAME", "Makina")
-        .env("GIT_AUTHOR_EMAIL", "makina@localhost")
-        .env("GIT_COMMITTER_NAME", "Makina")
-        .env("GIT_COMMITTER_EMAIL", "makina@localhost")
-        .current_dir(target)
-        .output()
-        .map_err(|e| format!("failed to run git: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git commit failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
+    let commit_message = if template.is_some() {
+        TODO_PROJECT_COMMIT
+    } else {
+        EMPTY_PROJECT_COMMIT
+    };
+    commit_as(target, commit_message, identity)?;
     let authored_oid = git_output(target, &["rev-parse", "develop"])?;
+    // Keep only the two repository branches created by folder initialization.
+    // The operator stays on `main`, while Makina owns `develop` as its base.
+    // Both begin at the exact same authored scaffold commit.
+    run_git(target, &["branch", "-f", "main", &authored_oid])?;
+    run_git(target, &["checkout", "main"])?;
+    if template.is_none() {
+        let instructions = format!(
+            "\nNo template was applied; add plans under docs/plans when you are ready.\nmain is checked out at the initialized project commit; develop is ready for Makina.\n\nNext:\n  cd {} && makina\n",
+            target.display()
+        );
+        return Ok(ScaffoldReport {
+            created,
+            instructions,
+        });
+    }
     let coordinator = AuthoringCoordinator::new(
         target.to_path_buf(),
         "develop".into(),
@@ -333,7 +390,13 @@ async fn scaffold_owned(
             }
         };
         let registration = coordinator
-            .publish_committed(key, authored_oid.clone(), plan.source_digest.to_string())
+            .publish_committed_with_identity(
+                key,
+                authored_oid.clone(),
+                plan.source_digest.to_string(),
+                &identity.name,
+                &identity.email,
+            )
             .await
             .map_err(|e| format!("failed to register scaffold plan {plan_dir}: {e}"))?;
         let CommandOutcome::PlanRegistered { registration_oid } = registration else {
@@ -345,10 +408,12 @@ async fn scaffold_owned(
             // The first successful response is deliberately discarded. Recovery
             // repeats the exact request and must observe the already-published R.
             let replay = coordinator
-                .publish_committed(
+                .publish_committed_with_identity(
                     PlanKey::parse(plan_dir).map_err(|e| e.to_string())?,
                     authored_oid.clone(),
                     plan.source_digest.to_string(),
+                    &identity.name,
+                    &identity.email,
                 )
                 .await
                 .map_err(|e| {
@@ -365,10 +430,8 @@ async fn scaffold_owned(
         }
         registration_oids.push(registration_oid);
     }
-    run_git(target, &["branch", "workspace", &authored_oid])?;
-    run_git(target, &["checkout", "workspace"])?;
     let instructions = format!(
-        "\nCreated {} exact registrations ({}) for the develop base.\nThe workspace branch is checked out at the authored scaffold commit; Makina may advance develop safely.\n\nNext:\n  cd {} && makina\n",
+        "\nCreated {} exact registrations ({}) for the develop base.\nmain is checked out at the authored scaffold commit; Makina may advance develop safely.\n\nNext:\n  cd {} && makina\n",
         registration_oids.len(),
         registration_oids.join(", "),
         target.display()

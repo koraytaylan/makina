@@ -61,6 +61,30 @@ fn new_app() -> App {
     App::new(api, vec![], PathBuf::from("/"))
 }
 
+fn configure_test_git_identity(folder: &Path) {
+    for args in [
+        &["init", "--quiet"][..],
+        &["config", "user.name", "Multi Folder Test"][..],
+        &["config", "user.email", "multi-folder@example.invalid"][..],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(folder)
+            .output()
+            .expect("configure test Git identity");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn initialize_test_folder(folder: &Path) {
+    configure_test_git_identity(folder);
+    makina::folder_init::initialize_folder(folder).expect("initialize test folder");
+}
+
 /// Add a minimal, unregistered typed plan under `folder/docs/plans/<slug>/`.
 fn add_plan(folder: &Path, slug: &str) {
     let plan_dir = folder.join("docs").join("plans").join(slug);
@@ -163,6 +187,7 @@ async fn close_folder_via_event(app: &mut App, folder: &Path) {
 /// event — this is what actually calls `folder_init::initialize_folder`
 /// (bootstrapping .git, main/develop branches, docs/plans/README.md).
 async fn initialize_folder_via_event(app: &mut App, folder: &Path) {
+    configure_test_git_identity(folder);
     let (resolved, status) = resolve_io_for_test(
         app,
         AppEvent::InitializeFolderSelected {
@@ -184,7 +209,7 @@ async fn test_open_folder_single() {
     let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
     let folder_a = temp_dir.path().join("folder-a");
     fs::create_dir_all(&folder_a).expect("failed to create folder-a");
-    makina::folder_init::initialize_folder(&folder_a).expect("failed to init folder A");
+    initialize_test_folder(&folder_a);
 
     let workspace_path = temp_dir.path().join("workspace.toml");
     let mut app = new_app();
@@ -221,8 +246,8 @@ async fn test_open_folder_multiple_shows_plans_in_sidebar() {
     fs::create_dir_all(&folder_a).expect("failed to create folder-a");
     fs::create_dir_all(&folder_b).expect("failed to create folder-b");
 
-    makina::folder_init::initialize_folder(&folder_a).expect("failed to init folder A");
-    makina::folder_init::initialize_folder(&folder_b).expect("failed to init folder B");
+    initialize_test_folder(&folder_a);
+    initialize_test_folder(&folder_b);
     add_plan(&folder_a, "0001-plan-a");
     add_plan(&folder_b, "0001-plan-b");
 
@@ -405,8 +430,8 @@ async fn test_close_folder_removes_from_sidebar() {
     fs::create_dir_all(&folder_a).expect("failed to create folder-a");
     fs::create_dir_all(&folder_b).expect("failed to create folder-b");
 
-    makina::folder_init::initialize_folder(&folder_a).expect("failed to init folder A");
-    makina::folder_init::initialize_folder(&folder_b).expect("failed to init folder B");
+    initialize_test_folder(&folder_a);
+    initialize_test_folder(&folder_b);
 
     let workspace_path = temp_dir.path().join("workspace.toml");
     let mut app = new_app();
@@ -498,8 +523,8 @@ async fn test_app_restart_restores_opened_folders_from_workspace() {
     fs::create_dir_all(&folder_a).expect("failed to create folder-a");
     fs::create_dir_all(&folder_b).expect("failed to create folder-b");
 
-    makina::folder_init::initialize_folder(&folder_a).expect("failed to init folder A");
-    makina::folder_init::initialize_folder(&folder_b).expect("failed to init folder B");
+    initialize_test_folder(&folder_a);
+    initialize_test_folder(&folder_b);
 
     // "Session 1": open both folders through the real event path.
     {
@@ -541,7 +566,7 @@ async fn test_sidebar_tree_three_level_structure() {
     let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
     let folder_a = temp_dir.path().join("folder-a");
     fs::create_dir_all(&folder_a).expect("failed to create folder-a");
-    makina::folder_init::initialize_folder(&folder_a).expect("failed to init folder A");
+    initialize_test_folder(&folder_a);
 
     add_plan(&folder_a, "0001-test-plan");
 
@@ -663,8 +688,8 @@ async fn test_multi_folder_complete_workflow() {
 
     // Step 1: Initialize folder A and B ahead of time (as if from a previous
     // session), then bring up the App and point it at a fresh workspace file.
-    makina::folder_init::initialize_folder(&folder_a).expect("failed to init folder A");
-    makina::folder_init::initialize_folder(&folder_b).expect("failed to init folder B");
+    initialize_test_folder(&folder_a);
+    initialize_test_folder(&folder_b);
     add_plan(&folder_a, "0001-plan-a");
     add_plan(&folder_b, "0001-plan-b");
 

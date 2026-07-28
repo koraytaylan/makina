@@ -174,10 +174,10 @@ makina create ~/tmp/todo --template todo   # scaffold a runnable project
 cd ~/tmp/todo && makina                     # open it in the TUI
 ```
 
-`makina create <path> [--template <name>]` bootstraps a git repo, a committed
-and registered starter plan on `develop`, and a checked-out `workspace` branch
-at the same commit. Keeping `develop` unchecked out lets Makina finalize it
-safely. The only template today is `todo`.
+`makina create <path>` bootstraps an empty Makina git repo with no sample code
+or plans. Pass `--template todo` explicitly to add the runnable todo project
+and its committed, registered starter plans. Both forms leave `main` checked
+out, with `develop` at the same scaffold commit and available for Makina.
 
 ## Run
 

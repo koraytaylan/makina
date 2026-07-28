@@ -19,10 +19,32 @@ use makina_core::repository_lease::RepositoryLeaseRegistry;
 use makina_core::worktree::WorktreeManager;
 use std::sync::Arc;
 
+struct RestoreEnv(Option<std::ffi::OsString>);
+
+impl Drop for RestoreEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match self.0.take() {
+                Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn todo_plan_first_run_no_skipped_tasks() {
     // ── Step 1: Create a fresh todo project (same as `makina create`) ──────
     let tmp = tempfile::tempdir().expect("tempdir");
+    let global_config = tmp.path().join("gitconfig");
+    std::fs::write(
+        &global_config,
+        "[user]\n\tname = Skipped E2E Test\n\temail = skipped-e2e@example.invalid\n",
+    )
+    .expect("write test global Git identity");
+    let prior = std::env::var_os("GIT_CONFIG_GLOBAL");
+    unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global_config) };
+    let _restore_global = RestoreEnv(prior);
     let target = tmp.path().join("todo");
     makina::scaffold::scaffold_project(&target, "todo")
         .await

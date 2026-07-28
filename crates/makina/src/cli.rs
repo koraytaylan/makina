@@ -11,7 +11,10 @@ pub enum CliAction {
     ShowHelp,
     ShowVersion,
     RunDoctor,
-    Create { path: String, template: String },
+    Create {
+        path: String,
+        template: Option<String>,
+    },
     CreateError(String),
     Unknown(String),
 }
@@ -30,13 +33,13 @@ pub fn parse_args(args: &[String]) -> CliAction {
 
 fn parse_create(rest: &[String]) -> CliAction {
     let mut path: Option<String> = None;
-    let mut template = String::from("todo");
+    let mut template: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--template" => match rest.get(i + 1) {
                 Some(t) => {
-                    template = t.clone();
+                    template = Some(t.clone());
                     i += 2;
                 }
                 None => return CliAction::CreateError("--template requires a value".to_string()),
@@ -51,7 +54,9 @@ fn parse_create(rest: &[String]) -> CliAction {
     let Some(path) = path else {
         return CliAction::CreateError("makina create requires a target <path>".to_string());
     };
-    if !AVAILABLE_TEMPLATES.contains(&template.as_str()) {
+    if let Some(template) = template.as_deref()
+        && !AVAILABLE_TEMPLATES.contains(&template)
+    {
         return CliAction::CreateError(format!(
             "unknown template '{template}'; available templates: {}",
             AVAILABLE_TEMPLATES.join(", ")
@@ -78,7 +83,7 @@ pub fn help_text() -> String {
          \n\
          SUBCOMMANDS:\n  \
          create <path> [--template <name>]\n    \
-         Scaffold a new, runnable Makina project at <path> (default template: todo)\n    \
+         Create an empty Makina project; --template adds sample code and plans\n    \
          Available templates: todo\n\
          \n\
          CONFIGURATION:\n  \
@@ -148,12 +153,17 @@ mod tests {
     }
 
     #[test]
+    fn create_help_does_not_claim_a_default_template() {
+        assert!(!help_text().contains("default template"));
+    }
+
+    #[test]
     fn parse_args_handles_create_subcommand() {
         assert_eq!(
             parse_args(&["create".into(), "/tmp/x".into()]),
             CliAction::Create {
                 path: "/tmp/x".into(),
-                template: "todo".into()
+                template: None
             }
         );
         assert_eq!(
@@ -165,7 +175,7 @@ mod tests {
             ]),
             CliAction::Create {
                 path: "/tmp/x".into(),
-                template: "todo".into()
+                template: Some("todo".into())
             }
         );
         match parse_args(&["create".into()]) {

@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 static HOME_LOCK: Mutex<()> = Mutex::const_new(());
+const TEST_GIT_NAME: &str = "Scaffold User";
+const TEST_GIT_EMAIL: &str = "scaffold@example.invalid";
 
 struct RestoreHome(Option<std::ffi::OsString>);
 
@@ -28,12 +30,29 @@ impl Drop for RestoreHome {
 
 fn use_test_home(path: &std::path::Path) -> RestoreHome {
     std::fs::create_dir_all(path).expect("create isolated HOME");
+    std::fs::write(
+        path.join(".gitconfig"),
+        format!("[user]\n\tname = {TEST_GIT_NAME}\n\temail = {TEST_GIT_EMAIL}\n"),
+    )
+    .expect("write isolated global Git identity");
     let prior = std::env::var_os("HOME");
     unsafe { std::env::set_var("HOME", path) };
     RestoreHome(prior)
 }
 
-fn workspace_snapshot(
+fn assert_all_commits_use_test_identity(root: &std::path::Path) {
+    let log = run_git(root, &["log", "--all", "--format=%an%x00%ae%x00%cn%x00%ce"]);
+    let log = String::from_utf8(log.stdout).expect("identity log is UTF-8");
+    assert!(!log.trim().is_empty(), "create must author commits");
+    for identity in log.lines() {
+        assert_eq!(
+            identity.split('\0').collect::<Vec<_>>(),
+            vec![TEST_GIT_NAME, TEST_GIT_EMAIL, TEST_GIT_NAME, TEST_GIT_EMAIL]
+        );
+    }
+}
+
+fn checkout_snapshot(
     root: &std::path::Path,
 ) -> (String, Vec<u8>, Vec<u8>, BTreeMap<String, Vec<u8>>) {
     fn visit(root: &std::path::Path, dir: &std::path::Path, files: &mut BTreeMap<String, Vec<u8>>) {
@@ -79,6 +98,119 @@ fn workspace_snapshot(
     )
 }
 
+#[test]
+fn bare_create_has_no_todo_template_and_uses_global_identity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let global = home.join(".gitconfig");
+    std::fs::write(
+        &global,
+        format!("[user]\n\tname = {TEST_GIT_NAME}\n\temail = {TEST_GIT_EMAIL}\n"),
+    )
+    .unwrap();
+    let target = tmp.path().join("empty");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_makina"))
+        .args(["create", target.to_str().unwrap()])
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Wrong Author")
+        .env("GIT_AUTHOR_EMAIL", "wrong-author@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Wrong Committer")
+        .env("GIT_COMMITTER_EMAIL", "wrong-committer@example.invalid")
+        .output()
+        .expect("run bare create");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(target.join("docs/plans/README.md").is_file());
+    assert!(target.join(".makina/.gitignore").is_file());
+    assert!(!target.join("Cargo.toml").exists());
+    assert!(!target.join("src").exists());
+    assert!(!target.join(".makina/config.toml").exists());
+    assert!(discover_plans(&target).is_empty());
+    let refs = run_git(
+        &target,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/plan"],
+    );
+    assert!(refs.stdout.is_empty());
+    let branches = run_git(&target, &["branch", "--format=%(refname:short)"]);
+    assert_eq!(
+        String::from_utf8_lossy(&branches.stdout),
+        "develop\nmain\n",
+        "bare create must have only main and develop"
+    );
+    let head = run_git(&target, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
+    let main = run_git(&target, &["rev-parse", "main"]);
+    let develop = run_git(&target, &["rev-parse", "develop"]);
+    assert_eq!(
+        main.stdout, develop.stdout,
+        "main and develop must start at the same scaffold commit"
+    );
+    assert_all_commits_use_test_identity(&target);
+}
+
+#[test]
+fn create_requires_global_git_identity_before_creating_target() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let global = tmp.path().join("empty-gitconfig");
+    std::fs::write(&global, "").unwrap();
+    let target = tmp.path().join("absent");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_makina"))
+        .args(["create", target.to_str().unwrap()])
+        .env("HOME", tmp.path())
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Ambient Author")
+        .env("GIT_AUTHOR_EMAIL", "ambient@example.invalid")
+        .output()
+        .expect("run create without global identity");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("global Git identity is not configured"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("user.name") && stderr.contains("user.email"));
+    assert!(!target.exists());
+}
+
+#[test]
+fn todo_registration_commits_use_global_identity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let global = home.join(".gitconfig");
+    std::fs::write(
+        &global,
+        format!("[user]\n\tname = {TEST_GIT_NAME}\n\temail = {TEST_GIT_EMAIL}\n"),
+    )
+    .unwrap();
+    let target = tmp.path().join("todo");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_makina"))
+        .args(["create", target.to_str().unwrap(), "--template", "todo"])
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Wrong Author")
+        .env("GIT_AUTHOR_EMAIL", "wrong-author@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Wrong Committer")
+        .env("GIT_COMMITTER_EMAIL", "wrong-committer@example.invalid")
+        .output()
+        .expect("run todo create");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(discover_plans(&target).len(), 3);
+    assert_all_commits_use_test_identity(&target);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn scaffold_creates_runnable_todo_project() {
     let _lock = HOME_LOCK.lock().await;
@@ -94,9 +226,13 @@ async fn scaffold_creates_runnable_todo_project() {
     let branches = String::from_utf8_lossy(&branches.stdout);
     assert!(branches.contains("main"), "main branch: {branches}");
     assert!(branches.contains("develop"), "develop branch: {branches}");
+    assert!(
+        !branches.lines().any(|branch| branch == "workspace"),
+        "workspace branch must not be created: {branches}"
+    );
 
     let head = run_git(&target, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "workspace");
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
     let log = run_git(&target, &["log", "--oneline", "develop"]);
     assert!(
         String::from_utf8_lossy(&log.stdout).contains("scaffold"),
@@ -162,10 +298,10 @@ async fn scaffold_creates_runnable_todo_project() {
         String::from_utf8_lossy(&develop.stdout).trim(),
         "exact registration R is retained separately from develop"
     );
-    let workspace = run_git(&target, &["rev-parse", "workspace"]);
+    let main = run_git(&target, &["rev-parse", "main"]);
     assert_eq!(
-        workspace.stdout, develop.stdout,
-        "workspace stays at authored commit"
+        main.stdout, develop.stdout,
+        "main and develop start at the authored commit"
     );
 
     assert!(
@@ -258,7 +394,7 @@ async fn scaffold_recovers_registration_response_loss_with_exact_r() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scaffold_sample_runs_claim_a_b_p_f_c_without_touching_workspace() {
+async fn scaffold_sample_runs_claim_a_b_p_f_c_without_touching_main_checkout() {
     let _lock = HOME_LOCK.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let _home = use_test_home(&tmp.path().join("home"));
@@ -266,13 +402,18 @@ async fn scaffold_sample_runs_claim_a_b_p_f_c_without_touching_workspace() {
     makina::scaffold::scaffold_project(&target, "todo")
         .await
         .expect("scaffold");
-    let before = workspace_snapshot(&target);
+    run_git(&target, &["config", "user.name", "Workflow Test"]);
+    run_git(
+        &target,
+        &["config", "user.email", "workflow@example.invalid"],
+    );
+    let before = checkout_snapshot(&target);
     let plan_ref = "refs/heads/plan/0001-todo-core";
     let run = "01AAAAAAAAAAAAAAAAAAAAAAAA";
     // Extend the starter through a separate develop worktree with a fourth,
     // independent task (disjoint footprint `src/list.rs`), then refresh exact
-    // R. The checked-out operator workspace remains pinned to the original
-    // authored commit throughout.
+    // R. The checked-out main branch remains pinned to the original authored
+    // commit throughout.
     let author = tmp.path().join("author");
     run_git(
         &target,
@@ -569,9 +710,9 @@ Implement the list summary independently from task toggling.
     let final_root = String::from_utf8_lossy(&final_root.stdout);
     assert!(final_root.contains("| 0001 | Todo Core (Sequential) | Complete | 4/4 |"));
     assert_eq!(
-        workspace_snapshot(&target),
+        checkout_snapshot(&target),
         before,
-        "workspace HEAD/index/tree unchanged through C"
+        "main HEAD/index/tree unchanged through C"
     );
     let projected = ProjectedTaskGraph::from_document(&final_plan, chrono::Utc::now());
     persist_checkpoint(
@@ -612,10 +753,12 @@ async fn scaffold_refuses_non_empty_directory() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "compiles the scaffolded crate; slow, run explicitly"]
 async fn scaffolded_todo_project_passes_its_own_gates() {
+    let _lock = HOME_LOCK.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = use_test_home(&tmp.path().join("home"));
     let target = tmp.path().join("todo");
     makina::scaffold::scaffold_project(&target, "todo")
         .await

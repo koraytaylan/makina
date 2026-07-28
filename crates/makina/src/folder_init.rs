@@ -3,6 +3,52 @@
 use std::path::Path;
 use std::process::Command;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitIdentity {
+    pub(crate) name: String,
+    pub(crate) email: String,
+}
+
+fn global_git_config_value(key: &str) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .args(["config", "--global", "--includes", "--get", key])
+        .output()
+        .map_err(|error| format!("failed to run git while reading global {key}: {error}"))?;
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return Ok((!value.is_empty()).then_some(value));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(format!(
+        "failed to read global Git {key}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+pub(crate) fn global_git_identity() -> Result<GitIdentity, String> {
+    let name = global_git_config_value("user.name")?;
+    let email = global_git_config_value("user.email")?;
+    let mut missing = Vec::new();
+    if name.is_none() {
+        missing.push("user.name");
+    }
+    if email.is_none() {
+        missing.push("user.email");
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "global Git identity is not configured (missing {}). Configure it before creating a project:\n  git config --global user.name \"Your Name\"\n  git config --global user.email \"you@example.com\"",
+            missing.join(" and ")
+        ));
+    }
+    Ok(GitIdentity {
+        name: name.expect("checked above"),
+        email: email.expect("checked above"),
+    })
+}
+
 /// Initialize a folder for use with Makina.
 ///
 /// On success, the folder will have:
@@ -14,6 +60,13 @@ use std::process::Command;
 /// The function is idempotent: running it twice on an already-initialized folder
 /// succeeds with no further changes.
 pub fn initialize_folder(folder: &Path) -> Result<(), String> {
+    initialize_folder_with_identity(folder, None)
+}
+
+pub(crate) fn initialize_folder_with_identity(
+    folder: &Path,
+    identity: Option<&GitIdentity>,
+) -> Result<(), String> {
     // 1. Ensure a git repository exists.
     if !folder.join(".git").exists() {
         run_git(folder, &["init"])?;
@@ -24,12 +77,6 @@ pub fn initialize_folder(folder: &Path) -> Result<(), String> {
     //    (`git branch`/`checkout -b` need a commit to point at). Bootstrap only
     //    when HEAD is unborn, so re-running on an initialized repo is a no-op.
     if run_git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err() {
-        // Leave a repo-local identity behind when the machine has none configured,
-        // so later commits in this repo (e.g. by agents) don't fail on identity.
-        if run_git(folder, &["config", "user.email"]).is_err() {
-            run_git(folder, &["config", "user.email", "makina@localhost"])?;
-            run_git(folder, &["config", "user.name", "Makina"])?;
-        }
         // Shield this repo (and every worktree spawned from it) against a host
         // with `commit.gpgsign = true` and no signing key configured for
         // automation: engine-spawned commits (this bootstrap commit, and later
@@ -37,20 +84,21 @@ pub fn initialize_folder(folder: &Path) -> Result<(), String> {
         // signing locally rather than relying on ambient config — mirrors the
         // hermetic shield in makina_core::test_support::init_git_repo_with_identity.
         run_git(folder, &["config", "commit.gpgsign", "false"])?;
-        // Pin the bootstrap commit's identity via env (env beats config): the commit
-        // is Makina's, and resolving identity from ambient config here is racy when
-        // the process's HOME changes between the probe above and this commit.
-        let output = Command::new("git")
-            .args([
-                "commit",
-                "--allow-empty",
-                "-m",
-                "chore: initialize repository",
-            ])
-            .env("GIT_AUTHOR_NAME", "Makina")
-            .env("GIT_AUTHOR_EMAIL", "makina@localhost")
-            .env("GIT_COMMITTER_NAME", "Makina")
-            .env("GIT_COMMITTER_EMAIL", "makina@localhost")
+        let mut commit = Command::new("git");
+        commit.args([
+            "commit",
+            "--allow-empty",
+            "-m",
+            "chore: initialize repository",
+        ]);
+        if let Some(identity) = identity {
+            commit
+                .env("GIT_AUTHOR_NAME", &identity.name)
+                .env("GIT_AUTHOR_EMAIL", &identity.email)
+                .env("GIT_COMMITTER_NAME", &identity.name)
+                .env("GIT_COMMITTER_EMAIL", &identity.email);
+        }
+        let output = commit
             .current_dir(folder)
             .output()
             .map_err(|e| format!("failed to run git: {e}"))?;
@@ -124,11 +172,31 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn configure_test_identity(folder: &Path) {
+        for args in [
+            &["init"][..],
+            &["config", "user.name", "Folder Init Test"][..],
+            &["config", "user.email", "folder-init@example.invalid"][..],
+        ] {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(folder)
+                .output()
+                .expect("configure test Git identity");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     fn test_initialize_folder_creates_git_structure() {
         // Create a temporary directory
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let folder = temp_dir.path();
+        configure_test_identity(folder);
 
         // Initialize the folder
         initialize_folder(folder).expect("initialize_folder failed");
@@ -187,6 +255,7 @@ mod tests {
     fn test_initialize_folder_is_idempotent() {
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let folder = temp_dir.path();
+        configure_test_identity(folder);
 
         // Initialize once
         initialize_folder(folder).expect("first initialize_folder failed");
