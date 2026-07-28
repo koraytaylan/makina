@@ -10,7 +10,7 @@
 use makina_core::api::{Api, Command, CommandOutcome, RunStatus, TaskState};
 use makina_core::audit::JsonlAuditSink;
 use makina_core::backend::noop::NoopBackend;
-use makina_core::config::Config;
+use makina_core::config::{Config, GlobalConfig, ProjectConfig};
 use makina_core::dependency::EdgeInferrer;
 use makina_core::interpreter::SourceProjectionUnavailable;
 use makina_core::orchestrator::CoreApi;
@@ -52,9 +52,15 @@ async fn todo_plan_first_run_no_skipped_tasks() {
 
     // ── Step 2: Build a CoreApi with NoopBackend (simulates agent) ──────────
     let backend: Arc<dyn makina_core::backend::AgentBackend> = Arc::new(NoopBackend::new());
-    let config = Config::load_for_repo_with_paths(&target)
-        .0
-        .expect("config must load");
+    let project_config_path = target.join(".makina/config.toml");
+    let project_config = std::fs::read_to_string(&project_config_path)
+        .expect("scaffolded project config must be readable");
+    let project_config =
+        ProjectConfig::from_toml_str(&project_config, &project_config_path.display().to_string())
+            .expect("scaffolded project config must parse");
+    // This test injects NoopBackend directly, so resolving the project settings
+    // must not depend on an operator-installed backend CLI.
+    let config = Config::resolve(GlobalConfig::default(), project_config);
     let worktree_manager = WorktreeManager::new(target.clone(), config.base_branch.clone());
     let audit_sink = Arc::new(JsonlAuditSink::new(target.clone()));
 
