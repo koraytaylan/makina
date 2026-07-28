@@ -46,7 +46,7 @@ fn authoring_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
             depends_on: vec![],
             touches: vec!["crates/**".into()],
             gated: false,
-            body: "Implement it.\n".into(),
+            body: "# First\n\nImplement it.\n".into(),
         }],
     }
 }
