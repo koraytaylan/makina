@@ -122,7 +122,7 @@ async fn open_validates_plan_source_without_creating_a_checkpoint() {
 }
 
 #[tokio::test]
-async fn start_fails_before_running_when_external_state_disappears() {
+async fn start_does_not_depend_on_home_after_open() {
     let _guard = makina_core::HOME_ENV_LOCK.lock().await;
     let (repo, _plan_dir) = fixture_repo();
     let home = tempfile::tempdir().unwrap();
@@ -139,12 +139,10 @@ async fn start_fails_before_running_when_external_state_disappears() {
         panic!()
     };
     unsafe { std::env::remove_var("HOME") };
-    let error = api
-        .execute(Command::StartRun { run })
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("external runtime state"), "{error}");
+    assert!(matches!(
+        api.execute(Command::StartRun { run }).await.unwrap(),
+        CommandOutcome::Acknowledged
+    ));
     restore_home(old);
 }
 
@@ -500,7 +498,7 @@ async fn assert_task_tree_mutation_blocks(mutate: impl FnOnce(&Path)) {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn external_home_symlink_into_repository_blocks_start() {
+async fn home_symlink_into_repository_does_not_affect_in_repo_state() {
     let _guard = makina_core::HOME_ENV_LOCK.lock().await;
     let (repo, _plan_dir) = fixture_repo();
     let links = tempfile::tempdir().unwrap();
@@ -518,22 +516,16 @@ async fn external_home_symlink_into_repository_blocks_start() {
     else {
         panic!()
     };
-    let error = api
-        .execute(Command::StartRun { run })
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("runtime state root")
-            || error.contains("checkpoint location is unavailable"),
-        "{error}"
-    );
+    assert!(matches!(
+        api.execute(Command::StartRun { run }).await.unwrap(),
+        CommandOutcome::Acknowledged
+    ));
     restore_home(old);
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn unwritable_external_root_blocks_before_run_state_mutation() {
+async fn unwritable_home_does_not_block_in_repo_state() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = makina_core::HOME_ENV_LOCK.lock().await;
@@ -554,12 +546,7 @@ async fn unwritable_external_root_blocks_before_run_state_mutation() {
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o500)).unwrap();
     let result = api.execute(Command::StartRun { run }).await;
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("durably writable"), "{error}");
-    assert_eq!(
-        api.run(run).await.unwrap().status,
-        makina_core::api::RunStatus::Pending
-    );
+    assert!(matches!(result.unwrap(), CommandOutcome::Acknowledged));
     restore_home(old);
 }
 
