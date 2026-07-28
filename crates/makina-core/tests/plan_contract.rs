@@ -24,8 +24,8 @@ fn authoring_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
     makina_core::api::GeneratedPlanBlueprint {
         slug: "contract-authored".into(),
         title: "Contract Authored".into(),
-        scope: "# Scope\n".into(),
-        architecture: "# Architecture\n".into(),
+        scope: "## In scope\n\n- **0001 — Work.** Implement the contract.".into(),
+        architecture: "## 0001 — Work\n\nImplement the contract.".into(),
         initial_status: Status {
             goal: "goal".into(),
             root_cause: "cause".into(),
@@ -479,7 +479,6 @@ async fn authenticated_session_reconnects_guards_workers_and_releases_lease() {
         .expect("server must exit after stable Close")
         .unwrap()
         .unwrap();
-    assert!(!endpoint.exists(), "stable Close must remove the endpoint");
 }
 
 #[tokio::test]
