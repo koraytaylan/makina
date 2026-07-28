@@ -4650,19 +4650,57 @@ impl App {
             // ── Settings screen (plan 0070) ───────────────────────────────────────
             AppEvent::OpenSettings => {
                 let project_root = self.context_project_root();
-                let (caps, concurrency, final_merge, error) =
-                    match makina_core::config::Config::load_for_repo_with_paths(&project_root).0 {
-                        Ok(config) => (config.caps, config.concurrency, config.merge.final_, None),
-                        Err(load_error) => (
-                            self.caps.clone(),
-                            self.concurrency,
-                            self.final_merge,
-                            Some(format!(
-                                "Could not load {} settings: {load_error}",
-                                project_root.display()
-                            )),
-                        ),
-                    };
+                let (loaded, paths) =
+                    makina_core::config::Config::load_for_repo_with_paths(&project_root);
+                let (caps, concurrency, final_merge, error) = match loaded {
+                    Ok(config) => (config.caps, config.concurrency, config.merge.final_, None),
+                    Err(load_error) => {
+                        let mut caps = self.caps.clone();
+                        let mut concurrency = self.concurrency;
+                        let mut final_merge = self.final_merge;
+                        let project = paths.project.as_ref().and_then(|path| {
+                            std::fs::read_to_string(path).ok().and_then(|text| {
+                                makina_core::config::ProjectConfig::from_toml_str(
+                                    &text,
+                                    &path.display().to_string(),
+                                )
+                                .ok()
+                            })
+                        });
+                        if let Some(project) = project {
+                            if let Some(overrides) = project.caps {
+                                caps.gate_iterations =
+                                    overrides.gate_iterations.unwrap_or(caps.gate_iterations);
+                                caps.reviewer_iterations = overrides
+                                    .reviewer_iterations
+                                    .unwrap_or(caps.reviewer_iterations);
+                                caps.wall_clock_secs =
+                                    overrides.wall_clock_secs.unwrap_or(caps.wall_clock_secs);
+                                if let Some(idle_secs) = overrides.idle_secs {
+                                    caps.idle_secs = idle_secs;
+                                }
+                            }
+                            concurrency = project.concurrency.unwrap_or(concurrency);
+                            final_merge = project
+                                .merge
+                                .map(|merge| merge.final_)
+                                .unwrap_or(final_merge);
+                            (caps, concurrency, final_merge, None)
+                        } else if paths.project.as_ref().is_some_and(|path| path.exists()) {
+                            (
+                                caps,
+                                concurrency,
+                                final_merge,
+                                Some(format!(
+                                    "Could not load {} settings: {load_error}",
+                                    project_root.display()
+                                )),
+                            )
+                        } else {
+                            (caps, concurrency, final_merge, None)
+                        }
+                    }
+                };
                 // Seed model text buffers from current role assignments.
                 let model_of = |role: &Option<makina_core::config::RoleAssignment>| {
                     role.as_ref()
