@@ -1468,6 +1468,12 @@ pub fn render(app: &App, frame: &mut Frame) {
         render_command_palette(app, p, frame, area);
     }
 
+    if app.is_plan_authoring()
+        && let Some(authoring) = app.plan_authoring.as_ref()
+    {
+        render_plan_authoring(app, authoring, frame, area);
+    }
+
     // ── Settings overlay (plan 0070) ──────────────────────────────────────────────
     // Drawn after command palette so it sits on top when both might be open.
     if app.is_settings()
@@ -4374,6 +4380,70 @@ fn render_command_palette(
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
+}
+
+fn render_plan_authoring(
+    app: &App,
+    authoring: &crate::app::PlanAuthoring,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let popup = centered_rect(76, 76, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Create plan ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Describe what you want to build in {}",
+            authoring.project_root.display()
+        ))
+        .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))),
+        chunks[0],
+    );
+    let conversation = authoring
+        .messages
+        .iter()
+        .map(|message| {
+            Line::from(vec![
+                Span::styled(
+                    if message.from_model {
+                        "Planner: "
+                    } else {
+                        "You: "
+                    },
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&message.text),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(conversation).wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+    let input = if authoring.waiting {
+        "Waiting for planner…".to_owned()
+    } else {
+        format!("> {}▏", authoring.input)
+    };
+    frame.render_widget(
+        Paragraph::new(input).block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+    frame.render_widget(Paragraph::new("Enter submit · Esc cancel"), chunks[3]);
 }
 
 /// Render the settings modal.

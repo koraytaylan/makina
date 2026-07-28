@@ -63,7 +63,7 @@ fn build_project_api(
     repo_root: &std::path::Path,
     config: Config,
     repository_leases: Arc<makina_core::repository_lease::RepositoryLeaseRegistry>,
-) -> (Arc<dyn Api>, Arc<dyn AgentBackend>) {
+) -> (Arc<dyn Api>, Arc<dyn AgentBackend>, Arc<dyn AgentBackend>) {
     let audit_sink = Arc::new(JsonlAuditSink::new(repo_root.to_path_buf()));
 
     let mut provider_backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
@@ -119,6 +119,7 @@ fn build_project_api(
         first_provider_name,
         legacy_backend,
     );
+    let planner_backend_for_app = Arc::clone(&planner_backend);
 
     let ingestion_interpreter: Arc<dyn makina_core::interpreter::TaskListInterpreter> =
         Arc::new(makina_core::dependency::EdgeInferrer::new(Arc::new(
@@ -153,7 +154,7 @@ fn build_project_api(
         audit_sink as Arc<dyn makina_core::audit::AuditRegistry>,
         repository_leases,
     ));
-    (api, developer_backend)
+    (api, developer_backend, planner_backend_for_app)
 }
 
 /// Run the headless `--doctor` preflight check.
@@ -208,7 +209,9 @@ async fn main() {
             std::process::exit(run_headless_doctor());
         }
         makina::cli::CliAction::Create { path, template } => {
-            match makina::scaffold::scaffold_project(std::path::Path::new(&path), &template).await {
+            match makina::scaffold::create_project(std::path::Path::new(&path), template.as_deref())
+                .await
+            {
                 Ok(report) => {
                     println!("{report}");
                     return;
@@ -403,6 +406,7 @@ async fn main() {
     // probing in Settings. Other projects get their own backends via the
     // factory, but the launch project is the one shown in Settings.
     let mut launch_developer_backend: Option<Arc<dyn AgentBackend>> = None;
+    let mut launch_planner_backend: Option<Arc<dyn AgentBackend>> = None;
     let factory: ProjectApiFactory = Arc::new(move |project_root| {
         let (result, _paths) = Config::load_for_repo_with_paths(project_root);
         let project_config = result.map_err(|error| ApiError::InvalidCommand {
@@ -411,7 +415,7 @@ async fn main() {
                 project_root.display()
             ),
         })?;
-        let (api, _dev_backend) = build_project_api(
+        let (api, _dev_backend, _planner_backend) = build_project_api(
             project_root,
             project_config,
             Arc::clone(&repository_leases_for_factory),
@@ -439,9 +443,10 @@ async fn main() {
     // for model probing in Settings. The project_api router holds its own
     // copy; this one is just for the backend reference.
     if let Ok(launch_config) = Config::load_for_repo_with_paths(&repo_root).0 {
-        let (_launch_api, dev_backend) =
+        let (_launch_api, dev_backend, planner_backend) =
             build_project_api(&repo_root, launch_config, repository_leases.clone());
         launch_developer_backend = Some(dev_backend);
+        launch_planner_backend = Some(planner_backend);
     }
 
     // ── Initial state ─────────────────────────────────────────────────────────
@@ -464,6 +469,7 @@ async fn main() {
     );
     app.project_api = Some(project_api);
     app.developer_backend = launch_developer_backend;
+    app.planner_backend = launch_planner_backend;
 
     // Restore theme from GlobalConfig; unknown/absent names fall back to Ayu Dark with no panic.
     let active_theme = makina::theme::Theme::builtin_themes()

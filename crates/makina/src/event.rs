@@ -137,6 +137,7 @@ pub async fn run(
             viewing_doctor: app.is_viewing_doctor(),
             help_mode_active: app.help_mode_active,
             command_palette: app.is_command_palette(),
+            plan_authoring: app.is_plan_authoring(),
             settings: app.is_settings(),
             reset_confirm: app.is_confirming_reset(),
             operation_notice: app.is_operation_notice(),
@@ -597,6 +598,10 @@ async fn resolve_io(
             blueprint,
         } => {
             let label = blueprint.slug.clone();
+            if app.is_plan_authoring() {
+                app.plan_authoring = None;
+                app.mode = crate::app::Mode::Normal;
+            }
             spawn_generate_plan_bundle(
                 std::sync::Arc::clone(&app.api),
                 app.project_api.clone(),
@@ -606,6 +611,67 @@ async fn resolve_io(
                 background_tx.clone(),
             );
             (AppEvent::Tick, Some(format!("Generating {label}…")))
+        }
+        AppEvent::PlanAuthoringSubmit => {
+            let Some(state) = app.plan_authoring.as_mut() else {
+                return (AppEvent::Tick, None);
+            };
+            let text = state.input.trim().to_owned();
+            if text.is_empty() || state.waiting {
+                return (AppEvent::Tick, None);
+            }
+            state.input.clear();
+            state.messages.push(crate::app::PlanAuthoringMessage {
+                from_model: false,
+                text: text.clone(),
+            });
+            state.waiting = true;
+
+            if let Some(tx) = state.answer_tx.as_ref() {
+                if tx.send(text).await.is_err() {
+                    state.waiting = false;
+                    state.answer_tx = None;
+                    return (
+                        AppEvent::Tick,
+                        Some("The planner session ended; submit again to restart".into()),
+                    );
+                }
+                return (AppEvent::Tick, None);
+            }
+
+            let Some(backend) = app.planner_backend.clone() else {
+                state.waiting = false;
+                return (
+                    AppEvent::Tick,
+                    Some(
+                        "No planner backend configured — choose a Planner model in Settings".into(),
+                    ),
+                );
+            };
+            let project_root = state.project_root.clone();
+            let model = app
+                .roles
+                .planner
+                .as_ref()
+                .and_then(|role| role.model.clone());
+            if model.is_none() {
+                state.waiting = false;
+                return (
+                    AppEvent::Tick,
+                    Some("No Planner model selected — choose one in Settings".into()),
+                );
+            }
+            let (answer_tx, answer_rx) = mpsc::channel(8);
+            state.answer_tx = Some(answer_tx);
+            spawn_plan_authoring(
+                backend,
+                project_root,
+                model,
+                text,
+                answer_rx,
+                background_tx.clone(),
+            );
+            (AppEvent::Tick, None)
         }
         AppEvent::StartRun => {
             if let Some(event) = operation_blocked_event(app, "Start run") {
@@ -1017,6 +1083,125 @@ fn spawn_generate_plan_bundle(
                     .await;
             }
         }
+    });
+}
+
+const PLAN_AUTHOR_SYSTEM_PROMPT: &str = r#"You are Makina's plan author. Turn the user's project idea into an implementation plan. Ask a single concise clarification question whenever an important product or technical decision is missing. Respond with JSON only, using exactly one of these shapes:
+{"type":"question","question":"..."}
+{"type":"plan","blueprint":{"slug":"kebab-case","title":"...","scope":"...","architecture":"...","initial_status":{"goal":"...","root_cause":"...","approach":"...","outcome":"","last_updated":"YYYY-MM-DD"},"workstreams":[{"id":"0001","title":"..."}],"tasks":[{"sequence":"01","id":"kebab-case","title":"...","workstream":"0001","kind":"task","depends_on":[],"touches":["path/**"],"gated":false,"body":"..."}]}}
+Do not write files or run commands. The host validates, renders, commits, and registers the blueprint."#;
+
+fn spawn_plan_authoring(
+    backend: std::sync::Arc<dyn makina_core::backend::AgentBackend>,
+    project_root: std::path::PathBuf,
+    model: Option<String>,
+    first_prompt: String,
+    mut answer_rx: mpsc::Receiver<String>,
+    background_tx: mpsc::Sender<AppEvent>,
+) {
+    use makina_core::backend::{Prompt, ResponseEvent, SessionConfig};
+    tokio::spawn(async move {
+        let config = SessionConfig {
+            working_dir: project_root.clone(),
+            system_prompt: PLAN_AUTHOR_SYSTEM_PROMPT.into(),
+            mode: None,
+            model,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: String::new(),
+        };
+        let mut session = match backend.spawn(config).await {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = background_tx
+                    .send(AppEvent::PlanAuthoringFailed {
+                        reason: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let mut prompt = first_prompt;
+        loop {
+            let mut stream = match session.prompt(Prompt::new(prompt)).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = background_tx
+                        .send(AppEvent::PlanAuthoringFailed {
+                            reason: error.to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            };
+            let mut answer = String::new();
+            let mut failed = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(ResponseEvent::TextChunk { text }) => answer.push_str(&text),
+                    Ok(ResponseEvent::TurnComplete { .. }) => {}
+                    Ok(_) => {}
+                    Err(error) => {
+                        failed = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = failed {
+                let _ = background_tx
+                    .send(AppEvent::PlanAuthoringFailed { reason })
+                    .await;
+                break;
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(tag = "type", rename_all = "snake_case")]
+            enum Reply {
+                Question {
+                    question: String,
+                },
+                Plan {
+                    blueprint: makina_core::api::GeneratedPlanBlueprint,
+                },
+            }
+            let json = answer
+                .find('{')
+                .zip(answer.rfind('}'))
+                .and_then(|(start, end)| answer.get(start..=end));
+            match json.and_then(|text| serde_json::from_str::<Reply>(text).ok()) {
+                Some(Reply::Question { question }) => {
+                    if background_tx
+                        .send(AppEvent::PlanAuthoringQuestion { question })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let Some(next) = answer_rx.recv().await else {
+                        break;
+                    };
+                    prompt = next;
+                }
+                Some(Reply::Plan { blueprint }) => {
+                    let _ = background_tx
+                        .send(AppEvent::GeneratePlanBundle {
+                            project_root,
+                            blueprint,
+                        })
+                        .await;
+                    break;
+                }
+                None => {
+                    let _ = background_tx
+                        .send(AppEvent::PlanAuthoringFailed {
+                            reason: "planner returned an invalid response; expected a question or typed plan blueprint".into(),
+                        })
+                        .await;
+                    break;
+                }
+            }
+        }
+        let _ = session.terminate().await;
     });
 }
 
@@ -1906,6 +2091,7 @@ struct ModalState {
     viewing_doctor: bool,
     help_mode_active: bool,
     command_palette: bool,
+    plan_authoring: bool,
     settings: bool,
     reset_confirm: bool,
     operation_notice: bool,
@@ -2027,6 +2213,7 @@ fn translate_key(
         viewing_doctor,
         help_mode_active,
         command_palette,
+        plan_authoring,
         settings,
         reset_confirm,
         operation_notice,
@@ -2071,6 +2258,14 @@ fn translate_key(
                 .clone()
                 .map(|confirmation| AppEvent::ResetRun { confirmation })
                 .unwrap_or(AppEvent::CloseResetConfirmation),
+            _ => AppEvent::Tick,
+        }
+    } else if plan_authoring {
+        match key.code {
+            KeyCode::Esc => AppEvent::ClosePlanAuthoring,
+            KeyCode::Enter => AppEvent::PlanAuthoringSubmit,
+            KeyCode::Backspace => AppEvent::PlanAuthoringBackspace,
+            KeyCode::Char(c) => AppEvent::PlanAuthoringInput(c),
             _ => AppEvent::Tick,
         }
     } else if command_palette {
@@ -4442,6 +4637,22 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let folder = tmp.path().join("new-project");
         std::fs::create_dir_all(&folder).expect("create folder");
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.name", "Event Test"][..],
+            &["config", "user.email", "event@example.invalid"][..],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&folder)
+                .output()
+                .expect("configure test Git identity");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
 
         let workspace_file = tmp.path().join("workspace.toml");
 

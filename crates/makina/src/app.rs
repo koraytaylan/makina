@@ -423,6 +423,23 @@ pub enum Mode {
     OperationNotice,
     /// Searchable model picker overlay (opened from Settings).
     ModelPicker,
+    /// Conversational plan-authoring overlay.
+    PlanAuthoring,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanAuthoringMessage {
+    pub from_model: bool,
+    pub text: String,
+}
+
+#[derive(Debug)]
+pub struct PlanAuthoring {
+    pub project_root: PathBuf,
+    pub input: String,
+    pub messages: Vec<PlanAuthoringMessage>,
+    pub waiting: bool,
+    pub answer_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 /// The purpose of the folder browser modal — determines which event is emitted on selection.
@@ -484,6 +501,10 @@ impl CommandPalette {
             PaletteAction::Regular {
                 label: "Open plan",
                 event: Box::new(AppEvent::OpenBrowser),
+            },
+            PaletteAction::Regular {
+                label: "Create plan",
+                event: Box::new(AppEvent::OpenPlanAuthoring),
             },
             PaletteAction::Regular {
                 label: "Open Folder",
@@ -1065,6 +1086,18 @@ pub enum AppEvent {
         project_root: PathBuf,
         blueprint: makina_core::api::GeneratedPlanBlueprint,
     },
+    /// Open the natural-language plan authoring flow.
+    OpenPlanAuthoring,
+    PlanAuthoringInput(char),
+    PlanAuthoringBackspace,
+    PlanAuthoringSubmit,
+    PlanAuthoringQuestion {
+        question: String,
+    },
+    PlanAuthoringFailed {
+        reason: String,
+    },
+    ClosePlanAuthoring,
     /// Pause the selected Run.
     PauseRun,
     /// Cancel the selected Run.
@@ -1088,11 +1121,16 @@ pub enum AppEvent {
     /// Reset the selected run/plan back to a fresh pending graph.
     RequestResetRun,
     /// Execute a reset after the confirmation modal has been accepted.
-    ResetRun { confirmation: ResetConfirmation },
+    ResetRun {
+        confirmation: ResetConfirmation,
+    },
     /// Close the reset confirmation modal without doing anything.
     CloseResetConfirmation,
     /// A reset has started in a background task.
-    ResetStarted { target: PlanIdentity, label: String },
+    ResetStarted {
+        target: PlanIdentity,
+        label: String,
+    },
     /// A background reset finished.
     ResetFinished {
         target: PlanIdentity,
@@ -1104,15 +1142,21 @@ pub enum AppEvent {
         attempted: String,
     },
     /// A project-scoped plan open/start was launched in the background.
-    PlanOpenStarted { target: PlanIdentity },
+    PlanOpenStarted {
+        target: PlanIdentity,
+    },
     /// The background open/start completed (successfully or otherwise).
-    PlanOpenFinished { target: PlanIdentity },
+    PlanOpenFinished {
+        target: PlanIdentity,
+    },
     /// A run was just opened (or an existing Pending run was started) and is
     /// now in the "starting" phase — the sidebar should render an animated
     /// badge until the run transitions out of `Pending`. Emitted by the
     /// background `spawn_open_run` auto-start path and by the direct
     /// `StartRun` resolve_io arm.
-    RunStarting { run: makina_core::api::RunId },
+    RunStarting {
+        run: makina_core::api::RunId,
+    },
     /// Close the operation notice modal.
     CloseOperationNotice,
 
@@ -1134,7 +1178,9 @@ pub enum AppEvent {
     /// [`makina_core::log_record::LogRecord`] into an [`ErrorMessage`].
     /// `update` pushes it via [`App::push_error`] (respecting
     /// [`ERROR_MESSAGES_CAP`]).
-    ErrorMessageArrived { msg: ErrorMessage },
+    ErrorMessageArrived {
+        msg: ErrorMessage,
+    },
 
     /// Dismiss the provider-missing warning banner.
     ///
@@ -1200,14 +1246,18 @@ pub enum AppEvent {
         values: crate::settings_validation::SettingsValidation,
     },
     /// Settings validation or persistence failed; keep the modal open.
-    SettingsSaveFailed { reason: String },
+    SettingsSaveFailed {
+        reason: String,
+    },
     /// Close the settings screen without saving.
     CloseSettings,
     /// Save settings but keep the modal open (auto-save during editing).
     SettingsAutoSave,
     /// Agent model probe completed — discovered models are available.
     /// Each entry is "agent_name/provider_name/model_name".
-    ModelsDiscovered { models: Vec<String> },
+    ModelsDiscovered {
+        models: Vec<String>,
+    },
     /// Open the searchable model picker for the focused Settings field.
     OpenModelPicker,
     /// Close the model picker without selecting.
@@ -1228,19 +1278,25 @@ pub enum AppEvent {
     OpenFolder,
 
     /// User selected a folder path to open (from file picker).
-    OpenFolderSelected { path: std::path::PathBuf },
+    OpenFolderSelected {
+        path: std::path::PathBuf,
+    },
 
     /// User requested to close a folder via palette action.
     CloseFolderRequested,
 
     /// User selected a folder path to close (from list).
-    CloseFolderConfirmed { path: std::path::PathBuf },
+    CloseFolderConfirmed {
+        path: std::path::PathBuf,
+    },
 
     /// User requested to initialize a folder via palette action.
     InitializeFolderRequested,
 
     /// User selected a folder path to initialize (from file picker).
-    InitializeFolderSelected { path: std::path::PathBuf },
+    InitializeFolderSelected {
+        path: std::path::PathBuf,
+    },
 
     /// Move the folder browser selection one row up.
     FolderBrowserUp,
@@ -1545,6 +1601,12 @@ pub struct App {
     /// The developer agent backend, used to probe available models when
     /// Settings opens. Set by main.rs after building the project API.
     pub developer_backend: Option<Arc<dyn makina_core::backend::AgentBackend>>,
+
+    /// Planner backend used by conversational plan authoring.
+    pub planner_backend: Option<Arc<dyn makina_core::backend::AgentBackend>>,
+
+    /// Active plan-authoring conversation.
+    pub plan_authoring: Option<PlanAuthoring>,
 
     /// Searchable model picker state (open from Settings model fields).
     pub model_picker: Option<ModelPicker>,
@@ -2557,6 +2619,8 @@ impl App {
             api,
             project_api: None,
             developer_backend: None,
+            planner_backend: None,
+            plan_authoring: None,
             model_picker: None,
             focused_panel: Panel::Sidebar,
             focused_section: None,
@@ -2827,6 +2891,10 @@ impl App {
     /// Whether the command palette is currently active.
     pub fn is_command_palette(&self) -> bool {
         self.mode == Mode::CommandPalette
+    }
+
+    pub fn is_plan_authoring(&self) -> bool {
+        self.mode == Mode::PlanAuthoring
     }
 
     /// Whether the settings modal is currently active.
@@ -4396,6 +4464,65 @@ impl App {
                 // will emit a StatusMessage with the outcome.
                 true
             }
+
+            // ── Conversational plan authoring ────────────────────────────────────
+            AppEvent::OpenPlanAuthoring => {
+                self.plan_authoring = Some(PlanAuthoring {
+                    project_root: self.context_project_root(),
+                    input: String::new(),
+                    messages: Vec::new(),
+                    waiting: false,
+                    answer_tx: None,
+                });
+                self.command_palette = None;
+                self.mode = Mode::PlanAuthoring;
+                true
+            }
+            AppEvent::PlanAuthoringInput(c) => {
+                if let Some(state) = self.plan_authoring.as_mut()
+                    && !state.waiting
+                {
+                    state.input.push(c);
+                }
+                true
+            }
+            AppEvent::PlanAuthoringBackspace => {
+                if let Some(state) = self.plan_authoring.as_mut()
+                    && !state.waiting
+                {
+                    state.input.pop();
+                }
+                true
+            }
+            AppEvent::PlanAuthoringQuestion { question } => {
+                if let Some(state) = self.plan_authoring.as_mut() {
+                    state.messages.push(PlanAuthoringMessage {
+                        from_model: true,
+                        text: question,
+                    });
+                    state.waiting = false;
+                }
+                true
+            }
+            AppEvent::PlanAuthoringFailed { reason } => {
+                if let Some(state) = self.plan_authoring.as_mut() {
+                    state.messages.push(PlanAuthoringMessage {
+                        from_model: true,
+                        text: format!("Error: {reason}"),
+                    });
+                    state.waiting = false;
+                    state.answer_tx = None;
+                }
+                true
+            }
+            AppEvent::ClosePlanAuthoring => {
+                self.plan_authoring = None;
+                self.mode = Mode::Normal;
+                true
+            }
+
+            // Submission is IO-backed; resolve_io consumes the buffer.
+            AppEvent::PlanAuthoringSubmit => true,
 
             // ── Command palette (plan 0069) ───────────────────────────────────────
             AppEvent::OpenCommandPalette => {
@@ -9581,6 +9708,13 @@ mod tests {
             !palette.actions.is_empty(),
             "default_actions must be non-empty"
         );
+        assert!(
+            palette
+                .actions
+                .iter()
+                .any(|action| action.label() == "Create plan"),
+            "command palette must expose plan authoring"
+        );
 
         // Selected is 0.
         assert_eq!(palette.selected, 0, "selected must be 0");
@@ -9599,8 +9733,8 @@ mod tests {
         let palette = app.command_palette.as_ref().unwrap();
         assert_eq!(
             palette.filtered().len(),
-            15,
-            "full list must have 15 actions"
+            16,
+            "full list must include all 16 actions"
         );
         for label in [
             "Start run",
@@ -9651,7 +9785,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            15,
+            16,
             "full list restored after filter cleared"
         );
     }
