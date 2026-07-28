@@ -14,6 +14,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::Duration;
 
+static CONTRACT_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn authoring_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
     use makina_core::api::{
         GeneratedInitialStatusBlueprint as Status, GeneratedTaskBlueprint as Task,
@@ -127,12 +129,14 @@ fn windows_pipe_shape_is_remote_namespace_safe_and_credential_derived() {
 
 #[tokio::test]
 async fn hard_dead_server_keeps_lease_until_orphan_sentinel_is_evidenced_and_reaped() {
+    let _guard = CONTRACT_LIFECYCLE_TEST_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.email", "test@example.invalid"]);
     git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("seed"), "seed\n").unwrap();
     git(&repo, &["add", "seed"]);
     git(&repo, &["commit", "-qm", "seed"]);
@@ -230,12 +234,14 @@ async fn hard_dead_server_keeps_lease_until_orphan_sentinel_is_evidenced_and_rea
 
 #[tokio::test]
 async fn authenticated_session_reconnects_guards_workers_and_releases_lease() {
+    let _guard = CONTRACT_LIFECYCLE_TEST_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.email", "test@example.invalid"]);
     git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("seed"), "seed\n").unwrap();
     git(&repo, &["add", "seed"]);
     git(&repo, &["commit", "-qm", "seed"]);
@@ -490,12 +496,14 @@ async fn authenticated_session_reconnects_guards_workers_and_releases_lease() {
 
 #[tokio::test]
 async fn authoring_protocol_create_only_is_reconnectable_and_replays_lost_response() {
+    let _guard = CONTRACT_LIFECYCLE_TEST_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join("docs/plans")).unwrap();
     git(&repo, &["init", "-q", "-b", "develop"]);
     git(&repo, &["config", "user.email", "test@example.invalid"]);
     git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("docs/plans/STATUS.md"), "# Plans\n\n| Plan | Title | Status | Progress | Outcome | Link |\n|---|---|---|---|---|---|\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "base"]);
