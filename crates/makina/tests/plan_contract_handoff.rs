@@ -12,6 +12,7 @@ use std::time::Duration;
 
 fn git(repo: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(repo)
         .output()
