@@ -34,6 +34,8 @@
 //!   table and shows the focused task's prompts and streamed answers in order.
 //! * Task 31 (run-control): add keybind hints to the status bar.
 
+pub mod blocks;
+
 use chrono::{DateTime, Utc};
 use ratatui::{
     Frame,
@@ -1100,8 +1102,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(error_pane_height)])
         .split(inner);
-    let content_area = main_split[0];
-    let error_area = main_split[1];
+    let _content_area = main_split[0];
+    let _error_area = main_split[1];
 
     // Content precedence: an active plan tab is rendered via
     // render_plan_accordion_pane; an active task detail tab (live or preview) is
@@ -1690,7 +1692,7 @@ fn wrap_plain_line(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
 
 fn log_tab_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
-    let error_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error));
+    let _error_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error));
     if let Some(op) = app.context_operation_log()
         && !op.log.is_empty()
     {
@@ -1736,38 +1738,50 @@ fn log_tab_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 
     match (exchange_log, failure_reason) {
         (Some(log), _) if !log.entries.is_empty() => {
-            let mut lines: Vec<Line> = log
-                .entries
-                .iter()
-                .flat_map(|e| exchange_entry_lines(e, app, width))
-                .collect();
+            // Use block-based rendering with accent lines and folding.
+            let mut lines = blocks::render_entries(&log.entries, app, width);
             // If the task also has a failure reason, append it at the end.
             if let Some(reason) = failure_reason {
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![Span::styled(
-                    format!("  Failure: {}", reason.message),
-                    error_style,
-                )]));
+                let failure_out = blocks::render_failure(&reason.message, app, width);
+                let accent_color = failure_out.accent.color(app);
+                for line in failure_out.lines {
+                    let mut spans = vec![Span::styled("│ ", Style::default().fg(accent_color))];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
+                }
             }
             lines
         }
         (Some(_), Some(reason)) => {
-            // No exchange entries but the task has a failure reason — show it.
-            vec![Line::from(vec![Span::styled(
-                format!("  Task failed: {}", reason.message),
-                error_style,
-            )])]
+            let failure_out = blocks::render_failure(&reason.message, app, width);
+            let accent_color = failure_out.accent.color(app);
+            failure_out
+                .lines
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![Span::styled("│ ", Style::default().fg(accent_color))];
+                    spans.extend(line.spans);
+                    Line::from(spans)
+                })
+                .collect()
         }
         (Some(_), None) => vec![Line::from(vec![Span::styled(
             "  No log entries yet for this task.",
             dim,
         )])],
         (None, Some(reason)) => {
-            // No exchange log at all but the task has a failure reason.
-            vec![Line::from(vec![Span::styled(
-                format!("  Task failed: {}", reason.message),
-                error_style,
-            )])]
+            let failure_out = blocks::render_failure(&reason.message, app, width);
+            let accent_color = failure_out.accent.color(app);
+            failure_out
+                .lines
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![Span::styled("│ ", Style::default().fg(accent_color))];
+                    spans.extend(line.spans);
+                    Line::from(spans)
+                })
+                .collect()
         }
         (None, None) => vec![Line::from(vec![Span::styled(
             "  Select a task (open a task tab or pick one in the sidebar) to see its log.",
