@@ -1416,6 +1416,7 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
             {
                 let _ = tokio::fs::write(global_path, toml_str).await;
             }
+        }
     }
 
     let status = match app

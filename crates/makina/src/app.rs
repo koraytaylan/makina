@@ -2499,11 +2499,11 @@ impl App {
         // `opened_tab` tracks whether Enter opened (or focused) a content tab
         // so the focus can cross to the main pane — mirroring `FocusRightOrExpand`'s
         // crossing behavior. Folders only expand/collapse and stay on the sidebar.
-        let mut opened_tab = false;
+        let mut _opened_tab = false;
         match self.focused_node() {
             Some(TreeNode::Plan { plan_idx }) => {
                 self.activate_plan_node(plan_idx);
-                opened_tab = true;
+                _opened_tab = true;
             }
             Some(TreeNode::PlanTask { plan_idx, task_idx }) => {
                 if let Some(plan) = self.discovered_plans.get(plan_idx)
@@ -2514,7 +2514,7 @@ impl App {
                         task_id: preview.frontmatter.id.as_str().to_owned(),
                     };
                     self.tabs.open_tab(tab_content);
-                    opened_tab = true;
+                    _opened_tab = true;
                 }
             }
             Some(TreeNode::PlanInFolder {
@@ -2522,7 +2522,7 @@ impl App {
                 plan_idx,
             }) => {
                 self.activate_plan_in_folder(folder_idx, plan_idx);
-                opened_tab = true;
+                _opened_tab = true;
             }
             Some(TreeNode::PlanTaskInFolder {
                 folder_idx,
@@ -2539,7 +2539,7 @@ impl App {
                         task_id: preview.frontmatter.id.as_str().to_owned(),
                     };
                     self.tabs.open_tab(tab_content);
-                    opened_tab = true;
+                    _opened_tab = true;
                 }
             }
             Some(TreeNode::Folder { .. }) => {
@@ -2559,7 +2559,7 @@ impl App {
                     };
                     self.tabs.open_tab(tab_content);
                     self.sync_selected_run_to_active_tab();
-                    opened_tab = true;
+                    _opened_tab = true;
                 }
             }
             Some(TreeNode::Run { run }) => {
@@ -2567,7 +2567,7 @@ impl App {
                     let target = self.plan_identity_for_run(run_view);
                     if self.plan_entry(&target).is_some() {
                         self.tabs.open_tab(TabContent::Plan { plan: target });
-                        opened_tab = true;
+                        _opened_tab = true;
                     }
                     // Expand the run so its tasks become visible in the sidebar
                     // (mirrors the Plan node path in activate_plan_node).

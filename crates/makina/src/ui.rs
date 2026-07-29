@@ -1102,8 +1102,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(error_pane_height)])
         .split(inner);
-    let _content_area = main_split[0];
-    let _error_area = main_split[1];
+    let content_area = main_split[0];
+    let error_area = main_split[1];
 
     // Content precedence: an active plan tab is rendered via
     // render_plan_accordion_pane; an active task detail tab (live or preview) is
@@ -4585,8 +4585,9 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
 
     // If there's an error, render it in red
     if let Some(error) = &settings.error {
-        let error_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error));
-        let error_line = Line::from(vec![Span::styled(error.clone(), error_style)]);
+        let _error_style =
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error));
+        let error_line = Line::from(vec![Span::styled(error.clone(), _error_style)]);
         let error_para = Paragraph::new(error_line);
         frame.render_widget(error_para, error_area);
     }
