@@ -1241,12 +1241,21 @@ fn resolve_plan_to_open(app: &App) -> Option<PlanOpen> {
     })
 }
 
-/// Commit edited settings (caps, concurrency, and final merge mode) to the project config file.
+/// Commit edited settings (caps, concurrency, final merge mode, and per-role
+/// models) to the project config file, and the model selections to the global
+/// config as well.
 ///
 /// Uses the project-config writer so repository-specific fields (`base_branch`,
 /// `[[gates]]`, discovery stamps, and role prompts) survive the round-trip. On a
 /// successful write it also updates the live CoreApi runtime settings so a
 /// restart is not required before the next scheduler run observes the new mode.
+///
+/// Models are written to **both** layers: the project keeps its own selection,
+/// while `~/.makina/config.toml` accumulates the last-selected models so a
+/// project with no selection of its own still resolves one (see
+/// [`makina_core::config`] § Per-role models). A failed global write never fails
+/// the save — the project write is authoritative for this repository — but it is
+/// reported in the status line.
 async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String>) {
     use crate::settings_validation::validate_settings;
     use makina_core::api::Command;
@@ -1283,6 +1292,11 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         idle_secs: valid.idle_secs,
     };
 
+    // Model buffers are shared by both writes: an empty buffer yields `None`,
+    // which every writer reads as "leave the stored model alone".
+    let models = app.selected_role_models();
+    let provider_defaults = app.roles.clone();
+
     if let Err(e) = write_project_config(&project_root, |cfg| {
         cfg.caps = Some(CapsOverride {
             gate_iterations: Some(valid.gate_iterations),
@@ -1294,68 +1308,7 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         cfg.merge = Some(MergeConfig {
             final_: valid.final_merge,
         });
-        // Write model selections for each role. Strip the "tool/" prefix
-        // from the picker format — the config stores just the model name.
-        if let Some(settings) = app.settings.as_ref() {
-            let resolve = |s: &str| {
-                if s.is_empty() {
-                    None
-                } else {
-                    let model = s.split('/').skip(1).collect::<Vec<_>>().join("/");
-                    Some(if model.is_empty() {
-                        s.to_string()
-                    } else {
-                        model
-                    })
-                }
-            };
-            // Preserve the existing provider name — don't overwrite with empty.
-            let dev_provider = app
-                .roles
-                .developer
-                .as_ref()
-                .map(|r| r.provider.clone())
-                .unwrap_or_else(|| "default".to_string());
-            let rev_provider = app
-                .roles
-                .reviewer
-                .as_ref()
-                .map(|r| r.provider.clone())
-                .unwrap_or_else(|| "default".to_string());
-            let plan_provider = app
-                .roles
-                .planner
-                .as_ref()
-                .map(|r| r.provider.clone())
-                .unwrap_or_else(|| "default".to_string());
-            if let Some(model) = resolve(&settings.developer_model) {
-                cfg.roles
-                    .developer
-                    .get_or_insert_with(Default::default)
-                    .provider = dev_provider;
-                cfg.roles
-                    .developer
-                    .get_or_insert_with(Default::default)
-                    .model = Some(model);
-            }
-            if let Some(model) = resolve(&settings.reviewer_model) {
-                cfg.roles
-                    .reviewer
-                    .get_or_insert_with(Default::default)
-                    .provider = rev_provider;
-                cfg.roles
-                    .reviewer
-                    .get_or_insert_with(Default::default)
-                    .model = Some(model);
-            }
-            if let Some(model) = resolve(&settings.planner_model) {
-                cfg.roles
-                    .planner
-                    .get_or_insert_with(Default::default)
-                    .provider = plan_provider;
-                cfg.roles.planner.get_or_insert_with(Default::default).model = Some(model);
-            }
-        }
+        cfg.roles.apply_models(&models, &provider_defaults);
     })
     .await
     {
@@ -1368,56 +1321,10 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         );
     }
 
-    // Also write model selections to the global config (~/.makina/config.toml)
-    // so they become "last used models" that are available across projects.
-    if let Some(settings) = app.settings.as_ref() {
-        let resolve = |s: &str| {
-            if s.is_empty() {
-                None
-            } else {
-                let model = s.split('/').skip(1).collect::<Vec<_>>().join("/");
-                Some(if model.is_empty() {
-                    s.to_string()
-                } else {
-                    model
-                })
-            }
-        };
-        let global_path = dirs::home_dir().map(|h| h.join(".makina").join("config.toml"));
-        if let Some(ref global_path) = global_path
-            && let Ok(existing) = tokio::fs::read_to_string(global_path).await
-            && let Ok(mut global) = toml::from_str::<makina_core::config::GlobalConfig>(&existing)
-                .or_else(|_| Ok::<_, ()>(makina_core::config::GlobalConfig::default()))
-        {
-            if let Some(model) = resolve(&settings.developer_model) {
-                global
-                    .roles
-                    .developer
-                    .get_or_insert_with(Default::default)
-                    .model = Some(model);
-            }
-            if let Some(model) = resolve(&settings.reviewer_model) {
-                global
-                    .roles
-                    .reviewer
-                    .get_or_insert_with(Default::default)
-                    .model = Some(model);
-            }
-            if let Some(model) = resolve(&settings.planner_model) {
-                global
-                    .roles
-                    .planner
-                    .get_or_insert_with(Default::default)
-                    .model = Some(model);
-            }
-            if let Ok(toml_str) = toml::to_string_pretty(&global)
-                && let Some(parent) = global_path.parent()
-                && tokio::fs::create_dir_all(parent).await.is_ok()
-            {
-                let _ = tokio::fs::write(global_path, toml_str).await;
-            }
-        }
-    }
+    // Mirror the model selections into ~/.makina/config.toml, creating it when
+    // absent, so they survive as the operator's last-selected models and seed
+    // every other project that has no selection of its own.
+    let global_warning = commit_global_models(app, &models, &provider_defaults).await;
 
     let status = match app
         .api
@@ -1432,6 +1339,10 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         Ok(_) => "Settings saved".to_string(),
         Err(e) => format!("Settings saved; runtime update failed: {e}"),
     };
+    let status = match global_warning {
+        Some(warning) => format!("{status}; {warning}"),
+        None => status,
+    };
     if close {
         app.mode = crate::app::Mode::Normal;
     }
@@ -1442,6 +1353,56 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
         },
         Some(status),
     )
+}
+
+/// Mirror the Settings modal's model selections into the global config,
+/// creating `~/.makina/config.toml` when it does not exist yet.
+///
+/// The global layer is the operator's "last selected models" store: it is
+/// project-independent, so a freshly created project resolves these models with
+/// no project config of its own (see [`makina_core::config`] § Per-role models).
+///
+/// Only when the file is being **created** are the active providers written
+/// alongside the models. Otherwise the new file would name models but no
+/// backend to run them on, leaving a new project dependent on re-detecting an
+/// agent CLI on `$PATH`. An existing global config is never given providers it
+/// did not already have — an operator who deliberately relies on auto-detection
+/// keeps doing so.
+///
+/// Returns `None` on success (or when there is nothing to write), or a short
+/// warning for the status line — a failure here never fails the save, because
+/// the project write already succeeded and is authoritative for this repository.
+async fn commit_global_models(
+    app: &App,
+    models: &makina_core::config::RoleModels,
+    provider_defaults: &makina_core::config::RolesConfig,
+) -> Option<String> {
+    use makina_core::config::write_global_config_at;
+
+    if models.is_empty() {
+        return None;
+    }
+    // `config_paths.global` is `~/.makina/config.toml` resolved at startup, and
+    // `None` only when $HOME is unset — then there is no global layer at all.
+    let global_path = app.config_paths.global.as_ref()?;
+
+    let creating = !global_path.exists();
+    let providers = app.providers.clone();
+    let result = write_global_config_at(global_path, |global| {
+        global.roles.apply_models(models, provider_defaults);
+        if creating {
+            global.providers = providers;
+        }
+    })
+    .await;
+
+    match result {
+        Ok(()) => None,
+        Err(error) => {
+            tracing::warn!(%error, "failed to persist models to the global config");
+            Some(format!("global models not saved: {error}"))
+        }
+    }
 }
 
 /// Persist the chosen theme name to `{repo_root}/.makina/config.toml`.
@@ -6088,6 +6049,368 @@ provider = "default"
             app.roles.developer.as_ref().unwrap().model.as_deref(),
             Some("my-model"),
             "app role must have the clean model name"
+        );
+    }
+
+    // ── Global "last selected models" store ───────────────────────────────────
+
+    /// Build an app on a temp repo with one provider, one role, and a global
+    /// config path inside `home` (never the operator's real `~/.makina`).
+    ///
+    /// Returns the app plus the project and global config paths.
+    fn app_for_model_selection(
+        repo_root: &std::path::Path,
+        home: &std::path::Path,
+    ) -> (App, std::path::PathBuf, std::path::PathBuf) {
+        use crate::placeholder::PlaceholderApi;
+
+        let project_config = repo_root.join(".makina").join("config.toml");
+        let global_config = home.join(".makina").join("config.toml");
+
+        let mut app = App::new(
+            Arc::new(PlaceholderApi::empty()),
+            vec![],
+            repo_root.to_path_buf(),
+        );
+        app.providers = vec![makina_core::config::ProviderConfig {
+            name: "default".into(),
+            command: "opencode".into(),
+            args: vec!["acp".into()],
+            env: Default::default(),
+        }];
+        app.roles.developer = Some(makina_core::config::RoleAssignment {
+            provider: "default".into(),
+            ..Default::default()
+        });
+        app.config_paths = makina_core::config::ConfigPaths {
+            global: Some(global_config.clone()),
+            project: Some(project_config.clone()),
+        };
+        (app, project_config, global_config)
+    }
+
+    /// **Acceptance criterion — a missing global config is created.**
+    ///
+    /// Selecting a model when `~/.makina/config.toml` does not exist must
+    /// create it (and its parent directory) carrying the selection, so the
+    /// choice survives as the operator's last-selected model.
+    #[tokio::test]
+    async fn model_selection_creates_the_global_config_when_absent() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path().join("repo");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&repo_root).expect("create repo dir");
+
+        let (mut app, project_config, global_config) = app_for_model_selection(&repo_root, &home);
+        assert!(!global_config.exists(), "precondition: no global config");
+
+        app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().developer_model = "opencode/my-model".to_string();
+        let (resolved, _) = resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+        app.update(resolved);
+
+        assert!(
+            global_config.exists(),
+            "the global config must be created when it does not exist"
+        );
+        let text = std::fs::read_to_string(&global_config).expect("read global config");
+        let global = makina_core::config::GlobalConfig::from_toml_str(&text, "global")
+            .expect("written global config must be valid TOML");
+        assert_eq!(
+            global.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("my-model"),
+            "the global config must record the selected model"
+        );
+        assert_eq!(
+            global.providers.len(),
+            1,
+            "a freshly created global config also records the active providers"
+        );
+        assert_eq!(global.providers[0].command, "opencode");
+
+        // The project layer is still written — global is a mirror, not a move.
+        let project = std::fs::read_to_string(&project_config).expect("read project config");
+        assert!(
+            project.contains("model = \"my-model\""),
+            "the project config must still record the model; got:\n{project}"
+        );
+    }
+
+    /// An existing global config is updated in place: the new model lands and
+    /// every unrelated field survives.
+    #[tokio::test]
+    async fn model_selection_updates_an_existing_global_config() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path().join("repo");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&repo_root).expect("create repo dir");
+
+        let (mut app, _project_config, global_config) = app_for_model_selection(&repo_root, &home);
+        std::fs::create_dir_all(global_config.parent().unwrap()).expect("create home dir");
+        std::fs::write(
+            &global_config,
+            r#"theme_name = "Ayu Mirage"
+
+[[providers]]
+name = "grok"
+command = "grok-cli"
+
+[roles.developer]
+provider = "grok"
+model = "stale-model"
+
+[roles.reviewer]
+provider = "grok"
+model = "reviewer-model"
+"#,
+        )
+        .expect("seed global config");
+
+        app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().developer_model = "opencode/fresh-model".to_string();
+        let (resolved, _) = resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+        app.update(resolved);
+
+        let global = makina_core::config::GlobalConfig::from_toml_str(
+            &std::fs::read_to_string(&global_config).expect("read global config"),
+            "global",
+        )
+        .expect("valid TOML");
+        let developer = global.roles.developer.as_ref().unwrap();
+        assert_eq!(
+            developer.model.as_deref(),
+            Some("fresh-model"),
+            "the global model must be replaced with the new selection"
+        );
+        assert_eq!(
+            developer.provider, "grok",
+            "an existing global provider must be preserved"
+        );
+        assert_eq!(
+            global.roles.reviewer.as_ref().unwrap().model.as_deref(),
+            Some("reviewer-model"),
+            "a role with no selection must keep its stored model"
+        );
+        assert_eq!(global.theme_name, "Ayu Mirage");
+        assert_eq!(
+            global.providers.len(),
+            1,
+            "existing providers must not be replaced"
+        );
+        assert_eq!(global.providers[0].name, "grok");
+    }
+
+    /// **Acceptance criterion — a new project inherits the global models.**
+    ///
+    /// End-to-end: selecting a model in one project writes the global store,
+    /// and a brand-new project with no config of its own resolves that model —
+    /// both through `Config` and in the Settings modal.
+    #[tokio::test]
+    async fn a_new_project_inherits_the_models_selected_elsewhere() {
+        use crate::placeholder::PlaceholderApi;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_a = tmpdir.path().join("repo-a");
+        let repo_b = tmpdir.path().join("repo-b");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&repo_a).expect("create repo-a");
+        std::fs::create_dir_all(&repo_b).expect("create repo-b");
+
+        // Select a model in repo-a.
+        let (mut app_a, _project_config, global_config) = app_for_model_selection(&repo_a, &home);
+        app_a.update(AppEvent::OpenSettings);
+        app_a.settings.as_mut().unwrap().developer_model = "opencode/my-model".to_string();
+        let (resolved, _) = resolve_io_for_test(&mut app_a, AppEvent::SettingsCommit).await;
+        app_a.update(resolved);
+
+        // repo-b is brand new: no .makina directory at all.
+        assert!(!repo_b.join(".makina").exists(), "precondition: no config");
+
+        let (loaded, _paths) =
+            makina_core::config::Config::load_for_repo_with_global(Some(&global_config), &repo_b);
+        let config = loaded.expect("a project with no config still resolves against the global");
+        assert_eq!(
+            config.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("my-model"),
+            "a brand-new project must inherit the globally stored model"
+        );
+
+        // The Settings modal for the new project shows the inherited model.
+        let mut app_b = App::new(Arc::new(PlaceholderApi::empty()), vec![], repo_b.clone());
+        app_b.config_paths = makina_core::config::ConfigPaths {
+            global: Some(global_config),
+            project: Some(repo_b.join(".makina").join("config.toml")),
+        };
+        app_b.update(AppEvent::OpenSettings);
+        assert_eq!(
+            app_b.settings.as_ref().unwrap().developer_model,
+            "my-model",
+            "the modal must show the model inherited from the global layer"
+        );
+    }
+
+    /// A model name that itself contains a slash survives a reopen → auto-save
+    /// round trip. The buffer is re-seeded with the bare stored name, so the
+    /// picker-prefix strip must key on the agent command, not on "first
+    /// segment"; otherwise every save would eat one more segment.
+    #[tokio::test]
+    async fn slashed_model_name_survives_a_save_round_trip() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path().join("repo");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&repo_root).expect("create repo dir");
+
+        let (mut app, _project_config, global_config) = app_for_model_selection(&repo_root, &home);
+
+        // First save: pick "opencode/anthropic/claude-sonnet-4" from the picker.
+        app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().developer_model =
+            "opencode/anthropic/claude-sonnet-4".to_string();
+        let (resolved, _) = resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+        app.update(resolved);
+        assert_eq!(
+            app.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("anthropic/claude-sonnet-4"),
+            "only the agent prefix may be stripped"
+        );
+
+        // Second save: reopen (re-seeding the buffer from config) and save again.
+        app.update(AppEvent::OpenSettings);
+        assert_eq!(
+            app.settings.as_ref().unwrap().developer_model,
+            "anthropic/claude-sonnet-4",
+            "the modal must re-seed with the stored model name"
+        );
+        let (resolved, _) = resolve_io_for_test(&mut app, AppEvent::SettingsAutoSave).await;
+        app.update(resolved);
+
+        let global = makina_core::config::GlobalConfig::from_toml_str(
+            &std::fs::read_to_string(&global_config).expect("read global config"),
+            "global",
+        )
+        .expect("valid TOML");
+        assert_eq!(
+            global.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("anthropic/claude-sonnet-4"),
+            "re-saving must not strip another segment from the model name"
+        );
+    }
+
+    /// Clearing one role's buffer must not clear that role's stored model in
+    /// either layer, and must not disturb the roles that do have a selection.
+    #[tokio::test]
+    async fn clearing_a_model_buffer_leaves_both_layers_intact() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path().join("repo");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&repo_root).expect("create repo dir");
+
+        let (mut app, project_config, global_config) = app_for_model_selection(&repo_root, &home);
+
+        // Save a model for both roles first.
+        app.update(AppEvent::OpenSettings);
+        {
+            let settings = app.settings.as_mut().unwrap();
+            settings.developer_model = "opencode/dev-model".to_string();
+            settings.reviewer_model = "opencode/reviewer-model".to_string();
+        }
+        let (resolved, _) = resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+        app.update(resolved);
+
+        // Now clear the developer buffer and save again.
+        app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().developer_model = String::new();
+        let (resolved, _) = resolve_io_for_test(&mut app, AppEvent::SettingsAutoSave).await;
+        app.update(resolved);
+
+        for (label, path) in [("project", &project_config), ("global", &global_config)] {
+            let text =
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {label}: {e}"));
+            let roles = if label == "project" {
+                makina_core::config::ProjectConfig::from_toml_str(&text, label)
+                    .expect("valid TOML")
+                    .roles
+            } else {
+                makina_core::config::GlobalConfig::from_toml_str(&text, label)
+                    .expect("valid TOML")
+                    .roles
+            };
+            assert_eq!(
+                roles.developer.as_ref().and_then(|r| r.model.as_deref()),
+                Some("dev-model"),
+                "{label}: clearing the buffer must not clear the stored model"
+            );
+            assert_eq!(
+                roles.reviewer.as_ref().and_then(|r| r.model.as_deref()),
+                Some("reviewer-model"),
+                "{label}: the other role's model must be untouched"
+            );
+        }
+    }
+
+    /// With `$HOME` unresolvable there is no global layer, so the save still
+    /// succeeds against the project config alone.
+    #[tokio::test]
+    async fn model_selection_succeeds_without_a_global_config_path() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path().join("repo");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&repo_root).expect("create repo dir");
+
+        let (mut app, project_config, _global) = app_for_model_selection(&repo_root, &home);
+        app.config_paths.global = None;
+
+        app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().developer_model = "opencode/my-model".to_string();
+        let (resolved, status) = resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+        app.update(resolved.clone());
+
+        assert!(
+            matches!(resolved, AppEvent::SettingsSaved { .. }),
+            "the save must still succeed; got {resolved:?}"
+        );
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|s| !s.contains("global models not saved")),
+            "no global path is not a failure; got {status:?}"
+        );
+        let project = std::fs::read_to_string(&project_config).expect("read project config");
+        assert!(project.contains("model = \"my-model\""));
+    }
+
+    /// A global config that cannot be parsed is left untouched, and the save
+    /// reports the problem instead of silently discarding the operator's file.
+    #[tokio::test]
+    async fn unparseable_global_config_is_reported_and_left_intact() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmpdir.path().join("repo");
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&repo_root).expect("create repo dir");
+
+        let (mut app, _project_config, global_config) = app_for_model_selection(&repo_root, &home);
+        std::fs::create_dir_all(global_config.parent().unwrap()).expect("create home dir");
+        let broken = "not = = valid toml!!!";
+        std::fs::write(&global_config, broken).expect("seed broken global config");
+
+        app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().developer_model = "opencode/my-model".to_string();
+        let (resolved, status) = resolve_io_for_test(&mut app, AppEvent::SettingsCommit).await;
+
+        assert!(
+            matches!(resolved, AppEvent::SettingsSaved { .. }),
+            "a global-write failure must not fail the project save"
+        );
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|s| s.contains("global models not saved")),
+            "the status line must report the global write failure; got {status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&global_config).expect("read back"),
+            broken,
+            "the unparseable global config must be left exactly as it was"
         );
     }
 

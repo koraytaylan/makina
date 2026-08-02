@@ -597,6 +597,37 @@ impl CommandPalette {
 
 // ── Settings modal (plan 0070) ────────────────────────────────────────────────
 
+/// Reduce a settings model buffer to the bare model name stored in config.
+///
+/// The model picker lists entries as `{agent}/{model}` (see the probe in
+/// `event::resolve_io`), so the chosen value carries the agent command as a
+/// prefix. Config stores only the model name, and `agent_names` — the commands
+/// of the configured providers — is what distinguishes that prefix from a model
+/// whose own name contains slashes (`anthropic/claude-sonnet-4`). Stripping the
+/// first segment unconditionally would eat a real segment every time the modal
+/// re-seeded from config and auto-saved.
+///
+/// Returns `None` for an empty buffer ("leave the stored model alone").
+pub fn canonical_model_name(raw: &str, agent_names: &[String]) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    for agent in agent_names {
+        if agent.is_empty() {
+            continue;
+        }
+        if let Some(rest) = raw
+            .strip_prefix(agent.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            && !rest.is_empty()
+        {
+            return Some(rest.to_string());
+        }
+    }
+    Some(raw.to_string())
+}
+
 /// Which settings field is focused / being edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsField {
@@ -2734,6 +2765,32 @@ impl App {
         app
     }
 
+    /// The agent commands of the configured providers.
+    ///
+    /// These are the prefixes the model picker prepends to each discovered
+    /// model; [`canonical_model_name`] needs them to tell a picker prefix apart
+    /// from a model name that legitimately contains a slash.
+    pub fn provider_agent_names(&self) -> Vec<String> {
+        self.providers.iter().map(|p| p.command.clone()).collect()
+    }
+
+    /// The per-role models currently entered in the Settings modal, reduced to
+    /// the bare names stored in config.
+    ///
+    /// An empty buffer yields `None` for that role, which every writer reads as
+    /// "leave the stored model alone" rather than "clear it".
+    pub fn selected_role_models(&self) -> makina_core::config::RoleModels {
+        let Some(settings) = self.settings.as_ref() else {
+            return makina_core::config::RoleModels::default();
+        };
+        let agents = self.provider_agent_names();
+        makina_core::config::RoleModels {
+            developer: canonical_model_name(&settings.developer_model, &agents),
+            reviewer: canonical_model_name(&settings.reviewer_model, &agents),
+            planner: canonical_model_name(&settings.planner_model, &agents),
+        }
+    }
+
     /// Push a new error-pane message, evicting the oldest when over cap.
     ///
     /// Mirrors [`ExchangeLog::push`]: maintains the [`ERROR_MESSAGES_CAP`]
@@ -4646,14 +4703,30 @@ impl App {
             // ── Settings screen (plan 0070) ───────────────────────────────────────
             AppEvent::OpenSettings => {
                 let project_root = self.context_project_root();
-                let (loaded, paths) =
-                    makina_core::config::Config::load_for_repo_with_paths(&project_root);
-                let (caps, concurrency, final_merge, error) = match loaded {
-                    Ok(config) => (config.caps, config.concurrency, config.merge.final_, None),
+                // Load through the startup-resolved global path so the modal
+                // reads exactly the file `commit_settings` writes back to.
+                let (loaded, paths) = makina_core::config::Config::load_for_repo_with_global(
+                    self.config_paths.global.as_deref(),
+                    &project_root,
+                );
+                let (caps, concurrency, final_merge, roles, error) = match loaded {
+                    // `config.roles` is already resolved project → global, so
+                    // the modal shows the model this project would actually
+                    // use — including one inherited from the global layer.
+                    Ok(config) => (
+                        config.caps,
+                        config.concurrency,
+                        config.merge.final_,
+                        config.roles,
+                        None,
+                    ),
                     Err(load_error) => {
                         let mut caps = self.caps.clone();
                         let mut concurrency = self.concurrency;
                         let mut final_merge = self.final_merge;
+                        // The config did not resolve, so fall back to the live
+                        // role assignments for the model buffers.
+                        let mut roles = self.roles.clone();
                         let project = paths.project.as_ref().and_then(|path| {
                             std::fs::read_to_string(path).ok().and_then(|text| {
                                 makina_core::config::ProjectConfig::from_toml_str(
@@ -4681,23 +4754,49 @@ impl App {
                                 .merge
                                 .map(|merge| merge.final_)
                                 .unwrap_or(final_merge);
-                            (caps, concurrency, final_merge, None)
+                            // A project-level model still wins over the live
+                            // assignments, mirroring `Config::resolve`.
+                            let project_models = makina_core::config::RoleModels {
+                                developer: project
+                                    .roles
+                                    .developer
+                                    .as_ref()
+                                    .and_then(|r| r.model.clone()),
+                                reviewer: project
+                                    .roles
+                                    .reviewer
+                                    .as_ref()
+                                    .and_then(|r| r.model.clone()),
+                                planner: project
+                                    .roles
+                                    .planner
+                                    .as_ref()
+                                    .and_then(|r| r.model.clone()),
+                            };
+                            let provider_defaults = roles.clone();
+                            roles.apply_models(&project_models, &provider_defaults);
+                            (caps, concurrency, final_merge, roles, None)
                         } else if paths.project.as_ref().is_some_and(|path| path.exists()) {
                             (
                                 caps,
                                 concurrency,
                                 final_merge,
+                                roles,
                                 Some(format!(
                                     "Could not load {} settings: {load_error}",
                                     project_root.display()
                                 )),
                             )
                         } else {
-                            (caps, concurrency, final_merge, None)
+                            (caps, concurrency, final_merge, roles, None)
                         }
                     }
                 };
-                // Seed model text buffers from current role assignments.
+                // Adopt the context project's resolved assignments so the modal,
+                // the start-run model check, and the plan-authoring session all
+                // agree on which model this project would actually use.
+                self.roles = roles.clone();
+                // Seed model text buffers from the resolved role assignments.
                 let model_of = |role: &Option<makina_core::config::RoleAssignment>| {
                     role.as_ref()
                         .and_then(|r| r.model.clone())
@@ -4711,9 +4810,9 @@ impl App {
                     idle_secs: caps.idle_secs.map(|s| s.to_string()).unwrap_or_default(),
                     concurrency: concurrency.to_string(),
                     final_merge,
-                    developer_model: model_of(&self.roles.developer),
-                    reviewer_model: model_of(&self.roles.reviewer),
-                    planner_model: model_of(&self.roles.planner),
+                    developer_model: model_of(&roles.developer),
+                    reviewer_model: model_of(&roles.reviewer),
+                    planner_model: model_of(&roles.planner),
                     discovered_models: vec![],
                     focused: SettingsField::GateIterations,
                     error,
@@ -5159,39 +5258,11 @@ impl App {
                 }
                 // Apply model selections from the settings modal to the app's
                 // role assignments so subsequent runs use the chosen models.
-                // Strip the "tool/" prefix — the app stores just the model name.
-                if let Some(settings) = self.settings.as_ref() {
-                    let resolve = |s: &str| {
-                        if s.is_empty() {
-                            None
-                        } else {
-                            let model = s.split('/').skip(1).collect::<Vec<_>>().join("/");
-                            Some(if model.is_empty() {
-                                s.to_string()
-                            } else {
-                                model
-                            })
-                        }
-                    };
-                    if let Some(model) = resolve(&settings.developer_model) {
-                        self.roles
-                            .developer
-                            .get_or_insert_with(Default::default)
-                            .model = Some(model);
-                    }
-                    if let Some(model) = resolve(&settings.reviewer_model) {
-                        self.roles
-                            .reviewer
-                            .get_or_insert_with(Default::default)
-                            .model = Some(model);
-                    }
-                    if let Some(model) = resolve(&settings.planner_model) {
-                        self.roles
-                            .planner
-                            .get_or_insert_with(Default::default)
-                            .model = Some(model);
-                    }
-                }
+                // The buffers hold the picker's `{agent}/{model}` form; config
+                // and the App store the bare model name.
+                let models = self.selected_role_models();
+                let provider_defaults = self.roles.clone();
+                self.roles.apply_models(&models, &provider_defaults);
                 // Only close the modal if SettingsCommit triggered the save
                 // (Esc). Auto-save (SettingsAutoSave) keeps the modal open.
                 // SettingsCommit sets mode to Normal before the IO layer
@@ -15007,5 +15078,118 @@ final = "stage"
         assert_eq!(settings.concurrency, "7");
         assert_eq!(settings.final_merge, FinalMerge::Stage);
         assert!(settings.error.is_none());
+    }
+
+    // ── Model name canonicalisation ───────────────────────────────────────────
+
+    #[test]
+    fn canonical_model_name_strips_only_a_known_agent_prefix() {
+        let agents = vec!["opencode".to_string(), "claude".to_string()];
+
+        assert_eq!(
+            canonical_model_name("opencode/my-model", &agents).as_deref(),
+            Some("my-model"),
+            "the picker's agent prefix must be stripped"
+        );
+        assert_eq!(
+            canonical_model_name("opencode/anthropic/claude-sonnet-4", &agents).as_deref(),
+            Some("anthropic/claude-sonnet-4"),
+            "only the agent prefix goes — the rest of the name is the model"
+        );
+        assert_eq!(
+            canonical_model_name("anthropic/claude-sonnet-4", &agents).as_deref(),
+            Some("anthropic/claude-sonnet-4"),
+            "a slash that is not an agent prefix must be left alone"
+        );
+        assert_eq!(
+            canonical_model_name("my-model", &agents).as_deref(),
+            Some("my-model")
+        );
+        assert_eq!(
+            canonical_model_name("  ", &agents),
+            None,
+            "an empty buffer means 'leave the stored model alone'"
+        );
+        assert_eq!(
+            canonical_model_name("opencode/", &agents).as_deref(),
+            Some("opencode/"),
+            "a bare prefix with nothing after it is not a model selection"
+        );
+    }
+
+    /// The Settings modal shows the model the context project would actually
+    /// use — here, the one its own config names.
+    #[test]
+    fn settings_seeds_model_buffers_from_the_project_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".makina")).unwrap();
+        std::fs::write(
+            repo.join(".makina/config.toml"),
+            r#"
+[roles.developer]
+provider = "default"
+model = "project-dev-model"
+
+[roles.planner]
+provider = "default"
+model = "project-planner-model"
+"#,
+        )
+        .unwrap();
+
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), repo.clone());
+        app.providers = vec![makina_core::config::ProviderConfig {
+            name: "default".into(),
+            command: "opencode".into(),
+            args: vec!["acp".into()],
+            env: Default::default(),
+        }];
+
+        app.update(AppEvent::OpenSettings);
+
+        let settings = app.settings.as_ref().unwrap();
+        assert_eq!(settings.developer_model, "project-dev-model");
+        assert_eq!(settings.planner_model, "project-planner-model");
+        assert_eq!(
+            settings.reviewer_model, "",
+            "a role with no model in either layer shows as unset"
+        );
+        assert_eq!(
+            app.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("project-dev-model"),
+            "opening Settings adopts the context project's resolved assignments"
+        );
+    }
+
+    /// An empty model buffer yields no selection, so no writer touches that
+    /// role — clearing one field must never wipe a stored model, least of all
+    /// the global one another project inherits.
+    #[test]
+    fn empty_model_buffer_yields_no_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), temp.path().to_path_buf());
+
+        app.update(AppEvent::OpenSettings);
+        {
+            let settings = app.settings.as_mut().unwrap();
+            settings.developer_model = String::new();
+            settings.reviewer_model = "opencode/reviewer-model".to_string();
+            settings.planner_model = "   ".to_string();
+        }
+
+        let models = app.selected_role_models();
+        assert_eq!(models.developer, None, "an empty buffer is not a selection");
+        assert_eq!(
+            models.planner, None,
+            "a whitespace-only buffer is not a selection"
+        );
+        assert_eq!(
+            models.reviewer.as_deref(),
+            Some("opencode/reviewer-model"),
+            "with no configured providers there is no prefix to strip"
+        );
     }
 }

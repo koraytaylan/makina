@@ -10,6 +10,17 @@
 //!   version control): gates (toolchain-specific shell commands), base branch,
 //!   and optional per-project overrides of caps and concurrency.
 //!
+//! # Per-role models
+//!
+//! A role's model resolves **project → global → unset**: [`Config::resolve`]
+//! starts from the global `[roles.*]` assignments and lets a project-level
+//! `model` override them. Selecting a model in the Settings modal writes it to
+//! *both* layers ([`write_project_config`] and [`write_global_config_at`]), so the
+//! global layer accumulates the operator's last-selected models and a brand-new
+//! project inherits them without any project config at all. When neither layer
+//! supplies a model the role's `model` stays `None` and the caller surfaces the
+//! "no model selected" error.
+//!
 //! # Usage pattern
 //!
 //! ```rust,no_run
@@ -218,6 +229,76 @@ pub struct RolesConfig {
     /// Optional assignment for the Reviewer role.
     #[serde(default)]
     pub reviewer: Option<RoleAssignment>,
+}
+
+/// One model selection per role, as chosen in the Settings modal.
+///
+/// `None` means "not selected / leave alone", **not** "clear it" — the same
+/// value is applied to both the project and the global layer by
+/// [`RolesConfig::apply_models`], so an unset field must never wipe a model
+/// that another project (or an earlier session) already stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleModels {
+    /// Model chosen for the Developer role.
+    pub developer: Option<String>,
+    /// Model chosen for the Reviewer role.
+    pub reviewer: Option<String>,
+    /// Model chosen for the Planner role.
+    pub planner: Option<String>,
+}
+
+impl RoleModels {
+    /// True when no role has a selection — nothing to persist.
+    pub fn is_empty(&self) -> bool {
+        self.developer.is_none() && self.reviewer.is_none() && self.planner.is_none()
+    }
+}
+
+impl RolesConfig {
+    /// Write `models` into these role assignments, creating assignments as needed.
+    ///
+    /// Roles whose selection is `None` are left untouched. An assignment that
+    /// already names a provider keeps it; an empty one is filled from the
+    /// matching role in `provider_defaults` (the live resolved roles), falling
+    /// back to `"default"` — the name [`Config::resolve`] synthesizes for the
+    /// legacy single-backend shape.
+    pub fn apply_models(&mut self, models: &RoleModels, provider_defaults: &RolesConfig) {
+        apply_role_model(
+            &mut self.developer,
+            models.developer.as_deref(),
+            provider_defaults.developer.as_ref(),
+        );
+        apply_role_model(
+            &mut self.reviewer,
+            models.reviewer.as_deref(),
+            provider_defaults.reviewer.as_ref(),
+        );
+        apply_role_model(
+            &mut self.planner,
+            models.planner.as_deref(),
+            provider_defaults.planner.as_ref(),
+        );
+    }
+}
+
+/// Set one role's model, preserving (or backfilling) its provider name.
+fn apply_role_model(
+    slot: &mut Option<RoleAssignment>,
+    model: Option<&str>,
+    provider_default: Option<&RoleAssignment>,
+) {
+    let Some(model) = model else {
+        return;
+    };
+    let assignment = slot.get_or_insert_with(RoleAssignment::default);
+    if assignment.provider.is_empty() {
+        assignment.provider = provider_default
+            .map(|a| a.provider.as_str())
+            .filter(|p| !p.is_empty())
+            .unwrap_or("default")
+            .to_string();
+    }
+    assignment.model = Some(model.to_string());
 }
 
 // ── Planner config ────────────────────────────────────────────────────────────
@@ -1131,16 +1212,29 @@ impl Config {
     pub fn load_for_repo_with_paths(
         repo_root: &Path,
     ) -> (Result<Config, ConfigError>, ConfigPaths) {
-        let global_path = home_dir().map(|h| h.join(".makina").join("config.toml"));
+        Self::load_for_repo_with_global(global_config_path().as_deref(), repo_root)
+    }
+
+    /// Like [`Config::load_for_repo_with_paths`] but with the global layer's
+    /// path supplied by the caller.
+    ///
+    /// The TUI already resolved `~/.makina/config.toml` once at startup and
+    /// carries it in [`ConfigPaths::global`]; re-loading through that value
+    /// keeps every later read on the exact file the writes target. `None` means
+    /// "no global layer" — the global side falls back to [`GlobalConfig::default`].
+    pub fn load_for_repo_with_global(
+        global_path: Option<&Path>,
+        repo_root: &Path,
+    ) -> (Result<Config, ConfigError>, ConfigPaths) {
         let (project_path, _legacy) = resolve_project_config_path(repo_root);
 
         let paths = ConfigPaths {
-            global: global_path.clone(),
+            global: global_path.map(Path::to_path_buf),
             project: project_path.clone(),
         };
 
         let result = Config::load_with_labels(
-            global_path.as_deref(),
+            global_path,
             Some("global (~/.makina/config.toml)"),
             project_path.as_deref(),
             Some("project (.makina/config.toml)"),
@@ -1225,6 +1319,106 @@ fn resolve_project_config_path(repo_root: &Path) -> (Option<PathBuf>, bool) {
 /// global config file and uses defaults for the global layer.
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// The canonical path of the global config, `~/.makina/config.toml`.
+///
+/// Returns `None` when `$HOME` is unset — in that case there is no global
+/// layer to read or write and callers must fall back to defaults.
+///
+/// This is the single source of truth for the global config location; both
+/// [`Config::load_for_repo_with_paths`] and the Settings writer use it so
+/// the read and write paths can never drift apart.
+pub fn global_config_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".makina").join("config.toml"))
+}
+
+// ── Global config writer ──────────────────────────────────────────────────────
+
+/// Errors that can occur while persisting the global config.
+///
+/// Distinct from [`ConfigError`] because the write path has one failure mode
+/// the read path does not: an existing file that cannot be parsed. Overwriting
+/// it would silently destroy the operator's providers, caps, and theme, so
+/// [`write_global_config_at`] refuses instead.
+#[derive(Debug, Error)]
+pub enum GlobalConfigWriteError {
+    /// The existing file is not valid TOML; it was left untouched.
+    #[error("global config `{path}` is not valid TOML ({message}) — refusing to overwrite it")]
+    Unparseable {
+        /// Path of the file that failed to parse.
+        path: String,
+        /// The underlying `toml::de::Error` message.
+        message: String,
+    },
+
+    /// The updated config could not be serialized back to TOML.
+    #[error("failed to serialize global config: {0}")]
+    Serialize(String),
+
+    /// Reading, creating, or writing the file failed.
+    #[error("I/O error writing `{path}`: {message}")]
+    Io {
+        /// Path that could not be written.
+        path: String,
+        /// The underlying `std::io::Error` message.
+        message: String,
+    },
+}
+
+/// Read-modify-write the global config at an explicit path.
+///
+/// Mirrors [`write_project_config`] for the global layer, with one deliberate
+/// difference: a **missing** file starts from [`GlobalConfig::default`] and is
+/// created (parent directories included), while an **unparseable** file is left
+/// untouched and reported as [`GlobalConfigWriteError::Unparseable`]. Silently
+/// starting from a default there would wipe providers, caps, and theme.
+///
+/// Every field the `edit` callback does not touch round-trips unchanged.
+///
+/// # Errors
+///
+/// See [`GlobalConfigWriteError`].
+pub async fn write_global_config_at<F>(path: &Path, edit: F) -> Result<(), GlobalConfigWriteError>
+where
+    F: FnOnce(&mut GlobalConfig),
+{
+    let mut config = if path.exists() {
+        let text =
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| GlobalConfigWriteError::Io {
+                    path: path.display().to_string(),
+                    message: e.to_string(),
+                })?;
+        toml::from_str::<GlobalConfig>(&text).map_err(|e| GlobalConfigWriteError::Unparseable {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?
+    } else {
+        GlobalConfig::default()
+    };
+
+    edit(&mut config);
+
+    let toml_str = toml::to_string_pretty(&config)
+        .map_err(|e| GlobalConfigWriteError::Serialize(e.to_string()))?;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| GlobalConfigWriteError::Io {
+                path: parent.display().to_string(),
+                message: e.to_string(),
+            })?;
+    }
+
+    tokio::fs::write(path, toml_str)
+        .await
+        .map_err(|e| GlobalConfigWriteError::Io {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })
 }
 
 // ── Project config writer ─────────────────────────────────────────────────────
@@ -2351,6 +2545,326 @@ mod tests {
             config.roles.developer.as_ref().unwrap().provider,
             "default",
             "empty provider should be auto-fixed to the first available"
+        );
+    }
+
+    // ── Per-role model resolution: project → global → unset ───────────────────
+
+    /// A global config with a `[[providers]]` entry, so resolved role
+    /// assignments validate without touching `$PATH` auto-detection.
+    fn global_with_provider() -> GlobalConfig {
+        GlobalConfig {
+            providers: vec![ProviderConfig {
+                name: "default".into(),
+                command: "opencode".into(),
+                args: vec!["acp".into()],
+                env: BTreeMap::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A role model stored only in the global layer is what a project with no
+    /// model of its own resolves to — this is what lets a brand-new project
+    /// inherit the operator's last-selected models.
+    #[test]
+    fn global_role_model_is_used_when_the_project_has_none() {
+        let mut global = global_with_provider();
+        global.roles.developer = Some(RoleAssignment {
+            provider: "default".into(),
+            model: Some("global-model".into()),
+            ..Default::default()
+        });
+
+        let mut config = Config::resolve(global, ProjectConfig::default());
+        config.validate().expect("resolved config should be valid");
+
+        assert_eq!(
+            config.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("global-model"),
+            "a project with no model of its own must fall back to the global model"
+        );
+    }
+
+    /// The project layer still wins when both layers name a model.
+    #[test]
+    fn project_role_model_overrides_the_global_one() {
+        let mut global = global_with_provider();
+        global.roles.developer = Some(RoleAssignment {
+            provider: "default".into(),
+            model: Some("global-model".into()),
+            ..Default::default()
+        });
+        let project = ProjectConfig {
+            roles: RolesConfig {
+                developer: Some(RoleAssignment {
+                    model: Some("project-model".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let config = Config::resolve(global, project);
+
+        assert_eq!(
+            config.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("project-model"),
+            "the project layer must win over the global layer"
+        );
+    }
+
+    /// The same fallback holds through the real file-loading path: a project
+    /// config that names no model resolves the global one.
+    #[test]
+    fn load_resolves_the_global_model_when_the_project_names_none() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let global_path = tmp.path().join("global.toml");
+        let project_path = tmp.path().join("project.toml");
+        std::fs::write(
+            &global_path,
+            r#"
+            [[providers]]
+            name = "default"
+            command = "opencode"
+
+            [roles.developer]
+            provider = "default"
+            model = "global-model"
+            "#,
+        )
+        .expect("write global");
+        std::fs::write(
+            &project_path,
+            r#"
+            base_branch = "develop"
+
+            [roles.developer]
+            system_prompt = "Follow the repository style."
+            "#,
+        )
+        .expect("write project");
+
+        let config = Config::load(Some(&global_path), Some(&project_path))
+            .expect("both layers load and validate");
+
+        let developer = config.roles.developer.as_ref().unwrap();
+        assert_eq!(
+            developer.model.as_deref(),
+            Some("global-model"),
+            "the global model must survive a project layer that only sets a prompt"
+        );
+        assert_eq!(
+            developer.system_prompt.as_deref(),
+            Some("Follow the repository style."),
+            "the project prompt must still be merged in"
+        );
+    }
+
+    /// A role that has a model in neither layer resolves to `None`, which is
+    /// what the callers turn into the "no model selected" error.
+    #[test]
+    fn role_model_is_none_when_neither_layer_supplies_one() {
+        let config = Config::resolve(global_with_provider(), ProjectConfig::default());
+
+        assert!(
+            config
+                .roles
+                .developer
+                .as_ref()
+                .and_then(|r| r.model.as_ref())
+                .is_none(),
+            "with no model in either layer the resolved model must stay unset"
+        );
+    }
+
+    /// `apply_models` writes only the roles that carry a selection, backfills an
+    /// empty provider, and preserves one that is already set.
+    #[test]
+    fn apply_models_only_touches_selected_roles() {
+        let mut roles = RolesConfig {
+            developer: Some(RoleAssignment {
+                provider: "grok".into(),
+                model: Some("old-dev-model".into()),
+                ..Default::default()
+            }),
+            reviewer: Some(RoleAssignment {
+                model: Some("keep-me".into()),
+                ..Default::default()
+            }),
+            planner: None,
+        };
+        let defaults = RolesConfig {
+            planner: Some(RoleAssignment {
+                provider: "claude".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        roles.apply_models(
+            &RoleModels {
+                developer: Some("new-dev-model".into()),
+                reviewer: None,
+                planner: Some("new-planner-model".into()),
+            },
+            &defaults,
+        );
+
+        let developer = roles.developer.as_ref().unwrap();
+        assert_eq!(developer.model.as_deref(), Some("new-dev-model"));
+        assert_eq!(
+            developer.provider, "grok",
+            "an existing provider must be preserved"
+        );
+        assert_eq!(
+            roles.reviewer.as_ref().unwrap().model.as_deref(),
+            Some("keep-me"),
+            "a role with no selection must keep its stored model"
+        );
+        let planner = roles.planner.as_ref().unwrap();
+        assert_eq!(planner.model.as_deref(), Some("new-planner-model"));
+        assert_eq!(
+            planner.provider, "claude",
+            "a created assignment takes its provider from the defaults"
+        );
+    }
+
+    /// With no matching default, a created assignment falls back to the
+    /// `"default"` provider name that `resolve` synthesizes.
+    #[test]
+    fn apply_models_falls_back_to_the_default_provider_name() {
+        let mut roles = RolesConfig::default();
+        roles.apply_models(
+            &RoleModels {
+                developer: Some("m".into()),
+                ..Default::default()
+            },
+            &RolesConfig::default(),
+        );
+        assert_eq!(roles.developer.as_ref().unwrap().provider, "default");
+    }
+
+    // ── Global config writer ──────────────────────────────────────────────────
+
+    /// **Acceptance criterion — the global config is created when absent.**
+    ///
+    /// Selecting a model with no `~/.makina/config.toml` present must create
+    /// the file (and its parent directory), not silently skip the write.
+    #[tokio::test]
+    async fn write_global_config_creates_the_file_when_absent() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // Two levels deep: the writer must create the whole parent chain.
+        let path = tmp.path().join(".makina").join("config.toml");
+        assert!(!path.exists());
+
+        write_global_config_at(&path, |global| {
+            global.roles.apply_models(
+                &RoleModels {
+                    developer: Some("dev-model".into()),
+                    ..Default::default()
+                },
+                &RolesConfig::default(),
+            );
+        })
+        .await
+        .expect("writing a missing global config should create it");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        let parsed = GlobalConfig::from_toml_str(&written, "written").expect("valid TOML");
+        assert_eq!(
+            parsed.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("dev-model")
+        );
+    }
+
+    /// Fields the edit callback does not touch round-trip unchanged.
+    #[tokio::test]
+    async fn write_global_config_preserves_unrelated_fields() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            concurrency = 7
+            theme_name = "Ayu Mirage"
+
+            [[providers]]
+            name = "grok"
+            command = "grok-cli"
+
+            [caps]
+            gate_iterations = 9
+
+            [roles.reviewer]
+            provider = "grok"
+            model = "reviewer-model"
+            effort = "high"
+            "#,
+        )
+        .expect("seed global config");
+
+        write_global_config_at(&path, |global| {
+            global.roles.apply_models(
+                &RoleModels {
+                    developer: Some("dev-model".into()),
+                    ..Default::default()
+                },
+                &RolesConfig::default(),
+            );
+        })
+        .await
+        .expect("write should succeed");
+
+        let parsed = GlobalConfig::from_toml_str(
+            &std::fs::read_to_string(&path).expect("read back"),
+            "written",
+        )
+        .expect("valid TOML");
+
+        assert_eq!(parsed.concurrency, 7);
+        assert_eq!(parsed.theme_name, "Ayu Mirage");
+        assert_eq!(parsed.caps.gate_iterations, 9);
+        assert_eq!(parsed.providers.len(), 1);
+        assert_eq!(parsed.providers[0].name, "grok");
+        assert_eq!(
+            parsed.roles.developer.as_ref().unwrap().model.as_deref(),
+            Some("dev-model"),
+            "the edited role must be written"
+        );
+        let reviewer = parsed.roles.reviewer.as_ref().unwrap();
+        assert_eq!(
+            reviewer.model.as_deref(),
+            Some("reviewer-model"),
+            "an untouched role must round-trip"
+        );
+        assert_eq!(reviewer.effort.as_deref(), Some("high"));
+    }
+
+    /// An existing file that does not parse is left byte-for-byte alone —
+    /// overwriting it would destroy the operator's providers, caps, and theme.
+    #[tokio::test]
+    async fn write_global_config_refuses_to_overwrite_an_unparseable_file() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("config.toml");
+        let original = "this is not = = valid toml!!!";
+        std::fs::write(&path, original).expect("seed broken config");
+
+        let error = write_global_config_at(&path, |global| {
+            global.theme_name = "Ayu Mirage".into();
+        })
+        .await
+        .expect_err("an unparseable global config must not be overwritten");
+
+        assert!(
+            matches!(error, GlobalConfigWriteError::Unparseable { .. }),
+            "expected Unparseable, got: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            original,
+            "the broken file must be left exactly as it was"
         );
     }
 }

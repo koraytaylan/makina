@@ -129,6 +129,22 @@ Gates are exit-code-zero shell commands run (via `sh -c`) in each task's worktre
 a task must pass all of them before it is reviewed and merged. Sign the agent in
 once (e.g. run `gemini` interactively) — Makina inherits its session.
 
+### Per-role models
+
+Choosing a Developer, Reviewer, or Planner model in Settings writes it to **both**
+layers: the project's `.makina/config.toml` and `~/.makina/config.toml` (created if
+it does not exist yet). A role's model then resolves **project → global → unset**,
+so the global layer doubles as your last-selected models and a brand-new project
+picks them up with no project config of its own. Clearing a model field leaves the
+stored selection alone; to change a model, pick a different one.
+
+```toml
+# ~/.makina/config.toml — written for you when you pick a model in Settings
+[roles.developer]
+provider = "default"
+model    = "claude-sonnet-4"
+```
+
 ### Safe defaults
 
 The shipped `.makina/config.toml` uses `concurrency = 2` (a first-timer-safe ceiling:
