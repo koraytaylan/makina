@@ -290,12 +290,13 @@ async fn real_cli_applies_the_configured_model() {
     let (program, args) = cli_program_and_args();
     let model = std::env::var("MAKINA_ACP_MODEL")
         .expect("set MAKINA_ACP_MODEL to a model value the agent advertises");
+    let mode = std::env::var("MAKINA_ACP_MODE").ok();
 
     let backend = AcpBackend::new(&program, args);
     let config = SessionConfig {
         working_dir: std::env::current_dir().unwrap(),
         system_prompt: "You are a test harness. Do nothing.".to_string(),
-        mode: None,
+        mode: mode.clone(),
         model: Some(model.clone()),
         effort: None,
         extra: None,
@@ -303,7 +304,7 @@ async fn real_cli_applies_the_configured_model() {
         run_id: String::new(),
     };
 
-    eprintln!("spawning session on {program} with model {model}");
+    eprintln!("spawning session on {program} with model {model}, mode {mode:?}");
     // The assertion IS the spawn: applying the model option is part of `spawn`,
     // so a rejected `session/set_config_option` surfaces here as an `Err`.
     let mut session = backend

@@ -602,6 +602,38 @@ impl AcpClient {
         .await
     }
 
+    /// Convenience: set the agent's session mode through the `mode`-category
+    /// config option, for agents that advertise no `modes` object.
+    ///
+    /// The `modes` object is optional in the schema, and a real agent may omit
+    /// it entirely and expose the session mode as an ordinary config option
+    /// instead (opencode 1.18.11 does exactly this: no `modes`, plus a
+    /// `{id: "mode", category: "mode"}` select).  Without this path a configured
+    /// role mode is silently dropped for such an agent.
+    ///
+    /// Returns `Ok(false)` — nothing set — when the agent advertises no
+    /// `mode`-category option, or advertises one that does not offer `mode`
+    /// among its choices.  The choice check is not cosmetic: an agent rejects an
+    /// unknown mode (opencode answers `-32602 mode not found`), and that error
+    /// fails the whole session spawn.  This mirrors the `available_modes` guard
+    /// on the `session/set_mode` path.
+    pub async fn set_mode_option(&mut self, mode: &str) -> Result<bool> {
+        let option = self
+            .config_options
+            .iter()
+            .find(|o| o.category.as_deref() == Some("mode"));
+        let Some(option) = option else {
+            return Ok(false);
+        };
+        if !option.options.iter().any(|choice| choice.value == mode) {
+            return Ok(false);
+        }
+        let id = option.id.clone();
+        self.set_config_option(&id, serde_json::Value::String(mode.to_string()))
+            .await?;
+        Ok(true)
+    }
+
     /// Locate the advertised config option whose `category` matches and set it.
     async fn set_option_in_category(
         &mut self,

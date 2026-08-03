@@ -298,51 +298,74 @@ impl AgentBackend for AcpBackend {
         let command = self.command_for(&config);
         let mut client = AcpClient::connect(command).await.map_err(map_error)?;
 
-        // Apply role assignments (mode, model, effort) if advertised.
-        if let Some(mode) = &config.mode
-            && let Some(modes) = client.modes()
-            && modes.available_modes.iter().any(|m| &m.id == mode)
-        {
-            client.set_mode(mode).await.map_err(map_error)?;
-        }
-
-        if let Some(model) = &config.model {
-            // Find the first option whose category is "model" — its *id* is the
-            // option identifier; `model` is the desired *value* to set on it.
-            let model_option_id = client
-                .config_options()
-                .iter()
-                .find(|o| o.category.as_deref() == Some("model"))
-                .map(|o| o.id.clone());
-            if let Some(option_id) = model_option_id {
-                client
-                    .set_config_option(&option_id, serde_json::Value::String(model.clone()))
-                    .await
-                    .map_err(map_error)?;
-            }
-        }
-
-        if let Some(effort) = &config.effort {
-            // Find the first option whose category is "thought_level" — its *id* is
-            // the option identifier; `effort` is the desired *value* to set on it.
-            let effort_option_id = client
-                .config_options()
-                .iter()
-                .find(|o| o.category.as_deref() == Some("thought_level"))
-                .map(|o| o.id.clone());
-            if let Some(option_id) = effort_option_id {
-                client
-                    .set_config_option(&option_id, serde_json::Value::String(effort.clone()))
-                    .await
-                    .map_err(map_error)?;
-            }
-        }
+        apply_role_selections(&mut client, &config).await?;
 
         Ok(Box::new(AcpSession::from_client(
             client,
             config.system_prompt,
         )))
     }
+}
+
+/// Apply the role assignment's mode/model/effort to a freshly-connected client,
+/// skipping anything the agent did not advertise.
+///
+/// Lives outside [`AgentBackend::spawn`] so a test can drive the **same** code
+/// the production path runs.  Spawning needs a real subprocess, so a test that
+/// reimplemented this logic inline could not catch a change to it.
+async fn apply_role_selections(
+    client: &mut AcpClient,
+    config: &SessionConfig,
+) -> Result<(), BackendError> {
+    if let Some(mode) = &config.mode {
+        // Preferred: the dedicated `modes` object and `session/set_mode`.
+        let advertised_as_mode = client
+            .modes()
+            .is_some_and(|modes| modes.available_modes.iter().any(|m| &m.id == mode));
+        if advertised_as_mode {
+            client.set_mode(mode).await.map_err(map_error)?;
+        } else {
+            // Fallback: `modes` is optional in the schema, and an agent may omit
+            // it entirely and expose the session mode as a `category: "mode"`
+            // config option instead (opencode 1.18.11 does exactly this).
+            // Without this the configured role mode was silently dropped.
+            client.set_mode_option(mode).await.map_err(map_error)?;
+        }
+    }
+
+    if let Some(model) = &config.model {
+        // Find the first option whose category is "model" — its *id* is the
+        // option identifier; `model` is the desired *value* to set on it.
+        let model_option_id = client
+            .config_options()
+            .iter()
+            .find(|o| o.category.as_deref() == Some("model"))
+            .map(|o| o.id.clone());
+        if let Some(option_id) = model_option_id {
+            client
+                .set_config_option(&option_id, serde_json::Value::String(model.clone()))
+                .await
+                .map_err(map_error)?;
+        }
+    }
+
+    if let Some(effort) = &config.effort {
+        // Find the first option whose category is "thought_level" — its *id* is
+        // the option identifier; `effort` is the desired *value* to set on it.
+        let effort_option_id = client
+            .config_options()
+            .iter()
+            .find(|o| o.category.as_deref() == Some("thought_level"))
+            .map(|o| o.id.clone());
+        if let Some(option_id) = effort_option_id {
+            client
+                .set_config_option(&option_id, serde_json::Value::String(effort.clone()))
+                .await
+                .map_err(map_error)?;
+        }
+    }
+
+    Ok(())
 }
 
 // ── Capability snapshot helper ────────────────────────────────────────────────
@@ -1669,6 +1692,213 @@ mod tests {
             recorded[0].task_id.as_deref(),
             Some(EXPECTED_TASK_ID),
             "AuditEntry.task_id must match SessionConfig.task_id threaded through spawn"
+        );
+    }
+
+    /// **An agent that advertises no `modes` object still gets its role mode.**
+    ///
+    /// The ACP `modes` object is optional, and a real agent may omit it and
+    /// expose the session mode as a `category: "mode"` config option instead —
+    /// opencode 1.18.11 does. `apply_role_selections` previously reached for
+    /// `client.modes()` only, so a configured role mode was silently dropped for
+    /// such an agent: no error, no log, just the agent's default mode.
+    ///
+    /// Drives the real `apply_role_selections` (the same code `spawn` runs)
+    /// against a mock agent over a duplex pipe, and asserts the client sends
+    /// `session/set_config_option` with the mode option's id and value.
+    #[tokio::test]
+    async fn role_mode_falls_back_to_the_mode_category_config_option() {
+        use serde_json::json;
+        use std::sync::Mutex;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&requests);
+
+        let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(peer_read).lines();
+            macro_rules! reply {
+                ($v:expr) => {{
+                    let line = format!("{}\n", serde_json::to_string(&$v).unwrap());
+                    peer_write.write_all(line.as_bytes()).await.unwrap();
+                    peer_write.flush().await.unwrap();
+                }};
+            }
+
+            // initialize
+            let init: serde_json::Value =
+                serde_json::from_str(lines.next_line().await.unwrap().unwrap().trim()).unwrap();
+            reply!(json!({
+                "jsonrpc": "2.0", "id": init["id"],
+                "result": { "protocolVersion": 1, "agentCapabilities": {} }
+            }));
+
+            // session/new — NO `modes` key at all; mode is a config option.
+            let new: serde_json::Value =
+                serde_json::from_str(lines.next_line().await.unwrap().unwrap().trim()).unwrap();
+            reply!(json!({
+                "jsonrpc": "2.0", "id": new["id"],
+                "result": {
+                    "sessionId": "sess-no-modes",
+                    "configOptions": [
+                        {
+                            "id": "mode", "name": "Session Mode",
+                            "category": "mode", "type": "select",
+                            "currentValue": "build",
+                            "options": [
+                                { "value": "build", "name": "build" },
+                                { "value": "plan", "name": "plan" }
+                            ]
+                        }
+                    ]
+                }
+            }));
+
+            // Whatever the client sends next is what we are testing.  Bounded:
+            // if the mode were dropped nothing would arrive, and an unbounded
+            // read would hang the suite instead of failing the assertion below.
+            let next =
+                tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line()).await;
+            let Ok(Ok(Some(line))) = next else {
+                return; // nothing sent — the assertions below report it.
+            };
+            let applied: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            recorder.lock().unwrap().push(applied.clone());
+            reply!(json!({ "jsonrpc": "2.0", "id": applied["id"], "result": {} }));
+        });
+
+        let mut client = AcpClient::with_transport(
+            client_read,
+            client_write,
+            std::path::Path::new("/work"),
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .expect("handshake against the mock agent");
+
+        assert!(
+            client.modes().is_none(),
+            "the mock deliberately advertises no `modes` object"
+        );
+
+        let config = SessionConfig {
+            working_dir: std::path::PathBuf::from("/work"),
+            system_prompt: String::new(),
+            mode: Some("plan".into()),
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: String::new(),
+        };
+        apply_role_selections(&mut client, &config)
+            .await
+            .expect("applying the role mode must succeed");
+
+        mock.await.expect("mock agent task");
+
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "exactly one request must be sent; got {sent:?}"
+        );
+        assert_eq!(
+            sent[0]["method"], "session/set_config_option",
+            "an agent without `modes` must be driven through the mode config option"
+        );
+        assert_eq!(sent[0]["params"]["configId"], "mode");
+        assert_eq!(sent[0]["params"]["value"], "plan");
+    }
+
+    /// A mode the agent does not offer must be skipped, not sent.
+    ///
+    /// The agent rejects an unknown mode (opencode answers
+    /// `-32602 mode not found`), and that error fails the whole session spawn —
+    /// so an unavailable mode must be dropped exactly as the `modes`-object path
+    /// drops one missing from `available_modes`.
+    #[tokio::test]
+    async fn an_unavailable_mode_is_not_sent_to_the_agent() {
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (peer_read, mut peer_write) = tokio::io::split(peer_io);
+
+        let mock = tokio::spawn(async move {
+            let mut lines = BufReader::new(peer_read).lines();
+            macro_rules! reply {
+                ($v:expr) => {{
+                    let line = format!("{}\n", serde_json::to_string(&$v).unwrap());
+                    peer_write.write_all(line.as_bytes()).await.unwrap();
+                    peer_write.flush().await.unwrap();
+                }};
+            }
+            let init: serde_json::Value =
+                serde_json::from_str(lines.next_line().await.unwrap().unwrap().trim()).unwrap();
+            reply!(json!({
+                "jsonrpc": "2.0", "id": init["id"],
+                "result": { "protocolVersion": 1, "agentCapabilities": {} }
+            }));
+            let new: serde_json::Value =
+                serde_json::from_str(lines.next_line().await.unwrap().unwrap().trim()).unwrap();
+            reply!(json!({
+                "jsonrpc": "2.0", "id": new["id"],
+                "result": {
+                    "sessionId": "sess-no-modes",
+                    "configOptions": [
+                        {
+                            "id": "mode", "name": "Session Mode",
+                            "category": "mode", "type": "select",
+                            "options": [{ "value": "build", "name": "build" }]
+                        }
+                    ]
+                }
+            }));
+            // Anything further would be the bug: report it back.
+            lines.next_line().await.unwrap()
+        });
+
+        let mut client = AcpClient::with_transport(
+            client_read,
+            client_write,
+            std::path::Path::new("/work"),
+            None,
+            None,
+            String::new(),
+            None,
+        )
+        .await
+        .expect("handshake against the mock agent");
+
+        let config = SessionConfig {
+            working_dir: std::path::PathBuf::from("/work"),
+            system_prompt: String::new(),
+            mode: Some("nonexistent".into()),
+            model: None,
+            effort: None,
+            extra: None,
+            task_id: None,
+            run_id: String::new(),
+        };
+        apply_role_selections(&mut client, &config)
+            .await
+            .expect("an unavailable mode must be skipped, not surfaced as an error");
+
+        // Drop the client so the mock's pending read ends instead of hanging.
+        drop(client);
+        let extra = mock.await.expect("mock agent task");
+        assert!(
+            extra.is_none(),
+            "no request may be sent for a mode the agent does not offer; got {extra:?}"
         );
     }
 }
