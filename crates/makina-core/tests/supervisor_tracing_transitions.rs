@@ -279,3 +279,109 @@ async fn run_graph_emits_tracing_transition_and_gate_events() {
         "must capture at least one gate-output record (`gates passed` or `gate failed`); got {events:#?}"
     );
 }
+
+// ── Failure-path acceptance test ───────────────────────────────────────────────
+
+/// An [`AgentBackend`] whose `spawn` always fails — mirrors the production
+/// failure where a session could not be opened (e.g. the agent rejected a
+/// handshake request), which surfaces as `developer backend spawn failed: …`.
+#[derive(Clone)]
+struct SpawnFailsBackend;
+
+#[async_trait::async_trait]
+impl AgentBackend for SpawnFailsBackend {
+    async fn spawn(
+        &self,
+        _config: makina_core::backend::SessionConfig,
+    ) -> Result<Box<dyn makina_core::backend::AgentSession>, makina_core::backend::BackendError>
+    {
+        Err(makina_core::backend::BackendError::Transport {
+            reason: "injected handshake rejection".to_string(),
+        })
+    }
+}
+
+/// **A hard failure is recorded in the per-task log** — the developer hard-error
+/// arm must emit both the failure record (with its reason) and the terminal
+/// `InProgress → Failed` transition.
+///
+/// Without these the arm returns silently: the per-task log ends at
+/// `Ready → InProgress`, and the only trace of the failure is the persisted run
+/// snapshot — a failed run with no error message in any log.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hard_developer_failure_is_traced_with_its_reason() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    // SAFETY: serialized by HOME_ENV_LOCK for the duration of this async test.
+    unsafe { std::env::set_var("HOME", temp_home.path()) };
+
+    let task_id_str = "failing-task";
+    let backend: Arc<dyn AgentBackend> = Arc::new(SpawnFailsBackend);
+
+    let collector = CapturingCollector::new();
+    let probe = collector.clone();
+    let _guard = install(collector);
+
+    let graph = Arc::new(tokio::sync::Mutex::new(TaskGraph {
+        slug: "trace-failure-slug".into(),
+        tasks: vec![task(task_id_str)],
+        authored: Default::default(),
+    }));
+
+    let control = RunControl {
+        run: RunId(8),
+        sink: Arc::new(|_| {}),
+        pause: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+
+    let report = run_graph(
+        Arc::clone(&graph),
+        WorktreeManager::new(repo_root, "develop".into()),
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+        Arc::clone(&backend),
+        backend,
+        control,
+        Arc::new(NoopAuditRegistry),
+        "trace-failure-slug".to_string(),
+        "trace-failure-run-uid".to_string(),
+        String::new(),
+        Arc::new(SourceProjectionUnavailable::new()),
+    )
+    .await
+    .expect("a task-level failure must not hard-error the run");
+
+    assert_eq!(
+        report.outcomes,
+        vec![(TaskId::new(task_id_str), TaskState::Failed)],
+        "the task must reach Failed"
+    );
+
+    let events = probe.captured();
+
+    let failure_record = events
+        .iter()
+        .find(|e| e.message == "developer turn failed" && e.field("task") == Some(task_id_str))
+        .unwrap_or_else(|| {
+            panic!("the developer hard-error arm must trace the failure; got {events:#?}")
+        });
+    let reason = failure_record
+        .field("reason")
+        .expect("the failure record must carry a `reason` field");
+    assert!(
+        reason.contains("injected handshake rejection"),
+        "the traced reason must carry the backend's error; got {reason:?}"
+    );
+
+    assert!(
+        events.iter().any(|e| {
+            e.message == "task state transition"
+                && e.field("task") == Some(task_id_str)
+                && e.field("from") == Some("InProgress")
+                && e.field("to") == Some("Failed")
+        }),
+        "must capture the terminal InProgress → Failed transition; got {events:#?}"
+    );
+}

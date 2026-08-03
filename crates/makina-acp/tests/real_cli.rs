@@ -269,3 +269,50 @@ fn probe_permission_trigger_captured_data() {
         "Conclusion: keep empty ClientCapabilities; permission requests arrive regardless of fs advertisement."
     );
 }
+
+/// **Model selection reaches the agent** — `AcpBackend::spawn` applies
+/// `SessionConfig::model` via `session/set_config_option`.  A wrong param name
+/// there makes a conforming agent reject the request with JSON-RPC `-32602`,
+/// which fails the whole spawn and therefore the whole run — the failure this
+/// test guards against was exactly that (`optionId` instead of `configId`).
+///
+/// This test spawns and terminates a session; it never sends a prompt, so it
+/// costs no model tokens.
+///
+/// ```bash
+/// MAKINA_ACP_CMD=opencode MAKINA_ACP_ARGS=acp MAKINA_ACP_MODEL='<provider/model>' \
+///     cargo test -p makina-acp --test real_cli -- --ignored --nocapture \
+///     real_cli_applies_the_configured_model
+/// ```
+#[tokio::test]
+#[ignore = "requires a real, authenticated ACP CLI; run manually with MAKINA_ACP_CMD set"]
+async fn real_cli_applies_the_configured_model() {
+    let (program, args) = cli_program_and_args();
+    let model = std::env::var("MAKINA_ACP_MODEL")
+        .expect("set MAKINA_ACP_MODEL to a model value the agent advertises");
+
+    let backend = AcpBackend::new(&program, args);
+    let config = SessionConfig {
+        working_dir: std::env::current_dir().unwrap(),
+        system_prompt: "You are a test harness. Do nothing.".to_string(),
+        mode: None,
+        model: Some(model.clone()),
+        effort: None,
+        extra: None,
+        task_id: None,
+        run_id: String::new(),
+    };
+
+    eprintln!("spawning session on {program} with model {model}");
+    // The assertion IS the spawn: applying the model option is part of `spawn`,
+    // so a rejected `session/set_config_option` surfaces here as an `Err`.
+    let mut session = backend
+        .spawn(config)
+        .await
+        .expect("spawn must apply the configured model without the agent rejecting it");
+
+    if let Some(capabilities) = session.capabilities() {
+        eprintln!("agent capabilities: {capabilities:?}");
+    }
+    session.terminate().await.expect("terminate");
+}

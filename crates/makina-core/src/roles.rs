@@ -272,7 +272,7 @@ pub fn current_model_from(caps: Option<&api::SessionCapabilities>) -> Option<Str
     let caps = caps?;
     caps.config_options
         .iter()
-        .find(|opt| opt.category == "model")
+        .find(|opt| opt.category.as_deref() == Some("model"))
         .and_then(|opt| opt.current_value.as_ref())
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())

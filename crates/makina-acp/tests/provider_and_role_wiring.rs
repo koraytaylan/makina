@@ -240,7 +240,7 @@ async fn roles_use_distinct_providers() {
 /// 2. Responds to `session/new` with `modes` (one available mode: "code-mode")
 ///    and `configOptions` (one model option with id "model-opt" and category "model").
 /// 3. Expects to receive `session/set_mode` with `modeId = "code-mode"`.
-/// 4. Expects to receive `session/set_config_option` with `optionId = "model-opt"`
+/// 4. Expects to receive `session/set_config_option` with `configId = "model-opt"`
 ///    and `value = "grok-3-mini"`.
 /// 5. Sends back successful responses for both.
 ///
@@ -344,9 +344,16 @@ async fn selections_applied_after_session_new() {
             "session/set_config_option",
             "expected session/set_config_option"
         );
-        let opt_id = set_opt_req["params"]["optionId"]
+        // The wire name for the option identifier is `configId`; a conforming
+        // agent rejects `optionId` with -32602 and the session spawn fails.
+        assert!(
+            set_opt_req["params"].get("optionId").is_none(),
+            "set_config_option must not send `optionId`; got {}",
+            set_opt_req["params"]
+        );
+        let opt_id = set_opt_req["params"]["configId"]
             .as_str()
-            .unwrap()
+            .expect("set_config_option params must carry a string `configId`")
             .to_string();
         let opt_val = set_opt_req["params"]["value"].clone();
         config_log_clone.lock().unwrap().push((opt_id, opt_val));
@@ -395,7 +402,7 @@ async fn selections_applied_after_session_new() {
     let model_option_id = client
         .config_options()
         .iter()
-        .find(|o| o.category == "model")
+        .find(|o| o.category.as_deref() == Some("model"))
         .map(|o| o.id.clone());
     if let Some(option_id) = model_option_id {
         client

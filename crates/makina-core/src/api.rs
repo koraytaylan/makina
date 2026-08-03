@@ -890,7 +890,13 @@ pub struct ConfigOptionView {
     /// Human-readable name of the option.
     pub name: String,
     /// The category of this option (e.g., "model", "thought_level", "model_config").
-    pub category: String,
+    ///
+    /// `None` when the agent advertised the option without a category — the ACP
+    /// schema makes it optional.  Mirrors the protocol shape rather than
+    /// substituting `""`, so a lookup for a well-known category cannot match an
+    /// option that declared none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// The type of this option (e.g., "select", "boolean").
     pub kind: String,
     /// The current value of this option (if set).
@@ -911,6 +917,10 @@ pub struct ConfigOptionChoiceView {
     /// Optional description of what this choice does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Label of the group this choice was advertised under (e.g. the provider,
+    /// for a grouped model list); `None` when the agent sent a flat list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Long-running plan-level operation surfaced to the TUI.
@@ -1025,6 +1035,25 @@ pub enum Event {
         task: TaskId,
         /// The new state of the task.
         state: TaskState,
+    },
+
+    /// A task reached the `Failed` state, with the reason it failed.
+    ///
+    /// [`Event::TaskStateChanged`] carries only the new [`TaskState`], so on its
+    /// own a failure reaches the TUI as a bare `Failed` badge with no
+    /// explanation — the supervisor's diagnosis would live only in the persisted
+    /// run snapshot.  This event carries that diagnosis on the live stream so
+    /// the TUI can populate [`TaskView::failure_reason`] and render it.
+    ///
+    /// Emitted alongside (immediately before) the terminal
+    /// `TaskStateChanged{state: Failed}` for the same task.
+    TaskFailed {
+        /// The Run that contains the task.
+        run: RunId,
+        /// The task that failed.
+        task: TaskId,
+        /// Why it failed.
+        reason: FailureReason,
     },
 
     /// A task's iteration counters were updated.

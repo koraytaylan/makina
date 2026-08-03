@@ -893,6 +893,35 @@ impl DriverContext {
         });
     }
 
+    /// Emit `TaskFailed{run, task, reason}` carrying the reason stored on the
+    /// task at its failure site, and record it in the per-task log.
+    ///
+    /// `TaskStateChanged` carries only the state, so without this the TUI shows
+    /// a bare `Failed` badge and the reason survives only in the run snapshot —
+    /// a failed run with no visible error anywhere.  Call this immediately
+    /// **before** the terminal `emit_task_state(.., Failed)` on every arm that
+    /// lands a task on `Failed`.  A no-op when no reason was stored.
+    async fn emit_task_failure(&self, task_id: &TaskId) {
+        let reason = {
+            let graph = self.graph.lock().await;
+            stored_failure_reason_locked(&graph, task_id)
+        }; // guard dropped before emit.
+        let Some(reason) = reason else {
+            return;
+        };
+        tracing::error!(
+            task = %task_id.0,
+            kind = ?reason.kind,
+            reason = %reason.message,
+            "task failed"
+        );
+        self.control.emit(api::Event::TaskFailed {
+            run: self.control.run,
+            task: api::TaskId(task_id.0.clone()),
+            reason,
+        });
+    }
+
     /// Emit `TaskIterationsUpdated{run, task, gate, review}` for this run.
     ///
     /// Called after a gate/review counter bump, outside the graph lock.
@@ -1010,6 +1039,9 @@ impl DriverContext {
                 .collect::<Vec<_>>()
         };
         for (id, state) in changed {
+            if state == TaskState::Failed {
+                self.emit_task_failure(&id).await;
+            }
             self.emit_task_state(&id, state);
         }
     }
@@ -1679,6 +1711,9 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
         match joined {
             Some(Ok((id, Some(Ok(state))))) => {
                 in_flight.remove(&id);
+                if state == TaskState::Failed {
+                    ctx.emit_task_failure(&id).await;
+                }
                 ctx.emit_task_state(&id, state);
                 outcomes.push((id.clone(), state));
                 // A cap-driven terminal `Failed` surfaces here (gate/review caps
@@ -1726,6 +1761,9 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                     let skipped = mark_dependents_skipped(&mut graph, &id);
                     (terminal, skipped)
                 };
+                if terminal == TaskState::Failed {
+                    ctx.emit_task_failure(&id).await;
+                }
                 ctx.emit_task_state(&id, terminal);
                 // Persist the dependents' Skipped transitions (best-effort; lock
                 // already released above).
@@ -1788,6 +1826,9 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 // Persist WallClockCapReached → Failed + dependents' Skipped
                 // (best-effort).
                 ctx.persist().await;
+                if final_state == TaskState::Failed {
+                    ctx.emit_task_failure(&id).await;
+                }
                 ctx.emit_task_state(&id, final_state);
                 // Cap failures carry no driver reason string, so synthesize the
                 // literal for this arm (sched-run-status-failed).  Guard on
@@ -2250,8 +2291,26 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     let mut graph = ctx.graph.lock().await;
                     apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                     mark_finished_locked(&mut graph, task_id);
-                    set_failure_reason_locked(&mut graph, task_id, failure_kind, msg.clone());
+                    set_failure_reason_locked(
+                        &mut graph,
+                        task_id,
+                        failure_kind.clone(),
+                        msg.clone(),
+                    );
                 }
+                // Record the failure in the per-task log (see the developer arm).
+                tracing::error!(
+                    task = %task_id.0,
+                    kind = ?failure_kind,
+                    reason = %msg,
+                    "reviewer turn failed"
+                );
+                tracing::info!(
+                    task = %task_id.0,
+                    from = ?TaskState::InReview,
+                    to = ?TaskState::Failed,
+                    "task state transition"
+                );
                 // Persist InReview→Failed (best-effort; lock released above).
                 ctx.persist().await;
                 remove_worktree(ctx, task_id).await;
@@ -2678,8 +2737,24 @@ async fn develop_until_gates_pass(
                 let mut graph = ctx.graph.lock().await;
                 apply_event_locked(&mut graph, task_id, TaskEvent::HardError)?;
                 mark_finished_locked(&mut graph, task_id);
-                set_failure_reason_locked(&mut graph, task_id, failure_kind, msg.clone());
+                set_failure_reason_locked(&mut graph, task_id, failure_kind.clone(), msg.clone());
             }
+            // Record the failure in the per-task log.  This runs inside the
+            // task's `task_slug` span, so it lands in `{task_slug}.log` — the
+            // scheduler's own `TaskFailed` log line is outside that span and
+            // goes to `run.log` instead.
+            tracing::error!(
+                task = %task_id.0,
+                kind = ?failure_kind,
+                reason = %msg,
+                "developer turn failed"
+            );
+            tracing::info!(
+                task = %task_id.0,
+                from = ?TaskState::InProgress,
+                to = ?TaskState::Failed,
+                "task state transition"
+            );
             // Persist InProgress→Failed (best-effort; lock released above).
             ctx.persist().await;
             remove_worktree(ctx, task_id).await;
@@ -2956,13 +3031,19 @@ fn set_failure_reason_locked(
     }
 }
 
-/// Read the stored [`api::FailureReason`] from the locked graph, returning
-/// its `message` string, or `None` if no reason was set.
-fn stored_failure_reason_message_locked(graph: &TaskGraph, task_id: &TaskId) -> Option<String> {
+/// Read the stored [`api::FailureReason`] from the locked graph, or `None` if
+/// no reason was set.
+fn stored_failure_reason_locked(graph: &TaskGraph, task_id: &TaskId) -> Option<api::FailureReason> {
     graph
         .get(task_id)
         .and_then(|t| t.failure_reason.as_ref())
-        .map(|fr| fr.message.clone())
+        .cloned()
+}
+
+/// Read the stored [`api::FailureReason`] from the locked graph, returning
+/// its `message` string, or `None` if no reason was set.
+fn stored_failure_reason_message_locked(graph: &TaskGraph, task_id: &TaskId) -> Option<String> {
+    stored_failure_reason_locked(graph, task_id).map(|fr| fr.message)
 }
 
 /// Settle a task whose driver returned `Err`, and report its terminal state.

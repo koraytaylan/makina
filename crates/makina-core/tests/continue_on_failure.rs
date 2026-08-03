@@ -607,3 +607,98 @@ async fn scheduler_fatal_arm_reports_a_genuine_driver_future_panic() {
         "the fatal error must report the panic; got {err:?}"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test 4: a failed task publishes WHY it failed on the live event stream
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// **A failure is visible to the client** — `TaskStateChanged` carries only the
+/// new `TaskState`, so on its own a hard error reaches the TUI as a bare
+/// `Failed` badge and the supervisor's diagnosis lives only in the persisted run
+/// snapshot: a failed run with no error message anywhere in the UI.
+///
+/// The scheduler must therefore publish `Event::TaskFailed{run, task, reason}`
+/// carrying the reason it stored at the failure site, for the failed task only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_task_publishes_its_failure_reason_as_an_event() {
+    use makina_core::api;
+
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // `b` fails (Developer hard error); `a` succeeds and is approved.
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(FailOneBackend::new("", "b", r#"{"verdict":"approve"}"#));
+
+    let graph = TaskGraph {
+        slug: "failure-reason-event".into(),
+        tasks: vec![task("a", &[]), task("b", &[])],
+        authored: Default::default(),
+    };
+
+    let (_report, _shared, events) = tokio::time::timeout(
+        Duration::from_secs(20),
+        common::run_graph_in_repo_capturing(
+            repo_root,
+            graph,
+            Arc::clone(&backend),
+            backend,
+            config(2),
+        ),
+    )
+    .await
+    .expect("run_graph must not deadlock (timed out)");
+
+    let failures: Vec<(&api::TaskId, &api::FailureReason)> = events
+        .iter()
+        .filter_map(|e| match e {
+            api::Event::TaskFailed { task, reason, .. } => Some((task, reason)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly one TaskFailed must be published (only `b` failed); got {failures:?}"
+    );
+    let (failed_id, reason) = failures[0];
+    assert_eq!(failed_id.0, "b", "TaskFailed must name the failed task");
+    assert_eq!(
+        reason.kind,
+        api::FailureKind::HardError,
+        "a developer dispatch failure is a hard error; got {:?}",
+        reason.kind
+    );
+    assert!(
+        reason.message.contains('b'),
+        "the reason must carry the supervisor's message; got {:?}",
+        reason.message
+    );
+
+    // The reason must arrive no later than the terminal `Failed` badge, so the
+    // TUI never renders a `Failed` task with no explanation attached.
+    let failed_at = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                api::Event::TaskFailed { task, .. } if task.0 == "b"
+            )
+        })
+        .expect("TaskFailed must be present");
+    let state_changed_at = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                api::Event::TaskStateChanged { task, state, .. }
+                    if task.0 == "b" && *state == api::TaskState::Failed
+            )
+        })
+        .expect("the terminal TaskStateChanged{Failed} must be present");
+    assert!(
+        failed_at < state_changed_at,
+        "TaskFailed must precede TaskStateChanged{{Failed}} (got {failed_at} vs {state_changed_at})"
+    );
+}

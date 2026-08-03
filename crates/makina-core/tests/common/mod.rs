@@ -166,6 +166,55 @@ pub async fn run_graph_in_repo_result(
     Ok((report, shared))
 }
 
+/// Drive a graph through the production scheduler with a **capturing**
+/// [`RunControl`], returning every [`makina_core::api::Event`] the run published
+/// in emission order alongside the report.
+///
+/// The other helpers use [`RunControl::silent`], so they cannot observe the live
+/// event stream at all.  Tests that assert on what the TUI would actually see
+/// (e.g. that a failure carries its reason to the client) need this instead.
+pub async fn run_graph_in_repo_capturing(
+    repo_root: PathBuf,
+    graph: TaskGraph,
+    developer_backend: Arc<dyn AgentBackend>,
+    reviewer_backend: Arc<dyn AgentBackend>,
+    config: Config,
+) -> (RunReport, SharedTaskGraph, Vec<makina_core::api::Event>) {
+    ensure_writable_home();
+
+    let events: Arc<std::sync::Mutex<Vec<makina_core::api::Event>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+
+    let base_branch = config.base_branch.clone();
+    let run_slug = graph.slug.clone();
+    let shared = Arc::new(TokioMutex::new(graph));
+    let control = RunControl {
+        sink: Arc::new(move |event| {
+            sink_events.lock().expect("event sink lock").push(event);
+        }),
+        ..RunControl::silent()
+    };
+    let report = run_graph(
+        Arc::clone(&shared),
+        WorktreeManager::new(repo_root, base_branch),
+        config,
+        developer_backend,
+        reviewer_backend,
+        control,
+        Arc::new(NoopAuditRegistry),
+        run_slug,
+        "test-run".to_string(),
+        String::new(),
+        Arc::new(SourceProjectionUnavailable::new()),
+    )
+    .await
+    .expect("run_graph must drive the loop without a hard error");
+
+    let captured = events.lock().expect("event sink lock").clone();
+    (report, shared, captured)
+}
+
 /// Clone the scheduler-owned graph for assertions.
 pub async fn graph_snapshot(shared: &SharedTaskGraph) -> TaskGraph {
     shared.lock().await.clone()

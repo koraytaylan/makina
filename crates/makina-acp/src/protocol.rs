@@ -365,6 +365,22 @@ pub struct SessionModeState {
     pub available_modes: Vec<SessionMode>,
 }
 
+/// Deserialize a JSON array the schema marks `nullish`, mapping an explicit
+/// `null` **and** an omitted key to an empty `Vec`.
+///
+/// `#[serde(default)]` alone covers only the *omitted* case; an explicit `null`
+/// still fails with `invalid type: null, expected a sequence`.  For a field on
+/// the `session/new` result that failure rejects the entire result, so the
+/// spawn fails and the task hard-errors — a `null` array would take down the
+/// run.  Pair this with `#[serde(default)]` so both spellings are accepted.
+fn nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// A choice for a config option (e.g., a model variant).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigOptionChoice {
@@ -375,6 +391,77 @@ pub struct ConfigOptionChoice {
     /// Optional description of what this choice does.
     #[serde(default)]
     pub description: Option<String>,
+    /// Human-readable label of the group this choice was advertised under, when
+    /// the agent groups its choices (e.g. models by provider); `None` for a flat
+    /// choice list.
+    ///
+    /// Never read from the choice object itself — the schema's choice shape has
+    /// no `group` field.  [`flattened_choices`] fills this in from the enclosing
+    /// group while flattening, so the grouping the agent expressed is preserved
+    /// rather than discarded.
+    #[serde(skip)]
+    pub group: Option<String>,
+}
+
+/// A group of choices, for agents that advertise their choices grouped (e.g.
+/// models by provider) rather than as one flat list.
+///
+/// Not public: groups are flattened into [`ConfigOptionChoice`]s (each carrying
+/// its group label) by [`flattened_choices`], so consumers only ever deal with
+/// a flat list.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigOptionChoiceGroup {
+    /// Stable group identifier.
+    ///
+    /// Not read after parsing — it is declared because it is what distinguishes
+    /// the grouped shape from the flat one in [`flattened_choices`]'s untagged
+    /// union.  Dropping it would let a flat choice satisfy this variant.
+    #[expect(dead_code, reason = "required for the untagged shape discrimination")]
+    group: String,
+    /// Human-readable group label — preserved onto each flattened choice.
+    name: String,
+    /// The choices in this group.
+    #[serde(default, deserialize_with = "nullable_vec")]
+    options: Vec<ConfigOptionChoice>,
+}
+
+/// Deserialize a select option's `options`, which the schema models as a union
+/// of **either** a flat choice array **or** an array of groups:
+/// `union([array(Choice), array(Group)])`.
+///
+/// A group carries no `value` of its own, so modelling only the flat half made
+/// a grouped list fail with `missing field \`value\`` — rejecting the whole
+/// `session/new` result and failing the run.  Groups are flattened into the
+/// choice list with their label preserved on each choice; no `value` is
+/// invented for the group itself.  `null`/absent yields an empty list.
+fn flattened_choices<'de, D>(deserializer: D) -> Result<Vec<ConfigOptionChoice>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// The two shapes `options` may take on the wire.  `Flat` is tried first;
+    /// a group object has no `value`, so it can only match `Grouped`.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ChoiceList {
+        Flat(Vec<ConfigOptionChoice>),
+        Grouped(Vec<ConfigOptionChoiceGroup>),
+    }
+
+    Ok(match Option::<ChoiceList>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(ChoiceList::Flat(choices)) => choices,
+        Some(ChoiceList::Grouped(groups)) => groups
+            .into_iter()
+            .flat_map(|group| {
+                let label = group.name;
+                group.options.into_iter().map(move |mut choice| {
+                    choice.group = Some(label.clone());
+                    choice
+                })
+            })
+            .collect(),
+    })
 }
 
 /// A configuration option the agent supports (e.g., model, reasoning effort).
@@ -386,7 +473,16 @@ pub struct ConfigOption {
     /// Human-readable name of the option.
     pub name: String,
     /// The category of this option (e.g., "model", "thought_level", "model_config").
-    pub category: String,
+    ///
+    /// **Optional in the schema** — an agent may advertise an option with no
+    /// category at all (an agent-specific option with no well-known meaning).
+    /// This MUST stay `Option`: a required field here fails deserialization of
+    /// the whole `session/new` result, which fails the session spawn and hard-
+    /// errors the task — one uncategorized option would take down the run.
+    /// `None` is preserved rather than defaulted to `""`, so a lookup for a
+    /// well-known category never matches an option that declared none.
+    #[serde(default)]
+    pub category: Option<String>,
     /// The type of this option (e.g., "select", "boolean").
     #[serde(rename = "type")]
     pub kind: String,
@@ -394,7 +490,10 @@ pub struct ConfigOption {
     #[serde(default)]
     pub current_value: Option<serde_json::Value>,
     /// Available choices for this option (if it's a select type).
-    #[serde(default)]
+    ///
+    /// Accepts both wire shapes the schema allows — a flat choice array or an
+    /// array of groups — flattened into one list; see [`flattened_choices`].
+    #[serde(default, deserialize_with = "flattened_choices")]
     pub options: Vec<ConfigOptionChoice>,
     /// Extra/unknown fields to preserve forward compatibility.
     #[serde(flatten)]
@@ -411,7 +510,12 @@ pub struct NewSessionResult {
     #[serde(default)]
     pub modes: Option<SessionModeState>,
     /// Optional config options the agent advertises (model, effort, etc).
-    #[serde(default)]
+    ///
+    /// The schema marks this array `nullish`, so an agent with nothing to
+    /// advertise may send `"configOptions": null` just as legitimately as
+    /// omitting the key; both must yield an empty list rather than failing the
+    /// whole result.  See [`nullable_vec`].
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub config_options: Vec<ConfigOption>,
 }
 
@@ -472,13 +576,18 @@ pub struct SetModeParams {
 }
 
 /// `session/set_config_option` params (client → agent request).
+///
+/// The option identifier is `configId` on the wire — **not** `optionId`.  It
+/// matches the `id` of a [`ConfigOption`] advertised in the `session/new`
+/// result.  Sending `optionId` makes a spec-conforming agent reject the request
+/// with JSON-RPC `-32602 Invalid params`, which fails the whole session spawn.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetConfigOptionParams {
     /// The session this option applies to.
     pub session_id: String,
-    /// The option id to set.
-    pub option_id: String,
+    /// The option id to set — the `id` of an advertised [`ConfigOption`].
+    pub config_id: String,
     /// The new value for this option.
     pub value: serde_json::Value,
 }
@@ -1233,7 +1342,7 @@ mod tests {
         // Check first option (model)
         assert_eq!(result.config_options[0].id, "model_opt_1");
         assert_eq!(result.config_options[0].name, "Model");
-        assert_eq!(result.config_options[0].category, "model");
+        assert_eq!(result.config_options[0].category.as_deref(), Some("model"));
         assert_eq!(result.config_options[0].kind, "select");
         assert_eq!(
             result.config_options[0]
@@ -1247,11 +1356,17 @@ mod tests {
         assert_eq!(result.config_options[0].options[0].name, "Grok 1");
 
         // Check second option (effort)
-        assert_eq!(result.config_options[1].category, "thought_level");
+        assert_eq!(
+            result.config_options[1].category.as_deref(),
+            Some("thought_level")
+        );
         assert_eq!(result.config_options[1].options.len(), 3);
 
         // Check that unknown category is preserved
-        assert_eq!(result.config_options[2].category, "unknown_category");
+        assert_eq!(
+            result.config_options[2].category.as_deref(),
+            Some("unknown_category")
+        );
         assert!(
             result.config_options[2].extra.contains_key("futureField"),
             "unknown fields must be preserved in extra"
@@ -1265,28 +1380,271 @@ mod tests {
         );
     }
 
+    /// A `session/new` result whose config option omits `category` must still
+    /// deserialize — the ACP schema marks `category` optional.
+    ///
+    /// A required `category` here fails the whole `NewSessionResult` parse, so
+    /// `AcpClient::connect` returns `invalid session/new result: …`,
+    /// `AgentBackend::spawn` returns `Err`, and the task hard-errors with
+    /// `developer backend spawn failed` — one uncategorized option advertised by
+    /// the agent would take down the entire run.  The uncategorized option must
+    /// also stay **invisible** to the well-known-category lookups (`model` /
+    /// `thought_level`) rather than being defaulted into one of them.
+    #[test]
+    fn session_new_parses_config_option_without_category() {
+        let v = serde_json::json!({
+            "sessionId": "sess-no-category",
+            "configOptions": [
+                {
+                    "id": "agent_specific_opt",
+                    "name": "Agent Specific",
+                    "type": "boolean",
+                    "currentValue": true
+                },
+                {
+                    "id": "model_opt",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "options": [{ "value": "m-1", "name": "Model 1" }]
+                }
+            ]
+        });
+
+        let result: NewSessionResult =
+            serde_json::from_value(v).expect("a config option without `category` must parse");
+        assert_eq!(result.config_options.len(), 2);
+
+        // The uncategorized option parses with `category: None` — NOT `""`.
+        assert_eq!(result.config_options[0].id, "agent_specific_opt");
+        assert_eq!(
+            result.config_options[0].category, None,
+            "a missing `category` must stay absent, not be defaulted to a string"
+        );
+        assert_eq!(result.config_options[0].kind, "boolean");
+
+        // The categorized option is unaffected.
+        assert_eq!(result.config_options[1].category.as_deref(), Some("model"));
+
+        // An uncategorized option must never be picked up by a category lookup —
+        // this is the comparison the backend/client use to select model/effort.
+        let uncategorized_matches_model = result
+            .config_options
+            .iter()
+            .filter(|o| o.category.as_deref() == Some("model"))
+            .count();
+        assert_eq!(
+            uncategorized_matches_model, 1,
+            "only the genuinely `model`-category option may match a model lookup"
+        );
+    }
+
+    /// A `session/new` result whose config option sends `category: null` must
+    /// parse the same way as an omitted one — the schema is `nullish`, so an
+    /// agent may send either.
+    #[test]
+    fn session_new_parses_config_option_with_null_category() {
+        let v = serde_json::json!({
+            "sessionId": "sess-null-category",
+            "configOptions": [
+                {
+                    "id": "opt",
+                    "name": "Option",
+                    "category": null,
+                    "type": "select"
+                }
+            ]
+        });
+
+        let result: NewSessionResult =
+            serde_json::from_value(v).expect("a config option with `category: null` must parse");
+        assert_eq!(result.config_options[0].category, None);
+    }
+
+    /// `configOptions: null` must parse as an empty list, exactly like omitting
+    /// the key — the schema marks the array `nullish`.
+    ///
+    /// `#[serde(default)]` alone covers only omission; an explicit `null` failed
+    /// with `invalid type: null, expected a sequence`, rejecting the whole
+    /// `session/new` result -> `AcpClient::connect` Err -> `spawn` Err -> the
+    /// task hard-errors and the run fails.  Any agent that serializes an empty
+    /// `Option<Vec<_>>` without skip-if-none sends exactly this.
+    #[test]
+    fn session_new_parses_null_config_options() {
+        // `modes: null` is covered too: it already worked (Option absorbs null),
+        // and is asserted here so the two stay consistent.
+        let v = serde_json::json!({
+            "sessionId": "sess-null-options",
+            "configOptions": null,
+            "modes": null
+        });
+
+        let result: NewSessionResult =
+            serde_json::from_value(v).expect("`configOptions: null` must parse as an empty list");
+        assert!(
+            result.config_options.is_empty(),
+            "a null config-option array must yield an empty list, not fail the parse"
+        );
+        assert!(result.modes.is_none());
+
+        // Omitting the key entirely must behave identically.
+        let omitted: NewSessionResult =
+            serde_json::from_value(serde_json::json!({ "sessionId": "s" }))
+                .expect("an omitted `configOptions` must still parse");
+        assert!(omitted.config_options.is_empty());
+    }
+
+    /// A select option may advertise its choices **grouped** (e.g. models by
+    /// provider) instead of as one flat array — the schema's `options` is
+    /// `union([array(Choice), array(Group)])` and a group carries no `value`.
+    ///
+    /// Modelling only the flat half failed a grouped list with
+    /// `missing field \`value\``, rejecting the whole `session/new` result and
+    /// failing the run.  Groups must flatten into the choice list with their
+    /// label preserved, and no `value` invented for the group itself.
+    #[test]
+    fn session_new_parses_grouped_config_option_choices() {
+        let v = serde_json::json!({
+            "sessionId": "sess-grouped",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "openai/gpt-5",
+                    "options": [
+                        {
+                            "group": "openai",
+                            "name": "OpenAI",
+                            "options": [
+                                { "value": "openai/gpt-5", "name": "GPT-5" },
+                                { "value": "openai/gpt-5-mini", "name": "GPT-5 mini" }
+                            ]
+                        },
+                        {
+                            "group": "anthropic",
+                            "name": "Anthropic",
+                            "options": [
+                                { "value": "anthropic/opus", "name": "Opus" }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let result: NewSessionResult =
+            serde_json::from_value(v).expect("a grouped choice list must parse");
+
+        let opt = &result.config_options[0];
+        assert_eq!(opt.category.as_deref(), Some("model"));
+
+        // Groups are flattened: three real choices, no synthetic group entry.
+        let values: Vec<&str> = opt.options.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["openai/gpt-5", "openai/gpt-5-mini", "anthropic/opus"],
+            "every grouped choice must appear once, in order, with its own value"
+        );
+
+        // The group label rides along on each choice rather than being dropped.
+        let groups: Vec<Option<&str>> = opt.options.iter().map(|c| c.group.as_deref()).collect();
+        assert_eq!(
+            groups,
+            vec![Some("OpenAI"), Some("OpenAI"), Some("Anthropic")],
+            "each flattened choice must carry its group's label"
+        );
+    }
+
+    /// The flat choice shape must keep working unchanged alongside the grouped
+    /// one, and `options: null` must yield an empty list.
+    ///
+    /// `ConfigOption` carries a `#[serde(flatten)] extra` map, and `flatten`
+    /// routes deserialization through serde's buffered `Content` path — this
+    /// pins that `deserialize_with` on a sibling field still works there, and
+    /// that a consumed field is not also swallowed into `extra`.
+    #[test]
+    fn config_option_choices_flat_shape_and_null_survive_the_flatten_path() {
+        let v = serde_json::json!({
+            "sessionId": "sess-flat",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "options": [
+                        { "value": "m-1", "name": "Model 1", "description": "the first" }
+                    ],
+                    "futureField": "preserved"
+                },
+                {
+                    "id": "toggle",
+                    "name": "Toggle",
+                    "type": "boolean",
+                    "options": null
+                }
+            ]
+        });
+
+        let result: NewSessionResult =
+            serde_json::from_value(v).expect("the flat shape must still parse");
+
+        let flat = &result.config_options[0];
+        assert_eq!(flat.options.len(), 1);
+        assert_eq!(flat.options[0].value, "m-1");
+        assert_eq!(flat.options[0].description.as_deref(), Some("the first"));
+        assert_eq!(
+            flat.options[0].group, None,
+            "a flat choice has no group label"
+        );
+
+        // The flatten map still captures unknown fields, and does NOT also
+        // capture the fields the named fields consumed.
+        assert_eq!(
+            flat.extra.get("futureField").and_then(|v| v.as_str()),
+            Some("preserved")
+        );
+        for consumed in ["id", "name", "category", "type", "options"] {
+            assert!(
+                !flat.extra.contains_key(consumed),
+                "`{consumed}` is a named field and must not also land in `extra`"
+            );
+        }
+
+        // `options: null` on the boolean option yields an empty list.
+        assert!(result.config_options[1].options.is_empty());
+    }
+
     #[test]
     fn set_config_option_serializes() {
         // SetConfigOptionParams should serialize to the correct JSON-RPC shape.
+        // The option identifier is `configId` — an agent that validates its
+        // params rejects `optionId` with -32602, failing the session spawn.
         let params = SetConfigOptionParams {
             session_id: "sess-456".into(),
-            option_id: "model_opt_1".into(),
+            config_id: "model_opt_1".into(),
             value: serde_json::json!("grok-2"),
         };
         let v = serde_json::to_value(&params).unwrap();
         assert_eq!(v["sessionId"], "sess-456");
-        assert_eq!(v["optionId"], "model_opt_1");
+        assert_eq!(v["configId"], "model_opt_1");
         assert_eq!(v["value"], "grok-2");
+        assert!(
+            v.get("optionId").is_none(),
+            "`optionId` is not the wire name; agents reject it with -32602"
+        );
 
         // Test with a non-string value
         let params2 = SetConfigOptionParams {
             session_id: "sess-789".into(),
-            option_id: "effort_opt_1".into(),
+            config_id: "effort_opt_1".into(),
             value: serde_json::json!(42),
         };
         let v2 = serde_json::to_value(&params2).unwrap();
         assert_eq!(v2["sessionId"], "sess-789");
-        assert_eq!(v2["optionId"], "effort_opt_1");
+        assert_eq!(v2["configId"], "effort_opt_1");
         assert_eq!(v2["value"], 42);
     }
 

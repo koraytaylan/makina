@@ -506,6 +506,12 @@ fn log_event(ev: &Event) {
         Event::TaskStateChanged { task, state, .. } => {
             eprintln!("  · TaskStateChanged {} → {state:?}", task.0)
         }
+        Event::TaskFailed { task, reason, .. } => {
+            eprintln!(
+                "  · TaskFailed {} [{:?}]: {}",
+                task.0, reason.kind, reason.message
+            )
+        }
         Event::TaskIterationsUpdated {
             task,
             gate_iterations,

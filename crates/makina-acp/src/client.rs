@@ -567,7 +567,7 @@ impl AcpClient {
 
         let params = protocol::SetConfigOptionParams {
             session_id: self.session_id.clone(),
-            option_id: option_id.to_string(),
+            config_id: option_id.to_string(),
             value,
         };
 
@@ -611,7 +611,7 @@ impl AcpClient {
         let option_id = self
             .config_options
             .iter()
-            .find(|o| o.category == category)
+            .find(|o| o.category.as_deref() == Some(category))
             .map(|o| o.id.clone());
         match option_id {
             Some(id) => {

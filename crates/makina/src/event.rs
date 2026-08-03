@@ -819,14 +819,15 @@ async fn resolve_io(
                             let models: Vec<String> = session
                                 .capabilities()
                                 .and_then(|c| {
-                                    c.config_options.iter().find(|o| o.category == "model").map(
-                                        |o| {
+                                    c.config_options
+                                        .iter()
+                                        .find(|o| o.category.as_deref() == Some("model"))
+                                        .map(|o| {
                                             o.options
                                                 .iter()
                                                 .map(|c| format!("{agent_name}/{}", c.value))
                                                 .collect()
-                                        },
-                                    )
+                                        })
                                 })
                                 .unwrap_or_default();
                             let _ = session.terminate().await;

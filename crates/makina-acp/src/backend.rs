@@ -312,7 +312,7 @@ impl AgentBackend for AcpBackend {
             let model_option_id = client
                 .config_options()
                 .iter()
-                .find(|o| o.category == "model")
+                .find(|o| o.category.as_deref() == Some("model"))
                 .map(|o| o.id.clone());
             if let Some(option_id) = model_option_id {
                 client
@@ -328,7 +328,7 @@ impl AgentBackend for AcpBackend {
             let effort_option_id = client
                 .config_options()
                 .iter()
-                .find(|o| o.category == "thought_level")
+                .find(|o| o.category.as_deref() == Some("thought_level"))
                 .map(|o| o.id.clone());
             if let Some(option_id) = effort_option_id {
                 client
@@ -382,6 +382,7 @@ fn build_capabilities(client: &AcpClient) -> Option<api::SessionCapabilities> {
                     value: choice.value.clone(),
                     name: choice.name.clone(),
                     description: choice.description.clone(),
+                    group: choice.group.clone(),
                 })
                 .collect(),
         })

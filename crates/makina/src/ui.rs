@@ -5429,6 +5429,7 @@ fn event_short_name(ev: &makina_core::api::Event) -> &'static str {
         Event::RunProgress { .. } => "RunProgress",
         Event::RunCommand { .. } => "RunCommand",
         Event::TaskStateChanged { .. } => "TaskStateChanged",
+        Event::TaskFailed { .. } => "TaskFailed",
         Event::TaskIterationsUpdated { .. } => "TaskIterationsUpdated",
         Event::SessionCapabilities { .. } => "SessionCapabilities",
         Event::CurrentModeUpdate { .. } => "CurrentModeUpdate",

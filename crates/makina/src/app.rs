@@ -5745,6 +5745,13 @@ impl App {
                     && let Some(tv) = rv.tasks.iter_mut().find(|t| t.id == *task)
                 {
                     tv.state = state.clone();
+                    // Leaving `Failed` (retry / reset / reinterpret) invalidates
+                    // the stored reason — the log pane and task summary render it
+                    // without checking the state, so a stale reason would keep
+                    // showing "failed: …" under a task that is running again.
+                    if !matches!(state, TaskState::Failed) {
+                        tv.failure_reason = None;
+                    }
                     // When entering InProgress or InReview, record the step start tick.
                     if matches!(state, TaskState::InProgress | TaskState::InReview) {
                         self.task_step_start_tick
@@ -5769,6 +5776,16 @@ impl App {
                     } else {
                         rv.status.clone()
                     };
+                }
+            }
+            // The supervisor's diagnosis for a failed task. `TaskStateChanged`
+            // carries only the state, so without this the task shows a bare
+            // `Failed` badge and the reason is visible nowhere in the TUI.
+            Event::TaskFailed { run, task, reason } => {
+                if let Some(rv) = self.runs.iter_mut().find(|r| r.id == *run)
+                    && let Some(tv) = rv.tasks.iter_mut().find(|t| t.id == *task)
+                {
+                    tv.failure_reason = Some(reason.clone());
                 }
             }
             Event::TaskIterationsUpdated {

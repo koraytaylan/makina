@@ -158,6 +158,11 @@ impl RouterEvents {
                 task,
                 state,
             },
+            Event::TaskFailed { run, task, reason } => Event::TaskFailed {
+                run: map(run),
+                task,
+                reason,
+            },
             Event::TaskIterationsUpdated {
                 run,
                 task,
