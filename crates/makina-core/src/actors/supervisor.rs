@@ -28,7 +28,11 @@
 //!                        else: feedback = gate output ; re-dispatch
 //!     review(task, worktree)
 //!       (dispatch/parse failure) --HardError--> Failed ; teardown   (task 25)
-//!       Approve  squash_merge(task/{id} → develop)      (task 23 — BEFORE teardown)
+//!       Approve  enforce_task_branch_footprint(task/{id})
+//!                 undeclared change: counted + capped like a rejection —
+//!                   --ReviewerRejected--> InProgress (re-develop)  OR
+//!                   --ReviewCapReached--> Failed ; teardown at the cap
+//!                squash_merge(task/{id} → develop)      (task 23 — BEFORE teardown)
 //!                 Merged    --ReviewerApproved--> Done ; WorktreeManager::remove
 //!                 Conflict  develop already restored clean by merger ;
 //!                           --ReviewCapReached--> Failed ; teardown  (safe-fail; agent-reconcile seam)
@@ -101,6 +105,10 @@
 //!   emits `ReviewCapReached` (InReview → Failed) and terminates the task
 //!   instead of looping back to develop.  This uses `ReviewCapReached` from its
 //!   intended state (`InReview`) and replaced the old stand-in constant.
+//!   A **review-acceptance footprint correction** rewinds the same
+//!   `InReview → InProgress` edge, so [`return_footprint_correction`] counts and
+//!   caps it identically — otherwise an undeclared change the agent cannot fix
+//!   loops forever with `review_iterations` pinned at 0.
 //! - **Wall-clock cap** (`caps.wall_clock_secs`): enforced by the [`scheduler`],
 //!   which wraps each driver future in `tokio::time::timeout`.  On elapse the
 //!   driver is cancelled (its [`DriverGuard`] cleans up) and the scheduler emits
@@ -379,19 +387,85 @@ async fn git_output(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
+/// What the driver must do after a review-acceptance footprint correction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FootprintCorrection {
+    /// `InReview --ReviewerRejected--> InProgress`: re-develop with the reason
+    /// as feedback.
+    Returned,
+    /// The correction exhausted the reviewer cap; the task is already terminal
+    /// `Failed` and the driver must tear down instead of looping.
+    CapReached,
+}
+
+/// Return an approved-but-undeclared task to its branch for correction.
+///
+/// A correction is a *rejection* — it rewinds the same `InReview → InProgress`
+/// edge the Reviewer's own rejection uses — so it MUST be counted and capped
+/// like one (driver-footprint-correction-capped).  Until it was, the correction
+/// loop was the one unbounded path through the driver: a footprint the agent
+/// cannot fix (build artifacts, a generated lockfile) re-approved and re-failed
+/// the same check forever, with `review_iterations` pinned at 0, until the
+/// wall-clock cap eventually killed the whole task.
 async fn return_footprint_correction(
     ctx: &DriverContext,
     task_id: &TaskId,
     message: String,
-) -> Result<(), String> {
-    {
+) -> Result<FootprintCorrection, String> {
+    let cap = ctx.config.caps.reviewer_iterations;
+    let prior_iterations = {
+        let graph = ctx.graph.lock().await;
+        review_iterations_locked(&graph, task_id)?
+    };
+
+    if prior_iterations + 1 >= cap {
+        let (gate_iters, review_iters) = {
+            let mut graph = ctx.graph.lock().await;
+            increment_review_iterations_locked(&mut graph, task_id);
+            apply_event_locked(&mut graph, task_id, TaskEvent::ReviewCapReached)?;
+            mark_finished_locked(&mut graph, task_id);
+            let review_iters = review_iterations_locked(&graph, task_id)?;
+            set_failure_reason_locked(
+                &mut graph,
+                task_id,
+                api::FailureKind::ReviewCap,
+                format!(
+                    "footprint corrections exhausted the reviewer cap for {task_id} \
+                     ({review_iters}/{cap}): {message}"
+                ),
+            );
+            (gate_iterations_locked(&graph, task_id)?, review_iters)
+        }; // guard dropped before emit.
+        ctx.persist().await;
+        ctx.emit_task_iterations(task_id, gate_iters, review_iters);
+        tracing::warn!(
+            task = %task_id,
+            reason = %message,
+            "footprint corrections exhausted the reviewer cap",
+        );
+        tracing::info!(
+            task = %task_id.0,
+            from = ?TaskState::InReview,
+            to = ?TaskState::Failed,
+            "task state transition"
+        );
+        return Ok(FootprintCorrection::CapReached);
+    }
+
+    let (gate_iters, review_iters) = {
         let mut graph = ctx.graph.lock().await;
         apply_event_locked(&mut graph, task_id, TaskEvent::ReviewerRejected)?;
-    }
+        increment_review_iterations_locked(&mut graph, task_id);
+        (
+            gate_iterations_locked(&graph, task_id)?,
+            review_iterations_locked(&graph, task_id)?,
+        )
+    }; // guard dropped before emit.
     ctx.persist().await;
     ctx.emit_task_state(task_id, TaskState::InProgress);
+    ctx.emit_task_iterations(task_id, gate_iters, review_iters);
     tracing::warn!(task = %task_id, reason = %message, "task returned for footprint correction");
-    Ok(())
+    Ok(FootprintCorrection::Returned)
 }
 
 // ── Live event emission (task 31: run-control) ──────────────────────────────────
@@ -1641,7 +1715,12 @@ async fn scheduler(ctx: DriverContext, concurrency: usize) -> Result<RunReport, 
                 in_flight.remove(&id);
                 let (terminal, skipped) = {
                     let mut graph = ctx.graph.lock().await;
-                    let terminal = task_state_locked(&graph, &id).unwrap_or(TaskState::Failed);
+                    let terminal = settle_driver_error_locked(
+                        &mut graph,
+                        &id,
+                        &e,
+                        ctx.control.cancel.is_cancelled(),
+                    );
                     // Transitively `Skipped` the failed task's dependents under the
                     // held lock (no .await), then drop the guard before emitting.
                     let skipped = mark_dependents_skipped(&mut graph, &id);
@@ -2215,9 +2294,18 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                 // the task branch for correction, never silently landed.
                 if matches!(authored_footprint, Some((_, None))) {
                     let reason = format!("task {task_id} has no recorded branch base OID");
-                    return_footprint_correction(ctx, task_id, reason.clone()).await?;
-                    feedback = Some(reason);
-                    continue;
+                    match return_footprint_correction(ctx, task_id, reason.clone()).await? {
+                        FootprintCorrection::Returned => {
+                            feedback = Some(reason);
+                            continue;
+                        }
+                        FootprintCorrection::CapReached => {
+                            remove_worktree(ctx, task_id).await;
+                            guard.worktree_removed = true;
+                            terminal_state = TaskState::Failed;
+                            break;
+                        }
+                    }
                 }
                 if let Some((touches, Some(recorded_base))) = &authored_footprint
                     && let Err(reason) = enforce_task_branch_footprint(
@@ -2229,9 +2317,18 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     )
                     .await
                 {
-                    return_footprint_correction(ctx, task_id, reason.clone()).await?;
-                    feedback = Some(reason);
-                    continue;
+                    match return_footprint_correction(ctx, task_id, reason.clone()).await? {
+                        FootprintCorrection::Returned => {
+                            feedback = Some(reason);
+                            continue;
+                        }
+                        FootprintCorrection::CapReached => {
+                            remove_worktree(ctx, task_id).await;
+                            guard.worktree_removed = true;
+                            terminal_state = TaskState::Failed;
+                            break;
+                        }
+                    }
                 }
                 #[cfg(test)]
                 if let Some(observer) = &ctx.pre_a_observer {
@@ -2272,9 +2369,18 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         Ok(()) => ctx.squash_merger.squash_merge(&branch, &message).await,
                         Err(reason) => {
                             drop(_merge_guard);
-                            return_footprint_correction(ctx, task_id, reason.clone()).await?;
-                            feedback = Some(reason);
-                            continue;
+                            match return_footprint_correction(ctx, task_id, reason.clone()).await? {
+                                FootprintCorrection::Returned => {
+                                    feedback = Some(reason);
+                                    continue;
+                                }
+                                FootprintCorrection::CapReached => {
+                                    remove_worktree(ctx, task_id).await;
+                                    guard.worktree_removed = true;
+                                    terminal_state = TaskState::Failed;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }; // merge lock released here.
@@ -2857,6 +2963,54 @@ fn stored_failure_reason_message_locked(graph: &TaskGraph, task_id: &TaskId) -> 
         .get(task_id)
         .and_then(|t| t.failure_reason.as_ref())
         .map(|fr| fr.message.clone())
+}
+
+/// Settle a task whose driver returned `Err`, and report its terminal state.
+///
+/// A driver that gives up must never leave its task NON-terminal
+/// (sched-no-stranded-task).  Most failure sites drive the task to `Failed`
+/// themselves, but any `?` that fires *between* two transitions — a Phase-B
+/// landing failure after the task has left `InReview`, say — used to return the
+/// error while the task was still active.  That stranded the whole run: the task
+/// was neither runnable nor retryable ([`reset_task_for_retry_locked`] requires
+/// `Failed`), [`mark_dependents_skipped`] skipped its dependents anyway, and the
+/// caller dropped the driver's reason because it only recorded `Failed` tasks —
+/// so the run finalized `Failed` with no explanation anywhere and the operator
+/// saw an unexplained halt.  This is the single choke point every driver error
+/// passes through, so the hole is closed here rather than at each `?`.
+///
+/// Cancellation is exempt: an interrupted transactional task deliberately
+/// retains its recoverable `InReview` boundary so restart reconciliation can
+/// project it forward from durable landing evidence.
+///
+/// Called under the held graph guard (no `.await`).
+fn settle_driver_error_locked(
+    graph: &mut TaskGraph,
+    task_id: &TaskId,
+    reason: &str,
+    cancelled: bool,
+) -> TaskState {
+    let mut terminal = task_state_locked(graph, task_id).unwrap_or(TaskState::Failed);
+    if !crate::state_machine::is_terminal(terminal)
+        && !cancelled
+        && apply_event_locked(graph, task_id, TaskEvent::HardError).is_ok()
+    {
+        mark_finished_locked(graph, task_id);
+        terminal = TaskState::Failed;
+    }
+    // Keep a more specific reason the failure site already stored (gate cap,
+    // reviewer cap, merge conflict, …); otherwise record the driver's own.
+    if terminal == TaskState::Failed
+        && stored_failure_reason_message_locked(graph, task_id).is_none()
+    {
+        set_failure_reason_locked(
+            graph,
+            task_id,
+            api::FailureKind::HardError,
+            reason.to_owned(),
+        );
+    }
+    terminal
 }
 
 /// Move the transitive dependents of a just-`Failed` task to [`TaskState::Skipped`].
@@ -3515,5 +3669,108 @@ mod tests {
         );
         assert!(readied.contains(&TaskId::new("ready-me")));
         assert!(!readied.contains(&TaskId::new("blocked")));
+    }
+
+    /// A driver error must terminate its task even when the error escaped from
+    /// between two transitions — otherwise the task is stuck active, cannot be
+    /// retried, and the run looks halted for no reason.
+    #[test]
+    fn driver_error_terminates_a_task_left_active_and_records_the_reason() {
+        for state in [TaskState::Ready, TaskState::InProgress, TaskState::InReview] {
+            let mut graph = TaskGraph {
+                slug: "stranded".into(),
+                tasks: vec![task_in("stranded", state)],
+                authored: Default::default(),
+            };
+            let terminal = settle_driver_error_locked(
+                &mut graph,
+                &TaskId::new("stranded"),
+                "commit Phase B for stranded: ref moved",
+                false,
+            );
+            assert_eq!(terminal, TaskState::Failed, "from {state:?}");
+            let task = graph.get(&TaskId::new("stranded")).unwrap();
+            assert_eq!(task.state, TaskState::Failed, "from {state:?}");
+            assert!(task.finished_at.is_some(), "from {state:?}");
+            assert_eq!(
+                task.failure_reason.as_ref().map(|r| r.message.as_str()),
+                Some("commit Phase B for stranded: ref moved"),
+                "the driver's reason must reach the operator; from {state:?}",
+            );
+        }
+    }
+
+    /// A failure site that already settled the task owns both the terminal
+    /// state and the (more specific) reason.
+    #[test]
+    fn driver_error_keeps_an_already_recorded_failure_reason() {
+        let mut graph = TaskGraph {
+            slug: "already-failed".into(),
+            tasks: vec![task_in("capped", TaskState::Failed)],
+            authored: Default::default(),
+        };
+        set_failure_reason_locked(
+            &mut graph,
+            &TaskId::new("capped"),
+            api::FailureKind::ReviewCap,
+            "reviewer cap reached for capped: 3/3 rejections".into(),
+        );
+        let terminal = settle_driver_error_locked(
+            &mut graph,
+            &TaskId::new("capped"),
+            "a later, vaguer error",
+            false,
+        );
+        assert_eq!(terminal, TaskState::Failed);
+        let task = graph.get(&TaskId::new("capped")).unwrap();
+        assert_eq!(
+            task.failure_reason.as_ref().map(|r| r.kind.clone()),
+            Some(api::FailureKind::ReviewCap),
+            "the specific cap reason must survive",
+        );
+    }
+
+    /// A `Done` task races ahead of its driver's error on rare paths; it must
+    /// not be dragged back to `Failed`.
+    #[test]
+    fn driver_error_leaves_a_done_task_alone() {
+        let mut graph = TaskGraph {
+            slug: "done".into(),
+            tasks: vec![task_in("landed", TaskState::Done)],
+            authored: Default::default(),
+        };
+        let terminal =
+            settle_driver_error_locked(&mut graph, &TaskId::new("landed"), "teardown noise", false);
+        assert_eq!(terminal, TaskState::Done);
+        assert!(
+            graph
+                .get(&TaskId::new("landed"))
+                .unwrap()
+                .failure_reason
+                .is_none(),
+            "a landed task must not acquire a failure reason",
+        );
+    }
+
+    /// Cancellation keeps the recoverable `InReview` boundary a transactional
+    /// task retains for restart reconciliation.
+    #[test]
+    fn cancellation_retains_the_recoverable_in_review_boundary() {
+        let mut graph = TaskGraph {
+            slug: "cancelled".into(),
+            tasks: vec![task_in("interrupted", TaskState::InReview)],
+            authored: Default::default(),
+        };
+        let terminal = settle_driver_error_locked(
+            &mut graph,
+            &TaskId::new("interrupted"),
+            "run cancelled after Phase B",
+            true,
+        );
+        assert_eq!(terminal, TaskState::InReview);
+        assert_eq!(
+            graph.get(&TaskId::new("interrupted")).unwrap().state,
+            TaskState::InReview,
+        );
     }
 }

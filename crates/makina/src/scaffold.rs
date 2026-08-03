@@ -40,6 +40,11 @@ pub struct ScaffoldTestHooks {
 
 /// Template files mapped to their destinations.
 const TODO_FILES: &[(&str, &str)] = &[
+    // Build output MUST be ignored: the gates (`cargo test`/`clippy`) run in the
+    // task worktree, and the Developer's `git add -A` would otherwise sweep
+    // `target/` and a generated `Cargo.lock` onto the task branch — undeclared
+    // paths that fail the review-acceptance footprint check on EVERY task.
+    (".gitignore", include_str!("templates/todo/gitignore")),
     ("Cargo.toml", include_str!("templates/todo/cargo_toml")),
     ("src/main.rs", include_str!("templates/todo/main_rs")),
     ("src/list.rs", include_str!("templates/todo/src_list_rs")),

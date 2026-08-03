@@ -356,6 +356,29 @@ impl SquashMerger {
         Ok(MergeOutcome::Merged { oid })
     }
 
+    /// Phase A of the transactional task landing: squash the task branch onto
+    /// the plan ref as ONE evidence-carrying commit and **publish** it.
+    ///
+    /// # Why this prepares detached and CAS-publishes
+    ///
+    /// Unlike [`squash_merge`](Self::squash_merge) — whose caller owns a checkout
+    /// with `base_branch` attached — the transactional path runs inside the run's
+    /// private integration workspace, which the claim/status landings leave on a
+    /// **detached HEAD** (they `checkout --detach {expected_old}`, commit, then
+    /// CAS the plan ref).  Committing on HEAD alone would move HEAD and leave
+    /// `refs/heads/{base_branch}` behind the landing commit, which breaks the two
+    /// invariants the rest of the protocol depends on:
+    ///
+    /// - Phase B passes the landing OID as its expected-old CAS value, so it
+    ///   fails `RefMoved` and strands the task mid-landing.
+    /// - [`find_task_landing`](Self::find_task_landing) /
+    ///   [`verify_task_landing_oid`](Self::verify_task_landing_oid) look for the
+    ///   evidence commit *reachable from the plan ref*, so a retry cannot reuse
+    ///   an unpublished landing and lands a duplicate instead.
+    ///
+    /// So this mirrors the discipline used by [`final_squash`](Self::final_squash)
+    /// and the `landing` module: prepare the candidate on a detached workspace,
+    /// then move the shared ref only by expected-old compare-and-swap.
     pub async fn squash_merge_with_evidence(
         &self,
         task_branch: &str,
@@ -377,7 +400,24 @@ impl SquashMerger {
             "{subject}\n\nMakina-Plan: {}\nMakina-Task: {}\nMakina-Run: {}",
             identity.plan, identity.task, identity.run
         );
-        self.squash_merge(task_branch, &message).await
+        let expected = self.rev_parse(&self.base_branch).await?;
+        self.run_git_checked(
+            &["checkout", "--detach", &expected],
+            &format!(
+                "git -C {} checkout --detach {}",
+                self.repo_root.display(),
+                &self.base_branch
+            ),
+        )
+        .await?;
+        match self.squash_merge(task_branch, &message).await? {
+            MergeOutcome::Merged { oid } => {
+                self.cas_branch(&self.base_branch, oid.as_str(), &expected)
+                    .await?;
+                Ok(MergeOutcome::Merged { oid })
+            }
+            conflict => Ok(conflict),
+        }
     }
 
     pub async fn find_task_landing(
