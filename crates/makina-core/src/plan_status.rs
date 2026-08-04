@@ -301,14 +301,41 @@ pub fn expected_root_row(plan: &PlanDocument) -> String {
     )
 }
 
-/// Registration inserts an absent row and idempotently reuses one exact row.
-pub fn register_root_row(root: &str, plan: &PlanDocument) -> Result<String, StatusEditError> {
-    edit_root(root, plan, true)
+/// How a root roll-up edit treats an absent row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootEdit {
+    /// Insert an absent row; reuse one exact row; reject a divergent one.
+    Register,
+    /// Require exactly one existing row and rewrite it.
+    Update,
+    /// Insert an absent row, otherwise rewrite the unique existing one.
+    Upsert,
 }
 
-/// A lifecycle transition requires exactly one existing row.
+/// Registration inserts an absent row and idempotently reuses one exact row.
+pub fn register_root_row(root: &str, plan: &PlanDocument) -> Result<String, StatusEditError> {
+    edit_root(root, plan, RootEdit::Register)
+}
+
+/// A lifecycle transition against a board that already carries the row.
+///
+/// Use this for boards read from the plan ref: registration guarantees the row
+/// is there, so its absence is real corruption and must not be papered over.
 pub fn update_root_row(root: &str, plan: &PlanDocument) -> Result<String, StatusEditError> {
-    edit_root(root, plan, false)
+    edit_root(root, plan, RootEdit::Update)
+}
+
+/// A lifecycle transition against a board read from the **base** branch.
+///
+/// Registration can only add a missing row to the plan ref — it must never move
+/// the base branch — so a plan registered against a board that did not already
+/// list it has its row on the plan ref and nowhere else. Finalization overlays
+/// onto the current base board, so requiring the row there stranded such a plan
+/// in `awaiting-integration` forever, with Phase P failing on every attempt.
+/// Inserting the row is the same thing registration already decided to do.
+/// Duplicate rows remain an error in every mode.
+pub fn upsert_root_row(root: &str, plan: &PlanDocument) -> Result<String, StatusEditError> {
+    edit_root(root, plan, RootEdit::Upsert)
 }
 
 /// Append one bounded coordinator disposition record without rewriting history.
@@ -327,11 +354,7 @@ pub fn append_disposition_exception(body: &str, record: &str) -> Result<String, 
     Ok(out)
 }
 
-fn edit_root(
-    root: &str,
-    plan: &PlanDocument,
-    registration: bool,
-) -> Result<String, StatusEditError> {
+fn edit_root(root: &str, plan: &PlanDocument, mode: RootEdit) -> Result<String, StatusEditError> {
     let prefix = format!("| {} |", plan.key.number);
     let positions = root
         .lines()
@@ -339,8 +362,9 @@ fn edit_root(
         .filter(|(_, l)| l.starts_with(&prefix))
         .collect::<Vec<_>>();
     let expected = expected_root_row(plan);
+    let inserts = matches!(mode, RootEdit::Register | RootEdit::Upsert);
     match positions.as_slice() {
-        [] if registration => {
+        [] if inserts => {
             let mut out = root.trim_end_matches('\n').to_owned();
             out.push('\n');
             out.push_str(&expected);
@@ -351,8 +375,8 @@ fn edit_root(
             number: plan.key.number.clone(),
             count: 0,
         }),
-        [(_, actual)] if registration && *actual == expected => Ok(root.to_owned()),
-        [(_, actual)] if registration => Err(StatusEditError::RootMismatch {
+        [(_, actual)] if mode == RootEdit::Register && *actual == expected => Ok(root.to_owned()),
+        [(_, actual)] if mode == RootEdit::Register => Err(StatusEditError::RootMismatch {
             number: plan.key.number.clone(),
             expected,
             actual: (*actual).to_owned(),

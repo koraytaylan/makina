@@ -1386,7 +1386,10 @@ async fn run_graph_inner(
                         .map_err(|e| e.to_string())?,
                 )
                 .map_err(|_| "root board is not UTF-8")?;
-                let board = crate::plan_status::update_root_row(&board, &plan)
+                // Read from the current base, which may never have carried this
+                // plan's row: registration can only add a missing row to the
+                // plan ref, never to base.
+                let board = crate::plan_status::upsert_root_row(&board, &plan)
                     .map_err(|e| e.to_string())?;
                 crate::landing::commit_finalization_prepared(
                     &integration_root,

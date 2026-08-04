@@ -3344,7 +3344,10 @@ impl CoreApi {
                     .map_err(|e| invalid(e.to_string()))?,
             )
             .map_err(|_| invalid("root board is not UTF-8".into()))?;
-            let board = crate::plan_status::update_root_row(&board, &prepared_plan)
+            // Read from the current base, which may never have carried this
+            // plan's row: registration can only add a missing row to the plan
+            // ref, never to base.
+            let board = crate::plan_status::upsert_root_row(&board, &prepared_plan)
                 .map_err(|e| invalid(e.to_string()))?;
             let prepared = crate::landing::commit_finalization_prepared(
                 &workspace.path,
@@ -3495,7 +3498,9 @@ impl CoreApi {
                 .map_err(|e| invalid(e.to_string()))?,
         )
         .map_err(|_| invalid("root board is not UTF-8".into()))?;
-        let board = crate::plan_status::update_root_row(&board, &complete_plan)
+        // The completed tree descends from base, so it inherits base's board —
+        // including a board that never listed this plan.
+        let board = crate::plan_status::upsert_root_row(&board, &complete_plan)
             .map_err(|e| invalid(e.to_string()))?;
         let completion = crate::landing::commit_finalization_completion(
             &workspace.path,

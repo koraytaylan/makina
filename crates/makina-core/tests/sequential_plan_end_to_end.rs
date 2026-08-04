@@ -31,6 +31,9 @@
 //!    each commit loads through `load_plan` without a diagnostic, because each
 //!    one is what some later claim reads. Intermediate commits must report
 //!    `assembling` with no merge mode, not `awaiting-integration`.
+//! 4. **A plan absent from the base board still finalizes** — registration can
+//!    add a missing roll-up row only to the plan ref, so Phase P's overlay onto
+//!    the base board has to insert it rather than demand it.
 //!
 //! # Test-strategy compliance
 //!
@@ -244,9 +247,79 @@ async fn every_published_status_commit_loads_back() {
     restore();
 }
 
+/// A plan whose base board never listed it must still finalize.
+///
+/// Registration inserts a missing roll-up row, but it can only write to the plan
+/// ref — moving the base branch is exactly what registration must not do. Phase
+/// P then overlays onto the *current base* board, which still has no row. When
+/// that overlay demanded an existing row, such a plan ran every task
+/// successfully and then failed Phase P forever, logging at WARN and leaving the
+/// plan `awaiting-integration` with no explanation.
+#[tokio::test]
+async fn a_plan_missing_from_the_base_board_still_finalizes() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let repo = fixture_repo_without_root_row();
+    let home = tempfile::tempdir().unwrap();
+    let restore = set_home(home.path());
+
+    let api = build_api(repo.path().to_owned());
+    register(&api, repo.path()).await;
+    let CommandOutcome::RunOpened { run } = api
+        .execute(Command::OpenPlan {
+            plan_dir: PlanKey::parse(PLAN_DIR).unwrap(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("OpenPlan must return RunOpened")
+    };
+    api.execute(Command::StartRun { run }).await.unwrap();
+    await_run(&api, run).await;
+
+    let plan = load_plan_at(repo.path(), "refs/heads/plan/0001-Sequential-Chain");
+    assert_eq!(
+        plan.status.integration_state,
+        PlanIntegrationState::FinalizationPending,
+        "Phase P must insert the absent roll-up row instead of failing",
+    );
+
+    // The row Phase P wrote must be the only one, and must be the row the
+    // loader's own roll-up validation expects.
+    let board = git_output(
+        repo.path(),
+        &[
+            "show",
+            "refs/heads/plan/0001-Sequential-Chain:docs/plans/STATUS.md",
+        ],
+    );
+    let rows = board
+        .lines()
+        .filter(|line| line.starts_with("| 0001 |"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "exactly one row for the plan; got {rows:?}");
+    assert!(
+        makina_core::plan::validate_root_rollup(&plan, rows[0]).is_empty(),
+        "the inserted row must satisfy roll-up validation; got {}",
+        rows[0],
+    );
+
+    restore();
+}
+
 // ── Fixture ──────────────────────────────────────────────────────────────────
 
+/// The ordinary shape: the operator's board already lists the plan.
 fn fixture_repo() -> tempfile::TempDir {
+    fixture_repo_with_root_row(true)
+}
+
+/// A board that never listed the plan — registration adds the row to the plan
+/// ref, and nothing ever adds it to base.
+fn fixture_repo_without_root_row() -> tempfile::TempDir {
+    fixture_repo_with_root_row(false)
+}
+
+fn fixture_repo_with_root_row(row: bool) -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     git(root, &["init", "-q", "-b", "develop"]);
@@ -256,17 +329,19 @@ fn fixture_repo() -> tempfile::TempDir {
 
     fs::create_dir_all(root.join("docs/plans")).unwrap();
     fs::write(root.join(".gitignore"), ".makina/\n").unwrap();
-    // The roll-up row is authored, not synthesized: Phase P overlays this plan's
-    // row onto the *base* board, and `update_root_row` requires exactly one
-    // existing row there — a board without it makes finalization fail.
-    fs::write(
-        root.join("docs/plans/STATUS.md"),
-        "# Plans — roll-up board\n\n\
+    let board = "# Plans — roll-up board\n\n\
          | Plan | Title | Status | Tasks | Outcome | Status doc |\n\
-         |---|---|---|---|---|---|\n\
-         | 0001 | Sequential Chain | 📋 Planned | 0/3 | three sequential tasks land in order and the plan stays loadable throughout. | [status](0001-Sequential-Chain/STATUS.md) |\n",
-    )
-    .unwrap();
+         |---|---|---|---|---|---|\n";
+    let board = if row {
+        format!(
+            "{board}| 0001 | Sequential Chain | 📋 Planned | 0/3 | three sequential tasks land \
+             in order and the plan stays loadable throughout. | \
+             [status](0001-Sequential-Chain/STATUS.md) |\n"
+        )
+    } else {
+        board.to_owned()
+    };
+    fs::write(root.join("docs/plans/STATUS.md"), board).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     copy_tree(

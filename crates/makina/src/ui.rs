@@ -3826,10 +3826,16 @@ fn tool_content_is_expandable_diff(title: &str, kind: &Option<String>, content: 
     edit_kind || tool_title_suggests_edit(title) || tool_content_has_diff_markers(content)
 }
 
+/// Render one entry the way the pane does, for tests that assert on a single
+/// entry rather than a grouped block. Production rendering goes through
+/// [`exchange_entries_grouped_blocks`], so this is test-only — same as the
+/// neighbouring [`exchange_entries_grouped_lines`].
+#[cfg(test)]
 fn exchange_entry_lines(entry: &ExchangeEntry, app: &App, width: u16) -> Vec<Line<'static>> {
     exchange_entry_lines_with_tool_diff(entry, app, width, false)
 }
 
+#[cfg(test)]
 fn exchange_entry_lines_with_tool_diff(
     entry: &ExchangeEntry,
     app: &App,
