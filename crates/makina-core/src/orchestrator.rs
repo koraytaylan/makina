@@ -3281,12 +3281,9 @@ impl CoreApi {
                 "authored status is not ready for finalization".into(),
             ));
         }
-        let mode_name = match mode {
-            FinalMerge::Squash => "squash",
-            FinalMerge::Stage => "stage",
-            FinalMerge::MergeCommit => "merge-commit",
-            FinalMerge::Manual => "manual",
-        };
+        // `mode_name` is the commit-trailer spelling; `status_mode` is the
+        // STATUS.md spelling the plan loader accepts. Never swap them.
+        let (mode_name, status_mode) = crate::plan_status::final_mode_names(mode);
         let base_ref = format!("refs/heads/{}", self.state.worktree_manager.base_branch);
         let base_output = tokio::process::Command::new("git")
             .arg("-C")
@@ -3322,9 +3319,10 @@ impl CoreApi {
             prepared_plan.status.integration_state =
                 crate::plan::PlanIntegrationState::FinalizationPending;
             prepared_plan.status.run = Some(run_uid.clone());
-            prepared_plan.status.mode = Some(mode_name.into());
+            prepared_plan.status.mode = Some(status_mode.into());
             prepared_plan.status.final_oid = None;
-            prepared_plan.status.display_status = "⏳ Finalizing".into();
+            prepared_plan.status.display_status =
+                crate::plan_status::display_badge(prepared_plan.status.integration_state).into();
             let transition = crate::plan_status::StatusTransition {
                 integration_state: prepared_plan.status.integration_state,
                 run: prepared_plan.status.run.clone(),
@@ -3472,12 +3470,13 @@ impl CoreApi {
         };
         complete_plan.status.integration_state = crate::plan::PlanIntegrationState::Complete;
         complete_plan.status.run = Some(run_uid.clone());
-        complete_plan.status.mode = Some(mode_name.into());
+        complete_plan.status.mode = Some(status_mode.into());
         complete_plan.status.final_oid = Some(
             crate::plan::GitObjectId::parse(&final_oid, final_source.object_format())
                 .map_err(|e| invalid(e.to_string()))?,
         );
-        complete_plan.status.display_status = "✅ Complete".into();
+        complete_plan.status.display_status =
+            crate::plan_status::display_badge(complete_plan.status.integration_state).into();
         let transition = crate::plan_status::StatusTransition {
             integration_state: complete_plan.status.integration_state,
             run: complete_plan.status.run.clone(),
@@ -4245,7 +4244,7 @@ impl AuthoringCoordinator {
                 "target base moved: expected {expected_base_oid}, found {base_tip}"
             )));
         }
-        let plan_identity = format!("{}-{}", key.number, key.slug);
+        let plan_identity = key.plan_identity();
         let plan_ref = key.ref_name();
         let mut refresh_old = None;
         let mut source_origin = "base".to_owned();
@@ -4650,7 +4649,13 @@ impl CoreApi {
 
         let repo_root = &self.state.worktree_manager.repo_root;
         let slug = format!("{}-{}", plan_key.number, plan_key.slug).to_ascii_lowercase();
-        let worktree_plan_slug = slug.clone();
+        // The plan identity is NOT case-folded: it names `refs/heads/plan/{id}`,
+        // which registration published verbatim from `PlanKey::ref_name`. Git
+        // refs are case-sensitive, so folding here would make every mixed-case
+        // plan directory look unregistered to its own run. Worktree directory
+        // names stay stable regardless — `paths::short_worktree_name` lowercases
+        // internally.
+        let worktree_plan_slug = plan_key.plan_identity();
 
         // OpenPlan is idempotent for the canonical project+plan identity. A
         // CoreApi is bound to one project, so the canonical plan path is the
@@ -5084,9 +5089,9 @@ impl CoreApi {
                 reason: format!("cannot start without external runtime state: {error}"),
             },
         )?;
-        let plan_identity =
-            format!("{}-{}", opened.key.number, opened.key.slug).to_ascii_lowercase();
-        let plan_ref = format!("refs/heads/plan/{plan_identity}");
+        // Case-preserving: this must resolve the very ref registration published.
+        let plan_identity = opened.key.plan_identity();
+        let plan_ref = opened.key.ref_name();
         let tip_output = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&self.state.worktree_manager.repo_root)

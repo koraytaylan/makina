@@ -633,6 +633,115 @@ fn all_six_integration_states_accept_only_coherent_evidence() {
     }
 }
 
+/// The renderer must refuse to emit a `STATUS.md` the loader would reject.
+///
+/// Coordinator writes are committed to the plan ref and only re-read by the
+/// *next* durable claim, so a silently unreadable render surfaces one task later
+/// as an opaque failure in a different subsystem. `awaiting-integration` plus a
+/// final merge mode is the exact combination that stranded a real run.
+#[test]
+fn render_refuses_a_status_the_loader_would_reject() {
+    let repo = fixture_repo();
+    let source = FilesystemPlanFileSource::new(repo.path(), None).unwrap();
+    let PlanCandidate::Plan(plan) = load_plan(
+        &source,
+        PlanKey::parse("docs/plans/0049-Sample").unwrap(),
+        &PlanReservations::default(),
+    )
+    .unwrap() else {
+        panic!("the fixture must be a plan")
+    };
+    let oid = makina_core::plan::GitObjectId::parse(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        makina_core::plan::GitObjectFormat::Sha1,
+    )
+    .unwrap();
+    let error = makina_core::plan_status::render_plan_status(
+        &plan,
+        &makina_core::plan_status::StatusTransition {
+            integration_state: makina_core::plan::PlanIntegrationState::AwaitingIntegration,
+            run: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+            validation_base: Some(oid),
+            mode: Some("Squash".into()),
+            final_oid: None,
+            display_status: "🚧 In Progress".into(),
+            last_updated: "_Last updated: 2026-07-19, against `develop` @ `aaaaaaa`._".into(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            makina_core::plan_status::StatusEditError::UnreadableRender(_)
+        ),
+        "the renderer must reject its own unreadable output, got {error:?}",
+    );
+}
+
+/// Every canonical spelling the coordinator writes must survive a reload.
+///
+/// The final merge mode has two vocabularies — a lowercase-kebab commit trailer
+/// and a CamelCase STATUS field — and the display badge has one per integration
+/// state. Writing the wrong vocabulary into `STATUS.md` produced plans that
+/// registration accepted and the loader then refused.
+#[test]
+fn canonical_mode_spellings_and_badges_reload() {
+    use makina_core::config::FinalMerge;
+    use makina_core::plan::PlanIntegrationState;
+    use makina_core::plan_status::{display_badge, final_mode_names};
+
+    let repo = fixture_repo();
+    let source = FilesystemPlanFileSource::new(repo.path(), None).unwrap();
+    let PlanCandidate::Plan(plan) = load_plan(
+        &source,
+        PlanKey::parse("docs/plans/0049-Sample").unwrap(),
+        &PlanReservations::default(),
+    )
+    .unwrap() else {
+        panic!("the fixture must be a plan")
+    };
+    let oid = makina_core::plan::GitObjectId::parse(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        makina_core::plan::GitObjectFormat::Sha1,
+    )
+    .unwrap();
+    // The fixture's single task is `planned`, so the states reachable with that
+    // task shape are the pre-terminal ones; each must render and reload.
+    for state in [
+        PlanIntegrationState::Planned,
+        PlanIntegrationState::Assembling,
+        PlanIntegrationState::AwaitingIntegration,
+        PlanIntegrationState::FinalizationPending,
+    ] {
+        for mode in [
+            FinalMerge::Squash,
+            FinalMerge::MergeCommit,
+            FinalMerge::Stage,
+            FinalMerge::Manual,
+        ] {
+            let carries_mode = state == PlanIntegrationState::FinalizationPending;
+            let rendered = makina_core::plan_status::render_plan_status(
+                &plan,
+                &makina_core::plan_status::StatusTransition {
+                    integration_state: state,
+                    run: (state != PlanIntegrationState::Planned)
+                        .then(|| "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+                    validation_base: (state != PlanIntegrationState::Planned).then(|| oid.clone()),
+                    mode: carries_mode.then(|| final_mode_names(mode).1.to_owned()),
+                    final_oid: None,
+                    display_status: display_badge(state).into(),
+                    last_updated: "_Last updated: 2026-07-19, against `develop` @ `aaaaaaa`._"
+                        .into(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("{state:?} with {mode:?} failed to render: {error}"));
+            makina_core::plan::verify_rendered_status(&plan, &rendered).unwrap_or_else(|errors| {
+                panic!("{state:?} with {mode:?} will not reload: {errors:?}")
+            });
+        }
+    }
+}
+
 fn fixture_repo() -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     run_git(repo.path(), &["init", "-q"]);

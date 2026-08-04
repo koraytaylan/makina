@@ -710,7 +710,8 @@ impl DriverContext {
             .map_err(|error| format!("render task claim: {error}"))?;
         plan.status.integration_state = crate::plan::PlanIntegrationState::Assembling;
         plan.status.run = Some(self.run_uid.clone());
-        plan.status.display_status = "🔄 In progress".into();
+        plan.status.display_status =
+            crate::plan_status::display_badge(plan.status.integration_state).into();
         let transition = crate::plan_status::StatusTransition {
             integration_state: plan.status.integration_state,
             run: plan.status.run.clone(),
@@ -823,9 +824,31 @@ impl DriverContext {
             .iter()
             .filter(|task| task.frontmatter.status == crate::plan::AuthoredTaskStatus::Dropped)
             .count();
-        plan.status.display_status = "🔄 In progress".into();
-        plan.status.integration_state = crate::plan::PlanIntegrationState::AwaitingIntegration;
-        plan.status.mode = Some("Squash".into());
+        // Integration state follows the *authored* task statuses, exactly as the
+        // typed contract's `complete_task` derives it: a plan is only awaiting
+        // integration once every task is terminal; while work remains it is
+        // still assembling.
+        //
+        // The final merge mode is deliberately NOT written here — it belongs to
+        // Phase P (finalization), and `awaiting-integration` + a mode is one of
+        // the combinations the plan loader rejects outright. Writing it made
+        // every Phase B publish a STATUS.md that the *next* task's durable claim
+        // could not parse, so the second task of any multi-task plan died with a
+        // hard error and every task after it was skipped.
+        let all_terminal = plan.tasks.iter().all(|task| {
+            matches!(
+                task.frontmatter.status,
+                crate::plan::AuthoredTaskStatus::Done | crate::plan::AuthoredTaskStatus::Dropped
+            )
+        });
+        plan.status.integration_state = if all_terminal {
+            crate::plan::PlanIntegrationState::AwaitingIntegration
+        } else {
+            crate::plan::PlanIntegrationState::Assembling
+        };
+        plan.status.display_status =
+            crate::plan_status::display_badge(plan.status.integration_state).into();
+        plan.status.mode = None;
         let transition = crate::plan_status::StatusTransition {
             integration_state: plan.status.integration_state,
             run: Some(self.run_uid.clone()),
@@ -1313,12 +1336,9 @@ async fn run_graph_inner(
                 else {
                     return Err("registered source is not a plan".into());
                 };
-                let mode = match config.merge.final_ {
-                    FinalMerge::Squash => "squash",
-                    FinalMerge::MergeCommit => "merge-commit",
-                    FinalMerge::Stage => "stage",
-                    FinalMerge::Manual => "manual",
-                };
+                // `mode` is the commit-trailer spelling; `status_mode` is the
+                // STATUS.md spelling the plan loader accepts. Never swap them.
+                let (mode, status_mode) = crate::plan_status::final_mode_names(config.merge.final_);
                 let base_ref = format!("refs/heads/{}", worktree_manager.base_branch);
                 let base = String::from_utf8(
                     git_output(&integration_root, &["rev-parse", &base_ref])
@@ -1339,9 +1359,10 @@ async fn run_graph_inner(
                 plan.status.integration_state =
                     crate::plan::PlanIntegrationState::FinalizationPending;
                 plan.status.run = Some(ctx.run_uid.clone());
-                plan.status.mode = Some(mode.into());
+                plan.status.mode = Some(status_mode.into());
                 plan.status.final_oid = None;
-                plan.status.display_status = "⏳ Finalizing".into();
+                plan.status.display_status =
+                    crate::plan_status::display_badge(plan.status.integration_state).into();
                 let status = crate::plan_status::render_plan_status(
                     &plan,
                     &crate::plan_status::StatusTransition {
@@ -1396,7 +1417,11 @@ async fn run_graph_inner(
             }
             .await;
             if let Err(error) = prepared {
-                tracing::warn!(%error, "Phase P preparation failed; retaining plan branch");
+                // ERROR, not WARN: a failed Phase P means the run finished every
+                // task and then silently did not finalize. The only visible
+                // symptom was a plan that stayed `awaiting-integration` with no
+                // recorded reason anywhere the operator looks.
+                tracing::error!(%error, "Phase P preparation failed; retaining plan branch");
             }
             Some(plan_branch.clone())
         } else {

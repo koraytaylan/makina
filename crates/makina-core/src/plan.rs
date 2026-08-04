@@ -113,6 +113,15 @@ impl GitObjectId {
         }
         Ok(Self(value.to_ascii_lowercase()))
     }
+
+    /// The object format this ID was parsed under, recovered from its width.
+    pub fn format(&self) -> GitObjectFormat {
+        if self.0.len() == GitObjectFormat::Sha256.hex_len() {
+            GitObjectFormat::Sha256
+        } else {
+            GitObjectFormat::Sha1
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1676,8 +1685,19 @@ impl PlanKey {
             slug,
         })
     }
+    /// The one canonical `{number}-{slug}` plan identity.
+    ///
+    /// Every consumer that names a plan branch, an integration workspace, or a
+    /// landing trailer must derive it from here. Git refs are case-sensitive, so
+    /// a caller that case-folds this on its own produces a *different* branch
+    /// than registration published, and the run then behaves as though the plan
+    /// were never registered.
+    pub fn plan_identity(&self) -> String {
+        format!("{}-{}", self.number, self.slug)
+    }
+
     pub fn ref_name(&self) -> String {
-        format!("refs/heads/plan/{}-{}", self.number, self.slug)
+        format!("refs/heads/plan/{}", self.plan_identity())
     }
 }
 
@@ -2776,6 +2796,41 @@ fn parse_status_document(
     })
 }
 
+/// Re-read a freshly rendered `STATUS.md` body exactly the way the plan loader
+/// will, and report every diagnostic it would raise.
+///
+/// Every coordinator write path renders `STATUS.md` and commits it; the *next*
+/// durable claim loads it back through [`load_plan`]. A render that produces a
+/// body the loader rejects is therefore not cosmetic — it strands every task
+/// that has not claimed yet, and the failure surfaces one task later, in a
+/// different subsystem, as an opaque "load integration plan for claim" error.
+/// Running the loader's own parse and validation against the rendered bytes
+/// moves that error back to the write site that caused it.
+pub fn verify_rendered_status(plan: &PlanDocument, rendered: &str) -> Result<(), Vec<String>> {
+    let document = MarkdownDocument {
+        source_path: plan.status.source.source_path.clone(),
+        body: rendered.to_owned(),
+    };
+    let surface = status_surface_errors(&document.body);
+    if !surface.is_empty() {
+        return Err(surface);
+    }
+    let status = parse_status_document(document, plan.status.base_oid.format())
+        .map_err(|error| vec![error])?;
+    let mut report = PlanValidationReport::default();
+    // A successfully loaded `PlanDocument` never carries unparsed task stubs —
+    // they are validation errors, so `load_plan` would have failed instead.
+    validate_plan_status(&status, &plan.tasks, &[], &mut report);
+    if report.diagnostics.is_empty() {
+        return Ok(());
+    }
+    Err(report
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+        .collect())
+}
+
 fn validate_plan_status(
     status: &PlanStatusDocument,
     tasks: &[TaskDocument],
@@ -2833,8 +2888,14 @@ fn validate_plan_status(
                     )
                 })
         }
+        // The documented badges for these two states are "⏳ Awaiting
+        // integration" and "🔄 Finalizing"; a generic in-progress badge stays
+        // acceptable so authored boards written before the table existed keep
+        // loading.
         PlanIntegrationState::AwaitingIntegration | PlanIntegrationState::FinalizationPending => {
-            display.contains("progress")
+            (display.contains("progress")
+                || display.contains("awaiting integration")
+                || display.contains("finalizing"))
                 && !tasks
                     .iter()
                     .any(|task| task.frontmatter.status == AuthoredTaskStatus::InProgress)

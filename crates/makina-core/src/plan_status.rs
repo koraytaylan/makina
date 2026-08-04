@@ -23,6 +23,8 @@ pub enum StatusEditError {
     ExceptionCardinality(String),
     #[error("exception record is not a bounded single line")]
     InvalidException,
+    #[error("rendered status would not load back: {0}")]
+    UnreadableRender(String),
 }
 
 fn validate_exception_part(value: &str) -> Result<(), StatusEditError> {
@@ -138,6 +140,39 @@ pub struct StatusTransition {
     pub last_updated: String,
 }
 
+/// The two canonical spellings of a final merge mode, returned together.
+///
+/// `.0` is the commit-trailer vocabulary (`Makina-Final-Mode`, lowercase-kebab);
+/// `.1` is the `STATUS.md` `Integration` vocabulary, which is the *only*
+/// spelling the plan loader accepts. They are handed out as a pair so a caller
+/// cannot write one vocabulary into the other's slot — writing the trailer
+/// spelling into STATUS produced an `invalid integration mode` that made the
+/// finalized plan unreadable.
+pub fn final_mode_names(mode: crate::config::FinalMerge) -> (&'static str, &'static str) {
+    match mode {
+        crate::config::FinalMerge::Squash => ("squash", "Squash"),
+        crate::config::FinalMerge::MergeCommit => ("merge-commit", "MergeCommit"),
+        crate::config::FinalMerge::Stage => ("stage", "Stage"),
+        crate::config::FinalMerge::Manual => ("manual", "Manual"),
+    }
+}
+
+/// The documented root/heading badge for an integration state.
+///
+/// Mirrors the display-precedence table in the plan-0048 architecture note. Use
+/// it instead of an ad-hoc string so a writer cannot invent a badge the status
+/// validator rejects as lifecycle drift.
+pub fn display_badge(state: PlanIntegrationState) -> &'static str {
+    match state {
+        PlanIntegrationState::Planned => "📋 Planned",
+        PlanIntegrationState::Assembling => "🚧 In progress",
+        PlanIntegrationState::AwaitingIntegration => "⏳ Awaiting integration",
+        PlanIntegrationState::FinalizationPending => "🔄 Finalizing",
+        PlanIntegrationState::IntegrationBlocked => "⛔ Blocked",
+        PlanIntegrationState::Complete => "✅ Complete",
+    }
+}
+
 fn state_name(state: PlanIntegrationState) -> &'static str {
     match state {
         PlanIntegrationState::Planned => "planned",
@@ -237,6 +272,12 @@ pub fn render_plan_status(
     );
     replace_unique_line(&mut body, "- **Integration:** ", integration)?;
     replace_unique_line(&mut body, "_Last updated:", transition.last_updated.clone())?;
+    // Fail here, not one task later. A rendered status the loader rejects is
+    // committed to the plan ref and only explodes when the *next* durable claim
+    // re-reads it, by which point the reported error names the reader rather
+    // than the writer that produced it.
+    crate::plan::verify_rendered_status(plan, &body)
+        .map_err(|diagnostics| StatusEditError::UnreadableRender(diagnostics.join("; ")))?;
     Ok(body)
 }
 
