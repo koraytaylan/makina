@@ -16,6 +16,12 @@ pub enum CliAction {
         template: Option<String>,
     },
     CreateError(String),
+    /// Drive one plan to a terminal run status without a terminal attached.
+    Run {
+        plan_dir: String,
+        finalize: bool,
+    },
+    RunError(String),
     Unknown(String),
 }
 
@@ -27,8 +33,34 @@ pub fn parse_args(args: &[String]) -> CliAction {
         Some("-V") | Some("--version") => CliAction::ShowVersion,
         Some("--doctor") => CliAction::RunDoctor,
         Some("create") => parse_create(&args[1..]),
+        Some("run") => parse_run(&args[1..]),
         Some(other) => CliAction::Unknown(other.to_string()),
     }
+}
+
+fn parse_run(rest: &[String]) -> CliAction {
+    let mut plan_dir: Option<String> = None;
+    let mut finalize = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--finalize" => {
+                finalize = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') && plan_dir.is_none() => {
+                plan_dir = Some(other.to_string());
+                i += 1;
+            }
+            other => return CliAction::RunError(format!("unexpected argument: {other}")),
+        }
+    }
+    let Some(plan_dir) = plan_dir else {
+        return CliAction::RunError(
+            "makina run requires a <plan-dir> (e.g. docs/plans/0001-todo-core)".to_string(),
+        );
+    };
+    CliAction::Run { plan_dir, finalize }
 }
 
 fn parse_create(rest: &[String]) -> CliAction {
@@ -84,7 +116,11 @@ pub fn help_text() -> String {
          SUBCOMMANDS:\n  \
          create <path> [--template <name>]\n    \
          Create an empty Makina project; --template adds sample code and plans\n    \
-         Available templates: todo\n\
+         Available templates: todo\n  \
+         run <plan-dir> [--finalize]\n    \
+         Register, open, and drive one plan to a terminal status without a terminal;\n    \
+         exits non-zero if any task fails. --finalize also merges the plan branch\n    \
+         into the base branch once every task has landed.\n\
          \n\
          CONFIGURATION:\n  \
          Global config: ~/.makina/config.toml\n  \
@@ -138,6 +174,43 @@ mod tests {
             parse_args(&["--nope".into()]),
             CliAction::Unknown("--nope".into())
         );
+    }
+
+    #[test]
+    fn parse_args_handles_run_subcommand() {
+        assert_eq!(
+            parse_args(&["run".into(), "docs/plans/0001-todo-core".into()]),
+            CliAction::Run {
+                plan_dir: "docs/plans/0001-todo-core".into(),
+                finalize: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "run".into(),
+                "docs/plans/0001-todo-core".into(),
+                "--finalize".into()
+            ]),
+            CliAction::Run {
+                plan_dir: "docs/plans/0001-todo-core".into(),
+                finalize: true,
+            }
+        );
+        match parse_args(&["run".into()]) {
+            CliAction::RunError(msg) => assert!(msg.contains("plan-dir"), "{msg}"),
+            other => panic!("expected RunError, got {other:?}"),
+        }
+        match parse_args(&["run".into(), "a".into(), "b".into()]) {
+            CliAction::RunError(msg) => assert!(msg.contains("unexpected"), "{msg}"),
+            other => panic!("expected RunError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_documents_the_run_subcommand() {
+        let help = help_text();
+        assert!(help.contains("run <plan-dir>"), "{help}");
+        assert!(help.contains("--finalize"), "{help}");
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod cli;
 pub mod event;
 pub mod exit;
 pub mod folder_init;
+pub mod headless;
 pub mod log;
 pub mod markup;
 #[cfg(test)]

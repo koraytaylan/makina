@@ -29,7 +29,11 @@ const LIVE_FRAME_REGION: &[&str] = &["event.rs", "app.rs", "ui.rs", "tui.rs", "b
 /// and only because each runs with NO live ratatui frame.
 /// Updated to 13 to include CLI dispatch prints (--help, --version, --doctor, unknown flag,
 /// create success report print, create error) which all run before Tui::init().
-const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 14;
+/// Updated to 15 for the `run` subcommand's usage-error print, the same
+/// dispatch-time category as create-error. `makina run`'s own output is NOT
+/// counted here: it lives in `makina::headless`, where stdout is the output
+/// medium rather than a bypassed frame.
+const MAIN_RS_EXEMPT_PRINT_COUNT: usize = 15;
 
 fn src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")

@@ -190,6 +190,13 @@ makina create ~/tmp/todo --template todo   # scaffold a runnable project
 cd ~/tmp/todo && makina                     # open it in the TUI
 ```
 
+Or drive the same plan with no terminal attached:
+
+```bash
+cd ~/tmp/todo
+makina run docs/plans/0001-todo-core --finalize
+```
+
 `makina create <path>` bootstraps an empty Makina git repo with no sample code
 or plans. Pass `--template todo` explicitly to add the runnable todo project
 and its committed, registered starter plans. Both forms leave `main` checked
@@ -205,6 +212,21 @@ cargo run -p makina    # auto-detects an installed agent — no global config re
 - **`makina --help`** — print usage and config file locations
 - **`makina --version`** / **`-V`** — print the version and git sha (when available)
 - **`makina --doctor`** — run a headless preflight check; exits 0 if a backend is configured or detected, non-zero otherwise
+
+**Headless runs:**
+
+```bash
+makina run docs/plans/0001-todo-core              # drive every task, stop at durable Phase P
+makina run docs/plans/0001-todo-core --finalize   # …then merge the plan branch onto the base branch
+```
+
+`makina run <plan-dir>` registers the committed bundle if it has not been
+published yet, opens it, starts the supervisor, streams task transitions to
+stdout, and exits non-zero if any task fails — the same orchestration the TUI
+performs, without the rendering. Re-running a plan that has already landed
+every task reports that it is awaiting finalization; adding `--finalize`
+resumes it from its retained Phase P. Per-run logs land in
+`.makina/runs/{run-uid}/logs/` exactly as they do under the TUI.
 
 **Keys:**
 - **`!`** — open the Doctor overlay for a headless health check

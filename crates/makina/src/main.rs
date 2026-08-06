@@ -226,6 +226,21 @@ async fn main() {
             eprintln!("error: {msg}\n\n{}", makina::cli::help_text());
             std::process::exit(2);
         }
+        makina::cli::CliAction::Run { plan_dir, finalize } => {
+            // The agent-backend wiring stays here; the orchestration and its
+            // stdout contract live in `makina::headless`.
+            let leases = Arc::new(makina_core::repository_lease::RepositoryLeaseRegistry::new());
+            let build = move |root: &std::path::Path, config: Config| {
+                let (api, _developer, _planner) =
+                    build_project_api(root, config, Arc::clone(&leases));
+                api
+            };
+            std::process::exit(makina::headless::run_plan(&plan_dir, finalize, &build).await);
+        }
+        makina::cli::CliAction::RunError(msg) => {
+            eprintln!("error: {msg}\n\n{}", makina::cli::help_text());
+            std::process::exit(2);
+        }
         makina::cli::CliAction::Unknown(flag) => {
             eprintln!("unknown flag: {flag}\n\n{}", makina::cli::help_text());
             std::process::exit(2);
