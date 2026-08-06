@@ -294,6 +294,112 @@ fn retained_lifecycle_rejects_skips_duplicates_mismatches_and_out_of_order_phase
     }
 }
 
+/// Discovery must accept the lineage vocabulary the coordinator actually writes.
+///
+/// The other lineage tests spell a claim `Makina-Phase: task-status`, which is
+/// what the *reader* happened to accept — the writer stamps `task-claim`, and a
+/// reconcile/retry/cancel stamps `task-transition`. Neither was classified, so
+/// the first post-registration commit of every real plan was unrecognized and
+/// no plan could be re-opened once a single task had been claimed. Fixtures
+/// written against the reader could never catch that, so this one uses only
+/// vocabulary the writers emit.
+#[test]
+fn discovery_accepts_the_lineage_vocabulary_the_writers_emit() {
+    let repo = registered_repo();
+    let claim = lifecycle_message("task-claim", "Makina-Task: sample-task\nMakina-Run: run-1");
+    commit_message(repo.path(), &claim);
+    let entries = discover_plans(repo.path());
+    assert_eq!(
+        entries[0].state,
+        PlanDiscoveryState::Active,
+        "a `task-claim` must be recognized: {:?}",
+        entries[0].diagnostics,
+    );
+
+    // A reconcile/cancel ends the open claim without a landing.
+    let transition = lifecycle_message(
+        "task-transition",
+        "Makina-Task: sample-task\nMakina-Run: run-1\nMakina-Transition: reconcile",
+    );
+    commit_message(repo.path(), &transition);
+    let entries = discover_plans(repo.path());
+    assert_eq!(
+        entries[0].state,
+        PlanDiscoveryState::Active,
+        "a `task-transition` must be recognized: {:?}",
+        entries[0].diagnostics,
+    );
+}
+
+/// Concurrent tasks interleave in the retained lineage, and that is legal.
+///
+/// The scheduler runs independent tasks in parallel by design, so two claims
+/// appear back to back before either lands. A single-slot lineage model called
+/// that "duplicate, skipped, or out of order" and marked the plan Invalid, so
+/// no parallel plan could ever be re-opened.
+#[test]
+fn discovery_accepts_interleaved_concurrent_task_lineage() {
+    let repo = registered_repo();
+    for message in [
+        lifecycle_message("task-claim", "Makina-Task: alpha\nMakina-Run: run-1"),
+        lifecycle_message("task-claim", "Makina-Task: beta\nMakina-Run: run-1"),
+    ] {
+        commit_message(repo.path(), &message);
+    }
+    let beta_landing = commit_message(
+        repo.path(),
+        "landing beta\n\nMakina-Plan: 0049-Sample\nMakina-Task: beta\nMakina-Run: run-1",
+    );
+    commit_message(
+        repo.path(),
+        &lifecycle_message(
+            "task-status",
+            &format!("Makina-Task: beta\nMakina-Run: run-1\nMakina-Landing: {beta_landing}"),
+        ),
+    );
+    let alpha_landing = commit_message(
+        repo.path(),
+        "landing alpha\n\nMakina-Plan: 0049-Sample\nMakina-Task: alpha\nMakina-Run: run-1",
+    );
+    commit_message(
+        repo.path(),
+        &lifecycle_message(
+            "task-status",
+            &format!("Makina-Task: alpha\nMakina-Run: run-1\nMakina-Landing: {alpha_landing}"),
+        ),
+    );
+
+    let entries = discover_plans(repo.path());
+    assert_eq!(
+        entries[0].state,
+        PlanDiscoveryState::Active,
+        "interleaved parallel lineage must be accepted: {:?}",
+        entries[0].diagnostics,
+    );
+}
+
+/// Per-task ordering stays exact: a landing with no matching claim is rejected.
+#[test]
+fn discovery_still_rejects_a_landing_without_its_claim() {
+    let repo = registered_repo();
+    commit_message(
+        repo.path(),
+        &lifecycle_message("task-claim", "Makina-Task: alpha\nMakina-Run: run-1"),
+    );
+    // A landing for a task that never claimed.
+    commit_message(
+        repo.path(),
+        "landing beta\n\nMakina-Plan: 0049-Sample\nMakina-Task: beta\nMakina-Run: run-1",
+    );
+    let entries = discover_plans(repo.path());
+    assert_eq!(entries[0].state, PlanDiscoveryState::Invalid);
+    let reason = format!("{:?}", entries[0].diagnostics);
+    assert!(
+        reason.contains("beta"),
+        "the reason must name the offending task: {reason}",
+    );
+}
+
 fn registered_repo() -> tempfile::TempDir {
     let repo = fixture_repo();
     git(repo.path(), &["add", "."]);

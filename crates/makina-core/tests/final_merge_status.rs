@@ -113,6 +113,135 @@ async fn p_f_c_are_cas_linked_and_completion_records_f() {
     }
 }
 
+/// The second plan to finalize in a repository must still finalize.
+///
+/// Every plan branch carries the shared root roll-up board as it stood when
+/// that plan registered. Once any *other* plan finalizes, the base board has a
+/// rewritten row, and squash-merging the moved base into this plan branch
+/// conflicts on `docs/plans/STATUS.md` — even though the two versions are not
+/// in genuine disagreement. That file is coordinator-owned and recomputed from
+/// the current base, so the conflict is moot; before this was handled, a repo's
+/// second plan ran every task and then failed Phase P forever.
+#[tokio::test]
+async fn a_conflict_confined_to_coordinator_owned_documents_still_prepares() {
+    let repo = repo();
+    let base = git(repo.path(), &["rev-parse", "develop"]);
+
+    // The plan branch edits the shared board its own way…
+    git(repo.path(), &["checkout", "-q", "plan/0048-X"]);
+    fs::write(
+        repo.path().join("docs/plans/STATUS.md"),
+        "root\n| 0048 | X | in progress |\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "plan board"]);
+    let plan_tip = git(repo.path(), &["rev-parse", "plan/0048-X"]);
+
+    // …while another plan finalizing onto the base rewrites the same file.
+    git(repo.path(), &["checkout", "-q", "develop"]);
+    fs::write(
+        repo.path().join("docs/plans/STATUS.md"),
+        "root\n| 0047 | W | complete |\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "other plan finalized"]);
+    let moved_base = git(repo.path(), &["rev-parse", "develop"]);
+    assert_ne!(moved_base, base, "the base must have moved");
+
+    let identity = FinalizationIdentity {
+        plan: "0048-X".into(),
+        run: "01FINAL".into(),
+        mode: "squash".into(),
+        expected_base: moved_base.clone(),
+    };
+    let board = "root\n| 0047 | W | complete |\n| 0048 | X | finalizing |\n";
+    let prepared = commit_finalization_prepared(
+        repo.path(),
+        "refs/heads/plan/0048-X",
+        "refs/heads/develop",
+        &plan_tip,
+        &moved_base,
+        &[
+            OwnedWrite {
+                path: "docs/plans/0048-X/STATUS.md".into(),
+                bytes: b"pending\n".to_vec(),
+            },
+            OwnedWrite {
+                path: "docs/plans/STATUS.md".into(),
+                bytes: board.as_bytes().to_vec(),
+            },
+        ],
+        &identity,
+        true,
+    )
+    .await
+    .expect("a conflict confined to recomputed documents must not abort Phase P");
+
+    // The prepared tree carries the recomputed board, not a conflicted one.
+    let written = git(
+        repo.path(),
+        &["show", &format!("{prepared}:docs/plans/STATUS.md")],
+    );
+    assert_eq!(written, board.trim_end());
+    assert!(
+        !written.contains("<<<<<<<"),
+        "conflict markers must never reach the prepared tree",
+    );
+    assert_eq!(git(repo.path(), &["rev-parse", "plan/0048-X"]), prepared);
+}
+
+/// A conflict in a file the coordinator does NOT rewrite is still fatal, and
+/// the message must name it — `git merge --squash` reports conflicts on stdout,
+/// so reporting stderr alone produced an empty reason.
+#[tokio::test]
+async fn a_conflict_outside_coordinator_documents_fails_with_a_named_reason() {
+    let repo = repo();
+    git(repo.path(), &["checkout", "-q", "plan/0048-X"]);
+    fs::write(repo.path().join("src.txt"), "from the plan branch\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "plan edit"]);
+    let plan_tip = git(repo.path(), &["rev-parse", "plan/0048-X"]);
+
+    git(repo.path(), &["checkout", "-q", "develop"]);
+    fs::write(repo.path().join("src.txt"), "from the base\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "base edit"]);
+    let moved_base = git(repo.path(), &["rev-parse", "develop"]);
+
+    let identity = FinalizationIdentity {
+        plan: "0048-X".into(),
+        run: "01FINAL".into(),
+        mode: "squash".into(),
+        expected_base: moved_base.clone(),
+    };
+    let error = commit_finalization_prepared(
+        repo.path(),
+        "refs/heads/plan/0048-X",
+        "refs/heads/develop",
+        &plan_tip,
+        &moved_base,
+        &[OwnedWrite {
+            path: "docs/plans/0048-X/STATUS.md".into(),
+            bytes: b"pending\n".to_vec(),
+        }],
+        &identity,
+        true,
+    )
+    .await
+    .expect_err("a genuine content conflict must abort Phase P");
+    let error = error.to_string();
+    assert!(
+        error.contains("src.txt"),
+        "the reason must name it: {error}"
+    );
+    assert!(
+        error.contains("outside coordinator-owned"),
+        "the reason must say why it is fatal: {error}",
+    );
+}
+
 #[tokio::test]
 async fn manual_requires_exact_base_tip_tree_parents_and_trailers() {
     let repo = repo();

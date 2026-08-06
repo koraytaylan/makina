@@ -143,38 +143,30 @@ pub async fn run_plan(plan_dir: &str, finalize: bool, build_api: ApiBuilder<'_>)
         }
     }
 
-    // A plan already at durable Phase P has finished every task and is waiting
-    // for delayed finalization. `OpenPlan` rejects that tip — its Phase-R
-    // trailers no longer match the prepared status — so resume through the
-    // entry point that state actually has instead of reporting a spurious
-    // registration error.
-    if let Some((state, run_uid, plan_oid)) = retained_finalization(&repo_root, &key) {
+    // A plan that has landed every task is waiting on finalization, whether it
+    // reached durable Phase P or stopped at `awaiting-integration` because a
+    // Phase-P attempt failed. `OpenPlan` rejects both tips — their Phase-R
+    // trailers no longer match the retained status — so resume through the
+    // entry point those states actually have instead of reporting a spurious
+    // registration error and stranding the plan for good.
+    if let Some((state, run_uid, _)) = retained_finalization(&repo_root, &key) {
         match state.as_str() {
             "complete" => {
                 println!("{plan_dir} is already complete");
                 return 0;
             }
-            "finalization-pending" if finalize => {
-                return match api
-                    .execute(Command::FinalizePlan {
-                        plan_dir: key,
-                        run_uid,
-                        expected_plan_oid: plan_oid,
-                        input: FinalizeInput::Automatic,
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        println!("finalized {plan_dir} onto {base_branch}");
-                        0
-                    }
-                    Err(error) => {
-                        eprintln!("error: finalizing {plan_dir} failed: {error}");
-                        1
-                    }
-                };
+            "finalization-pending" | "awaiting-integration" if finalize => {
+                return finalize_retained(
+                    api.as_ref(),
+                    &repo_root,
+                    &key,
+                    &run_uid,
+                    plan_dir,
+                    &base_branch,
+                )
+                .await;
             }
-            "finalization-pending" => {
+            "finalization-pending" | "awaiting-integration" => {
                 println!(
                     "{plan_dir} has landed every task and is awaiting finalization; \
                      re-run with --finalize to merge it onto {base_branch}"
@@ -261,30 +253,92 @@ pub async fn run_plan(plan_dir: &str, finalize: bool, build_api: ApiBuilder<'_>)
     }
 
     if finalize {
-        let plan_oid = match git_rev_parse(&repo_root, &key.ref_name()) {
-            Ok(oid) => oid,
-            Err(error) => {
-                eprintln!("error: cannot resolve {}: {error}", key.ref_name());
-                return 1;
-            }
-        };
+        // The supervisor attempts Phase P at the end of a run, but that attempt
+        // can fail — a genuine content conflict with a base another plan has
+        // since advanced, for instance — and it only logs. Re-read the retained
+        // state instead of assuming P exists: calling `FinalizePlan` on a plan
+        // still at `awaiting-integration` reported "expected plan tip is not
+        // exact Phase P evidence", which describes the symptom and hides the
+        // conflict that actually caused it.
+        return finalize_retained(
+            api.as_ref(),
+            &repo_root,
+            &key,
+            &view.run_uid,
+            plan_dir,
+            &base_branch,
+        )
+        .await;
+    }
+    0
+}
+
+/// Take a plan that has landed every task through Phase P (when it has none)
+/// and then through F/C.
+async fn finalize_retained(
+    api: &dyn Api,
+    repo_root: &Path,
+    key: &PlanKey,
+    run_uid: &str,
+    plan_dir: &str,
+    base_branch: &str,
+) -> i32 {
+    let (state, plan_oid) = match retained_finalization(repo_root, key) {
+        Some((state, _, oid)) => (state, oid),
+        None => {
+            eprintln!(
+                "error: {plan_dir} is not in a finalizable state; see the run log for the \
+                 Phase P failure that left it there"
+            );
+            return 1;
+        }
+    };
+    if state == "complete" {
+        println!("{plan_dir} is already complete");
+        return 0;
+    }
+    let mut plan_oid = plan_oid;
+    if state == "awaiting-integration" {
         match api
-            .execute(Command::FinalizePlan {
-                plan_dir: key,
-                run_uid: view.run_uid.clone(),
-                expected_plan_oid: plan_oid,
-                input: FinalizeInput::Automatic,
+            .execute(Command::ReprepareFinalization {
+                plan_dir: key.clone(),
+                run_uid: run_uid.to_owned(),
+                expected_plan_oid: plan_oid.clone(),
             })
             .await
         {
-            Ok(_) => println!("finalized onto {base_branch}"),
+            Ok(CommandOutcome::FinalizationAccepted { plan_oid: prepared }) => {
+                println!("prepared finalization for {plan_dir}");
+                plan_oid = prepared;
+            }
+            Ok(other) => {
+                eprintln!("error: preparing finalization returned {other:?}");
+                return 1;
+            }
             Err(error) => {
-                eprintln!("error: finalizing failed: {error}");
+                eprintln!("error: preparing finalization for {plan_dir} failed: {error}");
                 return 1;
             }
         }
     }
-    0
+    match api
+        .execute(Command::FinalizePlan {
+            plan_dir: key.clone(),
+            run_uid: run_uid.to_owned(),
+            expected_plan_oid: plan_oid,
+            input: FinalizeInput::Automatic,
+        })
+        .await
+    {
+        Ok(_) => {
+            println!("finalized {plan_dir} onto {base_branch}");
+            0
+        }
+        Err(error) => {
+            eprintln!("error: finalizing {plan_dir} failed: {error}");
+            1
+        }
+    }
 }
 
 /// Read the retained plan ref's integration state, run, and tip.
@@ -303,6 +357,11 @@ fn retained_finalization(repo_root: &Path, key: &PlanKey) -> Option<(String, Str
     };
     let state = match plan.status.integration_state {
         PlanIntegrationState::FinalizationPending => "finalization-pending",
+        // Every task has landed but Phase P has not been published — either it
+        // has not been attempted or an attempt failed. Finalization is still
+        // the correct next step, so this must not be mistaken for a run to
+        // start over.
+        PlanIntegrationState::AwaitingIntegration => "awaiting-integration",
         PlanIntegrationState::Complete => "complete",
         _ => return None,
     };

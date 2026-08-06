@@ -1,6 +1,7 @@
 //! Recoverable coordinator bookkeeping commits.
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -152,6 +153,17 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String, LandingError> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Run `git` and split its stdout into non-empty trimmed lines.
+async fn git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>, LandingError> {
+    Ok(git(repo, args)
+        .await?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 fn exact(message: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}: ");
     let values = message
@@ -247,10 +259,46 @@ pub async fn commit_finalization_prepared(
         .output()
         .await?;
     if !merge.status.success() {
-        return Err(LandingError::Git {
-            command: "prepare finalization tree".into(),
-            stderr: String::from_utf8_lossy(&merge.stderr).trim().into(),
-        });
+        // `git merge --squash` reports conflicts on STDOUT; stderr is empty for
+        // an ordinary conflict, so reporting stderr alone produced a failure
+        // message with nothing after the colon.
+        let detail = {
+            let out = String::from_utf8_lossy(&merge.stdout);
+            let err = String::from_utf8_lossy(&merge.stderr);
+            let joined = format!("{}\n{}", out.trim(), err.trim());
+            joined.trim().to_owned()
+        };
+        // Coordinator-owned documents are DERIVED, not merged. The plan branch
+        // carries the root roll-up board as it stood when this plan registered;
+        // any other plan that finalized since has rewritten its own row on the
+        // base. Three-way merging those two versions conflicts even though the
+        // texts are not in genuine disagreement — and the conflict is moot,
+        // because the loop below overwrites exactly these paths with the board
+        // recomputed from the *current* base plus this plan's row.
+        //
+        // Without this, the second plan to finalize in any repository could
+        // never finalize: every task landed, then Phase P failed forever.
+        let unresolved = git_lines(repo, &["diff", "--name-only", "--diff-filter=U"]).await?;
+        let owned = writes
+            .iter()
+            .map(|write| write.path.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        let genuine = unresolved
+            .iter()
+            .filter(|path| !owned.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        // An empty conflict set means the merge failed for some other reason.
+        if unresolved.is_empty() || !genuine.is_empty() {
+            return Err(LandingError::Git {
+                command: "prepare finalization tree".into(),
+                stderr: if genuine.is_empty() {
+                    detail
+                } else {
+                    format!("conflicts outside coordinator-owned documents: {genuine:?}\n{detail}")
+                },
+            });
+        }
     }
     for write in writes {
         let path = repo.join(&write.path);

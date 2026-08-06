@@ -234,6 +234,12 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
         Landing,
         Bookkeeping,
         Disposition,
+        /// A coordinator-owned source transition — `reconcile`, `retry`,
+        /// `requeue`, `cancel`, or `blocker`. It rewrites the task's authored
+        /// status, which is deliberately outside the digest, so unlike a
+        /// disposition it never re-authorizes digests; it only ends whatever
+        /// claim was open for that task.
+        Transition,
         Prepared,
         FinalIntegration,
         Completion,
@@ -257,6 +263,14 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
             {
                 Ok(RetainedEvidence::Bookkeeping)
             }
+            // `commit_task_claim` stamps `task-claim`; `landing::inspect_task_evidence`
+            // reads that spelling too. Only this classifier did not, so the very
+            // first post-registration commit of every plan was unclassifiable
+            // and no plan could be re-opened once a single task had been
+            // claimed — no resume after an interrupt, no second `OpenPlan`.
+            Some("task-claim") if has("Makina-Task") && has("Makina-Run") => {
+                Ok(RetainedEvidence::Claim)
+            }
             Some("task-status") if has("Makina-Task") && has("Makina-Run") => {
                 Ok(RetainedEvidence::Claim)
             }
@@ -269,6 +283,11 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
                     && has("Makina-New-Plan-Digest") =>
             {
                 Ok(RetainedEvidence::Disposition)
+            }
+            Some("task-transition")
+                if has("Makina-Task") && has("Makina-Run") && has("Makina-Transition") =>
+            {
+                Ok(RetainedEvidence::Transition)
             }
             Some("finalization-prepared")
                 if has("Makina-Run") && has("Makina-Final-Mode") && has("Makina-Expected-Base") =>
@@ -350,68 +369,101 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
         mut source: String,
         mut executable: String,
     ) -> Result<(String, String), String> {
+        // Per-task lineage. A single global slot could only describe one task
+        // at a time, so any plan whose scheduler ran two tasks concurrently —
+        // which is the normal case, and the entire point of a parallel
+        // workstream — produced a "duplicate, skipped, or out of order" verdict
+        // and could never be re-opened. Ordering is still enforced strictly,
+        // but per task, so concurrent tasks interleave freely while each one's
+        // claim → landing → status sequence stays exact.
         #[derive(Debug)]
-        enum LineageState {
-            Ready,
-            Claimed {
-                task: String,
-                run: String,
-            },
-            Landed {
-                task: String,
-                run: String,
-                oid: String,
-            },
-            Prepared {
-                oid: String,
-                run: String,
-            },
-            Integrated {
-                oid: String,
-                run: String,
-            },
+        enum TaskLineage {
+            Claimed { run: String },
+            Landed { run: String, oid: String },
+        }
+        #[derive(Debug)]
+        enum FinalizationLineage {
+            None,
+            Prepared { oid: String, run: String },
+            Integrated { oid: String, run: String },
             Complete,
         }
 
         let range = format!("{registration}..{tip}");
         let history = git(root, &["rev-list", "--first-parent", "--reverse", &range])
             .ok_or_else(|| "cannot inspect post-registration lineage".to_owned())?;
-        let mut state = LineageState::Ready;
+        let mut inflight = BTreeMap::<String, TaskLineage>::new();
+        let mut finalization = FinalizationLineage::None;
         for oid in history.lines() {
             let message = git(root, &["show", "-s", "--format=%B", oid])
                 .ok_or_else(|| format!("cannot read commit {oid}"))?;
             let expected = format!("{}-{}", key.number, key.slug);
             let evidence = retained_evidence(&message, &expected)
                 .map_err(|reason| format!("invalid retained commit {oid}: {reason}"))?;
-            state = match (state, evidence) {
-                (LineageState::Ready, RetainedEvidence::Claim) => LineageState::Claimed {
-                    task: trailer(&message, "Makina-Task").unwrap(),
-                    run: trailer(&message, "Makina-Run").unwrap(),
-                },
-                (LineageState::Claimed { task, run }, RetainedEvidence::Landing)
-                    if trailer(&message, "Makina-Task").as_deref() == Some(task.as_str())
-                        && trailer(&message, "Makina-Run").as_deref() == Some(run.as_str()) =>
-                {
-                    LineageState::Landed {
-                        task,
-                        run,
-                        oid: oid.to_owned(),
+            let task_of = |name: &str| trailer(&message, name);
+            match evidence {
+                RetainedEvidence::Registration => {
+                    return Err(format!(
+                        "retained lineage carries a second registration at {oid}"
+                    ));
+                }
+                RetainedEvidence::Claim => {
+                    let (Some(task), Some(run)) = (task_of("Makina-Task"), task_of("Makina-Run"))
+                    else {
+                        return Err(format!("claim {oid} lacks task/run identity"));
+                    };
+                    if inflight.contains_key(&task) {
+                        return Err(format!(
+                            "task {task} is claimed again at {oid} before its prior claim completed"
+                        ));
+                    }
+                    inflight.insert(task, TaskLineage::Claimed { run });
+                }
+                RetainedEvidence::Landing => {
+                    let (Some(task), Some(run)) = (task_of("Makina-Task"), task_of("Makina-Run"))
+                    else {
+                        return Err(format!("landing {oid} lacks task/run identity"));
+                    };
+                    match inflight.get(&task) {
+                        Some(TaskLineage::Claimed { run: claimed }) if *claimed == run => {
+                            inflight.insert(
+                                task,
+                                TaskLineage::Landed {
+                                    run,
+                                    oid: oid.to_owned(),
+                                },
+                            );
+                        }
+                        other => {
+                            return Err(format!(
+                                "landing {oid} for {task} does not follow a matching claim (found {other:?})"
+                            ));
+                        }
                     }
                 }
-                (
-                    LineageState::Landed {
-                        task,
-                        run,
-                        oid: landing,
-                    },
-                    RetainedEvidence::Bookkeeping,
-                ) if trailer(&message, "Makina-Task").as_deref() == Some(task.as_str())
-                    && trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
-                    && trailer(&message, "Makina-Landing").as_deref() == Some(landing.as_str()) =>
-                {
-                    LineageState::Ready
+                RetainedEvidence::Bookkeeping => {
+                    let (Some(task), Some(run), Some(landing)) = (
+                        task_of("Makina-Task"),
+                        task_of("Makina-Run"),
+                        task_of("Makina-Landing"),
+                    ) else {
+                        return Err(format!("status {oid} lacks task/run/landing identity"));
+                    };
+                    match inflight.get(&task) {
+                        Some(TaskLineage::Landed {
+                            run: landed,
+                            oid: landed_oid,
+                        }) if *landed == run && *landed_oid == landing => {
+                            inflight.remove(&task);
+                        }
+                        other => {
+                            return Err(format!(
+                                "status {oid} for {task} does not follow its exact landing (found {other:?})"
+                            ));
+                        }
+                    }
                 }
-                (LineageState::Ready, RetainedEvidence::Disposition) => {
+                RetainedEvidence::Disposition => {
                     let previous_source = trailer(&message, "Makina-Previous-Source-Digest")
                         .expect("classified disposition has previous source digest");
                     let next_source = trailer(&message, "Makina-New-Source-Digest")
@@ -427,43 +479,67 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
                     }
                     source = next_source;
                     executable = next_plan;
-                    LineageState::Ready
                 }
-                (LineageState::Ready, RetainedEvidence::Prepared) => LineageState::Prepared {
-                    oid: oid.to_owned(),
-                    run: trailer(&message, "Makina-Run").unwrap(),
-                },
-                (
-                    LineageState::Prepared { oid: prepared, run },
-                    RetainedEvidence::FinalIntegration,
-                ) if trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
-                    && trailer(&message, "Makina-Plan-Tip").as_deref()
-                        == Some(prepared.as_str()) =>
-                {
-                    LineageState::Integrated {
-                        oid: oid.to_owned(),
-                        run,
+                RetainedEvidence::Transition => {
+                    // Ends whatever claim was open for the task — a reconcile
+                    // or cancel returns an interrupted task to the pool without
+                    // a landing. Permissive when no claim is open: a blocker
+                    // may be recorded against a task that never claimed.
+                    if let Some(task) = task_of("Makina-Task") {
+                        inflight.remove(&task);
                     }
                 }
-                (
-                    LineageState::Integrated {
+                RetainedEvidence::Prepared => {
+                    if !inflight.is_empty() {
+                        return Err(format!(
+                            "finalization is prepared at {oid} while {:?} are still in flight",
+                            inflight.keys().collect::<Vec<_>>()
+                        ));
+                    }
+                    if !matches!(finalization, FinalizationLineage::None) {
+                        return Err(format!("finalization is prepared twice at {oid}"));
+                    }
+                    finalization = FinalizationLineage::Prepared {
+                        oid: oid.to_owned(),
+                        run: trailer(&message, "Makina-Run").unwrap_or_default(),
+                    };
+                }
+                RetainedEvidence::FinalIntegration => match finalization {
+                    FinalizationLineage::Prepared { oid: prepared, run }
+                        if trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
+                            && trailer(&message, "Makina-Plan-Tip").as_deref()
+                                == Some(prepared.as_str()) =>
+                    {
+                        finalization = FinalizationLineage::Integrated {
+                            oid: oid.to_owned(),
+                            run,
+                        };
+                    }
+                    other => {
+                        return Err(format!(
+                            "final integration {oid} does not follow its exact preparation (found {other:?})"
+                        ));
+                    }
+                },
+                RetainedEvidence::Completion => match finalization {
+                    FinalizationLineage::Integrated {
                         oid: integrated,
                         run,
-                    },
-                    RetainedEvidence::Completion,
-                ) if trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
-                    && trailer(&message, "Makina-Final-Commit").as_deref()
-                        == Some(integrated.as_str()) =>
-                {
-                    LineageState::Complete
-                }
-                (prior, next) => {
-                    return Err(format!(
-                        "retained lifecycle evidence {next:?} is duplicate, skipped, or out of order after {prior:?}"
-                    ));
-                }
-            };
+                    } if trailer(&message, "Makina-Run").as_deref() == Some(run.as_str())
+                        && trailer(&message, "Makina-Final-Commit").as_deref()
+                            == Some(integrated.as_str()) =>
+                    {
+                        finalization = FinalizationLineage::Complete;
+                    }
+                    other => {
+                        return Err(format!(
+                            "completion {oid} does not follow its exact final integration (found {other:?})"
+                        ));
+                    }
+                },
+            }
         }
+        let _ = finalization;
         Ok((source, executable))
     }
 
@@ -566,26 +642,60 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
                     )
                 })
                 .and_then(|source| load_plan(source, key.clone(), &reservations));
-            match (registration, loaded) {
+            // Compute the authorization verdict BEFORE matching so its reason
+            // survives. Evaluating it inside a match guard discarded every
+            // explanation and reported the same generic "Phase-R trailers
+            // disagree" line for a lineage error, a digest mismatch, and a
+            // validation-base mismatch alike — three very different faults, all
+            // indistinguishable to whoever had to fix them.
+            let rejection: Option<String> = match (&registration, &loaded) {
                 (
                     Ok((registration, source_digest, executable_digest, validation_base)),
                     Ok(PlanCandidate::Plan(document)),
-                ) if authorized_digests(
+                ) => match authorized_digests(
                     &repo_root,
                     &key,
                     tip,
-                    &registration,
+                    registration,
                     source_digest.clone(),
                     executable_digest.clone(),
-                )
-                .is_ok_and(|(source_digest, executable_digest)| {
-                    source_digest == document.source_digest.as_str()
-                        && executable_digest == document.executable_digest.as_str()
-                }) && document
-                    .status
-                    .validation_base_oid
-                    .as_ref()
-                    .is_some_and(|oid| oid.as_str() == validation_base) =>
+                ) {
+                    Err(reason) => Some(reason),
+                    Ok((source_digest, executable_digest)) => {
+                        if source_digest != document.source_digest.as_str() {
+                            Some(format!(
+                                "authorized source digest {source_digest} does not match the retained document's {}",
+                                document.source_digest.as_str()
+                            ))
+                        } else if executable_digest != document.executable_digest.as_str() {
+                            Some(format!(
+                                "authorized executable digest {executable_digest} does not match the retained document's {}",
+                                document.executable_digest.as_str()
+                            ))
+                        } else if document
+                            .status
+                            .validation_base_oid
+                            .as_ref()
+                            .is_none_or(|oid| oid.as_str() != validation_base)
+                        {
+                            Some(format!(
+                                "STATUS validation base {} does not match the registration's {validation_base}",
+                                document
+                                    .status
+                                    .validation_base_oid
+                                    .as_ref()
+                                    .map_or("—", |oid| oid.as_str())
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                },
+                _ => None,
+            };
+            match (registration, loaded) {
+                (Ok((registration, _, _, _)), Ok(PlanCandidate::Plan(document)))
+                    if rejection.is_none() =>
                 {
                     entries.push(PlanEntry {
                         dir: repo_root.join(&key.relative_dir),
@@ -606,7 +716,7 @@ pub fn discover_plans(repo_root: &Path) -> Vec<PlanEntry> {
                         _ => diagnostic(
                             "invalid-registration",
                             key.relative_dir.clone(),
-                            registration.err().unwrap_or_else(|| {
+                            registration.err().or(rejection).unwrap_or_else(|| {
                                 "Phase-R trailers disagree with the retained plan document"
                                     .to_owned()
                             }),
