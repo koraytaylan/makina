@@ -26,6 +26,7 @@ use std::panic;
 use ratatui::Terminal;
 use ratatui::crossterm::{
     cursor,
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -60,6 +61,11 @@ impl Tui {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            // Without bracketed paste a pasted block arrives as ordinary key
+            // presses, so its newlines read as Enter — submitting the composer
+            // partway through the paste and losing the rest. With it the whole
+            // block arrives as one `Event::Paste` and survives intact.
+            EnableBracketedPaste,
             cursor::Hide
         )?;
         let backend = CrosstermBackend::new(stdout);
@@ -82,6 +88,7 @@ impl Tui {
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
             DisableMouseCapture,
+            DisableBracketedPaste,
             cursor::Show
         );
     }
@@ -104,6 +111,7 @@ impl Tui {
             self.terminal.backend_mut(),
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableBracketedPaste,
             cursor::Hide
         )?;
         // Force a full repaint so no stale pager content bleeds through.
@@ -241,6 +249,7 @@ pub fn restore_terminal() {
         io::stdout(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableBracketedPaste,
         cursor::Show
     );
 }

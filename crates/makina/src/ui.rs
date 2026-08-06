@@ -1153,166 +1153,187 @@ pub fn render(app: &App, frame: &mut Frame) {
         rect: sidebar_area,
     }];
 
-    match (
-        active_plan_tab,
-        active_plan_task_tab,
-        active_task_tab.clone(),
-        app.selected_run(),
-    ) {
-        (Some(plan), _, _, _) => {
-            // Split content area to reserve 1 row for tab bar at the top
-            let plan_split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(3)])
-                .split(content_area);
+    // The authoring tab takes precedence over every other content source: it is
+    // the active tab, and its composer owns the keyboard while it is showing.
+    let active_authoring = app
+        .is_plan_authoring()
+        .then_some(app.plan_authoring.as_ref())
+        .flatten();
 
-            let tab_area = plan_split[0];
-            // Carve a dependency-view sub-pane (when `v` is active) so it renders
-            // on a plan tab too, not only the bare selected-run view.
-            let plan_area = carve_dependency_overlay(app, frame, plan_split[1], &mut panel_geoms);
+    if let Some(authoring) = active_authoring {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(3)])
+            .split(content_area);
+        render_tab_bar(app, frame, split[0]);
+        render_plan_authoring(app, authoring, frame, split[1]);
+    } else {
+        match (
+            active_plan_tab,
+            active_plan_task_tab,
+            active_task_tab.clone(),
+            app.selected_run(),
+        ) {
+            (Some(plan), _, _, _) => {
+                // Split content area to reserve 1 row for tab bar at the top
+                let plan_split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(3)])
+                    .split(content_area);
 
-            // Render the tab bar
-            render_tab_bar(app, frame, tab_area);
+                let tab_area = plan_split[0];
+                // Carve a dependency-view sub-pane (when `v` is active) so it renders
+                // on a plan tab too, not only the bare selected-run view.
+                let plan_area =
+                    carve_dependency_overlay(app, frame, plan_split[1], &mut panel_geoms);
 
-            // Render the plan accordion pane below the tab bar
-            render_plan_accordion_pane(app, plan, frame, plan_area);
+                // Render the tab bar
+                render_tab_bar(app, frame, tab_area);
 
-            // Record the plan accordion geometry
-            panel_geoms.push(PanelGeometry {
-                panel: ScrollablePanel::PlanAccordion,
-                rect: plan_area,
-            });
-        }
-        (None, Some((plan_identity, plan, preview)), _, _) => {
-            // A plan-task tab starts as a read-only preview, then upgrades to
-            // the live task detail as soon as a matching run exists.
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(3)])
-                .split(content_area);
-            render_tab_bar(app, frame, split[0]);
-            let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
-            if let Some((run, task_idx)) =
-                find_live_plan_task_for_preview(app, plan_identity, preview.frontmatter.id.as_str())
-            {
-                render_task_entry_pane(app, run, task_idx, frame, task_area);
-            } else {
-                render_plan_task_pane(app, plan, preview, frame, task_area);
-            }
-            panel_geoms.push(PanelGeometry {
-                panel: ScrollablePanel::TaskEntry,
-                rect: task_area,
-            });
-        }
-        (None, None, None, None) => {
-            // No run selected: show a hint paragraph.
-            let hint_lines = vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  Select a run, or press Enter on a plan to view it.",
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  [→] expand plan   [Enter] plan detail   [Tab] switch focus",
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                )]),
-                Line::from(vec![Span::styled(
-                    "  [q / Esc / Ctrl-C] — quit",
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                )]),
-            ];
-            let hint_para = Paragraph::new(hint_lines).style(
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-            );
-            frame.render_widget(hint_para, content_area);
-        }
-        (None, None, Some(task_id), Some(run)) => {
-            // An active task tab shows the task entry (metadata + Markdown body).
-            // Split content area to reserve 1 row for tab bar at the top.
-            let task_split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(3)])
-                .split(content_area);
+                // Render the plan accordion pane below the tab bar
+                render_plan_accordion_pane(app, plan, frame, plan_area);
 
-            let tab_area = task_split[0];
-            // Carve a dependency-view sub-pane (when `v` is active) so it renders
-            // on a task tab too.
-            let task_area = carve_dependency_overlay(app, frame, task_split[1], &mut panel_geoms);
-
-            // Render the tab bar first so it stays visible even if the task
-            // itself can't be resolved in the selected run.
-            render_tab_bar(app, frame, tab_area);
-
-            if let Some(task_idx) = find_task_idx_in_run(app, &task_id) {
-                // Render the task entry pane below the tab bar
-                render_task_entry_pane(app, run, task_idx, frame, task_area);
-
-                // Record the task entry geometry
+                // Record the plan accordion geometry
                 panel_geoms.push(PanelGeometry {
-                    panel: ScrollablePanel::TaskEntry,
-                    rect: task_area,
+                    panel: ScrollablePanel::PlanAccordion,
+                    rect: plan_area,
                 });
-            } else {
-                // The active task tab points at a task that is no longer in the
-                // selected run — keep the tab bar and show a hint rather than a
-                // blank pane.
-                let hint = Paragraph::new(vec![
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        "  This task is no longer available.",
-                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                    )]),
-                ])
-                .style(
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-                );
-                frame.render_widget(hint, task_area);
             }
-        }
-        (None, None, _, Some(_run)) => {
-            // No tab is open. Don't render a run's exchange log implicitly — the
-            // user never opened anything. Show the hint instead so the main
-            // pane reads cleanly until the user opens a plan or run tab.
-            let hint_lines = vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  Select a run, or press Enter on a plan to view it.",
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                )]),
-                Line::from(""),
-            ];
-            let hint_para = Paragraph::new(hint_lines).style(
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-            );
-            frame.render_widget(hint_para, content_area);
-        }
-        _ => {
-            // Fallback: a tab is active but its task can't be resolved to a run
-            // (e.g. the run was closed). Keep the tab bar visible when any tab is
-            // open so the strip never silently disappears, and show a hint below.
-            let hint_area = if app.tabs.open_tabs.is_empty() {
-                content_area
-            } else {
+            (None, Some((plan_identity, plan, preview)), _, _) => {
+                // A plan-task tab starts as a read-only preview, then upgrades to
+                // the live task detail as soon as a matching run exists.
                 let split = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(1), Constraint::Min(3)])
                     .split(content_area);
                 render_tab_bar(app, frame, split[0]);
-                split[1]
-            };
-            let hint_lines = vec![
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "  Select a run, or press Enter on a plan to view it.",
-                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                )]),
-                Line::from(""),
-            ];
-            let hint_para = Paragraph::new(hint_lines).style(
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-            );
-            frame.render_widget(hint_para, hint_area);
+                let task_area = carve_dependency_overlay(app, frame, split[1], &mut panel_geoms);
+                if let Some((run, task_idx)) = find_live_plan_task_for_preview(
+                    app,
+                    plan_identity,
+                    preview.frontmatter.id.as_str(),
+                ) {
+                    render_task_entry_pane(app, run, task_idx, frame, task_area);
+                } else {
+                    render_plan_task_pane(app, plan, preview, frame, task_area);
+                }
+                panel_geoms.push(PanelGeometry {
+                    panel: ScrollablePanel::TaskEntry,
+                    rect: task_area,
+                });
+            }
+            (None, None, None, None) => {
+                // No run selected: show a hint paragraph.
+                let hint_lines = vec![
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "  Select a run, or press Enter on a plan to view it.",
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    )]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "  [→] expand plan   [Enter] plan detail   [Tab] switch focus",
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    )]),
+                    Line::from(vec![Span::styled(
+                        "  [q / Esc / Ctrl-C] — quit",
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    )]),
+                ];
+                let hint_para = Paragraph::new(hint_lines).style(
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+                );
+                frame.render_widget(hint_para, content_area);
+            }
+            (None, None, Some(task_id), Some(run)) => {
+                // An active task tab shows the task entry (metadata + Markdown body).
+                // Split content area to reserve 1 row for tab bar at the top.
+                let task_split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(3)])
+                    .split(content_area);
+
+                let tab_area = task_split[0];
+                // Carve a dependency-view sub-pane (when `v` is active) so it renders
+                // on a task tab too.
+                let task_area =
+                    carve_dependency_overlay(app, frame, task_split[1], &mut panel_geoms);
+
+                // Render the tab bar first so it stays visible even if the task
+                // itself can't be resolved in the selected run.
+                render_tab_bar(app, frame, tab_area);
+
+                if let Some(task_idx) = find_task_idx_in_run(app, &task_id) {
+                    // Render the task entry pane below the tab bar
+                    render_task_entry_pane(app, run, task_idx, frame, task_area);
+
+                    // Record the task entry geometry
+                    panel_geoms.push(PanelGeometry {
+                        panel: ScrollablePanel::TaskEntry,
+                        rect: task_area,
+                    });
+                } else {
+                    // The active task tab points at a task that is no longer in the
+                    // selected run — keep the tab bar and show a hint rather than a
+                    // blank pane.
+                    let hint = Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(vec![Span::styled(
+                            "  This task is no longer available.",
+                            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                        )]),
+                    ])
+                    .style(
+                        Style::default()
+                            .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+                    );
+                    frame.render_widget(hint, task_area);
+                }
+            }
+            (None, None, _, Some(_run)) => {
+                // No tab is open. Don't render a run's exchange log implicitly — the
+                // user never opened anything. Show the hint instead so the main
+                // pane reads cleanly until the user opens a plan or run tab.
+                let hint_lines = vec![
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "  Select a run, or press Enter on a plan to view it.",
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    )]),
+                    Line::from(""),
+                ];
+                let hint_para = Paragraph::new(hint_lines).style(
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+                );
+                frame.render_widget(hint_para, content_area);
+            }
+            _ => {
+                // Fallback: a tab is active but its task can't be resolved to a run
+                // (e.g. the run was closed). Keep the tab bar visible when any tab is
+                // open so the strip never silently disappears, and show a hint below.
+                let hint_area = if app.tabs.open_tabs.is_empty() {
+                    content_area
+                } else {
+                    let split = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(1), Constraint::Min(3)])
+                        .split(content_area);
+                    render_tab_bar(app, frame, split[0]);
+                    split[1]
+                };
+                let hint_lines = vec![
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "  Select a run, or press Enter on a plan to view it.",
+                        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+                    )]),
+                    Line::from(""),
+                ];
+                let hint_para = Paragraph::new(hint_lines).style(
+                    Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+                );
+                frame.render_widget(hint_para, hint_area);
+            }
         }
     }
 
@@ -1467,12 +1488,6 @@ pub fn render(app: &App, frame: &mut Frame) {
         render_command_palette(app, p, frame, area);
     }
 
-    if app.is_plan_authoring()
-        && let Some(authoring) = app.plan_authoring.as_ref()
-    {
-        render_plan_authoring(app, authoring, frame, area);
-    }
-
     // ── Settings overlay (plan 0070) ──────────────────────────────────────────────
     // Drawn after command palette so it sits on top when both might be open.
     if app.is_settings()
@@ -1555,6 +1570,7 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
             TabContent::Task { task_id, .. } => ("task ", task_id.0.clone()),
             TabContent::PlanTask { task_id, .. } => ("task ", task_id.clone()),
             TabContent::Plan { plan } => ("plan ", plan.slug.clone()),
+            TabContent::PlanAuthoring { .. } => ("", "create plan".to_owned()),
         };
         let chip = format!(" {kind}{label} × ");
         let chip_w = chip.chars().count() as u16;
@@ -4399,29 +4415,53 @@ fn render_command_palette(
     frame.render_widget(footer, footer_area);
 }
 
+/// Rows the composer may grow to before it starts scrolling instead.
+///
+/// Leaves the conversation the majority of a normal pane; a very long paste
+/// scrolls rather than pushing the transcript off-screen.
+const AUTHORING_COMPOSER_MAX_ROWS: u16 = 12;
+
+/// Render the plan-authoring workspace as tab content.
+///
+/// Laid out bottom-up like a chat composer: the transcript takes the remaining
+/// space and the input box sits under it, sized to its own content.
 fn render_plan_authoring(
     app: &App,
     authoring: &crate::app::PlanAuthoring,
     frame: &mut Frame,
     area: Rect,
 ) {
-    let popup = centered_rect(76, 76, area);
-    frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(" Create plan ")
         .borders(Borders::ALL)
-        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
         .padding(Padding::horizontal(1));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // The composer's inner width is what the text actually wraps to: the pane
+    // interior minus the composer's own left/right border and the "> " prefix.
+    let composer_text_width = inner.width.saturating_sub(2 + 2).max(1);
+    let composer_height = if authoring.waiting {
+        3
+    } else {
+        crate::app::composer_height(
+            &authoring.input,
+            composer_text_width,
+            AUTHORING_COMPOSER_MAX_ROWS,
+        )
+    };
     let chunks = Layout::vertical([
         Constraint::Length(2),
-        Constraint::Min(4),
-        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
     .split(inner);
+
     frame.render_widget(
         Paragraph::new(format!(
             "Describe what you want to build in {}",
@@ -4430,37 +4470,63 @@ fn render_plan_authoring(
         .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))),
         chunks[0],
     );
+
     let conversation = authoring
         .messages
         .iter()
-        .map(|message| {
-            Line::from(vec![
-                Span::styled(
-                    if message.from_model {
-                        "Planner: "
-                    } else {
-                        "You: "
-                    },
+        .flat_map(|message| {
+            let speaker = if message.from_model {
+                "Planner: "
+            } else {
+                "You: "
+            };
+            // Authored text may be multi-line; render each line so a pasted
+            // block reads back the way it was written.
+            let mut lines = Vec::new();
+            for (index, text) in message.text.lines().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if index == 0 { speaker } else { "" },
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(text.to_owned()),
+                ]));
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    speaker,
                     Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(&message.text),
-            ])
+                )));
+            }
+            lines
         })
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(conversation).wrap(Wrap { trim: false }),
         chunks[1],
     );
-    let input = if authoring.waiting {
-        "Waiting for planner…".to_owned()
+
+    let composer = if authoring.waiting {
+        Paragraph::new("Waiting for planner…")
+            .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)))
     } else {
-        format!("> {}▏", authoring.input)
+        let rows = crate::app::composer_rows(&authoring.input, composer_text_width);
+        // Past the cap the box stops growing and follows the caret instead.
+        let scroll = rows.saturating_sub(AUTHORING_COMPOSER_MAX_ROWS);
+        Paragraph::new(format!("> {}▏", authoring.input))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
     };
     frame.render_widget(
-        Paragraph::new(input).block(Block::default().borders(Borders::ALL)),
+        composer.block(Block::default().borders(Borders::ALL)),
         chunks[2],
     );
-    frame.render_widget(Paragraph::new("Enter submit · Esc cancel"), chunks[3]);
+
+    frame.render_widget(
+        Paragraph::new("Enter submit · Shift+Enter newline · Esc close")
+            .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))),
+        chunks[3],
+    );
 }
 
 /// Render the settings modal.
@@ -5491,6 +5557,77 @@ mod tests {
         plan: &makina_core::orchestrator::PlanEntry,
     ) -> PlanIdentity {
         app.plan_identity_for_entry(&app.repo_root, plan)
+    }
+
+    // ── Render: plan authoring as a tab ───────────────────────────────────────
+
+    fn authoring_app(input: &str) -> App {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.update(crate::app::AppEvent::OpenPlanAuthoring);
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.input = input.to_owned();
+        }
+        app
+    }
+
+    /// Authoring renders inline as tab content with a chip in the tab bar —
+    /// not as a centred popup floating over the rest of the UI.
+    #[test]
+    fn plan_authoring_renders_as_a_tab_not_a_popup() {
+        let app = authoring_app("");
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Create plan"),
+            "the authoring pane must render"
+        );
+        assert!(
+            screen.contains("create plan"),
+            "the tab bar must carry a chip for the authoring tab"
+        );
+        assert!(
+            screen.contains("Shift+Enter newline"),
+            "the composer must advertise how to type a newline"
+        );
+    }
+
+    /// A multi-line draft is shown in full: every line reaches the screen
+    /// rather than being clipped at the right edge of a one-line field.
+    #[test]
+    fn a_multiline_draft_renders_every_line() {
+        let app = authoring_app("alpha line\nbeta line\ngamma line");
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        for line in ["alpha line", "beta line", "gamma line"] {
+            assert!(screen.contains(line), "the composer must show {line:?}");
+        }
+    }
+
+    /// Long single-line input wraps into the grown box instead of being hidden
+    /// past the right edge, which is what the old single-line field did.
+    ///
+    /// Counts the characters actually painted rather than looking for a marker
+    /// string: a wrapped run straddles a row boundary, so the marker would be
+    /// split by the rest of the terminal row and never match as one substring.
+    #[test]
+    fn long_input_wraps_instead_of_being_clipped() {
+        const DRAFT: usize = 180;
+        // 'ẅ' appears nowhere else in the chrome, so every hit is composer text.
+        let app = authoring_app(&"ẅ".repeat(DRAFT));
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let painted = screen_of(&terminal).matches('ẅ').count();
+
+        assert_eq!(
+            painted, DRAFT,
+            "every character of the draft must be painted; a one-line field \
+             would have clipped all but the first row",
+        );
     }
 
     // ── Render: empty state ───────────────────────────────────────────────────

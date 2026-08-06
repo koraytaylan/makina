@@ -598,9 +598,9 @@ async fn resolve_io(
             blueprint,
         } => {
             let label = blueprint.slug.clone();
-            if app.is_plan_authoring() {
-                app.plan_authoring = None;
-                app.mode = crate::app::Mode::Normal;
+            // The draft has become a plan; retire the composer and its tab.
+            if app.plan_authoring.is_some() {
+                app.update(AppEvent::ClosePlanAuthoring);
             }
             spawn_generate_plan_bundle(
                 std::sync::Arc::clone(&app.api),
@@ -2151,7 +2151,10 @@ fn translate_terminal_event(
             MouseEventKind::Up(MouseButton::Left) => AppEvent::SelectionEnd(m.column, m.row),
             _ => AppEvent::Tick,
         },
-        // Paste, focus, etc. — ignored for now.
+        // A bracketed paste is one atomic edit. Only the composer consumes it;
+        // everywhere else it stays inert rather than being replayed as keys.
+        CrosstermEvent::Paste(text) if modal.plan_authoring => AppEvent::PlanAuthoringPaste(text),
+        // Focus, unhandled paste, etc.
         _ => AppEvent::Tick,
     }
 }
@@ -2218,14 +2221,6 @@ fn translate_key(
                 .clone()
                 .map(|confirmation| AppEvent::ResetRun { confirmation })
                 .unwrap_or(AppEvent::CloseResetConfirmation),
-            _ => AppEvent::Tick,
-        }
-    } else if plan_authoring {
-        match key.code {
-            KeyCode::Esc => AppEvent::ClosePlanAuthoring,
-            KeyCode::Enter => AppEvent::PlanAuthoringSubmit,
-            KeyCode::Backspace => AppEvent::PlanAuthoringBackspace,
-            KeyCode::Char(c) => AppEvent::PlanAuthoringInput(c),
             _ => AppEvent::Tick,
         }
     } else if command_palette {
@@ -2332,6 +2327,31 @@ fn translate_key(
         match key.code {
             KeyCode::Esc => AppEvent::CloseDoctor,
             KeyCode::Char('w') | KeyCode::Char('W') => AppEvent::DoctorWriteScaffold,
+            _ => AppEvent::Tick,
+        }
+    } else if plan_authoring {
+        // ── Plan-authoring composer keymap ───────────────────────────────────
+        // Last of the special keymaps because authoring is a tab, not a modal:
+        // every real overlay above may open on top of it and keeps its keys.
+        //
+        // Enter submits, so a newline needs its own chord. Terminals that
+        // report modifiers give us Shift/Alt+Enter; a bracketed paste carries
+        // its own newlines and never reaches here.
+        match key.code {
+            KeyCode::Esc => AppEvent::ClosePlanAuthoring,
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                AppEvent::PlanAuthoringNewline
+            }
+            KeyCode::Enter => AppEvent::PlanAuthoringSubmit,
+            KeyCode::Backspace => AppEvent::PlanAuthoringBackspace,
+            // Ctrl chords are reserved for global shortcuts, not composer text.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                AppEvent::PlanAuthoringInput(c)
+            }
             _ => AppEvent::Tick,
         }
     } else {
@@ -3318,6 +3338,106 @@ mod tests {
                 "'{ch}' must be inert in browser mode"
             );
         }
+    }
+
+    // ── Plan-authoring composer keymap ────────────────────────────────────────
+
+    fn authoring_modal() -> ModalState {
+        ModalState {
+            plan_authoring: true,
+            ..ModalState::default()
+        }
+    }
+
+    fn translate_in_authoring(ev: CrosstermEvent, app: &App) -> AppEvent {
+        translate_terminal_event(ev, authoring_modal(), crate::app::Panel::Main, false, app)
+    }
+
+    /// A bracketed paste reaches the composer as one atomic edit. Without this
+    /// the block arrives as key presses and its newlines read as Enter, which
+    /// submits the draft partway through and drops the rest.
+    #[test]
+    fn bracketed_paste_reaches_the_composer_intact() {
+        let app = test_app();
+        let pasted = "line one\nline two\nline three".to_owned();
+        assert!(matches!(
+            translate_in_authoring(CrosstermEvent::Paste(pasted.clone()), &app),
+            AppEvent::PlanAuthoringPaste(text) if text == pasted
+        ));
+    }
+
+    /// A paste outside the composer stays inert rather than leaking as text.
+    #[test]
+    fn paste_without_the_composer_is_inert() {
+        let app = test_app();
+        assert!(matches!(
+            translate_terminal_event(
+                CrosstermEvent::Paste("anything".to_owned()),
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                &app
+            ),
+            AppEvent::Tick
+        ));
+    }
+
+    /// Enter submits; Shift/Alt+Enter type a newline instead.
+    #[test]
+    fn enter_submits_and_modified_enter_types_a_newline() {
+        let app = test_app();
+        assert!(matches!(
+            translate_in_authoring(key_press(KeyCode::Enter, KeyModifiers::NONE), &app),
+            AppEvent::PlanAuthoringSubmit
+        ));
+        for modifier in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            assert!(
+                matches!(
+                    translate_in_authoring(key_press(KeyCode::Enter, modifier), &app),
+                    AppEvent::PlanAuthoringNewline
+                ),
+                "{modifier:?}+Enter must type a newline, not submit",
+            );
+        }
+    }
+
+    /// Typing feeds the composer, but Ctrl chords stay global.
+    #[test]
+    fn composer_takes_text_but_not_control_chords() {
+        let app = test_app();
+        assert!(matches!(
+            translate_in_authoring(key_press(KeyCode::Char('a'), KeyModifiers::NONE), &app),
+            AppEvent::PlanAuthoringInput('a')
+        ));
+        assert!(
+            matches!(
+                translate_in_authoring(key_press(KeyCode::Char('p'), KeyModifiers::CONTROL), &app),
+                AppEvent::OpenCommandPalette
+            ),
+            "Ctrl-P must still open the palette over an authoring tab",
+        );
+    }
+
+    /// A real overlay opened above the tab keeps its own keys — authoring is a
+    /// tab, so it must not swallow input meant for a modal on top of it.
+    #[test]
+    fn an_overlay_above_the_authoring_tab_keeps_its_keymap() {
+        let app = test_app();
+        let ev = key_press(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(
+            translate_terminal_event(
+                ev,
+                ModalState {
+                    plan_authoring: true,
+                    command_palette: true,
+                    ..ModalState::default()
+                },
+                crate::app::Panel::Main,
+                false,
+                &app
+            ),
+            AppEvent::CommandPaletteInput('x')
+        ));
     }
 
     #[test]

@@ -421,8 +421,6 @@ pub enum Mode {
     OperationNotice,
     /// Searchable model picker overlay (opened from Settings).
     ModelPicker,
-    /// Conversational plan-authoring overlay.
-    PlanAuthoring,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,10 +432,44 @@ pub struct PlanAuthoringMessage {
 #[derive(Debug)]
 pub struct PlanAuthoring {
     pub project_root: PathBuf,
+    /// The composer buffer. May contain newlines: they arrive from a bracketed
+    /// paste or from an explicit Shift/Alt+Enter, and are preserved verbatim.
     pub input: String,
     pub messages: Vec<PlanAuthoringMessage>,
     pub waiting: bool,
     pub answer_tx: Option<tokio::sync::mpsc::Sender<String>>,
+}
+
+/// Rows the composer needs to show `input` wrapped to `width`, before clamping.
+///
+/// A single-line draft occupies one row and the composer looks like a one-line
+/// field; as the text wraps or carries explicit newlines it grows to fit. This
+/// counts exactly what [`ratatui::widgets::Wrap`] will lay out, so the box
+/// height and the rendered text never disagree — the previous single-line
+/// `Paragraph` simply hid everything past the right edge.
+pub fn composer_rows(input: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    // A trailing newline means the caret sits on a fresh, empty row.
+    let segments = input.split('\n');
+    let rows: usize = segments
+        .map(|segment| {
+            // Wrapping is by display width; the caret needs a cell of its own,
+            // so a segment that exactly fills the width spills to the next row.
+            let cells = segment.chars().count() + 1;
+            cells.div_ceil(width).max(1)
+        })
+        .sum();
+    rows.clamp(1, u16::MAX as usize) as u16
+}
+
+/// Rows the composer is allowed to occupy, including its border.
+///
+/// Growth is bounded so a long paste cannot squeeze the conversation off the
+/// screen; past the cap the composer scrolls to keep the caret visible.
+pub fn composer_height(input: &str, width: u16, max_rows: u16) -> u16 {
+    composer_rows(input, width)
+        .min(max_rows.max(1))
+        .saturating_add(2)
 }
 
 /// The purpose of the folder browser modal — determines which event is emitted on selection.
@@ -1118,6 +1150,10 @@ pub enum AppEvent {
     /// Open the natural-language plan authoring flow.
     OpenPlanAuthoring,
     PlanAuthoringInput(char),
+    /// Insert a literal newline (Shift/Alt+Enter) without submitting.
+    PlanAuthoringNewline,
+    /// A bracketed paste delivered as one atomic edit, newlines included.
+    PlanAuthoringPaste(String),
     PlanAuthoringBackspace,
     PlanAuthoringSubmit,
     PlanAuthoringQuestion {
@@ -1448,6 +1484,13 @@ pub enum TabContent {
     PlanTask { plan: PlanIdentity, task_id: String },
     /// A discovered plan, including stable project identity.
     Plan { plan: PlanIdentity },
+    /// The conversational plan-authoring workspace for one project.
+    ///
+    /// Authoring is a working surface, not a prompt: the operator drafts a
+    /// description, reads the planner's questions, and answers them. That is
+    /// the same shape as every other tab, and unlike a modal it can be left
+    /// open while looking at a plan or a task and returned to afterwards.
+    PlanAuthoring { project_root: PathBuf },
 }
 
 /// State for the tabbed content pane.
@@ -2288,7 +2331,9 @@ impl App {
             // slug; close either when its plan is gone.
             let plan = match tab {
                 TabContent::Plan { plan } | TabContent::PlanTask { plan, .. } => Some(plan),
-                TabContent::Task { .. } => None,
+                // Authoring is keyed by project root, not by a plan that must
+                // already exist — it is where a plan comes from.
+                TabContent::Task { .. } | TabContent::PlanAuthoring { .. } => None,
             };
             if let Some(plan) = plan
                 && !valid_plans.contains(plan)
@@ -2898,12 +2943,13 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(idx, tab)| {
-                let target = match tab {
+                let root = match tab {
                     TabContent::Plan { plan }
                     | TabContent::PlanTask { plan, .. }
-                    | TabContent::Task { plan, .. } => plan,
+                    | TabContent::Task { plan, .. } => &plan.project_root,
+                    TabContent::PlanAuthoring { project_root } => project_root,
                 };
-                (target.project_root == removed_root).then_some(idx)
+                (*root == removed_root).then_some(idx)
             })
             .collect();
         for idx in tabs_to_close.into_iter().rev() {
@@ -2944,8 +2990,16 @@ impl App {
         self.mode == Mode::CommandPalette
     }
 
+    /// Whether the plan-authoring tab is the active tab.
+    ///
+    /// Authoring is a tab, not a mode: this reports where the composer is
+    /// showing rather than whether an overlay has seized the screen, so the
+    /// rest of the UI keeps working while a draft is open.
     pub fn is_plan_authoring(&self) -> bool {
-        self.mode == Mode::PlanAuthoring
+        self.tabs
+            .active_tab
+            .and_then(|idx| self.tabs.open_tabs.get(idx))
+            .is_some_and(|tab| matches!(tab, TabContent::PlanAuthoring { .. }))
     }
 
     /// Whether the settings modal is currently active.
@@ -3032,10 +3086,15 @@ impl App {
         if let Some(active) = self.tabs.active_tab
             && let Some(tab) = self.tabs.open_tabs.get(active)
         {
+            // An authoring tab already names its project root outright.
+            if let TabContent::PlanAuthoring { project_root } = tab {
+                return project_root.clone();
+            }
             let target = match tab {
                 TabContent::Plan { plan }
                 | TabContent::PlanTask { plan, .. }
                 | TabContent::Task { plan, .. } => plan,
+                TabContent::PlanAuthoring { .. } => unreachable!("handled above"),
             };
             if target.project_root.as_os_str().is_empty() {
                 if let Some(entry) = self.plan_entry(target) {
@@ -3275,6 +3334,8 @@ impl App {
             && let Some(content) = self.tabs.open_tabs.get(active)
         {
             match content {
+                // No plan exists yet while it is still being authored.
+                TabContent::PlanAuthoring { .. } => return None,
                 TabContent::Plan { plan }
                 | TabContent::PlanTask { plan, .. }
                 | TabContent::Task { plan, .. } => {
@@ -3469,7 +3530,9 @@ impl App {
                 ScrollablePanel::TaskEntry
             }
             Some(TabContent::Plan { .. }) => ScrollablePanel::PlanAccordion,
-            None => ScrollablePanel::Exchange,
+            // The composer owns the keyboard on an authoring tab, so arrow keys
+            // must not drive a scroll pane behind it.
+            Some(TabContent::PlanAuthoring { .. }) | None => ScrollablePanel::Exchange,
         }
     }
 
@@ -4518,15 +4581,48 @@ impl App {
 
             // ── Conversational plan authoring ────────────────────────────────────
             AppEvent::OpenPlanAuthoring => {
-                self.plan_authoring = Some(PlanAuthoring {
-                    project_root: self.context_project_root(),
-                    input: String::new(),
-                    messages: Vec::new(),
-                    waiting: false,
-                    answer_tx: None,
-                });
+                let project_root = self.context_project_root();
+                // Re-opening returns to the existing draft rather than
+                // discarding it — the tab is a workspace, not a prompt.
+                if self
+                    .plan_authoring
+                    .as_ref()
+                    .is_none_or(|state| state.project_root != project_root)
+                {
+                    self.plan_authoring = Some(PlanAuthoring {
+                        project_root: project_root.clone(),
+                        input: String::new(),
+                        messages: Vec::new(),
+                        waiting: false,
+                        answer_tx: None,
+                    });
+                }
                 self.command_palette = None;
-                self.mode = Mode::PlanAuthoring;
+                self.tabs
+                    .open_tab(TabContent::PlanAuthoring { project_root });
+                self.focused_panel = Panel::Main;
+                self.mode = Mode::Normal;
+                true
+            }
+            AppEvent::PlanAuthoringNewline => {
+                if let Some(state) = self.plan_authoring.as_mut()
+                    && !state.waiting
+                {
+                    state.input.push('\n');
+                }
+                true
+            }
+            AppEvent::PlanAuthoringPaste(text) => {
+                if let Some(state) = self.plan_authoring.as_mut()
+                    && !state.waiting
+                {
+                    // Verbatim: a bracketed paste is one atomic edit, and its
+                    // newlines are content. Normalise only the CR forms a
+                    // terminal may deliver so they do not render as blanks.
+                    state
+                        .input
+                        .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                }
                 true
             }
             AppEvent::PlanAuthoringInput(c) => {
@@ -4567,6 +4663,14 @@ impl App {
                 true
             }
             AppEvent::ClosePlanAuthoring => {
+                if let Some(idx) = self
+                    .tabs
+                    .open_tabs
+                    .iter()
+                    .position(|tab| matches!(tab, TabContent::PlanAuthoring { .. }))
+                {
+                    self.tabs.close_tab(idx);
+                }
                 self.plan_authoring = None;
                 self.mode = Mode::Normal;
                 true
@@ -5469,7 +5573,9 @@ impl App {
                     let task_id = match content {
                         TabContent::Task { task_id, .. } => task_id.clone(),
                         TabContent::PlanTask { task_id, .. } => TaskId::new(task_id.clone()),
-                        TabContent::Plan { .. } => return true,
+                        TabContent::Plan { .. } | TabContent::PlanAuthoring { .. } => {
+                            return true;
+                        }
                     };
                     // Seed an absent entry with the SAME default the renderer uses
                     // (Scope + Execution expanded), so the first toggle collapses
@@ -11416,6 +11522,197 @@ mod tests {
             makina_core::plan::PlanKey::parse("docs/plans/0001-alpha").unwrap(),
             "opened run should have the correct plan directory"
         );
+    }
+
+    // ── Plan authoring as a tab ────────────────────────────────────────────────
+
+    /// Authoring opens as a tab, not as a modal overlay.
+    #[test]
+    fn opening_plan_authoring_opens_a_tab_and_leaves_normal_mode() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+
+        assert_eq!(app.mode, Mode::Normal, "authoring must not seize a mode");
+        assert!(app.plan_authoring.is_some());
+        assert!(
+            app.is_plan_authoring(),
+            "the authoring tab must be the active tab"
+        );
+        assert!(
+            app.tabs
+                .open_tabs
+                .iter()
+                .any(|tab| matches!(tab, TabContent::PlanAuthoring { .. })),
+            "an authoring tab must be open; got {:?}",
+            app.tabs.open_tabs,
+        );
+    }
+
+    /// Re-opening returns to the existing draft rather than discarding it.
+    #[test]
+    fn reopening_plan_authoring_preserves_the_draft() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.update(AppEvent::PlanAuthoringInput('h'));
+        app.update(AppEvent::PlanAuthoringInput('i'));
+        app.update(AppEvent::OpenPlanAuthoring);
+
+        assert_eq!(
+            app.plan_authoring
+                .as_ref()
+                .map(|state| state.input.as_str()),
+            Some("hi"),
+            "re-opening must not wipe the composer",
+        );
+        assert_eq!(
+            app.tabs
+                .open_tabs
+                .iter()
+                .filter(|tab| matches!(tab, TabContent::PlanAuthoring { .. }))
+                .count(),
+            1,
+            "re-opening must reuse the tab, not stack duplicates",
+        );
+    }
+
+    /// Closing retires both the tab and its state.
+    #[test]
+    fn closing_plan_authoring_removes_the_tab_and_the_draft() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.update(AppEvent::ClosePlanAuthoring);
+
+        assert!(app.plan_authoring.is_none());
+        assert!(!app.is_plan_authoring());
+        assert!(
+            !app.tabs
+                .open_tabs
+                .iter()
+                .any(|tab| matches!(tab, TabContent::PlanAuthoring { .. })),
+            "the authoring tab must be closed with its draft",
+        );
+    }
+
+    /// A pasted block keeps its newlines — the whole point of bracketed paste.
+    #[test]
+    fn pasting_multiline_text_preserves_every_line() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.update(AppEvent::PlanAuthoringPaste(
+            "first line\nsecond line\nthird line".to_owned(),
+        ));
+
+        assert_eq!(
+            app.plan_authoring
+                .as_ref()
+                .map(|state| state.input.as_str()),
+            Some("first line\nsecond line\nthird line"),
+        );
+    }
+
+    /// Terminals deliver CRLF and bare CR; both normalise to a real newline
+    /// rather than rendering as a blank or swallowing the rest of the line.
+    #[test]
+    fn pasted_carriage_returns_normalise_to_newlines() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.update(AppEvent::PlanAuthoringPaste("a\r\nb\rc".to_owned()));
+
+        assert_eq!(
+            app.plan_authoring
+                .as_ref()
+                .map(|state| state.input.as_str()),
+            Some("a\nb\nc"),
+        );
+    }
+
+    /// An explicit newline chord types a newline instead of submitting.
+    #[test]
+    fn newline_event_extends_the_draft_without_submitting() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.update(AppEvent::PlanAuthoringInput('a'));
+        app.update(AppEvent::PlanAuthoringNewline);
+        app.update(AppEvent::PlanAuthoringInput('b'));
+
+        assert_eq!(
+            app.plan_authoring
+                .as_ref()
+                .map(|state| state.input.as_str()),
+            Some("a\nb"),
+        );
+        assert!(
+            app.is_plan_authoring(),
+            "a newline must not close the composer"
+        );
+    }
+
+    /// While the planner is thinking the composer is read-only, so a stray
+    /// paste or keystroke cannot race the answer being sent.
+    #[test]
+    fn a_waiting_composer_ignores_input_and_paste() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.waiting = true;
+        }
+        app.update(AppEvent::PlanAuthoringInput('x'));
+        app.update(AppEvent::PlanAuthoringNewline);
+        app.update(AppEvent::PlanAuthoringPaste("pasted".to_owned()));
+
+        assert_eq!(
+            app.plan_authoring
+                .as_ref()
+                .map(|state| state.input.as_str()),
+            Some(""),
+        );
+    }
+
+    // ── Composer geometry ──────────────────────────────────────────────────────
+
+    /// The composer starts as a one-line field and grows only as it needs to.
+    #[test]
+    fn composer_starts_single_line_and_grows_with_wrapped_content() {
+        assert_eq!(composer_rows("", 20), 1, "an empty draft is one row");
+        assert_eq!(composer_rows("short", 20), 1);
+
+        // 20 columns: 25 characters plus the caret wrap onto a second row.
+        assert_eq!(composer_rows(&"x".repeat(25), 20), 2);
+        // Exactly filling the width still needs a row for the caret.
+        assert_eq!(composer_rows(&"x".repeat(20), 20), 2);
+    }
+
+    /// Explicit newlines each open a row, including a trailing one.
+    #[test]
+    fn composer_counts_explicit_newlines() {
+        assert_eq!(composer_rows("a\nb\nc", 20), 3);
+        assert_eq!(
+            composer_rows("a\n", 20),
+            2,
+            "a trailing newline leaves the caret on a fresh row",
+        );
+    }
+
+    /// Growth is bounded so a long paste cannot swallow the transcript.
+    #[test]
+    fn composer_height_adds_the_border_and_clamps_to_the_cap() {
+        // One text row plus the top and bottom border.
+        assert_eq!(composer_height("", 20, 12), 3);
+        assert_eq!(composer_height("a\nb\nc", 20, 12), 5);
+
+        let long = "x\n".repeat(50);
+        assert_eq!(
+            composer_height(&long, 20, 12),
+            14,
+            "past the cap the composer stops growing and scrolls instead",
+        );
+    }
+
+    /// A zero width must not divide by zero or report zero rows.
+    #[test]
+    fn composer_geometry_survives_a_degenerate_width() {
+        assert_eq!(composer_rows("abc", 0), 4);
+        assert!(composer_height("abc", 0, 12) >= 3);
     }
 
     // ── Tab state operations ───────────────────────────────────────────────────
