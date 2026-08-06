@@ -511,6 +511,13 @@ pub struct PlanAuthoring {
     /// conversation back instead of leaving the operator with nothing.
     pub generating: bool,
     pub answer_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Carries a rejected blueprint's validation error back to the live planner
+    /// session.
+    ///
+    /// Deliberately not `answer_tx`: the operator can submit while generation
+    /// is in flight, and a verdict arriving on the operator's channel would be
+    /// indistinguishable from something they typed.
+    pub rejection_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl PlanAuthoring {
@@ -4790,6 +4797,7 @@ impl App {
                         waiting: false,
                         generating: false,
                         answer_tx: None,
+                        rejection_tx: None,
                     });
                 }
                 self.command_palette = None;
@@ -4853,17 +4861,34 @@ impl App {
                     Err(reason) => {
                         if let Some(state) = self.plan_authoring.as_mut() {
                             state.generating = false;
-                            state.waiting = false;
-                            // The planner session ended when it emitted the
-                            // blueprint. Dropping the handle lets the next
-                            // submit open a fresh one immediately, replaying
-                            // the transcript, instead of spending a submit on
-                            // discovering the channel is closed.
-                            state.answer_tx = None;
-                            state.push_planner(format!(
-                                "The plan could not be generated: {reason}\n\
-                                 Tell me what to change and I will revise it."
-                            ));
+                            // The validator names a field and a rule. That is
+                            // addressed to whoever wrote the blueprint, so it
+                            // goes back to the planner; asking the operator to
+                            // translate it was the defect, not the wording.
+                            let handed_back = state
+                                .rejection_tx
+                                .as_ref()
+                                .is_some_and(|tx| tx.try_send(reason.clone()).is_ok());
+                            if handed_back {
+                                state.waiting = true;
+                                state.push_planner(format!(
+                                    "The plan could not be generated: {reason}\n\
+                                     Revising the blueprint."
+                                ));
+                            } else {
+                                state.waiting = false;
+                                // No live session to correct it. Dropping the
+                                // handles lets the next submit open a fresh
+                                // one immediately, replaying the transcript,
+                                // instead of spending a submit on discovering
+                                // the channel is closed.
+                                state.answer_tx = None;
+                                state.rejection_tx = None;
+                                state.push_planner(format!(
+                                    "The plan could not be generated: {reason}\n\
+                                     Tell me what to change and I will revise it."
+                                ));
+                            }
                         }
                     }
                 }
@@ -4882,6 +4907,7 @@ impl App {
                     state.waiting = false;
                     state.generating = false;
                     state.answer_tx = None;
+                    state.rejection_tx = None;
                 }
                 true
             }
@@ -11991,10 +12017,56 @@ mod tests {
         );
     }
 
+    /// The validator's message is addressed to whoever wrote the blueprint.
+    ///
+    /// The operator used to receive `outcome: must not be empty` with "tell me
+    /// what to change" — a contract they cannot see, from a session that had
+    /// already ended. While the planner is live, the rejection goes to it.
+    #[test]
+    fn a_rejected_blueprint_goes_back_to_the_live_planner() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.generating = true;
+            state.rejection_tx = Some(tx);
+        }
+
+        app.update(AppEvent::PlanAuthoringGenerated(Err(
+            "outcome: must not be empty".into(),
+        )));
+
+        assert_eq!(
+            rx.try_recv().ok().as_deref(),
+            Some("outcome: must not be empty"),
+            "the planner must receive the rejection it has to fix",
+        );
+        let state = app.plan_authoring.as_ref().expect("the tab stays open");
+        assert!(!state.generating);
+        assert!(
+            state.waiting,
+            "the planner owns the turn while it revises the blueprint"
+        );
+        assert!(
+            state.rejection_tx.is_some(),
+            "the session stays usable for the next verdict"
+        );
+        assert!(
+            state
+                .log
+                .entries
+                .last()
+                .is_some_and(|entry| entry.text().contains("Revising")),
+            "the operator must see that a revision is under way: {:?}",
+            state.log.entries,
+        );
+    }
+
     /// A blueprint alone must not retire the conversation.
     ///
     /// Closing on the blueprint destroyed the tab before generation had run,
-    /// so a failure left the operator with no transcript to fall back on.
+    /// so a failure left the operator with no transcript to fall back on. With
+    /// no live planner left to correct it, the operator is asked directly.
     #[test]
     fn a_failed_generation_hands_the_conversation_back() {
         let mut app = make_app();
@@ -12144,6 +12216,7 @@ mod tests {
             waiting: false,
             generating: false,
             answer_tx: None,
+            rejection_tx: None,
         };
         assert!(!authoring.is_busy());
 

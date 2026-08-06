@@ -621,7 +621,11 @@ async fn resolve_io(
                 return (AppEvent::Tick, None);
             };
             let text = state.input.trim().to_owned();
-            if text.is_empty() || state.waiting {
+            // `is_busy` rather than `waiting`: generation now keeps the planner
+            // session open, and anything submitted mid-generation would sit in
+            // the answer queue until the planner's *next* question and be
+            // consumed as the answer to that.
+            if text.is_empty() || state.is_busy() {
                 return (AppEvent::Tick, None);
             }
             state.input.clear();
@@ -668,13 +672,16 @@ async fn resolve_io(
             // a failed generation a continuation rather than a fresh start.
             let opening = plan_authoring_opening_prompt(&state.log.entries, &text);
             let (answer_tx, answer_rx) = mpsc::channel(8);
+            let (rejection_tx, rejection_rx) = mpsc::channel(8);
             state.answer_tx = Some(answer_tx);
+            state.rejection_tx = Some(rejection_tx);
             spawn_plan_authoring(
                 backend,
                 project_root,
                 model,
                 opening,
                 answer_rx,
+                rejection_rx,
                 background_tx.clone(),
             );
             (AppEvent::Tick, None)
@@ -1123,10 +1130,74 @@ fn spawn_generate_plan_bundle(
     });
 }
 
-const PLAN_AUTHOR_SYSTEM_PROMPT: &str = r#"You are Makina's plan author. Turn the user's project idea into an implementation plan. Ask a single concise clarification question whenever an important product or technical decision is missing. Respond with JSON only, using exactly one of these shapes:
-{"type":"question","question":"..."}
-{"type":"plan","blueprint":{"slug":"kebab-case","title":"...","scope":"...","architecture":"...","initial_status":{"goal":"...","root_cause":"...","approach":"...","outcome":"","last_updated":"YYYY-MM-DD"},"workstreams":[{"id":"0001","title":"..."}],"tasks":[{"sequence":"01","id":"kebab-case","title":"...","workstream":"0001","kind":"task","depends_on":[],"touches":["path/**"],"gated":false,"body":"..."}]}}
+/// A complete, valid `plan` reply, shown to the planner as the shape to copy.
+///
+/// This is not decoration: the previous prompt carried a skeleton with
+/// `"outcome":""` in it, and planners copied the empty string straight into
+/// their blueprint, which the bundle validator rejects
+/// (`GeneratedPlanBundle::validate_authoring_data`). A worked example that
+/// itself satisfies every rule cannot teach a violation, and
+/// `the_prompt_example_renders_as_a_valid_bundle` plus
+/// `the_prompt_example_survives_being_loaded_back` hold it to that.
+const PLAN_AUTHOR_EXAMPLE: &str = r##"{"type":"plan","blueprint":{
+  "slug": "cache-markdown-rendering",
+  "title": "Cache Markdown Rendering",
+  "scope": "> Stop re-parsing Markdown on every frame.\n\n## Why this plan\n\nThe render pass reparses every visible body each tick, which burns CPU proportional to document size for output that has not changed.\n\n## In scope\n\n- **0001 — Render-Cache.** Add a width-keyed parse cache and invalidate it when the text or the width changes.\n\n## Out of scope\n\nThe Markdown dialect itself is unchanged.",
+  "architecture": "> The concrete deltas, by symbol.\n\n## 0001 — Render-Cache\n\n`render_markdown` becomes a thin lookup over a `RefCell` cache keyed by the text hash and the render width, so the immutable render pass can still populate it.",
+  "initial_status": {
+    "goal": "Render cached Markdown instead of reparsing it every frame.",
+    "root_cause": "Every render call parses the full document, with no memoization between frames.",
+    "approach": "Introduce a width-keyed parse cache on the app and invalidate it on text or width change.",
+    "outcome": "Repeated frames over unchanged text reuse the parsed result and no longer reparse.",
+    "last_updated": "2026-01-31"
+  },
+  "workstreams": [{"id": "0001", "title": "Render-Cache"}],
+  "tasks": [{
+    "sequence": "01",
+    "id": "cache-parsed-markdown",
+    "title": "Cache Parsed Markdown",
+    "workstream": "0001",
+    "kind": "task",
+    "depends_on": [],
+    "touches": ["crates/makina/src/markup.rs", "crates/makina/src/ui.rs"],
+    "gated": false,
+    "body": "# Cache Parsed Markdown\n\nParsing is repeated per frame for text that has not changed.\n\n**Steps:**\n\n1. Add a cache keyed by the text hash and the render width.\n2. Look up before parsing and store the parsed lines on a miss.\n3. Cover a repeated render and a width change with tests.\n\n- **Done when:** a second render of unchanged text at the same width performs no parse, and the tests prove it."
+  }]
+}}"##;
+
+/// Everything the bundle validator enforces, stated once.
+///
+/// The validator is fail-closed and reports only the first violation, so any
+/// rule the planner has to guess at costs a full generation round trip. These
+/// mirror `makina_core::plan`: `validate_authoring_data`, `parse_repo_pattern`,
+/// `validate_body`, `scope_workstreams`, and `architecture_workstreams`.
+const PLAN_AUTHOR_RULES: &str = r#"Rules — the blueprint is validated mechanically and rejected whole on the first violation:
+- Every string is required and must be non-empty, `initial_status.outcome` included: it states what is observably true once the plan is done. `last_updated` is `YYYY-MM-DD`.
+- `slug` and every task `id` are lowercase kebab-case: `a`-`z`, `0`-`9`, and single `-` separators, never leading, trailing, or doubled.
+- `workstreams[].id` and each task's `workstream` are four digits from `0001`; `sequence` is two digits and unique per workstream.
+- `scope` and `architecture` are Markdown starting *below* the plan H1 — the host writes that H1, so do not include one.
+- `scope` needs a `## In scope` section declaring each workstream exactly once as `- **0001 — Name.** summary`, where `Name` is that workstream's title verbatim and is closed by `.**`.
+- `architecture` needs a `## 0001 — Name` heading for each workstream exactly once, with the same names. Scope and Architecture must declare the same set.
+- A task `body` opens with `# ` plus that task's `title` exactly, carries a `**Steps:**` line followed by an ordered list, and ends with a final `- **Done when:** …` line standing alone as the last block.
+- `depends_on` names task `id`s from this same blueprint: unique, acyclic, never itself.
+- `kind` is `task`, `spike`, or `chore`.
+- `touches` are repository-relative paths owned by that task. Globbing is narrow: a whole path segment may be `*`, and a pattern may end in `/**`. So `src/**` and `src/*/mod.rs` are accepted, while `src/**/*.rs`, `*.rs`, and `**/tests` are rejected. No `..`, no absolute paths, nothing under `.git/`, and nothing under this plan's own `docs/plans/` directory — the host owns those.
+
 Do not write files or run commands. The host validates, renders, commits, and registers the blueprint."#;
+
+/// The planner's contract, assembled from the shape, the example, and the rules.
+fn plan_author_system_prompt() -> String {
+    format!(
+        r#"You are Makina's plan author. Turn the user's project idea into an implementation plan. Ask a single concise clarification question whenever an important product or technical decision is missing. Respond with JSON only — no prose, no code fences — using exactly one of these shapes:
+{{"type":"question","question":"..."}}
+{{"type":"plan","blueprint":{{…}}}}
+
+A complete `plan` reply looks like this, and satisfies every rule below:
+{PLAN_AUTHOR_EXAMPLE}
+
+{PLAN_AUTHOR_RULES}"#
+    )
+}
 
 /// Restated on every follow-up turn.
 ///
@@ -1170,6 +1241,36 @@ fn plan_author_recovery(reason: &str, repairs: usize) -> PlanAuthorRecovery {
         PlanAuthorRecovery::Fail(format!(
             "planner did not return a usable reply after \
              {PLAN_AUTHOR_REPAIR_ATTEMPTS} correction attempts: {reason}"
+        ))
+    }
+}
+
+/// How many rejected blueprints are handed back to the planner to correct.
+///
+/// Separate from [`PLAN_AUTHOR_REPAIR_ATTEMPTS`] because this is a different
+/// failure: the reply parsed cleanly and the fault is a contract violation the
+/// validator names precisely. It reports one violation at a time, so a budget
+/// of one or two would strand a blueprint that trips two independent rules —
+/// and the operator, who cannot see the contract, has nothing to contribute.
+const PLAN_AUTHOR_GENERATION_ATTEMPTS: usize = 3;
+
+/// Decide whether a rejected blueprint is worth handing back.
+///
+/// The validator's message is the whole payload: it names the field and the
+/// rule, which is exactly what the planner needs and exactly what the operator
+/// cannot act on. Routing it back to the planner is what turns a dead end into
+/// a revision.
+fn plan_generation_recovery(reason: &str, attempts: usize) -> PlanAuthorRecovery {
+    if attempts < PLAN_AUTHOR_GENERATION_ATTEMPTS {
+        PlanAuthorRecovery::Retry(format!(
+            "The host rejected that blueprint: {reason}\n\
+             Fix exactly that, keep everything else, and reply with the corrected \
+             blueprint.{PLAN_AUTHOR_TURN_REMINDER}"
+        ))
+    } else {
+        PlanAuthorRecovery::Fail(format!(
+            "the planner could not produce a valid blueprint in \
+             {PLAN_AUTHOR_GENERATION_ATTEMPTS} attempts; the last rejection was: {reason}"
         ))
     }
 }
@@ -1363,13 +1464,14 @@ fn spawn_plan_authoring(
     model: Option<String>,
     first_prompt: String,
     mut answer_rx: mpsc::Receiver<String>,
+    mut rejection_rx: mpsc::Receiver<String>,
     background_tx: mpsc::Sender<AppEvent>,
 ) {
     use makina_core::backend::{Prompt, ResponseEvent, SessionConfig};
     tokio::spawn(async move {
         let config = SessionConfig {
             working_dir: project_root.clone(),
-            system_prompt: PLAN_AUTHOR_SYSTEM_PROMPT.into(),
+            system_prompt: plan_author_system_prompt(),
             mode: None,
             model,
             effort: None,
@@ -1391,6 +1493,8 @@ fn spawn_plan_authoring(
         let mut prompt = first_prompt;
         // Consecutive malformed replies since the last usable one.
         let mut repairs = 0usize;
+        // Blueprints this session has had rejected by the bundle validator.
+        let mut rejections = 0usize;
         loop {
             let mut stream = match session.prompt(Prompt::new(prompt)).await {
                 Ok(stream) => stream,
@@ -1505,13 +1609,38 @@ fn spawn_plan_authoring(
                     prompt = format!("{next}{PLAN_AUTHOR_TURN_REMINDER}");
                 }
                 Ok(Reply::Plan { blueprint }) => {
-                    let _ = background_tx
+                    repairs = 0;
+                    if background_tx
                         .send(AppEvent::GeneratePlanBundle {
-                            project_root,
+                            project_root: project_root.clone(),
                             blueprint: *blueprint,
                         })
-                        .await;
-                    break;
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    // Stay alive for the verdict. Terminating here is what made
+                    // a rejected blueprint the operator's problem: the only
+                    // thing left to show them was the validator's message, and
+                    // a contract violation is not something they can answer.
+                    // A published bundle drops the sender, which ends the
+                    // session exactly as breaking used to.
+                    let Some(reason) = rejection_rx.recv().await else {
+                        break;
+                    };
+                    match plan_generation_recovery(&reason, rejections) {
+                        PlanAuthorRecovery::Retry(correction) => {
+                            rejections += 1;
+                            prompt = correction;
+                        }
+                        PlanAuthorRecovery::Fail(reason) => {
+                            let _ = background_tx
+                                .send(AppEvent::PlanAuthoringFailed { reason })
+                                .await;
+                            break;
+                        }
+                    }
                 }
                 Err(reason) => match plan_author_recovery(&reason, repairs) {
                     // Hand the fault back and let the planner correct itself.
@@ -4076,6 +4205,225 @@ mod tests {
     fn the_turn_reminder_restates_both_allowed_shapes() {
         assert!(PLAN_AUTHOR_TURN_REMINDER.contains(r#"{"type":"question""#));
         assert!(PLAN_AUTHOR_TURN_REMINDER.contains(r#"{"type":"plan""#));
+    }
+
+    /// Turn the prompt's own example into the bundle the host would build from
+    /// it, so the real validators — not a paraphrase of them — get to judge it.
+    fn example_bundle() -> makina_core::plan::GeneratedPlanBundle {
+        use makina_core::plan::{
+            GeneratedInitialStatus, GeneratedTaskDocument, GeneratedWorkstream, GitObjectFormat,
+            GitObjectId, PlanKey, TaskFrontmatter, TaskId, TaskKind, TaskSequence, WorkstreamId,
+            parse_generated_repo_pattern,
+        };
+
+        let Reply::Plan { blueprint } = parse_planner_reply(PLAN_AUTHOR_EXAMPLE)
+            .expect("the prompt's example must be a parseable reply")
+        else {
+            panic!("the example must be a plan, not a question");
+        };
+        let key = PlanKey::parse(
+            std::path::PathBuf::from("docs/plans").join(format!("0001-{}", blueprint.slug)),
+        )
+        .expect("the example slug must form a plan key");
+
+        let tasks = blueprint
+            .tasks
+            .iter()
+            .map(|task| {
+                let workstream = WorkstreamId::parse(task.workstream.clone())
+                    .expect("workstream id must be four digits");
+                let sequence = TaskSequence::parse(task.sequence.clone())
+                    .expect("sequence must be two digits");
+                let id = TaskId::parse(task.id.clone()).expect("task id must be kebab-case");
+                let kind = match task.kind.as_str() {
+                    "task" => TaskKind::Task,
+                    "spike" => TaskKind::Spike,
+                    "chore" => TaskKind::Chore,
+                    other => panic!("unsupported kind {other}"),
+                };
+                let task_path = key.relative_dir.join("tasks").join(format!(
+                    "{}{}-{}.md",
+                    &workstream.as_str()[2..],
+                    sequence,
+                    id
+                ));
+                GeneratedTaskDocument {
+                    sequence,
+                    frontmatter: TaskFrontmatter {
+                        id,
+                        title: task.title.clone(),
+                        workstream,
+                        kind,
+                        depends_on: task
+                            .depends_on
+                            .iter()
+                            .map(|dependency| {
+                                TaskId::parse(dependency.clone()).expect("dependency id")
+                            })
+                            .collect(),
+                        gated: task.gated,
+                        // The rule the second reported failure tripped: the
+                        // example's globs have to survive the real parser.
+                        touches: task
+                            .touches
+                            .iter()
+                            .map(|value| {
+                                parse_generated_repo_pattern(value, kind, &task_path)
+                                    .unwrap_or_else(|error| {
+                                        panic!("touches {value:?} is not permitted: {error}")
+                                    })
+                            })
+                            .collect(),
+                        status: makina_core::plan::AuthoredTaskStatus::Planned,
+                        merged_as: None,
+                    },
+                    body: task.body.clone(),
+                }
+            })
+            .collect();
+
+        makina_core::plan::GeneratedPlanBundle {
+            key,
+            title: blueprint.title.clone(),
+            scope: blueprint.scope.clone(),
+            architecture: blueprint.architecture.clone(),
+            initial_status: GeneratedInitialStatus {
+                goal: blueprint.initial_status.goal.clone(),
+                root_cause: blueprint.initial_status.root_cause.clone(),
+                approach: blueprint.initial_status.approach.clone(),
+                outcome: blueprint.initial_status.outcome.clone(),
+                base_name: "develop".into(),
+                base_oid: GitObjectId::parse(
+                    String::from("0123456789abcdef0123456789abcdef01234567"),
+                    GitObjectFormat::Sha1,
+                )
+                .expect("a well-formed oid"),
+                last_updated: blueprint.initial_status.last_updated.clone(),
+            },
+            workstreams: blueprint
+                .workstreams
+                .iter()
+                .map(|workstream| GeneratedWorkstream {
+                    id: WorkstreamId::parse(workstream.id.clone()).expect("workstream id"),
+                    title: workstream.title.clone(),
+                })
+                .collect(),
+            tasks,
+        }
+    }
+
+    /// The prompt must not teach a violation.
+    ///
+    /// The shipped skeleton carried `"outcome":""`, planners copied it, and the
+    /// bundle validator rejected every plan with `outcome: must not be empty` —
+    /// a failure the operator was then asked to explain. The example is now a
+    /// worked one, and this holds it to the validator that rejected the old one.
+    #[test]
+    fn the_prompt_example_renders_as_a_valid_bundle() {
+        let files = example_bundle()
+            .render_files()
+            .expect("the prompt's example must satisfy the bundle validator");
+
+        for required in ["SCOPE.md", "ARCHITECTURE.md", "STATUS.md"] {
+            assert!(
+                files.contains_key(std::path::Path::new(required)),
+                "the rendered bundle must contain {required}: {:?}",
+                files.keys().collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// Rendering only proves the frontmatter surface. The body rules — the H1
+    /// matching the title, `**Steps:**` with an ordered list, a closing
+    /// `Done when` — are enforced when the bundle is read back, which is the
+    /// stage the operator's plan would have reached next.
+    #[test]
+    fn the_prompt_example_survives_being_loaded_back() {
+        use makina_core::plan::{
+            FilesystemPlanFileSource, GitObjectFormat, PlanCandidate, PlanReservations, load_plan,
+        };
+
+        let bundle = example_bundle();
+        let files = bundle.render_files().expect("the example must render");
+        let root = tempfile::tempdir().expect("a temporary directory");
+        for (relative, bytes) in &files {
+            let target = root.path().join(&bundle.key.relative_dir).join(relative);
+            std::fs::create_dir_all(target.parent().expect("a parent directory"))
+                .expect("the plan subtree");
+            std::fs::write(&target, bytes).expect("writing the rendered file");
+        }
+
+        let source = FilesystemPlanFileSource::new_unbound(root.path(), GitObjectFormat::Sha1)
+            .expect("a plan file source");
+        match load_plan(&source, bundle.key.clone(), &PlanReservations::default()) {
+            Ok(PlanCandidate::Plan(_)) => {}
+            Ok(PlanCandidate::NotCandidate) => panic!("the example must load as a plan"),
+            Err(report) => panic!(
+                "the prompt's example must load cleanly: {:?}",
+                report.diagnostics
+            ),
+        }
+    }
+
+    /// The assembled contract has to carry the example and the rules, or the
+    /// planner never sees either.
+    #[test]
+    fn the_system_prompt_carries_the_example_and_the_rules() {
+        let prompt = plan_author_system_prompt();
+        assert!(prompt.contains(PLAN_AUTHOR_EXAMPLE), "{prompt}");
+        assert!(prompt.contains(PLAN_AUTHOR_RULES), "{prompt}");
+        assert!(
+            !prompt.contains(r#""outcome": """#) && !prompt.contains(r#""outcome":"""#),
+            "the prompt must never model an empty outcome: {prompt}"
+        );
+        // The touches grammar is the rule the second reported failure tripped;
+        // it is unguessable, so it has to be stated.
+        assert!(
+            prompt.contains("`src/**/*.rs`"),
+            "the prompt must show a rejected glob: {prompt}"
+        );
+    }
+
+    /// A rejected blueprint is a contract violation, and the contract is the
+    /// planner's. The operator was being handed `outcome: must not be empty`
+    /// and asked what to change; the validator's message must go back to the
+    /// author instead.
+    #[test]
+    fn a_rejected_blueprint_is_handed_back_to_the_planner() {
+        let PlanAuthorRecovery::Retry(correction) =
+            plan_generation_recovery("outcome: must not be empty", 0)
+        else {
+            panic!("the first rejection must be recoverable");
+        };
+        assert!(
+            correction.contains("outcome: must not be empty"),
+            "the correction must carry the validator's message: {correction}"
+        );
+        assert!(
+            correction.contains(r#"{"type":"plan""#),
+            "the correction must restate the contract: {correction}"
+        );
+    }
+
+    /// Bounded, so a planner that cannot satisfy the validator stops instead of
+    /// regenerating forever against a live backend.
+    #[test]
+    fn blueprint_rejections_give_up_after_the_bounded_attempts() {
+        assert!(matches!(
+            plan_generation_recovery("bad", PLAN_AUTHOR_GENERATION_ATTEMPTS - 1),
+            PlanAuthorRecovery::Retry(_)
+        ));
+        let PlanAuthorRecovery::Fail(reason) = plan_generation_recovery(
+            "touches: only single-segment",
+            PLAN_AUTHOR_GENERATION_ATTEMPTS,
+        ) else {
+            panic!("exhausted attempts must fail");
+        };
+        assert!(reason.contains("attempts"), "{reason}");
+        assert!(
+            reason.contains("touches: only single-segment"),
+            "the final report must carry the last rejection: {reason}"
+        );
     }
 
     #[test]

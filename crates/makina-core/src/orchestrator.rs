@@ -3150,14 +3150,9 @@ impl AuthoringCoordinator {
             }
             let source = crate::plan::FilesystemPlanFileSource::new_unbound(&temporary, format)
                 .map_err(|error| invalid(error.to_string()))?;
-            let plan = match load_plan(&source, key.clone(), &PlanReservations::default()).map_err(
-                |report| {
-                    invalid(format!(
-                        "generated bundle validation failed: {:?}",
-                        report.diagnostics
-                    ))
-                },
-            )? {
+            let plan = match load_plan(&source, key.clone(), &PlanReservations::default())
+                .map_err(|report| invalid(render_generation_diagnostics(&report.diagnostics)))?
+            {
                 PlanCandidate::Plan(plan) => plan,
                 PlanCandidate::NotCandidate => {
                     return Err(invalid("generated bundle is not a plan".into()));
@@ -3203,6 +3198,41 @@ impl AuthoringCoordinator {
         .await;
         let _ = tokio::fs::remove_dir_all(&temporary).await;
         result
+    }
+}
+
+/// Render bundle diagnostics for the reader who has to act on them.
+///
+/// Debug-formatting the vector produced a wall of `PlanValidationDiagnostic {
+/// code: "…", path: "…", … }` structs. That string is not an internal detail:
+/// it reaches the authoring transcript, and it is handed back to the planner as
+/// the correction to apply. Bounded, because the whole of it becomes prompt.
+fn render_generation_diagnostics(diagnostics: &[crate::plan::PlanValidationDiagnostic]) -> String {
+    const MAX_REPORTED: usize = 8;
+    if diagnostics.is_empty() {
+        return "generated bundle validation failed without a diagnostic".into();
+    }
+    let rendered = diagnostics
+        .iter()
+        .take(MAX_REPORTED)
+        .map(|diagnostic| {
+            let field = diagnostic
+                .field
+                .as_deref()
+                .map(|field| format!(" [{field}]"))
+                .unwrap_or_default();
+            format!(
+                "{} ({}){field}: {}",
+                diagnostic.path.display(),
+                diagnostic.code,
+                diagnostic.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    match diagnostics.len().saturating_sub(MAX_REPORTED) {
+        0 => format!("generated bundle validation failed: {rendered}"),
+        elided => format!("generated bundle validation failed: {rendered}; and {elided} more"),
     }
 }
 
@@ -7210,6 +7240,52 @@ mod tests {
     // serialize HOME mutations across crate boundaries.
     use crate::HOME_ENV_LOCK;
     use crate::test_support::setup_temp_repo as shared_setup_temp_repo;
+
+    /// The rejection message is read by a person and re-prompted to a planner,
+    /// so it has to name the file, the rule, and the field — not Debug-print
+    /// the diagnostic structs, which is what it used to do.
+    #[test]
+    fn generation_diagnostics_render_as_prose() {
+        let rendered = render_generation_diagnostics(&[crate::plan::PlanValidationDiagnostic {
+            code: "invalid-task-document".into(),
+            path: PathBuf::from("docs/plans/0001-fsm/tasks/0101-parse.md"),
+            field: Some("body".into()),
+            message: "H1 must exactly equal the frontmatter title".into(),
+        }]);
+
+        assert!(
+            rendered.contains("docs/plans/0001-fsm/tasks/0101-parse.md"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("invalid-task-document"), "{rendered}");
+        assert!(rendered.contains("[body]"), "{rendered}");
+        assert!(
+            rendered.contains("H1 must exactly equal the frontmatter title"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("PlanValidationDiagnostic"),
+            "the struct must not leak into the message: {rendered}"
+        );
+    }
+
+    /// The whole string becomes prompt, so a pathological bundle must not turn
+    /// into an unbounded one.
+    #[test]
+    fn generation_diagnostics_are_bounded() {
+        let many = (0..20)
+            .map(|index| crate::plan::PlanValidationDiagnostic {
+                code: "invalid-task-document".into(),
+                path: PathBuf::from(format!("tasks/{index}.md")),
+                field: None,
+                message: "bad".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let rendered = render_generation_diagnostics(&many);
+        assert!(rendered.contains("and 12 more"), "{rendered}");
+        assert!(!rendered.contains("tasks/8.md"), "{rendered}");
+    }
 
     /// Build a `Config` with NO gates (the gate loop is a no-op) so the develop
     /// → review loop advances straight from develop to review — the same config
