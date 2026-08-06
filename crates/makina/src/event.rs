@@ -598,9 +598,14 @@ async fn resolve_io(
             blueprint,
         } => {
             let label = blueprint.slug.clone();
-            // The draft has become a plan; retire the composer and its tab.
-            if app.plan_authoring.is_some() {
-                app.update(AppEvent::ClosePlanAuthoring);
+            // The tab stays open until the bundle actually exists. Closing here
+            // destroyed the conversation the moment a blueprint arrived — before
+            // generation had run, let alone succeeded — so a failure left the
+            // operator with no tab, no transcript, and a transient status line.
+            if let Some(state) = app.plan_authoring.as_mut() {
+                state.waiting = false;
+                state.generating = true;
+                state.thoughts.clear();
             }
             spawn_generate_plan_bundle(
                 std::sync::Arc::clone(&app.api),
@@ -661,13 +666,18 @@ async fn resolve_io(
                     Some("No Planner model selected — choose one in Settings".into()),
                 );
             }
+            // A session that ended — because a blueprint was emitted, or the
+            // agent dropped — leaves a transcript the operator can still see.
+            // Replaying it as the opening prompt is what makes continuing after
+            // a failed generation a continuation rather than a fresh start.
+            let opening = plan_authoring_opening_prompt(&state.messages, &text);
             let (answer_tx, answer_rx) = mpsc::channel(8);
             state.answer_tx = Some(answer_tx);
             spawn_plan_authoring(
                 backend,
                 project_root,
                 model,
-                text,
+                opening,
                 answer_rx,
                 background_tx.clone(),
             );
@@ -1079,29 +1089,41 @@ fn spawn_generate_plan_bundle(
             })
             .await
         };
-        match result {
+        // Every arm reports the outcome to the authoring tab, which is what
+        // decides whether the conversation is retired or handed back.
+        let outcome = match result {
             Ok(CommandOutcome::PlanGenerated { plan_dir, .. }) => {
                 spawn_discover_plans(opened_folders, background_tx.clone(), false);
+                let label = plan_dir.relative_dir.display().to_string();
                 let _ = background_tx
                     .send(AppEvent::StatusMessage(format!(
-                        "Generated {}; select the registered plan to open or start it",
-                        plan_dir.relative_dir.display()
+                        "Generated {label}; select the registered plan to open or start it"
                     )))
                     .await;
+                Ok(label)
             }
             Ok(other) => {
+                let reason = format!("unexpected outcome {other:?}");
                 let _ = background_tx
                     .send(AppEvent::StatusMessage(format!(
-                        "Generate failed: unexpected outcome {other:?}"
+                        "Generate failed: {reason}"
                     )))
                     .await;
+                Err(reason)
             }
             Err(error) => {
+                let reason = error.to_string();
                 let _ = background_tx
-                    .send(AppEvent::StatusMessage(format!("Generate failed: {error}")))
+                    .send(AppEvent::StatusMessage(format!(
+                        "Generate failed: {reason}"
+                    )))
                     .await;
+                Err(reason)
             }
-        }
+        };
+        let _ = background_tx
+            .send(AppEvent::PlanAuthoringGenerated(outcome))
+            .await;
     });
 }
 
@@ -1298,6 +1320,40 @@ fn parse_planner_reply(answer: &str) -> Result<Reply, String> {
     }))
 }
 
+/// Build the opening prompt for a planner session.
+///
+/// The newest message is the operator's own text and is already in `messages`
+/// by the time this runs, so it is passed separately and the transcript is
+/// replayed ahead of it. Without this, resuming after a failed generation would
+/// silently drop everything already agreed and quietly restart the interview.
+fn plan_authoring_opening_prompt(
+    messages: &[crate::app::PlanAuthoringMessage],
+    text: &str,
+) -> String {
+    // Everything before the message just added — matched positionally, since
+    // an operator who repeats themselves would otherwise have both copies
+    // dropped from the replay.
+    let prior = match messages.split_last() {
+        Some((last, head)) if !last.from_model && last.text == text => head,
+        _ => messages,
+    };
+    if prior.is_empty() {
+        return text.to_owned();
+    }
+    let mut prompt = String::from("Continuing an earlier drafting conversation:\n");
+    for message in prior {
+        let speaker = if message.from_model {
+            "You"
+        } else {
+            "Operator"
+        };
+        prompt.push_str(&format!("{speaker}: {}\n", message.text));
+    }
+    prompt.push_str("\nOperator: ");
+    prompt.push_str(text);
+    prompt
+}
+
 fn spawn_plan_authoring(
     backend: std::sync::Arc<dyn makina_core::backend::AgentBackend>,
     project_root: std::path::PathBuf,
@@ -1349,6 +1405,18 @@ fn spawn_plan_authoring(
             while let Some(event) = stream.next().await {
                 match event {
                     Ok(ResponseEvent::TextChunk { text }) => answer.push_str(&text),
+                    // Reasoning is a side channel: it never contributes to the
+                    // answer, but it is the only signal that the planner is
+                    // working rather than hung.
+                    Ok(ResponseEvent::ThoughtChunk { text }) => {
+                        if background_tx
+                            .send(AppEvent::PlanAuthoringThought(text))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(ResponseEvent::TurnComplete { .. }) => {}
                     Ok(_) => {}
                     Err(error) => {
@@ -3601,6 +3669,51 @@ mod tests {
             ),
             AppEvent::Tick
         ));
+    }
+
+    /// The first prompt of a brand-new conversation is just the operator's text.
+    #[test]
+    fn a_first_prompt_carries_no_transcript() {
+        let messages = vec![crate::app::PlanAuthoringMessage {
+            from_model: false,
+            text: "an fsm cli".into(),
+        }];
+        assert_eq!(
+            plan_authoring_opening_prompt(&messages, "an fsm cli"),
+            "an fsm cli"
+        );
+    }
+
+    /// Resuming after a session ended replays what was already agreed, so
+    /// continuing is a continuation rather than a silent restart.
+    #[test]
+    fn resuming_replays_the_earlier_transcript() {
+        let messages = vec![
+            crate::app::PlanAuthoringMessage {
+                from_model: false,
+                text: "an fsm cli".into(),
+            },
+            crate::app::PlanAuthoringMessage {
+                from_model: true,
+                text: "YAML or TOML?".into(),
+            },
+            crate::app::PlanAuthoringMessage {
+                from_model: false,
+                text: "YAML".into(),
+            },
+        ];
+        let prompt = plan_authoring_opening_prompt(&messages, "YAML");
+
+        assert!(prompt.contains("an fsm cli"), "{prompt}");
+        assert!(prompt.contains("YAML or TOML?"), "{prompt}");
+        assert!(
+            prompt.trim_end().ends_with("Operator: YAML"),
+            "the newest message must come last: {prompt}"
+        );
+        assert!(
+            prompt.matches("YAML\n").count() <= 2,
+            "the newest message must not be replayed twice: {prompt}"
+        );
     }
 
     /// Ctrl+J is the newline chord that works without terminal negotiation.

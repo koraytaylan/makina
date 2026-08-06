@@ -429,6 +429,13 @@ pub struct PlanAuthoringMessage {
     pub text: String,
 }
 
+/// Longest reasoning tail kept for the in-flight turn.
+///
+/// Thoughts stream continuously and are only interesting as "what is it doing
+/// right now", so an unbounded buffer would grow for the whole turn to show a
+/// few visible lines.
+pub const PLAN_AUTHORING_THOUGHT_CAP: usize = 4_000;
+
 #[derive(Debug)]
 pub struct PlanAuthoring {
     pub project_root: PathBuf,
@@ -437,7 +444,47 @@ pub struct PlanAuthoring {
     pub input: String,
     pub messages: Vec<PlanAuthoringMessage>,
     pub waiting: bool,
+    /// The planner's reasoning for the turn currently in flight.
+    ///
+    /// Cleared when the turn resolves: it answers "what is it doing right now",
+    /// not "what did it decide", which is what `messages` records.
+    pub thoughts: String,
+    /// True once a blueprint has been accepted and the bundle is being written.
+    ///
+    /// The tab stays open through this so a generation failure can hand the
+    /// conversation back instead of leaving the operator with nothing.
+    pub generating: bool,
     pub answer_tx: Option<tokio::sync::mpsc::Sender<String>>,
+}
+
+impl PlanAuthoring {
+    /// Append streamed reasoning, keeping only the most recent tail.
+    pub fn push_thought(&mut self, chunk: &str) {
+        self.thoughts.push_str(chunk);
+        if self.thoughts.len() <= PLAN_AUTHORING_THOUGHT_CAP {
+            return;
+        }
+        // Trim from the front on a char boundary so the tail stays intact.
+        let excess = self.thoughts.len() - PLAN_AUTHORING_THOUGHT_CAP;
+        let cut = (excess..=self.thoughts.len())
+            .find(|index| self.thoughts.is_char_boundary(*index))
+            .unwrap_or(self.thoughts.len());
+        self.thoughts.drain(..cut);
+    }
+
+    /// Whether the planner currently owns the turn.
+    pub fn is_busy(&self) -> bool {
+        self.waiting || self.generating
+    }
+
+    /// What the planner is doing, for the activity indicator.
+    pub fn activity(&self) -> &'static str {
+        if self.generating {
+            "Generating the plan bundle"
+        } else {
+            "Waiting for the planner"
+        }
+    }
 }
 
 /// Rows the composer needs to show `input` wrapped to `width`, before clamping.
@@ -1196,6 +1243,11 @@ pub enum AppEvent {
     PlanAuthoringFailed {
         reason: String,
     },
+    /// A chunk of the planner's reasoning for the in-flight turn.
+    PlanAuthoringThought(String),
+    /// Bundle generation finished; `Err` carries the reason and hands the
+    /// conversation back rather than discarding it.
+    PlanAuthoringGenerated(Result<String, String>),
     ClosePlanAuthoring,
     /// Pause the selected Run.
     PauseRun,
@@ -4681,6 +4733,8 @@ impl App {
                         input: String::new(),
                         messages: Vec::new(),
                         waiting: false,
+                        thoughts: String::new(),
+                        generating: false,
                         answer_tx: None,
                     });
                 }
@@ -4728,6 +4782,41 @@ impl App {
                 }
                 true
             }
+            AppEvent::PlanAuthoringThought(chunk) => {
+                if let Some(state) = self.plan_authoring.as_mut() {
+                    state.push_thought(&chunk);
+                }
+                true
+            }
+            AppEvent::PlanAuthoringGenerated(outcome) => {
+                match outcome {
+                    // Only a confirmed bundle retires the conversation.
+                    Ok(_) => {
+                        self.update(AppEvent::ClosePlanAuthoring);
+                    }
+                    Err(reason) => {
+                        if let Some(state) = self.plan_authoring.as_mut() {
+                            state.generating = false;
+                            state.waiting = false;
+                            state.thoughts.clear();
+                            // The planner session ended when it emitted the
+                            // blueprint. Dropping the handle lets the next
+                            // submit open a fresh one immediately, replaying
+                            // the transcript, instead of spending a submit on
+                            // discovering the channel is closed.
+                            state.answer_tx = None;
+                            state.messages.push(PlanAuthoringMessage {
+                                from_model: true,
+                                text: format!(
+                                    "The plan could not be generated: {reason}\n\
+                                     Tell me what to change and I will revise it."
+                                ),
+                            });
+                        }
+                    }
+                }
+                true
+            }
             AppEvent::PlanAuthoringQuestion { question } => {
                 if let Some(state) = self.plan_authoring.as_mut() {
                     state.messages.push(PlanAuthoringMessage {
@@ -4735,6 +4824,7 @@ impl App {
                         text: question,
                     });
                     state.waiting = false;
+                    state.thoughts.clear();
                 }
                 true
             }
@@ -4745,6 +4835,8 @@ impl App {
                         text: format!("Error: {reason}"),
                     });
                     state.waiting = false;
+                    state.generating = false;
+                    state.thoughts.clear();
                     state.answer_tx = None;
                 }
                 true
@@ -11853,6 +11945,129 @@ mod tests {
                 .any(|tab| matches!(tab, TabContent::PlanAuthoring { .. })),
             "the authoring tab must be closed with its draft",
         );
+    }
+
+    /// A blueprint alone must not retire the conversation.
+    ///
+    /// Closing on the blueprint destroyed the tab before generation had run,
+    /// so a failure left the operator with no transcript to fall back on.
+    #[test]
+    fn a_failed_generation_hands_the_conversation_back() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.generating = true;
+            state.messages.push(PlanAuthoringMessage {
+                from_model: false,
+                text: "an fsm cli".into(),
+            });
+        }
+
+        app.update(AppEvent::PlanAuthoringGenerated(Err(
+            "slug already registered".into(),
+        )));
+
+        let state = app
+            .plan_authoring
+            .as_ref()
+            .expect("a failed generation must keep the conversation");
+        assert!(app.is_plan_authoring(), "the tab must stay open");
+        assert!(!state.generating, "the composer must be usable again");
+        assert!(
+            state
+                .messages
+                .last()
+                .is_some_and(|m| m.text.contains("slug already registered")),
+            "the reason must reach the transcript: {:?}",
+            state.messages,
+        );
+        assert!(
+            state.messages.iter().any(|m| m.text == "an fsm cli"),
+            "the earlier conversation must survive",
+        );
+    }
+
+    /// Only a confirmed bundle retires the tab.
+    #[test]
+    fn a_successful_generation_closes_the_tab() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.update(AppEvent::PlanAuthoringGenerated(Ok(
+            "docs/plans/0001-fsm".into()
+        )));
+
+        assert!(app.plan_authoring.is_none());
+        assert!(!app.is_plan_authoring());
+    }
+
+    /// Reasoning streams into the in-flight turn and is dropped once it
+    /// resolves — it says what the planner is doing, not what it decided.
+    #[test]
+    fn thoughts_accumulate_while_waiting_and_clear_on_an_answer() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.plan_authoring.as_mut().unwrap().waiting = true;
+
+        app.update(AppEvent::PlanAuthoringThought("weighing ".into()));
+        app.update(AppEvent::PlanAuthoringThought("YAML".into()));
+        assert_eq!(
+            app.plan_authoring.as_ref().unwrap().thoughts,
+            "weighing YAML"
+        );
+
+        app.update(AppEvent::PlanAuthoringQuestion {
+            question: "One file or many?".into(),
+        });
+        let state = app.plan_authoring.as_ref().unwrap();
+        assert!(state.thoughts.is_empty(), "reasoning is per-turn");
+        assert!(!state.waiting);
+    }
+
+    /// The reasoning buffer is bounded and never splits a character.
+    #[test]
+    fn the_thought_buffer_keeps_a_bounded_tail() {
+        let mut authoring = PlanAuthoring {
+            project_root: std::path::PathBuf::from("."),
+            input: String::new(),
+            messages: Vec::new(),
+            waiting: true,
+            thoughts: String::new(),
+            generating: false,
+            answer_tx: None,
+        };
+        // Multi-byte on purpose: trimming must land on a char boundary.
+        for _ in 0..2_000 {
+            authoring.push_thought("λ think ");
+        }
+        assert!(authoring.thoughts.len() <= PLAN_AUTHORING_THOUGHT_CAP);
+        assert!(
+            authoring.thoughts.ends_with("think "),
+            "the newest reasoning must survive"
+        );
+    }
+
+    /// The indicator distinguishes the two waits, and both count as busy.
+    #[test]
+    fn activity_reports_which_wait_is_in_progress() {
+        let mut authoring = PlanAuthoring {
+            project_root: std::path::PathBuf::from("."),
+            input: String::new(),
+            messages: Vec::new(),
+            waiting: false,
+            thoughts: String::new(),
+            generating: false,
+            answer_tx: None,
+        };
+        assert!(!authoring.is_busy());
+
+        authoring.waiting = true;
+        assert!(authoring.is_busy());
+        assert!(authoring.activity().contains("planner"));
+
+        authoring.waiting = false;
+        authoring.generating = true;
+        assert!(authoring.is_busy());
+        assert!(authoring.activity().contains("Generating"));
     }
 
     /// A pasted block keeps its newlines — the whole point of bracketed paste.

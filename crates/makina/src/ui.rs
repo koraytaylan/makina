@@ -4421,10 +4421,69 @@ fn render_command_palette(
 /// scrolls rather than pushing the transcript off-screen.
 const AUTHORING_COMPOSER_MAX_ROWS: u16 = 12;
 
+/// Rows reserved for the activity indicator and streamed reasoning.
+///
+/// One row for the indicator plus a short tail of thinking — enough to see the
+/// planner working without crowding out the conversation.
+const AUTHORING_THINKING_ROWS: u16 = 5;
+
 /// Render the plan-authoring workspace as tab content.
 ///
 /// Laid out bottom-up like a chat composer: the transcript takes the remaining
 /// space and the input box sits under it, sized to its own content.
+/// Render the activity indicator and the planner's streamed reasoning.
+///
+/// The spinner is driven by the same `app.tick` the rest of the UI animates on,
+/// so a stalled frame loop is visible as a frozen spinner rather than being
+/// mistaken for a slow model. Reasoning is tail-anchored: the newest lines
+/// matter, and the band is deliberately short.
+fn render_authoring_activity(
+    app: &App,
+    authoring: &crate::app::PlanAuthoring,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+    let accent = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent));
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{} ", spinner_frame(app.tick)), accent),
+            Span::styled(format!("{}…", authoring.activity()), dim),
+        ])),
+        rows[0],
+    );
+
+    if rows[1].height == 0 {
+        return;
+    }
+    let thoughts = authoring.thoughts.trim();
+    if thoughts.is_empty() {
+        return;
+    }
+    // Show the tail: reasoning streams continuously and the newest text is the
+    // part that says what the planner is doing now.
+    let lines = thoughts.lines().collect::<Vec<_>>();
+    let visible = lines
+        .len()
+        .saturating_sub(rows[1].height as usize)
+        .min(lines.len());
+    let tail = lines[visible..]
+        .iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                (*line).to_owned(),
+                dim.add_modifier(Modifier::ITALIC),
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: true }), rows[1]);
+}
+
 fn render_plan_authoring(
     app: &App,
     authoring: &crate::app::PlanAuthoring,
@@ -4457,9 +4516,19 @@ fn render_plan_authoring(
             AUTHORING_COMPOSER_MAX_ROWS,
         )
     };
+    // While the planner owns the turn, a band above the composer carries the
+    // activity indicator and whatever reasoning has streamed so far. It is the
+    // only evidence the turn is progressing rather than hung, so it is reserved
+    // only while busy and costs nothing when the operator is typing.
+    let thinking_height = if authoring.is_busy() {
+        AUTHORING_THINKING_ROWS.min(inner.height.saturating_sub(composer_height + 3))
+    } else {
+        0
+    };
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
+        Constraint::Length(thinking_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
@@ -4509,8 +4578,12 @@ fn render_plan_authoring(
         chunks[1],
     );
 
-    let composer = if authoring.waiting {
-        Paragraph::new("Waiting for planner…")
+    if thinking_height > 0 {
+        render_authoring_activity(app, authoring, frame, chunks[2]);
+    }
+
+    let composer = if authoring.is_busy() {
+        Paragraph::new(format!("{}…", authoring.activity()))
             .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)))
     } else {
         let rows = crate::app::composer_rows(&authoring.input, composer_text_width);
@@ -4522,7 +4595,7 @@ fn render_plan_authoring(
     };
     frame.render_widget(
         composer.block(Block::default().borders(Borders::ALL)),
-        chunks[2],
+        chunks[3],
     );
 
     // Footer: key hints on the left, the model that will actually answer on the
@@ -4534,7 +4607,7 @@ fn render_plan_authoring(
         Constraint::Min(0),
         Constraint::Length(app.planner_model_label().chars().count() as u16),
     ])
-    .split(chunks[3]);
+    .split(chunks[4]);
     frame.render_widget(
         Paragraph::new("Enter submit · Ctrl+J newline · Esc close").style(dim),
         footer[0],
@@ -5677,6 +5750,75 @@ mod tests {
             screen.contains("glm-5.2 · high"),
             "the footer must show the model and its effort"
         );
+    }
+
+    /// While the planner owns the turn the pane shows an animated indicator and
+    /// the reasoning streamed so far — the only evidence the turn is moving.
+    #[test]
+    fn a_waiting_turn_shows_the_indicator_and_reasoning() {
+        let mut app = authoring_app("");
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.waiting = true;
+            state.thoughts = "comparing YAML and TOML for multi-line blocks".into();
+        }
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Waiting for the planner"),
+            "the indicator must name the wait"
+        );
+        assert!(
+            screen.contains("comparing YAML"),
+            "streamed reasoning must be visible"
+        );
+        assert!(
+            screen.contains(spinner_frame(app.tick)),
+            "the wait must be animated, not a static label"
+        );
+    }
+
+    /// The spinner advances with the tick the rest of the UI animates on.
+    #[test]
+    fn the_authoring_indicator_animates_across_ticks() {
+        let mut app = authoring_app("");
+        app.plan_authoring.as_mut().unwrap().waiting = true;
+
+        let mut frames = std::collections::BTreeSet::new();
+        for tick in 0..8u64 {
+            app.tick = tick;
+            let mut terminal = make_terminal(100, 30);
+            terminal.draw(|frame| render(&app, frame)).unwrap();
+            frames.insert(spinner_frame(app.tick).to_owned());
+        }
+        assert!(
+            frames.len() > 1,
+            "the indicator must change across ticks; got {frames:?}"
+        );
+    }
+
+    /// Generating a bundle is its own wait, and says so.
+    #[test]
+    fn a_generating_turn_names_the_generation_wait() {
+        let mut app = authoring_app("");
+        app.plan_authoring.as_mut().unwrap().generating = true;
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        assert!(screen_of(&terminal).contains("Generating the plan bundle"));
+    }
+
+    /// An idle composer spends no rows on the indicator.
+    #[test]
+    fn an_idle_composer_shows_no_indicator() {
+        let app = authoring_app("draft");
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(!screen.contains("Waiting for the planner"));
+        assert!(!screen.contains("Generating the plan bundle"));
     }
 
     /// A multi-line draft is shown in full: every line reaches the screen
