@@ -567,3 +567,130 @@ fn output(repo: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
+
+/// Adopting Makina must not require Makina's own artifacts to exist first.
+///
+/// The root roll-up board is written only by registration, and only onto the
+/// plan ref — never onto the base branch. So the first plan a project ever
+/// registers necessarily runs against a base with no board. Reading it out of
+/// the immutable base tree therefore failed every single time, rejecting the
+/// blueprint with `path: does not exist in the immutable Git tree` — a fault
+/// no blueprint could fix, reported as though the blueprint were at fault.
+#[tokio::test]
+async fn a_project_without_a_root_board_registers_its_first_plan() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let repo = tempfile::tempdir().unwrap();
+    adopting_repo(repo.path(), /* with_plans_dir */ true);
+    let state_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", state_home.path()) };
+    let api = build_api(repo.path());
+
+    let outcome = api
+        .execute(Command::GeneratePlanBundle {
+            blueprint: adopting_blueprint(),
+        })
+        .await
+        .expect("a project with no root board must still be able to register");
+    let CommandOutcome::PlanGenerated { plan_dir, .. } = outcome else {
+        panic!("expected a generated plan")
+    };
+
+    // The board registration created lives on the plan ref, carrying the row.
+    let board = output(
+        repo.path(),
+        &[
+            "show",
+            &format!("{}:docs/plans/STATUS.md", plan_dir.ref_name()),
+        ],
+    );
+    assert!(
+        board.contains("| Plan | Title | Status | Tasks | Outcome | Status doc |"),
+        "the created board must carry the canonical header: {board}"
+    );
+    assert!(
+        board.contains("| 0001 | Adopting |"),
+        "the first plan's row must be registered: {board}"
+    );
+    // Registration must not have moved the base branch to get there.
+    assert!(
+        !output(
+            repo.path(),
+            &["ls-tree", "--name-only", "develop", "docs/plans/"]
+        )
+        .contains("STATUS.md"),
+        "the base branch must be left untouched",
+    );
+    let status = output(repo.path(), &["status", "--porcelain"]);
+    assert!(status.is_empty(), "working tree must stay clean: {status}");
+}
+
+/// A repository with no `docs/plans` at all fails one step earlier, where
+/// `{base}:docs/plans` is not a valid object name.
+#[tokio::test]
+async fn a_project_without_a_plans_directory_registers_its_first_plan() {
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let repo = tempfile::tempdir().unwrap();
+    adopting_repo(repo.path(), /* with_plans_dir */ false);
+    let state_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", state_home.path()) };
+    let api = build_api(repo.path());
+
+    let outcome = api
+        .execute(Command::GeneratePlanBundle {
+            blueprint: adopting_blueprint(),
+        })
+        .await
+        .expect("an empty repository must still be able to register its first plan");
+    assert!(matches!(outcome, CommandOutcome::PlanGenerated { .. }));
+}
+
+/// A committed repository with nothing of Makina's in it — optionally with the
+/// `docs/plans/README.md` that `initialize_folder` leaves behind.
+fn adopting_repo(root: &Path, with_plans_dir: bool) {
+    git(root, &["init", "-q", "-b", "develop"]);
+    git(root, &["config", "user.email", "adopting@example.invalid"]);
+    git(root, &["config", "user.name", "Adopting Test"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    fs::write(root.join(".gitignore"), ".makina/\n").unwrap();
+    if with_plans_dir {
+        fs::create_dir_all(root.join("docs/plans")).unwrap();
+        fs::write(root.join("docs/plans/README.md"), "# Plans\n").unwrap();
+    }
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "base"]);
+}
+
+fn adopting_blueprint() -> makina_core::api::GeneratedPlanBlueprint {
+    use makina_core::api::{
+        GeneratedInitialStatusBlueprint, GeneratedPlanBlueprint, GeneratedTaskBlueprint,
+        GeneratedWorkstreamBlueprint,
+    };
+    GeneratedPlanBlueprint {
+        slug: "adopting".into(),
+        title: "Adopting".into(),
+        scope: "## In scope\n\n- **0001 — Core.** Generate the bundle.".into(),
+        architecture: "## 0001 — Core\n\nRender the canonical bundle.".into(),
+        initial_status: GeneratedInitialStatusBlueprint {
+            goal: "publish one plan.".into(),
+            root_cause: "the project has no plans yet.".into(),
+            approach: "render typed documents.".into(),
+            outcome: "the bundle is ready.".into(),
+            last_updated: "2026-07-20".into(),
+        },
+        workstreams: vec![GeneratedWorkstreamBlueprint {
+            id: "0001".into(),
+            title: "Core".into(),
+        }],
+        tasks: vec![GeneratedTaskBlueprint {
+            sequence: "01".into(),
+            id: "first".into(),
+            title: "First".into(),
+            workstream: "0001".into(),
+            kind: "task".into(),
+            depends_on: vec![],
+            touches: vec!["src/**".into()],
+            gated: false,
+            body: "# First\n\nWork.\n\n**Steps:**\n\n1. Do it.\n\n- **Done when:** done.".into(),
+        }],
+    }
+}

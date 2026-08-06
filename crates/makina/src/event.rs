@@ -1257,12 +1257,30 @@ fn plan_author_recovery(reason: &str, repairs: usize) -> PlanAuthorRecovery {
 /// faulting at every stage still converges within the budget.
 const PLAN_AUTHOR_GENERATION_ATTEMPTS: usize = 3;
 
+/// Whether a generation failure is the planner's to fix.
+///
+/// Not every rejection is about the blueprint. A missing repository lease, a
+/// base that moved, a plan number already reserved, an absent root status
+/// board — the planner can revise a blueprint and can do nothing about any of
+/// those. Handing it one anyway spent the whole correction budget regenerating
+/// against an unchanging error and then reported that the *planner* had
+/// failed, which is what made `path: does not exist in the immutable Git tree`
+/// unreadable: it named neither the file nor the party who could act on it.
+///
+/// `contains` rather than `starts_with` because the reason arrives wrapped in
+/// `ApiError`'s own `invalid command: ` prefix.
+pub(crate) fn blueprint_fault(reason: &str) -> bool {
+    makina_core::api::BLUEPRINT_FAULT_PREFIXES
+        .iter()
+        .any(|prefix| reason.contains(prefix))
+}
+
 /// Decide whether a rejected blueprint is worth handing back.
 ///
 /// The validator's message is the whole payload: it names the field and the
 /// rule, which is exactly what the planner needs and exactly what the operator
 /// cannot act on. Routing it back to the planner is what turns a dead end into
-/// a revision.
+/// a revision. Only reached for faults [`blueprint_fault`] has accepted.
 fn plan_generation_recovery(reason: &str, attempts: usize) -> PlanAuthorRecovery {
     if attempts < PLAN_AUTHOR_GENERATION_ATTEMPTS {
         PlanAuthorRecovery::Retry(format!(
@@ -4427,6 +4445,36 @@ mod tests {
             reason.contains("touches: only single-segment"),
             "the final report must carry the last rejection: {reason}"
         );
+    }
+
+    /// Only faults the planner can act on re-enter the repair loop.
+    ///
+    /// Every rejection used to, so a repository precondition — an absent root
+    /// status board, reported as `path: does not exist in the immutable Git
+    /// tree` — was regenerated against three times and then blamed on the
+    /// planner.
+    #[test]
+    fn only_blueprint_faults_are_the_planners_to_fix() {
+        for blueprint in [
+            "invalid command: generated blueprint is invalid: tasks[0] `a`: touches: bad",
+            "invalid command: generated bundle validation failed: tasks/0101-a.md (x): bad",
+        ] {
+            assert!(
+                blueprint_fault(blueprint),
+                "the planner must be given what it can fix: {blueprint}"
+            );
+        }
+        for environment in [
+            "invalid command: path: does not exist in the immutable Git tree",
+            "invalid command: target base moved: expected abc, found def",
+            "invalid command: plan number 0001 is already reserved in the target base",
+            "invalid command: fatal: Not a valid object name abc:docs/plans",
+        ] {
+            assert!(
+                !blueprint_fault(environment),
+                "the planner cannot resolve this and must not be handed it: {environment}"
+            );
+        }
     }
 
     #[test]

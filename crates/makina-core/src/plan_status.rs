@@ -281,6 +281,19 @@ pub fn render_plan_status(
     Ok(body)
 }
 
+/// The root roll-up board as it looks before any plan has been registered.
+///
+/// The board is Makina's own artifact, so a project adopting Makina does not
+/// have one, and registration cannot create it on the base branch — it may only
+/// write to the plan ref. Standing this in for an absent board lets the first
+/// registration carry the board it creates, exactly as it already carries the
+/// row. Column headers match [`expected_root_row`].
+pub const EMPTY_ROOT_BOARD: &str = "# Plans — roll-up board\n\n\
+     One row per plan. Task status is authored in each plan's `tasks/*.md` \
+     frontmatter and summarized by its `STATUS.md`.\n\n\
+     | Plan | Title | Status | Tasks | Outcome | Status doc |\n\
+     |---|---|---|---|---|---|\n";
+
 pub fn expected_root_row(plan: &PlanDocument) -> String {
     let progress = if plan.status.dropped == 0 {
         format!("{}/{}", plan.status.done, plan.status.total)

@@ -4865,10 +4865,18 @@ impl App {
                             // addressed to whoever wrote the blueprint, so it
                             // goes back to the planner; asking the operator to
                             // translate it was the defect, not the wording.
-                            let handed_back = state
-                                .rejection_tx
-                                .as_ref()
-                                .is_some_and(|tx| tx.try_send(reason.clone()).is_ok());
+                            //
+                            // A repository fault is the opposite: the planner
+                            // cannot resolve a missing lease or an absent
+                            // status board, and regenerating against one only
+                            // spends its budget before blaming it for the
+                            // failure.
+                            let authors_fault = crate::event::blueprint_fault(&reason);
+                            let handed_back = authors_fault
+                                && state
+                                    .rejection_tx
+                                    .as_ref()
+                                    .is_some_and(|tx| tx.try_send(reason.clone()).is_ok());
                             if handed_back {
                                 state.waiting = true;
                                 state.push_planner(format!(
@@ -4877,16 +4885,22 @@ impl App {
                                 ));
                             } else {
                                 state.waiting = false;
-                                // No live session to correct it. Dropping the
-                                // handles lets the next submit open a fresh
-                                // one immediately, replaying the transcript,
-                                // instead of spending a submit on discovering
-                                // the channel is closed.
+                                // Nothing left to correct it — no live session,
+                                // or nothing the planner could change. Dropping
+                                // the handles closes the session and lets the
+                                // next submit open a fresh one immediately,
+                                // replaying the transcript, instead of spending
+                                // a submit on discovering the channel is closed.
                                 state.answer_tx = None;
                                 state.rejection_tx = None;
+                                let guidance = if authors_fault {
+                                    "Tell me what to change and I will revise it."
+                                } else {
+                                    "That is a problem with the repository rather than \
+                                     with the plan, and revising the plan will not clear it."
+                                };
                                 state.push_planner(format!(
-                                    "The plan could not be generated: {reason}\n\
-                                     Tell me what to change and I will revise it."
+                                    "The plan could not be generated: {reason}\n{guidance}"
                                 ));
                             }
                         }
@@ -12032,13 +12046,15 @@ mod tests {
             state.rejection_tx = Some(tx);
         }
 
-        app.update(AppEvent::PlanAuthoringGenerated(Err(
-            "outcome: must not be empty".into(),
-        )));
+        // As it arrives over the wire: the validator's message wrapped in the
+        // headline that marks it as the blueprint's fault.
+        const REJECTION: &str =
+            "invalid command: generated blueprint is invalid: outcome: must not be empty";
+        app.update(AppEvent::PlanAuthoringGenerated(Err(REJECTION.into())));
 
         assert_eq!(
             rx.try_recv().ok().as_deref(),
-            Some("outcome: must not be empty"),
+            Some(REJECTION),
             "the planner must receive the rejection it has to fix",
         );
         let state = app.plan_authoring.as_ref().expect("the tab stays open");
@@ -12059,6 +12075,52 @@ mod tests {
                 .is_some_and(|entry| entry.text().contains("Revising")),
             "the operator must see that a revision is under way: {:?}",
             state.log.entries,
+        );
+    }
+
+    /// A repository fault is not the planner's to fix.
+    ///
+    /// `path: does not exist in the immutable Git tree` was fed back three
+    /// times, unchanged and unfixable, before the operator was told that the
+    /// *planner* had failed. It belongs to the operator immediately.
+    #[test]
+    fn a_repository_fault_goes_straight_to_the_operator() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.generating = true;
+            state.rejection_tx = Some(tx);
+        }
+
+        app.update(AppEvent::PlanAuthoringGenerated(Err(
+            "invalid command: path: does not exist in the immutable Git tree".into(),
+        )));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "the planner must not be asked to fix the repository",
+        );
+        let state = app.plan_authoring.as_ref().expect("the tab stays open");
+        assert!(!state.generating);
+        assert!(!state.waiting, "the turn returns to the operator");
+        assert!(
+            state.rejection_tx.is_none() && state.answer_tx.is_none(),
+            "the session is retired rather than left waiting on a verdict",
+        );
+        let last = state
+            .log
+            .entries
+            .last()
+            .map(|entry| entry.text())
+            .unwrap_or_default();
+        assert!(
+            last.contains("does not exist in the immutable Git tree"),
+            "the reason must reach the operator verbatim: {last}"
+        );
+        assert!(
+            last.contains("problem with the repository"),
+            "the operator must be told revising will not help: {last}"
         );
     }
 

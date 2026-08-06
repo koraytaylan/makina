@@ -1787,7 +1787,7 @@ impl AuthoringCoordinator {
         bundle
             .render_files()
             .map_err(|error| ApiError::InvalidCommand {
-                reason: format!("generated blueprint is invalid: {error}"),
+                reason: format!("{}: {error}", crate::api::BLUEPRINT_FAULT_PREFIXES[0]),
             })
     }
 
@@ -2966,12 +2966,16 @@ impl AuthoringCoordinator {
                 }
             }
         }
-        let base_dirs = git(
-            root,
-            &["ls-tree", "--name-only", &format!("{base}:docs/plans")],
-        )
-        .await?;
-        for name in base_dirs.lines() {
+        // Addressed as a pathspec rather than as `{base}:docs/plans`, which is a
+        // hard error when the directory is absent from the base tree — the
+        // ordinary state of a project adopting Makina, whose plans directory
+        // exists only in the working tree, or not at all. The pathspec form
+        // lists nothing and succeeds, which is what "no plans yet" means.
+        let base_dirs = git(root, &["ls-tree", "--name-only", &base, "docs/plans/"]).await?;
+        for name in base_dirs
+            .lines()
+            .filter_map(|entry| entry.strip_prefix("docs/plans/"))
+        {
             let bytes = name.as_bytes();
             if bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_digit) {
                 reserved.insert(name[..4].to_owned());
@@ -3167,9 +3171,12 @@ impl AuthoringCoordinator {
         if !violations.is_empty() {
             return Err(invalid(render_blueprint_violations(&violations)));
         }
-        let files = authored
-            .render_files()
-            .map_err(|error| invalid(format!("generated blueprint is invalid: {error}")))?;
+        let files = authored.render_files().map_err(|error| {
+            invalid(format!(
+                "{}: {error}",
+                crate::api::BLUEPRINT_FAULT_PREFIXES[0]
+            ))
+        })?;
 
         let state_root = crate::checkpoint::external_state_root(root)
             .map_err(|error| invalid(error.to_string()))?;
@@ -3257,6 +3264,23 @@ impl AuthoringCoordinator {
     }
 }
 
+/// Read the root roll-up board, standing in an empty one when it is absent.
+///
+/// Registration is the only thing that writes this board, and it writes it to
+/// the plan ref rather than to the base branch — so the first plan a project
+/// ever registers necessarily runs against a base that has no board. Failing
+/// there made adopting Makina impossible: every generated plan was rejected
+/// with `path: does not exist in the immutable Git tree`, which named neither
+/// the file nor anything the author could act on.
+fn read_root_board(source: &dyn crate::plan::PlanFileSource) -> Result<String, ApiError> {
+    let invalid = |reason: String| ApiError::InvalidCommand { reason };
+    let bytes = match source.read_file(Path::new("docs/plans/STATUS.md")) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(crate::plan_status::EMPTY_ROOT_BOARD.to_owned()),
+    };
+    String::from_utf8(bytes).map_err(|_| invalid("root status board is not UTF-8".into()))
+}
+
 /// Longest list of faults reported in one rejection.
 ///
 /// The rejection is handed back to the planner as the correction to apply, so
@@ -3282,12 +3306,12 @@ fn render_violations(headline: &str, violations: &[String], empty: &str) -> Stri
 }
 
 /// Render everything wrong with a blueprint before it could be rendered at all.
+///
+/// The headline is [`crate::api::BLUEPRINT_FAULT_PREFIXES`]`[0]`, which is what
+/// marks this as the planner's to fix rather than the operator's.
 fn render_blueprint_violations(violations: &[String]) -> String {
-    render_violations(
-        "generated blueprint is invalid",
-        violations,
-        "generated blueprint is invalid",
-    )
+    let headline = crate::api::BLUEPRINT_FAULT_PREFIXES[0];
+    render_violations(headline, violations, headline)
 }
 
 /// Render bundle diagnostics for the reader who has to act on them.
@@ -3313,10 +3337,11 @@ fn render_generation_diagnostics(diagnostics: &[crate::plan::PlanValidationDiagn
             )
         })
         .collect::<Vec<_>>();
+    let headline = crate::api::BLUEPRINT_FAULT_PREFIXES[1];
     render_violations(
-        "generated bundle validation failed",
+        headline,
         &rendered,
-        "generated bundle validation failed without a diagnostic",
+        &format!("{headline} without a diagnostic"),
     )
 }
 
@@ -3561,16 +3586,11 @@ impl CoreApi {
             prepared_plan.status.source.body = status.clone();
             let base_source = crate::plan::GitTreePlanFileSource::new(root, &current_base)
                 .map_err(|e| invalid(e.to_string()))?;
-            use crate::plan::PlanFileSource as _;
-            let board = String::from_utf8(
-                base_source
-                    .read_file(Path::new("docs/plans/STATUS.md"))
-                    .map_err(|e| invalid(e.to_string()))?,
-            )
-            .map_err(|_| invalid("root board is not UTF-8".into()))?;
             // Read from the current base, which may never have carried this
-            // plan's row: registration can only add a missing row to the plan
-            // ref, never to base.
+            // plan's row — nor the board itself, for a project whose first plan
+            // this is: registration can only add either to the plan ref, never
+            // to base.
+            let board = read_root_board(&base_source)?;
             let board = crate::plan_status::upsert_root_row(&board, &prepared_plan)
                 .map_err(|e| invalid(e.to_string()))?;
             let prepared = crate::landing::commit_finalization_prepared(
@@ -3899,18 +3919,17 @@ impl AuthoringCoordinator {
                 "{plan_ref} already contains divergent evidence"
             )));
         }
+        // Pathspec form, so an absent plans directory reads as "no plans
+        // reserved" instead of failing the registration outright.
         let listed = git(
             root,
-            &[
-                "ls-tree",
-                "--name-only",
-                &format!("{expected_base_oid}:docs/plans"),
-            ],
+            &["ls-tree", "--name-only", &expected_base_oid, "docs/plans/"],
         )
         .await?;
         let mut reservations = PlanReservations::default();
         for name in listed
             .lines()
+            .filter_map(|entry| entry.strip_prefix("docs/plans/"))
             .filter(|name| name.len() >= 4 && name.as_bytes()[..4].iter().all(u8::is_ascii_digit))
         {
             reservations
@@ -4015,12 +4034,7 @@ impl AuthoringCoordinator {
         plan.status.source.body = status;
         let base_source = crate::plan::GitTreePlanFileSource::new(root, &expected_base_oid)
             .map_err(|e| invalid(e.to_string()))?;
-        let board = String::from_utf8(
-            base_source
-                .read_file(Path::new("docs/plans/STATUS.md"))
-                .map_err(|e| invalid(e.to_string()))?,
-        )
-        .map_err(|_| invalid("root status board is not UTF-8"))?;
+        let board = read_root_board(&base_source)?;
         let board = crate::plan_status::register_root_row(&board, &plan)
             .map_err(|e| invalid(e.to_string()))?;
         tokio::fs::write(workspace.path.join("docs/plans/STATUS.md"), board)
@@ -4642,11 +4656,7 @@ impl AuthoringCoordinator {
         };
         let status = crate::plan_status::render_plan_status(&base_plan, &transition)
             .map_err(|e| invalid(e.to_string()))?;
-        let root_board = source
-            .read_file(Path::new("docs/plans/STATUS.md"))
-            .map_err(|e| invalid(e.to_string()))?;
-        let root_board =
-            String::from_utf8(root_board).map_err(|_| invalid("root status board is not UTF-8"))?;
+        let root_board = read_root_board(&source)?;
         let root_board = crate::plan_status::register_root_row(&root_board, &base_plan)
             .map_err(|e| invalid(e.to_string()))?;
         tokio::fs::write(
@@ -7395,6 +7405,53 @@ mod tests {
         let bounded = render_blueprint_violations(&many);
         assert!(bounded.contains("and 12 more"), "{bounded}");
         assert!(!bounded.contains("fault 8"), "{bounded}");
+    }
+
+    /// The board is Makina's own artifact, so the tree it is read from may
+    /// simply not have one yet — the state of every project's first plan, for
+    /// both registration and the finalization overlay.
+    #[test]
+    fn an_absent_root_board_reads_as_an_empty_one() {
+        fn commit(root: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let root = repo.path();
+        commit(root, &["init", "-q", "-b", "develop"]);
+        commit(root, &["config", "user.email", "board@example.invalid"]);
+        commit(root, &["config", "user.name", "Board Test"]);
+        std::fs::write(root.join("README.md"), "hi\n").expect("a tracked file");
+        commit(root, &["add", "."]);
+        commit(root, &["commit", "-qm", "base"]);
+
+        let source = crate::plan::GitTreePlanFileSource::new(root, "develop")
+            .expect("a tree source over the base");
+        assert_eq!(
+            read_root_board(&source).expect("an absent board is not an error"),
+            crate::plan_status::EMPTY_ROOT_BOARD,
+        );
+
+        // An existing board is returned untouched.
+        std::fs::create_dir_all(root.join("docs/plans")).expect("the plans directory");
+        std::fs::write(root.join("docs/plans/STATUS.md"), "# Board\n").expect("a board");
+        commit(root, &["add", "."]);
+        commit(root, &["commit", "-qm", "board"]);
+        let source = crate::plan::GitTreePlanFileSource::new(root, "develop")
+            .expect("a tree source over the base");
+        assert_eq!(
+            read_root_board(&source).expect("an existing board reads back"),
+            "# Board\n",
+        );
     }
 
     /// Build a `Config` with NO gates (the gate loop is a no-op) so the develop

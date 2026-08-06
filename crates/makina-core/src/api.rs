@@ -743,6 +743,21 @@ pub enum ApiError {
     },
 }
 
+/// Prefixes marking a plan-generation failure as a fault in the submitted
+/// blueprint, rather than in the repository it was submitted against.
+///
+/// Generation is driven by an agent that can revise a blueprint and can do
+/// nothing about a missing lease, a moved base, or a reserved plan number.
+/// Handing it an environment failure to "fix" burns its whole correction
+/// budget and then reports that the *planner* failed. `InvalidCommand` carries
+/// only a string across that boundary, so these prefixes are the contract —
+/// `render_blueprint_violations` and `render_generation_diagnostics` are their
+/// only producers.
+pub const BLUEPRINT_FAULT_PREFIXES: [&str; 2] = [
+    "generated blueprint is invalid",
+    "generated bundle validation failed",
+];
+
 // ── Events ────────────────────────────────────────────────────────────────────
 
 /// The role of the agent involved in an exchange.
