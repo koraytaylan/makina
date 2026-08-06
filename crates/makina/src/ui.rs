@@ -4431,10 +4431,13 @@ fn render_plan_authoring(
     frame: &mut Frame,
     area: Rect,
 ) {
+    // A top rule in the neutral pane colour, exactly like every other tab pane
+    // (`render_task_detail_pane`, the task-entry placeholder). A full accent box
+    // read as an alert rather than as content.
     let block = Block::default()
         .title(" Create plan ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent)))
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Info)))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -4522,10 +4525,25 @@ fn render_plan_authoring(
         chunks[2],
     );
 
+    // Footer: key hints on the left, the model that will actually answer on the
+    // right. Authoring is a planner-role conversation, so it is the planner's
+    // assignment that matters here — reading it off Settings is indirection the
+    // operator should not have to perform mid-draft.
+    let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+    let footer = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(app.planner_model_label().chars().count() as u16),
+    ])
+    .split(chunks[3]);
     frame.render_widget(
-        Paragraph::new("Enter submit · Shift+Enter newline · Esc close")
-            .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))),
-        chunks[3],
+        Paragraph::new("Enter submit · Ctrl+J newline · Esc close").style(dim),
+        footer[0],
+    );
+    frame.render_widget(
+        Paragraph::new(app.planner_model_label())
+            .style(dim)
+            .alignment(Alignment::Right),
+        footer[1],
     );
 }
 
@@ -4613,15 +4631,32 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
             settings.developer_model.clone(),
             crate::app::SettingsField::DeveloperModel,
         ),
+        // Effort follows its model: the same model runs at several thought
+        // levels, so the pair reads as one choice about one role.
+        (
+            "Developer effort",
+            settings.developer_effort.clone(),
+            crate::app::SettingsField::DeveloperEffort,
+        ),
         (
             "Reviewer model",
             settings.reviewer_model.clone(),
             crate::app::SettingsField::ReviewerModel,
         ),
         (
+            "Reviewer effort",
+            settings.reviewer_effort.clone(),
+            crate::app::SettingsField::ReviewerEffort,
+        ),
+        (
             "Planner model",
             settings.planner_model.clone(),
             crate::app::SettingsField::PlannerModel,
+        ),
+        (
+            "Planner effort",
+            settings.planner_effort.clone(),
+            crate::app::SettingsField::PlannerEffort,
         ),
     ];
 
@@ -4666,7 +4701,7 @@ fn render_settings(app: &App, settings: &crate::app::Settings, frame: &mut Frame
 
     // Footer with hints
     let footer = Paragraph::new(Line::from(vec![Span::styled(
-        "↑/↓ field · 0-9/a-z edit · ←/→ option · Enter pick model · Esc save & close",
+        "↑/↓ field · 0-9/a-z edit · ←/→ option · Enter pick · Esc save & close",
         Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
     )]));
     frame.render_widget(footer, footer_area);
@@ -4682,6 +4717,9 @@ fn render_model_picker(app: &App, picker: &crate::app::ModelPicker, frame: &mut 
         crate::app::SettingsField::DeveloperModel => "Developer Model",
         crate::app::SettingsField::ReviewerModel => "Reviewer Model",
         crate::app::SettingsField::PlannerModel => "Planner Model",
+        crate::app::SettingsField::DeveloperEffort => "Developer Effort",
+        crate::app::SettingsField::ReviewerEffort => "Reviewer Effort",
+        crate::app::SettingsField::PlannerEffort => "Planner Effort",
         _ => "Model",
     };
     let title = format!(" Select {field_label} — type to filter ");
@@ -5589,8 +5627,55 @@ mod tests {
             "the tab bar must carry a chip for the authoring tab"
         );
         assert!(
-            screen.contains("Shift+Enter newline"),
-            "the composer must advertise how to type a newline"
+            screen.contains("Ctrl+J newline"),
+            "the composer must advertise a newline chord that actually works"
+        );
+        assert!(
+            screen.contains("provider default"),
+            "the footer must name the model the planner will use"
+        );
+    }
+
+    /// The pane wears the neutral rule every other tab pane uses, not the
+    /// accent colour, which read as an alert rather than as content.
+    #[test]
+    fn plan_authoring_pane_has_no_accent_border() {
+        let app = authoring_app("");
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
+        let buffer = terminal.backend().buffer().clone();
+        // The tab chip legitimately uses the accent as a background; only
+        // foreground accent on box-drawing glyphs would be the old border.
+        let bordered_in_accent = buffer
+            .content()
+            .iter()
+            .any(|cell| cell.fg == accent && matches!(cell.symbol(), "│" | "┌" | "└" | "┐" | "┘"));
+        assert!(
+            !bordered_in_accent,
+            "the authoring pane must not draw an accent-coloured box"
+        );
+    }
+
+    /// The footer reports the planner's model and effort, so the operator can
+    /// see what will answer without opening Settings.
+    #[test]
+    fn the_footer_reports_the_planner_model_and_effort() {
+        let mut app = authoring_app("");
+        app.roles.planner = Some(makina_core::config::RoleAssignment {
+            provider: "default".into(),
+            model: Some("glm-5.2".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        });
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("glm-5.2 · high"),
+            "the footer must show the model and its effort"
         );
     }
 
@@ -10986,7 +11071,11 @@ mod tests {
             developer_model: String::new(),
             reviewer_model: String::new(),
             planner_model: String::new(),
+            developer_effort: String::new(),
+            reviewer_effort: String::new(),
+            planner_effort: String::new(),
             discovered_models: vec![],
+            discovered_efforts: vec![],
             focused: crate::app::SettingsField::GateIterations,
             error: None,
         });

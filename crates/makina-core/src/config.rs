@@ -301,6 +301,73 @@ fn apply_role_model(
     assignment.model = Some(model.to_string());
 }
 
+/// Per-role effort (`thought_level`) selections, mirroring [`RoleModels`].
+///
+/// A model and its effort are separate advertised options — the same model can
+/// be run at several thought levels — so they are chosen, stored, and applied
+/// independently rather than being folded into one identifier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleEfforts {
+    /// Effort chosen for the Developer role.
+    pub developer: Option<String>,
+    /// Effort chosen for the Reviewer role.
+    pub reviewer: Option<String>,
+    /// Effort chosen for the Planner role.
+    pub planner: Option<String>,
+}
+
+impl RoleEfforts {
+    /// True when no role has a selection — nothing to persist.
+    pub fn is_empty(&self) -> bool {
+        self.developer.is_none() && self.reviewer.is_none() && self.planner.is_none()
+    }
+}
+
+impl RolesConfig {
+    /// Apply per-role effort selections, leaving unselected roles untouched.
+    pub fn apply_efforts(&mut self, efforts: &RoleEfforts, provider_defaults: &RolesConfig) {
+        apply_role_effort(
+            &mut self.developer,
+            efforts.developer.as_deref(),
+            provider_defaults.developer.as_ref(),
+        );
+        apply_role_effort(
+            &mut self.reviewer,
+            efforts.reviewer.as_deref(),
+            provider_defaults.reviewer.as_ref(),
+        );
+        apply_role_effort(
+            &mut self.planner,
+            efforts.planner.as_deref(),
+            provider_defaults.planner.as_ref(),
+        );
+    }
+}
+
+/// Set one role's effort, preserving (or backfilling) its provider name.
+///
+/// An empty selection clears the stored effort, which is how an operator
+/// returns a role to the provider's own default; `None` means "not chosen in
+/// this edit" and leaves the stored value alone.
+fn apply_role_effort(
+    slot: &mut Option<RoleAssignment>,
+    effort: Option<&str>,
+    provider_default: Option<&RoleAssignment>,
+) {
+    let Some(effort) = effort else {
+        return;
+    };
+    let assignment = slot.get_or_insert_with(RoleAssignment::default);
+    if assignment.provider.is_empty() {
+        assignment.provider = provider_default
+            .map(|a| a.provider.as_str())
+            .filter(|p| !p.is_empty())
+            .unwrap_or("default")
+            .to_string();
+    }
+    assignment.effort = (!effort.is_empty()).then(|| effort.to_string());
+}
+
 // ── Planner config ────────────────────────────────────────────────────────────
 
 /// Planner model and call mechanism configuration.
@@ -2733,6 +2800,66 @@ mod tests {
 
     /// With no matching default, a created assignment falls back to the
     /// `"default"` provider name that `resolve` synthesizes.
+    #[test]
+    fn apply_efforts_sets_clears_and_leaves_roles_alone() {
+        let mut roles = RolesConfig {
+            developer: Some(RoleAssignment {
+                provider: "grok".into(),
+                effort: Some("low".into()),
+                ..Default::default()
+            }),
+            reviewer: Some(RoleAssignment {
+                effort: Some("keep-me".into()),
+                ..Default::default()
+            }),
+            planner: None,
+        };
+
+        roles.apply_efforts(
+            &RoleEfforts {
+                // Set one, clear one by selecting the empty string, and leave
+                // the reviewer untouched by not selecting at all.
+                developer: Some("high".into()),
+                reviewer: None,
+                planner: Some(String::new()),
+            },
+            &RolesConfig::default(),
+        );
+
+        assert_eq!(
+            roles.developer.as_ref().unwrap().effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            roles.reviewer.as_ref().unwrap().effort.as_deref(),
+            Some("keep-me"),
+            "an unselected role must keep its stored effort",
+        );
+        assert_eq!(
+            roles.planner.as_ref().unwrap().effort,
+            None,
+            "an empty selection returns the role to the provider default",
+        );
+        assert_eq!(
+            roles.developer.as_ref().unwrap().provider,
+            "grok",
+            "applying an effort must not disturb the provider",
+        );
+    }
+
+    #[test]
+    fn apply_efforts_backfills_the_provider_name() {
+        let mut roles = RolesConfig::default();
+        roles.apply_efforts(
+            &RoleEfforts {
+                planner: Some("high".into()),
+                ..Default::default()
+            },
+            &RolesConfig::default(),
+        );
+        assert_eq!(roles.planner.as_ref().unwrap().provider, "default");
+    }
+
     #[test]
     fn apply_models_falls_back_to_the_default_provider_name() {
         let mut roles = RolesConfig::default();

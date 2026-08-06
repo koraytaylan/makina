@@ -28,16 +28,45 @@ use ratatui::crossterm::{
     cursor,
     event::{DisableBracketedPaste, EnableBracketedPaste},
     event::{DisableMouseCapture, EnableMouseCapture},
+    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::prelude::CrosstermBackend;
+
+/// Ask the terminal to report modified keys unambiguously, when it can.
+///
+/// Without the kitty keyboard protocol a terminal sends a bare CR for
+/// Shift+Enter — byte-identical to Enter — so no application can tell the two
+/// apart. `DISAMBIGUATE_ESCAPE_CODES` is the minimal flag that makes them
+/// distinguishable; it is deliberately the only one requested, since the
+/// report-all-keys flags change how ordinary text arrives.
+///
+/// Best-effort by design: terminals that do not support it keep their existing
+/// behaviour, and every newline chord has a plain-ASCII fallback (Ctrl+J) that
+/// needs none of this.
+fn push_keyboard_enhancements(out: &mut Stdout) -> bool {
+    if !matches!(supports_keyboard_enhancement(), Ok(true)) {
+        return false;
+    }
+    execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
+}
 
 // ── Tui wrapper ───────────────────────────────────────────────────────────────
 
 /// Owns the ratatui `Terminal` handle and manages the terminal lifecycle.
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// Whether `init`/`reinit` successfully pushed keyboard enhancement flags,
+    /// so `restore` pops exactly what it pushed and nothing else.
+    keyboard_enhanced: bool,
 }
 
 impl Tui {
@@ -68,9 +97,13 @@ impl Tui {
             EnableBracketedPaste,
             cursor::Hide
         )?;
+        let keyboard_enhanced = push_keyboard_enhancements(&mut stdout);
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            keyboard_enhanced,
+        })
     }
 
     /// Restore the terminal to its state before [`Tui::init`] was called.
@@ -83,6 +116,10 @@ impl Tui {
     /// and [`Drop`] as safety nets.
     pub fn restore(&mut self) {
         // Best-effort: ignore errors during teardown.
+        if self.keyboard_enhanced {
+            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+            self.keyboard_enhanced = false;
+        }
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
@@ -114,6 +151,7 @@ impl Tui {
             EnableBracketedPaste,
             cursor::Hide
         )?;
+        self.keyboard_enhanced = push_keyboard_enhancements(&mut io::stdout());
         // Force a full repaint so no stale pager content bleeds through.
         let _ = self.terminal.clear();
         Ok(())
@@ -244,6 +282,12 @@ pub(crate) fn install_panic_hook_for_test()
 /// own the render loop's [`Tui`], so they need a standalone restore that leaves
 /// the alternate screen, disables raw mode, and shows the cursor.
 pub fn restore_terminal() {
+    // Mirrors `Tui::restore` for callers that do not own the `Tui` (the panic
+    // hook, external exits). Gated on the same capability check that decided
+    // whether to push, so this never pops a level it did not add.
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),

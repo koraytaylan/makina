@@ -672,6 +672,32 @@ pub enum SettingsField {
     DeveloperModel,
     ReviewerModel,
     PlannerModel,
+    DeveloperEffort,
+    ReviewerEffort,
+    PlannerEffort,
+}
+
+impl SettingsField {
+    /// Whether this field selects an effort (`thought_level`) rather than a model.
+    pub fn is_effort(self) -> bool {
+        matches!(
+            self,
+            SettingsField::DeveloperEffort
+                | SettingsField::ReviewerEffort
+                | SettingsField::PlannerEffort
+        )
+    }
+
+    /// Whether this field is chosen from the searchable picker at all.
+    pub fn is_pickable(self) -> bool {
+        self.is_effort()
+            || matches!(
+                self,
+                SettingsField::DeveloperModel
+                    | SettingsField::ReviewerModel
+                    | SettingsField::PlannerModel
+            )
+    }
 }
 
 /// State for the settings modal: an editable text buffer per numeric field,
@@ -693,6 +719,14 @@ pub struct Settings {
     pub reviewer_model: String,
     /// Planner model text buffer.
     pub planner_model: String,
+    /// Developer effort (`thought_level`) text buffer.
+    pub developer_effort: String,
+    /// Reviewer effort text buffer.
+    pub reviewer_effort: String,
+    /// Planner effort text buffer.
+    pub planner_effort: String,
+    /// Effort values advertised by the probed agent.
+    pub discovered_efforts: Vec<String>,
     /// Models discovered by probing the agent (shown as hints, not auto-selected).
     pub discovered_models: Vec<String>,
     pub focused: SettingsField,
@@ -1322,6 +1356,9 @@ pub enum AppEvent {
     /// Each entry is "agent_name/provider_name/model_name".
     ModelsDiscovered {
         models: Vec<String>,
+        /// Advertised effort (`thought_level`) values, unqualified: they name a
+        /// level the chosen model runs at, not a model of their own.
+        efforts: Vec<String>,
     },
     /// Open the searchable model picker for the focused Settings field.
     OpenModelPicker,
@@ -2833,6 +2870,56 @@ impl App {
             developer: canonical_model_name(&settings.developer_model, &agents),
             reviewer: canonical_model_name(&settings.reviewer_model, &agents),
             planner: canonical_model_name(&settings.planner_model, &agents),
+        }
+    }
+
+    /// The per-role efforts currently entered in the Settings modal.
+    ///
+    /// Unlike a model, an empty buffer here is meaningful: it is how an
+    /// operator returns a role to the provider's own default. It is therefore
+    /// reported as `Some("")` — a deliberate clear — whenever the role has a
+    /// stored effort to clear, and `None` only when there is nothing to change.
+    pub fn selected_role_efforts(&self) -> makina_core::config::RoleEfforts {
+        let Some(settings) = self.settings.as_ref() else {
+            return makina_core::config::RoleEfforts::default();
+        };
+        let choice = |buffer: &str, stored: Option<&makina_core::config::RoleAssignment>| {
+            let buffer = buffer.trim();
+            if !buffer.is_empty() {
+                return Some(buffer.to_owned());
+            }
+            let had_effort = stored
+                .and_then(|role| role.effort.as_deref())
+                .is_some_and(|effort| !effort.is_empty());
+            had_effort.then(String::new)
+        };
+        makina_core::config::RoleEfforts {
+            developer: choice(&settings.developer_effort, self.roles.developer.as_ref()),
+            reviewer: choice(&settings.reviewer_effort, self.roles.reviewer.as_ref()),
+            planner: choice(&settings.planner_effort, self.roles.planner.as_ref()),
+        }
+    }
+
+    /// The model (and effort, when set) the planner role will actually use.
+    ///
+    /// Shown on the authoring tab so the operator can see which model is about
+    /// to answer without opening Settings to find out. Falls back to the
+    /// provider's default when no model is pinned, because that is what will
+    /// happen — reporting nothing would imply the choice is unset rather than
+    /// delegated.
+    pub fn planner_model_label(&self) -> String {
+        let assignment = self.roles.planner.as_ref();
+        let model = assignment
+            .and_then(|role| role.model.as_deref())
+            .filter(|model| !model.is_empty());
+        let effort = assignment
+            .and_then(|role| role.effort.as_deref())
+            .filter(|effort| !effort.is_empty());
+        match (model, effort) {
+            (Some(model), Some(effort)) => format!("{model} · {effort}"),
+            (Some(model), None) => model.to_owned(),
+            (None, Some(effort)) => format!("provider default · {effort}"),
+            (None, None) => "provider default".to_owned(),
         }
     }
 
@@ -4906,6 +4993,11 @@ impl App {
                         .and_then(|r| r.model.clone())
                         .unwrap_or_default()
                 };
+                let effort_of = |role: &Option<makina_core::config::RoleAssignment>| {
+                    role.as_ref()
+                        .and_then(|r| r.effort.clone())
+                        .unwrap_or_default()
+                };
                 self.settings = Some(Settings {
                     project_root,
                     gate_iterations: caps.gate_iterations.to_string(),
@@ -4917,7 +5009,11 @@ impl App {
                     developer_model: model_of(&roles.developer),
                     reviewer_model: model_of(&roles.reviewer),
                     planner_model: model_of(&roles.planner),
+                    developer_effort: effort_of(&roles.developer),
+                    reviewer_effort: effort_of(&roles.reviewer),
+                    planner_effort: effort_of(&roles.planner),
                     discovered_models: vec![],
+                    discovered_efforts: vec![],
                     focused: SettingsField::GateIterations,
                     error,
                 });
@@ -4929,15 +5025,18 @@ impl App {
             AppEvent::SettingsUp => {
                 if let Some(settings) = &mut self.settings {
                     settings.focused = match settings.focused {
-                        SettingsField::GateIterations => SettingsField::PlannerModel,
+                        SettingsField::GateIterations => SettingsField::PlannerEffort,
                         SettingsField::ReviewerIterations => SettingsField::GateIterations,
                         SettingsField::WallClockSecs => SettingsField::ReviewerIterations,
                         SettingsField::IdleSecs => SettingsField::WallClockSecs,
                         SettingsField::Concurrency => SettingsField::IdleSecs,
                         SettingsField::FinalMerge => SettingsField::Concurrency,
                         SettingsField::DeveloperModel => SettingsField::FinalMerge,
-                        SettingsField::ReviewerModel => SettingsField::DeveloperModel,
-                        SettingsField::PlannerModel => SettingsField::ReviewerModel,
+                        SettingsField::DeveloperEffort => SettingsField::DeveloperModel,
+                        SettingsField::ReviewerModel => SettingsField::DeveloperEffort,
+                        SettingsField::ReviewerEffort => SettingsField::ReviewerModel,
+                        SettingsField::PlannerModel => SettingsField::ReviewerEffort,
+                        SettingsField::PlannerEffort => SettingsField::PlannerModel,
                     };
                 }
                 true
@@ -4952,9 +5051,12 @@ impl App {
                         SettingsField::IdleSecs => SettingsField::Concurrency,
                         SettingsField::Concurrency => SettingsField::FinalMerge,
                         SettingsField::FinalMerge => SettingsField::DeveloperModel,
-                        SettingsField::DeveloperModel => SettingsField::ReviewerModel,
-                        SettingsField::ReviewerModel => SettingsField::PlannerModel,
-                        SettingsField::PlannerModel => SettingsField::GateIterations,
+                        SettingsField::DeveloperModel => SettingsField::DeveloperEffort,
+                        SettingsField::DeveloperEffort => SettingsField::ReviewerModel,
+                        SettingsField::ReviewerModel => SettingsField::ReviewerEffort,
+                        SettingsField::ReviewerEffort => SettingsField::PlannerModel,
+                        SettingsField::PlannerModel => SettingsField::PlannerEffort,
+                        SettingsField::PlannerEffort => SettingsField::GateIterations,
                     };
                 }
                 true
@@ -5074,6 +5176,9 @@ impl App {
                             SettingsField::DeveloperModel => settings.developer_model.push(c),
                             SettingsField::ReviewerModel => settings.reviewer_model.push(c),
                             SettingsField::PlannerModel => settings.planner_model.push(c),
+                            SettingsField::DeveloperEffort => settings.developer_effort.push(c),
+                            SettingsField::ReviewerEffort => settings.reviewer_effort.push(c),
+                            SettingsField::PlannerEffort => settings.planner_effort.push(c),
                             _ => {}
                         }
                     }
@@ -5108,6 +5213,15 @@ impl App {
                         }
                         SettingsField::PlannerModel => {
                             settings.planner_model.pop();
+                        }
+                        SettingsField::DeveloperEffort => {
+                            settings.developer_effort.pop();
+                        }
+                        SettingsField::ReviewerEffort => {
+                            settings.reviewer_effort.pop();
+                        }
+                        SettingsField::PlannerEffort => {
+                            settings.planner_effort.pop();
                         }
                     }
                     // Re-validate the focused field inline.
@@ -5176,16 +5290,16 @@ impl App {
                                     Some("concurrency must be a positive integer".to_string());
                             }
                         }
-                        SettingsField::FinalMerge => {}
-                        SettingsField::DeveloperModel => {
-                            settings.developer_model.pop();
-                        }
-                        SettingsField::ReviewerModel => {
-                            settings.reviewer_model.pop();
-                        }
-                        SettingsField::PlannerModel => {
-                            settings.planner_model.pop();
-                        }
+                        // Free-text and picker fields have nothing to
+                        // re-validate. They previously popped a second time
+                        // here, so one Backspace deleted two characters.
+                        SettingsField::FinalMerge
+                        | SettingsField::DeveloperModel
+                        | SettingsField::ReviewerModel
+                        | SettingsField::PlannerModel
+                        | SettingsField::DeveloperEffort
+                        | SettingsField::ReviewerEffort
+                        | SettingsField::PlannerEffort => {}
                     }
                 }
                 true
@@ -5211,11 +5325,17 @@ impl App {
                 true
             }
 
-            AppEvent::ModelsDiscovered { models } => {
-                if !models.is_empty()
-                    && let Some(settings) = &mut self.settings
-                {
-                    settings.discovered_models = models.clone();
+            AppEvent::ModelsDiscovered { models, efforts } => {
+                if let Some(settings) = &mut self.settings {
+                    // Each list is replaced only when the probe actually found
+                    // something, so an agent that advertises models but no
+                    // thought levels does not erase a previous discovery.
+                    if !models.is_empty() {
+                        settings.discovered_models = models.clone();
+                    }
+                    if !efforts.is_empty() {
+                        settings.discovered_efforts = efforts.clone();
+                    }
                 }
                 true
             }
@@ -5223,15 +5343,17 @@ impl App {
             AppEvent::OpenModelPicker => {
                 if let Some(settings) = &self.settings {
                     let target_field = settings.focused;
-                    // Only open for model fields.
-                    if matches!(
-                        target_field,
-                        SettingsField::DeveloperModel
-                            | SettingsField::ReviewerModel
-                            | SettingsField::PlannerModel
-                    ) {
+                    // The picker serves both kinds of choice; which list it
+                    // offers follows the focused field, so an effort field
+                    // lists thought levels rather than models.
+                    if target_field.is_pickable() {
+                        let all_models = if target_field.is_effort() {
+                            settings.discovered_efforts.clone()
+                        } else {
+                            settings.discovered_models.clone()
+                        };
                         self.model_picker = Some(ModelPicker {
-                            all_models: settings.discovered_models.clone(),
+                            all_models,
                             filter: String::new(),
                             selected: 0,
                             target_field,
@@ -5263,6 +5385,15 @@ impl App {
                             }
                             SettingsField::PlannerModel => {
                                 settings.planner_model = model.to_string()
+                            }
+                            SettingsField::DeveloperEffort => {
+                                settings.developer_effort = model.to_string()
+                            }
+                            SettingsField::ReviewerEffort => {
+                                settings.reviewer_effort = model.to_string()
+                            }
+                            SettingsField::PlannerEffort => {
+                                settings.planner_effort = model.to_string()
                             }
                             _ => {}
                         }
@@ -10669,11 +10800,25 @@ mod tests {
             SettingsField::DeveloperModel
         );
 
+        // Down again -> DeveloperEffort: each role's effort follows its model.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::DeveloperEffort
+        );
+
         // Down again -> ReviewerModel.
         app.update(AppEvent::SettingsDown);
         assert_eq!(
             app.settings.as_ref().unwrap().focused,
             SettingsField::ReviewerModel
+        );
+
+        // Down again -> ReviewerEffort.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::ReviewerEffort
         );
 
         // Down again -> PlannerModel.
@@ -10683,6 +10828,13 @@ mod tests {
             SettingsField::PlannerModel
         );
 
+        // Down again -> PlannerEffort.
+        app.update(AppEvent::SettingsDown);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::PlannerEffort
+        );
+
         // Down again -> wraps to GateIterations.
         app.update(AppEvent::SettingsDown);
         assert_eq!(
@@ -10690,7 +10842,12 @@ mod tests {
             SettingsField::GateIterations
         );
 
-        // Up should go backward.
+        // Up should go backward, mirroring the same order.
+        app.update(AppEvent::SettingsUp);
+        assert_eq!(
+            app.settings.as_ref().unwrap().focused,
+            SettingsField::PlannerEffort
+        );
         app.update(AppEvent::SettingsUp);
         assert_eq!(
             app.settings.as_ref().unwrap().focused,
@@ -10699,8 +10856,113 @@ mod tests {
         app.update(AppEvent::SettingsUp);
         assert_eq!(
             app.settings.as_ref().unwrap().focused,
-            SettingsField::ReviewerModel
+            SettingsField::ReviewerEffort
         );
+    }
+
+    /// One Backspace deletes one character.
+    ///
+    /// The re-validation pass used to `pop()` the model buffers a second time,
+    /// so every Backspace on a model field removed two characters.
+    #[test]
+    fn backspace_on_a_model_field_deletes_exactly_one_character() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenSettings);
+        app.settings.as_mut().unwrap().focused = SettingsField::PlannerModel;
+        app.settings.as_mut().unwrap().planner_model = "glm-5.2".to_string();
+
+        app.update(AppEvent::SettingsBackspace);
+
+        assert_eq!(app.settings.as_ref().unwrap().planner_model, "glm-5.");
+    }
+
+    /// The picker offers thought levels for an effort field and models for a
+    /// model field — the same overlay, sourced from the focused field.
+    #[test]
+    fn the_picker_offers_efforts_for_an_effort_field() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenSettings);
+        {
+            let settings = app.settings.as_mut().unwrap();
+            settings.discovered_models = vec!["agent/glm-5.2".into()];
+            settings.discovered_efforts = vec!["low".into(), "high".into()];
+            settings.focused = SettingsField::PlannerEffort;
+        }
+        app.update(AppEvent::OpenModelPicker);
+
+        assert_eq!(
+            app.model_picker.as_ref().map(|p| p.all_models.clone()),
+            Some(vec!["low".to_string(), "high".to_string()]),
+            "an effort field must list thought levels, not models",
+        );
+
+        app.update(AppEvent::CloseModelPicker);
+        app.settings.as_mut().unwrap().focused = SettingsField::PlannerModel;
+        app.update(AppEvent::OpenModelPicker);
+        assert_eq!(
+            app.model_picker.as_ref().map(|p| p.all_models.clone()),
+            Some(vec!["agent/glm-5.2".to_string()]),
+            "a model field must still list models",
+        );
+    }
+
+    /// Choosing an effort writes it into that role's buffer.
+    #[test]
+    fn selecting_an_effort_fills_the_focused_role_buffer() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenSettings);
+        {
+            let settings = app.settings.as_mut().unwrap();
+            settings.discovered_efforts = vec!["low".into(), "high".into()];
+            settings.focused = SettingsField::PlannerEffort;
+        }
+        app.update(AppEvent::OpenModelPicker);
+        app.update(AppEvent::ModelPickerDown);
+        app.update(AppEvent::ModelPickerSelect);
+
+        assert_eq!(app.settings.as_ref().unwrap().planner_effort, "high");
+    }
+
+    /// An emptied effort buffer is a deliberate clear, not "leave it alone" —
+    /// otherwise a role could never be returned to the provider's default.
+    #[test]
+    fn clearing_an_effort_buffer_is_reported_as_a_clear() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenSettings);
+        app.roles.planner = Some(makina_core::config::RoleAssignment {
+            provider: "default".into(),
+            effort: Some("high".into()),
+            ..Default::default()
+        });
+        app.settings.as_mut().unwrap().planner_effort = String::new();
+
+        assert_eq!(
+            app.selected_role_efforts().planner,
+            Some(String::new()),
+            "an emptied buffer over a stored effort must clear it",
+        );
+
+        // With nothing stored there is nothing to clear, so nothing to write.
+        app.roles.planner = None;
+        assert_eq!(app.selected_role_efforts().planner, None);
+    }
+
+    /// The authoring footer names the planner's model, falling back to the
+    /// provider default rather than implying no choice exists.
+    #[test]
+    fn planner_model_label_reports_model_effort_and_default() {
+        let mut app = make_app();
+        assert_eq!(app.planner_model_label(), "provider default");
+
+        app.roles.planner = Some(makina_core::config::RoleAssignment {
+            provider: "default".into(),
+            model: Some("glm-5.2".into()),
+            ..Default::default()
+        });
+        assert_eq!(app.planner_model_label(), "glm-5.2");
+
+        app.roles.planner.as_mut().unwrap().effort = Some("high".into());
+        assert_eq!(app.planner_model_label(), "glm-5.2 · high");
     }
 
     #[test]

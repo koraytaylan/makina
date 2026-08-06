@@ -816,22 +816,40 @@ async fn resolve_io(
                     };
                     match backend.spawn(config).await {
                         Ok(mut session) => {
-                            let models: Vec<String> = session
-                                .capabilities()
-                                .and_then(|c| {
-                                    c.config_options
-                                        .iter()
-                                        .find(|o| o.category.as_deref() == Some("model"))
-                                        .map(|o| {
-                                            o.options
-                                                .iter()
-                                                .map(|c| format!("{agent_name}/{}", c.value))
-                                                .collect()
-                                        })
-                                })
-                                .unwrap_or_default();
+                            let capabilities = session.capabilities();
+                            // Borrow the owned capabilities so both lookups can
+                            // read it; `and_then` on the Option itself would
+                            // consume it on the first call.
+                            let options_in = |category: &str| -> Vec<String> {
+                                capabilities
+                                    .as_ref()
+                                    .and_then(|c| {
+                                        c.config_options
+                                            .iter()
+                                            .find(|o| o.category.as_deref() == Some(category))
+                                            .map(|o| {
+                                                o.options
+                                                    .iter()
+                                                    .map(|choice| choice.value.clone())
+                                                    .collect()
+                                            })
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            // Effort (`thought_level`) is a separate advertised
+                            // option: the same model runs at several levels, so
+                            // it is discovered and chosen on its own rather than
+                            // being flattened into the model identifier. Values
+                            // stay unqualified — they name a level, not a model.
+                            let efforts = options_in("thought_level");
+                            let models: Vec<String> = options_in("model")
+                                .into_iter()
+                                .map(|value| format!("{agent_name}/{value}"))
+                                .collect();
                             let _ = session.terminate().await;
-                            let _ = tx.send(AppEvent::ModelsDiscovered { models }).await;
+                            let _ = tx
+                                .send(AppEvent::ModelsDiscovered { models, efforts })
+                                .await;
                         }
                         Err(e) => {
                             let _ = tx
@@ -1296,6 +1314,7 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
     // Model buffers are shared by both writes: an empty buffer yields `None`,
     // which every writer reads as "leave the stored model alone".
     let models = app.selected_role_models();
+    let efforts = app.selected_role_efforts();
     let provider_defaults = app.roles.clone();
 
     if let Err(e) = write_project_config(&project_root, |cfg| {
@@ -1310,6 +1329,7 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
             final_: valid.final_merge,
         });
         cfg.roles.apply_models(&models, &provider_defaults);
+        cfg.roles.apply_efforts(&efforts, &provider_defaults);
     })
     .await
     {
@@ -1325,7 +1345,7 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
     // Mirror the model selections into ~/.makina/config.toml, creating it when
     // absent, so they survive as the operator's last-selected models and seed
     // every other project that has no selection of its own.
-    let global_warning = commit_global_models(app, &models, &provider_defaults).await;
+    let global_warning = commit_global_models(app, &models, &efforts, &provider_defaults).await;
 
     let status = match app
         .api
@@ -1376,11 +1396,12 @@ async fn commit_settings(app: &mut App, close: bool) -> (AppEvent, Option<String
 async fn commit_global_models(
     app: &App,
     models: &makina_core::config::RoleModels,
+    efforts: &makina_core::config::RoleEfforts,
     provider_defaults: &makina_core::config::RolesConfig,
 ) -> Option<String> {
     use makina_core::config::write_global_config_at;
 
-    if models.is_empty() {
+    if models.is_empty() && efforts.is_empty() {
         return None;
     }
     // `config_paths.global` is `~/.makina/config.toml` resolved at startup, and
@@ -1391,6 +1412,7 @@ async fn commit_global_models(
     let providers = app.providers.clone();
     let result = write_global_config_at(global_path, |global| {
         global.roles.apply_models(models, provider_defaults);
+        global.roles.apply_efforts(efforts, provider_defaults);
         if creating {
             global.providers = providers;
         }
@@ -2334,11 +2356,23 @@ fn translate_key(
         // Last of the special keymaps because authoring is a tab, not a modal:
         // every real overlay above may open on top of it and keeps its keys.
         //
-        // Enter submits, so a newline needs its own chord. Terminals that
-        // report modifiers give us Shift/Alt+Enter; a bracketed paste carries
-        // its own newlines and never reaches here.
+        // Enter submits, so a newline needs its own chord.
+        //
+        // Ctrl+J is the one that always works: it is literally 0x0A, which
+        // every terminal delivers and crossterm parses as `Char('j')` with
+        // CONTROL. Shift+Enter cannot be seen at all unless the terminal speaks
+        // the kitty keyboard protocol — without it the terminal sends a bare CR
+        // that is indistinguishable from Enter, which is why advertising
+        // Shift+Enter alone left the composer with no working newline chord.
+        // `Tui::init` negotiates that protocol where it is available, so
+        // Shift/Alt+Enter are honoured too when the terminal reports them.
+        //
+        // A bracketed paste carries its own newlines and never reaches here.
         match key.code {
             KeyCode::Esc => AppEvent::ClosePlanAuthoring,
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                AppEvent::PlanAuthoringNewline
+            }
             KeyCode::Enter
                 if key
                     .modifiers
@@ -2348,7 +2382,7 @@ fn translate_key(
             }
             KeyCode::Enter => AppEvent::PlanAuthoringSubmit,
             KeyCode::Backspace => AppEvent::PlanAuthoringBackspace,
-            // Ctrl chords are reserved for global shortcuts, not composer text.
+            // Other Ctrl chords stay reserved for global shortcuts.
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 AppEvent::PlanAuthoringInput(c)
             }
@@ -3379,6 +3413,21 @@ mod tests {
                 &app
             ),
             AppEvent::Tick
+        ));
+    }
+
+    /// Ctrl+J is the newline chord that works without terminal negotiation.
+    ///
+    /// It is 0x0A, which every terminal sends and crossterm parses as
+    /// `Char('j')` with CONTROL. Shift+Enter is invisible unless the terminal
+    /// speaks the kitty keyboard protocol, so advertising it alone left the
+    /// composer with no working way to type a newline.
+    #[test]
+    fn ctrl_j_types_a_newline_without_terminal_negotiation() {
+        let app = test_app();
+        assert!(matches!(
+            translate_in_authoring(key_press(KeyCode::Char('j'), KeyModifiers::CONTROL), &app),
+            AppEvent::PlanAuthoringNewline
         ));
     }
 
