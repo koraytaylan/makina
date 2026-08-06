@@ -1110,6 +1110,194 @@ const PLAN_AUTHOR_SYSTEM_PROMPT: &str = r#"You are Makina's plan author. Turn th
 {"type":"plan","blueprint":{"slug":"kebab-case","title":"...","scope":"...","architecture":"...","initial_status":{"goal":"...","root_cause":"...","approach":"...","outcome":"","last_updated":"YYYY-MM-DD"},"workstreams":[{"id":"0001","title":"..."}],"tasks":[{"sequence":"01","id":"kebab-case","title":"...","workstream":"0001","kind":"task","depends_on":[],"touches":["path/**"],"gated":false,"body":"..."}]}}
 Do not write files or run commands. The host validates, renders, commits, and registers the blueprint."#;
 
+/// Restated on every follow-up turn.
+///
+/// The system prompt is applied once when the session opens, and an agent that
+/// answered correctly on turn one routinely drifts to prose by turn two when
+/// the only thing it receives is the operator's bare answer. Re-anchoring the
+/// contract with each answer is what keeps a multi-turn conversation parseable.
+const PLAN_AUTHOR_TURN_REMINDER: &str = r#"
+
+Reply with JSON only — no prose, no code fences — using exactly one of:
+{"type":"question","question":"..."}
+{"type":"plan","blueprint":{...}}"#;
+
+/// How many times a malformed reply is handed back to the planner to correct.
+///
+/// A formatting slip must not destroy the conversation: the operator would lose
+/// every answer given so far and have to start the draft over. Bounded so a
+/// model that cannot produce valid JSON fails instead of looping forever.
+const PLAN_AUTHOR_REPAIR_ATTEMPTS: usize = 2;
+
+/// What to do about a reply that could not be parsed.
+#[derive(Debug, PartialEq, Eq)]
+enum PlanAuthorRecovery {
+    /// Re-prompt the planner with the fault, keeping the conversation alive.
+    Retry(String),
+    /// Give up and report to the operator.
+    Fail(String),
+}
+
+/// Decide whether a malformed reply is recoverable.
+///
+/// Kept separate from the session loop so the policy is testable without a live
+/// backend — the loop it came from could only be exercised against a real agent,
+/// which is why this path had no tests and the defect went unnoticed.
+fn plan_author_recovery(reason: &str, repairs: usize) -> PlanAuthorRecovery {
+    if repairs < PLAN_AUTHOR_REPAIR_ATTEMPTS {
+        PlanAuthorRecovery::Retry(format!(
+            "Your previous reply could not be used: {reason}{PLAN_AUTHOR_TURN_REMINDER}"
+        ))
+    } else {
+        PlanAuthorRecovery::Fail(format!(
+            "planner did not return a usable reply after \
+             {PLAN_AUTHOR_REPAIR_ATTEMPTS} correction attempts: {reason}"
+        ))
+    }
+}
+
+/// One well-formed planner reply.
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Reply {
+    Question {
+        question: String,
+    },
+    Plan {
+        blueprint: Box<makina_core::api::GeneratedPlanBlueprint>,
+    },
+}
+
+/// Longest model output quoted back in a failure message.
+const PLANNER_SNIPPET: usize = 200;
+
+/// Quote what the model actually said, bounded and single-line.
+fn planner_snippet(answer: &str) -> String {
+    let flattened = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= PLANNER_SNIPPET {
+        return flattened;
+    }
+    let kept: String = flattened.chars().take(PLANNER_SNIPPET).collect();
+    format!("{kept}…")
+}
+
+/// Every JSON object candidate in a model reply, most likely first.
+///
+/// Ordered by decreasing confidence: the whole trimmed text, then the contents
+/// of a fenced block, then each brace-balanced object in the text. Several are
+/// returned rather than one because prose legitimately contains braces —
+/// "use {options} first" — and the reply object may not be the first of them.
+/// The old first-`{`-to-last-`}` span had no notion of either, so any stray
+/// brace produced a corrupt slice that could never parse.
+fn extract_planner_json(answer: &str) -> Vec<&str> {
+    let trimmed = answer.trim();
+    let mut candidates = Vec::new();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        candidates.push(trimmed);
+    }
+    // A fenced block: what lies between the first newline after the opening
+    // fence and the closing fence.
+    if let Some(fence_start) = trimmed.find("```") {
+        let after = &trimmed[fence_start + 3..];
+        if let Some(body_start) = after.find('\n')
+            && let Some(body_end) = after[body_start..].find("```")
+        {
+            let body = after[body_start..body_start + body_end].trim();
+            if body.starts_with('{') && body.ends_with('}') {
+                candidates.push(body);
+            }
+        }
+    }
+    candidates.extend(balanced_objects(trimmed));
+    candidates.dedup();
+    candidates
+}
+
+/// Each brace-balanced object in `text`, honouring JSON string escaping.
+///
+/// String tracking is what keeps a brace inside a value — shell `${VAR}` in a
+/// task body, a JSON example inside prose — from closing the object early.
+fn balanced_objects(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' if depth > 0 => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(offset);
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(open) = start.take()
+                    && let Some(slice) = text.get(open..=offset)
+                {
+                    found.push(slice);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Parse one planner reply, reporting why it failed rather than discarding it.
+///
+/// The error is handed back to the planner as a correction and shown to the
+/// operator if the retries are exhausted, so it has to say what was actually
+/// wrong — "invalid response" alone left nobody able to diagnose anything.
+fn parse_planner_reply(answer: &str) -> Result<Reply, String> {
+    let candidates = extract_planner_json(answer);
+    if candidates.is_empty() {
+        return Err(format!(
+            "no JSON object found in the reply; got: {}",
+            planner_snippet(answer)
+        ));
+    }
+    // Report against the candidate that looks most like an attempted reply, so
+    // the message names the real fault rather than some brace-pair in prose.
+    let mut reported: Option<String> = None;
+    let mut reported_a_real_attempt = false;
+    for candidate in candidates {
+        let error = match serde_json::from_str::<Reply>(candidate) {
+            Ok(reply) => return Ok(reply),
+            Err(error) => error,
+        };
+        let is_real_attempt = candidate.contains("\"type\"");
+        if reported.is_some() && (reported_a_real_attempt || !is_real_attempt) {
+            continue;
+        }
+        reported = Some(format!(
+            "reply is not a valid question or plan blueprint ({error}); got: {}",
+            planner_snippet(candidate)
+        ));
+        reported_a_real_attempt = is_real_attempt;
+    }
+    Err(reported.unwrap_or_else(|| {
+        format!(
+            "reply is not a valid question or plan blueprint; got: {}",
+            planner_snippet(answer)
+        )
+    }))
+}
+
 fn spawn_plan_authoring(
     backend: std::sync::Arc<dyn makina_core::backend::AgentBackend>,
     project_root: std::path::PathBuf,
@@ -1142,6 +1330,8 @@ fn spawn_plan_authoring(
             }
         };
         let mut prompt = first_prompt;
+        // Consecutive malformed replies since the last usable one.
+        let mut repairs = 0usize;
         loop {
             let mut stream = match session.prompt(Prompt::new(prompt)).await {
                 Ok(stream) => stream,
@@ -1173,22 +1363,9 @@ fn spawn_plan_authoring(
                     .await;
                 break;
             }
-            #[derive(serde::Deserialize)]
-            #[serde(tag = "type", rename_all = "snake_case")]
-            enum Reply {
-                Question {
-                    question: String,
-                },
-                Plan {
-                    blueprint: Box<makina_core::api::GeneratedPlanBlueprint>,
-                },
-            }
-            let json = answer
-                .find('{')
-                .zip(answer.rfind('}'))
-                .and_then(|(start, end)| answer.get(start..=end));
-            match json.and_then(|text| serde_json::from_str::<Reply>(text).ok()) {
-                Some(Reply::Question { question }) => {
+            match parse_planner_reply(&answer) {
+                Ok(Reply::Question { question }) => {
+                    repairs = 0;
                     if background_tx
                         .send(AppEvent::PlanAuthoringQuestion { question })
                         .await
@@ -1199,9 +1376,12 @@ fn spawn_plan_authoring(
                     let Some(next) = answer_rx.recv().await else {
                         break;
                     };
-                    prompt = next;
+                    // Carry the contract forward with the answer: the session
+                    // system prompt alone does not survive a multi-turn
+                    // conversation intact.
+                    prompt = format!("{next}{PLAN_AUTHOR_TURN_REMINDER}");
                 }
-                Some(Reply::Plan { blueprint }) => {
+                Ok(Reply::Plan { blueprint }) => {
                     let _ = background_tx
                         .send(AppEvent::GeneratePlanBundle {
                             project_root,
@@ -1210,14 +1390,21 @@ fn spawn_plan_authoring(
                         .await;
                     break;
                 }
-                None => {
-                    let _ = background_tx
-                        .send(AppEvent::PlanAuthoringFailed {
-                            reason: "planner returned an invalid response; expected a question or typed plan blueprint".into(),
-                        })
-                        .await;
-                    break;
-                }
+                Err(reason) => match plan_author_recovery(&reason, repairs) {
+                    // Hand the fault back and let the planner correct itself.
+                    // Ending the session here would discard every answer the
+                    // operator had already given.
+                    PlanAuthorRecovery::Retry(correction) => {
+                        repairs += 1;
+                        prompt = correction;
+                    }
+                    PlanAuthorRecovery::Fail(reason) => {
+                        let _ = background_tx
+                            .send(AppEvent::PlanAuthoringFailed { reason })
+                            .await;
+                        break;
+                    }
+                },
             }
         }
         let _ = session.terminate().await;
@@ -3487,6 +3674,202 @@ mod tests {
             ),
             AppEvent::CommandPaletteInput('x')
         ));
+    }
+
+    // ── Planner reply parsing ─────────────────────────────────────────────────
+
+    /// A minimal blueprint reply, as the system prompt specifies it.
+    fn plan_reply_json() -> String {
+        r#"{"type":"plan","blueprint":{"slug":"fsm","title":"FSM","scope":"s",
+        "architecture":"a","initial_status":{"goal":"g","root_cause":"r",
+        "approach":"ap","outcome":"","last_updated":"2026-01-01"},
+        "workstreams":[{"id":"0001","title":"Core"}],
+        "tasks":[{"sequence":"01","id":"first","title":"First","workstream":"0001",
+        "kind":"task","depends_on":[],"touches":["src/**"],"gated":false,"body":"b"}]}}"#
+            .to_owned()
+    }
+
+    #[test]
+    fn a_bare_question_object_parses() {
+        assert_eq!(
+            parse_planner_reply(r#"{"type":"question","question":"YAML or TOML?"}"#),
+            Ok(Reply::Question {
+                question: "YAML or TOML?".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_blueprint_object_parses() {
+        assert!(matches!(
+            parse_planner_reply(&plan_reply_json()),
+            Ok(Reply::Plan { .. })
+        ));
+    }
+
+    /// Models routinely wrap JSON in a fence despite being told not to. That is
+    /// a formatting habit, not a malformed answer, so it must still parse.
+    #[test]
+    fn a_fenced_reply_parses() {
+        let fenced = format!("Here you go:\n```json\n{}\n```", plan_reply_json());
+        assert!(matches!(
+            parse_planner_reply(&fenced),
+            Ok(Reply::Plan { .. })
+        ));
+    }
+
+    /// Prose after the object must not extend the slice. The old
+    /// first-`{`-to-last-`}` span swallowed any trailing brace and produced a
+    /// corrupt string that could never parse.
+    #[test]
+    fn prose_containing_braces_around_the_object_does_not_corrupt_it() {
+        let noisy = format!(
+            "Thinking about {{options}} first.\n{}\nLet me know if {{that}} works.",
+            r#"{"type":"question","question":"Single file or a directory?"}"#
+        );
+        assert_eq!(
+            parse_planner_reply(&noisy),
+            Ok(Reply::Question {
+                question: "Single file or a directory?".into()
+            })
+        );
+    }
+
+    /// Braces inside string values — shell `${VAR}` in a task body — must not
+    /// terminate the object early.
+    #[test]
+    fn braces_inside_strings_do_not_end_the_object() {
+        let reply = r#"prefix {"type":"question","question":"use ${HOME} and {} here?"} suffix"#;
+        assert_eq!(
+            parse_planner_reply(reply),
+            Ok(Reply::Question {
+                question: "use ${HOME} and {} here?".into()
+            })
+        );
+    }
+
+    /// An escaped quote must not be mistaken for the end of a string.
+    #[test]
+    fn escaped_quotes_inside_strings_are_honoured() {
+        let reply = r#"{"type":"question","question":"say \"hi\" then {stop}"}"#;
+        assert_eq!(
+            parse_planner_reply(reply),
+            Ok(Reply::Question {
+                question: r#"say "hi" then {stop}"#.into()
+            })
+        );
+    }
+
+    /// Prose with no object at all names the problem and quotes the reply,
+    /// instead of the old blanket "invalid response".
+    #[test]
+    fn prose_only_reply_reports_what_arrived() {
+        let error = parse_planner_reply("Sure — YAML is a good choice for that.")
+            .expect_err("prose is not a usable reply");
+        assert!(error.contains("no JSON object"), "{error}");
+        assert!(error.contains("YAML is a good choice"), "{error}");
+    }
+
+    /// A blueprint missing a required field reports the field, not a generic
+    /// failure — that is the difference between a fixable report and a dead end.
+    #[test]
+    fn a_malformed_blueprint_reports_the_serde_reason() {
+        let error = parse_planner_reply(r#"{"type":"plan","blueprint":{"slug":"fsm"}}"#)
+            .expect_err("an incomplete blueprint is not usable");
+        assert!(
+            error.contains("title"),
+            "the reason must name the gap: {error}"
+        );
+    }
+
+    /// An unknown discriminant is reported rather than silently ignored.
+    #[test]
+    fn an_unknown_reply_type_is_reported() {
+        let error = parse_planner_reply(r#"{"type":"summary","text":"..."}"#)
+            .expect_err("an unknown shape is not usable");
+        assert!(error.contains("not a valid question or plan"), "{error}");
+    }
+
+    /// The quoted reply is bounded and single-line so one runaway answer cannot
+    /// flood the failure message.
+    #[test]
+    fn the_quoted_snippet_is_bounded_and_flattened() {
+        let sprawling = format!("line one\nline two {}", "x".repeat(1_000));
+        let snippet = planner_snippet(&sprawling);
+        assert!(!snippet.contains('\n'), "the snippet must be one line");
+        assert!(
+            snippet.chars().count() <= PLANNER_SNIPPET + 1,
+            "got {} chars",
+            snippet.chars().count()
+        );
+    }
+
+    /// When prose braces and a real attempt both appear, the reported error is
+    /// about the attempt — not about `{options}`.
+    #[test]
+    fn the_reported_error_describes_the_real_attempt() {
+        let reply = r#"Considering {options}. {"type":"plan","blueprint":{"slug":"fsm"}}"#;
+        let error = parse_planner_reply(reply).expect_err("the blueprint is incomplete");
+        assert!(
+            error.contains("title"),
+            "the reason must describe the blueprint, not the prose brace: {error}"
+        );
+    }
+
+    /// The second turn of the reported exchange: the operator answers, and the
+    /// planner replies with prose. That used to end the session outright,
+    /// discarding every answer already given. It must now be a recoverable
+    /// parse error carrying the reason back to the planner.
+    #[test]
+    fn a_prose_second_turn_is_a_recoverable_error_not_a_dead_end() {
+        let second_turn = "YAML it is — each workflow in a single file, with steps \
+                           able to invoke other workflows.";
+        let error = parse_planner_reply(second_turn).expect_err("prose is not usable");
+
+        assert!(error.contains("no JSON object"), "{error}");
+        // The reason is what gets handed back for correction, so it has to be
+        // specific enough for the planner to act on.
+        assert!(
+            error.contains("YAML it is"),
+            "the reply must be quoted: {error}"
+        );
+
+        // The first such failure must be repaired, not fatal.
+        let PlanAuthorRecovery::Retry(correction) = plan_author_recovery(&error, 0) else {
+            panic!("the first malformed reply must be recoverable");
+        };
+        assert!(correction.contains("could not be used"), "{correction}");
+        assert!(
+            correction.contains(r#"{"type":"question""#),
+            "the correction must restate the contract: {correction}"
+        );
+    }
+
+    /// Repairs are bounded: once spent, the operator is told plainly.
+    #[test]
+    fn recovery_gives_up_after_the_bounded_attempts() {
+        assert!(matches!(
+            plan_author_recovery("bad", PLAN_AUTHOR_REPAIR_ATTEMPTS - 1),
+            PlanAuthorRecovery::Retry(_)
+        ));
+        let PlanAuthorRecovery::Fail(reason) =
+            plan_author_recovery("bad", PLAN_AUTHOR_REPAIR_ATTEMPTS)
+        else {
+            panic!("exhausted repairs must fail");
+        };
+        assert!(reason.contains("correction attempts"), "{reason}");
+        assert!(
+            reason.contains("bad"),
+            "the final report must carry the underlying reason: {reason}"
+        );
+    }
+
+    /// The follow-up prompt carries the contract, which is what a second turn
+    /// otherwise loses.
+    #[test]
+    fn the_turn_reminder_restates_both_allowed_shapes() {
+        assert!(PLAN_AUTHOR_TURN_REMINDER.contains(r#"{"type":"question""#));
+        assert!(PLAN_AUTHOR_TURN_REMINDER.contains(r#"{"type":"plan""#));
     }
 
     #[test]
