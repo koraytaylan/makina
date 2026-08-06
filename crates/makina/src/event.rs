@@ -605,7 +605,6 @@ async fn resolve_io(
             if let Some(state) = app.plan_authoring.as_mut() {
                 state.waiting = false;
                 state.generating = true;
-                state.thoughts.clear();
             }
             spawn_generate_plan_bundle(
                 std::sync::Arc::clone(&app.api),
@@ -626,10 +625,7 @@ async fn resolve_io(
                 return (AppEvent::Tick, None);
             }
             state.input.clear();
-            state.messages.push(crate::app::PlanAuthoringMessage {
-                from_model: false,
-                text: text.clone(),
-            });
+            state.push_operator(text.clone());
             state.waiting = true;
 
             if let Some(tx) = state.answer_tx.as_ref() {
@@ -670,7 +666,7 @@ async fn resolve_io(
             // agent dropped — leaves a transcript the operator can still see.
             // Replaying it as the opening prompt is what makes continuing after
             // a failed generation a continuation rather than a fresh start.
-            let opening = plan_authoring_opening_prompt(&state.messages, &text);
+            let opening = plan_authoring_opening_prompt(&state.log.entries, &text);
             let (answer_tx, answer_rx) = mpsc::channel(8);
             state.answer_tx = Some(answer_tx);
             spawn_plan_authoring(
@@ -1322,32 +1318,39 @@ fn parse_planner_reply(answer: &str) -> Result<Reply, String> {
 
 /// Build the opening prompt for a planner session.
 ///
-/// The newest message is the operator's own text and is already in `messages`
-/// by the time this runs, so it is passed separately and the transcript is
+/// The newest message is the operator's own text and is already in the
+/// transcript by the time this runs, so it is passed separately and the rest is
 /// replayed ahead of it. Without this, resuming after a failed generation would
 /// silently drop everything already agreed and quietly restart the interview.
-fn plan_authoring_opening_prompt(
-    messages: &[crate::app::PlanAuthoringMessage],
-    text: &str,
-) -> String {
+///
+/// Only what was *said* is replayed: the planner's reasoning and tool calls
+/// live in the same log so the tab can show them, but they were never part of
+/// the conversation and feeding them back would be putting words in its mouth.
+fn plan_authoring_opening_prompt(entries: &[crate::app::ExchangeEntry], text: &str) -> String {
+    use crate::app::{ExchangeContent, StreamRole};
+
+    let said = |entry: &crate::app::ExchangeEntry| match (&entry.role, &entry.content) {
+        (StreamRole::Operator, ExchangeContent::Prompt { text }) => {
+            Some(("Operator", text.clone()))
+        }
+        (StreamRole::Planner, ExchangeContent::Response { text, .. }) => {
+            Some(("You", text.clone()))
+        }
+        _ => None,
+    };
+    let mut spoken = entries.iter().filter_map(said).collect::<Vec<_>>();
     // Everything before the message just added — matched positionally, since
     // an operator who repeats themselves would otherwise have both copies
     // dropped from the replay.
-    let prior = match messages.split_last() {
-        Some((last, head)) if !last.from_model && last.text == text => head,
-        _ => messages,
-    };
-    if prior.is_empty() {
+    if matches!(spoken.last(), Some((speaker, said)) if *speaker == "Operator" && said == text) {
+        spoken.pop();
+    }
+    if spoken.is_empty() {
         return text.to_owned();
     }
     let mut prompt = String::from("Continuing an earlier drafting conversation:\n");
-    for message in prior {
-        let speaker = if message.from_model {
-            "You"
-        } else {
-            "Operator"
-        };
-        prompt.push_str(&format!("{speaker}: {}\n", message.text));
+    for (speaker, said) in spoken {
+        prompt.push_str(&format!("{speaker}: {said}\n"));
     }
     prompt.push_str("\nOperator: ");
     prompt.push_str(text);
@@ -1404,13 +1407,65 @@ fn spawn_plan_authoring(
             let mut failed = None;
             while let Some(event) = stream.next().await {
                 match event {
+                    // The reply itself is a protocol payload (a question or a
+                    // blueprint), not prose: it is parsed below and the *parsed*
+                    // form is what reaches the transcript. Streaming the raw
+                    // JSON in would show the operator the wire format.
                     Ok(ResponseEvent::TextChunk { text }) => answer.push_str(&text),
-                    // Reasoning is a side channel: it never contributes to the
-                    // answer, but it is the only signal that the planner is
-                    // working rather than hung.
+                    // Reasoning and tool calls are side channels: they never
+                    // contribute to the answer, but they are the signal that the
+                    // planner is working rather than hung. They go through the
+                    // same reducer a task's agent stream does, so the authoring
+                    // tab renders them exactly as the execution view does.
                     Ok(ResponseEvent::ThoughtChunk { text }) => {
                         if background_tx
-                            .send(AppEvent::PlanAuthoringThought(text))
+                            .send(AppEvent::PlanAuthoringExchange(
+                                makina_core::api::ExchangeEvent::ThoughtChunk { text },
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(ResponseEvent::ToolCall {
+                        id,
+                        title,
+                        kind,
+                        status,
+                        detail,
+                    }) => {
+                        if background_tx
+                            .send(AppEvent::PlanAuthoringExchange(
+                                makina_core::api::ExchangeEvent::ToolCall {
+                                    id,
+                                    title,
+                                    kind,
+                                    status,
+                                    content: detail,
+                                },
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(ResponseEvent::ToolCallUpdate {
+                        id,
+                        status,
+                        title,
+                        detail,
+                    }) => {
+                        if background_tx
+                            .send(AppEvent::PlanAuthoringExchange(
+                                makina_core::api::ExchangeEvent::ToolCallUpdate {
+                                    id,
+                                    status,
+                                    title,
+                                    content: detail,
+                                },
+                            ))
                             .await
                             .is_err()
                         {
@@ -2637,6 +2692,17 @@ fn translate_key(
             }
             KeyCode::Enter => AppEvent::PlanAuthoringSubmit,
             KeyCode::Backspace => AppEvent::PlanAuthoringBackspace,
+            // The transcript is the same scrollable stream a task's execution
+            // is, so it needs the same way to reach earlier turns. Arrow keys
+            // belong to the composer, which is why this is Page rather than Up.
+            KeyCode::PageUp => AppEvent::ScrollUp,
+            KeyCode::PageDown => AppEvent::ScrollDown,
+            // Ctrl+O toggles verbose here as it does everywhere else: without
+            // it the tab could show thought and tool previews but never open
+            // them, since every plain key goes to the composer.
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                AppEvent::ToggleVerbose
+            }
             // Other Ctrl chords stay reserved for global shortcuts.
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 AppEvent::PlanAuthoringInput(c)
@@ -3671,38 +3737,65 @@ mod tests {
         ));
     }
 
+    /// Build an authoring transcript the way the app does: operator prompts and
+    /// planner responses on their own lanes.
+    fn authoring_transcript(turns: &[(bool, &str)]) -> crate::app::ExchangeLog {
+        let mut log = crate::app::ExchangeLog::default();
+        for (from_model, text) in turns {
+            if *from_model {
+                log.add_response(crate::app::StreamRole::Planner, (*text).to_owned());
+            } else {
+                log.add_prompt(crate::app::StreamRole::Operator, (*text).to_owned());
+            }
+        }
+        log
+    }
+
     /// The first prompt of a brand-new conversation is just the operator's text.
     #[test]
     fn a_first_prompt_carries_no_transcript() {
-        let messages = vec![crate::app::PlanAuthoringMessage {
-            from_model: false,
-            text: "an fsm cli".into(),
-        }];
+        let log = authoring_transcript(&[(false, "an fsm cli")]);
         assert_eq!(
-            plan_authoring_opening_prompt(&messages, "an fsm cli"),
+            plan_authoring_opening_prompt(&log.entries, "an fsm cli"),
             "an fsm cli"
         );
+    }
+
+    /// Reasoning and tool calls share the transcript with what was said, but
+    /// they were never said — replaying them would put words in the planner's
+    /// mouth.
+    #[test]
+    fn the_replay_carries_only_what_was_said() {
+        let mut log = authoring_transcript(&[(false, "an fsm cli"), (true, "YAML or TOML?")]);
+        log.append_thought(
+            crate::app::StreamRole::Planner,
+            "the operator probably wants YAML".to_owned(),
+        );
+        log.start_tool(
+            crate::app::StreamRole::Planner,
+            "t1".to_owned(),
+            "Read README.md".to_owned(),
+            None,
+            "completed".to_owned(),
+            None,
+        );
+        let prompt = plan_authoring_opening_prompt(&log.entries, "YAML");
+
+        assert!(prompt.contains("YAML or TOML?"), "{prompt}");
+        assert!(!prompt.contains("probably wants"), "{prompt}");
+        assert!(!prompt.contains("README.md"), "{prompt}");
     }
 
     /// Resuming after a session ended replays what was already agreed, so
     /// continuing is a continuation rather than a silent restart.
     #[test]
     fn resuming_replays_the_earlier_transcript() {
-        let messages = vec![
-            crate::app::PlanAuthoringMessage {
-                from_model: false,
-                text: "an fsm cli".into(),
-            },
-            crate::app::PlanAuthoringMessage {
-                from_model: true,
-                text: "YAML or TOML?".into(),
-            },
-            crate::app::PlanAuthoringMessage {
-                from_model: false,
-                text: "YAML".into(),
-            },
-        ];
-        let prompt = plan_authoring_opening_prompt(&messages, "YAML");
+        let log = authoring_transcript(&[
+            (false, "an fsm cli"),
+            (true, "YAML or TOML?"),
+            (false, "YAML"),
+        ]);
+        let prompt = plan_authoring_opening_prompt(&log.entries, "YAML");
 
         assert!(prompt.contains("an fsm cli"), "{prompt}");
         assert!(prompt.contains("YAML or TOML?"), "{prompt}");

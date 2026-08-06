@@ -103,15 +103,38 @@ pub enum ExchangeContent {
     },
 }
 
-/// A single turn in a live agent exchange.
+/// Who produced one turn of a rendered conversation.
 ///
-/// Every entry carries the [`AgentRole`] that produced it plus its
+/// A run's exchange only ever involves the orchestrated [`AgentRole`]s, but the
+/// same log type — and the same renderer — also carries the plan-authoring
+/// conversation, whose two lanes are the operator and the planner. Keeping that
+/// in one enum is what lets both views share [`ExchangeLog`] rather than each
+/// growing its own transcript type and drifting apart.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StreamRole {
+    /// An orchestrated agent working a task.
+    Agent(AgentRole),
+    /// The person at the keyboard, in the plan-authoring conversation.
+    Operator,
+    /// The planner answering them.
+    Planner,
+}
+
+impl From<AgentRole> for StreamRole {
+    fn from(role: AgentRole) -> Self {
+        StreamRole::Agent(role)
+    }
+}
+
+/// A single turn in a live exchange.
+///
+/// Every entry carries the [`StreamRole`] that produced it plus its
 /// [`ExchangeContent`] — a prompt, a (possibly streaming) response, a thought
 /// burst, or a tool call.
 #[derive(Debug, Clone)]
 pub struct ExchangeEntry {
-    /// The agent role that produced this turn.
-    pub role: AgentRole,
+    /// The role that produced this turn.
+    pub role: StreamRole,
     /// The kind and payload of this turn.
     pub content: ExchangeContent,
 }
@@ -141,6 +164,26 @@ impl ExchangeEntry {
             _ => true,
         }
     }
+}
+
+/// Longest text kept in a single coalescing thought entry.
+///
+/// Reasoning streams continuously and is only interesting as "what is it doing
+/// right now", so an unbounded entry would grow for a whole turn to show a few
+/// lines. The cap lives here rather than at a call site so every stream — a
+/// task's agents and the planner alike — is bounded by the same rule.
+pub const THOUGHT_TAIL_CAP: usize = 8_000;
+
+/// Drop leading text so `thought` fits [`THOUGHT_TAIL_CAP`], on a char boundary.
+fn trim_thought_to_cap(thought: &mut String) {
+    if thought.len() <= THOUGHT_TAIL_CAP {
+        return;
+    }
+    let excess = thought.len() - THOUGHT_TAIL_CAP;
+    let cut = (excess..=thought.len())
+        .find(|index| thought.is_char_boundary(*index))
+        .unwrap_or(thought.len());
+    thought.drain(..cut);
 }
 
 /// Per-task bounded ring of exchange entries.
@@ -174,10 +217,26 @@ impl ExchangeLog {
     }
 
     /// Start a new prompt entry for the given role.
-    pub fn add_prompt(&mut self, role: AgentRole, text: String) {
+    pub fn add_prompt(&mut self, role: impl Into<StreamRole>, text: String) {
         self.push(ExchangeEntry {
-            role,
+            role: role.into(),
             content: ExchangeContent::Prompt { text },
+        });
+    }
+
+    /// Push an already-complete response entry for the given role.
+    ///
+    /// The streaming path builds a response chunk by chunk; a caller that
+    /// already holds the whole text (the planner's parsed reply, say) would
+    /// otherwise have to fake a stream to get the same entry.
+    pub fn add_response(&mut self, role: impl Into<StreamRole>, text: String) {
+        self.finalize_trailing_response();
+        self.push(ExchangeEntry {
+            role: role.into(),
+            content: ExchangeContent::Response {
+                text,
+                complete: true,
+            },
         });
     }
 
@@ -187,7 +246,8 @@ impl ExchangeLog {
     /// Design decision: a `ResponseChunk` arriving without a preceding
     /// `PromptSent` in this log still needs to go somewhere — we create an
     /// implicit incomplete response entry rather than silently dropping data.
-    pub fn append_chunk(&mut self, role: AgentRole, chunk: String) {
+    pub fn append_chunk(&mut self, role: impl Into<StreamRole>, chunk: String) {
+        let role = role.into();
         if let Some(last) = self.entries.last_mut()
             && last.role == role
             && let ExchangeContent::Response { text, complete } = &mut last.content
@@ -232,18 +292,22 @@ impl ExchangeLog {
     /// [`ExchangeContent::Thought`] of the same role; otherwise starts a new
     /// thought entry.  Thoughts are observability-only and never affect the
     /// answer text.
-    pub fn append_thought(&mut self, role: AgentRole, chunk: String) {
+    pub fn append_thought(&mut self, role: impl Into<StreamRole>, chunk: String) {
+        let role = role.into();
         self.finalize_trailing_response();
         if let Some(last) = self.entries.last_mut()
             && last.role == role
             && let ExchangeContent::Thought { text } = &mut last.content
         {
             text.push_str(&chunk);
+            trim_thought_to_cap(text);
             return;
         }
+        let mut text = chunk;
+        trim_thought_to_cap(&mut text);
         self.push(ExchangeEntry {
             role,
-            content: ExchangeContent::Thought { text: chunk },
+            content: ExchangeContent::Thought { text },
         });
     }
 
@@ -255,13 +319,14 @@ impl ExchangeLog {
     /// never blanks a captured diff), or pushes a new tool entry.
     pub fn start_tool(
         &mut self,
-        role: AgentRole,
+        role: impl Into<StreamRole>,
         id: String,
         title: String,
         kind: Option<String>,
         status: String,
         incoming_content: Option<String>,
     ) {
+        let role = role.into();
         if let Some(entry) = self.find_tool_mut(&role, &id) {
             if let ExchangeContent::Tool {
                 title: t,
@@ -304,13 +369,13 @@ impl ExchangeLog {
     /// entry matches (live updates always follow a `start_tool`).
     pub fn update_tool(
         &mut self,
-        role: AgentRole,
+        role: impl Into<StreamRole>,
         id: &str,
         status: Option<String>,
         title: Option<String>,
         incoming_content: Option<String>,
     ) {
-        if let Some(entry) = self.find_tool_mut(&role, id)
+        if let Some(entry) = self.find_tool_mut(&role.into(), id)
             && let ExchangeContent::Tool {
                 title: t,
                 status: s,
@@ -333,7 +398,7 @@ impl ExchangeLog {
     }
 
     /// Find the tool entry with the given `(role, id)`, if any.
-    fn find_tool_mut(&mut self, role: &AgentRole, id: &str) -> Option<&mut ExchangeEntry> {
+    fn find_tool_mut(&mut self, role: &StreamRole, id: &str) -> Option<&mut ExchangeEntry> {
         self.entries.iter_mut().find(|entry| {
             entry.role == *role
                 && matches!(
@@ -351,9 +416,15 @@ impl ExchangeLog {
 
 use makina_core::api::ExchangeEvent;
 
-/// Apply one exchange event to a task's log. The single source of truth used
-/// by both the live event path and on-disk replay (plan 0010).
-pub fn apply_exchange_event(log: &mut ExchangeLog, role: AgentRole, event: &ExchangeEvent) {
+/// Apply one exchange event to a stream's log. The single source of truth used
+/// by the live event path, on-disk replay (plan 0010), and the plan-authoring
+/// conversation.
+pub fn apply_exchange_event(
+    log: &mut ExchangeLog,
+    role: impl Into<StreamRole>,
+    event: &ExchangeEvent,
+) {
+    let role = role.into();
     match event {
         ExchangeEvent::PromptSent { text } => {
             log.add_prompt(role, text.clone());
@@ -423,32 +494,17 @@ pub enum Mode {
     ModelPicker,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanAuthoringMessage {
-    pub from_model: bool,
-    pub text: String,
-}
-
-/// Longest reasoning tail kept for the in-flight turn.
-///
-/// Thoughts stream continuously and are only interesting as "what is it doing
-/// right now", so an unbounded buffer would grow for the whole turn to show a
-/// few visible lines.
-pub const PLAN_AUTHORING_THOUGHT_CAP: usize = 4_000;
-
 #[derive(Debug)]
 pub struct PlanAuthoring {
     pub project_root: PathBuf,
     /// The composer buffer. May contain newlines: they arrive from a bracketed
     /// paste or from an explicit Shift/Alt+Enter, and are preserved verbatim.
     pub input: String,
-    pub messages: Vec<PlanAuthoringMessage>,
+    /// The conversation so far, in the same shape a task's execution uses:
+    /// operator prompts, planner replies, and the planner's streamed reasoning
+    /// and tool calls, all as [`ExchangeEntry`]s so one renderer serves both.
+    pub log: ExchangeLog,
     pub waiting: bool,
-    /// The planner's reasoning for the turn currently in flight.
-    ///
-    /// Cleared when the turn resolves: it answers "what is it doing right now",
-    /// not "what did it decide", which is what `messages` records.
-    pub thoughts: String,
     /// True once a blueprint has been accepted and the bundle is being written.
     ///
     /// The tab stays open through this so a generation failure can hand the
@@ -458,18 +514,14 @@ pub struct PlanAuthoring {
 }
 
 impl PlanAuthoring {
-    /// Append streamed reasoning, keeping only the most recent tail.
-    pub fn push_thought(&mut self, chunk: &str) {
-        self.thoughts.push_str(chunk);
-        if self.thoughts.len() <= PLAN_AUTHORING_THOUGHT_CAP {
-            return;
-        }
-        // Trim from the front on a char boundary so the tail stays intact.
-        let excess = self.thoughts.len() - PLAN_AUTHORING_THOUGHT_CAP;
-        let cut = (excess..=self.thoughts.len())
-            .find(|index| self.thoughts.is_char_boundary(*index))
-            .unwrap_or(self.thoughts.len());
-        self.thoughts.drain(..cut);
+    /// Record what the operator just sent.
+    pub fn push_operator(&mut self, text: String) {
+        self.log.add_prompt(StreamRole::Operator, text);
+    }
+
+    /// Record what the planner said back.
+    pub fn push_planner(&mut self, text: String) {
+        self.log.add_response(StreamRole::Planner, text);
     }
 
     /// Whether the planner currently owns the turn.
@@ -1243,8 +1295,10 @@ pub enum AppEvent {
     PlanAuthoringFailed {
         reason: String,
     },
-    /// A chunk of the planner's reasoning for the in-flight turn.
-    PlanAuthoringThought(String),
+    /// One event from the planner's own stream — reasoning, a tool call, a tool
+    /// update — folded into the authoring transcript exactly as a run's agent
+    /// events are folded into a task's.
+    PlanAuthoringExchange(makina_core::api::ExchangeEvent),
     /// Bundle generation finished; `Err` carries the reason and hands the
     /// conversation back rather than discarding it.
     PlanAuthoringGenerated(Result<String, String>),
@@ -3669,8 +3723,9 @@ impl App {
                 ScrollablePanel::TaskEntry
             }
             Some(TabContent::Plan { .. }) => ScrollablePanel::PlanAccordion,
-            // The composer owns the keyboard on an authoring tab, so arrow keys
-            // must not drive a scroll pane behind it.
+            // The authoring transcript is an exchange stream like any other, and
+            // auto-follows its tail. Arrow keys never reach here — the composer
+            // owns them — so only PageUp/PageDown and the wheel drive it.
             Some(TabContent::PlanAuthoring { .. }) | None => ScrollablePanel::Exchange,
         }
     }
@@ -4731,9 +4786,8 @@ impl App {
                     self.plan_authoring = Some(PlanAuthoring {
                         project_root: project_root.clone(),
                         input: String::new(),
-                        messages: Vec::new(),
+                        log: ExchangeLog::default(),
                         waiting: false,
-                        thoughts: String::new(),
                         generating: false,
                         answer_tx: None,
                     });
@@ -4782,9 +4836,11 @@ impl App {
                 }
                 true
             }
-            AppEvent::PlanAuthoringThought(chunk) => {
+            // The planner's own stream — reasoning and tool calls — folded into
+            // the transcript by the same reducer the run's agents go through.
+            AppEvent::PlanAuthoringExchange(event) => {
                 if let Some(state) = self.plan_authoring.as_mut() {
-                    state.push_thought(&chunk);
+                    apply_exchange_event(&mut state.log, StreamRole::Planner, &event);
                 }
                 true
             }
@@ -4798,20 +4854,16 @@ impl App {
                         if let Some(state) = self.plan_authoring.as_mut() {
                             state.generating = false;
                             state.waiting = false;
-                            state.thoughts.clear();
                             // The planner session ended when it emitted the
                             // blueprint. Dropping the handle lets the next
                             // submit open a fresh one immediately, replaying
                             // the transcript, instead of spending a submit on
                             // discovering the channel is closed.
                             state.answer_tx = None;
-                            state.messages.push(PlanAuthoringMessage {
-                                from_model: true,
-                                text: format!(
-                                    "The plan could not be generated: {reason}\n\
-                                     Tell me what to change and I will revise it."
-                                ),
-                            });
+                            state.push_planner(format!(
+                                "The plan could not be generated: {reason}\n\
+                                 Tell me what to change and I will revise it."
+                            ));
                         }
                     }
                 }
@@ -4819,24 +4871,16 @@ impl App {
             }
             AppEvent::PlanAuthoringQuestion { question } => {
                 if let Some(state) = self.plan_authoring.as_mut() {
-                    state.messages.push(PlanAuthoringMessage {
-                        from_model: true,
-                        text: question,
-                    });
+                    state.push_planner(question);
                     state.waiting = false;
-                    state.thoughts.clear();
                 }
                 true
             }
             AppEvent::PlanAuthoringFailed { reason } => {
                 if let Some(state) = self.plan_authoring.as_mut() {
-                    state.messages.push(PlanAuthoringMessage {
-                        from_model: true,
-                        text: format!("Error: {reason}"),
-                    });
+                    state.push_planner(format!("Error: {reason}"));
                     state.waiting = false;
                     state.generating = false;
-                    state.thoughts.clear();
                     state.answer_tx = None;
                 }
                 true
@@ -8441,7 +8485,7 @@ mod tests {
         // Entry 0: prompt.
         assert!(log.entries[0].is_prompt(), "first entry must be a prompt");
         assert_eq!(log.entries[0].text(), "implement X");
-        assert_eq!(log.entries[0].role, AgentRole::Developer);
+        assert_eq!(log.entries[0].role, StreamRole::Agent(AgentRole::Developer));
 
         // Entry 1: concatenated response.
         assert!(
@@ -8521,16 +8565,16 @@ mod tests {
         assert_eq!(log.entries.len(), 4, "2 prompts + 2 responses");
         // Ordering.
         assert!(log.entries[0].is_prompt());
-        assert_eq!(log.entries[0].role, AgentRole::Developer);
+        assert_eq!(log.entries[0].role, StreamRole::Agent(AgentRole::Developer));
         assert_eq!(log.entries[0].text(), "dev prompt");
         assert!(!log.entries[1].is_prompt());
-        assert_eq!(log.entries[1].role, AgentRole::Developer);
+        assert_eq!(log.entries[1].role, StreamRole::Agent(AgentRole::Developer));
         assert_eq!(log.entries[1].text(), "dev reply");
         assert!(log.entries[2].is_prompt());
-        assert_eq!(log.entries[2].role, AgentRole::Reviewer);
+        assert_eq!(log.entries[2].role, StreamRole::Agent(AgentRole::Reviewer));
         assert_eq!(log.entries[2].text(), "review prompt");
         assert!(!log.entries[3].is_prompt());
-        assert_eq!(log.entries[3].role, AgentRole::Reviewer);
+        assert_eq!(log.entries[3].role, StreamRole::Agent(AgentRole::Reviewer));
         assert_eq!(log.entries[3].text(), "lgtm");
     }
 
@@ -9633,7 +9677,7 @@ mod tests {
 
         match &log.entries[0] {
             ExchangeEntry {
-                role: AgentRole::Developer,
+                role: StreamRole::Agent(AgentRole::Developer),
                 content:
                     ExchangeContent::Tool {
                         title,
@@ -9651,7 +9695,7 @@ mod tests {
 
         match &log.entries[1] {
             ExchangeEntry {
-                role: AgentRole::Reviewer,
+                role: StreamRole::Agent(AgentRole::Reviewer),
                 content:
                     ExchangeContent::Tool {
                         title,
@@ -11957,10 +12001,7 @@ mod tests {
         app.update(AppEvent::OpenPlanAuthoring);
         if let Some(state) = app.plan_authoring.as_mut() {
             state.generating = true;
-            state.messages.push(PlanAuthoringMessage {
-                from_model: false,
-                text: "an fsm cli".into(),
-            });
+            state.push_operator("an fsm cli".into());
         }
 
         app.update(AppEvent::PlanAuthoringGenerated(Err(
@@ -11975,14 +12016,19 @@ mod tests {
         assert!(!state.generating, "the composer must be usable again");
         assert!(
             state
-                .messages
+                .log
+                .entries
                 .last()
-                .is_some_and(|m| m.text.contains("slug already registered")),
+                .is_some_and(|entry| entry.text().contains("slug already registered")),
             "the reason must reach the transcript: {:?}",
-            state.messages,
+            state.log.entries,
         );
         assert!(
-            state.messages.iter().any(|m| m.text == "an fsm cli"),
+            state
+                .log
+                .entries
+                .iter()
+                .any(|entry| entry.text() == "an fsm cli"),
             "the earlier conversation must survive",
         );
     }
@@ -12000,48 +12046,90 @@ mod tests {
         assert!(!app.is_plan_authoring());
     }
 
-    /// Reasoning streams into the in-flight turn and is dropped once it
-    /// resolves — it says what the planner is doing, not what it decided.
+    /// The planner's reasoning coalesces into a thought entry on the planner
+    /// lane — the same shape a task's agent reasoning takes — and stays in the
+    /// transcript once the turn resolves, so the operator can still read what
+    /// led to the question.
     #[test]
-    fn thoughts_accumulate_while_waiting_and_clear_on_an_answer() {
+    fn planner_reasoning_becomes_a_thought_entry_that_outlives_the_turn() {
         let mut app = make_app();
         app.update(AppEvent::OpenPlanAuthoring);
         app.plan_authoring.as_mut().unwrap().waiting = true;
 
-        app.update(AppEvent::PlanAuthoringThought("weighing ".into()));
-        app.update(AppEvent::PlanAuthoringThought("YAML".into()));
-        assert_eq!(
-            app.plan_authoring.as_ref().unwrap().thoughts,
-            "weighing YAML"
-        );
+        for chunk in ["weighing ", "YAML"] {
+            app.update(AppEvent::PlanAuthoringExchange(
+                ExchangeEvent::ThoughtChunk {
+                    text: chunk.to_owned(),
+                },
+            ));
+        }
+        let entries = &app.plan_authoring.as_ref().unwrap().log.entries;
+        assert_eq!(entries.len(), 1, "chunks must coalesce: {entries:?}");
+        assert_eq!(entries[0].role, StreamRole::Planner);
+        assert!(matches!(
+            entries[0].content,
+            ExchangeContent::Thought { ref text } if text == "weighing YAML"
+        ));
 
         app.update(AppEvent::PlanAuthoringQuestion {
             question: "One file or many?".into(),
         });
         let state = app.plan_authoring.as_ref().unwrap();
-        assert!(state.thoughts.is_empty(), "reasoning is per-turn");
         assert!(!state.waiting);
+        assert_eq!(
+            state.log.entries.len(),
+            2,
+            "the answer joins the reasoning rather than replacing it: {:?}",
+            state.log.entries,
+        );
+        assert_eq!(state.log.entries[1].text(), "One file or many?");
     }
 
-    /// The reasoning buffer is bounded and never splits a character.
+    /// A planner tool call reaches the transcript through the same reducer the
+    /// run's agents use, so the authoring tab renders it identically.
     #[test]
-    fn the_thought_buffer_keeps_a_bounded_tail() {
-        let mut authoring = PlanAuthoring {
-            project_root: std::path::PathBuf::from("."),
-            input: String::new(),
-            messages: Vec::new(),
-            waiting: true,
-            thoughts: String::new(),
-            generating: false,
-            answer_tx: None,
-        };
+    fn planner_tool_calls_land_on_the_planner_lane() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+
+        app.update(AppEvent::PlanAuthoringExchange(ExchangeEvent::ToolCall {
+            id: "t1".into(),
+            title: "Read README.md".into(),
+            kind: Some("read".into()),
+            status: "pending".into(),
+            content: None,
+        }));
+        app.update(AppEvent::PlanAuthoringExchange(
+            ExchangeEvent::ToolCallUpdate {
+                id: "t1".into(),
+                status: Some("completed".into()),
+                title: None,
+                content: None,
+            },
+        ));
+
+        let entries = &app.plan_authoring.as_ref().unwrap().log.entries;
+        assert_eq!(entries.len(), 1, "the update must fold into the call");
+        assert_eq!(entries[0].role, StreamRole::Planner);
+        assert!(matches!(
+            entries[0].content,
+            ExchangeContent::Tool { ref status, .. } if status == "completed"
+        ));
+    }
+
+    /// A coalescing thought entry is bounded and never splits a character.
+    /// The cap lives on the log, so every stream is bounded the same way.
+    #[test]
+    fn a_thought_entry_keeps_a_bounded_tail() {
+        let mut log = ExchangeLog::default();
         // Multi-byte on purpose: trimming must land on a char boundary.
-        for _ in 0..2_000 {
-            authoring.push_thought("λ think ");
+        for _ in 0..4_000 {
+            log.append_thought(StreamRole::Planner, "λ think ".into());
         }
-        assert!(authoring.thoughts.len() <= PLAN_AUTHORING_THOUGHT_CAP);
+        let text = log.entries[0].text();
+        assert!(text.len() <= THOUGHT_TAIL_CAP);
         assert!(
-            authoring.thoughts.ends_with("think "),
+            text.ends_with("think "),
             "the newest reasoning must survive"
         );
     }
@@ -12052,9 +12140,8 @@ mod tests {
         let mut authoring = PlanAuthoring {
             project_root: std::path::PathBuf::from("."),
             input: String::new(),
-            messages: Vec::new(),
+            log: ExchangeLog::default(),
             waiting: false,
-            thoughts: String::new(),
             generating: false,
             answer_tx: None,
         };

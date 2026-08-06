@@ -55,7 +55,7 @@ use std::{
 
 use crate::app::{
     AccordionSection, App, CollapseKey, DependencyViewMode, ExchangeEntry, Panel, PanelGeometry,
-    ScrollablePanel, TabContent, ToolDiffKey, TreeNode,
+    ScrollablePanel, StreamRole, TabContent, ToolDiffKey, TreeNode,
 };
 use makina_core::api::{AgentRole, FailureKind, RunId, RunStatus, RunView, TaskId};
 use makina_core::roles::{ReviewVerdict, parse_review_verdict};
@@ -141,7 +141,7 @@ struct ExchangeGroupedLines {
 }
 
 struct ExchangeRoleGroup {
-    role: AgentRole,
+    role: StreamRole,
     lines: Vec<Line<'static>>,
     rendered_rows: u16,
     tool_diff_header_rows: Vec<(u16, ToolDiffKey)>,
@@ -158,17 +158,60 @@ struct ExchangeGroupOverlay {
     group: ExchangeRoleGroup,
 }
 
-fn exchange_role_name(role: &AgentRole) -> &'static str {
+fn exchange_role_name(role: &StreamRole) -> &'static str {
     match role {
-        AgentRole::Developer => "Developer",
-        AgentRole::Reviewer => "Reviewer",
+        StreamRole::Agent(AgentRole::Developer) => "Developer",
+        StreamRole::Agent(AgentRole::Reviewer) => "Reviewer",
+        StreamRole::Operator => "You",
+        StreamRole::Planner => "Planner",
     }
 }
 
-fn exchange_role_color(app: &App, role: &AgentRole) -> Color {
+fn exchange_role_color(app: &App, role: &StreamRole) -> Color {
     match role {
-        AgentRole::Developer => app.active_theme.get(crate::theme::ThemeRole::Success),
-        AgentRole::Reviewer => app.active_theme.get(crate::theme::ThemeRole::Warning),
+        StreamRole::Agent(AgentRole::Developer) => {
+            app.active_theme.get(crate::theme::ThemeRole::Success)
+        }
+        StreamRole::Agent(AgentRole::Reviewer) => {
+            app.active_theme.get(crate::theme::ThemeRole::Warning)
+        }
+        StreamRole::Operator => app.active_theme.get(crate::theme::ThemeRole::Info),
+        StreamRole::Planner => app.active_theme.get(crate::theme::ThemeRole::Accent),
+    }
+}
+
+/// The header a single entry wears, e.g. `▶ Developer prompt` or `◀ Planner`.
+///
+/// An orchestrated agent both sends and receives, so its rows name which
+/// direction they are; the authoring lanes are one-way — the operator only
+/// prompts and the planner only answers — and naming the direction there would
+/// be noise on every row.
+fn exchange_entry_label(
+    role: &StreamRole,
+    kind: ExchangeEntryLabelKind,
+    mode: ExchangeEntryLabelMode,
+) -> String {
+    let name = exchange_role_name(role);
+    let conversational = matches!(role, StreamRole::Operator | StreamRole::Planner);
+    match (kind, mode) {
+        (ExchangeEntryLabelKind::Prompt, _) if conversational => format!("▶ {name}"),
+        (ExchangeEntryLabelKind::Response, _) if conversational => format!("◀ {name}"),
+        (ExchangeEntryLabelKind::Prompt, ExchangeEntryLabelMode::Full) => {
+            format!("▶ {name} prompt")
+        }
+        (ExchangeEntryLabelKind::Prompt, ExchangeEntryLabelMode::Compact) => "▶ prompt".to_owned(),
+        (ExchangeEntryLabelKind::Response, ExchangeEntryLabelMode::Full) => {
+            format!("◀ {name} response")
+        }
+        (ExchangeEntryLabelKind::Response, ExchangeEntryLabelMode::Compact) => {
+            "◀ response".to_owned()
+        }
+        (ExchangeEntryLabelKind::Thought, ExchangeEntryLabelMode::Full) => {
+            format!("💭 {name} thought")
+        }
+        (ExchangeEntryLabelKind::Thought, ExchangeEntryLabelMode::Compact) => {
+            "💭 thought".to_owned()
+        }
     }
 }
 
@@ -233,7 +276,7 @@ fn render_reviewer_verdict_lines(
 }
 
 #[cfg(test)]
-fn exchange_role_rail_line(mut line: Line<'static>, app: &App, role: &AgentRole) -> Line<'static> {
+fn exchange_role_rail_line(mut line: Line<'static>, app: &App, role: &StreamRole) -> Line<'static> {
     line.spans.insert(
         0,
         Span::styled(
@@ -330,6 +373,105 @@ fn render_exchange_group_overlays(
             height: visible_height,
         };
         render_exchange_role_group(frame, area, app, &overlay.group, scroll_within_group);
+    }
+}
+
+/// One conversation stream laid out as a document.
+///
+/// Both views that show a stream — a task's Execution section and the
+/// plan-authoring transcript — build it through [`exchange_stream_blocks`] and
+/// paint it through [`paint_stream_document`], so grouping, role rails,
+/// Markdown, thought compaction and tool-diff expansion cannot drift apart.
+struct StreamBlocks {
+    /// One blank line per rendered row. The caller pushes these into whatever
+    /// document it is building so the rows occupy the right scroll geometry;
+    /// the overlays paint the real content on top.
+    lines: Vec<Line<'static>>,
+    /// The role groups to paint, with `start_row` relative to the first line.
+    overlays: Vec<ExchangeGroupOverlay>,
+}
+
+/// Lay `entries` out at `indent_x` columns in, wrapping to `body_width`.
+///
+/// `tool_diff_context` keys which tool diffs are expanded; `None` leaves them
+/// collapsed, which is right for a stream that has no task identity to hang
+/// that state on.
+fn exchange_stream_blocks(
+    app: &App,
+    entries: &[ExchangeEntry],
+    body_width: u16,
+    indent_x: u16,
+    tool_diff_context: Option<(RunId, &TaskId)>,
+) -> StreamBlocks {
+    let mut lines = Vec::new();
+    let mut overlays = Vec::new();
+    for group in exchange_entries_grouped_blocks(entries, app, body_width, tool_diff_context).groups
+    {
+        let start_row = lines.len().min(u16::MAX as usize) as u16;
+        for _ in 0..group.rendered_rows {
+            lines.push(Line::from(""));
+        }
+        overlays.push(ExchangeGroupOverlay {
+            start_row,
+            indent_x,
+            width: body_width,
+            group,
+        });
+    }
+    StreamBlocks { lines, overlays }
+}
+
+/// Where a scrolled document is drawn, and how far it is scrolled.
+struct StreamViewport {
+    content: Rect,
+    scrollbar: Rect,
+    offset: u16,
+    max: u16,
+}
+
+/// Resolve the viewport for a `total_rows`-tall document drawn into `content`.
+///
+/// Recording the max is what lets the event layer clamp a scroll to what was
+/// actually rendered, so this is the only place either view computes it.
+fn stream_viewport(
+    app: &App,
+    panel: ScrollablePanel,
+    total_rows: u16,
+    content: Rect,
+    scrollbar: Rect,
+) -> StreamViewport {
+    let max = total_rows.saturating_sub(content.height);
+    app.last_scroll_maxes.borrow_mut().insert(panel, max);
+    StreamViewport {
+        content,
+        scrollbar,
+        offset: app.panel_offset(panel, max),
+        max,
+    }
+}
+
+/// Paint a scrolled line document plus its role-group overlays and scrollbar.
+fn paint_stream_document(
+    frame: &mut Frame,
+    app: &App,
+    viewport: &StreamViewport,
+    lines: Vec<Line<'static>>,
+    overlays: &[ExchangeGroupOverlay],
+) {
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((viewport.offset, 0));
+    frame.render_widget(para, viewport.content);
+    render_exchange_group_overlays(frame, app, viewport.content, viewport.offset, overlays);
+
+    if viewport.max > 0 {
+        let mut scrollbar_state =
+            ScrollbarState::new(viewport.max as usize).position(viewport.offset as usize);
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, viewport.scrollbar, &mut scrollbar_state);
     }
 }
 
@@ -1166,7 +1308,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             .constraints([Constraint::Length(1), Constraint::Min(3)])
             .split(content_area);
         render_tab_bar(app, frame, split[0]);
-        render_plan_authoring(app, authoring, frame, split[1]);
+        render_plan_authoring(app, authoring, frame, split[1], &mut panel_geoms);
     } else {
         match (
             active_plan_tab,
@@ -2560,22 +2702,23 @@ fn render_task_execution_section(
 
     // 2. Live exchange entries in chronological order, or the empty-state hint.
     if has_exchange {
-        let body_width = content_width.saturating_sub(2);
         let log = log_opt.expect("checked above");
-        for group in
-            exchange_entries_grouped_blocks(&log.entries, app, body_width, Some((run.id, &task.id)))
-                .groups
-        {
-            let start_row = rendered_rows;
-            for _ in 0..group.rendered_rows {
-                push_line!(Line::from(""));
-            }
-            group_overlays.push(ExchangeGroupOverlay {
-                start_row,
-                indent_x: 2,
-                width: body_width,
-                group,
-            });
+        // Same layout the authoring transcript gets — only the surroundings
+        // (the accordion header and the metrics above) are task-specific.
+        let stream = exchange_stream_blocks(
+            app,
+            &log.entries,
+            content_width.saturating_sub(2),
+            2,
+            Some((run.id, &task.id)),
+        );
+        let section_start = rendered_rows;
+        for line in stream.lines {
+            push_line!(line);
+        }
+        for mut overlay in stream.overlays {
+            overlay.start_row = section_start.saturating_add(overlay.start_row);
+            group_overlays.push(overlay);
         }
     } else {
         let hint = if app.exchange_logs.contains_key(&(run.id, task.id.clone())) {
@@ -2937,13 +3080,14 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
     }
     push_line!(Line::from(""));
 
-    let total_rendered_rows = rendered_row;
-    let task_scroll_max = total_rendered_rows.saturating_sub(content_area.height);
-    app.last_scroll_maxes
-        .borrow_mut()
-        .insert(ScrollablePanel::TaskEntry, task_scroll_max);
-
-    let task_scroll_offset = app.panel_offset(ScrollablePanel::TaskEntry, task_scroll_max);
+    let viewport = stream_viewport(
+        app,
+        ScrollablePanel::TaskEntry,
+        rendered_row,
+        content_area,
+        scrollbar_area,
+    );
+    let task_scroll_offset = viewport.offset;
 
     let mut computed_bounds = Vec::new();
     for (section, header_rendered_row) in accordion_header_rows {
@@ -2981,27 +3125,7 @@ fn render_task_detail_pane(app: &App, source: TaskDetailSource<'_>, frame: &mut 
     }
     *app.tool_diff_bounds.borrow_mut() = computed_tool_diff_bounds;
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((task_scroll_offset, 0));
-    frame.render_widget(para, content_area);
-    render_exchange_group_overlays(
-        frame,
-        app,
-        content_area,
-        task_scroll_offset,
-        &execution_group_overlays,
-    );
-
-    if task_scroll_max > 0 {
-        let mut scrollbar_state =
-            ScrollbarState::new(task_scroll_max as usize).position(task_scroll_offset as usize);
-        let scrollbar = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None);
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-    }
+    paint_stream_document(frame, app, &viewport, lines, &execution_group_overlays);
 }
 
 /// Render a task's entry (metadata + Markdown body) into a bordered pane.
@@ -3875,15 +3999,15 @@ fn exchange_entries_grouped_blocks(
 ) -> ExchangeGroupedBlocks {
     let entry_width = width.saturating_sub(EXCHANGE_ROLE_RAIL_WIDTH);
     let mut groups = Vec::new();
-    let mut previous_role: Option<&AgentRole> = None;
+    let mut previous_role: Option<&StreamRole> = None;
     let mut seen_role_labels = ExchangeRoleLabelSeen::default();
-    let mut current_role: Option<AgentRole> = None;
+    let mut current_role: Option<StreamRole> = None;
     let mut current_lines: Vec<Line<'static>> = Vec::new();
     let mut current_tool_diff_lines: Vec<(usize, ToolDiffKey)> = Vec::new();
 
     let finalize_group =
         |groups: &mut Vec<ExchangeRoleGroup>,
-         role: Option<AgentRole>,
+         role: Option<StreamRole>,
          lines: &mut Vec<Line<'static>>,
          tool_diff_lines: &mut Vec<(usize, ToolDiffKey)>| {
             let Some(role) = role else {
@@ -3989,7 +4113,7 @@ fn exchange_entries_grouped_lines(
 ) -> ExchangeGroupedLines {
     let entry_width = width.saturating_sub(EXCHANGE_ROLE_RAIL_WIDTH);
     let mut lines = Vec::new();
-    let mut previous_role: Option<&AgentRole> = None;
+    let mut previous_role: Option<&StreamRole> = None;
     let mut seen_role_labels = ExchangeRoleLabelSeen::default();
 
     for entry in entries {
@@ -4053,12 +4177,8 @@ fn exchange_entry_lines_with_options(
     match &entry.content {
         ExchangeContent::Prompt { text } => {
             // Role label + prompt Markdown on separate lines.
-            let label = match label_mode {
-                ExchangeEntryLabelMode::Full => {
-                    format!("▶ {} prompt", exchange_role_name(&entry.role))
-                }
-                ExchangeEntryLabelMode::Compact => "▶ prompt".to_string(),
-            };
+            let label =
+                exchange_entry_label(&entry.role, ExchangeEntryLabelKind::Prompt, label_mode);
             let label_color = exchange_role_color(app, &entry.role);
             lines.push(Line::from(vec![Span::styled(
                 label,
@@ -4078,7 +4198,7 @@ fn exchange_entry_lines_with_options(
             }
         }
         ExchangeContent::Response { text, complete } => {
-            if entry.role == AgentRole::Reviewer
+            if entry.role == StreamRole::Agent(AgentRole::Reviewer)
                 && *complete
                 && let Ok(verdict) = parse_review_verdict(text)
             {
@@ -4086,12 +4206,8 @@ fn exchange_entry_lines_with_options(
             }
 
             // Response entry.
-            let resp_label = match label_mode {
-                ExchangeEntryLabelMode::Full => {
-                    format!("◀ {} response", exchange_role_name(&entry.role))
-                }
-                ExchangeEntryLabelMode::Compact => "◀ response".to_string(),
-            };
+            let resp_label =
+                exchange_entry_label(&entry.role, ExchangeEntryLabelKind::Response, label_mode);
             let resp_color = app.active_theme.get(crate::theme::ThemeRole::Accent);
             lines.push(Line::from(vec![Span::styled(
                 resp_label,
@@ -4130,12 +4246,8 @@ fn exchange_entry_lines_with_options(
         // rendered so the user can see reasoning happened. Compact mode includes
         // a short inline preview; verbose mode renders the full text below.
         ExchangeContent::Thought { text } => {
-            let label = match label_mode {
-                ExchangeEntryLabelMode::Full => {
-                    format!("💭 {} thought", exchange_role_name(&entry.role))
-                }
-                ExchangeEntryLabelMode::Compact => "💭 thought".to_string(),
-            };
+            let label =
+                exchange_entry_label(&entry.role, ExchangeEntryLabelKind::Thought, label_mode);
             let label_color = exchange_role_color(app, &entry.role);
             let mut spans = vec![Span::styled(
                 label,
@@ -4421,74 +4533,27 @@ fn render_command_palette(
 /// scrolls rather than pushing the transcript off-screen.
 const AUTHORING_COMPOSER_MAX_ROWS: u16 = 12;
 
-/// Rows reserved for the activity indicator and streamed reasoning.
-///
-/// One row for the indicator plus a short tail of thinking — enough to see the
-/// planner working without crowding out the conversation.
-const AUTHORING_THINKING_ROWS: u16 = 5;
-
 /// Render the plan-authoring workspace as tab content.
 ///
 /// Laid out bottom-up like a chat composer: the transcript takes the remaining
 /// space and the input box sits under it, sized to its own content.
-/// Render the activity indicator and the planner's streamed reasoning.
 ///
-/// The spinner is driven by the same `app.tick` the rest of the UI animates on,
-/// so a stalled frame loop is visible as a frozen spinner rather than being
-/// mistaken for a slow model. Reasoning is tail-anchored: the newest lines
-/// matter, and the band is deliberately short.
-fn render_authoring_activity(
-    app: &App,
-    authoring: &crate::app::PlanAuthoring,
-    frame: &mut Frame,
-    area: Rect,
-) {
-    if area.height == 0 {
-        return;
-    }
-    let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
-    let accent = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent));
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!("{} ", spinner_frame(app.tick)), accent),
-            Span::styled(format!("{}…", authoring.activity()), dim),
-        ])),
-        rows[0],
-    );
-
-    if rows[1].height == 0 {
-        return;
-    }
-    let thoughts = authoring.thoughts.trim();
-    if thoughts.is_empty() {
-        return;
-    }
-    // Show the tail: reasoning streams continuously and the newest text is the
-    // part that says what the planner is doing now.
-    let lines = thoughts.lines().collect::<Vec<_>>();
-    let visible = lines
-        .len()
-        .saturating_sub(rows[1].height as usize)
-        .min(lines.len());
-    let tail = lines[visible..]
-        .iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                (*line).to_owned(),
-                dim.add_modifier(Modifier::ITALIC),
-            ))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: true }), rows[1]);
-}
-
+/// The transcript is the same stream a task's Execution section renders — role
+/// rails, Markdown bodies, compact thought and tool rows that open in verbose
+/// mode — so the planner's reasoning gets the room the old five-row band never
+/// had, and a change to either view lands in both. What stays specific to this
+/// tab is the composer, the single-line activity indicator above it, and the
+/// footer; the execution view has no prompt to write and no need for either.
+///
+/// The activity spinner is driven by the same `app.tick` the rest of the UI
+/// animates on, so a stalled frame loop shows as a frozen spinner rather than
+/// being mistaken for a slow model.
 fn render_plan_authoring(
     app: &App,
     authoring: &crate::app::PlanAuthoring,
     frame: &mut Frame,
     area: Rect,
+    panel_geoms: &mut Vec<PanelGeometry>,
 ) {
     // A top rule in the neutral pane colour, exactly like every other tab pane
     // (`render_task_detail_pane`, the task-entry placeholder). A full accent box
@@ -4516,19 +4581,14 @@ fn render_plan_authoring(
             AUTHORING_COMPOSER_MAX_ROWS,
         )
     };
-    // While the planner owns the turn, a band above the composer carries the
-    // activity indicator and whatever reasoning has streamed so far. It is the
-    // only evidence the turn is progressing rather than hung, so it is reserved
-    // only while busy and costs nothing when the operator is typing.
-    let thinking_height = if authoring.is_busy() {
-        AUTHORING_THINKING_ROWS.min(inner.height.saturating_sub(composer_height + 3))
-    } else {
-        0
-    };
+    // One row for the activity indicator while the planner owns the turn: the
+    // reasoning itself now lives in the transcript, so this only has to say
+    // *that* something is in flight, and it costs nothing while typing.
+    let activity_height = u16::from(authoring.is_busy());
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(thinking_height),
+        Constraint::Length(activity_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
@@ -4543,47 +4603,25 @@ fn render_plan_authoring(
         chunks[0],
     );
 
-    let conversation = authoring
-        .messages
-        .iter()
-        .flat_map(|message| {
-            let speaker = if message.from_model {
-                "Planner: "
-            } else {
-                "You: "
-            };
-            // Authored text may be multi-line; render each line so a pasted
-            // block reads back the way it was written.
-            let mut lines = Vec::new();
-            for (index, text) in message.text.lines().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if index == 0 { speaker } else { "" },
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text.to_owned()),
-                ]));
-            }
-            if lines.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    speaker,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-            }
-            lines
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(conversation).wrap(Wrap { trim: false }),
-        chunks[1],
-    );
+    render_authoring_transcript(app, authoring, frame, chunks[1], panel_geoms);
 
-    if thinking_height > 0 {
-        render_authoring_activity(app, authoring, frame, chunks[2]);
+    if activity_height > 0 {
+        let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
+        let accent = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Accent));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{} ", spinner_frame(app.tick)), accent),
+                Span::styled(format!("{}…", authoring.activity()), dim),
+            ])),
+            chunks[2],
+        );
     }
 
     let composer = if authoring.is_busy() {
-        Paragraph::new(format!("{}…", authoring.activity()))
+        // The indicator directly above already names the wait; repeating it
+        // here just said the same thing twice. What the box has to say is why
+        // it is not taking input.
+        Paragraph::new("locked until the planner answers")
             .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)))
     } else {
         let rows = crate::app::composer_rows(&authoring.input, composer_text_width);
@@ -4608,16 +4646,75 @@ fn render_plan_authoring(
         Constraint::Length(app.planner_model_label().chars().count() as u16),
     ])
     .split(chunks[4]);
-    frame.render_widget(
-        Paragraph::new("Enter submit · Ctrl+J newline · Esc close").style(dim),
-        footer[0],
-    );
+    // The model label has a fixed claim on the right, so the hints take what is
+    // left; on a narrow pane the least surprising hint (verbose detail, which
+    // the help overlay also lists) is the one that drops rather than the whole
+    // line being sliced mid-word.
+    let hints = "Enter submit · Ctrl+J newline · Ctrl+O detail · Esc close";
+    let hints = if footer[0].width as usize >= hints.chars().count() {
+        hints
+    } else {
+        "Enter submit · Ctrl+J newline · Esc close"
+    };
+    frame.render_widget(Paragraph::new(hints).style(dim), footer[0]);
     frame.render_widget(
         Paragraph::new(app.planner_model_label())
             .style(dim)
             .alignment(Alignment::Right),
         footer[1],
     );
+}
+
+/// Render the authoring conversation into `area` as an exchange stream.
+///
+/// Identical in construction to a task's Execution section: the same grouped
+/// blocks, the same overlays, the same scroll bookkeeping. Only the empty state
+/// and the absence of a tool-diff context differ — an authoring conversation
+/// has no task identity to key expanded diffs on, so they stay collapsed.
+fn render_authoring_transcript(
+    app: &App,
+    authoring: &crate::app::PlanAuthoring,
+    frame: &mut Frame,
+    area: Rect,
+    panel_geoms: &mut Vec<PanelGeometry>,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    // Registering the geometry is what makes the wheel scroll this pane; the
+    // panel is `Exchange`, which is also what `main_scroll_target` resolves an
+    // authoring tab to, so keyboard and mouse drive the same offset.
+    panel_geoms.push(PanelGeometry {
+        panel: ScrollablePanel::Exchange,
+        rect: area,
+    });
+
+    if authoring.log.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Nothing said yet — describe the work and press Enter.")
+                .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))),
+            area,
+        );
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::Exchange, 0);
+        return;
+    }
+
+    // Reserve the rightmost column for the scrollbar so text is not overpainted
+    // and the wrap width matches the visible width.
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let content_area = cols[0];
+    let stream = exchange_stream_blocks(app, &authoring.log.entries, content_area.width, 0, None);
+    let total_rows = stream.lines.len().min(u16::MAX as usize) as u16;
+    let viewport = stream_viewport(
+        app,
+        ScrollablePanel::Exchange,
+        total_rows,
+        content_area,
+        cols[1],
+    );
+    paint_stream_document(frame, app, &viewport, stream.lines, &stream.overlays);
 }
 
 /// Render the settings modal.
@@ -5353,6 +5450,26 @@ fn render_help_overlay(app: &App, frame: &mut Frame, area: Rect) {
     ]));
     lines.push(Line::from(""));
 
+    // Create-plan tab: the composer owns every plain key, so the transcript is
+    // reached through chords that would otherwise never be guessable.
+    lines.push(Line::from(Span::styled(
+        "Create Plan (Authoring Tab Active)",
+        section_style,
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", key_style),
+        Span::styled(" submit  ", binding_style),
+        Span::styled("[Ctrl+J]", key_style),
+        Span::styled(" newline", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[PgUp/PgDn]", key_style),
+        Span::styled(" scroll transcript  ", binding_style),
+        Span::styled("[Ctrl+O]", key_style),
+        Span::styled(" open reasoning / tool detail", binding_style),
+    ]));
+    lines.push(Line::from(""));
+
     // Accordion (plan tab)
     lines.push(Line::from(Span::styled(
         "Accordion (Plan Tab Active)",
@@ -5754,12 +5871,18 @@ mod tests {
 
     /// While the planner owns the turn the pane shows an animated indicator and
     /// the reasoning streamed so far — the only evidence the turn is moving.
+    ///
+    /// The reasoning is a thought entry in the transcript, so it wears the same
+    /// header a task's agent reasoning does and carries the same preview.
     #[test]
     fn a_waiting_turn_shows_the_indicator_and_reasoning() {
         let mut app = authoring_app("");
         if let Some(state) = app.plan_authoring.as_mut() {
             state.waiting = true;
-            state.thoughts = "comparing YAML and TOML for multi-line blocks".into();
+            state.log.append_thought(
+                StreamRole::Planner,
+                "comparing YAML and TOML for multi-line blocks".into(),
+            );
         }
         let mut terminal = make_terminal(100, 30);
         terminal.draw(|frame| render(&app, frame)).unwrap();
@@ -5770,6 +5893,12 @@ mod tests {
             "the indicator must name the wait"
         );
         assert!(
+            // ASCII only: `screen_of` flattens each cell to its first char, so
+            // the wide "💭" glyph does not survive the comparison.
+            screen.contains("Planner thought"),
+            "reasoning must wear the same header the execution view gives it"
+        );
+        assert!(
             screen.contains("comparing YAML"),
             "streamed reasoning must be visible"
         );
@@ -5777,6 +5906,143 @@ mod tests {
             screen.contains(spinner_frame(app.tick)),
             "the wait must be animated, not a static label"
         );
+    }
+
+    /// Compact by default, full body in verbose mode — exactly as a task's
+    /// Execution section behaves, and reachable here because the authoring
+    /// keymap keeps Ctrl+O.
+    #[test]
+    fn planner_reasoning_opens_in_verbose_mode() {
+        let mut app = authoring_app("");
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.waiting = true;
+            // Longer than the compact preview, so the tail only appears once
+            // the body is opened.
+            state.log.append_thought(
+                StreamRole::Planner,
+                format!(
+                    "first the state machine {}\nthen the transitions and their guards",
+                    "and its states ".repeat(12)
+                ),
+            );
+        }
+
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        assert!(
+            !screen_of(&terminal).contains("their guards"),
+            "compact mode shows a preview, not the whole reasoning"
+        );
+
+        app.update(crate::app::AppEvent::ToggleVerbose);
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        assert!(
+            screen_of(&terminal).contains("their guards"),
+            "verbose mode must open the reasoning body"
+        );
+    }
+
+    /// The conversation is rendered by the exchange stream, so operator and
+    /// planner turns wear role headers and role-coloured rails rather than the
+    /// old "You: " / "Planner: " prefixes.
+    #[test]
+    fn the_authoring_transcript_renders_as_an_exchange_stream() {
+        let mut app = authoring_app("");
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.push_operator("an fsm cli".into());
+            state.push_planner("YAML or TOML?".into());
+        }
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(screen.contains("▶ You"), "the operator lane must be named");
+        assert!(
+            screen.contains("◀ Planner"),
+            "the planner lane must be named"
+        );
+        assert!(screen.contains("an fsm cli") && screen.contains("YAML or TOML?"));
+
+        let planner = app.active_theme.get(crate::theme::ThemeRole::Accent);
+        let railed = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.fg == planner && cell.symbol() == "│");
+        assert!(
+            railed,
+            "the planner's turn must carry the same role rail an agent's does"
+        );
+    }
+
+    /// A tool the planner runs shows up the way a task's tool calls do.
+    #[test]
+    fn planner_tool_calls_render_like_a_task_s() {
+        let mut app = authoring_app("");
+        if let Some(state) = app.plan_authoring.as_mut() {
+            state.log.start_tool(
+                StreamRole::Planner,
+                "t1".into(),
+                "Read README.md".into(),
+                Some("read".into()),
+                "completed".into(),
+                None,
+            );
+        }
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Read README.md [completed]"),
+            "a planner tool row must read like an agent's: {screen}"
+        );
+    }
+
+    /// A transcript taller than the pane scrolls, and follows its own tail —
+    /// the same auto-follow the exchange pane has always had.
+    #[test]
+    fn a_long_authoring_transcript_scrolls_to_its_tail() {
+        let mut app = authoring_app("");
+        if let Some(state) = app.plan_authoring.as_mut() {
+            for turn in 0..40 {
+                state.push_operator(format!("question {turn}"));
+                state.push_planner(format!("answer {turn}"));
+            }
+        }
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("answer 39"),
+            "the newest turn must be on screen: {screen}"
+        );
+        assert!(
+            !screen.contains("question 0\n") && !screen.contains("question 1 "),
+            "the oldest turns must have scrolled off"
+        );
+        assert!(
+            app.last_scroll_maxes
+                .borrow()
+                .get(&ScrollablePanel::Exchange)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "the pane must report a scrollable extent"
+        );
+    }
+
+    /// An empty conversation says what to do rather than showing a blank slab.
+    #[test]
+    fn an_empty_authoring_transcript_prompts_the_operator() {
+        let app = authoring_app("");
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        assert!(screen_of(&terminal).contains("Nothing said yet"));
     }
 
     /// The spinner advances with the tick the rest of the UI animates on.
@@ -8730,7 +8996,7 @@ mod tests {
         use std::sync::Arc;
 
         let entry = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Prompt {
                 text: "Please **review** this:\n\n```rust\nlet prompt_markdown = true;\n```"
                     .to_string(),
@@ -8771,7 +9037,7 @@ mod tests {
         use std::sync::Arc;
 
         let entry = ExchangeEntry {
-            role: AgentRole::Reviewer,
+            role: StreamRole::Agent(AgentRole::Reviewer),
             content: ExchangeContent::Response {
                 text: r#"{"verdict":"approve"}"#.to_string(),
                 complete: true,
@@ -8813,7 +9079,7 @@ mod tests {
         use std::sync::Arc;
 
         let entry = ExchangeEntry {
-            role: AgentRole::Reviewer,
+            role: StreamRole::Agent(AgentRole::Reviewer),
             content: ExchangeContent::Response {
                 text: r#"{"verdict":"reject","feedback":"Add **coverage** for the empty-input case."}"#
                     .to_string(),
@@ -8861,7 +9127,7 @@ mod tests {
         use std::sync::Arc;
 
         let entry = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "tool-markdown".to_string(),
                 title: "Reading tool output".to_string(),
@@ -8914,7 +9180,7 @@ mod tests {
         use std::sync::Arc;
 
         let entry = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "tool-indented-markdown".to_string(),
                 title: "Reading markdown output".to_string(),
@@ -8952,13 +9218,13 @@ mod tests {
         use std::sync::Arc;
 
         let thought = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Thought {
                 text: "Considering **markdown** preview text.".to_string(),
             },
         };
         let tool = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "tool-preview".to_string(),
                 title: "Reading notes".to_string(),
@@ -9138,7 +9404,7 @@ mod tests {
         // the BOLD modifier is lost, and the text is rendered with the
         // response's Cyan base colour (not the old diff Green).
         let entry = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Response {
                 text: "+added bold line".to_string(), // ANSI removed for clarity
                 complete: true,
@@ -9188,13 +9454,13 @@ mod tests {
         // A Developer thought followed by a completed Developer tool whose
         // content carries a `@@` hunk header and a `+added line` diff line.
         let thought = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Thought {
                 text: "considering the trait".to_string(),
             },
         };
         let tool = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "tool-1".to_string(),
                 title: "Editing src/lib.rs".to_string(),
@@ -10040,7 +10306,7 @@ mod tests {
         );
 
         let tool = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "tool-1".to_string(),
                 title: format!("Editing {worktree_path}"),
@@ -10803,13 +11069,13 @@ mod tests {
         use makina_core::api::AgentRole;
 
         let thought = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Thought {
                 text: "verbose thought body here".to_string(),
             },
         };
         let tool = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "verbose-tool".to_string(),
                 title: "Editing lib.rs".to_string(),
@@ -10893,13 +11159,13 @@ mod tests {
         let app = App::new(api, vec![], std::path::PathBuf::from("."));
 
         let thought = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Thought {
                 text: "I need to inspect the exchange row renderer before patching it.".to_string(),
             },
         };
         let plan_tool = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "plan-tool".to_string(),
                 title: "Updating plan".to_string(),
@@ -10909,7 +11175,7 @@ mod tests {
             },
         };
         let write_tool = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "write-tool".to_string(),
                 title: "Write `src/model.rs`".to_string(),
@@ -10968,13 +11234,13 @@ mod tests {
         let app = App::new(api, vec![], std::path::PathBuf::from("."));
         let entries = vec![
             ExchangeEntry {
-                role: AgentRole::Reviewer,
+                role: StreamRole::Agent(AgentRole::Reviewer),
                 content: ExchangeContent::Thought {
                     text: "first reviewer pass".to_string(),
                 },
             },
             ExchangeEntry {
-                role: AgentRole::Reviewer,
+                role: StreamRole::Agent(AgentRole::Reviewer),
                 content: ExchangeContent::Tool {
                     id: "read-1".to_string(),
                     title: "Read src/lib.rs".to_string(),
@@ -10984,7 +11250,7 @@ mod tests {
                 },
             },
             ExchangeEntry {
-                role: AgentRole::Reviewer,
+                role: StreamRole::Agent(AgentRole::Reviewer),
                 content: ExchangeContent::Thought {
                     text: "second reviewer pass".to_string(),
                 },
@@ -11032,7 +11298,7 @@ mod tests {
         let api = Arc::new(PlaceholderApi::new());
         let app = App::new(api, vec![], std::path::PathBuf::from("."));
         let tool = ExchangeEntry {
-            role: AgentRole::Developer,
+            role: StreamRole::Agent(AgentRole::Developer),
             content: ExchangeContent::Tool {
                 id: "write-tool".to_string(),
                 title: "Write `src/model.rs`".to_string(),
@@ -12991,14 +13257,14 @@ mod tests {
             ExchangeLog {
                 entries: vec![
                     ExchangeEntry {
-                        role: AgentRole::Developer,
+                        role: StreamRole::Agent(AgentRole::Developer),
                         content: ExchangeContent::Response {
                             text: "This developer response is intentionally long so it wraps across multiple terminal rows before the reviewer section begins.".to_string(),
                             complete: true,
                         },
                     },
                     ExchangeEntry {
-                        role: AgentRole::Reviewer,
+                        role: StreamRole::Agent(AgentRole::Reviewer),
                         content: ExchangeContent::Thought {
                             text: "Reviewer starts here.".to_string(),
                         },
