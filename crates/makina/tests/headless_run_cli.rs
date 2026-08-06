@@ -27,10 +27,33 @@ fn makina_bin() -> std::path::PathBuf {
     path.join("makina")
 }
 
+/// An isolated `HOME` carrying a minimal, valid global config.
+///
+/// Without this the child inherits the developer's `~/.makina/config.toml`, so
+/// the outcome depends on whose machine runs the test: config resolution
+/// happens before the plan is inspected, and it fails outright when no backend
+/// is configured. The backend command is written explicitly rather than left to
+/// PATH auto-detection, which would otherwise resolve on a machine with an
+/// agent CLI installed and not on CI. Nothing here is ever spawned — every test
+/// in this file rejects before dispatching a turn.
+fn isolated_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("temp HOME");
+    let makina = home.path().join(".makina");
+    std::fs::create_dir_all(&makina).expect("create .makina");
+    std::fs::write(
+        makina.join("config.toml"),
+        "[backend]\ncommand = \"agent-that-is-never-spawned\"\nargs = []\n",
+    )
+    .expect("write global config");
+    home
+}
+
 fn run(cwd: &Path, args: &[&str]) -> (i32, String) {
+    let home = isolated_home();
     let output = Command::new(makina_bin())
         .args(args)
         .current_dir(cwd)
+        .env("HOME", home.path())
         .output()
         .expect("makina binary runs");
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
