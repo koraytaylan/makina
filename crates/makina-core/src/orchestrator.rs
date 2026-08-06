@@ -3032,67 +3032,113 @@ impl AuthoringCoordinator {
         let base_oid = crate::plan::GitObjectId::parse(base.clone(), format)
             .map_err(|error| invalid(error.to_string()))?;
 
-        let workstreams = blueprint
-            .workstreams
-            .into_iter()
-            .map(|workstream| {
-                Ok(GeneratedWorkstream {
-                    id: WorkstreamId::parse(workstream.id)
-                        .map_err(|error| invalid(error.to_string()))?,
+        // Everything the blueprint gets wrong, collected in one sweep. Bailing
+        // on the first bad field meant a blueprint with the same mistake in
+        // three tasks cost three regeneration rounds, each revealing one more.
+        let mut violations: Vec<String> = Vec::new();
+        let mut workstreams = Vec::with_capacity(blueprint.workstreams.len());
+        for (index, workstream) in blueprint.workstreams.into_iter().enumerate() {
+            match WorkstreamId::parse(workstream.id) {
+                Ok(id) => workstreams.push(GeneratedWorkstream {
+                    id,
                     title: workstream.title,
-                })
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
+                }),
+                Err(error) => violations.push(format!("workstreams[{index}]: {error}")),
+            }
+        }
         let mut tasks = Vec::with_capacity(blueprint.tasks.len());
-        for task in blueprint.tasks {
+        for (index, task) in blueprint.tasks.into_iter().enumerate() {
+            // Positional, because the id itself may be what failed to parse.
+            let label = format!("tasks[{index}] `{}`", task.title);
             let kind = match task.kind.as_str() {
-                "task" => TaskKind::Task,
-                "spike" => TaskKind::Spike,
-                "chore" => TaskKind::Chore,
-                _ => {
-                    return Err(invalid(format!(
-                        "invalid generated task kind `{}`",
-                        task.kind
-                    )));
+                "task" => Some(TaskKind::Task),
+                "spike" => Some(TaskKind::Spike),
+                "chore" => Some(TaskKind::Chore),
+                other => {
+                    violations.push(format!(
+                        "{label}: kind `{other}` is not task, spike, or chore"
+                    ));
+                    None
                 }
             };
-            let sequence =
-                TaskSequence::parse(task.sequence).map_err(|error| invalid(error.to_string()))?;
-            let id = PlanTaskId::parse(task.id).map_err(|error| invalid(error.to_string()))?;
-            let workstream =
-                WorkstreamId::parse(task.workstream).map_err(|error| invalid(error.to_string()))?;
+            let sequence = match TaskSequence::parse(task.sequence) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    violations.push(format!("{label}: {error}"));
+                    None
+                }
+            };
+            let id = match PlanTaskId::parse(task.id) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    violations.push(format!("{label}: {error}"));
+                    None
+                }
+            };
+            let workstream = match WorkstreamId::parse(task.workstream) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    violations.push(format!("{label}: {error}"));
+                    None
+                }
+            };
+            // `parse_generated_repo_pattern` reads only this path's ancestors —
+            // it is deciding whether a pattern reaches into coordinator-owned
+            // territory — so an unresolved filename cannot change its verdict.
+            // Naming it lets `touches` be checked even when the task's identity
+            // fields are what failed, which is the whole point of one sweep.
             let task_path = key.relative_dir.join("tasks").join(format!(
                 "{}{}-{}.md",
-                &workstream.as_str()[2..],
-                sequence,
-                id
+                workstream
+                    .as_ref()
+                    .map_or("00", |value| &value.as_str()[2..]),
+                sequence
+                    .as_ref()
+                    .map_or_else(|| "00".to_owned(), ToString::to_string),
+                id.as_ref().map_or("unresolved", PlanTaskId::as_str)
             ));
-            let touches = task
-                .touches
-                .iter()
-                .map(|value| parse_generated_repo_pattern(value, kind, &task_path))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| invalid(error.to_string()))?;
-            tasks.push(GeneratedTaskDocument {
-                sequence,
-                frontmatter: TaskFrontmatter {
-                    id,
-                    title: task.title,
-                    workstream,
-                    kind,
-                    depends_on: task
-                        .depends_on
-                        .into_iter()
-                        .map(PlanTaskId::parse)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| invalid(error.to_string()))?,
-                    gated: task.gated,
-                    touches,
-                    status: AuthoredTaskStatus::Planned,
-                    merged_as: None,
-                },
-                body: task.body,
-            });
+            let mut touches = Vec::with_capacity(task.touches.len());
+            for value in &task.touches {
+                // An unparseable kind only relaxes the `.makina` chore
+                // exception, so the strictest reading is the safe stand-in.
+                match parse_generated_repo_pattern(
+                    value,
+                    kind.unwrap_or(TaskKind::Task),
+                    &task_path,
+                ) {
+                    Ok(pattern) => touches.push(pattern),
+                    Err(error) => violations.push(format!("{label}: touches {value:?}: {error}")),
+                }
+            }
+            let mut depends_on = Vec::with_capacity(task.depends_on.len());
+            for dependency in task.depends_on {
+                match PlanTaskId::parse(dependency) {
+                    Ok(value) => depends_on.push(value),
+                    Err(error) => violations.push(format!("{label}: depends_on: {error}")),
+                }
+            }
+            if let (Some(kind), Some(sequence), Some(id), Some(workstream)) =
+                (kind, sequence, id, workstream)
+            {
+                tasks.push(GeneratedTaskDocument {
+                    sequence,
+                    frontmatter: TaskFrontmatter {
+                        id,
+                        title: task.title,
+                        workstream,
+                        kind,
+                        depends_on,
+                        gated: task.gated,
+                        touches,
+                        status: AuthoredTaskStatus::Planned,
+                        merged_as: None,
+                    },
+                    body: task.body,
+                });
+            }
+        }
+        if !violations.is_empty() {
+            return Err(invalid(render_blueprint_violations(&violations)));
         }
         let authored = crate::plan::GeneratedPlanBundle {
             key: key.clone(),
@@ -3111,6 +3157,16 @@ impl AuthoringCoordinator {
             workstreams,
             tasks,
         };
+        // Ask for every authoring fault before rendering, so the report is not
+        // truncated to whichever one `render_files` happens to hit first.
+        let violations = authored
+            .authoring_violations()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !violations.is_empty() {
+            return Err(invalid(render_blueprint_violations(&violations)));
+        }
         let files = authored
             .render_files()
             .map_err(|error| invalid(format!("generated blueprint is invalid: {error}")))?;
@@ -3201,20 +3257,48 @@ impl AuthoringCoordinator {
     }
 }
 
+/// Longest list of faults reported in one rejection.
+///
+/// The rejection is handed back to the planner as the correction to apply, so
+/// the whole of it becomes prompt. A blueprint with more faults than this is
+/// not one more round trip away from correct anyway.
+const MAX_REPORTED_VIOLATIONS: usize = 8;
+
+/// Join a set of faults into one bounded, readable rejection.
+fn render_violations(headline: &str, violations: &[String], empty: &str) -> String {
+    if violations.is_empty() {
+        return empty.to_owned();
+    }
+    let rendered = violations
+        .iter()
+        .take(MAX_REPORTED_VIOLATIONS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    match violations.len().saturating_sub(MAX_REPORTED_VIOLATIONS) {
+        0 => format!("{headline}: {rendered}"),
+        elided => format!("{headline}: {rendered}; and {elided} more"),
+    }
+}
+
+/// Render everything wrong with a blueprint before it could be rendered at all.
+fn render_blueprint_violations(violations: &[String]) -> String {
+    render_violations(
+        "generated blueprint is invalid",
+        violations,
+        "generated blueprint is invalid",
+    )
+}
+
 /// Render bundle diagnostics for the reader who has to act on them.
 ///
 /// Debug-formatting the vector produced a wall of `PlanValidationDiagnostic {
 /// code: "…", path: "…", … }` structs. That string is not an internal detail:
 /// it reaches the authoring transcript, and it is handed back to the planner as
-/// the correction to apply. Bounded, because the whole of it becomes prompt.
+/// the correction to apply.
 fn render_generation_diagnostics(diagnostics: &[crate::plan::PlanValidationDiagnostic]) -> String {
-    const MAX_REPORTED: usize = 8;
-    if diagnostics.is_empty() {
-        return "generated bundle validation failed without a diagnostic".into();
-    }
     let rendered = diagnostics
         .iter()
-        .take(MAX_REPORTED)
         .map(|diagnostic| {
             let field = diagnostic
                 .field
@@ -3228,12 +3312,12 @@ fn render_generation_diagnostics(diagnostics: &[crate::plan::PlanValidationDiagn
                 diagnostic.message
             )
         })
-        .collect::<Vec<_>>()
-        .join("; ");
-    match diagnostics.len().saturating_sub(MAX_REPORTED) {
-        0 => format!("generated bundle validation failed: {rendered}"),
-        elided => format!("generated bundle validation failed: {rendered}; and {elided} more"),
-    }
+        .collect::<Vec<_>>();
+    render_violations(
+        "generated bundle validation failed",
+        &rendered,
+        "generated bundle validation failed without a diagnostic",
+    )
 }
 
 impl CoreApi {
@@ -7285,6 +7369,32 @@ mod tests {
         let rendered = render_generation_diagnostics(&many);
         assert!(rendered.contains("and 12 more"), "{rendered}");
         assert!(!rendered.contains("tasks/8.md"), "{rendered}");
+    }
+
+    /// Blueprint faults are reported together, under the same bound — the whole
+    /// string becomes prompt whichever stage produced it.
+    #[test]
+    fn blueprint_violations_are_joined_and_bounded() {
+        let joined = render_blueprint_violations(&[
+            "tasks[0] `first`: touches: only single-segment `*` is permitted".into(),
+            "tasks[1] `second`: kind `epic` is not task, spike, or chore".into(),
+        ]);
+        assert!(
+            joined.starts_with("generated blueprint is invalid: "),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("tasks[0]") && joined.contains("tasks[1]"),
+            "{joined}"
+        );
+        assert!(!joined.contains("more"), "nothing was elided: {joined}");
+
+        let many = (0..20)
+            .map(|index| format!("fault {index}"))
+            .collect::<Vec<_>>();
+        let bounded = render_blueprint_violations(&many);
+        assert!(bounded.contains("and 12 more"), "{bounded}");
+        assert!(!bounded.contains("fault 8"), "{bounded}");
     }
 
     /// Build a `Config` with NO gates (the gate loop is a no-op) so the develop

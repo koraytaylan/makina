@@ -101,6 +101,90 @@ fn authoring_rejects_tasks_outside_declared_workstreams() {
     assert!(bundle.render_files().is_err());
 }
 
+/// A valid bundle has nothing to report.
+#[test]
+fn a_renderable_bundle_reports_no_violations() {
+    assert_eq!(bundle().authoring_violations(), vec![]);
+}
+
+/// Independent faults are independent, so one pass must name them all.
+///
+/// Reporting only the first turned a blueprint with four mistakes into four
+/// regeneration rounds, each revealing exactly one more.
+#[test]
+fn every_authoring_violation_is_reported_in_one_pass() {
+    let mut bundle = bundle();
+    bundle.initial_status.outcome = String::new();
+    bundle.initial_status.last_updated = "20th July".into();
+    bundle.tasks[0].frontmatter.workstream = WorkstreamId::parse("0002").unwrap();
+
+    let reported = bundle
+        .authoring_violations()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    for expected in [
+        "outcome: must not be empty",
+        "last_updated: must be YYYY-MM-DD",
+        "references undeclared workstream 0002",
+    ] {
+        assert!(
+            reported
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "{expected:?} must be reported alongside the rest: {reported:?}",
+        );
+    }
+    // The first is still what `render_files` surfaces, so the two agree.
+    assert!(bundle.render_files().is_err());
+}
+
+/// The blanket "declare the typed workstreams exactly once" named neither the
+/// file nor the workstream, leaving the author to diff two documents by eye.
+#[test]
+fn workstream_declaration_violations_name_the_file_and_the_workstream() {
+    let mut bundle = bundle();
+    bundle.workstreams.push(GeneratedWorkstream {
+        id: WorkstreamId::parse("0002").unwrap(),
+        title: "Extra".into(),
+    });
+    // 0002 is declared in Architecture but missing from Scope, and Scope
+    // misnames 0001 — two faults, both of them Scope's.
+    bundle
+        .architecture
+        .push_str("\n\n## 0002 — Extra\n\nThe second workstream.");
+    bundle.scope = bundle.scope.replace("Core.", "Kernel.");
+
+    let reported = bundle
+        .authoring_violations()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    assert!(
+        reported
+            .iter()
+            .any(|violation| violation.contains("SCOPE.md does not declare workstream 0002")),
+        "the missing declaration must name its file: {reported:?}",
+    );
+    assert!(
+        reported.iter().any(|violation| {
+            violation.contains("SCOPE.md names workstream 0001 `Kernel`")
+                && violation.contains("`Core`")
+        }),
+        "the renamed workstream must show both names: {reported:?}",
+    );
+    // Architecture declares both correctly, so it must not be blamed for
+    // either — only the document at fault is named.
+    assert!(
+        !reported
+            .iter()
+            .any(|violation| violation.contains("ARCHITECTURE.md")),
+        "the correct document must not be reported: {reported:?}",
+    );
+}
+
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(["-c", "commit.gpgsign=false"])

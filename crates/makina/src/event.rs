@@ -1249,9 +1249,12 @@ fn plan_author_recovery(reason: &str, repairs: usize) -> PlanAuthorRecovery {
 ///
 /// Separate from [`PLAN_AUTHOR_REPAIR_ATTEMPTS`] because this is a different
 /// failure: the reply parsed cleanly and the fault is a contract violation the
-/// validator names precisely. It reports one violation at a time, so a budget
-/// of one or two would strand a blueprint that trips two independent rules —
-/// and the operator, who cannot see the contract, has nothing to contribute.
+/// validator names precisely, which the operator cannot act on anyway.
+///
+/// Three because validation has three stages that each report in full — the
+/// blueprint's fields must parse before the bundle can be assembled, and the
+/// bundle must be renderable before it can be loaded back — so a blueprint
+/// faulting at every stage still converges within the budget.
 const PLAN_AUTHOR_GENERATION_ATTEMPTS: usize = 3;
 
 /// Decide whether a rejected blueprint is worth handing back.

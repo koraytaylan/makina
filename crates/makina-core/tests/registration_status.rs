@@ -105,6 +105,102 @@ async fn generate_command_publishes_direct_r_without_operator_files_or_run_side_
     );
 }
 
+/// One rejection names every fault, across every task.
+///
+/// The author of a blueprint is an agent that gets one message back per
+/// attempt. Bailing on the first bad field meant the same mistake repeated in
+/// three tasks cost three regeneration rounds — and the `touches` grammar,
+/// which is the easiest rule to get wrong, was checked one task at a time.
+#[tokio::test]
+async fn a_rejected_blueprint_reports_every_fault_in_one_message() {
+    use makina_core::api::{
+        GeneratedInitialStatusBlueprint, GeneratedPlanBlueprint, GeneratedTaskBlueprint,
+        GeneratedWorkstreamBlueprint,
+    };
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "develop"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "generated@example.invalid"],
+    );
+    git(repo.path(), &["config", "user.name", "Generated Test"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
+    fs::write(repo.path().join(".gitignore"), ".makina/\n").unwrap();
+    fs::write(repo.path().join("docs/plans/STATUS.md"), "# Plans\n\n| Plan | Title | Status | Progress | Outcome | Link |\n|---|---|---|---|---|---|\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "base"]);
+    let state_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", state_home.path()) };
+    let api = build_api(repo.path());
+
+    let task =
+        |sequence: &str, id: &str, kind: &str, touches: Vec<String>| GeneratedTaskBlueprint {
+            sequence: sequence.into(),
+            id: id.into(),
+            title: id.into(),
+            workstream: "0001".into(),
+            kind: kind.into(),
+            depends_on: vec![],
+            touches,
+            gated: false,
+            body: format!("# {id}\n\nWork.\n\n**Steps:**\n\n1. Do it.\n\n- **Done when:** done."),
+        };
+    let blueprint = GeneratedPlanBlueprint {
+        slug: "multi-fault".into(),
+        title: "Multi Fault".into(),
+        scope: "## In scope\n\n- **0001 — Core.** Generate the bundle.".into(),
+        architecture: "## 0001 — Core\n\nRender the canonical bundle.".into(),
+        initial_status: GeneratedInitialStatusBlueprint {
+            goal: "publish one plan.".into(),
+            root_cause: "free-form output is not executable.".into(),
+            approach: "render typed documents.".into(),
+            outcome: "the bundle is ready.".into(),
+            last_updated: "2026-07-20".into(),
+        },
+        workstreams: vec![GeneratedWorkstreamBlueprint {
+            id: "0001".into(),
+            title: "Core".into(),
+        }],
+        tasks: vec![
+            // The reported failure: a glob with a `*` inside a segment.
+            task("01", "first", "task", vec!["src/**/*.rs".into()]),
+            // The same mistake again, plus an unsupported kind. Neither was
+            // reachable before the first task's `touches` was fixed.
+            task(
+                "02",
+                "second",
+                "epic",
+                vec!["crates/*/src/**/mod.rs".into()],
+            ),
+        ],
+    };
+
+    let error = api
+        .execute(Command::GeneratePlanBundle { blueprint })
+        .await
+        .expect_err("the blueprint is invalid");
+    let reported = error.to_string();
+
+    for expected in [
+        "tasks[0]",
+        "src/**/*.rs",
+        "tasks[1]",
+        "crates/*/src/**/mod.rs",
+        "kind `epic`",
+    ] {
+        assert!(
+            reported.contains(expected),
+            "{expected:?} must appear in the single rejection: {reported}",
+        );
+    }
+    assert!(
+        !repo.path().join("docs/plans/0001-multi-fault").exists(),
+        "a rejected blueprint must leave nothing behind",
+    );
+}
+
 #[tokio::test]
 async fn generated_closed_bundle_registers_without_operator_materialization_and_reuses_r() {
     let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;

@@ -1503,7 +1503,15 @@ impl GeneratedPlanBundle {
         Ok(files)
     }
 
-    fn validate_authoring_data(&self) -> Result<(), PlanDocumentError> {
+    /// Every authoring rule this bundle breaks, not just the first.
+    ///
+    /// The single implementation; [`Self::validate_authoring_data`] reports the
+    /// first of these. A generated bundle is written by an agent that gets one
+    /// message back per attempt, so stopping at the first violation turned a
+    /// blueprint with four independent faults into four regeneration rounds.
+    /// Empty means the bundle is renderable.
+    pub fn authoring_violations(&self) -> Vec<PlanDocumentError> {
+        let mut violations = Vec::new();
         for (field, value) in [
             ("title", self.title.as_str()),
             ("scope", self.scope.as_str()),
@@ -1515,10 +1523,9 @@ impl GeneratedPlanBundle {
             ("base_name", self.initial_status.base_name.as_str()),
         ] {
             if value.trim().is_empty() {
-                return Err(field_error(field, "must not be empty"));
-            }
-            if value.contains('\0') || value.contains('\r') {
-                return Err(field_error(field, "contains forbidden control characters"));
+                violations.push(field_error(field, "must not be empty"));
+            } else if value.contains('\0') || value.contains('\r') {
+                violations.push(field_error(field, "contains forbidden control characters"));
             }
         }
         let date = self.initial_status.last_updated.as_bytes();
@@ -1530,22 +1537,33 @@ impl GeneratedPlanBundle {
                 .enumerate()
                 .any(|(index, byte)| !matches!(index, 4 | 7) && !byte.is_ascii_digit())
         {
-            return Err(field_error("last_updated", "must be YYYY-MM-DD"));
+            violations.push(field_error("last_updated", "must be YYYY-MM-DD"));
         }
         let workstreams = self
             .workstreams
             .iter()
             .map(|workstream| workstream.id.as_str())
             .collect::<BTreeSet<_>>();
-        if workstreams.len() != self.workstreams.len() {
-            return Err(field_error("workstreams", "IDs must be unique"));
-        }
-        if self
+        let mut seen = BTreeSet::new();
+        for duplicate in self
             .workstreams
             .iter()
-            .any(|workstream| workstream.title.trim().is_empty())
+            .filter(|workstream| !seen.insert(workstream.id.as_str()))
         {
-            return Err(field_error("workstreams", "titles must not be empty"));
+            violations.push(field_error(
+                "workstreams",
+                &format!("ID {} is declared more than once", duplicate.id),
+            ));
+        }
+        for workstream in self
+            .workstreams
+            .iter()
+            .filter(|workstream| workstream.title.trim().is_empty())
+        {
+            violations.push(field_error(
+                "workstreams",
+                &format!("{} has an empty title", workstream.id),
+            ));
         }
         let expected_workstreams = self
             .workstreams
@@ -1557,42 +1575,55 @@ impl GeneratedPlanBundle {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let (scope_workstreams, scope_duplicates) = scope_workstreams(&self.scope);
-        let (architecture_workstreams, architecture_duplicates) =
+        let (scope_found, scope_duplicates) = scope_workstreams(&self.scope);
+        let (architecture_found, architecture_duplicates) =
             architecture_workstreams(&self.architecture);
-        if !scope_duplicates.is_empty()
-            || !architecture_duplicates.is_empty()
-            || scope_workstreams != expected_workstreams
-            || architecture_workstreams != expected_workstreams
-        {
-            return Err(field_error(
-                "workstreams",
-                "scope and architecture must each declare the typed workstreams exactly once",
-            ));
-        }
+        violations.extend(declaration_violations(
+            "SCOPE.md",
+            &expected_workstreams,
+            &scope_found,
+            &scope_duplicates,
+        ));
+        violations.extend(declaration_violations(
+            "ARCHITECTURE.md",
+            &expected_workstreams,
+            &architecture_found,
+            &architecture_duplicates,
+        ));
         if self.tasks.is_empty() {
-            return Err(field_error("tasks", "must contain at least one task"));
+            violations.push(field_error("tasks", "must contain at least one task"));
         }
         for task in &self.tasks {
             if !workstreams.contains(task.frontmatter.workstream.as_str()) {
-                return Err(field_error(
+                violations.push(field_error(
                     "workstream",
-                    "task references an undeclared workstream",
+                    &format!(
+                        "task `{}` references undeclared workstream {}",
+                        task.frontmatter.id, task.frontmatter.workstream
+                    ),
                 ));
             }
         }
-        let paths = self
+        let mut filenames = BTreeSet::new();
+        for duplicate in self
             .tasks
             .iter()
             .map(task_filename)
-            .collect::<BTreeSet<_>>();
-        if paths.len() != self.tasks.len() {
-            return Err(field_error(
+            .filter(|filename| !filenames.insert(filename.clone()))
+        {
+            violations.push(field_error(
                 "tasks",
-                "canonical task filenames must be unique",
+                &format!("two tasks both render as `{duplicate}`"),
             ));
         }
-        Ok(())
+        violations
+    }
+
+    fn validate_authoring_data(&self) -> Result<(), PlanDocumentError> {
+        self.authoring_violations()
+            .into_iter()
+            .next()
+            .map_or(Ok(()), Err)
     }
 
     fn render_initial_status(&self, heading: &str) -> String {
@@ -1613,6 +1644,51 @@ impl GeneratedPlanBundle {
             short_oid,
         )
     }
+}
+
+/// How one authored document's workstream declarations differ from the typed
+/// `workstreams` list.
+///
+/// This used to be a single blanket message — "scope and architecture must each
+/// declare the typed workstreams exactly once" — which named neither the file
+/// nor the workstream, leaving the author to diff two documents by eye. Each
+/// discrepancy is now its own violation, so a regenerating agent is told what
+/// to write and where.
+fn declaration_violations(
+    file: &str,
+    expected: &BTreeMap<String, String>,
+    found: &BTreeMap<String, String>,
+    duplicates: &BTreeSet<String>,
+) -> Vec<PlanDocumentError> {
+    let mut violations = Vec::new();
+    for duplicate in duplicates {
+        violations.push(field_error(
+            "workstreams",
+            &format!("{file} declares workstream {duplicate} more than once"),
+        ));
+    }
+    for (id, title) in expected {
+        match found.get(id) {
+            None => violations.push(field_error(
+                "workstreams",
+                &format!("{file} does not declare workstream {id} — {title}"),
+            )),
+            Some(declared) if declared != title => violations.push(field_error(
+                "workstreams",
+                &format!(
+                    "{file} names workstream {id} `{declared}`, but workstreams says `{title}`"
+                ),
+            )),
+            Some(_) => {}
+        }
+    }
+    for id in found.keys().filter(|id| !expected.contains_key(*id)) {
+        violations.push(field_error(
+            "workstreams",
+            &format!("{file} declares workstream {id}, which is not in workstreams"),
+        ));
+    }
+    violations
 }
 
 fn render_authored_markdown(heading: &str, authored: &str) -> String {
