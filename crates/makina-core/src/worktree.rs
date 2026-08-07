@@ -128,6 +128,39 @@ pub struct IntegrationWorkspace {
     pub plan_branch: String,
 }
 
+/// What happened to the operator's base branch when a plan was registered.
+///
+/// Registration always publishes the plan onto `refs/heads/plan/{slug}`; this
+/// records whether the base branch was additionally fast-forwarded onto it, and
+/// when it was not, why. A `Skipped` is never a failure — the plan is durable on
+/// its own ref either way — but it is the difference between the operator seeing
+/// their new plan in `git log` and wondering where it went, so the reason
+/// travels with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseAdvance {
+    /// The base branch, and the checkout on it, now contain the plan commit.
+    Advanced,
+    /// The base branch was left untouched, for this reason.
+    Skipped { reason: String },
+}
+
+impl BaseAdvance {
+    /// Whether the plan commit reached the base branch.
+    pub fn advanced(&self) -> bool {
+        matches!(self, BaseAdvance::Advanced)
+    }
+
+    /// A one-line description suitable for a log line or an operator-facing note.
+    pub fn describe(&self, base_branch: &str) -> String {
+        match self {
+            BaseAdvance::Advanced => format!("landed on {base_branch}"),
+            BaseAdvance::Skipped { reason } => {
+                format!("not landed on {base_branch}: {reason}")
+            }
+        }
+    }
+}
+
 /// Summary returned by [`WorktreeManager::purge_makina_worktrees`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreePurgeReport {
@@ -631,6 +664,109 @@ impl WorktreeManager {
             ),
         }
         let _ = self.git_worktree_prune().await;
+    }
+
+    /// Fast-forward the base branch onto `commit`, when doing so cannot cost
+    /// the operator anything.
+    ///
+    /// # Why this is guarded rather than simply done
+    ///
+    /// Registration deliberately does not touch the operator's checkout: it
+    /// publishes `refs/heads/plan/{slug}` in one compare-and-swap transaction
+    /// precisely so a dirty working tree, a mid-edit index, or a moved base can
+    /// never be disturbed by authoring a plan. That safety is the reason the
+    /// plan bundle does not appear on the base branch — which is also why it
+    /// looks, to the person who just created a plan, as though nothing was
+    /// written at all.
+    ///
+    /// This closes that gap without giving up the property that motivated it.
+    /// The advance happens only when every one of these holds, and otherwise
+    /// the checkout is left exactly as it was and the reason is reported:
+    ///
+    /// * the base branch still points at `expected_base`, so `commit` is a
+    ///   direct fast-forward and no merge decision is being made on the
+    ///   operator's behalf;
+    /// * the checkout is actually on the base branch, so nothing is switched;
+    /// * the checkout has no uncommitted tracked changes, so nothing in flight
+    ///   can be overwritten.
+    ///
+    /// The final step is `git merge --ff-only`, which independently refuses
+    /// anything that is not a clean fast-forward — including one that would
+    /// clobber an untracked file. The gates above are what make the *outcome*
+    /// explainable; `--ff-only` is what makes it safe.
+    ///
+    /// Never fails the caller: the plan is already registered and durable on
+    /// its ref, so a declined advance is information, not an error.
+    pub async fn fast_forward_base_to(&self, commit: &str, expected_base: &str) -> BaseAdvance {
+        let skipped = |reason: String| BaseAdvance::Skipped { reason };
+
+        let current_base = match self
+            .run_git(
+                &["rev-parse", &self.base_branch],
+                "resolve base branch for plan landing",
+            )
+            .await
+        {
+            Ok(oid) => oid.trim().to_owned(),
+            Err(error) => {
+                return skipped(format!("could not resolve {}: {error}", self.base_branch));
+            }
+        };
+        if current_base != expected_base {
+            return skipped(format!(
+                "{} moved since the plan was validated; the plan stays on its own branch",
+                self.base_branch
+            ));
+        }
+
+        let head = match self
+            .run_git(
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                "resolve checkout branch for plan landing",
+            )
+            .await
+        {
+            Ok(head) => head.trim().to_owned(),
+            Err(error) => {
+                return skipped(format!("could not resolve the current checkout: {error}"));
+            }
+        };
+        if head != self.base_branch {
+            return skipped(format!(
+                "the checkout is on {head}, not {}; nothing was switched",
+                self.base_branch
+            ));
+        }
+
+        match self
+            .run_git(
+                &["status", "--porcelain", "--untracked-files=no"],
+                "inspect checkout before landing the plan",
+            )
+            .await
+        {
+            Ok(status) if !status.trim().is_empty() => {
+                return skipped(
+                    "the checkout has uncommitted changes; the plan stays on its own branch"
+                        .to_owned(),
+                );
+            }
+            Err(error) => {
+                return skipped(format!("could not inspect the checkout: {error}"));
+            }
+            Ok(_) => {}
+        }
+
+        match self
+            .run_git(
+                &["merge", "--ff-only", commit],
+                "land the plan on the base branch",
+            )
+            .await
+        {
+            Ok(_) => BaseAdvance::Advanced,
+            Err(error) => skipped(format!("git declined the fast-forward: {error}")),
+        }
     }
 
     /// Free `branch` from any other worktree currently holding it.

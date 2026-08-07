@@ -4096,6 +4096,13 @@ impl AuthoringCoordinator {
         self.worktree_manager
             .release_integration_workspace(&workspace)
             .await;
+        // NOTE: registration deliberately does NOT advance the base branch here.
+        // The base OID is an input to the registration identity — a response-loss
+        // retry recomputes the candidate against whatever base it finds — so
+        // moving base inside this transaction makes the operation non-idempotent
+        // and the retry collides with its own published ref. Landing the plan on
+        // base is a separate, explicit step (`Command::CheckOutPlan`), issued
+        // after this outcome has been observed.
         Ok(CommandOutcome::PlanRegistered {
             registration_oid: candidate,
         })
@@ -4123,6 +4130,68 @@ impl CoreApi {
             });
         }
         Ok(outcome)
+    }
+
+    /// Bring a registered plan into the operator's checkout.
+    ///
+    /// The plan's registration commit is a direct child of the base it was
+    /// validated against, so landing it is a fast-forward when that base is
+    /// still current. This runs the same guarded advance registration attempts
+    /// automatically — offered again for the cases where it declined — and
+    /// reports the precondition that failed rather than forcing anything.
+    async fn check_out_plan(
+        &self,
+        plan_dir: crate::plan::PlanKey,
+    ) -> Result<CommandOutcome, ApiError> {
+        async fn rev_parse(root: &Path, rev: &str) -> Option<String> {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "--verify", rev])
+                .output()
+                .await
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
+
+        let identity = plan_dir.plan_identity();
+        let plan_ref = format!("refs/heads/plan/{identity}");
+        let repo_root = &self.state.worktree_manager.repo_root;
+
+        let tip =
+            rev_parse(repo_root, &plan_ref)
+                .await
+                .ok_or_else(|| ApiError::InvalidCommand {
+                    reason: format!(
+                        "plan `{identity}` has no registration to check out; register it first"
+                    ),
+                })?;
+
+        // The registration commit's parent is the base it was validated
+        // against; landing it is only a fast-forward while base is still there.
+        let parent = rev_parse(repo_root, &format!("{tip}^"))
+            .await
+            .ok_or_else(|| ApiError::InvalidCommand {
+                reason: format!("could not resolve the base `{identity}` was registered against"),
+            })?;
+
+        match self
+            .state
+            .worktree_manager
+            .fast_forward_base_to(&tip, &parent)
+            .await
+        {
+            crate::worktree::BaseAdvance::Advanced => {
+                tracing::info!(plan = %identity, "checked the plan out onto the base branch");
+                Ok(CommandOutcome::Acknowledged)
+            }
+            crate::worktree::BaseAdvance::Skipped { reason } => Err(ApiError::InvalidCommand {
+                reason: format!("could not check out `{identity}`: {reason}"),
+            }),
+        }
     }
 
     async fn set_task_disposition(
@@ -7181,6 +7250,7 @@ impl Api for CoreApi {
     async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
         match command {
             Command::GeneratePlanBundle { blueprint } => self.generate_plan_bundle(blueprint).await,
+            Command::CheckOutPlan { plan_dir } => self.check_out_plan(plan_dir).await,
             Command::RegisterPlan {
                 plan_dir,
                 expected_base_oid,

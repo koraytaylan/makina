@@ -99,6 +99,9 @@ impl Api for PlaceholderApi {
                 reason: "plan generation requires a repository-bound API".into(),
             }),
             Command::RegisterPlan { .. } => Ok(CommandOutcome::Acknowledged),
+            Command::CheckOutPlan { .. } => Err(ApiError::InvalidCommand {
+                reason: "checking a plan out requires a repository-bound API".into(),
+            }),
             Command::SetTaskDisposition { run, .. } => {
                 if self
                     .runs

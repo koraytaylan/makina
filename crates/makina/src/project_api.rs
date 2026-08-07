@@ -310,6 +310,24 @@ impl ProjectApiRouter {
             .await
     }
 
+    /// Bring a registered plan's files into an explicitly selected project's
+    /// checkout.
+    ///
+    /// Project-qualified for the same reason [`Self::open_plan`] is: a
+    /// `PlanKey` is repository-relative, so the root has to be stated rather
+    /// than guessed from matching directory names across the workspace.
+    pub async fn check_out_plan(
+        &self,
+        project_root: &Path,
+        plan_dir: makina_core::plan::PlanKey,
+    ) -> Result<CommandOutcome, ApiError> {
+        let project_root = self.require_allowed_project(project_root)?;
+        self.project_api(&project_root)
+            .await?
+            .execute(Command::CheckOutPlan { plan_dir })
+            .await
+    }
+
     /// Open a plan in an explicitly selected workspace project.
     ///
     /// `PlanKey` is repository-relative, so the project root is deliberately
@@ -507,6 +525,10 @@ impl Api for ProjectApiRouter {
             }),
             Command::RegisterPlan { .. } => Err(ApiError::InvalidCommand {
                 reason: "RegisterPlan must be sent to a repository-bound API".into(),
+            }),
+            Command::CheckOutPlan { .. } => Err(ApiError::InvalidCommand {
+                reason: "CheckOutPlan must be sent with an explicit project through the router"
+                    .into(),
             }),
             Command::SetTaskDisposition {
                 run,

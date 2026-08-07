@@ -758,6 +758,8 @@ async fn resolve_io(
         }
         AppEvent::PurgeWorktrees => (AppEvent::Tick, purge_worktrees(app).await),
 
+        AppEvent::CheckOutPlan => check_out_plan(app, background_tx).await,
+
         // ── Settings commit (plan 0070) ──────────────────────────────────────
         // Write the edited caps, concurrency, and finalization mode back to the config file
         // (`{repo_root}/.makina/config.toml`). Validates all fields first;
@@ -1106,13 +1108,40 @@ fn spawn_generate_plan_bundle(
         // decides whether the conversation is retired or handed back.
         let outcome = match result {
             Ok(CommandOutcome::PlanGenerated { plan_dir, .. }) => {
+                // Land the new plan on the base branch, now that registration
+                // has been observed. Deliberately AFTER the outcome rather than
+                // inside it: the base OID is an input to the registration
+                // identity, so advancing base mid-transaction would make a
+                // response-loss retry recompute a different candidate and
+                // collide with its own published ref.
+                //
+                // Declining is normal and non-fatal (the base moved, the
+                // checkout is busy or on another branch) — the plan is durable
+                // on its ref either way, and `Check out plan files` retries it
+                // on demand.
+                let landed = match project_api.as_ref() {
+                    Some(router) => router
+                        .check_out_plan(&project_root, plan_dir.clone())
+                        .await
+                        .is_ok(),
+                    None => api
+                        .execute(Command::CheckOutPlan {
+                            plan_dir: plan_dir.clone(),
+                        })
+                        .await
+                        .is_ok(),
+                };
                 spawn_discover_plans(opened_folders, background_tx.clone(), false);
                 let label = plan_dir.relative_dir.display().to_string();
-                let _ = background_tx
-                    .send(AppEvent::StatusMessage(format!(
-                        "Generated {label}; select the registered plan to open or start it"
-                    )))
-                    .await;
+                let note = if landed {
+                    format!("Generated {label} and landed it on the base branch")
+                } else {
+                    format!(
+                        "Generated {label}; it lives on its plan branch — use \
+                         \"Check out plan files\" to bring it into your checkout"
+                    )
+                };
+                let _ = background_tx.send(AppEvent::StatusMessage(note)).await;
                 Ok(label)
             }
             Ok(other) => {
@@ -2268,6 +2297,61 @@ async fn retry_focused(app: &App) -> Result<String, crate::app::FailureNotice> {
     }
 
     Ok("nothing to retry here".to_string())
+}
+
+/// Bring the context plan's files into the working tree.
+///
+/// A registered plan is listed and runnable from its `refs/heads/plan/*` ref
+/// alone, so `docs/plans/` can be empty while the sidebar shows the plan. This
+/// is the explicit "put it in my checkout" action for when registration's own
+/// automatic advance declined — because the base had moved, the checkout was on
+/// another branch, or it had uncommitted work.
+async fn check_out_plan(
+    app: &App,
+    background_tx: &mpsc::Sender<AppEvent>,
+) -> (AppEvent, Option<String>) {
+    let Some(target) = app.context_plan_identity() else {
+        return (
+            AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                "Nothing to check out",
+                "No plan is selected. Focus one in the sidebar, or press [o] to pick a plan \
+                 directory."
+                    .to_string(),
+            )),
+            None,
+        );
+    };
+
+    let outcome = match app.project_api.as_ref() {
+        Some(router) => {
+            router
+                .check_out_plan(&target.project_root, target.plan_dir.clone())
+                .await
+        }
+        None => {
+            app.api
+                .execute(makina_core::api::Command::CheckOutPlan {
+                    plan_dir: target.plan_dir.clone(),
+                })
+                .await
+        }
+    };
+
+    match outcome {
+        Ok(_) => {
+            // The plan is in the working tree now, so re-discover: the sidebar's
+            // "not checked out" marker is derived from the filesystem.
+            spawn_discover_plans(app.opened_folders.clone(), background_tx.clone(), false);
+            (AppEvent::Tick, Some(format!("Checked out {}", target.slug)))
+        }
+        Err(error) => (
+            AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                format!("Could not check out {}", target.slug),
+                error.to_string(),
+            )),
+            None,
+        ),
+    }
 }
 
 fn operation_blocked_event(app: &App, attempted: &str) -> Option<AppEvent> {
@@ -5341,10 +5425,17 @@ mod tests {
         .expect("generation command did not finish");
         assert!(matches!(commands[0], Command::GeneratePlanBundle { .. }));
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        assert_eq!(
-            api.commands.lock().unwrap().len(),
-            1,
-            "generation must not open or start a run as a side effect"
+        // Authoring a plan must never begin executing it. Asserted by kind
+        // rather than by command count: generation legitimately follows up with
+        // `CheckOutPlan` to land the new plan on the base branch, which is not a
+        // run side effect — a count would have conflated the two.
+        let issued = api.commands.lock().unwrap().clone();
+        assert!(
+            !issued.iter().any(|command| matches!(
+                command,
+                Command::OpenPlan { .. } | Command::StartRun { .. }
+            )),
+            "generation must not open or start a run as a side effect; got {issued:?}"
         );
     }
 

@@ -515,3 +515,210 @@ async fn releasing_a_workspace_frees_the_plan_branch() {
         }
     }
 }
+
+/// A registered plan lands on the base branch when that costs the operator
+/// nothing — and is declined, with a reason, whenever it would not.
+///
+/// Registration publishes `refs/heads/plan/{slug}` either way; this is about
+/// whether the operator also sees it in `git log` and `docs/plans/`. The
+/// guards exist because the alternative — always writing to the checkout —
+/// is what the original design refused, for good reason.
+#[tokio::test]
+async fn a_plan_lands_on_base_only_when_the_checkout_is_clean_current_and_on_base() {
+    let _guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let old_home = std::env::var_os("HOME");
+    unsafe { std::env::set_var("HOME", home.path()) };
+    let repo = setup_temp_repo();
+    let manager = WorktreeManager::new(repo.path().to_owned(), "develop".into());
+
+    // A tracked file, so the checkout can be made genuinely dirty later.
+    std::fs::write(repo.path().join("tracked.txt"), "committed\n").unwrap();
+    git(repo.path(), &["add", "tracked.txt"]);
+    git(repo.path(), &["commit", "-m", "tracked fixture"]);
+
+    // Build a registration commit the way registration does: a child of base.
+    let base = git(repo.path(), &["rev-parse", "develop"])
+        .trim()
+        .to_owned();
+    let workspace = manager
+        .create_integration_workspace("0009-land", "generated-land01")
+        .await
+        .unwrap();
+    std::fs::write(workspace.path.join("planned.txt"), "bundle\n").unwrap();
+    git(&workspace.path, &["add", "planned.txt"]);
+    git(&workspace.path, &["commit", "-m", "chore(plan): register"]);
+    let candidate = git(&workspace.path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    manager
+        .publish_registration(&workspace, &candidate, &base)
+        .await
+        .unwrap();
+    manager.release_integration_workspace(&workspace).await;
+
+    // ── Declined: the checkout has uncommitted tracked work ──────────────────
+    std::fs::write(repo.path().join("tracked.txt"), "operator edit\n").unwrap();
+    let declined = manager.fast_forward_base_to(&candidate, &base).await;
+    assert!(
+        matches!(&declined, makina_core::worktree::BaseAdvance::Skipped { reason }
+            if reason.contains("uncommitted changes")),
+        "a busy checkout must be left alone; got {declined:?}"
+    );
+    assert!(
+        !repo.path().join("planned.txt").exists(),
+        "nothing may be written into a busy checkout"
+    );
+    git(repo.path(), &["checkout", "--", "tracked.txt"]);
+
+    // ── Declined: the operator is on another branch ──────────────────────────
+    git(repo.path(), &["checkout", "-q", "-b", "side"]);
+    let declined = manager.fast_forward_base_to(&candidate, &base).await;
+    assert!(
+        matches!(&declined, makina_core::worktree::BaseAdvance::Skipped { reason }
+            if reason.contains("not develop")),
+        "nothing may be switched under the operator; got {declined:?}"
+    );
+
+    // ── Advanced: clean, current, on base ────────────────────────────────────
+    git(repo.path(), &["checkout", "-q", "develop"]);
+    let advanced = manager.fast_forward_base_to(&candidate, &base).await;
+    assert!(
+        advanced.advanced(),
+        "a clean, current checkout must receive the plan; got {advanced:?}"
+    );
+    assert!(
+        repo.path().join("planned.txt").exists(),
+        "the plan files must now be in the working tree"
+    );
+    assert_eq!(
+        git(repo.path(), &["rev-parse", "develop"]).trim(),
+        candidate,
+        "develop must be fast-forwarded onto the registration commit"
+    );
+
+    unsafe {
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// Untracked scratch does not block landing.
+///
+/// Gating on untracked files would decline in most real repositories, which
+/// have build output and notes lying around — the same over-strictness that
+/// would have left this feature useless in practice. `git merge --ff-only`
+/// independently refuses any advance that would overwrite an untracked file,
+/// so the collision case is still safe without making every stray file fatal.
+#[tokio::test]
+async fn untracked_scratch_does_not_block_landing() {
+    let _guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let old_home = std::env::var_os("HOME");
+    unsafe { std::env::set_var("HOME", home.path()) };
+    let repo = setup_temp_repo();
+    let manager = WorktreeManager::new(repo.path().to_owned(), "develop".into());
+
+    let base = git(repo.path(), &["rev-parse", "develop"])
+        .trim()
+        .to_owned();
+    let workspace = manager
+        .create_integration_workspace("0011-scratch", "generated-scratch")
+        .await
+        .unwrap();
+    std::fs::write(workspace.path.join("planned.txt"), "bundle\n").unwrap();
+    git(&workspace.path, &["add", "planned.txt"]);
+    git(&workspace.path, &["commit", "-m", "chore(plan): register"]);
+    let candidate = git(&workspace.path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    manager
+        .publish_registration(&workspace, &candidate, &base)
+        .await
+        .unwrap();
+    manager.release_integration_workspace(&workspace).await;
+
+    std::fs::write(repo.path().join("scratch-notes.txt"), "my notes\n").unwrap();
+
+    let advanced = manager.fast_forward_base_to(&candidate, &base).await;
+    assert!(
+        advanced.advanced(),
+        "untracked scratch must not block the advance; got {advanced:?}"
+    );
+    assert!(
+        repo.path().join("scratch-notes.txt").exists(),
+        "the operator's untracked file must survive"
+    );
+    assert!(repo.path().join("planned.txt").exists());
+
+    unsafe {
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// A base that moved since validation is never merged over.
+///
+/// The registration commit is a child of the base it was validated against; if
+/// base has advanced past it, landing is no longer a fast-forward, and choosing
+/// a merge strategy is not this code's call.
+#[tokio::test]
+async fn a_moved_base_is_left_alone() {
+    let _guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let old_home = std::env::var_os("HOME");
+    unsafe { std::env::set_var("HOME", home.path()) };
+    let repo = setup_temp_repo();
+    let manager = WorktreeManager::new(repo.path().to_owned(), "develop".into());
+
+    let base = git(repo.path(), &["rev-parse", "develop"])
+        .trim()
+        .to_owned();
+    let workspace = manager
+        .create_integration_workspace("0010-moved", "generated-moved1")
+        .await
+        .unwrap();
+    git(
+        &workspace.path,
+        &["commit", "--allow-empty", "-m", "chore(plan): register"],
+    );
+    let candidate = git(&workspace.path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    manager
+        .publish_registration(&workspace, &candidate, &base)
+        .await
+        .unwrap();
+    manager.release_integration_workspace(&workspace).await;
+
+    // Base moves on after validation.
+    std::fs::write(repo.path().join("later.txt"), "newer work\n").unwrap();
+    git(repo.path(), &["add", "later.txt"]);
+    git(repo.path(), &["commit", "-m", "later base commit"]);
+    let moved_base = git(repo.path(), &["rev-parse", "develop"])
+        .trim()
+        .to_owned();
+
+    let declined = manager.fast_forward_base_to(&candidate, &base).await;
+    assert!(
+        matches!(&declined, makina_core::worktree::BaseAdvance::Skipped { reason }
+            if reason.contains("moved since the plan was validated")),
+        "a moved base must be reported, not merged; got {declined:?}"
+    );
+    assert_eq!(
+        git(repo.path(), &["rev-parse", "develop"]).trim(),
+        moved_base,
+        "develop must be exactly where the operator left it"
+    );
+
+    unsafe {
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}

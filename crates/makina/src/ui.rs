@@ -823,6 +823,17 @@ pub fn render(app: &App, frame: &mut Frame) {
                                     .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                             ));
                         }
+                        // A plan registered on its own ref but absent from the
+                        // working tree is real and runnable — but `docs/plans/`
+                        // looks empty, which reads as "nothing was created".
+                        // Naming the state is what stops that being a mystery.
+                        if !plan_entry.dir.exists() {
+                            line_spans.push(Span::styled(
+                                "  · not checked out",
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Info)),
+                            ));
+                        }
                         if app.resetting_label(&target).is_some() {
                             line_spans.push(Span::styled(
                                 format!("  {} resetting", spinner_frame(app.tick)),
@@ -990,6 +1001,17 @@ pub fn render(app: &App, frame: &mut Frame) {
                             ));
                         }
 
+                        // A plan registered on its own ref but absent from the
+                        // working tree is real and runnable — but `docs/plans/`
+                        // looks empty, which reads as "nothing was created".
+                        // Naming the state is what stops that being a mystery.
+                        if !plan_entry.dir.exists() {
+                            line_spans.push(Span::styled(
+                                "  · not checked out",
+                                Style::default()
+                                    .fg(app.active_theme.get(crate::theme::ThemeRole::Info)),
+                            ));
+                        }
                         if app.resetting_label(&target).is_some() {
                             line_spans.push(Span::styled(
                                 format!("  {} resetting", spinner_frame(app.tick)),

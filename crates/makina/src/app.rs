@@ -689,6 +689,10 @@ impl CommandPalette {
                 event: Box::new(AppEvent::PurgeWorktrees),
             },
             PaletteAction::Regular {
+                label: "Check out plan files",
+                event: Box::new(AppEvent::CheckOutPlan),
+            },
+            PaletteAction::Regular {
                 label: "Logs",
                 event: Box::new(AppEvent::OpenLogsTab),
             },
@@ -1256,6 +1260,12 @@ pub enum AppEvent {
     /// Open (or switch to) the process-wide log viewer tab. Raised by the
     /// command palette's "Logs" action.
     OpenLogsTab,
+
+    /// Bring the context plan's files into the working tree by fast-forwarding
+    /// the base branch onto its registration commit.
+    ///
+    /// Resolved in `resolve_io`; `update` does nothing for this variant.
+    CheckOutPlan,
     /// Advance one Logs filter control to its next value (`1`/`2`/`3`, or a
     /// click on the chip).
     CycleLogFilter(LogFilterControl),
@@ -5166,6 +5176,7 @@ impl App {
             | AppEvent::CancelRun
             | AppEvent::Reinterpret
             | AppEvent::RetryFocused
+            | AppEvent::CheckOutPlan
             | AppEvent::PurgeWorktrees => true,
 
             AppEvent::RequestResetRun => {
@@ -11110,8 +11121,8 @@ mod tests {
         let palette = app.command_palette.as_ref().unwrap();
         assert_eq!(
             palette.filtered().len(),
-            17,
-            "full list must include all 17 actions"
+            18,
+            "full list must include all 18 actions"
         );
         for label in [
             "Start run",
@@ -11121,6 +11132,7 @@ mod tests {
             "Reset selected plan/run",
             "Purge Makina worktrees",
             "Logs",
+            "Check out plan files",
         ] {
             assert!(
                 palette.actions.iter().any(|action| action.label() == label),
@@ -11163,7 +11175,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            17,
+            18,
             "full list restored after filter cleared"
         );
     }

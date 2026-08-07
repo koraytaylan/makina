@@ -430,6 +430,27 @@ pub enum Command {
         plan_dir: PlanKey,
     },
 
+    /// Bring a registered plan's files into the operator's checkout by
+    /// fast-forwarding the base branch onto its registration commit.
+    ///
+    /// A plan lives on `refs/heads/plan/{slug}` from the moment it is
+    /// registered, so it is listed and runnable without ever appearing in the
+    /// working tree. This is the explicit request to *also* have it on the base
+    /// branch — the same advance registration attempts automatically, offered
+    /// again for the cases where it declined (the base had moved, the checkout
+    /// was busy, the operator was on another branch).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::InvalidCommand`] when the plan has no registration
+    /// ref to land, or when the advance is not possible; the reason explains
+    /// which precondition failed. Never modifies a checkout it cannot advance
+    /// cleanly.
+    CheckOutPlan {
+        /// The registered plan to bring into the checkout.
+        plan_dir: PlanKey,
+    },
+
     /// Transition a [`RunStatus::Pending`] or [`RunStatus::Paused`] Run to
     /// [`RunStatus::Running`], allowing the orchestrator to dispatch agents.
     ///
@@ -1415,6 +1436,9 @@ mod tests {
             match command {
                 Command::GeneratePlanBundle { .. } => Err(ApiError::InvalidCommand {
                     reason: "plan generation is unavailable in StubApi".into(),
+                }),
+                Command::CheckOutPlan { .. } => Err(ApiError::InvalidCommand {
+                    reason: "checking a plan out is unavailable in StubApi".into(),
                 }),
                 Command::OpenPlan { plan_dir } => {
                     let id = self.alloc_id();
