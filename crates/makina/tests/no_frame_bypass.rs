@@ -4,7 +4,7 @@
 //! inside the **live-frame region** of the event loop — the source modules that
 //! run while a ratatui frame is live during [`makina::event::run`]. Any
 //! in-frame system error must instead flow through `tracing::error!`/
-//! `tracing::warn!` → the tracing TUI layer → the error pane
+//! `tracing::warn!` → the tracing TUI layer → the Logs tab
 //! (`tui-error-pane-channel-wire`), so nothing writes outside the frame and
 //! corrupts the alternate screen.
 //!
@@ -73,7 +73,7 @@ fn no_print_macros_in_live_frame_region() {
             count, 0,
             "live-frame region file {file} contains {count} eprintln!/println! \
              frame-bypass call(s); in-frame system errors must use \
-             tracing::error!/tracing::warn! so they flow into the error pane \
+             tracing::error!/tracing::warn! so they flow into the Logs tab \
              instead of corrupting the ratatui alternate screen",
         );
     }
@@ -92,7 +92,7 @@ fn main_rs_has_exactly_the_exempt_print_sites() {
          config-load failure before Tui::init(), terminal-init failure, \
          the post-tui.restore() error print, the planner mechanism fallback at startup, \
          workspace-load failure, and the Doctor 'w' pointer for empty-backend recovery); \
-         found {count}. A new print here likely means an in-frame error is bypassing the error pane \
+         found {count}. A new print here likely means an in-frame error is bypassing the Logs tab \
          — route it through tracing::error! instead.",
     );
 }

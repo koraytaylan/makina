@@ -42,7 +42,7 @@ use makina_core::log_record::LogRecord;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::app::{App, AppEvent, ErrorLevel, ErrorMessage, PlanIdentity, ResetConfirmation};
+use crate::app::{App, AppEvent, PlanIdentity, ResetConfirmation};
 use crate::tui::Tui;
 use crate::ui;
 
@@ -65,8 +65,8 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// (task `log-subscriber-tui-channel`): the `TuiLogLayer` `try_send`s a
 /// [`LogRecord`] per event onto it, at every level. A dedicated `tokio::select!`
 /// arm below drains it and feeds each record to `update` as
-/// [`AppEvent::LogRecordArrived`], which retains it for the Logs tab and derives
-/// the narrower Problems entry from the WARN/ERROR ones.
+/// [`AppEvent::LogRecordArrived`], which retains it for the Logs tab — the one
+/// place anything the process logs can be read back.
 ///
 /// # Errors
 ///
@@ -248,18 +248,14 @@ async fn resolve_api_event(
     AppEvent::ApiEvent(ev)
 }
 
-/// Write the live authoring conversation, surfacing a failure in Problems.
+/// Write the live authoring conversation, reporting a failure to the log.
 ///
 /// Called wherever the transcript is about to become unreachable — a close, a
 /// deliberate restart — and from the tick, which is what keeps a long
 /// conversation durable while it is still being had.
 fn report_authoring_save(app: &mut App) {
     if let Err(error) = app.save_authoring_session() {
-        app.push_error(ErrorMessage {
-            timestamp: std::time::SystemTime::now(),
-            level: ErrorLevel::Error,
-            text: format!("Failed to save the plan conversation: {error}"),
-        });
+        tracing::error!("Failed to save the plan conversation: {error}");
     }
 }
 
@@ -400,11 +396,7 @@ async fn resolve_io(
         AppEvent::OpenFolderSelected { path } => {
             // Verify it's a valid directory.
             if !path.is_dir() {
-                app.push_error(ErrorMessage {
-                    timestamp: std::time::SystemTime::now(),
-                    level: ErrorLevel::Error,
-                    text: format!("Selected path is not a directory: {}", path.display()),
-                });
+                tracing::error!("Selected path is not a directory: {}", path.display());
                 app.mode = crate::app::Mode::Normal;
                 return (AppEvent::Tick, None);
             }
@@ -412,11 +404,7 @@ async fn resolve_io(
             let path = match register_project(app, &path).await {
                 Ok(path) => path,
                 Err(message) => {
-                    app.push_error(ErrorMessage {
-                        timestamp: std::time::SystemTime::now(),
-                        level: ErrorLevel::Error,
-                        text: message.clone(),
-                    });
+                    tracing::error!("{message}");
                     app.mode = crate::app::Mode::Normal;
                     return (AppEvent::Tick, Some(message));
                 }
@@ -430,11 +418,7 @@ async fn resolve_io(
             // Update workspace and save.
             app.workspace.add_folder(path.clone());
             if let Err(e) = app.save_workspace() {
-                app.push_error(ErrorMessage {
-                    timestamp: std::time::SystemTime::now(),
-                    level: ErrorLevel::Error,
-                    text: format!("Failed to save workspace: {e}"),
-                });
+                tracing::error!("Failed to save workspace: {e}");
             }
 
             // Trigger plan discovery for all opened folders.
@@ -454,11 +438,7 @@ async fn resolve_io(
                     let path = match register_project(app, &path).await {
                         Ok(path) => path,
                         Err(message) => {
-                            app.push_error(ErrorMessage {
-                                timestamp: std::time::SystemTime::now(),
-                                level: ErrorLevel::Error,
-                                text: message.clone(),
-                            });
+                            tracing::error!("{message}");
                             app.mode = crate::app::Mode::Normal;
                             return (AppEvent::Tick, Some(message));
                         }
@@ -471,11 +451,7 @@ async fn resolve_io(
                     // Update workspace and save.
                     app.workspace.add_folder(path.clone());
                     if let Err(e) = app.save_workspace() {
-                        app.push_error(ErrorMessage {
-                            timestamp: std::time::SystemTime::now(),
-                            level: ErrorLevel::Error,
-                            text: format!("Failed to save workspace: {e}"),
-                        });
+                        tracing::error!("Failed to save workspace: {e}");
                     }
 
                     // Trigger plan discovery for all opened folders.
@@ -490,11 +466,7 @@ async fn resolve_io(
                 }
                 Err(e) => {
                     // Return to Normal mode and push an error message.
-                    app.push_error(ErrorMessage {
-                        timestamp: std::time::SystemTime::now(),
-                        level: ErrorLevel::Error,
-                        text: format!("Failed to initialize folder: {e}"),
-                    });
+                    tracing::error!("Failed to initialize folder: {e}");
                     app.mode = crate::app::Mode::Normal;
                     (AppEvent::Tick, None)
                 }
@@ -554,11 +526,7 @@ async fn resolve_io(
                 .await
             {
                 let message = format!("Could not close project {}: {error}", path.display());
-                app.push_error(ErrorMessage {
-                    timestamp: std::time::SystemTime::now(),
-                    level: ErrorLevel::Error,
-                    text: message.clone(),
-                });
+                tracing::error!("{message}");
                 app.mode = crate::app::Mode::Normal;
                 return (AppEvent::Tick, Some(message));
             }
@@ -570,11 +538,7 @@ async fn resolve_io(
             // Update workspace and save.
             app.workspace.remove_folder(&path);
             if let Err(e) = app.save_workspace() {
-                app.push_error(ErrorMessage {
-                    timestamp: std::time::SystemTime::now(),
-                    level: ErrorLevel::Error,
-                    text: format!("Failed to save workspace: {e}"),
-                });
+                tracing::error!("Failed to save workspace: {e}");
             }
 
             // Trigger plan discovery to refresh the sidebar.
@@ -3142,10 +3106,6 @@ fn translate_key(
             }
             // Cycle the dependency view (Off → List → Tree → Timeline → Off).
             KeyCode::Char('v') | KeyCode::Char('V') => AppEvent::CycleDependencyView,
-            // Toggle the error pane open/closed.
-            KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
-            // Toggle the in-TUI log panel (the context task's agent log).
-            KeyCode::Char('l') | KeyCode::Char('L') => AppEvent::ToggleLogPane,
             // ── Logs tab filter toolbar ───────────────────────────────────
             // Gated on the log viewer being the active tab so the digits stay
             // unbound — and available — everywhere else.
@@ -3298,27 +3258,9 @@ fn translate_key(
                 Panel::Main => AppEvent::ToggleTreeNode,
                 Panel::Tabs => AppEvent::FocusContent,
             },
-            // PgUp/PgDn: scroll the open Output pane, or the log viewer when it
-            // is the active tab. The Output pane wins when both are up — it is
-            // the overlay, and the one the operator just opened.
-            KeyCode::PageUp => {
-                if app.error_pane_open {
-                    AppEvent::ErrorPaneScrollUp
-                } else if app.is_logs_tab_active() {
-                    AppEvent::LogsScrollUp
-                } else {
-                    AppEvent::Tick
-                }
-            }
-            KeyCode::PageDown => {
-                if app.error_pane_open {
-                    AppEvent::ErrorPaneScrollDown
-                } else if app.is_logs_tab_active() {
-                    AppEvent::LogsScrollDown
-                } else {
-                    AppEvent::Tick
-                }
-            }
+            // PgUp/PgDn: page the log viewer when it is the active tab.
+            KeyCode::PageUp if app.is_logs_tab_active() => AppEvent::LogsScrollUp,
+            KeyCode::PageDown if app.is_logs_tab_active() => AppEvent::LogsScrollDown,
             _ => AppEvent::Tick,
         }
     }
@@ -3889,21 +3831,6 @@ mod tests {
                 &app
             ),
             AppEvent::CycleDependencyView
-        ));
-    }
-
-    #[test]
-    fn e_key_translates_to_toggle_error_pane() {
-        let app = test_app();
-        assert!(matches!(
-            translate_terminal_event(
-                key_press(KeyCode::Char('e'), KeyModifiers::NONE),
-                ModalState::default(),
-                crate::app::Panel::Sidebar,
-                false,
-                &app
-            ),
-            AppEvent::ToggleErrorPane
         ));
     }
 
@@ -6284,12 +6211,6 @@ mod tests {
         );
         assert_eq!(status, None);
         assert!(
-            app.error_messages
-                .iter()
-                .any(|m| m.text.contains("not a directory")),
-            "a nonexistent path must push an error, not silently succeed"
-        );
-        assert!(
             app.opened_folders.is_empty(),
             "a rejected path must not be added to opened_folders"
         );
@@ -6301,9 +6222,8 @@ mod tests {
 
     /// Same regression coverage for `InitializeFolderSelected`, on a path
     /// where `folder_init::initialize_folder` fails (no such directory, so
-    /// `git init` errors) — the error path must push an error message into
-    /// the error pane rather than panic, and return to `Mode::Normal` with no
-    /// status message.
+    /// `git init` errors) — the error path must log the failure rather than
+    /// panic, and return to `Mode::Normal` with no status message.
     #[tokio::test]
     async fn resolve_io_does_not_panic_on_initialize_folder_selected_roundtrip() {
         use std::path::PathBuf;
@@ -6327,16 +6247,6 @@ mod tests {
             "InitializeFolderSelected must resolve to Tick, not pass through to update()'s unreachable! arm"
         );
         assert_eq!(status, None, "the error path must not set a status message");
-        assert!(
-            !app.error_messages.is_empty(),
-            "a failed initialize_folder() must push an error message into the error pane"
-        );
-        assert!(
-            app.error_messages
-                .iter()
-                .any(|m| m.text.contains("Failed to initialize folder")),
-            "the error pane message must explain the initialize_folder failure"
-        );
         assert_eq!(
             app.mode,
             crate::app::Mode::Normal,
@@ -6425,10 +6335,6 @@ mod tests {
         let saved = crate::workspace::Workspace::load_from(&workspace_file)
             .expect("saved workspace must parse");
         assert!(saved.opened_folders.contains(&folder));
-        assert!(
-            app.error_messages.is_empty(),
-            "success path must not push errors"
-        );
     }
 
     /// **`OpenFolderSelected` success path (task `handle-folder-open-close-events`).**
@@ -6557,11 +6463,6 @@ mod tests {
         );
         assert!(!app.opened_folders.contains(&folder));
         assert!(!app.workspace.opened_folders.contains(&folder));
-        assert!(
-            app.error_messages
-                .iter()
-                .any(|message| message.text.contains("register"))
-        );
     }
 
     /// **`OpenFolderSelected` re-opening an already-opened folder is
@@ -6984,59 +6885,6 @@ mod tests {
     }
 
     // ── Task-population test (task 29): RunOpened → api.run() → RunLoaded ─────
-
-    /// **Task population:** When a `RunOpened` core event is received by
-    /// `resolve_api_event`, it must call `api.run(id).await` and return an
-    /// `AppEvent::RunLoaded` carrying the full `RunView` (with tasks).
-    ///
-    /// This proves the async data-flow: `Event::RunOpened` → `resolve_api_event`
-    /// → fetch full `RunView` → `AppEvent::RunLoaded` → `App::update` → tasks
-    /// populated in `app.runs`.
-    /// Simulate the exact construction that main.rs performs for the api
-    /// (using the same typed-source projection literals).
-    /// Then create a CoreApi and assert that an OpenPlan of a known-good sample
-    /// produces the expected graph with zero backend involvement (the backend
-    /// panics if called, proving ingestion path does not touch it).
-    /// The test must be named exactly as shown and must fail before the 0029 change.
-    #[test]
-    fn log_pane_target_resolves_from_selection() {
-        use crate::placeholder::PlaceholderApi;
-        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
-        use std::path::PathBuf;
-        use std::sync::Arc;
-
-        let api = Arc::new(PlaceholderApi::empty());
-        let run = RunView {
-            id: RunId(123),
-            run_uid: "run-001-test".to_string(),
-            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
-            status: RunStatus::Completed,
-            project: "test".to_string(),
-            tasks: vec![TaskView {
-                authored: None,
-                id: TaskId::new("my-task"),
-                title: "Test Task".into(),
-                state: TaskState::Done,
-                gate_iterations: 0,
-                review_iterations: 0,
-                depends_on: vec![],
-                started_at: None,
-                finished_at: None,
-                failure_reason: None,
-                entry_text: String::new(),
-            }],
-            report: makina_core::api::IngestionReport::default(),
-        };
-        let mut app = crate::app::App::new(api, vec![run], PathBuf::from("/test/repo"));
-        app.selected_run = Some(0);
-        app.selected_task = Some(0);
-
-        assert_eq!(
-            app.log_pane_target(),
-            Some((RunId(123), TaskId::new("my-task"))),
-            "log_pane_target must resolve the sidebar selection's (RunId, TaskId)"
-        );
-    }
 
     /// The doctor scaffold action must refuse to run when a config file already
     /// exists on disk: it returns a refusal status message and leaves the
@@ -9295,10 +9143,9 @@ wall_clock_secs = 600
         assert!(matches!(translate(&app, '0'), AppEvent::ResetLogFilters));
     }
 
-    /// PgUp/PgDn scroll the log viewer when it is the active tab and the bottom
-    /// Output pane is not up (the overlay keeps priority when both are open).
+    /// PgUp/PgDn scroll the log viewer when it is the active tab.
     #[test]
-    fn page_keys_scroll_the_logs_tab_when_the_output_pane_is_closed() {
+    fn page_keys_scroll_the_logs_tab() {
         let mut app = test_app();
         app.update(AppEvent::OpenLogsTab);
 
@@ -9319,12 +9166,6 @@ wall_clock_secs = 600
             page(&app, KeyCode::PageDown),
             AppEvent::LogsScrollDown
         ));
-
-        app.update(AppEvent::ToggleErrorPane);
-        assert!(
-            matches!(page(&app, KeyCode::PageUp), AppEvent::ErrorPaneScrollUp),
-            "the open Output pane keeps PgUp while it is showing"
-        );
     }
 
     /// Clicking a toolbar chip cycles that control — the same intent the number

@@ -137,6 +137,34 @@ impl IngestionReport {
     pub fn is_empty(&self) -> bool {
         self.issues.is_empty()
     }
+
+    /// Log every issue against `plan`, blocking ones as errors.
+    ///
+    /// An ingestion issue is the reason a run will not start, so it has to be
+    /// readable somewhere. It used to be readable only in the TUI's Problems
+    /// pane, which meant it existed for exactly as long as that view did and
+    /// nowhere in a headless run at all. Logging it puts it in the same place
+    /// as every other reason something did not happen.
+    pub fn log(&self, plan: &str) {
+        for issue in self.blocking() {
+            tracing::error!(
+                plan = %plan,
+                task = %issue.task_id.as_ref().map(|id| id.0.as_str()).unwrap_or("-"),
+                code = %issue.code,
+                "{}",
+                issue.message,
+            );
+        }
+        for issue in self.warnings() {
+            tracing::warn!(
+                plan = %plan,
+                task = %issue.task_id.as_ref().map(|id| id.0.as_str()).unwrap_or("-"),
+                code = %issue.code,
+                "{}",
+                issue.message,
+            );
+        }
+    }
 }
 
 impl Default for IngestionReport {

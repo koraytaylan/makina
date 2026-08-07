@@ -5232,6 +5232,7 @@ impl CoreApi {
             issues.extend(crate::ingestion::qualify(&graph));
             crate::ingestion::IngestionReport { issues }
         };
+        report.log(&plan_key.relative_dir.display().to_string());
 
         // 3. Allocate an id, mint the persistent ULID run identity, and register
         //    the Run.  Lock → insert → DROP guard before any further
@@ -6320,6 +6321,7 @@ impl CoreApi {
             issues.extend(interpret_issues);
             crate::ingestion::IngestionReport { issues }
         };
+        report.log(&plan_dir.relative_dir.display().to_string());
 
         // Second lookup + re-check (defensive for races with Cancel or with a StartRun
         // that became legal because this re-interpret cleared the last blocker).
@@ -6787,6 +6789,7 @@ impl CoreApi {
             issues.extend(interpret_issues);
             crate::ingestion::IngestionReport { issues }
         };
+        report.log(&plan_dir.relative_dir.display().to_string());
         let graph_snapshot = (!new_graph.tasks.is_empty()).then(|| new_graph.clone());
         let graph = Arc::new(AsyncMutex::new(new_graph));
 

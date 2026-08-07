@@ -5,7 +5,7 @@
 //! integration tests exercise directly.
 //!
 //! Printing belongs here, not in `main.rs`. A `println!` inside the TUI path
-//! would corrupt the rendered frame and bypass the error pane — which is why
+//! would corrupt the rendered frame and bypass the Logs tab — which is why
 //! `no_frame_bypass` pins the exact set of prints `main.rs` may contain. A
 //! headless run has no frame: stdout *is* its output medium, and its exit code
 //! is what a script or CI job branches on.

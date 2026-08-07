@@ -503,7 +503,7 @@ impl AcpClient {
     /// (`gemini auth login`, `claude` login, etc.) and re-run. The error will surface
     /// as [`AcpError::Rpc`] or [`AcpError::AgentExited`]; the agent's stderr
     /// (forwarded to `tracing` under the `acp_agent` target → the run/task log
-    /// file and the TUI error pane) typically contains the human-readable reason.
+    /// file and the TUI Logs tab) typically contains the human-readable reason.
     pub fn auth_methods(&self) -> &[crate::protocol::AuthMethod] {
         &self.auth_methods
     }
@@ -884,7 +884,7 @@ fn spawn_transport(command: &AcpCommand) -> Result<SpawnedTransport> {
         .ok_or_else(|| AcpError::Spawn("child stdout was not captured".into()))?;
 
     // Forward the agent's stderr into `tracing` (never raw stderr) so operators
-    // can see auth/errors in the run/task log + TUI error pane without dumping
+    // can see auth/errors in the run/task log + TUI Logs tab without dumping
     // over the live frame. This task ends when stderr closes (process exit); it
     // holds no client state.
     if let Some(stderr) = child.stderr.take() {
@@ -967,7 +967,7 @@ fn monitor_child_status(
 ///
 /// Each line is emitted as a `tracing::info!` event under the `acp_agent`
 /// target so plan-0003's subscriber routes it to the per-run/per-task log file
-/// and the TUI error pane. It must **not** be written to this process's stderr:
+/// and the TUI Logs tab. It must **not** be written to this process's stderr:
 /// the ACP backend runs while the TUI's ratatui frame is live, so a raw
 /// `eprintln!` would dump over the alternate screen and corrupt the UI.
 async fn forward_stderr(

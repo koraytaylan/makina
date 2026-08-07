@@ -25,40 +25,12 @@ use crate::browser::{DirEntry, FileBrowser};
 /// bounded and cannot cause unbounded memory growth.
 pub const EXCHANGE_LOG_CAP: usize = 100;
 
-/// Maximum number of error-pane messages retained on [`App`].
-///
-/// When more messages arrive the oldest are evicted so the buffer stays
-/// bounded and cannot cause unbounded memory growth.
-pub const ERROR_MESSAGES_CAP: usize = 50;
-
 /// Maximum number of [`LogRecord`]s retained for the Logs tab.
 ///
 /// The tab shows everything the process logs at every level, so its buffer sees
-/// far more traffic than the Problems list and needs a correspondingly deeper —
-/// but still bounded — history. Oldest records are evicted first.
+/// a lot of traffic and needs a deep — but still bounded — history. Oldest
+/// records are evicted first.
 pub const LOG_ENTRIES_CAP: usize = 2000;
-
-/// Severity of an error-pane message.
-///
-/// Kept self-contained (no `tracing`/`chrono` dependency) so the `makina`
-/// crate's dependency set stays minimal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorLevel {
-    Error,
-    Warn,
-    Info,
-}
-
-/// A single message shown in the error pane.
-#[derive(Debug, Clone)]
-pub struct ErrorMessage {
-    /// When the message was produced.
-    pub timestamp: std::time::SystemTime,
-    /// Severity of the message.
-    pub level: ErrorLevel,
-    /// Human-readable text.
-    pub text: String,
-}
 
 /// The payload of an [`ExchangeEntry`].
 ///
@@ -1342,10 +1314,6 @@ pub enum AppEvent {
     ScrollUpAt(u16, u16),
     /// Scroll down at the given (column, row) — used for mouse-position-aware routing.
     ScrollDownAt(u16, u16),
-    /// Scroll the error pane one line up (PgUp key when error pane is open).
-    ErrorPaneScrollUp,
-    /// Scroll the error pane one line down (PgDn key when error pane is open).
-    ErrorPaneScrollDown,
     /// Left mouse button pressed at `(column, row)` — begin a text selection.
     SelectionStart(u16, u16),
     /// Mouse dragged to `(column, row)` with the left button held — extend the
@@ -1359,11 +1327,6 @@ pub enum AppEvent {
     ApiEvent(Event),
     /// Periodic tick — triggers a redraw without other state changes.
     Tick,
-    /// Toggle the error pane open/closed (`e` / `E`).
-    ToggleErrorPane,
-    /// Toggle the in-TUI log panel open/closed (`l` / `L`) — shows the context
-    /// task's agent log at the bottom, like the `v` dependency view.
-    ToggleLogPane,
 
     // ── Logs tab ──────────────────────────────────────────────────────────────
     /// Open (or switch to) the process-wide log viewer tab. Raised by the
@@ -1593,25 +1556,12 @@ pub enum AppEvent {
     /// (resolves the task-28 outcome-surfacing note).
     StatusMessage(String),
 
-    /// A log record arrived on the tracing→TUI channel and should be appended
-    /// to the error pane.
-    ///
-    /// Emitted by the event loop's `log_rx` drain arm (task
-    /// `tui-error-pane-channel-wire`) after converting a
-    /// [`makina_core::log_record::LogRecord`] into an [`ErrorMessage`].
-    /// `update` pushes it via [`App::push_error`] (respecting
-    /// [`ERROR_MESSAGES_CAP`]).
-    ErrorMessageArrived {
-        msg: ErrorMessage,
-    },
-
     /// A [`LogRecord`] arrived on the tracing→TUI channel.
     ///
     /// Emitted by the event loop's `log_rx` drain arm for **every** record, at
-    /// every level. `update` retains it for the Logs tab and, when it is a
-    /// WARN/ERROR, additionally pushes it to the Problems list — so the two
-    /// views stay in one pipeline instead of two subscriptions that could
-    /// disagree about what happened.
+    /// every level. `update` retains it for the Logs tab, which is the one
+    /// place anything the process logs can be read; its own filter toolbar is
+    /// what narrows the view to warnings and failures.
     LogRecordArrived {
         record: Box<LogRecord>,
     },
@@ -2126,23 +2076,8 @@ pub enum ScrollablePanel {
     DependencyView,
     /// The task entry pane (when a task tab is active).
     TaskEntry,
-    /// The bottom Output pane overlay (Problems / Logs tabs).
-    ErrorPane,
     /// The record list in the full-tab log viewer ([`TabContent::Logs`]).
     LogsTab,
-}
-
-/// Which tab the bottom Output pane is showing.
-///
-/// The Output pane unifies the former error pane and log panel: `Problems`
-/// lists run-blocking ingestion issues + app error messages; `Logs` shows the
-/// context task's agent transcript. `[e]` opens/toggles Problems, `[L]` Logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputTab {
-    /// Ingestion blocking/warning issues + app error messages.
-    Problems,
-    /// The context task's agent exchange log.
-    Logs,
 }
 
 /// Geometry of a single scrollable panel (used for mouse hitbox testing).
@@ -2345,12 +2280,6 @@ pub struct App {
     /// disengages auto-follow; scrolling back down to the bottom re-engages it.
     pub exchange_auto_follow: bool,
 
-    /// Whether the error pane auto-follows the bottom of the log.
-    ///
-    /// Defaults to `true` (newest error always visible).  Scrolling up
-    /// disengages auto-follow; scrolling back down to the bottom re-engages it.
-    pub error_pane_auto_follow: bool,
-
     /// Per-panel manual scroll offset (in lines from top). Key is the panel;
     /// a missing key defaults to 0. Written only from `App::update`, so a plain
     /// `HashMap` (no interior mutability needed).
@@ -2389,20 +2318,10 @@ pub struct App {
     /// idle.
     pub busy: Option<String>,
 
-    /// Whether the bottom Output pane is currently visible.
-    pub error_pane_open: bool,
-
-    /// Which tab the Output pane shows when open (`Problems` or `Logs`).
-    pub output_tab: OutputTab,
-
     /// Whether the help overlay is currently visible.
     ///
     /// Toggled by pressing `?` and dismissed with Escape or `q`.
     pub help_mode_active: bool,
-
-    /// Bounded ring of error-pane messages.  Capped at [`ERROR_MESSAGES_CAP`]
-    /// by evicting the oldest; see [`App::push_error`].
-    pub error_messages: Vec<ErrorMessage>,
 
     /// Bounded ring of every [`LogRecord`] the tracing layer has forwarded, in
     /// arrival order and at every level. Capped at [`LOG_ENTRIES_CAP`] by
@@ -2425,10 +2344,6 @@ pub struct App {
     /// pass so a click can cycle the control under the cursor. Same
     /// interior-mutability pattern as [`App::tab_bounds`].
     pub logs_toolbar_bounds: std::cell::RefCell<Vec<(LogFilterControl, Rect)>>,
-
-    /// Whether there are unseen error messages since the error pane was last opened.
-    /// Cleared when the error pane opens; set when a new error message arrives.
-    pub unseen_errors: bool,
 
     /// The root directory of the repository, used for compacting tool paths.
     pub repo_root: PathBuf,
@@ -3318,22 +3233,17 @@ impl App {
             task_last_activity_tick: HashMap::new(),
             task_step_start_tick: HashMap::new(),
             exchange_auto_follow: true,
-            error_pane_auto_follow: true,
             scroll_offsets: std::collections::HashMap::new(),
             last_scroll_maxes: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_event: None,
             status_message: None,
             busy: None,
-            error_pane_open: false,
-            output_tab: OutputTab::Problems,
             help_mode_active: false,
-            error_messages: Vec::new(),
             log_entries: VecDeque::new(),
             log_filter: LogFilter::default(),
             logs_auto_follow: true,
             logs_toolbar_bounds: std::cell::RefCell::new(Vec::new()),
-            unseen_errors: false,
             repo_root,
             tick: 0,
             idle_secs_config: None,
@@ -3494,30 +3404,6 @@ impl App {
         }
     }
 
-    /// Push a new error-pane message, evicting the oldest when over cap.
-    ///
-    /// Mirrors [`ExchangeLog::push`]: maintains the [`ERROR_MESSAGES_CAP`]
-    /// bound so the buffer cannot grow without limit.
-    /// Marks the errors as unseen if the pane is not currently open.
-    pub fn push_error(&mut self, msg: ErrorMessage) {
-        self.error_messages.push(msg);
-        if self.error_messages.len() > ERROR_MESSAGES_CAP {
-            // Drop the oldest message to maintain the bound.
-            self.error_messages.remove(0);
-        }
-        // Mark errors as unseen unless the Problems tab is currently visible.
-        if !(self.error_pane_open && self.output_tab == OutputTab::Problems) {
-            self.unseen_errors = true;
-        }
-        // When auto-follow is engaged, a new error snaps the view to the newest entry
-        // (reset the offset to 0 so panel_offset will render at scroll_max).
-        // If the user has scrolled up (auto-follow disengaged), leave the stored offset
-        // untouched so a new error does NOT yank the view back down.
-        if self.error_pane_auto_follow {
-            self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
-        }
-    }
-
     /// Record a forwarded [`LogRecord`] for the Logs tab, evicting the oldest
     /// when over [`LOG_ENTRIES_CAP`].
     ///
@@ -3626,24 +3512,6 @@ impl App {
     /// Record the Logs toolbar chip bounds for the current frame.
     pub fn set_logs_toolbar_bounds(&self, bounds: Vec<(LogFilterControl, Rect)>) {
         *self.logs_toolbar_bounds.borrow_mut() = bounds;
-    }
-
-    /// Open the bottom Output pane on `tab`. Re-invoking with the tab that is
-    /// already showing closes the pane (toggle); invoking with the other tab
-    /// switches to it while keeping the pane open. Opening/switching resets the
-    /// pane scroll so the new content starts at a sensible position, and opening
-    /// `Problems` clears the unseen-errors badge.
-    pub fn open_output_tab(&mut self, tab: OutputTab) {
-        if self.error_pane_open && self.output_tab == tab {
-            self.error_pane_open = false;
-            return;
-        }
-        self.error_pane_open = true;
-        self.output_tab = tab;
-        self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
-        if tab == OutputTab::Problems {
-            self.unseen_errors = false;
-        }
     }
 
     /// Whether the modal file browser is currently active.
@@ -4328,34 +4196,6 @@ impl App {
         self.selected_run().map(|run| run.id)
     }
 
-    /// Resolve the `(RunId, TaskId)` whose agent log the `[L]` panel should show,
-    /// preferring (1) the active task tab, then (2) the focused sidebar task
-    /// node, then (3) the sidebar selection. Returns `None` when no task is in
-    /// context (e.g. a plan tab or a run header) so the panel can hint.
-    ///
-    /// Keyed for an `exchange_logs` lookup (the panel reuses the live in-memory
-    /// agent exchanges rendered by the exchange pane).
-    pub fn log_pane_target(&self) -> Option<(RunId, TaskId)> {
-        // 1. Active task tab → its run + task.
-        if let Some(active) = self.tabs.active_tab
-            && let Some(TabContent::Task { run, task_id, .. }) = self.tabs.open_tabs.get(active)
-            && self.runs.iter().any(|view| view.id == *run)
-        {
-            return Some((*run, task_id.clone()));
-        }
-        // 2. Focused sidebar task node.
-        if let Some(TreeNode::Task { run, task }) = self.focused_node()
-            && let Some(rv) = self.runs.get(run)
-            && let Some(tv) = rv.tasks.get(task)
-        {
-            return Some((rv.id, tv.id.clone()));
-        }
-        // 3. Sidebar selection (selected_run + selected_task).
-        let run = self.selected_run()?;
-        let tv = self.selected_task.and_then(|i| run.tasks.get(i))?;
-        Some((run.id, tv.id.clone()))
-    }
-
     /// Resolve which [`ScrollablePanel`] keyboard scroll events (`SelectUp`/
     /// `SelectDown`/`ScrollUp`/`ScrollDown`) should target when the main pane is
     /// focused, based on the *active tab's* content type:
@@ -4587,9 +4427,10 @@ impl App {
         }
     }
 
-    /// Scroll the given panel up by one line, disengaging auto-follow if the panel is the exchange or error pane.
+    /// Scroll the given panel up by one line, disengaging auto-follow if the
+    /// panel is the exchange pane or the Logs tab.
     pub fn scroll_up(&mut self, panel: ScrollablePanel) {
-        // Only the exchange and error panes have auto-follow logic.
+        // Only the exchange pane and the Logs tab have auto-follow logic.
         if panel == ScrollablePanel::Exchange && self.exchange_auto_follow {
             self.exchange_auto_follow = false;
             // Anchor the manual offset to the last rendered bottom.
@@ -4601,17 +4442,6 @@ impl App {
                 .unwrap_or(0);
             self.scroll_offsets
                 .insert(ScrollablePanel::Exchange, bottom);
-        } else if panel == ScrollablePanel::ErrorPane && self.error_pane_auto_follow {
-            self.error_pane_auto_follow = false;
-            // Anchor the manual offset to the last rendered bottom.
-            let bottom = self
-                .last_scroll_maxes
-                .borrow()
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0);
-            self.scroll_offsets
-                .insert(ScrollablePanel::ErrorPane, bottom);
         } else if panel == ScrollablePanel::LogsTab && self.logs_auto_follow {
             self.logs_auto_follow = false;
             let bottom = self
@@ -4632,8 +4462,6 @@ impl App {
         *current = current.saturating_add(1).min(scroll_max);
         if panel == ScrollablePanel::Exchange && *current == scroll_max {
             self.exchange_auto_follow = true;
-        } else if panel == ScrollablePanel::ErrorPane && *current == scroll_max {
-            self.error_pane_auto_follow = true;
         } else if panel == ScrollablePanel::LogsTab && *current == scroll_max {
             self.logs_auto_follow = true;
         }
@@ -4656,21 +4484,11 @@ impl App {
 
     /// The render-time scroll offset for any panel, clamped to scroll_max.
     /// The exchange pane delegates to `effective_offset` so auto-follow is honored;
-    /// the error pane honors `error_pane_auto_follow` similarly;
+    /// the Logs tab honors `logs_auto_follow` similarly;
     /// every other panel uses its stored offset clamped to scroll_max.
     pub fn panel_offset(&self, panel: ScrollablePanel, scroll_max: u16) -> u16 {
         if panel == ScrollablePanel::Exchange {
             self.effective_offset(scroll_max)
-        } else if panel == ScrollablePanel::ErrorPane {
-            if self.error_pane_auto_follow {
-                scroll_max
-            } else {
-                self.scroll_offsets
-                    .get(&ScrollablePanel::ErrorPane)
-                    .copied()
-                    .unwrap_or(0)
-                    .min(scroll_max)
-            }
         } else if panel == ScrollablePanel::LogsTab {
             if self.logs_auto_follow {
                 scroll_max
@@ -4796,24 +4614,12 @@ impl App {
                 self.status_message = Some(format!("Dependency view: {}", label));
                 true
             }
-            AppEvent::ToggleErrorPane => {
-                // `[e]`: open the Output pane on Problems; if it is already open
-                // on Problems, close it; if open on Logs, switch to Problems.
-                self.open_output_tab(OutputTab::Problems);
-                true
-            }
             AppEvent::ToggleHelpMode => {
                 self.help_mode_active = !self.help_mode_active;
                 true
             }
             AppEvent::CloseHelpMode => {
                 self.help_mode_active = false;
-                true
-            }
-            AppEvent::ToggleLogPane => {
-                // `[L]`: open the Output pane on Logs; if already open on Logs,
-                // close it; if open on Problems, switch to Logs.
-                self.open_output_tab(OutputTab::Logs);
                 true
             }
             AppEvent::OpenLogsTab => {
@@ -5077,20 +4883,6 @@ impl App {
                         .unwrap_or(0);
                     self.scroll_down(panel, scroll_max);
                 }
-                true
-            }
-            AppEvent::ErrorPaneScrollUp => {
-                self.scroll_up(ScrollablePanel::ErrorPane);
-                true
-            }
-            AppEvent::ErrorPaneScrollDown => {
-                let max = self
-                    .last_scroll_maxes
-                    .borrow()
-                    .get(&ScrollablePanel::ErrorPane)
-                    .copied()
-                    .unwrap_or(0);
-                self.scroll_down(ScrollablePanel::ErrorPane, max);
                 true
             }
             // ── Mouse text selection ──────────────────────────────────────────
@@ -5473,9 +5265,11 @@ impl App {
                 );
                 self.mode = Mode::Normal;
                 self.reset_confirmation = None;
-                self.error_pane_open = true;
-                self.output_tab = OutputTab::Logs;
-                self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
+                // A reset used to narrate itself in a pane that opened over the
+                // content. It narrates itself to the log instead, which is
+                // where every other long-running step already reports and the
+                // one place with the scroll-back to read them in.
+                tracing::info!(plan = %label, "reset started");
                 self.status_message = Some(format!("Resetting {label}..."));
                 true
             }
@@ -5554,26 +5348,7 @@ impl App {
                 true
             }
 
-            AppEvent::ErrorMessageArrived { msg } => {
-                self.push_error(msg);
-                true
-            }
-
             AppEvent::LogRecordArrived { record } => {
-                // Problems stays what it always was — actionable failures only —
-                // while the Logs tab keeps the whole record. One arrival, two
-                // views, so they can never disagree about what was logged.
-                if record.level <= tracing::Level::WARN {
-                    self.push_error(ErrorMessage {
-                        timestamp: record.timestamp.into(),
-                        level: match record.level {
-                            tracing::Level::ERROR => ErrorLevel::Error,
-                            tracing::Level::WARN => ErrorLevel::Warn,
-                            _ => ErrorLevel::Info,
-                        },
-                        text: record.message.clone(),
-                    });
-                }
                 self.push_log_record(*record);
                 true
             }
@@ -7236,14 +7011,14 @@ impl App {
                         op.log.push(message.clone());
                     }
                 }
-                if matches!(
-                    phase,
-                    makina_core::api::PlanOperationPhase::Started
-                        | makina_core::api::PlanOperationPhase::Step
-                ) {
-                    self.error_pane_open = true;
-                    self.output_tab = OutputTab::Logs;
-                    self.scroll_offsets.remove(&ScrollablePanel::ErrorPane);
+                // Every step of the operation reaches the log, so the whole of
+                // it is readable after the fact; the status bar shows only the
+                // step in flight, and a failure additionally raises a modal.
+                match phase {
+                    makina_core::api::PlanOperationPhase::Failed => {
+                        tracing::error!(plan = %label, "{message}");
+                    }
+                    _ => tracing::info!(plan = %label, "{message}"),
                 }
                 self.status_message = Some(message.clone());
             }
@@ -7407,47 +7182,6 @@ mod tests {
         App::new(api, vec![], PathBuf::from("."))
     }
 
-    // ── Error pane ────────────────────────────────────────────────────────────
-
-    /// `push_error` must keep the error-pane buffer bounded at
-    /// [`ERROR_MESSAGES_CAP`] by evicting the OLDEST message (FIFO), not merely
-    /// capping the length.  Stronger than `exchange_log_bounded_at_cap`.
-    #[test]
-    fn error_messages_bounded_at_cap() {
-        use crate::app::ERROR_MESSAGES_CAP;
-
-        let mut app = make_app();
-        let total = ERROR_MESSAGES_CAP + 5;
-        for i in 0..total {
-            app.push_error(ErrorMessage {
-                timestamp: std::time::SystemTime::now(),
-                level: ErrorLevel::Error,
-                text: format!("msg {i}"),
-            });
-        }
-
-        // Exactly capped.
-        assert_eq!(
-            app.error_messages.len(),
-            ERROR_MESSAGES_CAP,
-            "error_messages must be capped at ERROR_MESSAGES_CAP={ERROR_MESSAGES_CAP} but has {}",
-            app.error_messages.len()
-        );
-        // The 5 oldest were evicted: the first retained is the 6th pushed
-        // (index 5, "msg 5").
-        assert_eq!(
-            app.error_messages.first().unwrap().text,
-            "msg 5",
-            "oldest messages must be evicted, not the newest"
-        );
-        // The last retained is the most recently pushed.
-        assert_eq!(
-            app.error_messages.last().unwrap().text,
-            format!("msg {}", total - 1),
-            "most recent message must be retained"
-        );
-    }
-
     // ── Failure notices ───────────────────────────────────────────────────────
 
     /// A reported failure raises the modal AND is written to the log store, so
@@ -7495,10 +7229,10 @@ mod tests {
     }
 
     /// A record arriving on the channel is retained for the Logs tab **whatever
-    /// its level**, while only WARN/ERROR additionally reach Problems. This is
-    /// the split the whole feature rests on: one arrival, two views.
+    /// its level**. The tab is the only view of what the process logged, so a
+    /// level it drops is a level nothing can get back.
     #[test]
-    fn arriving_records_populate_logs_but_only_warn_and_error_reach_problems() {
+    fn arriving_records_are_retained_at_every_level() {
         let mut app = make_app();
         for (level, text) in [
             (tracing::Level::TRACE, "t"),
@@ -7513,17 +7247,12 @@ mod tests {
         }
 
         assert_eq!(
-            app.log_entries.len(),
-            5,
-            "every level must be retained for the Logs tab"
-        );
-        assert_eq!(
-            app.error_messages
+            app.log_entries
                 .iter()
-                .map(|m| m.text.as_str())
+                .map(|record| record.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["w", "e"],
-            "Problems must stay WARN/ERROR-only"
+            vec!["t", "d", "i", "w", "e"],
+            "every level must be retained for the Logs tab"
         );
     }
 
@@ -7725,218 +7454,6 @@ mod tests {
         assert!(
             app.logs_auto_follow,
             "scrolling back to the bottom resumes following"
-        );
-    }
-
-    /// Error pane scroll: manual offset clamps to `[0, scroll_max]`,
-    /// scrolling up disengages auto-follow, and scrolling back down to the
-    /// bottom re-engages it (mirroring exchange pane behavior).
-    #[test]
-    fn error_pane_scroll_clamps_and_auto_follow_reengages() {
-        let mut app = make_app();
-        let max: u16 = 3;
-
-        // Default: auto-follow engaged, offset at the top.
-        assert!(app.error_pane_auto_follow);
-        assert_eq!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0),
-            0
-        );
-
-        // scroll_up clears auto-follow.
-        app.scroll_up(ScrollablePanel::ErrorPane);
-        assert!(
-            !app.error_pane_auto_follow,
-            "scroll_up must clear error_pane_auto_follow"
-        );
-
-        // scroll_up never goes below 0.
-        app.scroll_up(ScrollablePanel::ErrorPane);
-        app.scroll_up(ScrollablePanel::ErrorPane);
-        assert_eq!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0),
-            0,
-            "scroll_up must not go below 0"
-        );
-
-        // scroll_down never exceeds max.
-        for _ in 0..(max + 5) {
-            app.scroll_down(ScrollablePanel::ErrorPane, max);
-            assert!(
-                app.scroll_offsets
-                    .get(&ScrollablePanel::ErrorPane)
-                    .copied()
-                    .unwrap_or(0)
-                    <= max,
-                "scroll_down must never exceed scroll_max"
-            );
-        }
-        assert_eq!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0),
-            max
-        );
-
-        // scroll_down reaching max re-sets auto-follow.
-        assert!(
-            app.error_pane_auto_follow,
-            "scroll_down reaching scroll_max must re-set error_pane_auto_follow"
-        );
-    }
-
-    /// ErrorPaneScrollUp event scrolls the error pane up when open.
-    #[test]
-    fn test_error_pane_scrolls_up_on_pgup() {
-        let mut app = make_app();
-
-        // Set up scroll space and disengage auto-follow first.
-        app.last_scroll_maxes
-            .borrow_mut()
-            .insert(ScrollablePanel::ErrorPane, 10);
-        app.error_pane_auto_follow = false;
-        app.scroll_offsets.insert(ScrollablePanel::ErrorPane, 5);
-
-        let offset_before = app
-            .scroll_offsets
-            .get(&ScrollablePanel::ErrorPane)
-            .copied()
-            .unwrap_or(0);
-
-        // ErrorPaneScrollUp should decrease offset.
-        app.update(AppEvent::ErrorPaneScrollUp);
-        assert!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0)
-                < offset_before,
-            "ErrorPaneScrollUp must decrement error pane offset"
-        );
-    }
-
-    /// ErrorPaneScrollDown event scrolls the error pane down when open.
-    #[test]
-    fn test_error_pane_scrolls_down_on_pgdn() {
-        let mut app = make_app();
-        let max: u16 = 10;
-
-        // Set up scroll space.
-        app.last_scroll_maxes
-            .borrow_mut()
-            .insert(ScrollablePanel::ErrorPane, max);
-
-        let offset_before = app
-            .scroll_offsets
-            .get(&ScrollablePanel::ErrorPane)
-            .copied()
-            .unwrap_or(0);
-
-        // ErrorPaneScrollDown should increase offset.
-        app.update(AppEvent::ErrorPaneScrollDown);
-        assert!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0)
-                > offset_before,
-            "ErrorPaneScrollDown must increment error pane offset"
-        );
-    }
-
-    /// Auto-follow disengages when user scrolls up.
-    #[test]
-    fn test_error_pane_auto_follow_disengages_on_scroll_up() {
-        let mut app = make_app();
-
-        // Start with auto-follow engaged.
-        assert!(app.error_pane_auto_follow);
-
-        // Scroll up should disengage auto-follow.
-        app.scroll_up(ScrollablePanel::ErrorPane);
-        assert!(
-            !app.error_pane_auto_follow,
-            "scroll_up must disengage error_pane_auto_follow"
-        );
-    }
-
-    /// New error does not yank the view when user has scrolled up.
-    #[test]
-    fn test_error_pane_new_error_does_not_yank_when_scrolled_up() {
-        let mut app = make_app();
-
-        // Set up scroll space.
-        app.last_scroll_maxes
-            .borrow_mut()
-            .insert(ScrollablePanel::ErrorPane, 10);
-
-        // Manually set the offset to simulate user scrolling.
-        app.scroll_offsets.insert(ScrollablePanel::ErrorPane, 5);
-
-        // Disengage auto-follow.
-        app.error_pane_auto_follow = false;
-
-        // Verify the offset is 5.
-        assert_eq!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0),
-            5
-        );
-
-        // Push a new error while auto-follow is disengaged.
-        app.push_error(ErrorMessage {
-            timestamp: std::time::SystemTime::now(),
-            level: ErrorLevel::Error,
-            text: "new error".into(),
-        });
-
-        // The offset should NOT change (not yanked to bottom).
-        // Since auto_follow is false, push_error should not reset the offset.
-        assert_eq!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0),
-            5,
-            "new error must NOT yank the view when auto-follow is disengaged"
-        );
-    }
-
-    /// When auto-follow is engaged, new error snaps to the newest entry.
-    #[test]
-    fn test_error_pane_new_error_snaps_to_newest_when_auto_follow_engaged() {
-        let mut app = make_app();
-
-        // Start with auto-follow engaged (default).
-        assert!(app.error_pane_auto_follow);
-
-        // Set an initial offset.
-        app.scroll_offsets.insert(ScrollablePanel::ErrorPane, 5);
-
-        // Push a new error while auto-follow is engaged.
-        app.push_error(ErrorMessage {
-            timestamp: std::time::SystemTime::now(),
-            level: ErrorLevel::Error,
-            text: "new error".into(),
-        });
-
-        // The offset should be reset to 0 (so panel_offset will render at scroll_max).
-        assert_eq!(
-            app.scroll_offsets
-                .get(&ScrollablePanel::ErrorPane)
-                .copied()
-                .unwrap_or(0),
-            0,
-            "new error must snap to bottom when auto-follow is engaged"
         );
     }
 
@@ -8422,16 +7939,6 @@ mod tests {
         assert_eq!(app.status_message, Some("Dependency view: off".to_string()));
     }
 
-    #[test]
-    fn error_pane_toggle_flips_flag() {
-        let mut app = make_app();
-        assert!(!app.error_pane_open);
-        assert!(app.update(AppEvent::ToggleErrorPane));
-        assert!(app.error_pane_open);
-        assert!(app.update(AppEvent::ToggleErrorPane));
-        assert!(!app.error_pane_open);
-    }
-
     // ── Tick does not quit ────────────────────────────────────────────────────
 
     #[test]
@@ -8636,51 +8143,6 @@ mod tests {
             app.active_run_id(),
             Some(RunId(9)),
             "active_run_id must resolve the context plan's open run"
-        );
-    }
-
-    /// `log_pane_target` resolves the (RunId, TaskId) from the ACTIVE TASK TAB
-    /// even when the sidebar selection points elsewhere — so `[L]` shows the log
-    /// of the task the user is actually viewing.
-    #[test]
-    fn log_pane_target_resolves_from_active_task_tab() {
-        use makina_core::api::{RunId, RunStatus, RunView, TaskId, TaskState, TaskView};
-        let api = Arc::new(PlaceholderApi::new());
-        let run = RunView {
-            id: RunId(3),
-            run_uid: "run-uid-3".to_string(),
-            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
-            status: RunStatus::Running,
-            project: String::new(),
-            tasks: vec![TaskView {
-                authored: None,
-                id: TaskId::new("build-thing"),
-                title: "Build thing".into(),
-                state: TaskState::InProgress,
-                gate_iterations: 0,
-                review_iterations: 0,
-                depends_on: vec![],
-                started_at: None,
-                finished_at: None,
-                failure_reason: None,
-                entry_text: String::new(),
-            }],
-            report: makina_core::api::IngestionReport::default(),
-        };
-        let mut app = App::new(api, vec![run], PathBuf::from("."));
-        // No sidebar task selected, but a task tab for the run's task is active.
-        app.selected_task = None;
-        app.tabs.open_tab(TabContent::Task {
-            plan: PlanIdentity::legacy("0042-demo".to_string()),
-            run: RunId(3),
-            task_id: TaskId::new("build-thing"),
-        });
-        app.tabs.active_tab = Some(0);
-
-        assert_eq!(
-            app.log_pane_target(),
-            Some((RunId(3), TaskId::new("build-thing"))),
-            "log_pane_target must resolve the active task tab's (RunId, TaskId)"
         );
     }
 
@@ -11513,7 +10975,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_started_tracks_operation_and_opens_logs() {
+    fn reset_started_tracks_the_operation() {
         let mut app = make_app();
         let target = PlanIdentity::legacy("0099-demo");
 
@@ -11524,11 +10986,6 @@ mod tests {
 
         assert!(changed);
         assert_eq!(app.mode, Mode::Normal);
-        assert!(
-            app.error_pane_open,
-            "reset progress should open the output pane"
-        );
-        assert_eq!(app.output_tab, OutputTab::Logs);
         let op = app
             .plan_operations
             .get(&target)
@@ -11564,8 +11021,6 @@ mod tests {
             message: "Deleting plan branch".to_string(),
         }));
 
-        assert!(app.error_pane_open);
-        assert_eq!(app.output_tab, OutputTab::Logs);
         let op = app
             .plan_operations
             .get(&target)

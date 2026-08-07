@@ -430,7 +430,7 @@ where
 /// at every level — the Logs tab is the process-wide log viewer, and filtering
 /// by level happens there, at render time, where the operator can change their
 /// mind without losing the records they already filtered out. The narrower
-/// WARN/ERROR-only "Problems" view is derived downstream by the TUI, not by
+/// WARN/ERROR-only view is a filter the TUI's Logs tab applies, not something
 /// dropping records here.
 ///
 /// Each record also carries the `project_root` / `run_uid` / `task_slug` of the
@@ -739,8 +739,8 @@ mod tests {
 
     /// The TUI log channel is the process-wide firehose behind the Logs tab:
     /// **every** level reaches it, in emission order. Narrowing to WARN/ERROR is
-    /// the TUI's job (the Problems view and the tab's level filter), done where
-    /// the operator can widen it again without having lost the records.
+    /// the tab's level filter's job, done where the operator can widen it again
+    /// without having lost the records.
     #[test]
     fn tui_layer_forwards_every_level() {
         let (layer, mut rx) = tui_log_channel();

@@ -134,7 +134,7 @@ async fn todo_plan_first_run_no_skipped_tasks() {
     println!("Run status: {:?}", view.status);
 
     // The first task must be Failed (not Ready) and must have a failure_reason
-    // that explains WHY it failed. This is what the TUI's Logs pane shows.
+    // that explains WHY it failed. This is what the TUI's task tab shows.
     let failed_task = view
         .tasks
         .iter()
@@ -149,7 +149,7 @@ async fn todo_plan_first_run_no_skipped_tasks() {
     let reason = failed_task
         .failure_reason
         .as_ref()
-        .expect("failed task must have a failure_reason — the TUI Logs pane shows this");
+        .expect("failed task must have a failure_reason — the TUI task tab shows this");
     println!(
         "Failure reason: kind={:?} message={}",
         reason.kind, reason.message
@@ -197,11 +197,11 @@ async fn todo_plan_first_run_no_skipped_tasks() {
     }
 }
 
-/// Test that the TUI Logs pane shows the failure reason for a failed task.
+/// Test that a failed task's tab shows its failure reason.
 /// This verifies the UI rendering path, not just the API data.
 #[tokio::test(flavor = "multi_thread")]
-async fn tui_logs_pane_shows_failure_reason_for_failed_task() {
-    use makina::app::{App, AppEvent, OutputTab, Panel};
+async fn tui_task_tab_shows_failure_reason_for_failed_task() {
+    use makina::app::{App, AppEvent, Panel};
     use makina_core::api::{
         Api, ApiError, Command, CommandOutcome, EventStream, FailureKind, FailureReason, RunId,
         RunStatus, RunView, TaskId, TaskState, TaskView,
@@ -258,7 +258,6 @@ async fn tui_logs_pane_shows_failure_reason_for_failed_task() {
     app.selected_run = Some(0);
     app.selected_task = Some(0);
     app.focused_panel = Panel::Main;
-    app.output_tab = OutputTab::Logs;
 
     // Open a task tab so the main pane renders the task detail.
     app.update(AppEvent::OpenTab(makina::app::TabContent::Task {
@@ -280,6 +279,6 @@ async fn tui_logs_pane_shows_failure_reason_for_failed_task() {
 
     assert!(
         screen.contains("durable claim failed"),
-        "Logs pane must show the failure reason message; screen was:\n{screen}"
+        "the task tab must show the failure reason message; screen was:\n{screen}"
     );
 }

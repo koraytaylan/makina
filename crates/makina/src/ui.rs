@@ -1278,23 +1278,12 @@ pub fn render(app: &App, frame: &mut Frame) {
         ]
     });
 
-    // Draw the main pane once, then carve a GLOBAL error pane off the bottom
-    // of its inner area. The error pane is shared by every content state (hint,
-    // plan detail, run view) so `[e]` reveals errors even when no run is
-    // selected — previously it only rendered inside the run view.
-    let inner = main_block.inner(main_area);
+    // The content pane is the whole of the main area. It used to give up its
+    // bottom rows to a collapsible Output pane; the Logs tab shows the same
+    // records with a whole tab to do it in, and reading them no longer costs
+    // the content its height.
+    let content_area = main_block.inner(main_area);
     frame.render_widget(main_block, main_area);
-    let error_pane_height: u16 = if app.error_pane_open {
-        8.min(inner.height.saturating_sub(3))
-    } else {
-        0
-    };
-    let main_split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(error_pane_height)])
-        .split(inner);
-    let content_area = main_split[0];
-    let error_area = main_split[1];
 
     // Content precedence: an active plan tab is rendered via
     // render_plan_accordion_pane; an active task detail tab (live or preview) is
@@ -1541,21 +1530,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         }
     }
 
-    // Add error pane geometry if it's open (for mouse hitbox testing).
-    if app.error_pane_open && error_area.height > 0 && error_area.width > 0 {
-        panel_geoms.push(PanelGeometry {
-            panel: crate::app::ScrollablePanel::ErrorPane,
-            rect: error_area,
-        });
-    }
-
     // Record the accumulated panel geometries for hitbox testing in the event loop.
     app.set_panel_geometries(panel_geoms);
-
-    // ── Output pane (collapsible, global: Problems | Logs) ─────────────────
-    // A 0-height `error_area` (pane closed) makes this a no-op. Rendered for
-    // every content state so `[e]`/`[L]` always reveal Problems/Logs.
-    render_output_pane(app, frame, error_area);
 
     // ── Status bar ────────────────────────────────────────────────────────────
     // Key hints reflect the real keys: [o] open file browser, Ctrl+P opens the
@@ -1590,7 +1566,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             if r.report.is_blocked() {
                 let n = r.report.blocking().count();
                 Some(format!(
-                    "  │  ⚠ {} blocking issue(s) — press e to view, Ctrl+P to reset",
+                    "  │  ⚠ {} blocking issue(s) — see the Logs tab, Ctrl+P to reset",
                     n
                 ))
             } else {
@@ -1605,56 +1581,19 @@ pub fn render(app: &App, frame: &mut Frame) {
         DependencyViewMode::Tree => "tree",
         DependencyViewMode::Timeline => "timeline",
     };
-    // Build the Output-pane Problems badge: count = app error messages + the
-    // selected run's blocking ingestion issues. Show the count + warn colour
-    // (Yellow) when there is something to look at (unseen errors OR a blocked
-    // run); otherwise a plain "[e] problems".
-    let problems_count = app.error_messages.len()
-        + app
-            .selected_run()
-            .map(|r| r.report.blocking().count())
-            .unwrap_or(0);
-    let needs_attention = app.unseen_errors
-        || app
-            .selected_run()
-            .map(|r| r.report.is_blocked())
-            .unwrap_or(false);
-    let (error_badge_text, error_badge_style) = if needs_attention {
-        (
-            format!("[e] problems({})", problems_count),
-            Style::default()
-                .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
-                .fg(app.active_theme.get(crate::theme::ThemeRole::Warning)),
-        )
-    } else {
-        (
-            "[e] problems".to_string(),
-            Style::default()
-                .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
-                .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-        )
-    };
     // The blocked notice precedes the trailer so its full text stays inside the
     // visible width; the lower-priority trailer (focus/last-event hint) is the
     // part that gets clipped on narrow terminals.
-    //
-    // The status bar is built as a `Line` of `Span`s so the error-badge span
-    // can carry its own colour (warn/yellow) while the rest stays White/DarkGray.
     let verbose_state = if app.verbose_mode { "on" } else { "off" };
     let default_style = Style::default()
         .bg(app.active_theme.get(crate::theme::ThemeRole::Dim))
         .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground));
-    let status_bar = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!(" [^P] cmds/run  [o] open  [Tab] panel  [v] view  [^O] verbose:{verbose_state}  [L] logs  [?] help  [wheel] scroll  "),
-            default_style,
+    let status_bar = Paragraph::new(Line::from(vec![Span::styled(
+        format!(
+            " [^P] cmds/run  [o] open  [Tab] panel  [v] view  [^O] verbose:{verbose_state}               [?] help  [wheel] scroll  [q/^C] quit  │  view: {view}{blocked_notice}{trailer}"
         ),
-        Span::styled(error_badge_text, error_badge_style),
-        Span::styled(
-            format!("  [q/^C] quit  │  view: {view}{blocked_notice}{trailer}"),
-            default_style,
-        ),
-    ]))
+        default_style,
+    )]))
     .style(default_style);
     frame.render_widget(status_bar, status_area);
 
@@ -1887,142 +1826,6 @@ fn carve_dependency_overlay(
         rect: dep_area,
     });
     main_area
-}
-
-/// Build the lines for the Output pane's **Logs** tab: the agent exchange log
-/// for the task in context ([`App::log_pane_target`]), reusing the exchange
-/// pane's line builder so the content matches the run view. Falls back to a hint
-/// when no task is in context (e.g. a plan tab) or it has produced no log yet.
-fn wrap_plain_line(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
-    let max = usize::from(width.max(1));
-    let mut lines = Vec::new();
-    let mut current = String::new();
-
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        let current_len = current.chars().count();
-        let needed = if current.is_empty() {
-            word_len
-        } else {
-            current_len + 1 + word_len
-        };
-        if !current.is_empty() && needed > max {
-            lines.push(Line::from(vec![Span::styled(current, style)]));
-            current = word.to_string();
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-    }
-
-    if current.is_empty() {
-        lines.push(Line::from(vec![Span::styled(text.to_string(), style)]));
-    } else {
-        lines.push(Line::from(vec![Span::styled(current, style)]));
-    }
-    lines
-}
-
-fn log_tab_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim));
-    let _error_style = Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error));
-    if let Some(op) = app.context_operation_log()
-        && !op.log.is_empty()
-    {
-        let phase = match op.phase {
-            makina_core::api::PlanOperationPhase::Started
-            | makina_core::api::PlanOperationPhase::Step => "running",
-            makina_core::api::PlanOperationPhase::Finished => "finished",
-            makina_core::api::PlanOperationPhase::Failed => "failed",
-        };
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                format!("  Reset {} ", op.label),
-                Style::default()
-                    .fg(app.active_theme.get(crate::theme::ThemeRole::Accent))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("({phase})"), dim),
-        ])];
-        lines.push(Line::from(""));
-        for entry in &op.log {
-            lines.extend(wrap_plain_line(
-                &format!("  - {entry}"),
-                width,
-                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
-            ));
-        }
-        return lines;
-    }
-    // Get the focused task's run view + task view.
-    let target = app.log_pane_target();
-    let exchange_log = target
-        .as_ref()
-        .and_then(|(run, task)| app.exchange_logs.get(&(*run, task.clone())));
-
-    // Collect failure reason from the focused task (if any).
-    let failure_reason = target.as_ref().and_then(|(run, task_id)| {
-        app.runs
-            .iter()
-            .find(|r| r.id == *run)
-            .and_then(|rv| rv.tasks.iter().find(|t| t.id == *task_id))
-            .and_then(|t| t.failure_reason.as_ref())
-    });
-
-    match (exchange_log, failure_reason) {
-        (Some(log), _) if !log.entries.is_empty() => {
-            // Use block-based rendering with accent lines and folding.
-            let mut lines = blocks::render_entries(&log.entries, app, width);
-            // If the task also has a failure reason, append it at the end.
-            if let Some(reason) = failure_reason {
-                lines.push(Line::from(""));
-                let failure_out = blocks::render_failure(&reason.message, app, width);
-                let accent_color = failure_out.accent.color(app);
-                for line in failure_out.lines {
-                    let mut spans = vec![Span::styled("│ ", Style::default().fg(accent_color))];
-                    spans.extend(line.spans);
-                    lines.push(Line::from(spans));
-                }
-            }
-            lines
-        }
-        (Some(_), Some(reason)) => {
-            let failure_out = blocks::render_failure(&reason.message, app, width);
-            let accent_color = failure_out.accent.color(app);
-            failure_out
-                .lines
-                .into_iter()
-                .map(|line| {
-                    let mut spans = vec![Span::styled("│ ", Style::default().fg(accent_color))];
-                    spans.extend(line.spans);
-                    Line::from(spans)
-                })
-                .collect()
-        }
-        (Some(_), None) => vec![Line::from(vec![Span::styled(
-            "  No log entries yet for this task.",
-            dim,
-        )])],
-        (None, Some(reason)) => {
-            let failure_out = blocks::render_failure(&reason.message, app, width);
-            let accent_color = failure_out.accent.color(app);
-            failure_out
-                .lines
-                .into_iter()
-                .map(|line| {
-                    let mut spans = vec![Span::styled("│ ", Style::default().fg(accent_color))];
-                    spans.extend(line.spans);
-                    Line::from(spans)
-                })
-                .collect()
-        }
-        (None, None) => vec![Line::from(vec![Span::styled(
-            "  Select a task (open a task tab or pick one in the sidebar) to see its log.",
-            dim,
-        )])],
-    }
 }
 
 /// This is the single shared entry point for all [`DependencyViewMode`]
@@ -3666,136 +3469,6 @@ fn format_tasks_section(tasks: &[makina_core::plan::TaskDocument]) -> String {
         }
     }
     text
-}
-
-// ── Error pane (collapsible) ──────────────────────────────────────────────────
-
-/// Render the collapsible error pane below the exchange pane.
-///
-/// A top-bordered block titled `Errors` with
-/// one line per recent [`crate::app::ErrorMessage`], coloured by its
-/// [`crate::app::ErrorLevel`].  The pane is shown only when
-/// `app.error_pane_open` is set; the caller passes a 0-height `area` when the
-/// pane is collapsed, which makes this a no-op (nothing is drawn into an empty
-/// rectangle).
-/// Render one ingestion issue as a coloured line for the Output pane's Problems
-/// tab: `⊘`/`⚠ [task] message — suggestion`.
-fn issue_line(
-    app: &App,
-    issue: &makina_core::api::IngestionIssue,
-    level: crate::app::ErrorLevel,
-) -> Line<'static> {
-    use crate::app::ErrorLevel;
-    let (color, tag) = match level {
-        ErrorLevel::Error => (app.active_theme.get(crate::theme::ThemeRole::Error), "⊘"),
-        ErrorLevel::Warn => (app.active_theme.get(crate::theme::ThemeRole::Warning), "⚠"),
-        ErrorLevel::Info => (app.active_theme.get(crate::theme::ThemeRole::Dim), "·"),
-    };
-    let task = issue
-        .task_id
-        .as_ref()
-        .map(|t| format!(" [{}]", t.0))
-        .unwrap_or_default();
-    let suggestion = issue
-        .suggestion
-        .as_ref()
-        .map(|s| format!(" — {s}"))
-        .unwrap_or_default();
-    Line::from(vec![Span::styled(
-        format!("  {tag}{task} {}{suggestion}", issue.message),
-        Style::default().fg(color),
-    )])
-}
-
-/// Render the bottom **Output** pane: a `Problems | Logs` tabbed overlay. The
-/// `Problems` tab lists the selected run's blocking/warning ingestion issues
-/// followed by app error messages; the `Logs` tab shows the context task's agent
-/// transcript. Both tabs share the [`ScrollablePanel::ErrorPane`] scroll state.
-fn render_output_pane(app: &App, frame: &mut Frame, area: Rect) {
-    // A 0-height area (pane collapsed) is a no-op: skip all rendering.
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    use crate::app::{ErrorLevel, OutputTab};
-
-    let active = app.output_tab;
-    let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
-    let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
-    let tab_span = |label: String, is_active: bool| {
-        let style = if is_active {
-            Style::default().fg(accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(dim)
-        };
-        Span::styled(label, style)
-    };
-    let title = Line::from(vec![
-        Span::styled(" Output  ", Style::default().fg(dim)),
-        tab_span("Problems [e]".into(), active == OutputTab::Problems),
-        Span::styled("  ", Style::default().fg(dim)),
-        tab_span("Logs [L]".into(), active == OutputTab::Logs),
-        Span::styled(" ", Style::default().fg(dim)),
-    ]);
-    let border_color = match active {
-        OutputTab::Problems => app.active_theme.get(crate::theme::ThemeRole::Error),
-        OutputTab::Logs => dim,
-    };
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(border_color));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let lines: Vec<Line> = match active {
-        OutputTab::Problems => {
-            let mut lines: Vec<Line> = Vec::new();
-            // The selected run's ingestion issues first (blocking, then warnings)
-            // so "N blocking issues" from the status bar is readable here.
-            if let Some(run) = app.selected_run() {
-                for issue in run.report.blocking() {
-                    lines.push(issue_line(app, issue, ErrorLevel::Error));
-                }
-                for issue in run.report.warnings() {
-                    lines.push(issue_line(app, issue, ErrorLevel::Warn));
-                }
-            }
-            // Then app error messages (newest last), coloured by level.
-            for msg in &app.error_messages {
-                let color = match msg.level {
-                    ErrorLevel::Error => app.active_theme.get(crate::theme::ThemeRole::Error),
-                    ErrorLevel::Warn => app.active_theme.get(crate::theme::ThemeRole::Warning),
-                    ErrorLevel::Info => dim,
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("  {}", msg.text),
-                    Style::default().fg(color),
-                )]));
-            }
-            if lines.is_empty() {
-                lines.push(Line::from(vec![Span::styled(
-                    "  No problems.",
-                    Style::default().fg(dim),
-                )]));
-            }
-            lines
-        }
-        OutputTab::Logs => log_tab_lines(app, inner.width),
-    };
-
-    // Record scroll_max for clamping, then render at the stored offset.
-    let pane_height = inner.height as usize;
-    let scroll_max = lines.len().saturating_sub(pane_height) as u16;
-    app.last_scroll_maxes
-        .borrow_mut()
-        .insert(crate::app::ScrollablePanel::ErrorPane, scroll_max);
-    let scroll_offset = app.panel_offset(crate::app::ScrollablePanel::ErrorPane, scroll_max);
-
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
-    frame.render_widget(para, inner);
 }
 
 // ── Logs tab ──────────────────────────────────────────────────────────────────
@@ -5837,12 +5510,6 @@ fn render_help_overlay(app: &App, frame: &mut Frame, area: Rect) {
             " cycle dependency view (off → list → tree → timeline)  ",
             binding_style,
         ),
-        Span::styled("[e]", key_style),
-        Span::styled(" toggle error pane", binding_style),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("[l]", key_style),
-        Span::styled(" open log  ", binding_style),
         Span::styled("[Ctrl+O]", key_style),
         Span::styled(" toggle verbose", binding_style),
     ]));
@@ -7310,33 +6977,6 @@ mod tests {
         );
     }
 
-    /// The error pane must render even when no run is selected (regression: it
-    /// used to be drawn only inside the run view, so `[e]` showed nothing).
-    #[test]
-    fn render_error_pane_shows_with_no_run_selected() {
-        let mut terminal = make_terminal(90, 24);
-        let api = Arc::new(PlaceholderApi::empty());
-        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-        app.push_error(crate::app::ErrorMessage {
-            timestamp: std::time::SystemTime::UNIX_EPOCH,
-            level: crate::app::ErrorLevel::Error,
-            text: "boom-happened".to_string(),
-        });
-        // Open the error pane via the real toggle event; no run is selected.
-        app.update(crate::app::AppEvent::ToggleErrorPane);
-        assert!(
-            app.selected_run().is_none(),
-            "precondition: no run selected"
-        );
-
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-        assert!(
-            screen.contains("Problems") && screen.contains("boom-happened"),
-            "Output pane (Problems) + message must render with no run; screen:\n{screen}"
-        );
-    }
-
     /// The status bar must show the palette run-control hint without old direct shortcuts.
     #[test]
     fn render_status_bar_shows_run_control_hints() {
@@ -7441,9 +7081,9 @@ mod tests {
     /// The status bar must show the current dependency view label.
     #[test]
     fn status_bar_shows_current_view_label() {
-        // The status bar carries more hints now ([^P] cmds + [e] errors badge + [?] help
-        // + [wheel] scroll), so use a wider terminal to ensure the trailing
-        // `view:` label is not clipped before the assertions run.
+        // The status bar carries several hints ([^P] cmds, [?] help, [wheel]
+        // scroll), so use a wider terminal to ensure the trailing `view:` label
+        // is not clipped before the assertions run.
         let mut terminal = make_terminal(220, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
@@ -7484,56 +7124,6 @@ mod tests {
         assert!(
             screen.contains("view: timeline"),
             "status bar must show 'view: timeline' when dependency_view is Timeline"
-        );
-    }
-
-    /// The status bar must advertise the `[e]` key for the error pane.
-    /// When unseen errors are present, it must show a count badge.
-    #[test]
-    fn status_bar_advertises_errors_key() {
-        use crate::app::{ErrorLevel, ErrorMessage};
-
-        let mut terminal = make_terminal(170, 24);
-        let api = Arc::new(PlaceholderApi::empty());
-        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
-
-        // Without errors, the status bar shows "[e] errors"
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-        assert!(
-            screen.contains("[e]"),
-            "status bar must advertise the [e] problems key"
-        );
-
-        // Add an error while the pane is closed — should mark unseen
-        app.push_error(ErrorMessage {
-            timestamp: std::time::SystemTime::now(),
-            level: ErrorLevel::Error,
-            text: "test error".to_string(),
-        });
-        assert!(app.unseen_errors, "unseen_errors flag should be set");
-
-        // With unseen errors, the status bar shows "[e] errors(count)"
-        let mut terminal = make_terminal(170, 24);
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-        assert!(
-            screen.contains("[e] problems(1)"),
-            "status bar must show unseen problem count"
-        );
-
-        // Opening the error pane clears the unseen flag
-        app.update(crate::app::AppEvent::ToggleErrorPane);
-        assert!(
-            !app.unseen_errors,
-            "unseen_errors flag should be cleared when pane opens"
-        );
-        let mut terminal = make_terminal(170, 24);
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-        assert!(
-            screen.contains("[e] problems") && !screen.contains("[e] problems("),
-            "status bar must show [e] problems without count when pane is open and nothing needs attention"
         );
     }
 
@@ -8018,8 +7608,9 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
         assert!(
-            screen.contains("blocking issue(s) — press e to view, Ctrl+P to reset"),
-            "status bar must show the blocking-count notice when report.is_blocked()"
+            screen.contains("blocking issue(s) — see the Logs tab, Ctrl+P to reset"),
+            "status bar must show the blocking-count notice, and where the issues \
+             themselves are now readable, when report.is_blocked()"
         );
     }
 
@@ -9170,114 +8761,6 @@ mod tests {
         app
     }
 
-    /// `[L]` opens the Output pane on the **Logs** tab, showing the context
-    /// task's agent log. Regression: the old `L` shelled out to `$PAGER` and
-    /// showed nothing in many contexts.
-    #[test]
-    fn output_pane_logs_tab_renders_context_task_log() {
-        use crate::app::{AppEvent, OutputTab, TabContent};
-        use makina_core::api::TaskId;
-
-        let mut app = exchange_app();
-        // Open a task tab for task-a so the log target is deterministic.
-        let slug = format!(
-            "{:04}-{}",
-            app.runs[0].plan_dir.number, app.runs[0].plan_dir.slug
-        );
-        app.tabs.open_tab(TabContent::Task {
-            plan: PlanIdentity::legacy(slug),
-            run: RunId(1),
-            task_id: TaskId::new("task-a"),
-        });
-        app.tabs.active_tab = Some(0);
-
-        // Closed by default: the Output/Logs pane header must not be on screen.
-        // (The task's exchange content itself IS visible in the task detail tab's
-        // Execution section — that's the intended behaviour — so we assert on the
-        // pane header, not on the log text.)
-        let mut terminal = make_terminal(120, 40);
-        terminal.draw(|f| render(&app, f)).unwrap();
-        assert!(
-            !screen_of(&terminal).contains("Logs [L]"),
-            "the Output pane must be closed until the Logs tab is opened"
-        );
-
-        // [L] opens the Output pane on the Logs tab.
-        app.update(AppEvent::ToggleLogPane);
-        assert!(app.error_pane_open, "[L] must open the Output pane");
-        assert_eq!(app.output_tab, OutputTab::Logs, "[L] selects the Logs tab");
-        let mut terminal = make_terminal(120, 40);
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-        assert!(
-            screen.contains("Logs [L]"),
-            "the Output pane must show the Logs tab header"
-        );
-        assert!(
-            screen.contains("implement X"),
-            "the Logs tab must render the task's logged agent exchange"
-        );
-
-        // [L] again closes it.
-        app.update(AppEvent::ToggleLogPane);
-        assert!(
-            !app.error_pane_open,
-            "[L] on the active tab closes the pane"
-        );
-    }
-
-    /// The Output pane's Problems tab lists the selected run's blocking ingestion
-    /// issues (with their messages) — answering "the status bar says N blocking
-    /// issues, where are they?". `[e]` then `[L]` switches Problems↔Logs.
-    #[test]
-    fn output_pane_problems_tab_lists_blocking_issues_and_e_l_switch_tabs() {
-        use crate::app::{AppEvent, OutputTab};
-        use makina_core::api::{
-            IngestionIssue, IngestionReport, IssueSeverity, IssueSource, RunId, RunStatus, RunView,
-        };
-
-        let api = Arc::new(PlaceholderApi::empty());
-        let run = RunView {
-            id: RunId(1),
-            run_uid: String::new(),
-            plan_dir: makina_core::plan::PlanKey::parse("docs/plans/0001-Test").unwrap(),
-            status: RunStatus::Pending,
-            project: String::new(),
-            tasks: vec![],
-            report: IngestionReport {
-                issues: vec![IngestionIssue {
-                    task_id: None,
-                    severity: IssueSeverity::Blocking,
-                    source: IssueSource::Interpreter,
-                    code: "dep-cycle".into(),
-                    message: "dependency cycle detected".into(),
-                    suggestion: Some("break the cycle".into()),
-                }],
-            },
-        };
-        let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
-
-        // [e] opens the Problems tab listing the blocking issue's message.
-        app.update(AppEvent::ToggleErrorPane);
-        assert_eq!(app.output_tab, OutputTab::Problems);
-        let mut terminal = make_terminal(120, 30);
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-        assert!(
-            screen.contains("dependency cycle detected"),
-            "the blocking ingestion issue must be readable in the Problems tab"
-        );
-
-        // [L] switches the SAME pane to Logs (does not close it).
-        app.update(AppEvent::ToggleLogPane);
-        assert!(app.error_pane_open, "switching tabs keeps the pane open");
-        assert_eq!(app.output_tab, OutputTab::Logs);
-
-        // [L] again (active tab) closes it.
-        app.update(AppEvent::ToggleLogPane);
-        assert!(!app.error_pane_open);
-    }
-
     /// **Live streaming (done-when):** after feeding PromptSent + chunks +
     /// TurnComplete, the exchange pane must show the prompt AND the
     /// concatenated streamed answer.
@@ -9907,77 +9390,6 @@ mod tests {
         assert!(
             screen.contains("No execution yet"),
             "task pane must show 'No execution yet' when the exchange log is empty"
-        );
-    }
-
-    // ── Error pane (collapsible) ──────────────────────────────────────────────
-
-    /// **Open pane (done-when):** with `error_pane_open = true` and messages
-    /// present the pane shows the message text AND colours each line by level.
-    #[test]
-    fn render_error_pane_shows_messages_when_open() {
-        use crate::app::{ErrorLevel, ErrorMessage};
-
-        let mut terminal = make_terminal(120, 40);
-        let th = crate::theme::ayu_dark();
-        let mut app = exchange_app();
-        app.error_pane_open = true;
-        app.error_messages.push(ErrorMessage {
-            timestamp: std::time::SystemTime::now(),
-            level: ErrorLevel::Error,
-            text: "agent crashed unexpectedly".into(),
-        });
-
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-        let buf = terminal.backend().buffer().clone();
-
-        // The message text must be visible.
-        assert!(
-            screen.contains("agent crashed unexpectedly"),
-            "open error pane must show the message text"
-        );
-
-        // At least one cell must use the Error level colour (Red).
-        let has_red = buf
-            .content()
-            .iter()
-            .any(|cell| cell.fg == th.get(crate::theme::ThemeRole::Error));
-        assert!(
-            has_red,
-            "Error-level message must be rendered with Red foreground"
-        );
-    }
-
-    /// **Collapsed badge (done-when):** with `error_pane_open = false` and
-    /// messages present, the Exchange title carries a `(N errors)` badge and the
-    /// message text itself is NOT shown.
-    #[test]
-    #[ignore = "removed: run-view-without-tab rendering was dropped; these tests need to open a task tab"]
-    fn render_error_badge_when_collapsed_with_errors() {
-        use crate::app::{ErrorLevel, ErrorMessage};
-
-        let mut terminal = make_terminal(120, 40);
-        let mut app = exchange_app();
-        app.error_pane_open = false;
-        app.error_messages.push(ErrorMessage {
-            timestamp: std::time::SystemTime::now(),
-            level: ErrorLevel::Warn,
-            text: "this text must stay hidden".into(),
-        });
-
-        terminal.draw(|f| render(&app, f)).unwrap();
-        let screen = screen_of(&terminal);
-
-        // The count badge must appear in the Exchange title.
-        assert!(
-            screen.contains("(1 errors)"),
-            "collapsed error pane must surface a count badge in the Exchange title"
-        );
-        // The message text itself must NOT be rendered when collapsed.
-        assert!(
-            !screen.contains("this text must stay hidden"),
-            "collapsed error pane must NOT render message text"
         );
     }
 
@@ -13159,7 +12571,7 @@ mod tests {
             main_area.height,
         );
 
-        // content_area = main_inner (error pane height = 0).
+        // content_area = main_inner.
         let content_area = main_inner;
 
         // In the (None, Some(run)) arm, the header has 3 lines, ingestion = 0.
@@ -14804,8 +14216,7 @@ mod tests {
     }
 
     /// The Logs tab renders as tab content — a chip in the tab bar, its filter
-    /// toolbar, and every retained record regardless of level — rather than as
-    /// the bottom Output pane.
+    /// toolbar, and every retained record regardless of level.
     #[test]
     fn logs_tab_renders_every_level_with_its_toolbar() {
         let app = logs_app();

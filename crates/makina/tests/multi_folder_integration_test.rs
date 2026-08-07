@@ -219,11 +219,6 @@ async fn test_open_folder_single() {
 
     assert_eq!(app.opened_folders.len(), 1);
     assert_eq!(app.opened_folders[0], folder_a);
-    assert!(
-        app.error_messages.is_empty(),
-        "opening a valid directory must not push errors"
-    );
-
     let rendered = render_to_string(&app);
     assert!(
         rendered.contains("folder-a"),
@@ -331,11 +326,6 @@ async fn test_initialize_folder_creates_structure() {
         app.opened_folders.contains(&new_folder),
         "InitializeFolderSelected must add the folder to opened_folders"
     );
-    assert!(
-        app.error_messages.is_empty(),
-        "successful initialization must not push errors"
-    );
-
     // Verify .git exists.
     assert!(new_folder.join(".git").exists(), ".git should exist");
 
