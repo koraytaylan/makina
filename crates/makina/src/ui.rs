@@ -574,11 +574,9 @@ pub fn render(app: &App, frame: &mut Frame) {
     // ── Sidebar ───────────────────────────────────────────────────────────────
     // Render a tree of runs and tasks. Each open run is an expandable parent
     // node with its tasks nested beneath it (only when expanded).
-    // The sidebar now shows "Runs & Tasks" as the title.
-    let sidebar_focused = app.focused_panel == Panel::Sidebar;
 
     // Render the unified sidebar tree (plans + runs + tasks).
-    let sidebar_block = panel_block(app, "Runs & Tasks", sidebar_focused);
+    let sidebar_block = panel_block();
 
     // The tree is empty only when there are NO discovered plans AND no open
     // runs — gate on the flattened node list, not `runs` alone, so a freshly
@@ -1195,12 +1193,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     }
 
     // ── Main content — per-task status view (task 29) ────────────────────────
-    let main_focused = app.focused_panel == Panel::Main;
-    let main_block = panel_block(app, "Detail", main_focused);
+    let main_block = panel_block();
 
     // ── Record selectable panes for mouse text selection ───────────────────────
-    // `hit` is the full pane column (so a drag may begin on a border/padding
-    // cell); `clip` is the inner content rect (so the selection excludes borders
+    // `hit` is the full pane column (so a drag may begin on a padding cell);
+    // `clip` is the inner content rect (so the selection excludes the padding
     // and never crosses into the other pane). When a modal overlay is up, treat
     // the whole screen as one pane so selection spans it without column clipping.
     // See `crate::selection`.
@@ -1220,7 +1217,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         vec![
             crate::app::SelectionPane {
                 hit: sidebar_area,
-                clip: panel_block(app, "Runs & Tasks", sidebar_focused).inner(sidebar_area),
+                clip: panel_block().inner(sidebar_area),
             },
             crate::app::SelectionPane {
                 hit: main_area,
@@ -1229,7 +1226,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         ]
     });
 
-    // Draw the main border once, then carve a GLOBAL error pane off the bottom
+    // Draw the main pane once, then carve a GLOBAL error pane off the bottom
     // of its inner area. The error pane is shared by every content state (hint,
     // plan detail, run view) so `[e]` reveals errors even when no run is
     // selected — previously it only rendered inside the run view.
@@ -5557,23 +5554,21 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Build a titled [`Block`] with a focus-aware border style.
-fn panel_block(app: &App, title: &str, focused: bool) -> Block<'static> {
-    let border_style = if focused {
-        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Info))
-    } else {
-        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
-    };
-    Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_type(if focused {
-            BorderType::Thick
-        } else {
-            BorderType::Plain
-        })
-        .border_style(border_style)
-        .padding(Padding::horizontal(1))
+/// Build the chrome-free [`Block`] the sidebar and main panes are drawn in.
+///
+/// The panes carry no border and no title: both titles ("Runs & Tasks",
+/// "Detail") only restated what the content below them already showed, and the
+/// frames around them spent two rows per pane on a line. Which pane has focus
+/// stays legible from the status bar's `focus:` label and the sidebar's
+/// selection highlight.
+///
+/// The padding is two columns rather than the one that sat inside the old
+/// border, so the horizontal geometry is exactly what it was: with no border
+/// line between them the two panes need *more* whitespace to read as separate
+/// columns, not less. Only the vertical rows the borders occupied are
+/// reclaimed — content now starts directly under the title bar.
+fn panel_block() -> Block<'static> {
+    Block::default().padding(Padding::horizontal(2))
 }
 
 /// Derive the sidebar label from the typed plan identity.
@@ -6126,7 +6121,7 @@ mod tests {
     // ── Render: empty state ───────────────────────────────────────────────────
 
     #[test]
-    fn render_empty_state_contains_title_and_panels() {
+    fn render_empty_state_contains_title_and_chrome_free_panels() {
         let mut terminal = make_terminal(80, 24);
         let api = Arc::new(PlaceholderApi::new());
         let app = App::new(api, vec![], std::path::PathBuf::from("."));
@@ -6144,9 +6139,24 @@ mod tests {
 
         // Title bar
         assert!(screen.contains("Makina"), "title bar must say 'Makina'");
-        // Panel titles appear in the border
-        assert!(screen.contains("Runs"), "sidebar must show 'Runs'");
-        assert!(screen.contains("Detail"), "main area must show 'Detail'");
+        // The two panes carry no title and no frame of their own: both labels
+        // only restated what the pane already showed. Nothing in the empty
+        // state draws a box, so a box-drawing corner anywhere is the pane
+        // border having come back.
+        assert!(
+            !screen.contains("Runs & Tasks"),
+            "sidebar must not title itself"
+        );
+        assert!(
+            !screen.contains("Detail"),
+            "main area must not title itself"
+        );
+        for corner in ['┌', '┐', '└', '┘', '┏', '┓', '┗', '┛'] {
+            assert!(
+                !screen.contains(corner),
+                "panes must not draw a border (found {corner:?})"
+            );
+        }
         // Status bar keybinds
         assert!(screen.contains("Tab"), "status bar must show Tab hint");
         assert!(screen.contains("quit"), "status bar must mention quit");
@@ -6482,7 +6492,7 @@ mod tests {
 
         // The accordion's reserved scrollbar column is the rightmost column of plan_area.
         // For an 80-wide terminal: sidebar = 30% = 24 cols, main = 56 cols.
-        // main_block (Borders::ALL + Padding::horizontal(1)) inner: x=26, width=52.
+        // main_block (borderless, Padding::horizontal(2)) inner: x=26, width=52.
         // plan_area has the same x and width, so its rightmost column = 26 + 52 - 1 = 77.
         let accordion_scrollbar_col: u16 = 77;
         // Accordion rows start after the tab row inside main inner (y=2 for body starting at y=1).
@@ -6540,7 +6550,7 @@ mod tests {
 
         // The accordion's reserved scrollbar column is the rightmost column of plan_area.
         // For an 80-wide terminal: sidebar = 30% = 24 cols, main = 56 cols.
-        // main_block (Borders::ALL + Padding::horizontal(1)) inner: x=26, width=52.
+        // main_block (borderless, Padding::horizontal(2)) inner: x=26, width=52.
         // plan_area has the same x and width, so its rightmost column = 26 + 52 - 1 = 77.
         let accordion_scrollbar_col: u16 = 77;
         // With terminal height 25, accordion rows go from 1 to 23.
@@ -9604,7 +9614,7 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
 
         // The exchange pane's inner area (Borders::TOP, no horizontal border) has x=26, width=52
-        // for an 80-wide terminal (main_block inner: border+padding = 2 per side → x=26, width=52).
+        // for an 80-wide terminal (main_block inner: padding = 2 per side → x=26, width=52).
         // The scrollbar renders into the rightmost column of the inner area: x = 26 + 52 - 1 = 77.
         let exchange_scrollbar_col: u16 = 77;
         let exchange_rows = 2u16..9u16;
@@ -10850,12 +10860,6 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let screen = screen_of(&terminal);
 
-        // Verify sidebar shows "Runs & Tasks" title.
-        assert!(
-            screen.contains("Runs & Tasks"),
-            "sidebar must have 'Runs & Tasks' title"
-        );
-
         // Verify run header shows disclosure glyph (expanded run = ▾).
         assert!(
             screen.contains("▾"),
@@ -11931,7 +11935,7 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
 
         // Sidebar inner area: sidebar_area = Percentage(30) of 80 = 24 cols (x=0, width=24).
-        // sidebar_block has Borders::ALL + Padding::horizontal(1): removes 2 per horizontal side.
+        // sidebar_block is borderless with Padding::horizontal(2): removes 2 per horizontal side.
         // sidebar_inner: x = 0+2 = 2, width = 24-4 = 20, rightmost column = 2 + 20 - 1 = 21.
         let sidebar_scrollbar_col: u16 = 21;
         let sidebar_rows = 1u16..9u16; // Rows from below title bar to above status bar
@@ -12035,10 +12039,10 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        // The visible content must be items 20..25 — the manual offset of 20
+        // The visible content must start at item 20 — the manual offset of 20
         // must actually shift the viewport, NOT be pulled back to 0 to keep
         // the cursor (item 0) visible.
-        let sidebar_content = extract_buffer_region(&buffer, 1, 21, 2, 8);
+        let sidebar_content = extract_buffer_region(&buffer, 1, 21, 1, 9);
         assert!(
             sidebar_content.contains("0021-Run"),
             "sidebar must show item 20 (the manual offset) when scrolled; was:\n{sidebar_content}"
@@ -12048,28 +12052,27 @@ mod tests {
             "sidebar must NOT show the top item (run-0) after scrolling past it; was:\n{sidebar_content}"
         );
 
-        // The scrollbar thumb (█) must NOT be at the top (y=2): offset 20 of
+        // The scrollbar thumb (█) must NOT be at the top (y=1): offset 20 of
         // ~44 is past the middle of the track.
         let sidebar_scrollbar_col: u16 = 21;
         assert_ne!(
-            buffer[(sidebar_scrollbar_col, 2)].symbol(),
+            buffer[(sidebar_scrollbar_col, 1)].symbol(),
             "█",
             "scrollbar thumb must not sit at the top row when the offset is 20 of ~44"
         );
         // And the track must be present (║) at the top, confirming a scrollbar
         // is rendered (content is tall).
         assert_eq!(
-            buffer[(sidebar_scrollbar_col, 2)].symbol(),
+            buffer[(sidebar_scrollbar_col, 1)].symbol(),
             "║",
             "scrollbar track must appear at the top row when content is tall and offset is non-zero"
         );
 
         // The highlight symbol (▶) must NOT appear in the gutter because the
         // cursor (item 0) is scrolled out of view. The gutter starts at
-        // sidebar_inner.x = 2 (after the left border at x=0 and 1-cell padding
-        // at x=1).
+        // sidebar_inner.x = 2 (the pane's 2-cell horizontal padding).
         let gutter_col: u16 = 2;
-        for y in 2u16..8u16 {
+        for y in 1u16..9u16 {
             assert_ne!(
                 buffer[(gutter_col, y)].symbol(),
                 "▶",
@@ -12108,12 +12111,12 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        // The gutter starts at sidebar_inner.x = 2 (left border at x=0, then
-        // 1-cell horizontal padding at x=1, then the inner area at x=2). The
-        // highlight symbol `▶` occupies the first gutter cell.
+        // The gutter starts at sidebar_inner.x = 2 (the pane's 2-cell
+        // horizontal padding). The highlight symbol `▶` occupies the first
+        // gutter cell.
         let gutter_col: u16 = 2;
-        // The cursor's row: y = sidebar_inner.y + cursor = 2 + 3 = 5.
-        let cursor_row: u16 = 5;
+        // The cursor's row: y = sidebar_inner.y + cursor = 1 + 3 = 4.
+        let cursor_row: u16 = 4;
 
         // The gutter cell on the cursor's row must contain the `▶` highlight
         // symbol.
@@ -12131,7 +12134,7 @@ mod tests {
         );
 
         // No other visible row should carry the highlight symbol.
-        for y in 2u16..8u16 {
+        for y in 1u16..9u16 {
             if y == cursor_row {
                 continue;
             }
@@ -12180,7 +12183,7 @@ mod tests {
         // Initial render: offset 0, cursor at item 0 → items run-0..run-5 visible.
         terminal.draw(|f| render(&app, f)).unwrap();
         let buf_before = terminal.backend().buffer().clone();
-        let sidebar_before = extract_buffer_region(&buf_before, 4, 21, 2, 8);
+        let sidebar_before = extract_buffer_region(&buf_before, 4, 21, 1, 9);
         assert!(
             sidebar_before.contains("0001-Run"),
             "initial render must show the top item; was:\n{sidebar_before}"
@@ -12194,7 +12197,7 @@ mod tests {
         // Re-render and assert the visible content has shifted.
         terminal.draw(|f| render(&app, f)).unwrap();
         let buf_after = terminal.backend().buffer().clone();
-        let sidebar_after = extract_buffer_region(&buf_after, 4, 21, 2, 8);
+        let sidebar_after = extract_buffer_region(&buf_after, 4, 21, 1, 9);
         assert!(
             sidebar_after.contains("0006-Run"),
             "after 5 wheel-down clicks the sidebar must show item 5 (offset 5); was:\n{sidebar_after}"
@@ -12229,7 +12232,7 @@ mod tests {
             })
             .collect();
         let mut app = App::new(api, runs, std::path::PathBuf::from("."));
-        // Cursor on item 2 — its row (y=4) overlaps the scrollbar track/thumb.
+        // Cursor on item 2 — its row (y=3) overlaps the scrollbar track/thumb.
         app.tree_cursor = Some(2);
 
         terminal.draw(|f| render(&app, f)).unwrap();
@@ -12238,9 +12241,9 @@ mod tests {
         let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
         // Sidebar inner rightmost column = x=21 (see sidebar_scrollbar_renders_when_tall).
         // On EVERY visible row the scrollbar cell must NOT carry the accent
-        // background — including the cursor's row (y=4), which is where the
+        // background — including the cursor's row (y=3), which is where the
         // highlight used to bleed into the rail.
-        for y in 2u16..8u16 {
+        for y in 1u16..9u16 {
             assert_ne!(
                 buffer[(21, y)].bg,
                 accent,
@@ -12250,9 +12253,9 @@ mod tests {
         // Sanity: the cursor's row still gets the highlight on the gutter
         // (x=2), proving the highlight was painted — just not on the scrollbar.
         assert_eq!(
-            buffer[(2, 4)].bg,
+            buffer[(2, 3)].bg,
             accent,
-            "highlight style must still be painted on the cursor's gutter cell (x=2, y=4)"
+            "highlight style must still be painted on the cursor's gutter cell (x=2, y=3)"
         );
     }
 
@@ -12291,7 +12294,7 @@ mod tests {
         // Every scrollbar cell on a content row must carry the Dim theme
         // foreground — never Reset (which renders as the terminal default,
         // often white).
-        for y in 2u16..8u16 {
+        for y in 1u16..9u16 {
             assert_eq!(
                 buffer[(21, y)].fg,
                 dim,
@@ -12328,7 +12331,7 @@ mod tests {
     /// index 3, and items at indices 0-2 must NOT appear in the sidebar.
     ///
     /// With `scroll_offsets[Sidebar] = 0` the item at index 0 is visible and the
-    /// item at index 6 is not (only 6 inner rows fit in a height-10 terminal).
+    /// item at index 8 is not (only 8 inner rows fit in a height-10 terminal).
     ///
     /// The test scans only the sidebar's inner buffer columns (1..23 in an 80-wide
     /// terminal where the sidebar is 30% = 24 cols wide) to avoid false matches
@@ -12337,10 +12340,11 @@ mod tests {
     fn sidebar_scroll_offset_applied_to_rendering() {
         // Terminal: 80 wide, 10 tall.
         // Layout: row 0 = title, rows 1-8 = body (sidebar + main), row 9 = status bar.
-        // Sidebar occupies 30% of 80 = 24 columns (x: 0..24), with Borders::ALL:
-        //   inner columns: x 1..23 (22 wide), inner rows: y 2..8 (6 rows).
-        // With 12 items and 6 visible inner rows, offset=3 shows items 3-8; items 0-2 are hidden.
-        // With offset=0, items 0-5 are shown; item 6 is hidden.
+        // Sidebar occupies 30% of 80 = 24 columns (x: 0..24); the borderless pane
+        // pads 2 columns per side, so inner columns are x 2..22 and the inner
+        // rows are the whole body: y 1..9 (8 rows).
+        // With 12 items and 8 visible inner rows, offset=3 shows items 3-11; items 0-2 are hidden.
+        // With offset=0, items 0-7 are shown; item 8 is hidden.
         //
         // Item labels: file_stem of ".tasks/run-{i}.json" = "run-{i}" (no zero-padding).
         // Uniqueness: "run-0" only appears in item 0; "run-1" only in item 1 (items 10+ don't
@@ -12378,8 +12382,8 @@ mod tests {
         terminal.draw(|f| render(&app, f)).unwrap();
         let buf1 = terminal.backend().buffer().clone();
 
-        // Sidebar inner area: x in 1..23, y in 2..8 (rows inside the Borders::ALL box).
-        let sidebar1 = extract_buffer_region(&buf1, 1, 23, 2, 8);
+        // Sidebar inner area: x in 1..23, y in 1..9 (the pane draws no border).
+        let sidebar1 = extract_buffer_region(&buf1, 1, 23, 1, 9);
 
         assert!(
             sidebar1.contains("0004-Run"),
@@ -12408,16 +12412,16 @@ mod tests {
         terminal2.draw(|f| render(&app2, f)).unwrap();
         let buf2 = terminal2.backend().buffer().clone();
 
-        let sidebar2 = extract_buffer_region(&buf2, 1, 23, 2, 8);
+        let sidebar2 = extract_buffer_region(&buf2, 1, 23, 1, 9);
 
         assert!(
             sidebar2.contains("0001-Run"),
             "offset=0: item at index 0 (run-0) must be visible in the sidebar; sidebar was:\n{sidebar2}"
         );
-        // With 6 inner rows and offset=0, items 0-5 are visible; item 6 is not.
+        // With 8 inner rows and offset=0, items 0-7 are visible; item 8 is not.
         assert!(
-            !sidebar2.contains("0007-Run"),
-            "offset=0: item at index 6 (run-6) must NOT be visible with only 6 inner rows; sidebar was:\n{sidebar2}"
+            !sidebar2.contains("0009-Run"),
+            "offset=0: item at index 8 (run-8) must NOT be visible with only 8 inner rows; sidebar was:\n{sidebar2}"
         );
     }
 
@@ -12532,8 +12536,8 @@ mod tests {
     /// pane, DependencyViewMode::Off, empty ingestion report).
     ///
     /// Mirrors the layout logic in `render()` exactly, including the
-    /// `Padding::horizontal(1)` inside `panel_block` which shifts the inner
-    /// rect by +1 on each horizontal side.
+    /// `Padding::horizontal(2)` inside `panel_block` which shifts the inner
+    /// rect by +2 on each horizontal side.
     fn expected_geometry(width: u16, height: u16) -> (Rect, Rect) {
         let area = Rect::new(0, 0, width, height);
 
@@ -12557,14 +12561,13 @@ mod tests {
         let sidebar_area = body[0];
         let main_area = body[1];
 
-        // panel_block has Borders::ALL + Padding::horizontal(1).
-        // Borders::ALL removes 1 cell on each side; horizontal padding removes 1
-        // more on each side → total: x+2, y+1, width-4, height-2.
+        // panel_block is borderless with Padding::horizontal(2): 2 cells go on
+        // each horizontal side and no row is lost → x+2, width-4.
         let main_inner = Rect::new(
             main_area.x + 2,
-            main_area.y + 1,
+            main_area.y,
             main_area.width.saturating_sub(4),
-            main_area.height.saturating_sub(2),
+            main_area.height,
         );
 
         // content_area = main_inner (error pane height = 0).
@@ -12950,14 +12953,14 @@ mod tests {
 
         // A scrollbar must be rendered in the reserved rightmost column of the
         // task entry pane. The layout mirrors the plan accordion: main_block
-        // (Borders::ALL + Padding::horizontal(1)) inner is x=26, width=52 for an
+        // (borderless, Padding::horizontal(2)) inner is x=26, width=52 for an
         // 80-wide terminal (sidebar 30% = 24 cols). The task pane block uses
         // Borders::TOP (no horizontal border/padding), then reserves 1 col for
         // the scrollbar → content_area x=26 width=51, scrollbar column x=77.
         let buf = terminal.backend().buffer();
         let task_scrollbar_col: u16 = 77;
-        // Task rows: after the title bar (y=0), tab bar (y=1), block top border
-        // (y=2) → content starts at y=3; status bar is the last row (y=9).
+        // Task rows: after the title bar (y=0), tab bar (y=1), the task block's
+        // top border (y=2) → content starts at y=3; status bar is the last row (y=9).
         let has_scrollbar = col_has_scrollbar(buf, task_scrollbar_col, 3, 9);
         assert!(
             has_scrollbar,
@@ -14157,15 +14160,17 @@ mod tests {
         );
 
         // Normal layout widgets must be absent — the guard returns before any
-        // layout split, so sidebar/detail/title-bar/status-bar widgets are not drawn.
+        // layout split, so sidebar/detail/title-bar/status-bar widgets are not
+        // drawn. The panes carry no title of their own any more, so the probe
+        // is their content: the empty sidebar's hint and the status bar's keys.
         assert!(
-            !screen.contains("Runs"),
-            "normal sidebar widget 'Runs' must NOT appear in small-terminal fallback; got: {:?}",
+            !screen.contains("No runs open."),
+            "normal sidebar content must NOT appear in small-terminal fallback; got: {:?}",
             screen,
         );
         assert!(
-            !screen.contains("Detail"),
-            "normal main-pane 'Detail' must NOT appear in small-terminal fallback; got: {:?}",
+            !screen.contains("panel"),
+            "the status bar's '[Tab] panel' hint must NOT appear in small-terminal fallback; got: {:?}",
             screen,
         );
         assert!(
