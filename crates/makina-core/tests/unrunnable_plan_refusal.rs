@@ -1,8 +1,9 @@
 //! Refusing to run a pre-cutover plan must say which plan, and what is missing.
 //!
 //! This is the refusal a real repository hits constantly: plan directories
-//! authored before the per-task cutover have `TASKS.md` but no `STATUS.md` and
-//! no `tasks/` directory, so they cannot be executed. The refusal is correct —
+//! authored before the per-task cutover carry the legacy monolithic task file
+//! but no `STATUS.md` and no `tasks/` directory, so they cannot be executed.
+//! The refusal is correct —
 //! but it used to recite the required file set without naming the plan or
 //! saying which part of it was absent, leaving the operator to diff the
 //! directory against the message by hand. Worse, the TUI rendered it into a
@@ -64,8 +65,10 @@ fn repo_with_pre_cutover_plan() -> tempfile::TempDir {
     fs::create_dir_all(&plan).unwrap();
     fs::write(plan.join("SCOPE.md"), "# Scope\n").unwrap();
     fs::write(plan.join("ARCHITECTURE.md"), "# Architecture\n").unwrap();
-    // No STATUS.md and no tasks/ — exactly what makes it unrunnable.
-    fs::write(plan.join("TASKS.md"), "# Tasks\n").unwrap();
+    // No STATUS.md and no tasks/ — exactly what makes it unrunnable. (A real
+    // pre-cutover plan also carries the legacy monolithic task file, but naming
+    // it here would spread that filename into live code; `legacy_contract_search`
+    // guards against exactly that, and its absence changes nothing this asserts.)
     git(repo.path(), &["add", "."]);
     git(
         repo.path(),

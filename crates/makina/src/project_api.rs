@@ -315,6 +315,30 @@ impl ProjectApiRouter {
     /// `PlanKey` is repository-relative, so the project root is deliberately
     /// supplied at this binary boundary instead of inferred from matching
     /// directory names across the workspace.
+    ///
+    /// # Why existence is not checked here
+    ///
+    /// A plan does **not** have to be present in the working tree to be real.
+    /// Discovery resolves plans from three sources — the working tree, the
+    /// configured base revision, and retained `refs/heads/plan/*` registration
+    /// refs — so a plan that was authored and registered, but whose branch is
+    /// not checked out into the main worktree, is legitimately listed and
+    /// legitimately runnable (the run executes in its own worktree).
+    ///
+    /// This boundary used to `canonicalize` the plan directory and fail when it
+    /// was absent, which made it strictly stricter than the orchestrator it
+    /// delegates to: a registered plan visible in the sidebar could not be
+    /// started, reporting `cannot resolve plan directory …: No such file or
+    /// directory`. Existence is therefore left to the orchestrator, which knows
+    /// all three sources and can say precisely which one it is missing from.
+    ///
+    /// What this boundary still owes is **containment**: the plan must not
+    /// escape the project. `PlanKey::parse` already guarantees a relative path
+    /// of `Normal` components (no `..`, no absolute prefix), so the join is
+    /// lexically inside `project_root`; the one way out is a symlink, and a
+    /// symlink can only escape if it exists. Checking containment exactly when
+    /// the path resolves therefore keeps the guarantee without turning it into
+    /// an existence requirement.
     pub async fn open_plan(
         &self,
         project_root: &Path,
@@ -322,14 +346,9 @@ impl ProjectApiRouter {
     ) -> Result<CommandOutcome, ApiError> {
         let project_root = self.require_allowed_project(project_root)?;
         let candidate = project_root.join(&plan_dir.relative_dir);
-        let resolved =
-            std::fs::canonicalize(&candidate).map_err(|error| ApiError::InvalidCommand {
-                reason: format!(
-                    "cannot resolve plan directory {}: {error}",
-                    candidate.display()
-                ),
-            })?;
-        if !resolved.starts_with(&project_root) || !resolved.is_dir() {
+        if let Ok(resolved) = std::fs::canonicalize(&candidate)
+            && (!resolved.starts_with(&project_root) || !resolved.is_dir())
+        {
             return Err(ApiError::InvalidCommand {
                 reason: format!(
                     "plan directory {} is not contained in project {}",
@@ -905,6 +924,50 @@ mod tests {
                 body: "Generate safely.".into(),
             }],
         }
+    }
+
+    /// A plan that is **not** in the working tree still opens.
+    ///
+    /// Discovery lists plans from the working tree, the base revision, and
+    /// retained `refs/heads/plan/*` refs, so a plan that was authored and
+    /// registered — but whose branch is not checked out into the main worktree —
+    /// is shown in the sidebar and is runnable. This boundary used to
+    /// `canonicalize` the directory and reject exactly that case with
+    /// "cannot resolve plan directory …: No such file or directory", making it
+    /// stricter than the orchestrator it delegates to: the plan was visible and
+    /// could never be started.
+    #[tokio::test]
+    async fn a_plan_absent_from_the_working_tree_still_reaches_the_orchestrator() {
+        let repo = project("router-ref-only");
+        let fake = Arc::new(FakeApi::new());
+        let routed = Arc::clone(&fake);
+        let factory: ProjectApiFactory = Arc::new(move |_| {
+            let api: Arc<dyn Api> = routed.clone();
+            Ok(api)
+        });
+        let router = ProjectApiRouter::new([repo.path().to_path_buf()], factory);
+
+        // Registered on a plan ref, never checked out here.
+        let plan = makina_core::plan::PlanKey::parse("docs/plans/0002-Only-On-A-Ref").unwrap();
+        assert!(
+            !repo.path().join(&plan.relative_dir).exists(),
+            "precondition: the plan is absent from the working tree"
+        );
+
+        let outcome = router
+            .open_plan(repo.path(), plan.clone())
+            .await
+            .expect("a registered plan must reach the orchestrator, not be refused here");
+        assert!(matches!(outcome, CommandOutcome::RunOpened { .. }));
+
+        // Deciding whether the plan really exists is the orchestrator's job —
+        // it is the only layer that knows all three sources.
+        assert!(
+            fake.commands.lock().unwrap().iter().any(
+                |command| matches!(command, Command::OpenPlan { plan_dir } if *plan_dir == plan)
+            ),
+            "OpenPlan must have been delegated"
+        );
     }
 
     #[tokio::test]
