@@ -1202,17 +1202,22 @@ pub enum DependencyViewMode {
 
 /// Which panel the keyboard focus is currently on.
 ///
-/// The TUI has two top-level areas:
+/// The TUI has three focusable areas, laid out the way they are on screen so
+/// the arrow keys mean what they look like:
 ///
-/// * [`Panel::Sidebar`] — the left column listing open Runs.
-/// * [`Panel::Main`] — the right content area showing the focused Run.
+/// * [`Panel::Sidebar`] — the left column listing folders, plans, and runs.
+/// * [`Panel::Main`] — the content of the active tab, to its right.
+/// * [`Panel::Tabs`] — the strip of tab chips above the content.
 ///
-/// Task 27 (runs-sidebar) and tasks 29–31 will extend the rendering of these
-/// panels; the skeleton simply tracks which one owns focus.
+/// `→` crosses from the sidebar into the content, `←` goes back; `↑` from the
+/// content reaches the tab strip, where `←`/`→` change tabs and `↓` returns to
+/// the content. `Tab` cycles sidebar ↔ content as it always did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Sidebar,
     Main,
+    /// The tab strip. Reached with `↑` from the content; `←`/`→` switch tabs.
+    Tabs,
 }
 
 /// Hierarchical focus state: which nested item inside the focused panel owns focus.
@@ -1320,6 +1325,13 @@ pub enum AppEvent {
     /// `←` — from [`Panel::Main`], return focus to [`Panel::Sidebar`];
     /// otherwise collapse the focused expanded run. See plan 0018.
     FocusLeftOrCollapse,
+    /// `↑` from the content — move focus to the tab strip.
+    ///
+    /// A no-op when no tab is open: focus never lands somewhere with nothing
+    /// in it.
+    FocusTabBar,
+    /// `↓` from the tab strip — move focus back into the active tab's content.
+    FocusContent,
     /// Space key — toggle expand/collapse the focused tree node's run (sidebar focus only).
     ToggleTreeNode,
     /// Scroll the focused exchange pane one line up (mouse wheel up).
@@ -1827,6 +1839,20 @@ pub struct SelectionPane {
     pub hit: ratatui::layout::Rect,
     /// The rectangle the selection is confined to (inner content).
     pub clip: ratatui::layout::Rect,
+    /// Whether this pane holds wrapped prose.
+    ///
+    /// Set only where a row break may be the renderer's rather than the
+    /// author's — a transcript body, not a tree or a table — so that copying
+    /// out of it rejoins wrapped rows ([`crate::selection`]). Everywhere else a
+    /// row is a line and stays one.
+    pub flow: bool,
+    /// Which panel clicking here means the operator is working in.
+    ///
+    /// Focus decides where keys go, so a click has to move it: clicking into
+    /// the composer and then typing must reach the composer, not whatever held
+    /// focus beforehand. `None` for a full-screen overlay, which is modal and
+    /// owns the keyboard already.
+    pub focus: Option<Panel>,
 }
 
 /// Content displayed in a tab in the main pane.
@@ -4389,11 +4415,23 @@ impl App {
     pub fn focused_state(&self) -> FocusState {
         match self.focused_panel {
             Panel::Sidebar => FocusState::TreeNode,
-            Panel::Main => self
+            // The tab strip owns no nested item — the chips are the items — so
+            // it reports as the pane it sits above.
+            Panel::Main | Panel::Tabs => self
                 .focused_section
                 .map(FocusState::AccordionSection)
                 .unwrap_or(FocusState::MainPane),
         }
+    }
+
+    /// Whether the plan-authoring composer is the thing keys go to.
+    ///
+    /// The authoring tab being *open* is not enough: the sidebar and the tab
+    /// strip can hold focus while it is, and a keystroke belongs to whatever
+    /// has focus. Without this the composer swallowed every key the moment the
+    /// tab existed, which is what left no way back to the sidebar.
+    pub fn composer_focused(&self) -> bool {
+        self.focused_panel == Panel::Main && self.is_plan_authoring()
     }
 
     /// Return the static accordion section cycle order (used by Tab logic).
@@ -4415,6 +4453,12 @@ impl App {
                 // From Sidebar, Tab always moves to Main pane.
                 self.focused_panel = Panel::Main;
                 self.focused_section = None; // Enter Main without a specific section focus.
+            }
+            // The tab strip is reached with `↑`, not by cycling; Tab leaves it
+            // for the start of the cycle rather than trapping focus there.
+            Panel::Tabs => {
+                self.focused_panel = Panel::Sidebar;
+                self.focused_section = None;
             }
             Panel::Main => {
                 // From Main, check if a plan tab is active.
@@ -4469,6 +4513,11 @@ impl App {
     /// Sidebar → Status (if plan tab active) → Accordion sections in reverse → Main → Sidebar (wrap).
     pub fn move_focus_backward(&mut self) {
         match self.focused_panel {
+            // Backward out of the tab strip is the content it sits above —
+            // the same place `↓` goes.
+            Panel::Tabs => {
+                self.focused_panel = Panel::Main;
+            }
             Panel::Sidebar => {
                 // From Sidebar, Shift+Tab checks if a plan tab is active.
                 let has_active_plan_tab = self
@@ -4650,18 +4699,29 @@ impl App {
         *self.selection_panes.borrow_mut() = panes;
     }
 
-    /// The clip rectangle of the recorded pane whose `hit` region contains the
-    /// screen cell `(x, y)`, if any. Used to confine a new mouse selection to a
-    /// single pane. Returns `None` when the drag began outside every pane
-    /// (e.g. the title or status bar).
-    pub fn selection_pane_at(&self, x: u16, y: u16) -> Option<ratatui::layout::Rect> {
+    /// Record a pane that should be preferred over the ones already set.
+    ///
+    /// The frame's panes are recorded top-down — the whole sidebar, the whole
+    /// content pane — before the content itself knows its own geometry. A
+    /// region *inside* one of them that selects differently (a transcript body,
+    /// whose rail and scrollbar are chrome rather than text) records itself as
+    /// it renders, and has to be found first: [`App::selection_pane_at`] takes
+    /// the earliest match, so this goes to the front.
+    pub fn prefer_selection_pane(&self, pane: SelectionPane) {
+        self.selection_panes.borrow_mut().insert(0, pane);
+    }
+
+    /// The recorded pane whose `hit` region contains the screen cell `(x, y)`,
+    /// if any. Used to confine a new mouse selection to a single pane. Returns
+    /// `None` when the drag began outside every pane (e.g. the status bar).
+    pub fn selection_pane_at(&self, x: u16, y: u16) -> Option<SelectionPane> {
         self.selection_panes
             .borrow()
             .iter()
             .find(|p| {
                 x >= p.hit.left() && x < p.hit.right() && y >= p.hit.top() && y < p.hit.bottom()
             })
-            .map(|p| p.clip)
+            .copied()
     }
 
     /// Record the geometries of rendered panels for hitbox testing.
@@ -4708,6 +4768,16 @@ impl App {
             }
             AppEvent::FocusPrev => {
                 self.move_focus_backward();
+                true
+            }
+            AppEvent::FocusTabBar => {
+                if self.tabs.active_tab.is_some() {
+                    self.focused_panel = Panel::Tabs;
+                }
+                true
+            }
+            AppEvent::FocusContent => {
+                self.focused_panel = Panel::Main;
                 true
             }
             AppEvent::CycleDependencyView => {
@@ -4787,6 +4857,9 @@ impl App {
                         // Sidebar focus: walk the tree nodes up.
                         self.tree_move(-1);
                     }
+                    // The tab strip is one row of chips: there is nothing above
+                    // it and nothing in it to scroll.
+                    Panel::Tabs => {}
                     Panel::Main => {
                         // Main focus: scroll the active tab's pane up. The target
                         // depends on the active tab type — a Task/PlanTask tab scrolls its
@@ -4803,6 +4876,8 @@ impl App {
                         // Sidebar focus: walk the tree nodes down.
                         self.tree_move(1);
                     }
+                    // Handled as `FocusContent` before it reaches here.
+                    Panel::Tabs => {}
                     Panel::Main => {
                         // Main focus: scroll the active tab's pane down, clamped to
                         // the per-panel scroll max recorded by the last render pass.
@@ -4880,6 +4955,9 @@ impl App {
                 match self.focused_panel {
                     // From the content pane, `Left` steps back to the sidebar (no collapse).
                     Panel::Main => self.focused_panel = Panel::Sidebar,
+                    // On the tab strip, `Left` means the previous tab; it is
+                    // translated to `PrevTab` and never arrives here.
+                    Panel::Tabs => {}
                     // In the sidebar, `Left` collapses an *expanded* run/plan/folder. On a
                     // plan-task preview leaf, `Left` collapses its parent plan and
                     // parks the cursor on it.
@@ -5025,9 +5103,21 @@ impl App {
                 // sidebar). A drag that starts outside every pane selects
                 // nothing.
                 let had = self.selection.is_some();
-                self.selection = self
-                    .selection_pane_at(x, y)
-                    .map(|bounds| crate::selection::Selection::start(x, y, bounds));
+                let pane = self.selection_pane_at(x, y);
+                // Clicking in a pane is also how the operator says which pane
+                // they are working in — without this, clicking into the
+                // composer and typing sent the keystrokes to whatever had
+                // focus before, where `q` quits.
+                if let Some(focus) = pane.and_then(|pane| pane.focus) {
+                    self.focused_panel = focus;
+                }
+                self.selection = pane.map(|pane| {
+                    if pane.flow {
+                        crate::selection::Selection::start_flowing(x, y, pane.clip)
+                    } else {
+                        crate::selection::Selection::start(x, y, pane.clip)
+                    }
+                });
                 // Redraw if a selection started, or to clear a prior highlight.
                 had || self.selection.is_some()
             }
@@ -5059,6 +5149,9 @@ impl App {
                         // Toggle expand/collapse on the focused tree node's run.
                         self.tree_toggle_expand();
                     }
+                    // A chip has nothing to expand — the tab it names is
+                    // already the active one.
+                    Panel::Tabs => {}
                     Panel::Main => {
                         // Toggle the focused accordion section (if one is focused).
                         if let Some(focused_section) = self.focused_section
@@ -5619,9 +5712,16 @@ impl App {
                             state.waiting = false;
                             state.answer_tx = None;
                             state.rejection_tx = None;
-                            state.plans.push(plan_dir.clone());
+                            // A revision republishes the plan it already made,
+                            // so it is the same plan — recorded once, and named
+                            // for what just happened to it.
+                            let revised = state.plans.iter().any(|plan| plan == &plan_dir);
+                            if !revised {
+                                state.plans.push(plan_dir.clone());
+                            }
+                            let verb = if revised { "Updated" } else { "Created" };
                             state.push_planner(format!(
-                                "Created {plan_dir}.\nOpen it from the sidebar to read the \
+                                "{verb} {plan_dir}.\nOpen it from the sidebar to read the \
                                  plan, or tell me what to change and I will revise it."
                             ));
                         }
@@ -9980,6 +10080,8 @@ mod tests {
         app.set_selection_panes(vec![crate::app::SelectionPane {
             hit: area,
             clip: area,
+            flow: false,
+            focus: Some(Panel::Main),
         }]);
     }
 
@@ -10028,6 +10130,8 @@ mod tests {
         app.set_selection_panes(vec![crate::app::SelectionPane {
             hit: ratatui::layout::Rect::new(0, 2, 80, 22),
             clip: ratatui::layout::Rect::new(0, 2, 80, 22),
+            flow: false,
+            focus: Some(Panel::Main),
         }]);
         app.update(AppEvent::SelectionStart(5, 0));
         assert!(
@@ -10045,6 +10149,8 @@ mod tests {
         app.set_selection_panes(vec![crate::app::SelectionPane {
             hit: right,
             clip: right,
+            flow: false,
+            focus: Some(Panel::Main),
         }]);
         app.update(AppEvent::SelectionStart(35, 4));
         assert_eq!(app.selection.expect("selection started").bounds, right);
@@ -13218,6 +13324,111 @@ mod tests {
                 .iter()
                 .any(|entry| entry.text() == "an fsm cli"),
             "the earlier conversation must survive",
+        );
+    }
+
+    // ── Focus: sidebar ↔ content ↔ tab strip ───────────────────────────────────
+
+    /// The composer takes keys only while it has focus.
+    ///
+    /// Being open is not the same as being focused: the sidebar and the tab
+    /// strip can hold focus while the authoring tab is showing, and a key
+    /// belongs to whatever has it.
+    #[test]
+    fn the_composer_takes_keys_only_while_it_holds_focus() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        assert!(
+            app.composer_focused(),
+            "opening the tab puts the caret in the composer"
+        );
+
+        app.update(AppEvent::FocusLeftOrCollapse);
+        assert_eq!(app.focused_panel, Panel::Sidebar, "`←` reaches the sidebar");
+        assert!(
+            !app.composer_focused(),
+            "with the sidebar focused the composer is not what keys go to",
+        );
+        assert!(
+            app.is_plan_authoring(),
+            "the tab is still open and still showing the conversation",
+        );
+    }
+
+    /// `→` out of the sidebar lands on the composer — the one thing an
+    /// authoring tab has to focus.
+    #[test]
+    fn crossing_right_from_the_sidebar_reaches_the_composer() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.update(AppEvent::FocusLeftOrCollapse);
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+
+        app.update(AppEvent::FocusRightOrExpand);
+
+        assert_eq!(app.focused_panel, Panel::Main);
+        assert!(app.composer_focused());
+    }
+
+    /// `↑` reaches the tab strip, where the horizontal arrows change tabs and
+    /// `↓` goes back to the content.
+    #[test]
+    fn the_tab_strip_is_reachable_and_switches_tabs() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.tabs.open_tab(TabContent::Logs);
+        assert_eq!(app.tabs.active_tab, Some(1));
+
+        app.focused_panel = Panel::Main;
+        app.update(AppEvent::FocusTabBar);
+        assert_eq!(app.focused_panel, Panel::Tabs);
+        assert!(
+            !app.composer_focused(),
+            "the strip has focus, so the composer does not",
+        );
+
+        app.update(AppEvent::PrevTab);
+        assert_eq!(app.tabs.active_tab, Some(0), "`←` walks the strip");
+        app.update(AppEvent::NextTab);
+        assert_eq!(app.tabs.active_tab, Some(1), "`→` walks it back");
+
+        app.update(AppEvent::FocusContent);
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "`↓` steps into the tab the strip left active",
+        );
+    }
+
+    /// Focus never lands on an empty strip.
+    #[test]
+    fn the_tab_strip_cannot_take_focus_with_no_tabs_open() {
+        let mut app = make_app();
+        app.focused_panel = Panel::Main;
+        assert!(app.tabs.active_tab.is_none(), "precondition: no tabs");
+
+        app.update(AppEvent::FocusTabBar);
+
+        assert_eq!(app.focused_panel, Panel::Main);
+    }
+
+    /// Tab still cycles sidebar ↔ content, and leaving the strip rejoins that
+    /// cycle rather than trapping focus on it.
+    #[test]
+    fn tab_cycling_leaves_the_strip_rather_than_trapping_focus() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenPlanAuthoring);
+        app.focused_panel = Panel::Tabs;
+
+        app.move_focus_forward();
+        assert_eq!(app.focused_panel, Panel::Sidebar);
+
+        app.focused_panel = Panel::Tabs;
+        app.move_focus_backward();
+        assert_eq!(
+            app.focused_panel,
+            Panel::Main,
+            "backward out of the strip is the content it sits above",
         );
     }
 

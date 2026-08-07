@@ -3878,6 +3878,8 @@ impl AuthoringCoordinator {
             )));
         }
         let plan_ref = bundle.key.ref_name();
+        // The registration this one replaces, when the plan is being revised.
+        let mut refresh_old: Option<String> = None;
         if let Ok(tip) = git(root, &["rev-parse", "--verify", &plan_ref]).await {
             let message = git(root, &["show", "-s", "--format=%B", &tip]).await?;
             if trailer(&message, "Makina-Phase").as_deref() == Some("plan-registration")
@@ -3915,9 +3917,34 @@ impl AuthoringCoordinator {
                     registration_oid: tip,
                 });
             }
-            return Err(invalid(format!(
-                "{plan_ref} already contains divergent evidence"
-            )));
+            // Not the same bundle — but a plan the operator is still drafting is
+            // not finished the moment it is first registered. Refining it in the
+            // authoring conversation produces a new bundle under the same slug,
+            // and rejecting that as "divergent evidence" made the first draft
+            // the only draft: the plan could be discussed further but never
+            // changed.
+            //
+            // So the same rule the committed path already applies (see
+            // `publish_committed_inner`): while the ref still points at *this
+            // plan's* registration and nothing has been built on top of it, the
+            // registration is replaceable. The old one is archived rather than
+            // dropped, and anything past registration — a run's evidence, a
+            // registration this coordinator did not write — still refuses.
+            let ours = trailer(&message, "Makina-Phase").as_deref() == Some("plan-registration")
+                && trailer(&message, "Makina-Plan").as_deref() == Some(identity.as_str())
+                && trailer(&message, "Makina-Source-Origin").as_deref() == Some("generated")
+                && git(
+                    root,
+                    &["rev-list", "--count", &format!("{tip}..{plan_ref}")],
+                )
+                .await?
+                    == "0";
+            if !ours {
+                return Err(invalid(format!(
+                    "{plan_ref} already contains divergent evidence"
+                )));
+            }
+            refresh_old = Some(tip);
         }
         // Pathspec form, so an absent plans directory reads as "no plans
         // reserved" instead of failing the registration outright.
@@ -3938,21 +3965,32 @@ impl AuthoringCoordinator {
                 .or_default()
                 .push(PathBuf::from("docs/plans").join(name));
         }
-        if reservations
+        // A number is reserved by *another* plan, never by this one. That
+        // distinction only starts to matter once a plan can be revised: the
+        // first registration is usually landed on the base branch before the
+        // second is written, so the plan's own directory and its own ref are
+        // exactly what these three checks would find.
+        let own_dir = bundle.key.relative_dir.clone();
+        let taken_in_base = reservations
             .numbered_directories
-            .contains_key(&bundle.key.number)
-        {
+            .get(&bundle.key.number)
+            .into_iter()
+            .flatten()
+            .any(|path| path != &own_dir);
+        if taken_in_base {
             return Err(invalid(format!(
                 "plan number {} is already reserved in the target base",
                 bundle.key.number
             )));
         }
+        let own_basename = own_dir.file_name().and_then(|name| name.to_str());
         if let Ok(entries) = std::fs::read_dir(root.join("docs/plans")) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
                 if name.len() >= 4
                     && name[..4] == bundle.key.number
+                    && Some(name) != own_basename
                     && entry.file_type().is_ok_and(|kind| kind.is_dir())
                 {
                     return Err(invalid(format!(
@@ -3971,6 +4009,7 @@ impl AuthoringCoordinator {
         for reference in refs.lines() {
             if let Some(name) = reference.strip_prefix("refs/heads/plan/")
                 && name.starts_with(&bundle.key.number)
+                && reference != plan_ref
             {
                 return Err(invalid(format!(
                     "plan number {} is already reserved by {reference}",
@@ -3989,6 +4028,28 @@ impl AuthoringCoordinator {
             )
             .await
             .map_err(|e| invalid(e.to_string()))?;
+        if refresh_old.is_some() {
+            // The workspace attaches to the plan branch when one exists, which
+            // for a revision is the registration being replaced. The new
+            // registration has to be a child of the *base* — that is what
+            // `publish_registration_refresh` verifies and what makes the plan
+            // fast-forwardable onto base afterwards — so detach to it first.
+            git(
+                &workspace.path,
+                &["checkout", "--detach", &expected_base_oid],
+            )
+            .await?;
+            // Base already carries the previous revision if it was landed.
+            // Rebuilding the directory from the bundle alone is what makes a
+            // dropped task document actually disappear instead of surviving as
+            // a file nothing references.
+            let plan_dir = workspace.path.join(&bundle.key.relative_dir);
+            if plan_dir.exists() {
+                tokio::fs::remove_dir_all(&plan_dir)
+                    .await
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
+        }
         for (relative, bytes) in &bundle.files {
             let target = workspace.path.join(&bundle.key.relative_dir).join(relative);
             if let Some(parent) = target.parent() {
@@ -4035,8 +4096,17 @@ impl AuthoringCoordinator {
         let base_source = crate::plan::GitTreePlanFileSource::new(root, &expected_base_oid)
             .map_err(|e| invalid(e.to_string()))?;
         let board = read_root_board(&base_source)?;
-        let board = crate::plan_status::register_root_row(&board, &plan)
-            .map_err(|e| invalid(e.to_string()))?;
+        // A revision may change what the board says about the plan (its title,
+        // its state), and the row is already there from the registration being
+        // replaced — so overwrite it. A first registration has no row and both
+        // forms insert one; `register_root_row` is kept for that case because it
+        // still treats a *differing* existing row as the corruption it is.
+        let board = if refresh_old.is_some() {
+            crate::plan_status::upsert_root_row(&board, &plan)
+        } else {
+            crate::plan_status::register_root_row(&board, &plan)
+        }
+        .map_err(|e| invalid(e.to_string()))?;
         tokio::fs::write(workspace.path.join("docs/plans/STATUS.md"), board)
             .await
             .map_err(|e| invalid(e.to_string()))?;
@@ -4075,16 +4145,33 @@ impl AuthoringCoordinator {
             ],
         )
         .await?;
+        // The replaced registration is named in the message, so the revision
+        // says what it revises without anyone having to read the archive ref.
+        let previous = refresh_old
+            .as_ref()
+            .map(|old| format!("\nMakina-Previous-Registration: {old}"))
+            .unwrap_or_default();
         let message = format!(
-            "chore(plan): register {identity}\n\nMakina-Phase: plan-registration\nMakina-Plan: {identity}\nMakina-Source-Digest: {}\nMakina-Executable-Digest: {}\nMakina-Validation-Base: {expected_base_oid}\nMakina-Source-Origin: generated",
+            "chore(plan): register {identity}\n\nMakina-Phase: plan-registration\nMakina-Plan: {identity}\nMakina-Source-Digest: {}\nMakina-Executable-Digest: {}\nMakina-Validation-Base: {expected_base_oid}\nMakina-Source-Origin: generated{previous}",
             verified.source_digest, verified.executable_digest
         );
         git(&workspace.path, &["commit", "-m", &message]).await?;
         let candidate = git(&workspace.path, &["rev-parse", "HEAD"]).await?;
-        self.worktree_manager
-            .publish_registration(&workspace, &candidate, &expected_base_oid)
-            .await
-            .map_err(|e| invalid(e.to_string()))?;
+        match refresh_old.as_ref() {
+            // A revision moves the ref off the registration it replaces, which
+            // is archived under `refs/makina/recovery/` rather than dropped.
+            Some(old) => {
+                self.worktree_manager
+                    .publish_registration_refresh(&workspace, &candidate, &expected_base_oid, old)
+                    .await
+            }
+            None => {
+                self.worktree_manager
+                    .publish_registration(&workspace, &candidate, &expected_base_oid)
+                    .await
+            }
+        }
+        .map_err(|e| invalid(e.to_string()))?;
         // Registration is published: `refs/heads/plan/{identity}` now holds
         // everything this scratch workspace does. Release it so the plan branch
         // is free — a branch can be checked out in only one worktree, and

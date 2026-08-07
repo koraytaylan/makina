@@ -464,6 +464,38 @@ fn paint_stream_document(
     frame.render_widget(para, viewport.content);
     render_exchange_group_overlays(frame, app, viewport.content, viewport.offset, overlays);
 
+    // What is selectable here is the conversation, not the furniture around it.
+    // A drag may still *begin* on the role rail or the scrollbar — they are part
+    // of the stream to the pointer — but the selection is clipped to the text
+    // columns, so neither the rail glyphs nor the scrollbar track can end up in
+    // what gets copied. The rows are wrapped prose, so `flow` lets a copied
+    // paragraph come back as the paragraph it was written as.
+    if let Some(indent) = overlays.iter().map(|overlay| overlay.indent_x).min() {
+        // The rail is the group block's left border plus its one column of
+        // padding (see `render_exchange_role_group`).
+        let chrome = indent.saturating_add(2);
+        let text = Rect {
+            x: viewport.content.x.saturating_add(chrome),
+            y: viewport.content.y,
+            width: viewport.content.width.saturating_sub(chrome),
+            height: viewport.content.height,
+        };
+        if text.width > 0 {
+            app.prefer_selection_pane(crate::app::SelectionPane {
+                hit: Rect {
+                    width: viewport
+                        .content
+                        .width
+                        .saturating_add(viewport.scrollbar.width),
+                    ..viewport.content
+                },
+                clip: text,
+                flow: true,
+                focus: Some(crate::app::Panel::Main),
+            });
+        }
+    }
+
     if viewport.max > 0 {
         let mut scrollbar_state =
             ScrollbarState::new(viewport.max as usize).position(viewport.offset as usize);
@@ -902,7 +934,11 @@ pub fn render(app: &App, frame: &mut Frame) {
                             .unwrap_or(false);
 
                         if !has_plans {
-                            // Empty folder: render in distinct style with hint.
+                            // A folder with no plans yet is still just a folder.
+                            // It carries no disclosure glyph (there is nothing
+                            // to open) and is dimmed, which says "nothing here
+                            // yet" without spending half the sidebar width on a
+                            // sentence that says it again.
                             let spans = vec![
                                 Span::styled(
                                     "  ",
@@ -911,11 +947,6 @@ pub fn render(app: &App, frame: &mut Frame) {
                                 ),
                                 Span::styled(
                                     folder_name,
-                                    Style::default()
-                                        .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
-                                ),
-                                Span::styled(
-                                    "  (empty — Initialize Folder)",
                                     Style::default()
                                         .fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
                                 ),
@@ -1227,16 +1258,22 @@ pub fn render(app: &App, frame: &mut Frame) {
         vec![crate::app::SelectionPane {
             hit: area,
             clip: area,
+            flow: false,
+            focus: None,
         }]
     } else {
         vec![
             crate::app::SelectionPane {
                 hit: sidebar_area,
                 clip: panel_block().inner(sidebar_area),
+                flow: false,
+                focus: Some(Panel::Sidebar),
             },
             crate::app::SelectionPane {
                 hit: main_area,
                 clip: main_block.inner(main_area),
+                flow: false,
+                focus: Some(Panel::Main),
             },
         ]
     });
@@ -1531,6 +1568,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let focus_label = match app.focused_panel {
         Panel::Sidebar => "focus: sidebar",
         Panel::Main => "focus: main",
+        Panel::Tabs => "focus: tabs",
     };
     let trailer = if let Some(label) = &app.busy {
         // An in-flight background job (e.g. plan discovery): show an animated
@@ -1776,10 +1814,18 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
 
         let is_active = app.tabs.active_tab == Some(idx);
         let style = if is_active {
-            Style::default()
+            let style = Style::default()
                 .bg(app.active_theme.get(crate::theme::ThemeRole::Accent))
                 .fg(app.active_theme.get(crate::theme::ThemeRole::Background))
-                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::BOLD);
+            // Focus has to be visible where it is: with the strip focused the
+            // `←`/`→` keys change tabs rather than move within the content, and
+            // nothing else on screen would say so.
+            if app.focused_panel == crate::app::Panel::Tabs {
+                style.add_modifier(Modifier::UNDERLINED | Modifier::REVERSED)
+            } else {
+                style
+            }
         } else {
             Style::default()
                 .bg(app.active_theme.get(crate::theme::ThemeRole::Border))
@@ -4893,6 +4939,10 @@ fn render_plan_authoring(
         );
     }
 
+    // Typing only reaches the composer while it holds focus, so it has to look
+    // the part: the caret marks where the next character lands, and its absence
+    // says the keys are going somewhere else.
+    let focused = app.composer_focused();
     let composer = if authoring.is_busy() {
         // The indicator directly above already names the wait; repeating it
         // here just said the same thing twice. What the box has to say is why
@@ -4903,12 +4953,22 @@ fn render_plan_authoring(
         let rows = crate::app::composer_rows(&authoring.input, composer_text_width);
         // Past the cap the box stops growing and follows the caret instead.
         let scroll = rows.saturating_sub(AUTHORING_COMPOSER_MAX_ROWS);
-        Paragraph::new(format!("> {}▏", authoring.input))
+        let caret = if focused { "▏" } else { "" };
+        Paragraph::new(format!("> {}{caret}", authoring.input))
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
     };
+    // Deliberately not the accent colour: a full accent box around a pane reads
+    // as an alert (see `plan_authoring_pane_has_no_accent_border`). Focus is the
+    // difference between a normal border and a dimmed one, with the caret
+    // carrying the rest of the signal.
+    let border = if focused {
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
+    } else {
+        Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))
+    };
     frame.render_widget(
-        composer.block(Block::default().borders(Borders::ALL)),
+        composer.block(Block::default().borders(Borders::ALL).border_style(border)),
         chunks[3],
     );
 
@@ -4926,11 +4986,15 @@ fn render_plan_authoring(
     // left; on a narrow pane the least surprising hint (verbose detail, which
     // the help overlay also lists) is the one that drops rather than the whole
     // line being sliced mid-word.
-    let hints = "Enter submit · Ctrl+J newline · Ctrl+O detail · Esc close";
+    // No newline chord here: Shift+Enter and Alt+Enter both work, and naming a
+    // third spelling of the same key taught nothing that trying the obvious one
+    // does not. The keys worth the room are the ones that are not obvious — how
+    // to leave the composer without closing it.
+    let hints = "Enter submit · ← sidebar · ↑ tabs · Ctrl+O detail · Esc close";
     let hints = if footer[0].width as usize >= hints.chars().count() {
         hints
     } else {
-        "Enter submit · Ctrl+J newline · Esc close"
+        "Enter submit · ← sidebar · ↑ tabs · Esc close"
     };
     frame.render_widget(Paragraph::new(hints).style(dim), footer[0]);
     frame.render_widget(
@@ -6173,8 +6237,13 @@ mod tests {
             "the tab bar must carry a chip for the authoring tab"
         );
         assert!(
-            screen.contains("Ctrl+J newline"),
-            "the composer must advertise a newline chord that actually works"
+            !screen.contains("Ctrl+J"),
+            "Shift+Enter and Alt+Enter both insert a newline; naming a third \
+             spelling of the same key is footer width spent on nothing"
+        );
+        assert!(
+            screen.contains("← sidebar") && screen.contains("↑ tabs"),
+            "the footer must name the way out of the composer: {screen}"
         );
         assert!(
             screen.contains("provider default"),
@@ -6362,6 +6431,58 @@ mod tests {
         assert!(
             screen.contains("sidebar") && screen.contains("refine"),
             "and must say the plan is readable from the sidebar and still refinable: {screen}",
+        );
+    }
+
+    /// Dragging across the transcript selects the words, not the furniture.
+    ///
+    /// The whole content pane was one selectable region, so a drag over a reply
+    /// swept up the role rail on the left and the scrollbar on the right and
+    /// pasted them into whatever the operator was quoting into.
+    #[test]
+    fn selecting_in_the_transcript_excludes_the_rail_and_the_scrollbar() {
+        let mut app = authoring_app("");
+        if let Some(state) = app.plan_authoring.as_mut() {
+            for turn in 0..40 {
+                state.push_operator(format!("question {turn}"));
+                state.push_planner(format!("answer {turn}"));
+            }
+        }
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        // The transcript's own pane is preferred over the content pane it sits
+        // inside, so a drag beginning on the rail still starts a selection —
+        // clipped to the text.
+        let rail = app
+            .selection_panes
+            .borrow()
+            .first()
+            .copied()
+            .expect("the transcript records a selection pane");
+        assert!(rail.flow, "the transcript is wrapped prose");
+        assert!(
+            rail.clip.left() > rail.hit.left(),
+            "the clip must start past the role rail: {rail:?}",
+        );
+        assert!(
+            rail.clip.right() < rail.hit.right(),
+            "and end before the scrollbar column: {rail:?}",
+        );
+
+        // A drag that begins on the rail is confined to the text columns.
+        app.focused_panel = crate::app::Panel::Sidebar;
+        app.update(crate::app::AppEvent::SelectionStart(
+            rail.hit.left(),
+            rail.hit.top(),
+        ));
+        let selection = app.selection.expect("a drag on the rail still selects");
+        assert_eq!(selection.bounds, rail.clip);
+        assert!(selection.flow);
+        assert_eq!(
+            app.focused_panel,
+            crate::app::Panel::Main,
+            "clicking into the tab is also how the operator says they are working in it",
         );
     }
 
@@ -6781,6 +6902,33 @@ mod tests {
         assert!(
             screen.contains("depends on: task-model"),
             "plan must show dependencies; screen:\n{screen}"
+        );
+    }
+
+    /// A folder with no plans yet is just its name.
+    ///
+    /// The sidebar used to spend most of its width telling the operator the
+    /// folder was empty and naming a command — beside a folder they had just
+    /// created, in a column narrow enough that the name itself was what got
+    /// clipped.
+    #[test]
+    fn an_empty_folder_shows_only_its_name() {
+        let mut terminal = make_terminal(100, 26);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.opened_folders
+            .push(std::path::PathBuf::from("/test/brand-new"));
+
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("brand-new"),
+            "the folder is listed: {screen}"
+        );
+        assert!(
+            !screen.contains("empty") && !screen.contains("Initialize Folder"),
+            "and says nothing else about being empty: {screen}",
         );
     }
 

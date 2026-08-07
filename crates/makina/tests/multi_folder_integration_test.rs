@@ -640,7 +640,7 @@ async fn test_sidebar_tree_three_level_structure() {
 }
 
 /// Test that empty (uninitialized, no docs/plans) folders are tracked and
-/// rendered with the distinct "empty" sidebar treatment.
+/// listed in the sidebar by name.
 #[tokio::test]
 async fn test_empty_folder_tracking() {
     let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
@@ -664,8 +664,10 @@ async fn test_empty_folder_tracking() {
     let rendered = render_to_string(&app);
     assert!(rendered.contains("empty"), "rendered: {rendered}");
     assert!(
-        rendered.contains("Initialize F"),
-        "an empty folder must render the distinct empty-folder hint; rendered: {rendered}"
+        !rendered.contains("Initialize F"),
+        "an empty folder is listed by name; the sidebar column is too narrow to \
+         spend on a sentence saying it is empty next to a folder that plainly \
+         is; rendered: {rendered}"
     );
 }
 

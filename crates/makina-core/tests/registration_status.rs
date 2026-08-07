@@ -105,6 +105,163 @@ async fn generate_command_publishes_direct_r_without_operator_files_or_run_side_
     );
 }
 
+/// A plan the operator keeps discussing can be revised.
+///
+/// Refining a generated plan in the authoring conversation produces a second
+/// bundle under the same slug. That used to be rejected outright —
+/// `refs/heads/plan/NNNN-slug already contains divergent evidence` — which made
+/// the first draft the only draft: the plan could be talked about further but
+/// never changed. The revision now replaces the registration it revises, and
+/// the one it replaced is archived rather than dropped.
+#[tokio::test]
+async fn a_generated_plan_can_be_revised_after_it_has_been_registered_and_landed() {
+    use makina_core::api::{
+        GeneratedInitialStatusBlueprint, GeneratedPlanBlueprint, GeneratedTaskBlueprint,
+        GeneratedWorkstreamBlueprint,
+    };
+    let _home_guard = makina_core::HOME_ENV_LOCK.lock().await;
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "develop"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "generated@example.invalid"],
+    );
+    git(repo.path(), &["config", "user.name", "Generated Test"]);
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    fs::create_dir_all(repo.path().join("docs/plans")).unwrap();
+    fs::write(repo.path().join(".gitignore"), ".makina/\n").unwrap();
+    fs::write(repo.path().join("docs/plans/STATUS.md"), "# Plans\n\n| Plan | Title | Status | Progress | Outcome | Link |\n|---|---|---|---|---|---|\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "base"]);
+    let state_home = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("HOME", state_home.path()) };
+    let api = build_api(repo.path());
+
+    let blueprint = |title: &str, tasks: Vec<GeneratedTaskBlueprint>| GeneratedPlanBlueprint {
+        slug: "fsm-cli".into(),
+        title: title.into(),
+        scope: "## In scope\n\n- **0001 — Core.** Build the engine.".into(),
+        architecture: "## 0001 — Core\n\nRender the canonical bundle.".into(),
+        initial_status: GeneratedInitialStatusBlueprint {
+            goal: "ship a state-machine cli.".into(),
+            root_cause: "there is no runner for the workflows.".into(),
+            approach: "build the engine, then the binary.".into(),
+            outcome: "the cli runs a workflow end to end.".into(),
+            last_updated: "2026-08-07".into(),
+        },
+        workstreams: vec![GeneratedWorkstreamBlueprint {
+            id: "0001".into(),
+            title: "Core".into(),
+        }],
+        tasks,
+    };
+    let task = |sequence: &str, id: &str, title: &str| GeneratedTaskBlueprint {
+        sequence: sequence.into(),
+        id: id.into(),
+        title: title.into(),
+        workstream: "0001".into(),
+        kind: "task".into(),
+        depends_on: vec![],
+        touches: vec!["src/**".into()],
+        gated: false,
+        body: format!(
+            "# {title}\n\nDo the work.\n\n**Steps:**\n\n1. Do it.\n\n- **Done when:** it is done."
+        ),
+    };
+
+    // First draft, registered and landed on the base branch — the state the
+    // operator is in when they keep talking about the plan they just made.
+    let CommandOutcome::PlanGenerated {
+        plan_dir,
+        registration_oid: first,
+        ..
+    } = api
+        .execute(Command::GeneratePlanBundle {
+            blueprint: blueprint("FSM CLI", vec![task("01", "build-engine", "Build Engine")]),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected the first draft to be generated")
+    };
+    api.execute(Command::CheckOutPlan {
+        plan_dir: plan_dir.clone(),
+    })
+    .await
+    .expect("the first draft lands on the base branch");
+    assert!(
+        repo.path().join(&plan_dir.relative_dir).exists(),
+        "precondition: the plan is in the working tree",
+    );
+
+    // The revision: a second task, and a title the operator asked for.
+    let CommandOutcome::PlanGenerated {
+        plan_dir: revised_dir,
+        registration_oid: revised,
+        ..
+    } = api
+        .execute(Command::GeneratePlanBundle {
+            blueprint: blueprint(
+                "FSM CLI, Revised",
+                vec![
+                    task("01", "build-engine", "Build Engine"),
+                    task("02", "build-binary", "Build Binary"),
+                ],
+            ),
+        })
+        .await
+        .expect("a revision of a plan still being drafted must be publishable")
+    else {
+        panic!("expected the revision to be generated")
+    };
+
+    assert_eq!(
+        revised_dir, plan_dir,
+        "a revision is the same plan, not a second one",
+    );
+    assert_ne!(revised, first, "the revision is its own registration");
+    assert_eq!(
+        output(repo.path(), &["rev-parse", &plan_dir.ref_name()]),
+        revised,
+        "the plan ref names the revision",
+    );
+    assert_eq!(
+        output(repo.path(), &["rev-parse", &format!("{revised}^")]),
+        output(repo.path(), &["rev-parse", "develop"]),
+        "the revision is validated against the base it will land on",
+    );
+    assert_eq!(
+        output(
+            repo.path(),
+            &[
+                "rev-parse",
+                &format!(
+                    "refs/makina/recovery/plan/{}/{first}",
+                    plan_dir.plan_identity()
+                ),
+            ],
+        ),
+        first,
+        "the registration it replaced is archived, not dropped",
+    );
+    let message = output(repo.path(), &["show", "-s", "--format=%B", &revised]);
+    assert!(
+        message.contains(&format!("Makina-Previous-Registration: {first}")),
+        "the revision names what it revises: {message}",
+    );
+
+    // The revision is what the plan now says, and it lands the same way.
+    api.execute(Command::CheckOutPlan {
+        plan_dir: plan_dir.clone(),
+    })
+    .await
+    .expect("the revision lands on the base branch too");
+    let tasks = fs::read_dir(repo.path().join(&plan_dir.relative_dir).join("tasks"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or_default();
+    assert_eq!(tasks, 2, "the working tree carries the revised plan");
+}
+
 /// One rejection names every fault, across every task.
 ///
 /// The author of a blueprint is an agent that gets one message back per

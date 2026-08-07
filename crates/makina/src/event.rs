@@ -118,7 +118,7 @@ pub async fn run(
             viewing_doctor: app.is_viewing_doctor(),
             help_mode_active: app.help_mode_active,
             command_palette: app.is_command_palette(),
-            plan_authoring: app.is_plan_authoring(),
+            plan_authoring: app.composer_focused(),
             settings: app.is_settings(),
             reset_confirm: app.is_confirming_reset(),
             operation_notice: app.is_operation_notice(),
@@ -3069,6 +3069,9 @@ fn translate_key(
         // ── Plan-authoring composer keymap ───────────────────────────────────
         // Last of the special keymaps because authoring is a tab, not a modal:
         // every real overlay above may open on top of it and keeps its keys.
+        // It applies only while the composer actually has focus
+        // ([`App::composer_focused`]) — the sidebar and the tab strip can hold
+        // it instead, and then their keys are the ones that must work.
         //
         // Enter submits, so a newline needs its own chord.
         //
@@ -3096,9 +3099,15 @@ fn translate_key(
             }
             KeyCode::Enter => AppEvent::PlanAuthoringSubmit,
             KeyCode::Backspace => AppEvent::PlanAuthoringBackspace,
+            // The arrows leave: the composer is the only thing in this tab to
+            // focus, so `←` is the way back to the sidebar and `↑` reaches the
+            // tab strip — the same two moves as in every other tab, which is
+            // what makes them a habit rather than a lookup.
+            KeyCode::Left => AppEvent::FocusPrev,
+            KeyCode::Up => AppEvent::FocusTabBar,
             // The transcript is the same scrollable stream a task's execution
-            // is, so it needs the same way to reach earlier turns. Arrow keys
-            // belong to the composer, which is why this is Page rather than Up.
+            // is, so it needs the same way to reach earlier turns. The arrows
+            // move focus, which is why this is Page rather than Up.
             KeyCode::PageUp => AppEvent::ScrollUp,
             KeyCode::PageDown => AppEvent::ScrollDown,
             // Ctrl+O toggles verbose here as it does everywhere else: without
@@ -3254,28 +3263,40 @@ fn translate_key(
                 AppEvent::CloseTab
             }
             // Sidebar navigation: arrow keys and vim-style j/k.
+            //
+            // On the tab strip the vertical arrows are the way in and out: `↑`
+            // is already as high as focus goes, and `↓` returns to the content
+            // the strip belongs to.
+            KeyCode::Up if focused_panel == Panel::Tabs => AppEvent::Tick,
+            KeyCode::Down if focused_panel == Panel::Tabs => AppEvent::FocusContent,
             KeyCode::Up | KeyCode::Char('k') => AppEvent::SelectUp,
             KeyCode::Down | KeyCode::Char('j') => AppEvent::SelectDown,
-            // Right arrow: Tab-equivalent in main pane (forward focus), expand/cross in sidebar.
+            // Right arrow: the next tab on the strip, Tab-equivalent in the main
+            // pane (forward focus), expand/cross in the sidebar.
             KeyCode::Right => match focused_panel {
+                Panel::Tabs => AppEvent::NextTab,
                 Panel::Main => AppEvent::FocusNext,
                 Panel::Sidebar => AppEvent::FocusRightOrExpand,
             },
-            // Left arrow: Shift+Tab-equivalent in main pane (backward focus), collapse/cross in sidebar.
+            // Left arrow: the previous tab on the strip, Shift+Tab-equivalent in
+            // the main pane (backward focus), collapse/cross in the sidebar.
             KeyCode::Left => match focused_panel {
+                Panel::Tabs => AppEvent::PrevTab,
                 Panel::Main => AppEvent::FocusPrev,
                 Panel::Sidebar => AppEvent::FocusLeftOrCollapse,
             },
             // Space: toggle expand/collapse the focused tree node (sidebar focus only).
             KeyCode::Char(' ') => match focused_panel {
                 Panel::Sidebar => AppEvent::ToggleTreeNode,
-                Panel::Main => AppEvent::Tick,
+                Panel::Main | Panel::Tabs => AppEvent::Tick,
             },
-            // Enter: open the focused node in the sidebar, or toggle the focused
-            // accordion section in the main pane.
+            // Enter: open the focused node in the sidebar, toggle the focused
+            // accordion section in the main pane, or step from the chip into the
+            // tab it names.
             KeyCode::Enter => match focused_panel {
                 Panel::Sidebar => AppEvent::OpenFocusedNode,
                 Panel::Main => AppEvent::ToggleTreeNode,
+                Panel::Tabs => AppEvent::FocusContent,
             },
             // PgUp/PgDn: scroll the open Output pane, or the log viewer when it
             // is the active tab. The Output pane wins when both are up — it is
@@ -4129,6 +4150,50 @@ mod tests {
 
     fn translate_in_authoring(ev: CrosstermEvent, app: &App) -> AppEvent {
         translate_terminal_event(ev, authoring_modal(), crate::app::Panel::Main, false, app)
+    }
+
+    /// The arrows are how focus leaves the composer.
+    ///
+    /// There was no way out by keyboard at all: the composer swallowed every
+    /// key for as long as its tab was open, so reaching the sidebar meant the
+    /// mouse or closing the tab.
+    #[test]
+    fn the_arrows_carry_focus_out_of_the_composer() {
+        let app = test_app();
+        assert!(matches!(
+            translate_in_authoring(key_press(KeyCode::Left, KeyModifiers::NONE), &app),
+            AppEvent::FocusPrev,
+        ));
+        assert!(matches!(
+            translate_in_authoring(key_press(KeyCode::Up, KeyModifiers::NONE), &app),
+            AppEvent::FocusTabBar,
+        ));
+    }
+
+    /// On the tab strip the horizontal arrows are the tabs themselves, and the
+    /// vertical one steps back into what the active tab is showing.
+    #[test]
+    fn the_arrows_move_between_tabs_while_the_strip_has_focus() {
+        let app = test_app();
+        let on_the_strip = |code| {
+            translate_terminal_event(
+                key_press(code, KeyModifiers::NONE),
+                ModalState::default(),
+                crate::app::Panel::Tabs,
+                false,
+                &app,
+            )
+        };
+        assert!(matches!(on_the_strip(KeyCode::Right), AppEvent::NextTab));
+        assert!(matches!(on_the_strip(KeyCode::Left), AppEvent::PrevTab));
+        assert!(matches!(
+            on_the_strip(KeyCode::Down),
+            AppEvent::FocusContent
+        ));
+        assert!(
+            matches!(on_the_strip(KeyCode::Enter), AppEvent::FocusContent),
+            "Enter on a chip steps into the tab it names",
+        );
     }
 
     /// A bracketed paste reaches the composer as one atomic edit. Without this

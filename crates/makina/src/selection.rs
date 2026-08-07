@@ -61,6 +61,9 @@ pub struct Selection {
     /// it; the moving end is clamped into it so a wide drag never bleeds into a
     /// neighbouring pane.
     pub bounds: Rect,
+    /// Whether the pane holds wrapped prose, in which case a row break may be
+    /// the renderer's rather than the author's. See [`unwrap_rows`].
+    pub flow: bool,
 }
 
 impl Selection {
@@ -71,6 +74,15 @@ impl Selection {
             cursor: (x, y),
             active: true,
             bounds,
+            flow: false,
+        }
+    }
+
+    /// Begin a selection in a pane whose content is wrapped prose.
+    pub fn start_flowing(x: u16, y: u16, bounds: Rect) -> Self {
+        Self {
+            flow: true,
+            ..Self::start(x, y, bounds)
         }
     }
 
@@ -153,9 +165,11 @@ impl Selection {
 
     /// Extract the selected text from the rendered `buf`.
     ///
-    /// Rows are joined with `\n` and each row's trailing whitespace (the padding
-    /// cells beyond a line's content render as spaces) is trimmed. Returns
-    /// `None` for an empty selection or one that covers only whitespace.
+    /// Each row's trailing whitespace (the padding cells beyond a line's content
+    /// render as spaces) is trimmed. Rows are joined with `\n` — except in a
+    /// [`flow`](Self::flow) pane, where [`unwrap_rows`] puts a newline only
+    /// where the author wrote one. Returns `None` for an empty selection or one
+    /// that covers only whitespace.
     pub fn extract(&self, buf: &Buffer) -> Option<String> {
         if self.is_empty() {
             return None;
@@ -174,13 +188,59 @@ impl Selection {
             }
             lines.push(line.trim_end().to_string());
         }
-        let text = lines.join("\n");
+        let text = if self.flow {
+            unwrap_rows(&lines, self.bounds.width)
+        } else {
+            lines.join("\n")
+        };
         if text.trim().is_empty() {
             None
         } else {
             Some(text)
         }
     }
+}
+
+/// Rejoin rows that word wrap split, leaving the author's own newlines alone.
+///
+/// A wrapped paragraph is one line of text that the renderer had to draw on
+/// several rows. Copying it row by row pasted a hard break into the middle of
+/// every sentence — the text came back as the pane happened to be wide, not as
+/// it was written.
+///
+/// The rows alone do not say which breaks are which, but the wrap that made
+/// them does: every wrapper here is greedy, so it breaks before a word *only*
+/// when that word could not fit on the row. So if the next row's first word
+/// would still have fitted, the break must have been written; if it could not
+/// have, the break is the wrap's and the rows are one line.
+///
+/// This is exact for greedy wrapping and errs the safe way elsewhere: a short
+/// row (a heading, a list item, a blank line between paragraphs) always keeps
+/// its newline, because a short row leaves room for the next word.
+fn unwrap_rows(rows: &[String], width: u16) -> String {
+    let mut out = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        if index == 0 {
+            out.push_str(row);
+            continue;
+        }
+        let previous = rows[index - 1].as_str();
+        // The indent a continuation row inherits is layout, not content: it is
+        // the same rail/indent the first row already carries.
+        let continued = row.trim_start();
+        let word = continued.split(' ').next().unwrap_or_default();
+        let soft_wrapped = !previous.is_empty()
+            && !continued.is_empty()
+            && previous.chars().count() + 1 + word.chars().count() > width as usize;
+        if soft_wrapped {
+            out.push(' ');
+            out.push_str(continued);
+        } else {
+            out.push('\n');
+            out.push_str(row);
+        }
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -206,7 +266,70 @@ mod tests {
             cursor,
             active: false,
             bounds: buf.area,
+            flow: false,
         }
+    }
+
+    /// A selection over the whole of `buf`, in a pane of wrapped prose.
+    fn whole_flowing(buf: &Buffer, anchor: (u16, u16), cursor: (u16, u16)) -> Selection {
+        Selection {
+            flow: true,
+            ..whole(buf, anchor, cursor)
+        }
+    }
+
+    /// A paragraph the renderer had to break comes back as one paragraph.
+    #[test]
+    fn a_wrapped_paragraph_is_copied_as_one_line() {
+        // Greedy wrap of "the quick brown fox jumps over it" at width 20.
+        let buf = buffer(&["the quick brown fox", "jumps over it"]);
+        let sel = whole_flowing(&buf, (0, 0), (12, 1));
+        assert_eq!(
+            sel.extract(&buf).as_deref(),
+            Some("the quick brown fox jumps over it"),
+            "a break the pane width caused is not a break the author wrote",
+        );
+    }
+
+    /// A newline the author wrote survives being copied.
+    #[test]
+    fn an_authored_newline_is_kept() {
+        // "brown" would have fitted after "the quick" — so that break was
+        // written, not wrapped.
+        let buf = buffer(&["the quick           ", "brown fox           "]);
+        let sel = whole_flowing(&buf, (0, 0), (19, 1));
+        assert_eq!(sel.extract(&buf).as_deref(), Some("the quick\nbrown fox"),);
+    }
+
+    /// The blank line between two paragraphs keeps both breaks.
+    #[test]
+    fn a_blank_line_between_paragraphs_survives() {
+        let buf = buffer(&["the quick brown fox", "", "jumps over the lazy"]);
+        let sel = whole_flowing(&buf, (0, 0), (18, 2));
+        assert_eq!(
+            sel.extract(&buf).as_deref(),
+            Some("the quick brown fox\n\njumps over the lazy"),
+        );
+    }
+
+    /// The indent a continuation row inherits is layout, not content.
+    #[test]
+    fn a_continuation_row_does_not_carry_its_indent_into_the_text() {
+        let buf = buffer(&["  the quick brown fo", "  x jumps over it   "]);
+        let sel = whole_flowing(&buf, (0, 0), (19, 1));
+        assert_eq!(
+            sel.extract(&buf).as_deref(),
+            Some("  the quick brown fo x jumps over it"),
+        );
+    }
+
+    /// Outside a prose pane a row is a line, whatever its width: a tree, a
+    /// table, or a list must not have its rows run together.
+    #[test]
+    fn rows_outside_a_prose_pane_keep_every_break() {
+        let buf = buffer(&["abcde", "fghij", "klmno"]);
+        let sel = whole(&buf, (0, 0), (4, 2));
+        assert_eq!(sel.extract(&buf).as_deref(), Some("abcde\nfghij\nklmno"));
     }
 
     #[test]
@@ -217,6 +340,7 @@ mod tests {
             cursor: (1, 0),
             active: false,
             bounds: Rect::new(0, 0, 100, 100),
+            flow: false,
         };
         assert_eq!(sel.ordered(), ((1, 0), (4, 2)));
     }
@@ -282,6 +406,7 @@ mod tests {
             cursor: (5, 1),
             active: false,
             bounds: right,
+            flow: false,
         };
         assert_eq!(sel.extract(&buf).as_deref(), Some("RRR\nrrr"));
 
@@ -292,6 +417,7 @@ mod tests {
             cursor: (0, 1), // clamps to column 3
             active: false,
             bounds: right,
+            flow: false,
         };
         let text = crossing.extract(&buf).unwrap();
         assert!(
@@ -312,6 +438,7 @@ mod tests {
             cursor: (0, 0), // clamps to column 3
             active: false,
             bounds: Rect::new(3, 0, 3, 1),
+            flow: false,
         };
         sel.highlight(&mut buf, &th);
         let has_selection_style = |x: u16| {
