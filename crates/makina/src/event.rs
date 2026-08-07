@@ -192,11 +192,20 @@ pub async fn run(
             // `update` consumes — plus an OPTIONAL transient status message to
             // surface the command outcome/error (task 31).  Keeping the async
             // work here keeps `App::update` pure.
+            let on_the_beat = matches!(event, AppEvent::Tick);
             let (event, status) = resolve_io(app, event, &background_tx).await;
 
             let mut needs_redraw = app.update(event);
             if let Some(msg) = status {
                 needs_redraw |= app.update(AppEvent::StatusMessage(msg));
+            }
+            // Flush the authoring conversation on the tick rather than per
+            // event: the planner's reasoning arrives in chunks milliseconds
+            // apart, and writing the whole transcript for each of them would
+            // trade a lost conversation for a busy disk. A tick is 250 ms, so
+            // at most that much of a conversation is ever unwritten.
+            if on_the_beat {
+                report_authoring_save(app);
             }
             if app.should_quit {
                 break;
@@ -237,6 +246,21 @@ async fn resolve_api_event(
         return AppEvent::RunLoaded(full_run);
     }
     AppEvent::ApiEvent(ev)
+}
+
+/// Write the live authoring conversation, surfacing a failure in Problems.
+///
+/// Called wherever the transcript is about to become unreachable — a close, a
+/// deliberate restart — and from the tick, which is what keeps a long
+/// conversation durable while it is still being had.
+fn report_authoring_save(app: &mut App) {
+    if let Err(error) = app.save_authoring_session() {
+        app.push_error(ErrorMessage {
+            timestamp: std::time::SystemTime::now(),
+            level: ErrorLevel::Error,
+            text: format!("Failed to save the plan conversation: {error}"),
+        });
+    }
 }
 
 // ── IO resolution: file browser + run control (task 28 + 31) ──────────────────
@@ -595,6 +619,78 @@ async fn resolve_io(
                 background_tx.clone(),
             );
             (AppEvent::Tick, Some(format!("Generating {label}…")))
+        }
+        // Opening the authoring tab is a request to continue, not to start
+        // over: a conversation this project left unfinished is read back from
+        // `.makina/authoring/` and reopened as it was. Only a project that has
+        // never been talked about — or one whose every conversation already
+        // produced a plan — starts from a blank composer.
+        AppEvent::OpenPlanAuthoring => {
+            let project_root = app.context_project_root();
+            let live = app
+                .plan_authoring
+                .as_ref()
+                .is_some_and(|state| state.project_root == project_root);
+            if live {
+                return (AppEvent::OpenPlanAuthoring, None);
+            }
+            // Whatever the tab held was for another project and is about to be
+            // displaced, so it is written before it goes.
+            report_authoring_save(app);
+            match crate::authoring_session::latest_unfinished(&project_root) {
+                Some(session) => {
+                    let when = session.when().to_owned();
+                    (
+                        AppEvent::ResumePlanAuthoring {
+                            project_root,
+                            session: Box::new(session),
+                        },
+                        Some(format!("Resumed the plan conversation from {when}")),
+                    )
+                }
+                None => (AppEvent::OpenPlanAuthoring, None),
+            }
+        }
+        // Deliberately starting over. The outgoing conversation is written
+        // first, so "new" costs nothing that cannot be resumed.
+        AppEvent::NewPlanConversation => {
+            report_authoring_save(app);
+            (AppEvent::NewPlanConversation, None)
+        }
+        // The conversation that wrote the plan in context — the active plan tab,
+        // or the plan under the sidebar cursor. This is what makes a plan
+        // refinable: reopen the discussion that produced it instead of
+        // describing it again to a planner that has never seen it.
+        AppEvent::ResumePlanConversation => {
+            let Some(target) = app.context_plan_identity() else {
+                return (
+                    AppEvent::Tick,
+                    Some("Select a plan to reopen its conversation".into()),
+                );
+            };
+            let plan_dir = target.plan_dir.relative_dir.display().to_string();
+            match crate::authoring_session::for_plan(&target.project_root, &plan_dir) {
+                Some(session) => {
+                    report_authoring_save(app);
+                    (
+                        AppEvent::ResumePlanAuthoring {
+                            project_root: target.project_root,
+                            session: Box::new(session),
+                        },
+                        Some(format!("Reopened the conversation that wrote {plan_dir}")),
+                    )
+                }
+                None => (
+                    AppEvent::Tick,
+                    Some(format!("No saved conversation for {plan_dir}")),
+                ),
+            }
+        }
+        // Closing retires the tab, so this is the last chance to write what is
+        // in it. Losing the transcript to an `Esc` is the whole defect.
+        AppEvent::ClosePlanAuthoring => {
+            report_authoring_save(app);
+            (AppEvent::ClosePlanAuthoring, None)
         }
         AppEvent::PlanAuthoringSubmit => {
             let Some(state) = app.plan_authoring.as_mut() else {
@@ -4207,6 +4303,238 @@ mod tests {
             ),
             AppEvent::CommandPaletteInput('x')
         ));
+    }
+
+    // ── Durable plan-authoring conversations ──────────────────────────────────
+
+    /// An app rooted at `project`, with nothing selected, so the authoring
+    /// conversation resolves against that project's `.makina/authoring/`.
+    fn app_rooted_at(project: &std::path::Path) -> App {
+        use crate::placeholder::PlaceholderApi;
+        use std::sync::Arc;
+
+        let mut app = App::new(
+            Arc::new(PlaceholderApi::empty()),
+            vec![],
+            project.to_path_buf(),
+        );
+        seed_test_model(&mut app);
+        app
+    }
+
+    /// Asking to create a plan reopens the discussion this project left
+    /// unfinished, rather than starting the operator over.
+    #[tokio::test]
+    async fn opening_authoring_resumes_the_unfinished_conversation() {
+        let project = tempfile::TempDir::new().expect("temp project");
+        let mut app = app_rooted_at(project.path());
+        let root = app.context_project_root();
+
+        // A conversation from an earlier session of the TUI.
+        app.plan_authoring = Some(crate::app::PlanAuthoring::fresh(root.clone()));
+        let state = app.plan_authoring.as_mut().unwrap();
+        state.push_operator("an fsm cli".into());
+        state.input = "half a thought".into();
+        state.dirty = true;
+        let id = state.session_id.clone();
+        app.save_authoring_session()
+            .expect("write the conversation");
+        app.plan_authoring = None; // …and the tab is gone, as after a restart.
+
+        let (tx, _rx) = background_events();
+        let (event, status) = resolve_io(&mut app, AppEvent::OpenPlanAuthoring, &tx).await;
+        assert!(
+            status.as_deref().is_some_and(|m| m.contains("Resumed")),
+            "the operator must be told the conversation came back; got {status:?}",
+        );
+        let AppEvent::ResumePlanAuthoring { session, .. } = &event else {
+            panic!("an unfinished conversation must resume; got {event:?}");
+        };
+        assert_eq!(session.id, id);
+        assert_eq!(session.draft, "half a thought");
+
+        app.update(event);
+        let state = app
+            .plan_authoring
+            .as_ref()
+            .expect("the conversation is back");
+        assert_eq!(state.input, "half a thought");
+        assert!(
+            state
+                .log
+                .entries
+                .iter()
+                .any(|entry| entry.text() == "an fsm cli"),
+        );
+    }
+
+    /// A conversation that already produced a plan is finished work: creating
+    /// the *next* plan starts clean instead of silently continuing it.
+    #[tokio::test]
+    async fn opening_authoring_does_not_resume_a_conversation_that_made_a_plan() {
+        let project = tempfile::TempDir::new().expect("temp project");
+        let mut app = app_rooted_at(project.path());
+        let root = app.context_project_root();
+
+        app.plan_authoring = Some(crate::app::PlanAuthoring::fresh(root));
+        let state = app.plan_authoring.as_mut().unwrap();
+        state.push_operator("an fsm cli".into());
+        state.plans.push("docs/plans/0001-fsm".into());
+        state.dirty = true;
+        app.save_authoring_session()
+            .expect("write the conversation");
+        app.plan_authoring = None;
+
+        let (tx, _rx) = background_events();
+        let (event, status) = resolve_io(&mut app, AppEvent::OpenPlanAuthoring, &tx).await;
+        assert!(
+            matches!(event, AppEvent::OpenPlanAuthoring),
+            "a finished conversation must not be reopened as the draft; got {event:?}",
+        );
+        assert!(status.is_none());
+    }
+
+    /// A live conversation is never displaced by a stored one.
+    #[tokio::test]
+    async fn opening_authoring_leaves_the_live_conversation_alone() {
+        let project = tempfile::TempDir::new().expect("temp project");
+        let mut app = app_rooted_at(project.path());
+        let root = app.context_project_root();
+        app.plan_authoring = Some(crate::app::PlanAuthoring::fresh(root.clone()));
+        app.plan_authoring.as_mut().unwrap().input = "still typing".into();
+
+        let (tx, _rx) = background_events();
+        let (event, _status) = resolve_io(&mut app, AppEvent::OpenPlanAuthoring, &tx).await;
+
+        assert!(matches!(event, AppEvent::OpenPlanAuthoring));
+        app.update(event);
+        assert_eq!(
+            app.plan_authoring
+                .as_ref()
+                .map(|state| state.input.as_str()),
+            Some("still typing"),
+        );
+    }
+
+    /// A plan can be refined by reopening the conversation that wrote it —
+    /// which is what makes the sidebar the way back into a plan's history.
+    #[tokio::test]
+    async fn a_plans_conversation_reopens_from_the_plan_in_context() {
+        let project = tempfile::TempDir::new().expect("temp project");
+        let mut app = app_rooted_at(project.path());
+        let root = app.context_project_root();
+
+        app.plan_authoring = Some(crate::app::PlanAuthoring::fresh(root.clone()));
+        let state = app.plan_authoring.as_mut().unwrap();
+        state.push_operator("an fsm cli".into());
+        state.plans.push("docs/plans/0099-demo".into());
+        state.dirty = true;
+        let id = state.session_id.clone();
+        app.save_authoring_session()
+            .expect("write the conversation");
+        app.plan_authoring = None;
+
+        // The plan, open in its own tab, exactly as opening it from the sidebar
+        // leaves it.
+        let target = crate::app::PlanIdentity::from_key(
+            root,
+            makina_core::plan::PlanKey::parse("docs/plans/0099-demo").unwrap(),
+            "0099-demo".into(),
+        );
+        app.tabs
+            .open_tab(crate::app::TabContent::Plan { plan: target });
+
+        let (tx, _rx) = background_events();
+        let (event, status) = resolve_io(&mut app, AppEvent::ResumePlanConversation, &tx).await;
+        assert!(
+            status.as_deref().is_some_and(|m| m.contains("0099-demo")),
+            "the status must name the plan whose conversation reopened; got {status:?}",
+        );
+        let AppEvent::ResumePlanAuthoring { session, .. } = &event else {
+            panic!("the plan's conversation must reopen; got {event:?}");
+        };
+        assert_eq!(session.id, id);
+    }
+
+    /// A plan nobody discussed says so, rather than opening an empty tab.
+    #[tokio::test]
+    async fn a_plan_with_no_conversation_reports_instead_of_opening_one() {
+        let project = tempfile::TempDir::new().expect("temp project");
+        let mut app = app_rooted_at(project.path());
+        let target = crate::app::PlanIdentity::from_key(
+            app.context_project_root(),
+            makina_core::plan::PlanKey::parse("docs/plans/0099-demo").unwrap(),
+            "0099-demo".into(),
+        );
+        app.tabs
+            .open_tab(crate::app::TabContent::Plan { plan: target });
+
+        let (tx, _rx) = background_events();
+        let (event, status) = resolve_io(&mut app, AppEvent::ResumePlanConversation, &tx).await;
+
+        assert!(matches!(event, AppEvent::Tick));
+        assert!(
+            status
+                .as_deref()
+                .is_some_and(|m| m.contains("No saved conversation")),
+            "got {status:?}",
+        );
+        assert!(app.plan_authoring.is_none());
+    }
+
+    /// Closing writes the conversation first. Losing it to an `Esc` was the
+    /// whole defect.
+    #[tokio::test]
+    async fn closing_the_tab_writes_the_conversation_first() {
+        let project = tempfile::TempDir::new().expect("temp project");
+        let mut app = app_rooted_at(project.path());
+        let root = app.context_project_root();
+        app.plan_authoring = Some(crate::app::PlanAuthoring::fresh(root));
+        app.plan_authoring
+            .as_mut()
+            .unwrap()
+            .push_operator("an fsm cli".into());
+
+        let (tx, _rx) = background_events();
+        let (event, _status) = resolve_io(&mut app, AppEvent::ClosePlanAuthoring, &tx).await;
+        app.update(event);
+
+        assert!(app.plan_authoring.is_none(), "the tab is retired");
+        let stored = crate::authoring_session::load_all(&app.context_project_root());
+        assert_eq!(stored.len(), 1, "the conversation outlived the tab");
+        assert!(
+            stored[0]
+                .entries
+                .iter()
+                .any(|entry| entry.text() == "an fsm cli"),
+        );
+    }
+
+    /// Starting over writes the outgoing conversation before replacing it.
+    #[tokio::test]
+    async fn starting_a_new_conversation_keeps_the_old_one_on_disk() {
+        let project = tempfile::TempDir::new().expect("temp project");
+        let mut app = app_rooted_at(project.path());
+        let root = app.context_project_root();
+        app.plan_authoring = Some(crate::app::PlanAuthoring::fresh(root));
+        app.plan_authoring
+            .as_mut()
+            .unwrap()
+            .push_operator("an fsm cli".into());
+        let first = app.plan_authoring.as_ref().unwrap().session_id.clone();
+
+        let (tx, _rx) = background_events();
+        let (event, _status) = resolve_io(&mut app, AppEvent::NewPlanConversation, &tx).await;
+        app.update(event);
+
+        let state = app.plan_authoring.as_ref().expect("a fresh conversation");
+        assert!(state.log.entries.is_empty());
+        assert_ne!(state.session_id, first);
+        let stored = crate::authoring_session::load_all(&app.context_project_root());
+        assert!(
+            stored.iter().any(|session| session.id == first),
+            "the conversation replaced is still resumable",
+        );
     }
 
     // ── Planner reply parsing ─────────────────────────────────────────────────

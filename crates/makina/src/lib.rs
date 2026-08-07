@@ -7,6 +7,7 @@
 //! | `tui` | Terminal lifecycle: raw mode, alternate screen, panic hook. |
 //! | `event` | Async event loop: merges terminal input, periodic tick, and api events. |
 //! | `app` | All TUI state + pure `update(AppEvent)` function. |
+//! | `authoring_session` | Durable plan-authoring conversations under `.makina/authoring/`. |
 //! | `browser` | File-browser view state + pure navigation (no IO). |
 //! | `ui` | Pure rendering: `App` → `Frame` (uses `ratatui::TestBackend` in tests). |
 //! | `log` | Tracing-subscriber layers: per-run **file** layer (span-keyed routing) + a **TUI-channel** layer (`try_send` to a bounded mpsc). |
@@ -25,6 +26,7 @@
 
 pub mod ansi;
 pub mod app;
+pub mod authoring_session;
 pub mod browser;
 pub mod cli;
 pub mod event;

@@ -4842,12 +4842,40 @@ fn render_plan_authoring(
     ])
     .split(inner);
 
+    // The standing line is the brief; once a plan exists it is what the
+    // conversation produced, and where to read it. The operator arrives at this
+    // tab from a generation that used to close it, so the first thing it has to
+    // answer is "did it work, and where did it go".
+    let heading = match authoring.latest_plan() {
+        Some(plan_dir) => Line::from(vec![
+            Span::styled(
+                "Created ",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Success)),
+            ),
+            Span::styled(
+                plan_dir.to_owned(),
+                Style::default()
+                    .fg(app.active_theme.get(crate::theme::ThemeRole::Success))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " — open it from the sidebar, or keep talking to refine it",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            ),
+        ]),
+        None => Line::from(Span::styled(
+            format!(
+                "Describe what you want to build in {}",
+                authoring.project_root.display()
+            ),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+        )),
+    };
+    // Wrapped, because the heading has a plan directory in it: on a narrow pane
+    // an unwrapped line would cut the sentence off mid-clause, and what it gets
+    // cut off before saying is that the conversation can continue.
     frame.render_widget(
-        Paragraph::new(format!(
-            "Describe what you want to build in {}",
-            authoring.project_root.display()
-        ))
-        .style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim))),
+        Paragraph::new(heading).wrap(Wrap { trim: false }),
         chunks[0],
     );
 
@@ -6302,6 +6330,38 @@ mod tests {
         assert!(
             railed,
             "the planner's turn must carry the same role rail an agent's does"
+        );
+    }
+
+    /// Once a plan exists the tab says so, and says where to read it.
+    ///
+    /// The operator lands here from a generation that used to close the tab, so
+    /// the heading has to answer "did it work, and where did it go" before it
+    /// asks for anything else.
+    #[test]
+    fn the_authoring_tab_names_the_plan_it_created() {
+        let mut app = authoring_app("");
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        assert!(
+            screen_of(&terminal).contains("Describe what you want to build"),
+            "before a plan exists the heading is the brief",
+        );
+
+        app.update(crate::app::AppEvent::PlanAuthoringGenerated(Ok(
+            "docs/plans/0001-fsm".into(),
+        )));
+        let mut terminal = make_terminal(100, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Created docs/plans/0001-fsm"),
+            "the heading must name the plan: {screen}",
+        );
+        assert!(
+            screen.contains("sidebar") && screen.contains("refine"),
+            "and must say the plan is readable from the sidebar and still refinable: {screen}",
         );
     }
 
