@@ -500,6 +500,8 @@ pub enum Mode {
     OperationNotice,
     /// Searchable model picker overlay (opened from Settings).
     ModelPicker,
+    /// Modal reporting a failed command, carrying its full explanation.
+    FailureNotice,
 }
 
 #[derive(Debug)]
@@ -1017,6 +1019,40 @@ pub struct OperationNotice {
     pub attempted: String,
 }
 
+// ── Failure notices ───────────────────────────────────────────────────────────
+
+/// A failure worth interrupting the operator for.
+///
+/// # Why a modal and not a status line
+///
+/// Failures used to be rendered as one transient line at the bottom right. That
+/// surface was wrong in three ways at once, and every one of them cost real
+/// diagnosis: it was clipped to the terminal width, so an
+/// `ApiError::InvalidCommand` — which renders as `invalid command: {reason}` —
+/// showed as a bare "invalid command" with the reason cut off; it was
+/// overwritten by the next message; and it was never logged, so the Logs tab
+/// stayed empty for exactly the events an operator would go there to read.
+///
+/// A notice therefore carries the **whole** text, is shown until dismissed, and
+/// is written to `tracing` on the way in so it is in the Logs tab regardless of
+/// whether anyone was looking at the screen when it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureNotice {
+    /// Short headline — what the operator was trying to do.
+    pub title: String,
+    /// The full, untruncated explanation.
+    pub detail: String,
+}
+
+impl FailureNotice {
+    pub fn new(title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
 pub fn final_merge_label(mode: FinalMerge) -> &'static str {
     match mode {
         FinalMerge::Squash => "Squash merge into base branch",
@@ -1397,6 +1433,16 @@ pub enum AppEvent {
     },
     /// Close the operation notice modal.
     CloseOperationNotice,
+
+    /// Report a failed command: log it at ERROR (so the Logs tab has it) and
+    /// raise the modal carrying its full text.
+    ///
+    /// Every failure path in the IO layer goes through this rather than writing
+    /// a status line, so a failure is never both invisible and unlogged. See
+    /// [`FailureNotice`].
+    ReportFailure(FailureNotice),
+    /// Dismiss the failure modal.
+    CloseFailureNotice,
 
     /// Purge Makina-created transient git worktrees for this repository.
     PurgeWorktrees,
@@ -2281,6 +2327,10 @@ pub struct App {
     /// [`Mode::OperationNotice`].
     pub operation_notice: Option<OperationNotice>,
 
+    /// The failure currently being reported to the operator. `Some` only while
+    /// [`App::mode`] is [`Mode::FailureNotice`]; see [`FailureNotice`].
+    pub failure_notice: Option<FailureNotice>,
+
     /// The resolved run capabilities (gate/reviewer iterations, wall-clock/idle
     /// timeouts). Seeded from the loaded config and editable via the settings
     /// modal.
@@ -3146,6 +3196,7 @@ impl App {
             settings: None,
             reset_confirmation: None,
             operation_notice: None,
+            failure_notice: None,
             caps: makina_core::config::CapsConfig::default(),
             concurrency: 3,
             final_merge: FinalMerge::Squash,
@@ -3582,6 +3633,11 @@ impl App {
     /// Whether an operation notice modal is currently active.
     pub fn is_operation_notice(&self) -> bool {
         self.mode == Mode::OperationNotice
+    }
+
+    /// Whether the failure modal is currently up.
+    pub fn is_failure_notice(&self) -> bool {
+        self.mode == Mode::FailureNotice
     }
 
     /// Human label for a project-scoped plan that is currently resetting.
@@ -5212,7 +5268,32 @@ impl App {
             }
 
             AppEvent::StatusMessage(msg) => {
+                // Routine progress: logged so the Logs tab has the whole record
+                // of what the app did, but given no chrome of its own. Failures
+                // do NOT come through here — see [`AppEvent::ReportFailure`].
+                tracing::info!(target: "makina::ui", "{msg}");
                 self.status_message = Some(msg);
+                true
+            }
+
+            AppEvent::ReportFailure(notice) => {
+                // Log BEFORE showing it: the record must exist whether or not
+                // anyone was watching the screen, and whether or not the modal
+                // is dismissed a moment later.
+                tracing::error!(
+                    target: "makina::ui",
+                    "{}: {}",
+                    notice.title,
+                    notice.detail
+                );
+                self.failure_notice = Some(notice);
+                self.mode = Mode::FailureNotice;
+                true
+            }
+
+            AppEvent::CloseFailureNotice => {
+                self.failure_notice = None;
+                self.mode = Mode::Normal;
                 true
             }
 
@@ -7059,6 +7140,36 @@ mod tests {
             format!("msg {}", total - 1),
             "most recent message must be retained"
         );
+    }
+
+    // ── Failure notices ───────────────────────────────────────────────────────
+
+    /// A reported failure raises the modal AND is written to the log store, so
+    /// the Logs tab has it whether or not anyone was looking at the screen.
+    /// Failures used to reach neither — a status line that was clipped and then
+    /// overwritten, and nothing in the logs at all.
+    #[test]
+    fn a_reported_failure_raises_the_modal_and_is_logged() {
+        let mut app = make_app();
+        assert!(!app.is_failure_notice());
+
+        app.update(AppEvent::ReportFailure(FailureNotice::new(
+            "Could not start 0007-Demo",
+            "invalid command: plan `0007-Demo` is already open",
+        )));
+
+        assert!(app.is_failure_notice(), "the modal must be up");
+        let notice = app.failure_notice.as_ref().expect("notice retained");
+        assert_eq!(notice.title, "Could not start 0007-Demo");
+        assert!(
+            notice.detail.contains("already open"),
+            "the full reason must be retained, not a clipped prefix"
+        );
+
+        app.update(AppEvent::CloseFailureNotice);
+        assert!(!app.is_failure_notice(), "Esc/Enter dismisses it");
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.failure_notice.is_none());
     }
 
     // ── Logs tab ──────────────────────────────────────────────────────────────

@@ -4950,8 +4950,29 @@ impl CoreApi {
                         .iter()
                         .any(|diagnostic| diagnostic.code == "plan-not-found") =>
                 {
+                    // Name the plan and list what is actually missing from it.
+                    // Reciting the required set alone left the operator to diff
+                    // it against the directory by hand — and told them nothing
+                    // about *which* plan had been refused, which matters when
+                    // the command was issued against a sidebar selection.
+                    let plan_root = repo_root.join(&plan_key.relative_dir);
+                    let missing: Vec<&str> = ["SCOPE.md", "ARCHITECTURE.md", "STATUS.md"]
+                        .into_iter()
+                        .filter(|name| !plan_root.join(name).is_file())
+                        .chain((!plan_root.join("tasks").is_dir()).then_some("tasks/"))
+                        .collect();
+                    let detail = if missing.is_empty() {
+                        "its files are present but could not be read as a plan".to_owned()
+                    } else {
+                        format!("it is missing {}", missing.join(", "))
+                    };
                     return Err(ApiError::InvalidCommand {
-                        reason: "run execution requires a validated plan directory containing SCOPE.md, ARCHITECTURE.md, STATUS.md, and tasks/*.md; pre-cutover records and cached graph artifacts are read-only history".into(),
+                        reason: format!(
+                            "plan `{}` cannot be run: {detail}. A runnable plan directory needs \
+                             SCOPE.md, ARCHITECTURE.md, STATUS.md, and tasks/*.md; pre-cutover \
+                             records and cached graph artifacts are read-only history.",
+                            plan_key.relative_dir.display()
+                        ),
                     });
                 }
                 Err(report) => {
@@ -5026,7 +5047,12 @@ impl CoreApi {
         // inert. Execution begins only from a fully validated per-task plan.
         let Some((graph, plan_source)) = source_projection else {
             return Err(ApiError::InvalidCommand {
-                reason: "run execution requires a validated plan directory containing SCOPE.md, ARCHITECTURE.md, STATUS.md, and tasks/*.md; pre-cutover records and cached graph artifacts are read-only history".into(),
+                reason: format!(
+                    "plan `{}` cannot be run: it is a pre-cutover record or a cached graph \
+                     artifact, which are read-only history. A runnable plan directory needs \
+                     SCOPE.md, ARCHITECTURE.md, STATUS.md, and tasks/*.md.",
+                    plan_key.relative_dir.display()
+                ),
             });
         };
 

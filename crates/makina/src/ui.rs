@@ -526,21 +526,22 @@ pub fn render(app: &App, frame: &mut Frame) {
     let warning_height: u16 = if has_missing_provider { 1 } else { 0 };
 
     // ── Top-level vertical split ──────────────────────────────────────────────
-    // title_bar (1 row) / [warning_banner (0 or 1 row)] / body (fills remaining) / status_bar (1 row)
+    // [warning_banner (0 or 1 row)] / body (fills remaining) / status_bar (1 row)
+    //
+    // There is no title bar: a row spent restating the application's own name
+    // told the operator nothing they could act on, and the body needs the room.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),              // title bar
             Constraint::Length(warning_height), // warning banner (0 or 1)
             Constraint::Min(0),                 // body
             Constraint::Length(1),              // status bar
         ])
         .split(area);
 
-    let title_area = vertical[0];
-    let warning_area = vertical[1];
-    let body_area = vertical[2];
-    let status_area = vertical[3];
+    let warning_area = vertical[0];
+    let body_area = vertical[1];
+    let status_area = vertical[2];
 
     // ── Body horizontal split ─────────────────────────────────────────────────
     // Body split is driven by the user's saved sidebar width, not a fixed 30/70.
@@ -554,17 +555,6 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     let sidebar_area = body[0];
     let main_area = body[1];
-
-    // ── Title bar ─────────────────────────────────────────────────────────────
-    let version = env!("CARGO_PKG_VERSION");
-    let title_text = format!(" Makina v{version} — multi-agent software factory ");
-    let title = Paragraph::new(title_text).style(
-        Style::default()
-            .bg(app.active_theme.get(crate::theme::ThemeRole::Info))
-            .fg(app.active_theme.get(crate::theme::ThemeRole::Foreground))
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_widget(title, title_area);
 
     // ── Provider warning banner ───────────────────────────────────────────────
     if has_missing_provider {
@@ -1510,10 +1500,12 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // ── Status bar ────────────────────────────────────────────────────────────
     // Key hints reflect the real keys: [o] open file browser, Ctrl+P opens the
-    // command palette for run control, [Tab] switches
-    // focus, [q/Esc/^C] quit.  A transient command-outcome message (set on the
-    // most recent `api.execute(...)`) is shown when present; otherwise the focus
-    // label + last-event hint are shown.
+    // command palette for run control, [Tab] switches focus, [q/Esc/^C] quit.
+    //
+    // Command outcomes are deliberately NOT shown here. A one-line, width-clipped,
+    // self-overwriting slot could not carry a failure — it truncated the very
+    // part that explained it. Failures raise a modal and are logged; routine
+    // outcomes are logged only. See `crate::app::FailureNotice`.
     let focus_label = match app.focused_panel {
         Panel::Sidebar => "focus: sidebar",
         Panel::Main => "focus: main",
@@ -1523,16 +1515,11 @@ pub fn render(app: &App, frame: &mut Frame) {
         // spinner + label so the user can tell the app is working.
         format!("  │  {} {label}…", spinner_frame(app.tick))
     } else {
-        match &app.status_message {
-            Some(msg) => format!("  │  {msg}"),
-            None => {
-                let event_hint = match &app.last_event {
-                    None => String::new(),
-                    Some(ev) => format!("  │  last: {}", event_short_name(ev)),
-                };
-                format!("  {focus_label}{event_hint}")
-            }
-        }
+        let event_hint = match &app.last_event {
+            None => String::new(),
+            Some(ev) => format!("  │  last: {}", event_short_name(ev)),
+        };
+        format!("  {focus_label}{event_hint}")
     };
     // Blocked-start notice (mirrors gr-legend append): only when the selected
     // run's report has blocking issues. Tells user why Start is gated and how
@@ -1668,6 +1655,14 @@ pub fn render(app: &App, frame: &mut Frame) {
         && let Some(notice) = app.operation_notice.as_ref()
     {
         render_operation_notice(app, notice, frame, area);
+    }
+
+    // Drawn last of the modals: a failure is the thing the operator most needs
+    // to read, so it sits on top of whatever else was open when it arrived.
+    if app.is_failure_notice()
+        && let Some(notice) = app.failure_notice.as_ref()
+    {
+        render_failure_notice(app, notice, frame, area);
     }
 
     // ── Mouse text-selection highlight ─────────────────────────────────────────
@@ -5286,6 +5281,64 @@ fn render_reset_confirmation(
 }
 
 /// Render a notice when a command is blocked by an in-flight plan operation.
+/// Render the failure modal: headline, the **full** explanation wrapped over as
+/// many lines as it needs, and a dismiss hint.
+///
+/// The detail is wrapped rather than truncated — the reason a command failed is
+/// the whole value of the message, and clipping it is what made the old status
+/// line useless (an `ApiError::InvalidCommand` showed as "invalid command" with
+/// the explanation cut off).
+fn render_failure_notice(
+    app: &App,
+    notice: &crate::app::FailureNotice,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let popup = centered_rect(70, 44, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Command Failed ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Error)))
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+
+    let body = vec![
+        Line::from(vec![Span::styled(
+            notice.title.clone(),
+            Style::default()
+                .fg(app.active_theme.get(crate::theme::ThemeRole::Error))
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            notice.detail.clone(),
+            Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Foreground)),
+        )]),
+    ];
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), chunks[0]);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "[Esc/Enter] dismiss   ·   also recorded in the Logs tab (Ctrl+P → Logs)",
+                Style::default().fg(app.active_theme.get(crate::theme::ThemeRole::Dim)),
+            )]),
+        ]),
+        chunks[1],
+    );
+}
+
 fn render_operation_notice(
     app: &App,
     notice: &crate::app::OperationNotice,
@@ -6395,8 +6448,12 @@ mod tests {
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        // Title bar
-        assert!(screen.contains("Makina"), "title bar must say 'Makina'");
+        // There is no title bar: a row spent restating the app's own name told
+        // the operator nothing actionable, so it was reclaimed for the body.
+        assert!(
+            !screen.contains("Makina"),
+            "no title bar may be drawn; got: {screen:?}"
+        );
         // The two panes carry no title and no frame of their own: both labels
         // only restated what the pane already showed. Nothing in the empty
         // state draws a box, so a box-drawing corner anywhere is the pane
@@ -7075,9 +7132,13 @@ mod tests {
         );
     }
 
-    /// When `app.status_message` is set, it is rendered in the status bar.
+    /// Command outcomes never appear in the status bar.
+    ///
+    /// The bar is one width-clipped, self-overwriting line: it truncated the
+    /// part of a failure that explained it, so no message is routed there any
+    /// more. Routine outcomes are logged; failures raise a modal.
     #[test]
-    fn render_status_bar_shows_status_message() {
+    fn render_status_bar_never_shows_command_outcomes() {
         let mut terminal = make_terminal(220, 24);
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
@@ -7087,8 +7148,47 @@ mod tests {
         let screen = screen_of(&terminal);
 
         assert!(
-            screen.contains("Start run:1"),
-            "status bar must render the transient status_message"
+            !screen.contains("Start run:1"),
+            "the status bar must not carry command outcomes; got: {screen:?}"
+        );
+    }
+
+    /// A failure raises a modal carrying its FULL text, however long.
+    ///
+    /// This is the regression that made "Open failed: invalid command"
+    /// undiagnosable: `ApiError` renders as `invalid command: {reason}`, and the
+    /// status line clipped the reason — the only part worth reading.
+    #[test]
+    fn failure_modal_shows_the_whole_reason_untruncated() {
+        let mut terminal = make_terminal(100, 30);
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, vec![], std::path::PathBuf::from("."));
+        app.update(crate::app::AppEvent::ReportFailure(
+            crate::app::FailureNotice::new(
+                "Could not start 0007-Demo",
+                "invalid command: plan `0007-Demo` is already open from `docs/plans/0007-Demo`",
+            ),
+        ));
+
+        assert!(app.is_failure_notice(), "the modal must be raised");
+        terminal.draw(|f| render(&app, f)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Command Failed"),
+            "the modal must be titled: {screen:?}"
+        );
+        assert!(
+            screen.contains("Could not start 0007-Demo"),
+            "the modal must name what was attempted: {screen:?}"
+        );
+        assert!(
+            screen.contains("already open from"),
+            "the tail of the reason must survive — clipping it is the bug: {screen:?}"
+        );
+        assert!(
+            screen.contains("Logs tab"),
+            "the modal must point at the durable record: {screen:?}"
         );
     }
 
@@ -12300,7 +12400,7 @@ mod tests {
         // The visible content must start at item 20 — the manual offset of 20
         // must actually shift the viewport, NOT be pulled back to 0 to keep
         // the cursor (item 0) visible.
-        let sidebar_content = extract_buffer_region(&buffer, 1, 21, 1, 9);
+        let sidebar_content = extract_buffer_region(&buffer, 1, 21, 0, 8);
         assert!(
             sidebar_content.contains("0021-Run"),
             "sidebar must show item 20 (the manual offset) when scrolled; was:\n{sidebar_content}"
@@ -12373,8 +12473,9 @@ mod tests {
         // horizontal padding). The highlight symbol `▶` occupies the first
         // gutter cell.
         let gutter_col: u16 = 2;
-        // The cursor's row: y = sidebar_inner.y + cursor = 1 + 3 = 4.
-        let cursor_row: u16 = 4;
+        // The cursor's row: y = sidebar_inner.y + cursor = 0 + 3 = 3. The
+        // sidebar starts at the top row now that there is no title bar.
+        let cursor_row: u16 = 3;
 
         // The gutter cell on the cursor's row must contain the `▶` highlight
         // symbol.
@@ -12441,7 +12542,7 @@ mod tests {
         // Initial render: offset 0, cursor at item 0 → items run-0..run-5 visible.
         terminal.draw(|f| render(&app, f)).unwrap();
         let buf_before = terminal.backend().buffer().clone();
-        let sidebar_before = extract_buffer_region(&buf_before, 4, 21, 1, 9);
+        let sidebar_before = extract_buffer_region(&buf_before, 4, 21, 0, 8);
         assert!(
             sidebar_before.contains("0001-Run"),
             "initial render must show the top item; was:\n{sidebar_before}"
@@ -12455,7 +12556,7 @@ mod tests {
         // Re-render and assert the visible content has shifted.
         terminal.draw(|f| render(&app, f)).unwrap();
         let buf_after = terminal.backend().buffer().clone();
-        let sidebar_after = extract_buffer_region(&buf_after, 4, 21, 1, 9);
+        let sidebar_after = extract_buffer_region(&buf_after, 4, 21, 0, 8);
         assert!(
             sidebar_after.contains("0006-Run"),
             "after 5 wheel-down clicks the sidebar must show item 5 (offset 5); was:\n{sidebar_after}"
@@ -12501,7 +12602,7 @@ mod tests {
         // On EVERY visible row the scrollbar cell must NOT carry the accent
         // background — including the cursor's row (y=3), which is where the
         // highlight used to bleed into the rail.
-        for y in 1u16..9u16 {
+        for y in 0u16..8u16 {
             assert_ne!(
                 buffer[(21, y)].bg,
                 accent,
@@ -12511,9 +12612,9 @@ mod tests {
         // Sanity: the cursor's row still gets the highlight on the gutter
         // (x=2), proving the highlight was painted — just not on the scrollbar.
         assert_eq!(
-            buffer[(2, 3)].bg,
+            buffer[(2, 2)].bg,
             accent,
-            "highlight style must still be painted on the cursor's gutter cell (x=2, y=3)"
+            "highlight style must still be painted on the cursor's gutter cell (x=2, y=2)"
         );
     }
 
@@ -12641,7 +12742,7 @@ mod tests {
         let buf1 = terminal.backend().buffer().clone();
 
         // Sidebar inner area: x in 1..23, y in 1..9 (the pane draws no border).
-        let sidebar1 = extract_buffer_region(&buf1, 1, 23, 1, 9);
+        let sidebar1 = extract_buffer_region(&buf1, 1, 23, 0, 8);
 
         assert!(
             sidebar1.contains("0004-Run"),
@@ -12670,7 +12771,7 @@ mod tests {
         terminal2.draw(|f| render(&app2, f)).unwrap();
         let buf2 = terminal2.backend().buffer().clone();
 
-        let sidebar2 = extract_buffer_region(&buf2, 1, 23, 1, 9);
+        let sidebar2 = extract_buffer_region(&buf2, 1, 23, 0, 8);
 
         assert!(
             sidebar2.contains("0001-Run"),
@@ -14060,26 +14161,22 @@ mod tests {
 
         let buffer = terminal.backend().buffer().clone();
 
-        // Find a cell in the title bar that should have been rendered with theme colors.
-        // The title bar is at the top and uses Info role for background (Ayu Mirage: Rgb(128, 191, 255))
-        // and Foreground role for text (Ayu Mirage: Rgb(204, 202, 194)).
-        // We look for a cell that has one of these colors applied.
-        // Mirage's Info background (Rgb(128,191,255)) differs from the Ayu Dark
-        // default (Rgb(115,184,255)), so finding a cell painted with the Mirage
-        // value proves the active theme — not the Dark default — reached render.
-        let mirage_info_bg = Color::Rgb(128, 191, 255); // Ayu Mirage Info background
+        // Probe the STATUS BAR, which paints `ThemeRole::Dim` as its background
+        // across the full width. (This used to probe the title bar's Info
+        // background; there is no title bar any more, and a probe anchored to a
+        // widget that can be removed proves nothing once it is.)
+        //
+        // Mirage's Dim (Rgb(112,122,140)) differs from the Ayu Dark default
+        // (Rgb(90,99,120)), so finding a cell painted with the Mirage value
+        // proves the active theme — not the Dark default — reached render.
+        let mirage_dim_bg = Color::Rgb(112, 122, 140); // Ayu Mirage Dim
 
-        let mut found_mirage_color = false;
-        for cell in buffer.content() {
-            if cell.bg == mirage_info_bg {
-                found_mirage_color = true;
-                break;
-            }
-        }
+        let found_mirage_color = buffer.content().iter().any(|cell| cell.bg == mirage_dim_bg);
 
         assert!(
             found_mirage_color,
-            "Title bar should contain at least one cell with Ayu Mirage Info background color (Rgb(128, 191, 255))"
+            "the status bar must carry the Ayu Mirage Dim background (Rgb(112, 122, 140)), \
+             proving the active theme reached the render path"
         );
     }
 

@@ -122,6 +122,7 @@ pub async fn run(
             settings: app.is_settings(),
             reset_confirm: app.is_confirming_reset(),
             operation_notice: app.is_operation_notice(),
+            failure_notice: app.is_failure_notice(),
         };
         let app_event: Option<AppEvent> = tokio::select! {
             // Bias toward terminal input (lower latency for keystrokes).
@@ -732,28 +733,25 @@ async fn resolve_io(
                     )
                 }
                 // No run and no plan context: surface the standard hint.
-                None => (AppEvent::Tick, run_control(app, ControlKind::Start).await),
+                None => control_outcome(run_control(app, ControlKind::Start).await),
             }
         }
         AppEvent::PauseRun => match operation_blocked_event(app, "Pause run") {
             Some(event) => (event, None),
-            None => (AppEvent::Tick, run_control(app, ControlKind::Pause).await),
+            None => control_outcome(run_control(app, ControlKind::Pause).await),
         },
         AppEvent::CancelRun => match operation_blocked_event(app, "Stop run") {
             Some(event) => (event, None),
-            None => (AppEvent::Tick, run_control(app, ControlKind::Cancel).await),
+            None => control_outcome(run_control(app, ControlKind::Cancel).await),
         },
         AppEvent::Reinterpret => match operation_blocked_event(app, "Reinterpret run") {
             Some(event) => (event, None),
-            None => (
-                AppEvent::Tick,
-                run_control(app, ControlKind::Reinterpret).await,
-            ),
+            None => control_outcome(run_control(app, ControlKind::Reinterpret).await),
         },
         // ── Context-sensitive retry (plan 0017) ───────────────────────────────
         AppEvent::RetryFocused => match operation_blocked_event(app, "Reset/retry focused task") {
             Some(event) => (event, None),
-            None => (AppEvent::Tick, retry_focused(app).await),
+            None => control_outcome(retry_focused(app).await),
         },
         AppEvent::ResetRun { confirmation } => {
             start_reset_confirmed(app, confirmation, background_tx).await
@@ -845,7 +843,10 @@ async fn resolve_io(
                         }
                         Err(e) => {
                             let _ = tx
-                                .send(AppEvent::StatusMessage(format!("Model probe failed: {e}")))
+                                .send(AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                                    "Could not list models",
+                                    e.to_string(),
+                                )))
                                 .await;
                         }
                     }
@@ -1004,6 +1005,16 @@ fn spawn_open_run(
 ) {
     use makina_core::api::{Command, CommandOutcome};
     tokio::spawn(async move {
+        // Named before `plan_dir` is moved into the command, so a failure can
+        // say which plan it was about instead of just that something failed.
+        let plan_label = target
+            .as_ref()
+            .map(|t| t.slug.clone())
+            .unwrap_or_else(|| plan_dir.plan_identity());
+        // What the operator actually asked for. Reporting an `auto_start`
+        // request as "Open failed" described an internal step rather than their
+        // intent, and read as nonsense when the plan was plainly already open.
+        let intent = if auto_start { "start" } else { "open" };
         let result = if let Some(router) = project_api {
             router.open_plan(&project_root, plan_dir).await
         } else {
@@ -1024,17 +1035,37 @@ fn spawn_open_run(
                     }
                     Err(e) => {
                         let _ = background_tx
-                            .send(AppEvent::StatusMessage(format!("Start failed: {e}")))
+                            .send(AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                                format!("Could not start {plan_label}"),
+                                e.to_string(),
+                            )))
                             .await;
                         true
                     }
                 }
             }
             Ok(CommandOutcome::RunOpened { .. }) => true,
-            Ok(_) => false,
+            Ok(other) => {
+                // A non-RunOpened outcome is a contract violation, not a
+                // user-facing state — surface it rather than failing silently,
+                // which is how this previously vanished without a trace.
+                let _ = background_tx
+                    .send(AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                        format!("Could not {intent} {plan_label}"),
+                        format!(
+                            "the orchestrator answered {other:?} instead of opening a run; \
+                             this is an internal inconsistency, not something you did"
+                        ),
+                    )))
+                    .await;
+                false
+            }
             Err(e) => {
                 let _ = background_tx
-                    .send(AppEvent::StatusMessage(format!("Open failed: {e}")))
+                    .send(AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                        format!("Could not {intent} {plan_label}"),
+                        e.to_string(),
+                    )))
                     .await;
                 false
             }
@@ -1087,8 +1118,9 @@ fn spawn_generate_plan_bundle(
             Ok(other) => {
                 let reason = format!("unexpected outcome {other:?}");
                 let _ = background_tx
-                    .send(AppEvent::StatusMessage(format!(
-                        "Generate failed: {reason}"
+                    .send(AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                        "Could not generate the plan bundle",
+                        reason.clone(),
                     )))
                     .await;
                 Err(reason)
@@ -1096,8 +1128,9 @@ fn spawn_generate_plan_bundle(
             Err(error) => {
                 let reason = error.to_string();
                 let _ = background_tx
-                    .send(AppEvent::StatusMessage(format!(
-                        "Generate failed: {reason}"
+                    .send(AppEvent::ReportFailure(crate::app::FailureNotice::new(
+                        "Could not generate the plan bundle",
+                        reason.clone(),
                     )))
                     .await;
                 Err(reason)
@@ -2091,24 +2124,59 @@ enum ControlKind {
 /// The actual run-state changes (status, task progress, agent exchanges) flow
 /// back through `api.subscribe()`; this only surfaces the command's immediate
 /// acknowledgement / error in the status bar.
-async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
-    use makina_core::api::Command;
-
+/// Issue a run-control command, distinguishing success from failure in the
+/// **type** rather than in the prose of a single string.
+///
+/// Both used to come back as `Option<String>` bound for the status bar, so a
+/// refusal was indistinguishable from an acknowledgement at the call site.
+/// Returning a [`FailureNotice`] on the error path is what lets the caller raise
+/// the modal and log at ERROR, instead of a failure quietly reading as progress.
+async fn run_control(app: &App, kind: ControlKind) -> Result<String, crate::app::FailureNotice> {
+    let (_, verb) = control_command_and_verb(kind, makina_core::api::RunId(0));
     let run = match app.active_run_id() {
         Some(r) => r,
         None => {
-            return Some("No run selected — open a plan tab, or pick a plan with [o]".to_string());
+            return Err(crate::app::FailureNotice::new(
+                format!("Nothing to {}", verb.to_lowercase()),
+                "No run or plan is selected. Focus a plan in the sidebar, or press [o] to pick a \
+                 plan directory."
+                    .to_string(),
+            ));
         }
     };
-    let (command, verb) = match kind {
+    let (command, verb) = control_command_and_verb(kind, run);
+    match app.api.execute(command).await {
+        Ok(_) => Ok(format!("{verb} {run}")),
+        Err(e) => Err(crate::app::FailureNotice::new(
+            format!("Could not {} {run}", verb.to_lowercase()),
+            e.to_string(),
+        )),
+    }
+}
+
+/// The API command and human verb for a run-control intent.
+fn control_command_and_verb(
+    kind: ControlKind,
+    run: makina_core::api::RunId,
+) -> (makina_core::api::Command, &'static str) {
+    use makina_core::api::Command;
+    match kind {
         ControlKind::Start => (Command::StartRun { run }, "Start"),
         ControlKind::Pause => (Command::PauseRun { run }, "Pause"),
         ControlKind::Cancel => (Command::CancelRun { run }, "Cancel"),
         ControlKind::Reinterpret => (Command::ReinterpretRun { run }, "Reinterpret"),
-    };
-    match app.api.execute(command).await {
-        Ok(_) => Some(format!("{verb} {run}")),
-        Err(e) => Some(format!("{verb} failed: {e}")),
+    }
+}
+
+/// Fold a [`run_control`] outcome into the `(event, status)` pair `resolve_io`
+/// returns: an acknowledgement stays a logged status line, a failure becomes the
+/// modal-raising [`AppEvent::ReportFailure`].
+fn control_outcome(
+    result: Result<String, crate::app::FailureNotice>,
+) -> (AppEvent, Option<String>) {
+    match result {
+        Ok(message) => (AppEvent::Tick, Some(message)),
+        Err(notice) => (AppEvent::ReportFailure(notice), None),
     }
 }
 
@@ -2125,50 +2193,58 @@ async fn run_control(app: &App, kind: ControlKind) -> Option<String> {
 /// The actual state changes (task resets, run resuming) flow back through
 /// `api.subscribe()`; this only surfaces the command's immediate acknowledgement
 /// / error in the status bar.
-async fn retry_focused(app: &App) -> Option<String> {
+async fn retry_focused(app: &App) -> Result<String, crate::app::FailureNotice> {
     use crate::app::TreeNode;
     use makina_core::api::{Command, RunStatus, TaskState};
 
-    // Resolve the focused node into an optional retry command + a label.
-    let command: Option<(Command, String)> = match app.focused_node() {
-        Some(TreeNode::Task { run, task }) => {
-            let rv = app.runs.get(run)?;
-            let tv = rv.tasks.get(task)?;
-            if tv.state == TaskState::Failed {
-                Some((
-                    Command::RetryTask {
-                        run: rv.id,
-                        task: tv.id.clone(),
-                    },
-                    format!("retry {}", tv.id.0),
-                ))
-            } else {
-                None
+    // Resolve the focused node into an optional retry command + a label. Kept in
+    // a closure so `?` still means "no command here" — the function itself now
+    // returns a Result, where `?` would mean "failed".
+    let resolve = || -> Option<(Command, String)> {
+        match app.focused_node() {
+            Some(TreeNode::Task { run, task }) => {
+                let rv = app.runs.get(run)?;
+                let tv = rv.tasks.get(task)?;
+                if tv.state == TaskState::Failed {
+                    Some((
+                        Command::RetryTask {
+                            run: rv.id,
+                            task: tv.id.clone(),
+                        },
+                        format!("retry {}", tv.id.0),
+                    ))
+                } else {
+                    None
+                }
             }
-        }
-        Some(TreeNode::Run { run }) => {
-            let rv = app.runs.get(run)?;
-            if rv.tasks.iter().any(|t| t.state == TaskState::Failed) {
-                Some((
-                    Command::RetryFailedTasks { run: rv.id },
-                    format!("retry failed tasks in {}", rv.id),
-                ))
-            } else {
-                None
+            Some(TreeNode::Run { run }) => {
+                let rv = app.runs.get(run)?;
+                if rv.tasks.iter().any(|t| t.state == TaskState::Failed) {
+                    Some((
+                        Command::RetryFailedTasks { run: rv.id },
+                        format!("retry failed tasks in {}", rv.id),
+                    ))
+                } else {
+                    None
+                }
             }
+            Some(TreeNode::Plan { .. })
+            | Some(TreeNode::PlanTask { .. })
+            | Some(TreeNode::Folder { .. })
+            | Some(TreeNode::PlanInFolder { .. })
+            | Some(TreeNode::PlanTaskInFolder { .. }) => None,
+            None => None,
         }
-        Some(TreeNode::Plan { .. })
-        | Some(TreeNode::PlanTask { .. })
-        | Some(TreeNode::Folder { .. })
-        | Some(TreeNode::PlanInFolder { .. })
-        | Some(TreeNode::PlanTaskInFolder { .. }) => None,
-        None => None,
     };
+    let command = resolve();
 
     if let Some((command, verb)) = command {
         return match app.api.execute(command).await {
-            Ok(_) => Some(verb),
-            Err(e) => Some(format!("{verb} failed: {e}")),
+            Ok(_) => Ok(verb),
+            Err(e) => Err(crate::app::FailureNotice::new(
+                format!("Could not {verb}"),
+                e.to_string(),
+            )),
         };
     }
 
@@ -2191,7 +2267,7 @@ async fn retry_focused(app: &App) -> Option<String> {
         return run_control(app, ControlKind::Reinterpret).await;
     }
 
-    Some("nothing to retry here".to_string())
+    Ok("nothing to retry here".to_string())
 }
 
 fn operation_blocked_event(app: &App, attempted: &str) -> Option<AppEvent> {
@@ -2516,6 +2592,7 @@ struct ModalState {
     settings: bool,
     reset_confirm: bool,
     operation_notice: bool,
+    failure_notice: bool,
 }
 
 /// Translate a raw crossterm [`CrosstermEvent`] into an [`AppEvent`].
@@ -2648,6 +2725,7 @@ fn translate_key(
         settings,
         reset_confirm,
         operation_notice,
+        failure_notice,
     } = modal;
     use crossterm::event::KeyEventKind;
     // Only react to key-press events (not key-release / repeat on some platforms).
@@ -2668,11 +2746,21 @@ fn translate_key(
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !reset_confirm
         && !operation_notice
+        && !failure_notice
     {
         return AppEvent::OpenCommandPalette;
     }
 
-    if operation_notice {
+    // The failure modal is checked first: it is drawn on top of every other
+    // overlay, so it must be the one that consumes the dismiss key.
+    if failure_notice {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                AppEvent::CloseFailureNotice
+            }
+            _ => AppEvent::Tick,
+        }
+    } else if operation_notice {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 AppEvent::CloseOperationNotice
@@ -4769,11 +4857,22 @@ mod tests {
         });
         assert!(app.selected_run().is_none());
 
+        // With nothing selected there is no command to issue, and the refusal
+        // is raised as a modal rather than a status line — a status line was
+        // clipped and then overwritten, which is how these went unnoticed.
         let (ev, status) = resolve_io_for_test(&mut app, AppEvent::StartRun).await;
-        assert!(matches!(ev, AppEvent::Tick));
-        let msg = status.expect("must produce a status message");
-        assert!(msg.contains("No run selected"));
-        assert!(msg.contains("open a plan tab"));
+        assert!(
+            status.is_none(),
+            "a refusal must not be routed to the status bar; got {status:?}"
+        );
+        let AppEvent::ReportFailure(notice) = ev else {
+            panic!("a refusal must raise the failure modal; got {ev:?}");
+        };
+        assert!(
+            notice.detail.contains("Focus a plan in the sidebar"),
+            "the refusal must say how to proceed; got {:?}",
+            notice.detail
+        );
     }
 
     /// **Start on a discovered plan with no Run (plan 0042 follow-up).** When the
@@ -5370,11 +5469,25 @@ mod tests {
         };
         let mut app = App::new(api, vec![run], std::path::PathBuf::from("."));
 
-        let (_ev, status) = resolve_io_for_test(&mut app, AppEvent::PauseRun).await;
-        let msg = status.expect("an error must still produce a status message");
+        // A command error raises the modal carrying the API's own explanation
+        // in full, instead of a status line that truncated it away.
+        let (ev, status) = resolve_io_for_test(&mut app, AppEvent::PauseRun).await;
         assert!(
-            msg.contains("failed"),
-            "command error must be surfaced as a 'failed' message; got {msg:?}"
+            status.is_none(),
+            "a command error must not be routed to the status bar; got {status:?}"
+        );
+        let AppEvent::ReportFailure(notice) = ev else {
+            panic!("a command error must raise the failure modal; got {ev:?}");
+        };
+        assert!(
+            notice.title.contains("Could not pause"),
+            "the modal must name the attempted command; got {:?}",
+            notice.title
+        );
+        assert!(
+            notice.detail.contains("unknown run"),
+            "the API's reason must survive intact; got {:?}",
+            notice.detail
         );
     }
 
