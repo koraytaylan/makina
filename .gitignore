@@ -7,3 +7,6 @@
 
 # Per-task worktrees created by the implement-plan engine and Makina runs
 /.worktrees/
+
+# Claude Code worktrees
+/.claude/worktrees
