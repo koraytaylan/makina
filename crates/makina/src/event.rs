@@ -8763,4 +8763,160 @@ wall_clock_secs = 600
             AppEvent::CycleLogFilter(crate::app::LogFilterControl::Project)
         ));
     }
+
+    /// REPRODUCTION: a plan is focused in the sidebar, the operator opens the
+    /// Logs tab, then presses Start. The run must target the plan they had
+    /// focused — the Logs tab is about no plan at all, so it must not swallow
+    /// the command.
+    #[tokio::test]
+    async fn start_targets_the_sidebar_plan_with_the_logs_tab_open() {
+        use crate::app::{App, AppEvent, Panel};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command.clone());
+                match command {
+                    Command::OpenPlan { .. } => Ok(CommandOutcome::RunOpened { run: RunId(42) }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                vec![]
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![],
+            std::path::PathBuf::from("."),
+        );
+        seed_test_model(&mut app);
+        app.discovered_plans = vec![test_plan_entry(
+            std::path::PathBuf::from("/tmp/docs/plans/0099-demo"),
+            "0099-demo".to_string(),
+            Vec::new(),
+        )];
+        let target = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
+
+        // Focus that plan in the sidebar.
+        app.focused_panel = Panel::Sidebar;
+        let plan_row = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, crate::app::TreeNode::Plan { .. }))
+            .expect("the discovered plan must have a sidebar row");
+        app.tree_cursor = Some(plan_row);
+
+        // Open the Logs tab, then Start.
+        app.update(AppEvent::OpenLogsTab);
+
+        let (tx, _rx) = background_events();
+        let (ev, status) = resolve_io(&mut app, AppEvent::StartRun, &tx).await;
+        assert!(
+            matches!(&ev, AppEvent::PlanOpenStarted { target: opened } if opened == &target),
+            "Start must open the sidebar-focused plan; got {ev:?} / {status:?}"
+        );
+    }
+
+    /// REPRODUCTION: plan A's tab is open while the sidebar cursor sits on plan
+    /// B. Start must target B — the row the operator is looking at — not the
+    /// tab that happens to be open behind it.
+    #[tokio::test]
+    async fn start_targets_the_sidebar_plan_over_an_open_tab_for_another_plan() {
+        use crate::app::{App, AppEvent, Panel, TabContent};
+        use async_trait::async_trait;
+        use makina_core::api::{
+            Api, ApiError, Command, CommandOutcome, Event, EventStream, RunId, RunView,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingApi {
+            commands: Mutex<Vec<Command>>,
+        }
+        #[async_trait]
+        impl Api for RecordingApi {
+            async fn execute(&self, command: Command) -> Result<CommandOutcome, ApiError> {
+                self.commands.lock().unwrap().push(command.clone());
+                match command {
+                    Command::OpenPlan { .. } => Ok(CommandOutcome::RunOpened { run: RunId(42) }),
+                    _ => Ok(CommandOutcome::Acknowledged),
+                }
+            }
+            async fn runs(&self) -> Vec<RunView> {
+                vec![]
+            }
+            async fn run(&self, _id: RunId) -> Option<RunView> {
+                None
+            }
+            fn subscribe(&self) -> EventStream {
+                Box::pin(futures::stream::empty::<Event>())
+            }
+        }
+
+        let api = Arc::new(RecordingApi {
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            Arc::clone(&api) as Arc<dyn Api>,
+            vec![],
+            std::path::PathBuf::from("."),
+        );
+        seed_test_model(&mut app);
+        app.discovered_plans = vec![
+            test_plan_entry(
+                std::path::PathBuf::from("/tmp/docs/plans/0001-alpha"),
+                "0001-alpha".to_string(),
+                Vec::new(),
+            ),
+            test_plan_entry(
+                std::path::PathBuf::from("/tmp/docs/plans/0002-beta"),
+                "0002-beta".to_string(),
+                Vec::new(),
+            ),
+        ];
+        let alpha = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[0]);
+        let beta = app.plan_identity_for_entry(&app.repo_root, &app.discovered_plans[1]);
+
+        // Alpha's detail tab is open and active.
+        app.tabs.open_tab(TabContent::Plan {
+            plan: alpha.clone(),
+        });
+
+        // The operator goes back to the sidebar and focuses beta.
+        app.focused_panel = Panel::Sidebar;
+        let beta_row = app
+            .visible_tree_nodes()
+            .iter()
+            .position(|node| matches!(node, crate::app::TreeNode::Plan { plan_idx: 1 }))
+            .expect("beta must have a sidebar row");
+        app.tree_cursor = Some(beta_row);
+
+        // Now focus drifts to the main pane (Tab, a click, or opening any tab).
+        app.focused_panel = Panel::Main;
+
+        let (tx, _rx) = background_events();
+        let (ev, status) = resolve_io(&mut app, AppEvent::StartRun, &tx).await;
+        assert!(
+            matches!(&ev, AppEvent::PlanOpenStarted { target: opened } if opened == &beta),
+            "Start must target the sidebar-focused plan (beta), got {ev:?} / {status:?}; alpha={alpha:?}"
+        );
+    }
 }

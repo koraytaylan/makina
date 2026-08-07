@@ -2667,6 +2667,42 @@ impl App {
         if self.selected_run != prev_run {
             self.load_exchanges_for_selected_run();
         }
+        self.sync_tree_cursor_to_active_tab();
+    }
+
+    /// Move the sidebar cursor onto the row for the active tab's plan or run.
+    ///
+    /// This is the other half of making the sidebar highlight authoritative
+    /// (see [`App::context_plan_identity`]): because the cursor follows the tab,
+    /// activating a tab still retargets run control, and the highlight never
+    /// disagrees with what a command will act on.
+    ///
+    /// Tabs that name no plan — Logs, plan authoring — leave the cursor exactly
+    /// where it was, so opening one keeps whatever the operator had focused.
+    fn sync_tree_cursor_to_active_tab(&mut self) {
+        let Some(active) = self.tabs.active_tab else {
+            return;
+        };
+        let target = match self.tabs.open_tabs.get(active) {
+            Some(TabContent::Plan { plan })
+            | Some(TabContent::PlanTask { plan, .. })
+            | Some(TabContent::Task { plan, .. }) => plan.clone(),
+            Some(TabContent::PlanAuthoring { .. }) | Some(TabContent::Logs) | None => return,
+        };
+        if let Some(row) = self.tree_row_for_plan(&target) {
+            self.tree_cursor = Some(row);
+        }
+    }
+
+    /// The visible sidebar row whose node resolves to `target`, if it has one.
+    ///
+    /// A started plan is rendered as its run node rather than a plan node, so
+    /// this matches on the resolved identity rather than the node shape.
+    fn tree_row_for_plan(&self, target: &PlanIdentity) -> Option<usize> {
+        self.visible_tree_nodes().into_iter().position(|node| {
+            self.plan_identity_for_context_node(node)
+                .is_some_and(|identity| identity == *target)
+        })
     }
 
     /// Close plan tabs whose slug is no longer in `discovered_plans` or
@@ -3584,34 +3620,36 @@ impl App {
             .map(|run| self.plan_identity_for_run(run))
     }
 
-    /// Canonical project targeted by project-level commands. A sidebar
-    /// selection is authoritative only while the sidebar owns focus; otherwise
-    /// the active tab supplies the immutable project context.
+    /// Canonical project targeted by project-level commands.
+    ///
+    /// The focused sidebar row is authoritative whatever holds keyboard focus,
+    /// for the same reason it is in [`App::context_plan_identity`] — and so the
+    /// two cannot disagree and send a plan command to one project while a
+    /// project command goes to another. A row that names no project falls
+    /// through to the active tab.
     pub fn context_project_root(&self) -> PathBuf {
-        if self.focused_panel == Panel::Sidebar {
-            match self.focused_node() {
-                Some(TreeNode::Folder { folder_idx }) => {
-                    if let Some(root) = self.opened_folders.get(folder_idx) {
-                        return lexical_absolute(&self.repo_root, root);
-                    }
+        match self.focused_node() {
+            Some(TreeNode::Folder { folder_idx }) => {
+                if let Some(root) = self.opened_folders.get(folder_idx) {
+                    return lexical_absolute(&self.repo_root, root);
                 }
-                Some(
-                    node @ (TreeNode::Plan { .. }
-                    | TreeNode::PlanTask { .. }
-                    | TreeNode::PlanInFolder { .. }
-                    | TreeNode::PlanTaskInFolder { .. }),
-                ) => {
-                    if let Some(target) = self.plan_identity_for_node(node) {
-                        return target.project_root;
-                    }
-                }
-                Some(TreeNode::Run { run }) | Some(TreeNode::Task { run, .. }) => {
-                    if let Some(view) = self.runs.get(run) {
-                        return self.plan_identity_for_run(view).project_root;
-                    }
-                }
-                None => {}
             }
+            Some(
+                node @ (TreeNode::Plan { .. }
+                | TreeNode::PlanTask { .. }
+                | TreeNode::PlanInFolder { .. }
+                | TreeNode::PlanTaskInFolder { .. }),
+            ) => {
+                if let Some(target) = self.plan_identity_for_node(node) {
+                    return target.project_root;
+                }
+            }
+            Some(TreeNode::Run { run }) | Some(TreeNode::Task { run, .. }) => {
+                if let Some(view) = self.runs.get(run) {
+                    return self.plan_identity_for_run(view).project_root;
+                }
+            }
+            None => {}
         }
 
         if let Some(active) = self.tabs.active_tab
@@ -3930,22 +3968,37 @@ impl App {
         }
     }
 
-    /// Stable identity for the plan the user is currently "in". A focused
-    /// sidebar node is authoritative while the sidebar owns focus; otherwise
-    /// the active tab supplies immutable context. This prevents commands from
-    /// targeting a stale tab while the user is acting on another sidebar plan,
-    /// without letting a stale sidebar cursor override the tab shown in Main.
+    /// Stable identity for the plan the user is currently "in": the focused
+    /// **sidebar** node whenever it names a plan, and only otherwise the active
+    /// tab.
+    ///
+    /// # Why the sidebar wins outright
+    ///
+    /// The sidebar highlight is persistent and on screen — it is what the
+    /// operator points at when they say "start *that*". Keyboard focus is not:
+    /// it moves on Tab, on a click, and on opening any tab. Gating the sidebar's
+    /// authority on `focused_panel == Sidebar` therefore made the target of a
+    /// run command depend on invisible state: focusing a plan and then opening
+    /// so much as the Logs tab silently handed targeting back to whatever tab
+    /// was open, while the highlight still showed the plan that was chosen.
+    ///
+    /// A stale cursor cannot override the tab shown in Main, because the
+    /// converse sync holds too: activating a tab moves the cursor onto that
+    /// tab's row (see [`App::sync_selected_run_to_active_tab`]). The two agree
+    /// by construction, so the highlight always shows what a command will act
+    /// on. Tabs that name no plan at all — Logs, plan authoring — leave the
+    /// cursor untouched, which is what lets the sidebar keep the context while
+    /// one of them is open.
     pub fn context_plan_identity(&self) -> Option<PlanIdentity> {
-        if self.focused_panel == Panel::Sidebar
-            && let Some(node) = self.focused_node()
+        // Falls THROUGH rather than returning when the node names no plan (a
+        // folder header, an empty tree), so the tab can still supply context.
+        if let Some(node) = self.focused_node()
+            && let Some(target) = self.plan_identity_for_context_node(node)
         {
-            return self.plan_identity_for_context_node(node);
+            return Some(target);
         }
 
-        self.active_tab_plan_identity().or_else(|| {
-            self.focused_node()
-                .and_then(|node| self.plan_identity_for_context_node(node))
-        })
+        self.active_tab_plan_identity()
     }
 
     /// The discovered plan the user is currently "in" — derived from the active
@@ -3990,10 +4043,13 @@ impl App {
 
     /// for the current context (the caller may then open one for the plan).
     pub fn active_run_id(&self) -> Option<makina_core::api::RunId> {
-        if self.focused_panel == Panel::Sidebar
-            && let Some(node) = self.focused_node()
-        {
-            return match node {
+        // The focused sidebar row wins whenever it names a run, whatever holds
+        // keyboard focus — see [`App::context_plan_identity`] for why. A row
+        // that names none (a folder, or a plan not yet started) falls THROUGH
+        // to the tab rather than returning `None` outright, so an unstarted
+        // plan still reaches the "open it and start" path below.
+        if let Some(node) = self.focused_node() {
+            let from_sidebar = match node {
                 TreeNode::Run { run } | TreeNode::Task { run, .. } => {
                     self.runs.get(run).map(|view| view.id)
                 }
@@ -4006,6 +4062,15 @@ impl App {
                     .map(|run| run.id),
                 TreeNode::Folder { .. } => None,
             };
+            if let Some(run) = from_sidebar {
+                return Some(run);
+            }
+            // A focused plan row with no run yet is a deliberate target: it must
+            // not fall back to an unrelated tab's run, or Start would run
+            // something the operator never pointed at.
+            if self.plan_identity_for_context_node(node).is_some() {
+                return None;
+            }
         }
         if let Some(active) = self.tabs.active_tab
             && let Some(TabContent::Task { run, .. }) = self.tabs.open_tabs.get(active)
@@ -16639,8 +16704,16 @@ mod tests {
         );
     }
 
+    /// The focused sidebar row decides the command target whatever holds
+    /// keyboard focus.
+    ///
+    /// This used to follow `focused_panel`, which made the target of a run
+    /// command depend on invisible state: focusing a plan and then moving focus
+    /// to the main pane — by Tab, a click, or opening any tab — silently handed
+    /// targeting back to whatever tab was open, while the sidebar highlight
+    /// still showed the plan the operator had chosen.
     #[test]
-    fn command_plan_context_follows_the_panel_that_owns_focus() {
+    fn command_plan_context_follows_the_focused_sidebar_row_not_the_focused_panel() {
         let api = Arc::new(PlaceholderApi::empty());
         let mut app = App::new(api, Vec::new(), PathBuf::from("/work/repo-a"));
         app.opened_folders = vec![PathBuf::from("/work/repo-a"), PathBuf::from("/work/repo-b")];
@@ -16684,10 +16757,89 @@ mod tests {
         });
 
         app.focused_panel = Panel::Sidebar;
-        assert_eq!(app.context_plan_identity(), Some(sidebar_target));
+        assert_eq!(
+            app.context_plan_identity(),
+            Some(sidebar_target.clone()),
+            "the focused row is the target while the sidebar owns focus"
+        );
 
         app.focused_panel = Panel::Main;
+        assert_eq!(
+            app.context_plan_identity(),
+            Some(sidebar_target),
+            "…and still the target once focus moves to the main pane — the \
+             highlight the operator can see must not be overridden by an open tab"
+        );
+
+        // The tab supplies context only when the cursor names no plan at all.
+        app.tree_cursor = None;
         assert_eq!(app.context_plan_identity(), Some(tab_target));
+    }
+
+    /// Activating a tab moves the sidebar cursor onto that tab's row.
+    ///
+    /// This is what keeps the sidebar authoritative without making tab
+    /// switching inert: the highlight follows the tab, so Alt+←/→ still
+    /// retargets run control and the two views can never disagree about what a
+    /// command will act on.
+    #[test]
+    fn activating_a_tab_moves_the_sidebar_cursor_onto_its_row() {
+        let api = Arc::new(PlaceholderApi::empty());
+        let mut app = App::new(api, Vec::new(), PathBuf::from("/work/repo-a"));
+        app.opened_folders = vec![PathBuf::from("/work/repo-a")];
+        let plan = |slug: &str| {
+            test_plan_entry(
+                PathBuf::from("/work/repo-a").join("docs/plans").join(slug),
+                slug.to_string(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            )
+        };
+        app.plans_by_folder
+            .insert(0, vec![plan("plan-a"), plan("plan-b")]);
+        let alpha = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 0,
+            })
+            .unwrap();
+        let beta = app
+            .plan_identity_for_node(TreeNode::PlanInFolder {
+                folder_idx: 0,
+                plan_idx: 1,
+            })
+            .unwrap();
+
+        app.tabs.open_tab(TabContent::Plan {
+            plan: alpha.clone(),
+        });
+        app.tabs.open_tab(TabContent::Plan { plan: beta.clone() });
+
+        app.update(AppEvent::ActivateTab(0));
+        assert_eq!(
+            app.context_plan_identity(),
+            Some(alpha),
+            "activating alpha's tab must move the cursor onto alpha's row"
+        );
+
+        app.update(AppEvent::ActivateTab(1));
+        assert_eq!(
+            app.context_plan_identity(),
+            Some(beta.clone()),
+            "…and switching to beta's tab must retarget to beta"
+        );
+
+        // A tab that names no plan leaves the cursor where it was — this is what
+        // lets the operator open the Logs tab without losing their target.
+        app.update(AppEvent::OpenLogsTab);
+        assert!(app.is_logs_tab_active());
+        assert_eq!(
+            app.context_plan_identity(),
+            Some(beta),
+            "the Logs tab names no plan, so the focused row keeps the context"
+        );
     }
 
     #[test]
