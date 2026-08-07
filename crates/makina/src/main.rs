@@ -376,7 +376,13 @@ async fn main() {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
         let (tui_layer, log_rx) = log::tui_log_channel();
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        // The Logs tab shows everything Makina itself logs, so the default
+        // filter lets our own crates through at DEBUG while third-party crates
+        // stay at INFO — otherwise the tab could only ever show what a default
+        // `info` filter had already discarded. `RUST_LOG` overrides all of it.
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,makina=debug,makina_core=debug,makina_acp=debug")
+        });
         tracing_subscriber::registry()
             .with(filter)
             .with(log::RunFileLayer::new(repo_root.clone()))

@@ -6,8 +6,8 @@
 //! - [`RunFileLayer`] — the per-run **file** layer (span-keyed routing), and
 //! - [`TuiLogLayer`] — the **TUI-channel** layer that `try_send`s a
 //!   [`makina_core::log_record::LogRecord`] per event onto a bounded mpsc
-//!   channel the TUI drains. Build it (plus its receiver) with
-//!   [`tui_log_channel`].
+//!   channel the TUI drains, at every level and attributed to the span scope it
+//!   came from. Build it (plus its receiver) with [`tui_log_channel`].
 //!
 //! # Why a custom file layer
 //!
@@ -73,7 +73,11 @@ use tracing_subscriber::registry::LookupSpan;
 /// Bounded so a stalled / slow TUI consumer cannot grow unbounded memory: when
 /// the channel is full the [`TuiLogLayer`] **drops** the record rather than
 /// block the emitting thread (logging must never stall a run).
-pub const TUI_LOG_CHANNEL_CAPACITY: usize = 256;
+///
+/// Sized for a **firehose**: the layer forwards every level (the Logs tab shows
+/// all of them, filtering at render time), so a busy run produces far more
+/// records between two drains than the WARN/ERROR-only stream it replaced.
+pub const TUI_LOG_CHANNEL_CAPACITY: usize = 1024;
 
 /// The span-extension value: the `run_uid` a span (and its children) belong to.
 #[derive(Clone)]
@@ -137,6 +141,75 @@ impl Visit for FieldVisitor {
             }
         }
     }
+}
+
+/// The span-scope routing keys an event was emitted under: the nearest
+/// `project_root`, `run_uid`, and `task_slug` stashed on any enclosing span.
+///
+/// Both layers need the same three keys — [`RunFileLayer`] to resolve a
+/// destination file, [`TuiLogLayer`] to attribute the record so the TUI's Logs
+/// tab can filter on it — so the stash and the walk are shared rather than
+/// duplicated and left to drift.
+#[derive(Default)]
+struct SpanScope {
+    project_root: Option<PathBuf>,
+    run_uid: Option<String>,
+    task_slug: Option<String>,
+}
+
+/// Stash a new span's `run_uid` / `task_slug` / `project_root` fields (if any)
+/// into its [extensions] so child events can find them by walking the scope.
+///
+/// Both layers call this, and span extensions are **shared** across the layers
+/// of one registry — so the second call finds the first's values already there.
+/// That is why this uses `replace` rather than `insert`: `insert` asserts the
+/// type is absent and would panic on the second layer, and both layers have to
+/// stash independently so the keys are present when only ONE of them is
+/// installed (as in the unit tests, and in `--headless`).
+///
+/// [extensions]: tracing_subscriber::registry::SpanRef::extensions
+fn stash_span_scope<S>(
+    attrs: &tracing::span::Attributes<'_>,
+    id: &tracing::span::Id,
+    ctx: &Context<'_, S>,
+) where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let mut visitor = FieldVisitor::default();
+    attrs.record(&mut visitor);
+    let Some(span) = ctx.span(id) else { return };
+    if let Some(run_uid) = visitor.run_uid {
+        span.extensions_mut().replace(RunUid(run_uid));
+    }
+    if let Some(task_slug) = visitor.task_slug {
+        span.extensions_mut().replace(TaskSlug(task_slug));
+    }
+    if let Some(project_root) = visitor.project_root {
+        span.extensions_mut().replace(ProjectRoot(project_root));
+    }
+}
+
+/// Walk an event's span scope from the root inward and return the innermost
+/// stashed value for each routing key (a nested span's value shadows its
+/// parent's).
+fn resolve_span_scope<S>(event: &Event<'_>, ctx: &Context<'_, S>) -> SpanScope
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let Some(scope) = ctx.event_scope(event) else {
+        return SpanScope::default();
+    };
+    scope.from_root().fold(SpanScope::default(), |acc, span| {
+        let ext = span.extensions();
+        SpanScope {
+            project_root: ext
+                .get::<ProjectRoot>()
+                .map(|r| r.0.clone())
+                .or(acc.project_root),
+            run_uid: ext.get::<RunUid>().map(|r| r.0.clone()).or(acc.run_uid),
+            task_slug: ext.get::<TaskSlug>().map(|t| t.0.clone()).or(acc.task_slug),
+        }
+    })
 }
 
 /// A per-run / per-task file logging layer (see the module docs).
@@ -305,19 +378,7 @@ where
         id: &tracing::span::Id,
         ctx: Context<'_, S>,
     ) {
-        let mut visitor = FieldVisitor::default();
-        attrs.record(&mut visitor);
-        if let Some(span) = ctx.span(id) {
-            if let Some(run_uid) = visitor.run_uid {
-                span.extensions_mut().insert(RunUid(run_uid));
-            }
-            if let Some(task_slug) = visitor.task_slug {
-                span.extensions_mut().insert(TaskSlug(task_slug));
-            }
-            if let Some(project_root) = visitor.project_root {
-                span.extensions_mut().insert(ProjectRoot(project_root));
-            }
-        }
+        stash_span_scope(attrs, id, &ctx);
     }
 
     /// Route the event to its file: find the nearest `run_uid` (required) and
@@ -325,20 +386,11 @@ where
     /// event, and append it. When a `task_slug` is in scope the record fans out
     /// to that task's `{task_slug}.log`; otherwise it falls back to `run.log`.
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        // Walk from the innermost span outward; the first stashed key wins.
-        let (run_uid, task_slug, project_root) = match ctx.event_scope(event) {
-            Some(scope) => scope
-                .from_root()
-                .fold((None, None, None), |(run, task, root), span| {
-                    let ext = span.extensions();
-                    (
-                        ext.get::<RunUid>().map(|r| r.0.clone()).or(run),
-                        ext.get::<TaskSlug>().map(|t| t.0.clone()).or(task),
-                        ext.get::<ProjectRoot>().map(|r| r.0.clone()).or(root),
-                    )
-                }),
-            None => (None, None, None),
-        };
+        let SpanScope {
+            project_root,
+            run_uid,
+            task_slug,
+        } = resolve_span_scope(event, &ctx);
 
         let Some(run_uid) = run_uid else {
             // No run to attribute this event to — drop it from the file layer.
@@ -366,11 +418,25 @@ where
 ///
 /// # Why a channel layer
 ///
-/// The TUI's error/log pane needs to surface `warn!`/`error!` (and friends) as
-/// they happen. Rather than have the TUI poll the per-run log files, this layer
-/// converts each `tracing::Event` into a self-contained
+/// The TUI's Logs tab shows everything the process logs, as it happens. Rather
+/// than have the TUI poll the per-run log files, this layer converts each
+/// `tracing::Event` into a self-contained
 /// [`makina_core::log_record::LogRecord`] and `try_send`s it onto a channel the
 /// TUI drains in its `tokio::select!` loop.
+///
+/// # Every level, attributed
+///
+/// The layer forwards **every** event that clears the subscriber's `EnvFilter`,
+/// at every level — the Logs tab is the process-wide log viewer, and filtering
+/// by level happens there, at render time, where the operator can change their
+/// mind without losing the records they already filtered out. The narrower
+/// WARN/ERROR-only "Problems" view is derived downstream by the TUI, not by
+/// dropping records here.
+///
+/// Each record also carries the `project_root` / `run_uid` / `task_slug` of the
+/// span scope it was emitted inside (see [`resolve_span_scope`]), which is what
+/// lets the Logs tab filter by project and task. The scope is resolved *here*
+/// because it is gone by the time the TUI drains the channel.
 ///
 /// # Bounded, non-blocking, re-entrancy-safe
 ///
@@ -402,17 +468,25 @@ impl<S> Layer<S> for TuiLogLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+    /// Stash the span's routing keys so [`TuiLogLayer::on_event`] can attribute
+    /// records even when this is the only layer installed.
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        stash_span_scope(attrs, id, &ctx);
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let meta = event.metadata();
 
-        // The TUI "Errors" pane is for actionable problems, not a firehose. Only
-        // WARN and ERROR are surfaced; INFO/DEBUG/TRACE (e.g. mio poll internals,
-        // routine interpreter notices) are dropped here so they neither inflate
-        // the `[e] errors(N)` badge nor bury real failures. (In `tracing`'s
-        // ordering a more-verbose level is *greater*, so `> WARN` is INFO+.)
-        if *meta.level() > tracing::Level::WARN {
-            return;
-        }
+        let SpanScope {
+            project_root,
+            run_uid,
+            task_slug,
+        } = resolve_span_scope(event, &ctx);
 
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
@@ -420,7 +494,8 @@ where
             *meta.level(),
             visitor.message.trim_end().to_owned(),
             meta.target().to_owned(),
-        );
+        )
+        .with_scope(project_root, run_uid, task_slug);
 
         // Non-blocking: on a full channel, DROP the record. Do NOT emit a
         // tracing event here (it would re-enter this layer and could recurse).
@@ -662,19 +737,20 @@ mod tests {
         );
     }
 
-    /// The TUI log channel surfaces only WARN/ERROR — INFO/DEBUG/TRACE (mio poll
-    /// noise, routine notices) must be dropped so the "Errors" pane and its
-    /// `[e] errors(N)` badge stay meaningful.
+    /// The TUI log channel is the process-wide firehose behind the Logs tab:
+    /// **every** level reaches it, in emission order. Narrowing to WARN/ERROR is
+    /// the TUI's job (the Problems view and the tab's level filter), done where
+    /// the operator can widen it again without having lost the records.
     #[test]
-    fn tui_layer_forwards_only_warn_and_error() {
+    fn tui_layer_forwards_every_level() {
         let (layer, mut rx) = tui_log_channel();
         let subscriber = registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
-            tracing::trace!("noise-trace");
-            tracing::debug!("noise-debug");
-            tracing::info!("noise-info");
-            tracing::warn!("real-warn");
-            tracing::error!("real-error");
+            tracing::trace!("a-trace");
+            tracing::debug!("a-debug");
+            tracing::info!("an-info");
+            tracing::warn!("a-warn");
+            tracing::error!("an-error");
         });
 
         let mut got = Vec::new();
@@ -685,10 +761,76 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (tracing::Level::WARN, "real-warn".to_string()),
-                (tracing::Level::ERROR, "real-error".to_string()),
+                (tracing::Level::TRACE, "a-trace".to_string()),
+                (tracing::Level::DEBUG, "a-debug".to_string()),
+                (tracing::Level::INFO, "an-info".to_string()),
+                (tracing::Level::WARN, "a-warn".to_string()),
+                (tracing::Level::ERROR, "an-error".to_string()),
             ],
-            "only WARN/ERROR may reach the TUI channel; got {got:?}"
+            "every level must reach the TUI channel; got {got:?}"
         );
+    }
+
+    /// A record forwarded to the TUI carries the project/run/task of the span
+    /// scope it was emitted inside — that attribution is what the Logs tab's
+    /// project and task filters run on, and it cannot be recovered later.
+    #[test]
+    fn tui_layer_attributes_records_to_their_span_scope() {
+        let (layer, mut rx) = tui_log_channel();
+        let subscriber = registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let run = tracing::info_span!(
+                "run_graph",
+                run_uid = %"01HXSCOPED0000000000000001",
+                project_root = %"/repo/alpha",
+            );
+            let _run_guard = run.enter();
+            {
+                let task = tracing::info_span!("task", task_slug = %"task-a");
+                let _task_guard = task.enter();
+                tracing::info!("inside");
+            }
+            tracing::info!("run-level");
+        });
+
+        let scoped = rx.try_recv().expect("the in-task event must be forwarded");
+        assert_eq!(
+            scoped.run_uid.as_deref(),
+            Some("01HXSCOPED0000000000000001")
+        );
+        assert_eq!(
+            scoped.project_root.as_deref(),
+            Some(std::path::Path::new("/repo/alpha"))
+        );
+        assert_eq!(scoped.task_slug.as_deref(), Some("task-a"));
+
+        let run_level = rx
+            .try_recv()
+            .expect("the run-level event must be forwarded");
+        assert_eq!(
+            run_level.run_uid.as_deref(),
+            Some("01HXSCOPED0000000000000001")
+        );
+        assert_eq!(
+            run_level.task_slug, None,
+            "an event outside any task span carries no task slug"
+        );
+    }
+
+    /// An event emitted outside every span still reaches the TUI (process-level
+    /// diagnostics belong in the Logs tab too) — just with no attribution.
+    #[test]
+    fn tui_layer_forwards_unscoped_events() {
+        let (layer, mut rx) = tui_log_channel();
+        let subscriber = registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("no-span");
+        });
+
+        let rec = rx.try_recv().expect("an unscoped event must be forwarded");
+        assert_eq!(rec.message, "no-span");
+        assert_eq!(rec.run_uid, None);
+        assert_eq!(rec.project_root, None);
+        assert_eq!(rec.task_slug, None);
     }
 }

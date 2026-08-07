@@ -6,12 +6,13 @@
 //! Keeping `update` a synchronous, pure function means every state transition
 //! is unit-testable without a real terminal or async runtime.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use makina_core::api::{AgentRole, Api, Event, RunId, RunView, TaskId};
 use makina_core::config::{FinalMerge, ProviderConfig, RolesConfig};
+use makina_core::log_record::LogRecord;
 use ratatui::layout::Rect;
 
 use crate::browser::{DirEntry, FileBrowser};
@@ -29,6 +30,13 @@ pub const EXCHANGE_LOG_CAP: usize = 100;
 /// When more messages arrive the oldest are evicted so the buffer stays
 /// bounded and cannot cause unbounded memory growth.
 pub const ERROR_MESSAGES_CAP: usize = 50;
+
+/// Maximum number of [`LogRecord`]s retained for the Logs tab.
+///
+/// The tab shows everything the process logs at every level, so its buffer sees
+/// far more traffic than the Problems list and needs a correspondingly deeper —
+/// but still bounded — history. Oldest records are evicted first.
+pub const LOG_ENTRIES_CAP: usize = 2000;
 
 /// Severity of an error-pane message.
 ///
@@ -679,6 +687,10 @@ impl CommandPalette {
                 event: Box::new(AppEvent::PurgeWorktrees),
             },
             PaletteAction::Regular {
+                label: "Logs",
+                event: Box::new(AppEvent::OpenLogsTab),
+            },
+            PaletteAction::Regular {
                 label: "Settings",
                 event: Box::new(AppEvent::OpenSettings),
             },
@@ -1204,6 +1216,20 @@ pub enum AppEvent {
     /// task's agent log at the bottom, like the `v` dependency view.
     ToggleLogPane,
 
+    // ── Logs tab ──────────────────────────────────────────────────────────────
+    /// Open (or switch to) the process-wide log viewer tab. Raised by the
+    /// command palette's "Logs" action.
+    OpenLogsTab,
+    /// Advance one Logs filter control to its next value (`1`/`2`/`3`, or a
+    /// click on the chip).
+    CycleLogFilter(LogFilterControl),
+    /// Clear every Logs filter (`0`).
+    ResetLogFilters,
+    /// Scroll the Logs tab one line up.
+    LogsScrollUp,
+    /// Scroll the Logs tab one line down.
+    LogsScrollDown,
+
     // ── Task-status view (task 29) ────────────────────────────────────────────
     /// A full [`RunView`] (with its authored tasks) was fetched from the API and
     /// should be merged into [`App::runs`], replacing any placeholder entry.
@@ -1392,6 +1418,17 @@ pub enum AppEvent {
     /// [`ERROR_MESSAGES_CAP`]).
     ErrorMessageArrived {
         msg: ErrorMessage,
+    },
+
+    /// A [`LogRecord`] arrived on the tracing→TUI channel.
+    ///
+    /// Emitted by the event loop's `log_rx` drain arm for **every** record, at
+    /// every level. `update` retains it for the Logs tab and, when it is a
+    /// WARN/ERROR, additionally pushes it to the Problems list — so the two
+    /// views stay in one pipeline instead of two subscriptions that could
+    /// disagree about what happened.
+    LogRecordArrived {
+        record: Box<LogRecord>,
     },
 
     /// Dismiss the provider-missing warning banner.
@@ -1641,6 +1678,14 @@ pub enum TabContent {
     /// the same shape as every other tab, and unlike a modal it can be left
     /// open while looking at a plan or a task and returned to afterwards.
     PlanAuthoring { project_root: PathBuf },
+    /// The process-wide log viewer: every retained [`LogRecord`], from every
+    /// project, run, and task, narrowed by the tab's own filter toolbar.
+    ///
+    /// A tab rather than a pane because reading logs is an activity you stay
+    /// in — scrolling back, widening a filter, comparing two runs — not a glance
+    /// at the bottom of whatever else you were doing. Only one is ever open:
+    /// [`TabState::open_tab`] matches on content, and this variant carries none.
+    Logs,
 }
 
 /// State for the tabbed content pane.
@@ -1700,6 +1745,148 @@ impl Default for TabState {
     }
 }
 
+// ── Logs tab ──────────────────────────────────────────────────────────────────
+
+/// One control in the Logs tab's filter toolbar.
+///
+/// Each is cycled by its own key (and by clicking its chip); the set is what
+/// the toolbar renders, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogFilterControl {
+    /// Verbosity threshold.
+    Level,
+    /// Originating project (repository root).
+    Project,
+    /// Originating task slug.
+    Task,
+}
+
+impl LogFilterControl {
+    /// Every control, in toolbar order.
+    pub const ALL: [LogFilterControl; 3] = [
+        LogFilterControl::Level,
+        LogFilterControl::Project,
+        LogFilterControl::Task,
+    ];
+
+    /// The control's toolbar caption.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogFilterControl::Level => "Level",
+            LogFilterControl::Project => "Project",
+            LogFilterControl::Task => "Task",
+        }
+    }
+
+    /// The key that cycles this control while the Logs tab is focused.
+    pub fn key(self) -> char {
+        match self {
+            LogFilterControl::Level => '1',
+            LogFilterControl::Project => '2',
+            LogFilterControl::Task => '3',
+        }
+    }
+}
+
+/// The verbosity thresholds the Logs tab cycles through, widest first.
+///
+/// A record is shown when its level is at least as severe as the threshold. In
+/// `tracing`'s ordering a *more verbose* level compares **greater**, so `TRACE`
+/// as the threshold admits everything — which is the default, because the tab
+/// exists to show all of it.
+pub const LOG_LEVEL_CYCLE: [tracing::Level; 5] = [
+    tracing::Level::TRACE,
+    tracing::Level::DEBUG,
+    tracing::Level::INFO,
+    tracing::Level::WARN,
+    tracing::Level::ERROR,
+];
+
+/// The Logs tab's active filter set.
+///
+/// Filtering happens at render time over the full retained buffer, never by
+/// discarding records on the way in: widening a filter has to bring the older
+/// records back, so nothing may be dropped on the strength of a filter that the
+/// operator can change a keystroke later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFilter {
+    /// The most verbose level shown; records more verbose than this are hidden.
+    pub level: tracing::Level,
+    /// When set, show only records attributed to this project root.
+    pub project: Option<PathBuf>,
+    /// When set, show only records attributed to this task slug.
+    pub task: Option<String>,
+}
+
+impl Default for LogFilter {
+    fn default() -> Self {
+        Self {
+            // Everything, by default: the tab's whole point is the full picture.
+            level: tracing::Level::TRACE,
+            project: None,
+            task: None,
+        }
+    }
+}
+
+impl LogFilter {
+    /// Whether `record` passes every active filter.
+    pub fn matches(&self, record: &LogRecord) -> bool {
+        if record.level > self.level {
+            return false;
+        }
+        if let Some(project) = &self.project
+            && record.project_root.as_deref() != Some(project.as_path())
+        {
+            return false;
+        }
+        if let Some(task) = &self.task
+            && record.task_slug.as_deref() != Some(task.as_str())
+        {
+            return false;
+        }
+        true
+    }
+
+    /// The current value of `control`, as shown on its toolbar chip.
+    pub fn value_label(&self, control: LogFilterControl) -> String {
+        match control {
+            LogFilterControl::Level => format!("{}+", self.level),
+            LogFilterControl::Project => match &self.project {
+                None => "all".to_owned(),
+                Some(root) => project_display_name(root),
+            },
+            LogFilterControl::Task => match &self.task {
+                None => "all".to_owned(),
+                Some(task) => task.clone(),
+            },
+        }
+    }
+}
+
+/// The short, human-facing name of a project root: its final path component,
+/// falling back to the full path for a root with none (`/`).
+pub fn project_display_name(root: &Path) -> String {
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// Advance an optional selection through `options`, wrapping via `None` ("all").
+///
+/// A selection that is no longer among the options (its records were evicted)
+/// restarts the cycle at the first option rather than sticking.
+fn cycle_option<T: Clone + PartialEq>(current: &Option<T>, options: &[T]) -> Option<T> {
+    let Some(current) = current else {
+        return options.first().cloned();
+    };
+    match options.iter().position(|candidate| candidate == current) {
+        // Past the last option, wrap back to "all".
+        Some(idx) => options.get(idx + 1).cloned(),
+        None => options.first().cloned(),
+    }
+}
+
 /// Accordion section identifier for plan tabs and task detail tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccordionSection {
@@ -1742,6 +1929,8 @@ pub enum ScrollablePanel {
     TaskEntry,
     /// The bottom Output pane overlay (Problems / Logs tabs).
     ErrorPane,
+    /// The record list in the full-tab log viewer ([`TabContent::Logs`]).
+    LogsTab,
 }
 
 /// Which tab the bottom Output pane is showing.
@@ -2015,6 +2204,28 @@ pub struct App {
     /// Bounded ring of error-pane messages.  Capped at [`ERROR_MESSAGES_CAP`]
     /// by evicting the oldest; see [`App::push_error`].
     pub error_messages: Vec<ErrorMessage>,
+
+    /// Bounded ring of every [`LogRecord`] the tracing layer has forwarded, in
+    /// arrival order and at every level. Capped at [`LOG_ENTRIES_CAP`] by
+    /// evicting the oldest; see [`App::push_log_record`].
+    ///
+    /// This is the Logs tab's backing store, and it is deliberately unfiltered:
+    /// the tab's filters narrow the *view*, so the records behind a filter have
+    /// to still be here when it widens again.
+    pub log_entries: VecDeque<LogRecord>,
+
+    /// The Logs tab's active filter set.
+    pub log_filter: LogFilter,
+
+    /// Whether the Logs tab is pinned to its newest record. Cleared when the
+    /// operator scrolls up (they are reading history, so a new record must not
+    /// yank the view away) and re-engaged when they scroll back to the bottom.
+    pub logs_auto_follow: bool,
+
+    /// Per-frame click bounds of the Logs toolbar chips, recorded by the render
+    /// pass so a click can cycle the control under the cursor. Same
+    /// interior-mutability pattern as [`App::tab_bounds`].
+    pub logs_toolbar_bounds: std::cell::RefCell<Vec<(LogFilterControl, Rect)>>,
 
     /// Whether there are unseen error messages since the error pane was last opened.
     /// Cleared when the error pane opens; set when a new error message arrives.
@@ -2482,8 +2693,11 @@ impl App {
             let plan = match tab {
                 TabContent::Plan { plan } | TabContent::PlanTask { plan, .. } => Some(plan),
                 // Authoring is keyed by project root, not by a plan that must
-                // already exist — it is where a plan comes from.
-                TabContent::Task { .. } | TabContent::PlanAuthoring { .. } => None,
+                // already exist — it is where a plan comes from. Logs is keyed
+                // by nothing at all: it outlives every plan it reports on.
+                TabContent::Task { .. } | TabContent::PlanAuthoring { .. } | TabContent::Logs => {
+                    None
+                }
             };
             if let Some(plan) = plan
                 && !valid_plans.contains(plan)
@@ -2876,6 +3090,10 @@ impl App {
             output_tab: OutputTab::Problems,
             help_mode_active: false,
             error_messages: Vec::new(),
+            log_entries: VecDeque::new(),
+            log_filter: LogFilter::default(),
+            logs_auto_follow: true,
+            logs_toolbar_bounds: std::cell::RefCell::new(Vec::new()),
             unseen_errors: false,
             repo_root,
             tick: 0,
@@ -3060,6 +3278,116 @@ impl App {
         }
     }
 
+    /// Record a forwarded [`LogRecord`] for the Logs tab, evicting the oldest
+    /// when over [`LOG_ENTRIES_CAP`].
+    ///
+    /// Every record is retained regardless of the active filter — see
+    /// [`App::log_entries`]. When the tab is auto-following, a new record snaps
+    /// the view to the tail; when the operator has scrolled up, their position
+    /// is left alone.
+    pub fn push_log_record(&mut self, record: LogRecord) {
+        self.log_entries.push_back(record);
+        while self.log_entries.len() > LOG_ENTRIES_CAP {
+            self.log_entries.pop_front();
+        }
+        if self.logs_auto_follow {
+            self.scroll_offsets.remove(&ScrollablePanel::LogsTab);
+        }
+    }
+
+    /// The retained records that pass the active filter, oldest first.
+    pub fn filtered_log_entries(&self) -> Vec<&LogRecord> {
+        self.log_entries
+            .iter()
+            .filter(|record| self.log_filter.matches(record))
+            .collect()
+    }
+
+    /// Every project root that appears in the retained records, sorted, for the
+    /// Project control to cycle through.
+    pub fn log_projects(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = self
+            .log_entries
+            .iter()
+            .filter_map(|record| record.project_root.clone())
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Every task slug that appears in the retained records, sorted, for the
+    /// Task control to cycle through.
+    ///
+    /// Scoped by the selected project when one is set, so cycling tasks after
+    /// picking a project offers only that project's tasks.
+    pub fn log_tasks(&self) -> Vec<String> {
+        let mut tasks: Vec<String> = self
+            .log_entries
+            .iter()
+            .filter(|record| match &self.log_filter.project {
+                None => true,
+                Some(project) => record.project_root.as_deref() == Some(project.as_path()),
+            })
+            .filter_map(|record| record.task_slug.clone())
+            .collect();
+        tasks.sort();
+        tasks.dedup();
+        tasks
+    }
+
+    /// Advance one filter control to its next value, wrapping through "all".
+    ///
+    /// Narrowing the project also drops a task selection that project has no
+    /// records for, so the two controls can never combine into a view that is
+    /// empty by construction.
+    pub fn cycle_log_filter(&mut self, control: LogFilterControl) {
+        match control {
+            LogFilterControl::Level => {
+                let idx = LOG_LEVEL_CYCLE
+                    .iter()
+                    .position(|level| *level == self.log_filter.level)
+                    .unwrap_or(0);
+                self.log_filter.level = LOG_LEVEL_CYCLE[(idx + 1) % LOG_LEVEL_CYCLE.len()];
+            }
+            LogFilterControl::Project => {
+                self.log_filter.project =
+                    cycle_option(&self.log_filter.project, &self.log_projects());
+                if let Some(selected) = self.log_filter.task.clone()
+                    && !self.log_tasks().contains(&selected)
+                {
+                    self.log_filter.task = None;
+                }
+            }
+            LogFilterControl::Task => {
+                self.log_filter.task = cycle_option(&self.log_filter.task, &self.log_tasks());
+            }
+        }
+        // A filter change re-frames the list; start at its tail like a fresh open.
+        self.logs_auto_follow = true;
+        self.scroll_offsets.remove(&ScrollablePanel::LogsTab);
+    }
+
+    /// Clear every Logs filter, returning the tab to the full picture.
+    pub fn reset_log_filters(&mut self) {
+        self.log_filter = LogFilter::default();
+        self.logs_auto_follow = true;
+        self.scroll_offsets.remove(&ScrollablePanel::LogsTab);
+    }
+
+    /// Whether the Logs tab is the active tab.
+    pub fn is_logs_tab_active(&self) -> bool {
+        self.tabs
+            .active_tab
+            .and_then(|idx| self.tabs.open_tabs.get(idx))
+            .is_some_and(|tab| matches!(tab, TabContent::Logs))
+    }
+
+    /// Record the Logs toolbar chip bounds for the current frame.
+    pub fn set_logs_toolbar_bounds(&self, bounds: Vec<(LogFilterControl, Rect)>) {
+        *self.logs_toolbar_bounds.borrow_mut() = bounds;
+    }
+
     /// Open the bottom Output pane on `tab`. Re-invoking with the tab that is
     /// already showing closes the pane (toggle); invoking with the other tab
     /// switches to it while keeping the pane open. Opening/switching resets the
@@ -3148,6 +3476,9 @@ impl App {
                     | TabContent::PlanTask { plan, .. }
                     | TabContent::Task { plan, .. } => &plan.project_root,
                     TabContent::PlanAuthoring { project_root } => project_root,
+                    // The log viewer spans every project, so closing one leaves
+                    // it open — its records just stop being about that project.
+                    TabContent::Logs => return None,
                 };
                 (*root == removed_root).then_some(idx)
             })
@@ -3295,6 +3626,14 @@ impl App {
                 | TabContent::PlanTask { plan, .. }
                 | TabContent::Task { plan, .. } => plan,
                 TabContent::PlanAuthoring { .. } => unreachable!("handled above"),
+                // The log viewer names no project, so it supplies no context:
+                // fall through to the selected run / repo root below.
+                TabContent::Logs => {
+                    return self
+                        .selected_run()
+                        .map(|run| self.plan_identity_for_run(run).project_root)
+                        .unwrap_or_else(|| self.canonical_repo_root());
+                }
             };
             if target.project_root.as_os_str().is_empty() {
                 if let Some(entry) = self.plan_entry(target) {
@@ -3534,8 +3873,9 @@ impl App {
             && let Some(content) = self.tabs.open_tabs.get(active)
         {
             match content {
-                // No plan exists yet while it is still being authored.
-                TabContent::PlanAuthoring { .. } => return None,
+                // No plan exists yet while it is still being authored, and the
+                // log viewer is not about any one plan.
+                TabContent::PlanAuthoring { .. } | TabContent::Logs => return None,
                 TabContent::Plan { plan }
                 | TabContent::PlanTask { plan, .. }
                 | TabContent::Task { plan, .. } => {
@@ -3730,6 +4070,7 @@ impl App {
                 ScrollablePanel::TaskEntry
             }
             Some(TabContent::Plan { .. }) => ScrollablePanel::PlanAccordion,
+            Some(TabContent::Logs) => ScrollablePanel::LogsTab,
             // The authoring transcript is an exchange stream like any other, and
             // auto-follows its tail. Arrow keys never reach here — the composer
             // owns them — so only PageUp/PageDown and the wheel drive it.
@@ -3938,6 +4279,15 @@ impl App {
                 .unwrap_or(0);
             self.scroll_offsets
                 .insert(ScrollablePanel::ErrorPane, bottom);
+        } else if panel == ScrollablePanel::LogsTab && self.logs_auto_follow {
+            self.logs_auto_follow = false;
+            let bottom = self
+                .last_scroll_maxes
+                .borrow()
+                .get(&ScrollablePanel::LogsTab)
+                .copied()
+                .unwrap_or(0);
+            self.scroll_offsets.insert(ScrollablePanel::LogsTab, bottom);
         }
         let current = self.scroll_offsets.entry(panel).or_insert(0);
         *current = current.saturating_sub(1);
@@ -3951,6 +4301,8 @@ impl App {
             self.exchange_auto_follow = true;
         } else if panel == ScrollablePanel::ErrorPane && *current == scroll_max {
             self.error_pane_auto_follow = true;
+        } else if panel == ScrollablePanel::LogsTab && *current == scroll_max {
+            self.logs_auto_follow = true;
         }
     }
 
@@ -3982,6 +4334,16 @@ impl App {
             } else {
                 self.scroll_offsets
                     .get(&ScrollablePanel::ErrorPane)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(scroll_max)
+            }
+        } else if panel == ScrollablePanel::LogsTab {
+            if self.logs_auto_follow {
+                scroll_max
+            } else {
+                self.scroll_offsets
+                    .get(&ScrollablePanel::LogsTab)
                     .copied()
                     .unwrap_or(0)
                     .min(scroll_max)
@@ -4098,6 +4460,41 @@ impl App {
                 // `[L]`: open the Output pane on Logs; if already open on Logs,
                 // close it; if open on Problems, switch to Logs.
                 self.open_output_tab(OutputTab::Logs);
+                true
+            }
+            AppEvent::OpenLogsTab => {
+                self.tabs.open_tab(TabContent::Logs);
+                self.focused_panel = Panel::Main;
+                self.logs_auto_follow = true;
+                self.scroll_offsets.remove(&ScrollablePanel::LogsTab);
+                true
+            }
+            AppEvent::CycleLogFilter(control) => {
+                self.cycle_log_filter(control);
+                self.status_message = Some(format!(
+                    "Logs {}: {}",
+                    control.label().to_lowercase(),
+                    self.log_filter.value_label(control)
+                ));
+                true
+            }
+            AppEvent::ResetLogFilters => {
+                self.reset_log_filters();
+                self.status_message = Some("Logs filters cleared".to_string());
+                true
+            }
+            AppEvent::LogsScrollUp => {
+                self.scroll_up(ScrollablePanel::LogsTab);
+                true
+            }
+            AppEvent::LogsScrollDown => {
+                let max = self
+                    .last_scroll_maxes
+                    .borrow()
+                    .get(&ScrollablePanel::LogsTab)
+                    .copied()
+                    .unwrap_or(0);
+                self.scroll_down(ScrollablePanel::LogsTab, max);
                 true
             }
             AppEvent::SelectUp => {
@@ -4756,6 +5153,25 @@ impl App {
 
             AppEvent::ErrorMessageArrived { msg } => {
                 self.push_error(msg);
+                true
+            }
+
+            AppEvent::LogRecordArrived { record } => {
+                // Problems stays what it always was — actionable failures only —
+                // while the Logs tab keeps the whole record. One arrival, two
+                // views, so they can never disagree about what was logged.
+                if record.level <= tracing::Level::WARN {
+                    self.push_error(ErrorMessage {
+                        timestamp: record.timestamp.into(),
+                        level: match record.level {
+                            tracing::Level::ERROR => ErrorLevel::Error,
+                            tracing::Level::WARN => ErrorLevel::Warn,
+                            _ => ErrorLevel::Info,
+                        },
+                        text: record.message.clone(),
+                    });
+                }
+                self.push_log_record(*record);
                 true
             }
 
@@ -5880,7 +6296,9 @@ impl App {
                     let task_id = match content {
                         TabContent::Task { task_id, .. } => task_id.clone(),
                         TabContent::PlanTask { task_id, .. } => TaskId::new(task_id.clone()),
-                        TabContent::Plan { .. } | TabContent::PlanAuthoring { .. } => {
+                        TabContent::Plan { .. }
+                        | TabContent::PlanAuthoring { .. }
+                        | TabContent::Logs => {
                             return true;
                         }
                     };
@@ -6575,6 +6993,256 @@ mod tests {
             app.error_messages.last().unwrap().text,
             format!("msg {}", total - 1),
             "most recent message must be retained"
+        );
+    }
+
+    // ── Logs tab ──────────────────────────────────────────────────────────────
+
+    /// Build a [`LogRecord`] with the given level and attribution.
+    fn log_record(
+        level: tracing::Level,
+        message: &str,
+        project: Option<&str>,
+        task: Option<&str>,
+    ) -> LogRecord {
+        LogRecord::now(level, message.to_owned(), "makina::test".to_owned()).with_scope(
+            project.map(PathBuf::from),
+            project.map(|_| "01HXRUN".to_owned()),
+            task.map(str::to_owned),
+        )
+    }
+
+    /// A record arriving on the channel is retained for the Logs tab **whatever
+    /// its level**, while only WARN/ERROR additionally reach Problems. This is
+    /// the split the whole feature rests on: one arrival, two views.
+    #[test]
+    fn arriving_records_populate_logs_but_only_warn_and_error_reach_problems() {
+        let mut app = make_app();
+        for (level, text) in [
+            (tracing::Level::TRACE, "t"),
+            (tracing::Level::DEBUG, "d"),
+            (tracing::Level::INFO, "i"),
+            (tracing::Level::WARN, "w"),
+            (tracing::Level::ERROR, "e"),
+        ] {
+            app.update(AppEvent::LogRecordArrived {
+                record: Box::new(log_record(level, text, None, None)),
+            });
+        }
+
+        assert_eq!(
+            app.log_entries.len(),
+            5,
+            "every level must be retained for the Logs tab"
+        );
+        assert_eq!(
+            app.error_messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["w", "e"],
+            "Problems must stay WARN/ERROR-only"
+        );
+    }
+
+    /// The Logs buffer evicts oldest-first at [`LOG_ENTRIES_CAP`].
+    #[test]
+    fn log_entries_bounded_at_cap() {
+        let mut app = make_app();
+        let total = LOG_ENTRIES_CAP + 5;
+        for i in 0..total {
+            app.push_log_record(log_record(
+                tracing::Level::INFO,
+                &format!("msg {i}"),
+                None,
+                None,
+            ));
+        }
+
+        assert_eq!(app.log_entries.len(), LOG_ENTRIES_CAP);
+        assert_eq!(
+            app.log_entries.front().unwrap().message,
+            "msg 5",
+            "oldest records must be evicted, not the newest"
+        );
+        assert_eq!(
+            app.log_entries.back().unwrap().message,
+            format!("msg {}", total - 1)
+        );
+    }
+
+    /// The default view is unfiltered — the tab exists to show everything —
+    /// and narrowing the level hides the more verbose records without
+    /// discarding them, so widening it again brings them back.
+    #[test]
+    fn level_filter_narrows_the_view_without_losing_records() {
+        let mut app = make_app();
+        for (level, text) in [
+            (tracing::Level::DEBUG, "d"),
+            (tracing::Level::INFO, "i"),
+            (tracing::Level::ERROR, "e"),
+        ] {
+            app.push_log_record(log_record(level, text, None, None));
+        }
+
+        assert_eq!(
+            app.filtered_log_entries().len(),
+            3,
+            "the default filter must show everything"
+        );
+
+        // TRACE → DEBUG → INFO: hides the DEBUG record only.
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Level));
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Level));
+        assert_eq!(app.log_filter.level, tracing::Level::INFO);
+        assert_eq!(
+            app.filtered_log_entries()
+                .iter()
+                .map(|r| r.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["i", "e"]
+        );
+
+        // Everything is still retained, so clearing restores the full view.
+        assert_eq!(app.log_entries.len(), 3);
+        app.update(AppEvent::ResetLogFilters);
+        assert_eq!(app.filtered_log_entries().len(), 3);
+    }
+
+    /// Cycling Project walks the distinct roots present in the buffer and wraps
+    /// back through "all"; the Task control is scoped to the chosen project.
+    #[test]
+    fn project_and_task_filters_cycle_over_what_was_logged() {
+        let mut app = make_app();
+        app.push_log_record(log_record(
+            tracing::Level::INFO,
+            "alpha-one",
+            Some("/repo/alpha"),
+            Some("task-a"),
+        ));
+        app.push_log_record(log_record(
+            tracing::Level::INFO,
+            "beta-one",
+            Some("/repo/beta"),
+            Some("task-b"),
+        ));
+        app.push_log_record(log_record(tracing::Level::INFO, "loose", None, None));
+
+        assert_eq!(
+            app.log_projects(),
+            vec![PathBuf::from("/repo/alpha"), PathBuf::from("/repo/beta")],
+            "only roots that actually appear are offered"
+        );
+
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Project));
+        assert_eq!(app.log_filter.project, Some(PathBuf::from("/repo/alpha")));
+        assert_eq!(
+            app.filtered_log_entries()
+                .iter()
+                .map(|r| r.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-one"],
+            "a project filter hides other projects and unattributed records"
+        );
+        assert_eq!(
+            app.log_tasks(),
+            vec!["task-a".to_string()],
+            "task options are scoped to the selected project"
+        );
+
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Project));
+        assert_eq!(app.log_filter.project, Some(PathBuf::from("/repo/beta")));
+
+        // Past the last project the cycle wraps back to "all".
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Project));
+        assert_eq!(app.log_filter.project, None);
+        assert_eq!(app.filtered_log_entries().len(), 3);
+    }
+
+    /// Selecting a project must drop a task selection it has no records for —
+    /// otherwise the two controls combine into a view that is empty by
+    /// construction and reads as "nothing was logged".
+    #[test]
+    fn narrowing_the_project_drops_an_incompatible_task() {
+        let mut app = make_app();
+        app.push_log_record(log_record(
+            tracing::Level::INFO,
+            "alpha-one",
+            Some("/repo/alpha"),
+            Some("task-a"),
+        ));
+        app.push_log_record(log_record(
+            tracing::Level::INFO,
+            "beta-one",
+            Some("/repo/beta"),
+            Some("task-b"),
+        ));
+
+        // Pick task-b while unfiltered by project…
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Task));
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Task));
+        assert_eq!(app.log_filter.task, Some("task-b".to_string()));
+
+        // …then narrow to alpha, which has no task-b.
+        app.update(AppEvent::CycleLogFilter(LogFilterControl::Project));
+        assert_eq!(app.log_filter.project, Some(PathBuf::from("/repo/alpha")));
+        assert_eq!(
+            app.log_filter.task, None,
+            "an unreachable task selection must be dropped, not left to empty the view"
+        );
+        assert_eq!(app.filtered_log_entries().len(), 1);
+    }
+
+    /// Opening Logs from the palette adds one tab, focuses the main pane, and
+    /// re-opening switches to the tab already there rather than stacking a
+    /// second copy.
+    #[test]
+    fn open_logs_tab_is_idempotent() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenLogsTab);
+
+        assert_eq!(app.tabs.open_tabs, vec![TabContent::Logs]);
+        assert_eq!(app.tabs.active_tab, Some(0));
+        assert_eq!(app.focused_panel, Panel::Main);
+        assert!(app.is_logs_tab_active());
+        assert_eq!(
+            app.main_scroll_target(),
+            ScrollablePanel::LogsTab,
+            "keyboard scrolling must target the record list"
+        );
+
+        app.update(AppEvent::OpenLogsTab);
+        assert_eq!(
+            app.tabs.open_tabs.len(),
+            1,
+            "re-opening must switch to the existing tab, not stack another"
+        );
+    }
+
+    /// Scrolling up off the tail disengages auto-follow so an arriving record
+    /// cannot yank the view away from what is being read; scrolling back to the
+    /// bottom re-engages it.
+    #[test]
+    fn logs_auto_follow_disengages_on_scroll_up_and_re_engages_at_the_bottom() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenLogsTab);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::LogsTab, 10);
+
+        assert!(app.logs_auto_follow, "a fresh tab follows the tail");
+        app.update(AppEvent::LogsScrollUp);
+        assert!(!app.logs_auto_follow, "scrolling up pins the view");
+        assert_eq!(
+            app.panel_offset(ScrollablePanel::LogsTab, 10),
+            9,
+            "the view anchors one line above the last rendered bottom"
+        );
+
+        app.update(AppEvent::LogsScrollDown);
+        assert!(
+            app.logs_auto_follow,
+            "scrolling back to the bottom resumes following"
         );
     }
 
@@ -10266,8 +10934,8 @@ mod tests {
         let palette = app.command_palette.as_ref().unwrap();
         assert_eq!(
             palette.filtered().len(),
-            16,
-            "full list must include all 16 actions"
+            17,
+            "full list must include all 17 actions"
         );
         for label in [
             "Start run",
@@ -10276,6 +10944,7 @@ mod tests {
             "Reset/retry focused task",
             "Reset selected plan/run",
             "Purge Makina worktrees",
+            "Logs",
         ] {
             assert!(
                 palette.actions.iter().any(|action| action.label() == label),
@@ -10318,7 +10987,7 @@ mod tests {
         // Full list restored.
         assert_eq!(
             palette.filtered().len(),
-            16,
+            17,
             "full list restored after filter cleared"
         );
     }

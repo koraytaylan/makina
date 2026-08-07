@@ -46,25 +46,6 @@ use crate::app::{App, AppEvent, ErrorLevel, ErrorMessage, PlanIdentity, ResetCon
 use crate::tui::Tui;
 use crate::ui;
 
-/// Convert a tracing→TUI [`LogRecord`] into the TUI's [`ErrorMessage`] shape.
-///
-/// Maps the verbosity level (`ERROR`→[`ErrorLevel::Error`], `WARN`→
-/// [`ErrorLevel::Warn`], anything quieter→[`ErrorLevel::Info`]), carries the
-/// flattened message text across, and converts the wall-clock `DateTime<Utc>`
-/// into a [`std::time::SystemTime`] for the error pane.
-fn error_message_from_log_record(rec: LogRecord) -> ErrorMessage {
-    let level = match rec.level {
-        tracing::Level::ERROR => ErrorLevel::Error,
-        tracing::Level::WARN => ErrorLevel::Warn,
-        _ => ErrorLevel::Info,
-    };
-    ErrorMessage {
-        timestamp: rec.timestamp.into(),
-        level,
-        text: rec.message,
-    }
-}
-
 // ── Tick interval ─────────────────────────────────────────────────────────────
 
 /// How often a tick is sent to drive periodic redraws (250 ms → 4 fps minimum,
@@ -82,10 +63,10 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// `log_rx` is the receiving half of the bounded tracing→TUI channel
 /// (task `log-subscriber-tui-channel`): the `TuiLogLayer` `try_send`s a
-/// [`LogRecord`] per event onto it. A dedicated `tokio::select!` arm below
-/// drains it, converts each record into an [`ErrorMessage`] via
-/// [`error_message_from_log_record`], and feeds it to `update` as
-/// [`AppEvent::ErrorMessageArrived`] so it lands in the error pane.
+/// [`LogRecord`] per event onto it, at every level. A dedicated `tokio::select!`
+/// arm below drains it and feeds each record to `update` as
+/// [`AppEvent::LogRecordArrived`], which retains it for the Logs tab and derives
+/// the narrower Problems entry from the WARN/ERROR ones.
 ///
 /// # Errors
 ///
@@ -170,9 +151,7 @@ pub async fn run(
             }
 
             maybe_log = log_rx.recv() => {
-                maybe_log.map(|rec| AppEvent::ErrorMessageArrived {
-                    msg: error_message_from_log_record(rec),
-                })
+                maybe_log.map(|rec| AppEvent::LogRecordArrived { record: Box::new(rec) })
             }
 
             _ = ticker.tick() => {
@@ -2585,6 +2564,13 @@ fn translate_terminal_event(
                     .find(|(_, r)| in_bounds(r))
                 {
                     AppEvent::CloseTabAt(*idx)
+                } else if let Some((control, _)) = app
+                    .logs_toolbar_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(_, r)| in_bounds(r))
+                {
+                    AppEvent::CycleLogFilter(*control)
                 } else if let Some((idx, _)) =
                     app.tab_bounds.borrow().iter().find(|(_, r)| in_bounds(r))
                 {
@@ -2883,6 +2869,19 @@ fn translate_key(
             KeyCode::Char('e') | KeyCode::Char('E') => AppEvent::ToggleErrorPane,
             // Toggle the in-TUI log panel (the context task's agent log).
             KeyCode::Char('l') | KeyCode::Char('L') => AppEvent::ToggleLogPane,
+            // ── Logs tab filter toolbar ───────────────────────────────────
+            // Gated on the log viewer being the active tab so the digits stay
+            // unbound — and available — everywhere else.
+            KeyCode::Char('1') if app.is_logs_tab_active() => {
+                AppEvent::CycleLogFilter(crate::app::LogFilterControl::Level)
+            }
+            KeyCode::Char('2') if app.is_logs_tab_active() => {
+                AppEvent::CycleLogFilter(crate::app::LogFilterControl::Project)
+            }
+            KeyCode::Char('3') if app.is_logs_tab_active() => {
+                AppEvent::CycleLogFilter(crate::app::LogFilterControl::Task)
+            }
+            KeyCode::Char('0') if app.is_logs_tab_active() => AppEvent::ResetLogFilters,
             // Toggle verbose mode on/off (Ctrl+O — checked BEFORE the plain
             // `o`/`O` → OpenBrowser arm so the modifier guard wins).
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3010,10 +3009,14 @@ fn translate_key(
                 Panel::Sidebar => AppEvent::OpenFocusedNode,
                 Panel::Main => AppEvent::ToggleTreeNode,
             },
-            // PgUp/PgDn: scroll the error pane when it's open.
+            // PgUp/PgDn: scroll the open Output pane, or the log viewer when it
+            // is the active tab. The Output pane wins when both are up — it is
+            // the overlay, and the one the operator just opened.
             KeyCode::PageUp => {
                 if app.error_pane_open {
                     AppEvent::ErrorPaneScrollUp
+                } else if app.is_logs_tab_active() {
+                    AppEvent::LogsScrollUp
                 } else {
                     AppEvent::Tick
                 }
@@ -3021,6 +3024,8 @@ fn translate_key(
             KeyCode::PageDown => {
                 if app.error_pane_open {
                     AppEvent::ErrorPaneScrollDown
+                } else if app.is_logs_tab_active() {
+                    AppEvent::LogsScrollDown
                 } else {
                     AppEvent::Tick
                 }
@@ -8642,5 +8647,120 @@ wall_clock_secs = 600
             matches!(ev_a_sidebar, AppEvent::Tick),
             "pressing 'a' with an active plan tab in Sidebar should be a Tick"
         );
+    }
+
+    // ── Logs tab input ────────────────────────────────────────────────────────
+
+    /// The Logs filter keys bind ONLY while the log viewer is the active tab,
+    /// so the digits stay free (and inert) everywhere else in the app.
+    #[test]
+    fn digit_keys_drive_the_logs_toolbar_only_on_the_logs_tab() {
+        let mut app = test_app();
+
+        for digit in ['0', '1', '2', '3'] {
+            assert!(
+                matches!(
+                    translate_terminal_event(
+                        key_press(KeyCode::Char(digit), KeyModifiers::NONE),
+                        ModalState::default(),
+                        crate::app::Panel::Main,
+                        false,
+                        &app,
+                    ),
+                    AppEvent::Tick
+                ),
+                "{digit:?} must be inert without the Logs tab open"
+            );
+        }
+
+        app.update(AppEvent::OpenLogsTab);
+        let translate = |app: &App, c: char| {
+            translate_terminal_event(
+                key_press(KeyCode::Char(c), KeyModifiers::NONE),
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                app,
+            )
+        };
+        assert!(matches!(
+            translate(&app, '1'),
+            AppEvent::CycleLogFilter(crate::app::LogFilterControl::Level)
+        ));
+        assert!(matches!(
+            translate(&app, '2'),
+            AppEvent::CycleLogFilter(crate::app::LogFilterControl::Project)
+        ));
+        assert!(matches!(
+            translate(&app, '3'),
+            AppEvent::CycleLogFilter(crate::app::LogFilterControl::Task)
+        ));
+        assert!(matches!(translate(&app, '0'), AppEvent::ResetLogFilters));
+    }
+
+    /// PgUp/PgDn scroll the log viewer when it is the active tab and the bottom
+    /// Output pane is not up (the overlay keeps priority when both are open).
+    #[test]
+    fn page_keys_scroll_the_logs_tab_when_the_output_pane_is_closed() {
+        let mut app = test_app();
+        app.update(AppEvent::OpenLogsTab);
+
+        let page = |app: &App, code: KeyCode| {
+            translate_terminal_event(
+                key_press(code, KeyModifiers::NONE),
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                app,
+            )
+        };
+        assert!(matches!(
+            page(&app, KeyCode::PageUp),
+            AppEvent::LogsScrollUp
+        ));
+        assert!(matches!(
+            page(&app, KeyCode::PageDown),
+            AppEvent::LogsScrollDown
+        ));
+
+        app.update(AppEvent::ToggleErrorPane);
+        assert!(
+            matches!(page(&app, KeyCode::PageUp), AppEvent::ErrorPaneScrollUp),
+            "the open Output pane keeps PgUp while it is showing"
+        );
+    }
+
+    /// Clicking a toolbar chip cycles that control — the same intent the number
+    /// key raises, so the mouse and keyboard paths cannot drift apart.
+    #[test]
+    fn clicking_a_toolbar_chip_cycles_its_control() {
+        let mut app = test_app();
+        app.update(AppEvent::OpenLogsTab);
+        app.set_logs_toolbar_bounds(vec![(
+            crate::app::LogFilterControl::Project,
+            ratatui::layout::Rect {
+                x: 10,
+                y: 4,
+                width: 14,
+                height: 1,
+            },
+        )]);
+
+        let click = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            translate_terminal_event(
+                click,
+                ModalState::default(),
+                crate::app::Panel::Main,
+                false,
+                &app,
+            ),
+            AppEvent::CycleLogFilter(crate::app::LogFilterControl::Project)
+        ));
     }
 }

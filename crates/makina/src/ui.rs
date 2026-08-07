@@ -590,6 +590,9 @@ pub fn render(app: &App, frame: &mut Frame) {
     app.sidebar_node_bounds.borrow_mut().clear();
     app.tab_bounds.borrow_mut().clear();
     app.tab_close_bounds.borrow_mut().clear();
+    // Same reason: a frame that draws no Logs toolbar must not leave the last
+    // one's chip bounds around to absorb a stray click.
+    app.logs_toolbar_bounds.borrow_mut().clear();
     if tree_nodes.is_empty() {
         // Empty state. While a background job is running (e.g. startup plan
         // discovery) show an animated spinner + label so the empty sidebar
@@ -1306,6 +1309,19 @@ pub fn render(app: &App, frame: &mut Frame) {
             .split(content_area);
         render_tab_bar(app, frame, split[0]);
         render_plan_authoring(app, authoring, frame, split[1], &mut panel_geoms);
+    } else if app.is_logs_tab_active() {
+        // The log viewer owns the whole content pane: it is about every project
+        // at once, so none of the run/plan-derived content applies to it.
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(3)])
+            .split(content_area);
+        render_tab_bar(app, frame, split[0]);
+        let list_area = render_logs_tab(app, frame, split[1]);
+        panel_geoms.push(PanelGeometry {
+            panel: ScrollablePanel::LogsTab,
+            rect: list_area,
+        });
     } else {
         match (
             active_plan_tab,
@@ -1710,6 +1726,7 @@ fn render_tab_bar(app: &App, frame: &mut Frame, area: Rect) {
             TabContent::PlanTask { task_id, .. } => ("task ", task_id.clone()),
             TabContent::Plan { plan } => ("plan ", plan.slug.clone()),
             TabContent::PlanAuthoring { .. } => ("", "create plan".to_owned()),
+            TabContent::Logs => ("", "logs".to_owned()),
         };
         let chip = format!(" {kind}{label} × ");
         let chip_w = chip.chars().count() as u16;
@@ -3718,6 +3735,223 @@ fn render_output_pane(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para, inner);
 }
 
+// ── Logs tab ──────────────────────────────────────────────────────────────────
+
+/// The theme colour a log level renders in.
+fn log_level_color(app: &App, level: tracing::Level) -> Color {
+    match level {
+        tracing::Level::ERROR => app.active_theme.get(crate::theme::ThemeRole::Error),
+        tracing::Level::WARN => app.active_theme.get(crate::theme::ThemeRole::Warning),
+        tracing::Level::INFO => app.active_theme.get(crate::theme::ThemeRole::Info),
+        // DEBUG and TRACE are the background hum: legible, but never competing
+        // with the levels an operator is scanning for.
+        _ => app.active_theme.get(crate::theme::ThemeRole::Dim),
+    }
+}
+
+/// Render the Logs tab's filter toolbar into `area` (one row).
+///
+/// Each control is drawn as a `Label: value [key]` chip and its click bound is
+/// recorded, so the toolbar can be driven either by the number keys or by the
+/// mouse. The right-hand side reports how much of the buffer survives the
+/// filter — without it a narrow filter and an empty buffer look identical.
+fn render_logs_toolbar(app: &App, frame: &mut Frame, area: Rect, shown: usize) {
+    let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
+    let fg = app.active_theme.get(crate::theme::ThemeRole::Foreground);
+    let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
+
+    let mut spans = vec![Span::raw(" ")];
+    let mut bounds: Vec<(crate::app::LogFilterControl, Rect)> = Vec::new();
+    let mut x = area.x.saturating_add(1);
+    let area_end = area.x.saturating_add(area.width);
+
+    for control in crate::app::LogFilterControl::ALL {
+        let value = app.log_filter.value_label(control);
+        // An engaged control is highlighted so a filtered view can never be
+        // mistaken for a quiet one.
+        let engaged = match control {
+            crate::app::LogFilterControl::Level => {
+                app.log_filter.level != crate::app::LogFilter::default().level
+            }
+            crate::app::LogFilterControl::Project => app.log_filter.project.is_some(),
+            crate::app::LogFilterControl::Task => app.log_filter.task.is_some(),
+        };
+        let chip = format!(" {}: {value} [{}] ", control.label(), control.key());
+        let chip_w = chip.chars().count() as u16;
+        if x < area_end {
+            bounds.push((
+                control,
+                Rect {
+                    x,
+                    y: area.y,
+                    width: chip_w.min(area_end - x),
+                    height: 1,
+                },
+            ));
+        }
+        let style = if engaged {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(fg)
+        };
+        spans.push(Span::styled(chip, style));
+        spans.push(Span::styled("│", Style::default().fg(dim)));
+        x = x.saturating_add(chip_w).saturating_add(1);
+    }
+
+    spans.push(Span::styled(
+        format!(
+            " Reset [0]   {shown}/{} record{}",
+            app.log_entries.len(),
+            if app.log_entries.len() == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(dim),
+    ));
+
+    app.set_logs_toolbar_bounds(bounds);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Build one display [`Line`] per retained record that passes the filter.
+///
+/// The line leads with the wall-clock time and level so a scan down the left
+/// edge reads chronologically and by severity, then the emitting target, then
+/// the project/task the record was attributed to (omitted when it has none, so
+/// process-level records don't carry empty columns), then the message.
+fn logs_tab_lines(app: &App) -> Vec<Line<'static>> {
+    let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
+    let fg = app.active_theme.get(crate::theme::ThemeRole::Foreground);
+    let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
+
+    app.filtered_log_entries()
+        .into_iter()
+        .map(|record| {
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {} ", record.timestamp.format("%H:%M:%S%.3f")),
+                    Style::default().fg(dim),
+                ),
+                Span::styled(
+                    // Padded to the widest level name so the target column
+                    // stays aligned down the page and stays scannable.
+                    format!("{:<5} ", record.level.as_str()),
+                    Style::default()
+                        .fg(log_level_color(app, record.level))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{} ", record.target), Style::default().fg(dim)),
+            ];
+
+            let mut scope = Vec::new();
+            if let Some(root) = &record.project_root {
+                scope.push(crate::app::project_display_name(root));
+            }
+            if let Some(task) = &record.task_slug {
+                scope.push(task.clone());
+            }
+            if !scope.is_empty() {
+                spans.push(Span::styled(
+                    format!("[{}] ", scope.join(" · ")),
+                    Style::default().fg(accent),
+                ));
+            }
+
+            spans.push(Span::styled(
+                record.message.clone(),
+                Style::default().fg(fg),
+            ));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Render the full-tab log viewer: filter toolbar, then the record list.
+///
+/// `area` is the region below the tab bar. The list scrolls independently of
+/// the toolbar, which stays pinned so the active filters are readable no matter
+/// how far back the operator has scrolled.
+fn render_logs_tab(app: &App, frame: &mut Frame, area: Rect) -> Rect {
+    let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
+    if area.height == 0 || area.width == 0 {
+        app.set_logs_toolbar_bounds(Vec::new());
+        return area;
+    }
+
+    let lines = logs_tab_lines(app);
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // filter toolbar
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // records
+        ])
+        .split(area);
+    render_logs_toolbar(app, frame, split[0], lines.len());
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(split[1].width)),
+            Style::default().fg(dim),
+        ))),
+        split[1],
+    );
+    let list_area = split[2];
+
+    if lines.is_empty() {
+        let hint = if app.log_entries.is_empty() {
+            "  No log records yet."
+        } else {
+            "  No records match the current filters — press [0] to clear them."
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(hint, Style::default().fg(dim))),
+            ]),
+            list_area,
+        );
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::LogsTab, 0);
+        return list_area;
+    }
+
+    // Wrapped rows, not record count: a long message occupies several rows and
+    // the scroll bound has to agree with what is actually laid out.
+    let total_rows = paragraph_line_count(&lines, list_area.width);
+    let scroll_max = total_rows.saturating_sub(list_area.height);
+    app.last_scroll_maxes
+        .borrow_mut()
+        .insert(ScrollablePanel::LogsTab, scroll_max);
+    let offset = app.panel_offset(ScrollablePanel::LogsTab, scroll_max);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((offset, 0)),
+        list_area,
+    );
+
+    if scroll_max > 0 {
+        let mut scrollbar_state = ScrollbarState::new(usize::from(total_rows))
+            .position(usize::from(offset))
+            .viewport_content_length(usize::from(list_area.height));
+        let scrollbar_style = Style::default().fg(dim);
+        frame.render_stateful_widget(
+            Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(scrollbar_style)
+                .thumb_style(scrollbar_style),
+            list_area,
+            &mut scrollbar_state,
+        );
+    }
+
+    list_area
+}
+
 /// Render a warning banner when provider binaries are missing.
 ///
 /// Shows a single-line warning for each missing provider in a yellow/amber style,
@@ -5444,6 +5678,30 @@ fn render_help_overlay(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(" open log  ", binding_style),
         Span::styled("[Ctrl+O]", key_style),
         Span::styled(" toggle verbose", binding_style),
+    ]));
+    lines.push(Line::from(""));
+
+    // Logs tab: the filter toolbar's keys only bind while it is the active tab,
+    // so they are worth spelling out here rather than leaving to discovery.
+    lines.push(Line::from(Span::styled(
+        "Logs (Logs Tab Active — Ctrl+P → Logs)",
+        section_style,
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("[1]", key_style),
+        Span::styled(" cycle level  ", binding_style),
+        Span::styled("[2]", key_style),
+        Span::styled(" cycle project  ", binding_style),
+        Span::styled("[3]", key_style),
+        Span::styled(" cycle task  ", binding_style),
+        Span::styled("[0]", key_style),
+        Span::styled(" clear filters", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[PgUp/PgDn]", key_style),
+        Span::styled(" scroll records  ", binding_style),
+        Span::styled("[click]", key_style),
+        Span::styled(" a toolbar chip cycles it", binding_style),
     ]));
     lines.push(Line::from(""));
 
@@ -14177,6 +14435,135 @@ mod tests {
             !screen.contains("Makina"),
             "title bar 'Makina' must NOT appear in small-terminal fallback; got: {:?}",
             screen,
+        );
+    }
+
+    // ── Render: the Logs tab ──────────────────────────────────────────────────
+
+    /// An app with the Logs tab open and a few attributed records in the buffer.
+    fn logs_app() -> App {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        app.update(crate::app::AppEvent::OpenLogsTab);
+        for (level, message, project, task) in [
+            (tracing::Level::TRACE, "tracing-deep", None, None),
+            (
+                tracing::Level::INFO,
+                "opening plan",
+                Some("/repo/alpha"),
+                None,
+            ),
+            (
+                tracing::Level::ERROR,
+                "gate failed",
+                Some("/repo/alpha"),
+                Some("task-a"),
+            ),
+        ] {
+            app.push_log_record(
+                makina_core::log_record::LogRecord::now(
+                    level,
+                    message.to_owned(),
+                    "makina::test".to_owned(),
+                )
+                .with_scope(
+                    project.map(PathBuf::from),
+                    project.map(|_| "01HXRUN".to_owned()),
+                    task.map(str::to_owned),
+                ),
+            );
+        }
+        app
+    }
+
+    /// The Logs tab renders as tab content — a chip in the tab bar, its filter
+    /// toolbar, and every retained record regardless of level — rather than as
+    /// the bottom Output pane.
+    #[test]
+    fn logs_tab_renders_every_level_with_its_toolbar() {
+        let app = logs_app();
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("logs"),
+            "the tab chip must appear: {screen:?}"
+        );
+        assert!(
+            screen.contains("Level: TRACE+"),
+            "the default level chip must read as the widest threshold: {screen:?}"
+        );
+        assert!(
+            screen.contains("ERROR"),
+            "each record must be labelled with its level: {screen:?}"
+        );
+        for chip in ["Level:", "Project:", "Task:", "Reset [0]"] {
+            assert!(
+                screen.contains(chip),
+                "the filter toolbar must show {chip:?}: {screen:?}"
+            );
+        }
+        for message in ["tracing-deep", "opening plan", "gate failed"] {
+            assert!(
+                screen.contains(message),
+                "every retained record must render, including sub-WARN ones; missing {message:?}"
+            );
+        }
+        assert!(
+            screen.contains("alpha"),
+            "records must show the project they came from: {screen:?}"
+        );
+        assert!(
+            screen.contains("task-a"),
+            "records must show the task they came from: {screen:?}"
+        );
+    }
+
+    /// The toolbar records a click bound per control, so the chips are usable
+    /// with the mouse and not only through the number keys.
+    #[test]
+    fn logs_toolbar_records_click_bounds_for_every_control() {
+        let app = logs_app();
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let bounds = app.logs_toolbar_bounds.borrow();
+        assert_eq!(
+            bounds.len(),
+            crate::app::LogFilterControl::ALL.len(),
+            "every toolbar control needs a click bound: {bounds:?}"
+        );
+        for (control, rect) in bounds.iter() {
+            assert!(rect.width > 0, "{control:?} chip must be clickable");
+        }
+    }
+
+    /// A filter that matches nothing says so — and says how to undo it — rather
+    /// than rendering the same blank pane as an empty buffer.
+    #[test]
+    fn logs_tab_distinguishes_a_narrow_filter_from_an_empty_buffer() {
+        let mut app = logs_app();
+        app.log_filter.task = Some("no-such-task".to_owned());
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("No records match"),
+            "a filtered-to-empty view must explain itself: {screen:?}"
+        );
+
+        let empty = {
+            let api = Arc::new(PlaceholderApi::new());
+            let mut app = App::new(api, vec![], PathBuf::from("."));
+            app.update(crate::app::AppEvent::OpenLogsTab);
+            app
+        };
+        terminal.draw(|frame| render(&empty, frame)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("No log records yet"),
+            "an empty buffer must read as empty, not as filtered: {screen:?}"
         );
     }
 }
