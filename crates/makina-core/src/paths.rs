@@ -206,6 +206,17 @@ pub fn worktrees_dir(repo_root: &Path) -> std::io::Result<PathBuf> {
     Ok(state_root(repo_root)?.join("worktrees"))
 }
 
+/// Returns the directory that holds per-run state, including each run's
+/// integration workspace: `{repo_root}/.makina/runs/`.
+///
+/// This is the parent of every [`run_dir`]. It exists as its own helper so
+/// callers can ask "is this path Makina's own run state?" — which is what makes
+/// it safe to reclaim a worktree found there, and unsafe to touch one anywhere
+/// else.
+pub fn runs_dir(repo_root: &Path) -> std::io::Result<PathBuf> {
+    Ok(state_root(repo_root)?.join("runs"))
+}
+
 /// Creates (if needed) and returns the per-run log directory:
 /// `{repo_root}/.makina/runs/{run_id}/logs`.
 ///

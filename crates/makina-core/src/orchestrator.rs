@@ -4085,6 +4085,17 @@ impl AuthoringCoordinator {
             .publish_registration(&workspace, &candidate, &expected_base_oid)
             .await
             .map_err(|e| invalid(e.to_string()))?;
+        // Registration is published: `refs/heads/plan/{identity}` now holds
+        // everything this scratch workspace does. Release it so the plan branch
+        // is free — a branch can be checked out in only one worktree, and
+        // keeping this one attached made the plan it had just registered
+        // impossible to start ("fatal: 'plan/…' is already used by worktree").
+        //
+        // Only on success: every failure path above returns early and keeps the
+        // workspace, which is then the sole copy of its unpublished evidence.
+        self.worktree_manager
+            .release_integration_workspace(&workspace)
+            .await;
         Ok(CommandOutcome::PlanRegistered {
             registration_oid: candidate,
         })

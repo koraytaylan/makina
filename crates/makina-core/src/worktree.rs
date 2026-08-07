@@ -558,6 +558,12 @@ impl WorktreeManager {
         )
         .await?;
         if self.branch_exists(&branch).await? {
+            // A branch can be checked out in only one worktree. A previous
+            // generation or an interrupted run can leave one still holding this
+            // plan ref, which would make the plan permanently unstartable — so
+            // reclaim that holder when it is safe to (see
+            // [`Self::reclaim_branch_holder`]) before attaching.
+            self.reclaim_branch_holder(&branch, &path).await?;
             let attached = self
                 .git_command(&path)
                 .args(["checkout", &branch])
@@ -584,6 +590,135 @@ impl WorktreeManager {
     /// Response-loss retries are idempotent when the ref already equals the
     /// exact candidate. No branch is exposed before both the candidate parent
     /// and current base match `expected_base`.
+    /// Release a workspace whose purpose is complete, freeing the plan branch.
+    ///
+    /// A git branch can be checked out in **one** worktree at a time, so a
+    /// workspace left attached to `plan/{slug}` blocks every later attempt to
+    /// attach it — which is what made a generated plan impossible to start:
+    /// registration published the ref and then kept its scratch worktree
+    /// checked out on it forever.
+    ///
+    /// Call this only once the work the workspace existed for is durably
+    /// recorded elsewhere (for registration, that is the published plan ref —
+    /// the worktree holds nothing the ref does not). Failure paths must NOT
+    /// call it: an unpublished workspace is the only copy of its evidence.
+    ///
+    /// Best-effort, and never fails the caller: the caller's work already
+    /// succeeded, and failing it because a scratch directory resisted cleanup
+    /// would turn a tidiness problem into a lost result. Removal is attempted
+    /// first; if the workspace holds anything git will not discard, it is
+    /// detached instead — which frees the branch without touching a single
+    /// file.
+    pub async fn release_integration_workspace(&self, workspace: &IntegrationWorkspace) {
+        let _op_guard = self.op_lock.lock().await;
+        if self.remove_worktree_path(&workspace.path).await.is_ok() {
+            let _ = self.git_worktree_prune().await;
+            return;
+        }
+        // Removal refuses on a workspace carrying modified or untracked files.
+        // Freeing the branch is the part that matters; the directory can stay.
+        match self.detach_worktree(&workspace.path).await {
+            Ok(()) => tracing::info!(
+                path = %workspace.path.display(),
+                branch = %workspace.plan_branch,
+                "integration workspace retained its files; detached to free the plan branch"
+            ),
+            Err(error) => tracing::warn!(
+                path = %workspace.path.display(),
+                branch = %workspace.plan_branch,
+                %error,
+                "could not release integration workspace; it will be reclaimed on next use"
+            ),
+        }
+        let _ = self.git_worktree_prune().await;
+    }
+
+    /// Free `branch` from any other worktree currently holding it.
+    ///
+    /// Git refuses to check a branch out twice, so a holder left behind by a
+    /// finished generation or an interrupted run is fatal to the run that needs
+    /// it next — the plan becomes permanently unstartable.
+    ///
+    /// Reclaiming **detaches** the holder rather than removing it: `git checkout
+    /// --detach` moves its HEAD from `plan/{slug}` to the very commit that ref
+    /// already names, so the working tree, the index, and every untracked file
+    /// are left exactly as they were. Nothing has to be judged disposable, and
+    /// nothing is lost — which matters, because these workspaces routinely
+    /// carry untracked leftovers from abandoned authoring attempts.
+    ///
+    /// The one thing that is refused is a holder **outside** this repository's
+    /// `.makina/runs/`. A plan branch the operator checked out in their own
+    /// worktree is theirs; silently detaching their HEAD would be a surprising
+    /// thing to do to someone else's checkout, so that is reported instead.
+    async fn reclaim_branch_holder(
+        &self,
+        branch: &str,
+        requesting_path: &Path,
+    ) -> Result<(), WorktreeError> {
+        // A holder whose directory is already gone only lingers in git's
+        // registry; pruning is enough to free the branch.
+        let _ = self.git_worktree_prune().await;
+
+        let runs_root = paths::runs_dir(&self.repo_root).map_err(WorktreeError::Io)?;
+        let requesting = requesting_path.canonicalize();
+        let holders: Vec<RegisteredWorktree> = self
+            .registered_worktrees()
+            .await?
+            .into_iter()
+            .filter(|registered| registered.branch.as_deref() == Some(branch))
+            .filter(
+                |registered| match (&requesting, registered.path.canonicalize()) {
+                    // The workspace we are about to attach is not its own blocker.
+                    (Ok(requesting), Ok(holder)) => *requesting != holder,
+                    _ => true,
+                },
+            )
+            .collect();
+
+        for holder in holders {
+            let owned = holder
+                .path
+                .canonicalize()
+                .ok()
+                .zip(runs_root.canonicalize().ok())
+                .is_some_and(|(holder, runs)| holder.starts_with(runs));
+            if !owned {
+                return Err(WorktreeError::RecoveryEvidence {
+                    path: holder.path.clone(),
+                    reason: format!(
+                        "{branch} is checked out in a worktree outside this project's Makina run \
+                         state; detach or remove it before starting this plan"
+                    ),
+                });
+            }
+
+            tracing::info!(
+                path = %holder.path.display(),
+                %branch,
+                "detaching a Makina workspace still holding the plan branch"
+            );
+            self.detach_worktree(&holder.path).await?;
+        }
+
+        let _ = self.git_worktree_prune().await;
+        Ok(())
+    }
+
+    /// Point a worktree's HEAD at its current commit instead of a branch.
+    ///
+    /// Content-preserving by construction: the commit is the one the branch
+    /// already names, so the checkout does not change a single tracked file, and
+    /// untracked files are never touched by it.
+    async fn detach_worktree(&self, path: &Path) -> Result<(), WorktreeError> {
+        self.run_git_at_checked(
+            path,
+            &["checkout", "--detach"],
+            "detach worktree from its branch",
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn publish_registration(
         &self,
         workspace: &IntegrationWorkspace,
