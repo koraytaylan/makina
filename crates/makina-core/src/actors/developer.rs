@@ -310,9 +310,15 @@ fn build_develop_prompt(task: &Task, feedback: Option<&str>) -> String {
     );
 
     if let Some(feedback) = feedback {
+        // Deliberately not "a reviewer rejected this": work is also returned
+        // after the reviewer *approved* it, when the branch touched paths the
+        // task does not own. Naming the reviewer there sent the agent looking
+        // for quality problems in work that had just been approved, and it
+        // spent every remaining round defending it. The feedback says who is
+        // asking and what for; the preamble only has to be true.
         prompt.push_str(&format!(
-            "\nThis is a revision. A reviewer rejected the previous attempt with \
-             the following feedback — address it specifically:\n{feedback}\n"
+            "\nThis is a revision. The previous attempt was returned with the \
+             following feedback — address it specifically:\n{feedback}\n"
         ));
     }
 

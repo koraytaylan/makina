@@ -367,8 +367,60 @@ async fn a_rejection_bounds_the_paths_it_names_and_explains_a_flood_of_them() {
         "and what a whole directory of them usually means: {error}"
     );
     assert!(
-        error.len() < 2_000,
+        error.len() < 3_000,
         "a correction must be readable, not a wall: {} bytes",
         error.len()
+    );
+}
+
+/// The correction says where the violation lives and how to undo it.
+///
+/// A returned task keeps committing on the same branch, so a path it touched
+/// on its first attempt stays in the branch diff however clean the working
+/// tree looks afterwards. A developer told only "this path is outside your
+/// footprint" checks its tree, finds nothing, and says so — five times, until
+/// the reviewer cap fails a task whose work had been approved on every round.
+#[tokio::test]
+async fn a_correction_says_the_footprint_spans_the_branch_and_how_to_undo_it() {
+    let repo = repo();
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["switch", "-c", "task"]);
+
+    // First attempt strays outside the footprint...
+    std::fs::write(repo.path().join("src/lib.rs"), "strayed\n").unwrap();
+    commit_all(repo.path(), "attempt 1");
+    // ...and the next attempt leaves the tree clean without putting it back.
+    std::fs::create_dir_all(repo.path().join("declared")).unwrap();
+    std::fs::write(repo.path().join("declared/work.rs"), "declared\n").unwrap();
+    commit_all(repo.path(), "attempt 2");
+
+    let touches = [makina_core::task::AuthoredRepoPattern::Glob(
+        "declared/**".into(),
+    )];
+    let error = enforce_task_branch_footprint(
+        repo.path(),
+        &makina_core::task::TaskId::new("task"),
+        "task",
+        &touches,
+        &base,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.contains("src/lib.rs"),
+        "the stray path must be named: {error}"
+    );
+    assert!(
+        error.contains("every commit this branch has made since"),
+        "the correction must say the check spans the branch, not the tree: {error}"
+    );
+    assert!(
+        error.contains(&base) && error.contains("git checkout"),
+        "and must give the exact way to put it back: {error}"
+    );
+    assert!(
+        error.starts_with("The work was approved"),
+        "a correction follows an approval, and must not read as a rejection: {error}"
     );
 }

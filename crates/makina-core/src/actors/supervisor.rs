@@ -321,7 +321,15 @@ pub async fn enforce_task_branch_footprint(
         .collect::<Vec<_>>();
     enforce_authored_footprint(&patterns, &changes).map_err(|violations| {
         format!(
-            "task {task_id} changed paths outside its authored footprint: {}",
+            "The work was approved, but this task branch changes paths that task {task_id} does \
+             not own: {}\n\n\
+             The footprint is measured across every commit this branch has made since {base}, not \
+             against the working tree — a path changed in an earlier attempt stays a violation \
+             until it is put back, however clean the tree looks now. Put each one back: \
+             `git checkout {base} -- <path>` for a file that existed at {base}, or delete a file \
+             this task created there. If the change is genuinely needed, it belongs to the task \
+             whose footprint owns that path, not to this one — say so plainly rather than \
+             reverting the work that depends on it.",
             render_footprint_violations(&violations)
         )
     })
