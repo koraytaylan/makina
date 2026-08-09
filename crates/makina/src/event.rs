@@ -1283,6 +1283,7 @@ const PLAN_AUTHOR_RULES: &str = r#"Rules — the blueprint is validated mechanic
 - `depends_on` names task `id`s from this same blueprint: unique, acyclic, never itself.
 - `kind` is `task`, `spike`, or `chore`.
 - `touches` are repository-relative paths owned by that task. Globbing is narrow: a whole path segment may be `*`, and a pattern may end in `/**`. So `src/**` and `src/*/mod.rs` are accepted, while `src/**/*.rs`, `*.rs`, and `**/tests` are rejected. No `..`, no absolute paths, nothing under `.git/`, and nothing under this plan's own `docs/plans/` directory — the host owns those.
+- `touches` must cover everything the task's steps *cause* to appear, not only what it edits by hand. A step that builds, resolves, or installs also writes the lockfile its tool keeps — `Cargo.lock`, `package-lock.json`, `go.sum`, `poetry.lock` — and a tracked path a task produces without declaring fails that task outright. The steps must also name the paths the footprint permits: a step that says only "create the crate" gets it created wherever the agent chooses, so a footprint of `crates/name/**` needs a step that says `crates/name`.
 
 Do not write files or run commands. The host validates, renders, commits, and registers the blueprint."#;
 
@@ -4899,6 +4900,16 @@ mod tests {
         assert!(
             prompt.contains("`src/**/*.rs`"),
             "the prompt must show a rejected glob: {prompt}"
+        );
+        // The grammar alone is not the whole contract. A footprint that is
+        // legal but incomplete fails its task just as hard, and it fails it
+        // where nothing downstream can fix it: the developer cannot edit the
+        // plan, so a build step whose lockfile was never declared loops until
+        // the reviewer cap and takes the run with it.
+        assert!(
+            prompt.contains("Cargo.lock") && prompt.contains("cause"),
+            "the prompt must say a footprint covers what the steps cause to \
+             appear, lockfiles included: {prompt}"
         );
     }
 
