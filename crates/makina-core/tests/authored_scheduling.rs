@@ -424,3 +424,76 @@ async fn a_correction_says_the_footprint_spans_the_branch_and_how_to_undo_it() {
         "a correction follows an approval, and must not read as a rejection: {error}"
     );
 }
+
+/// A violation on a path another task owns names that task.
+///
+/// A stray edit and a plan boundary look identical in a diff, and only one of
+/// them is the developer's to fix. When a later task has to extend a type an
+/// earlier task owns — the layered decomposition every generated plan so far
+/// has produced — the correction has to say whose path it is, or the agent
+/// spends the reviewer cap insisting, correctly, that its own work is fine.
+#[tokio::test]
+async fn a_violation_on_another_tasks_path_names_the_task_that_owns_it() {
+    use makina_core::actors::supervisor::enforce_task_branch_footprint_against;
+
+    let repo = repo();
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["switch", "-c", "task"]);
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "extended by a later layer\n",
+    )
+    .unwrap();
+    commit_all(repo.path(), "extend a type the core task owns");
+
+    let mine = [makina_core::task::AuthoredRepoPattern::Glob(
+        "yaml/**".into(),
+    )];
+    let owners = vec![(
+        makina_core::task::TaskId::new("core-domain-types"),
+        vec![makina_core::task::AuthoredRepoPattern::Glob(
+            "src/**".into(),
+        )],
+    )];
+
+    let error = enforce_task_branch_footprint_against(
+        repo.path(),
+        &makina_core::task::TaskId::new("yaml-schema"),
+        "task",
+        &mine,
+        &base,
+        &owners,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.contains("src/lib.rs belongs to task `core-domain-types`"),
+        "the correction must name the owning task: {error}"
+    );
+    assert!(
+        error.contains("boundary in the plan"),
+        "and must say this is not the developer's to fix: {error}"
+    );
+
+    // With no other task claiming it, the same stray path stays what it was:
+    // a wandering edit the developer can simply put back.
+    let stray = enforce_task_branch_footprint_against(
+        repo.path(),
+        &makina_core::task::TaskId::new("yaml-schema"),
+        "task",
+        &mine,
+        &base,
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !stray.contains("boundary in the plan"),
+        "an unowned stray path is not a plan boundary: {stray}"
+    );
+    assert!(
+        stray.contains("git checkout"),
+        "it is the developer's to put back: {stray}"
+    );
+}

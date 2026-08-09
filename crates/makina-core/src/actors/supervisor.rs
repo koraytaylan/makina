@@ -269,12 +269,37 @@ fn is_reserved_status_path(path: &str) -> bool {
         || (path.starts_with("docs/plans/") && path.contains("/tasks/") && path.ends_with(".md"))
 }
 
+/// One other task in this plan and the paths it owns.
+///
+/// Passed alongside the task under check so a violation can name the task the
+/// offending path belongs to. See [`enforce_task_branch_footprint_against`].
+pub type FootprintOwner = (TaskId, Vec<crate::task::AuthoredRepoPattern>);
+
 pub async fn enforce_task_branch_footprint(
     repo: &Path,
     task_id: &TaskId,
     branch: &str,
     touches: &[crate::task::AuthoredRepoPattern],
     recorded_base: &str,
+) -> Result<(), String> {
+    enforce_task_branch_footprint_against(repo, task_id, branch, touches, recorded_base, &[]).await
+}
+
+/// As [`enforce_task_branch_footprint`], but able to say which task owns a path.
+///
+/// A stray edit and a plan boundary look identical in a diff and are not the
+/// same problem. If the path belongs to no one, the developer wandered and can
+/// put it back. If it belongs to *another task in this plan*, the decomposition
+/// is what is wrong: this task cannot edit that path however many times it is
+/// asked, so the correction has to say whose it is instead of sending the agent
+/// back to look again.
+pub async fn enforce_task_branch_footprint_against(
+    repo: &Path,
+    task_id: &TaskId,
+    branch: &str,
+    touches: &[crate::task::AuthoredRepoPattern],
+    recorded_base: &str,
+    owners: &[FootprintOwner],
 ) -> Result<(), String> {
     let base = recorded_base;
     let raw = git_output(
@@ -320,18 +345,49 @@ pub async fn enforce_task_branch_footprint(
         .map(crate::task::AuthoredRepoPattern::to_repo_pattern)
         .collect::<Vec<_>>();
     enforce_authored_footprint(&patterns, &changes).map_err(|violations| {
+        let owned = violations
+            .iter()
+            .filter_map(|violation| {
+                owner_of(&violation.path, owners).map(|owner| (violation.path.clone(), owner))
+            })
+            .collect::<Vec<_>>();
+        let boundary = if owned.is_empty() {
+            String::new()
+        } else {
+            let named = owned
+                .iter()
+                .take(MAX_REPORTED_VIOLATIONS)
+                .map(|(path, owner)| format!("{path} belongs to task `{owner}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\n\n{named}. A path another task owns is a boundary in the plan, not a fault in \
+                 this work: this task may never edit it, so no revision here can resolve it. If \
+                 the change is genuinely needed, the task that owns the path has to provide it — \
+                 say that plainly and stop, rather than reverting work that depends on it."
+            )
+        };
         format!(
             "The work was approved, but this task branch changes paths that task {task_id} does \
-             not own: {}\n\n\
+             not own: {}{boundary}\n\n\
              The footprint is measured across every commit this branch has made since {base}, not \
              against the working tree — a path changed in an earlier attempt stays a violation \
              until it is put back, however clean the tree looks now. Put each one back: \
              `git checkout {base} -- <path>` for a file that existed at {base}, or delete a file \
-             this task created there. If the change is genuinely needed, it belongs to the task \
-             whose footprint owns that path, not to this one — say so plainly rather than \
-             reverting the work that depends on it.",
+             this task created there.",
             render_footprint_violations(&violations)
         )
+    })
+}
+
+/// The task whose footprint claims `path`, if any of `owners` does.
+fn owner_of(path: &str, owners: &[FootprintOwner]) -> Option<TaskId> {
+    owners.iter().find_map(|(task, patterns)| {
+        patterns
+            .iter()
+            .map(crate::task::AuthoredRepoPattern::to_repo_pattern)
+            .any(|pattern| crate::dependency::footprint_matches(pattern.as_str(), path))
+            .then(|| task.clone())
     })
 }
 
@@ -2407,6 +2463,18 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                         (metadata.touches.clone(), metadata.branch_base_oid.clone())
                     })
                 };
+                // Every *other* task's footprint, so a violation can name the
+                // task that owns the path instead of only saying it is not
+                // this one's.
+                let footprint_owners: Vec<FootprintOwner> = {
+                    let graph = ctx.graph.lock().await;
+                    graph
+                        .authored
+                        .iter()
+                        .filter(|(id, _)| *id != task_id)
+                        .map(|(id, metadata)| (id.clone(), metadata.touches.clone()))
+                        .collect()
+                };
 
                 // Review-acceptance checkpoint: undeclared work is returned to
                 // the task branch for correction, never silently landed.
@@ -2426,12 +2494,13 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     }
                 }
                 if let Some((touches, Some(recorded_base))) = &authored_footprint
-                    && let Err(reason) = enforce_task_branch_footprint(
+                    && let Err(reason) = enforce_task_branch_footprint_against(
                         &ctx.worktree_manager.repo_root,
                         task_id,
                         &branch,
                         touches,
                         recorded_base,
+                        &footprint_owners,
                     )
                     .await
                 {
@@ -2460,12 +2529,13 @@ async fn task_driver(ctx: &DriverContext, task_id: &TaskId) -> Result<TaskState,
                     // other integration mutations, closing the review→landing
                     // branch-change window.
                     match if let Some((touches, Some(recorded_base))) = &authored_footprint {
-                        enforce_task_branch_footprint(
+                        enforce_task_branch_footprint_against(
                             &ctx.worktree_manager.repo_root,
                             task_id,
                             &branch,
                             touches,
                             recorded_base,
+                            &footprint_owners,
                         )
                         .await
                     } else {

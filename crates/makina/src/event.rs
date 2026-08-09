@@ -1284,6 +1284,7 @@ const PLAN_AUTHOR_RULES: &str = r#"Rules — the blueprint is validated mechanic
 - `kind` is `task`, `spike`, or `chore`.
 - `touches` are repository-relative paths owned by that task. Globbing is narrow: a whole path segment may be `*`, and a pattern may end in `/**`. So `src/**` and `src/*/mod.rs` are accepted, while `src/**/*.rs`, `*.rs`, and `**/tests` are rejected. No `..`, no absolute paths, nothing under `.git/`, and nothing under this plan's own `docs/plans/` directory — the host owns those.
 - `touches` must cover everything the task's steps *cause* to appear, not only what it edits by hand. A step that builds, resolves, or installs also writes the lockfile its tool keeps — `Cargo.lock`, `package-lock.json`, `go.sum`, `poetry.lock` — and a tracked path a task produces without declaring fails that task outright. The steps must also name the paths the footprint permits: a step that says only "create the crate" gets it created wherever the agent chooses, so a footprint of `crates/name/**` needs a step that says `crates/name`.
+- Footprints partition the repository, so a task can only be finished if everything it needs to change is inside its own. That bites hardest in a layered plan: if task B deserializes into, implements, or extends a type that task A's file defines, B *cannot* add a field or a variant to it — it may not edit A's file, and no amount of revision changes that. Resolve it while authoring, one of two ways: give A a step that defines the type completely enough for every later task (and pin those fields in `architecture`, not only in the later task that first needs them), or put A's path in B's `touches` and accept that the two tasks then serialise. Never leave a task whose `body` requires a path only another task owns.
 
 Do not write files or run commands. The host validates, renders, commits, and registers the blueprint."#;
 
@@ -4933,6 +4934,15 @@ mod tests {
             prompt.contains("Cargo.lock") && prompt.contains("cause"),
             "the prompt must say a footprint covers what the steps cause to \
              appear, lockfiles included: {prompt}"
+        );
+        // The failure this one prevents: a layered plan where each task owns a
+        // crate, and a later task has to add a field to a type an earlier task
+        // owns. It cannot — the footprints forbid it — and the run dies in a
+        // correction loop no revision can satisfy.
+        assert!(
+            prompt.contains("Footprints partition the repository") && prompt.contains("serialise"),
+            "the prompt must say a task cannot extend what another task owns, and \
+             name both ways out: {prompt}"
         );
     }
 
