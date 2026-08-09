@@ -327,3 +327,120 @@ async fn dependency_chain_runs_a_then_b() {
     assert!(!common::scheduler_worktree_path(&repo_root, "task-a").exists());
     assert!(!common::scheduler_worktree_path(&repo_root, "task-b").exists());
 }
+
+/// A verdict the reviewer mangled is asked for again, not fatal.
+///
+/// A verdict is one small JSON object, and a model that has just written a
+/// paragraph of prose sometimes writes it in the dialect it was thinking in —
+/// `{'verdict': 'approve'}`. That ended the task as a hard error and took the
+/// whole run with it, on the third review of a task the same reviewer had
+/// already approved twice: the only thing it got wrong was the punctuation of
+/// its answer, and nothing asked it again.
+#[tokio::test]
+async fn an_unparseable_verdict_is_re_asked_and_the_task_still_finishes() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    // Response cycle:
+    //   1. developer → dev output
+    //   2. reviewer  → single-quoted keys: not JSON, unreadable as a verdict
+    //   3. reviewer  → the same judgement, correctly punctuated
+    let backend = NoopBackend::with_responses(vec![
+        "Implemented the feature.".into(),
+        "{'verdict': 'approve'}".into(),
+        r#"{"verdict":"approve"}"#.into(),
+    ]);
+    let backend_probe = backend.clone();
+
+    let graph = TaskGraph {
+        slug: "verdict-repair".into(),
+        tasks: vec![task("build-thing", "the thing builds", &[])],
+        authored: Default::default(),
+    };
+
+    let (report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+    )
+    .await;
+
+    assert_eq!(
+        report.outcomes,
+        vec![(TaskId::new("build-thing"), TaskState::Done)],
+        "a reply that only needed re-punctuating must not fail the task"
+    );
+
+    let snapshot = common::graph_snapshot(&graph_ref).await;
+    let t = snapshot
+        .get(&TaskId::new("build-thing"))
+        .expect("task must be present");
+    assert_eq!(t.state, TaskState::Done);
+    assert_eq!(
+        t.review_iterations, 0,
+        "re-asking for the verdict is not a rejection of the work"
+    );
+
+    // Three prompts: dev, review, and the re-ask — which restates the shape.
+    let prompts = backend_probe.recorded_prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "expected dev + review + one re-ask; got {prompts:?}"
+    );
+    assert!(
+        prompts[2].contains(r#"{"verdict":"approve"}"#),
+        "the re-ask must restate the verdict shape; got: {:?}",
+        prompts[2]
+    );
+}
+
+/// A reviewer that cannot produce a verdict at all still fails the task — and
+/// the failure says what it actually replied.
+#[tokio::test]
+async fn a_reviewer_that_never_parses_fails_with_its_own_words() {
+    let repo_dir = setup_temp_repo();
+    let repo_root = repo_dir.path().to_path_buf();
+
+    let backend = NoopBackend::with_responses(vec![
+        "Implemented the feature.".into(),
+        "{'verdict': 'approve'}".into(),
+        "{'verdict': 'approve'}".into(),
+        "{'verdict': 'approve'}".into(),
+    ]);
+
+    let graph = TaskGraph {
+        slug: "verdict-hopeless".into(),
+        tasks: vec![task("build-thing", "the thing builds", &[])],
+        authored: Default::default(),
+    };
+
+    let (_report, graph_ref) = common::run_graph_in_repo(
+        repo_root.clone(),
+        graph,
+        Arc::new(backend) as Arc<dyn AgentBackend>,
+        Config::resolve(GlobalConfig::default(), ProjectConfig::default()),
+    )
+    .await;
+
+    let snapshot = common::graph_snapshot(&graph_ref).await;
+    let t = snapshot
+        .get(&TaskId::new("build-thing"))
+        .expect("task must be present");
+    assert_eq!(t.state, TaskState::Failed);
+    let reason = t
+        .failure_reason
+        .as_ref()
+        .expect("a failed task carries its reason");
+    assert!(
+        reason.message.contains("after 3 attempts"),
+        "the failure must say it asked more than once: {}",
+        reason.message
+    );
+    assert!(
+        reason.message.contains("'verdict'"),
+        "and must quote what the reviewer actually said: {}",
+        reason.message
+    );
+}
