@@ -18,7 +18,7 @@ fn finalize_line(spans: Vec<Span<'static>>) -> Line<'static> {
 
 /// Greedily wrap `text` into chunks no wider than `width` (in columns),
 /// breaking on spaces; `width == 0` disables wrapping (returns one chunk).
-fn wrap_words(text: &str, width: u16) -> Vec<String> {
+pub(crate) fn wrap_words(text: &str, width: u16) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }

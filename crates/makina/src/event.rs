@@ -2793,6 +2793,23 @@ fn translate_terminal_event(
                     .find(|(_, r)| in_bounds(r))
                 {
                     AppEvent::CycleLogFilter(*control)
+                } else if let Some((control, _)) = app
+                    .logs_toggle_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(_, r)| in_bounds(r))
+                {
+                    match control {
+                        crate::app::LogToggleControl::Follow => AppEvent::ToggleLogsFollow,
+                        crate::app::LogToggleControl::Order => AppEvent::ToggleLogSortOrder,
+                    }
+                } else if let Some((key, _)) = app
+                    .log_row_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(_, r)| in_bounds(r))
+                {
+                    AppEvent::ToggleLogRow(key.clone())
                 } else if let Some((idx, _)) =
                     app.tab_bounds.borrow().iter().find(|(_, r)| in_bounds(r))
                 {
@@ -3120,6 +3137,12 @@ fn translate_key(
                 AppEvent::CycleLogFilter(crate::app::LogFilterControl::Task)
             }
             KeyCode::Char('0') if app.is_logs_tab_active() => AppEvent::ResetLogFilters,
+            KeyCode::Char('f') | KeyCode::Char('F') if app.is_logs_tab_active() => {
+                AppEvent::ToggleLogsFollow
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if app.is_logs_tab_active() => {
+                AppEvent::ToggleLogSortOrder
+            }
             // Toggle verbose mode on/off (Ctrl+O — checked BEFORE the plain
             // `o`/`O` → OpenBrowser arm so the modifier guard wins).
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {

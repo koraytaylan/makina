@@ -3485,21 +3485,33 @@ fn log_level_color(app: &App, level: tracing::Level) -> Color {
     }
 }
 
-/// Render the Logs tab's filter toolbar into `area` (one row).
+/// Render the Logs tab's two-row toolbar into `area` (height 2): a filter row
+/// (Level/Project/Task) above a control row (Follow/Order, then Reset and the
+/// shown/total count). Two rows because the filter chips alone already fill a
+/// typical terminal's width — cramming the newer toggles into the same line
+/// would push the record count off the right edge.
 ///
-/// Each control is drawn as a `Label: value [key]` chip and its click bound is
-/// recorded, so the toolbar can be driven either by the number keys or by the
-/// mouse. The right-hand side reports how much of the buffer survives the
+/// Each chip is drawn as a `Label: value [key]` and its click bound is
+/// recorded, so the toolbar can be driven either by its key or by the mouse.
+/// The record count on the right reports how much of the buffer survives the
 /// filter — without it a narrow filter and an empty buffer look identical.
 fn render_logs_toolbar(app: &App, frame: &mut Frame, area: Rect, shown: usize) {
     let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
     let fg = app.active_theme.get(crate::theme::ThemeRole::Foreground);
     let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
 
-    let mut spans = vec![Span::raw(" ")];
-    let mut bounds: Vec<(crate::app::LogFilterControl, Rect)> = Vec::new();
-    let mut x = area.x.saturating_add(1);
-    let area_end = area.x.saturating_add(area.width);
+    let filter_row = Rect { height: 1, ..area };
+    let control_row = Rect {
+        y: area.y.saturating_add(1),
+        height: 1,
+        ..area
+    };
+
+    // ── Row 1: filters ──────────────────────────────────────────────────
+    let mut filter_spans = vec![Span::raw(" ")];
+    let mut filter_bounds: Vec<(crate::app::LogFilterControl, Rect)> = Vec::new();
+    let mut x = filter_row.x.saturating_add(1);
+    let filter_row_end = filter_row.x.saturating_add(filter_row.width);
 
     for control in crate::app::LogFilterControl::ALL {
         let value = app.log_filter.value_label(control);
@@ -3514,13 +3526,13 @@ fn render_logs_toolbar(app: &App, frame: &mut Frame, area: Rect, shown: usize) {
         };
         let chip = format!(" {}: {value} [{}] ", control.label(), control.key());
         let chip_w = chip.chars().count() as u16;
-        if x < area_end {
-            bounds.push((
+        if x < filter_row_end {
+            filter_bounds.push((
                 control,
                 Rect {
                     x,
-                    y: area.y,
-                    width: chip_w.min(area_end - x),
+                    y: filter_row.y,
+                    width: chip_w.min(filter_row_end - x),
                     height: 1,
                 },
             ));
@@ -3530,12 +3542,52 @@ fn render_logs_toolbar(app: &App, frame: &mut Frame, area: Rect, shown: usize) {
         } else {
             Style::default().fg(fg)
         };
-        spans.push(Span::styled(chip, style));
-        spans.push(Span::styled("│", Style::default().fg(dim)));
+        filter_spans.push(Span::styled(chip, style));
+        filter_spans.push(Span::styled("│", Style::default().fg(dim)));
         x = x.saturating_add(chip_w).saturating_add(1);
     }
 
-    spans.push(Span::styled(
+    // ── Row 2: Follow/Order toggles, then Reset and the record count ──────
+    let mut control_spans = vec![Span::raw(" ")];
+    let mut toggle_bounds: Vec<(crate::app::LogToggleControl, Rect)> = Vec::new();
+    let mut x = control_row.x.saturating_add(1);
+    let control_row_end = control_row.x.saturating_add(control_row.width);
+
+    for control in crate::app::LogToggleControl::ALL {
+        let (value, engaged) = match control {
+            crate::app::LogToggleControl::Follow => (
+                if app.logs_auto_follow { "on" } else { "off" }.to_string(),
+                app.logs_auto_follow,
+            ),
+            crate::app::LogToggleControl::Order => (
+                app.log_sort_order.label().to_string(),
+                app.log_sort_order != crate::app::LogSortOrder::default(),
+            ),
+        };
+        let chip = format!(" {}: {value} [{}] ", control.label(), control.key());
+        let chip_w = chip.chars().count() as u16;
+        if x < control_row_end {
+            toggle_bounds.push((
+                control,
+                Rect {
+                    x,
+                    y: control_row.y,
+                    width: chip_w.min(control_row_end - x),
+                    height: 1,
+                },
+            ));
+        }
+        let style = if engaged {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(fg)
+        };
+        control_spans.push(Span::styled(chip, style));
+        control_spans.push(Span::styled("│", Style::default().fg(dim)));
+        x = x.saturating_add(chip_w).saturating_add(1);
+    }
+
+    control_spans.push(Span::styled(
         format!(
             " Reset [0]   {shown}/{} record{}",
             app.log_entries.len(),
@@ -3544,61 +3596,90 @@ fn render_logs_toolbar(app: &App, frame: &mut Frame, area: Rect, shown: usize) {
         Style::default().fg(dim),
     ));
 
-    app.set_logs_toolbar_bounds(bounds);
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    app.set_logs_toolbar_bounds(filter_bounds);
+    app.set_logs_toggle_bounds(toggle_bounds);
+    frame.render_widget(Paragraph::new(Line::from(filter_spans)), filter_row);
+    frame.render_widget(Paragraph::new(Line::from(control_spans)), control_row);
 }
 
-/// Build one display [`Line`] per retained record that passes the filter.
+/// Build the Logs tab's display rows: one row per collapsed record — no
+/// wrapping, so a long message is left for [`Paragraph`]'s default
+/// behaviour to truncate at the pane edge — or a header row plus indented,
+/// word-wrapped continuation rows for a record the operator has clicked
+/// open. `keys[i]` is the [`crate::app::LogRowKey`] that owns `lines[i]`, so
+/// a click on any row of an expanded block (not just its header) can
+/// collapse it again.
 ///
-/// The line leads with the wall-clock time and level so a scan down the left
-/// edge reads chronologically and by severity, then the emitting target, then
-/// the project/task the record was attributed to (omitted when it has none, so
-/// process-level records don't carry empty columns), then the message.
-fn logs_tab_lines(app: &App) -> Vec<Line<'static>> {
+/// The header leads with the wall-clock time and level so a scan down the
+/// left edge reads chronologically and by severity, then the emitting
+/// target, then the project/task the record was attributed to (omitted when
+/// it has none, so process-level records don't carry empty columns).
+fn logs_tab_rows(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<crate::app::LogRowKey>) {
     let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
     let fg = app.active_theme.get(crate::theme::ThemeRole::Foreground);
     let accent = app.active_theme.get(crate::theme::ThemeRole::Accent);
 
-    app.filtered_log_entries()
-        .into_iter()
-        .map(|record| {
-            let mut spans = vec![
-                Span::styled(
-                    format!(" {} ", record.timestamp.format("%H:%M:%S%.3f")),
-                    Style::default().fg(dim),
-                ),
-                Span::styled(
-                    // Padded to the widest level name so the target column
-                    // stays aligned down the page and stays scannable.
-                    format!("{:<5} ", record.level.as_str()),
-                    Style::default()
-                        .fg(log_level_color(app, record.level))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("{} ", record.target), Style::default().fg(dim)),
-            ];
+    let mut lines = Vec::new();
+    let mut keys = Vec::new();
 
-            let mut scope = Vec::new();
-            if let Some(root) = &record.project_root {
-                scope.push(crate::app::project_display_name(root));
-            }
-            if let Some(task) = &record.task_slug {
-                scope.push(task.clone());
-            }
-            if !scope.is_empty() {
-                spans.push(Span::styled(
-                    format!("[{}] ", scope.join(" · ")),
-                    Style::default().fg(accent),
-                ));
-            }
+    for record in app.filtered_log_entries() {
+        let key = crate::app::LogRowKey::of(record);
+        let expanded = app.expanded_log_rows.contains(&key);
 
+        let mut spans = vec![
+            Span::styled(if expanded { "▾ " } else { "▸ " }, Style::default().fg(dim)),
+            Span::styled(
+                format!("{} ", record.timestamp.format("%H:%M:%S%.3f")),
+                Style::default().fg(dim),
+            ),
+            Span::styled(
+                // Padded to the widest level name so the target column
+                // stays aligned down the page and stays scannable.
+                format!("{:<5} ", record.level.as_str()),
+                Style::default()
+                    .fg(log_level_color(app, record.level))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{} ", record.target), Style::default().fg(dim)),
+        ];
+
+        let mut scope = Vec::new();
+        if let Some(root) = &record.project_root {
+            scope.push(crate::app::project_display_name(root));
+        }
+        if let Some(task) = &record.task_slug {
+            scope.push(task.clone());
+        }
+        if !scope.is_empty() {
+            spans.push(Span::styled(
+                format!("[{}] ", scope.join(" · ")),
+                Style::default().fg(accent),
+            ));
+        }
+
+        if expanded {
+            lines.push(Line::from(spans));
+            keys.push(key.clone());
+            const INDENT: &str = "    ";
+            let wrap_width = width.saturating_sub(INDENT.chars().count() as u16).max(1);
+            for chunk in crate::markup::wrap_words(&record.message, wrap_width) {
+                lines.push(Line::from(Span::styled(
+                    format!("{INDENT}{chunk}"),
+                    Style::default().fg(fg),
+                )));
+                keys.push(key.clone());
+            }
+        } else {
             spans.push(Span::styled(
                 record.message.clone(),
                 Style::default().fg(fg),
             ));
-            Line::from(spans)
-        })
-        .collect()
+            lines.push(Line::from(spans));
+            keys.push(key);
+        }
+    }
+
+    (lines, keys)
 }
 
 /// Render the full-tab log viewer: filter toolbar, then the record list.
@@ -3610,20 +3691,21 @@ fn render_logs_tab(app: &App, frame: &mut Frame, area: Rect) -> Rect {
     let dim = app.active_theme.get(crate::theme::ThemeRole::Dim);
     if area.height == 0 || area.width == 0 {
         app.set_logs_toolbar_bounds(Vec::new());
+        app.set_logs_toggle_bounds(Vec::new());
+        app.set_log_row_bounds(Vec::new());
         return area;
     }
-
-    let lines = logs_tab_lines(app);
 
     let split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // filter toolbar
+            Constraint::Length(2), // filter + control toolbar rows
             Constraint::Length(1), // separator
             Constraint::Min(1),    // records
         ])
         .split(area);
-    render_logs_toolbar(app, frame, split[0], lines.len());
+    let shown = app.filtered_log_entries().len();
+    render_logs_toolbar(app, frame, split[0], shown);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(usize::from(split[1].width)),
@@ -3633,7 +3715,7 @@ fn render_logs_tab(app: &App, frame: &mut Frame, area: Rect) -> Rect {
     );
     let list_area = split[2];
 
-    if lines.is_empty() {
+    if shown == 0 {
         let hint = if app.log_entries.is_empty() {
             "  No log records yet."
         } else {
@@ -3649,24 +3731,43 @@ fn render_logs_tab(app: &App, frame: &mut Frame, area: Rect) -> Rect {
         app.last_scroll_maxes
             .borrow_mut()
             .insert(ScrollablePanel::LogsTab, 0);
+        app.set_log_row_bounds(Vec::new());
         return list_area;
     }
 
-    // Wrapped rows, not record count: a long message occupies several rows and
-    // the scroll bound has to agree with what is actually laid out.
-    let total_rows = paragraph_line_count(&lines, list_area.width);
+    // One row per line already — no wrapping — so the row count is the scroll
+    // bound directly, unlike the wrapped-row math this used to need.
+    let (lines, keys) = logs_tab_rows(app, list_area.width);
+    let total_rows = lines.len() as u16;
     let scroll_max = total_rows.saturating_sub(list_area.height);
     app.last_scroll_maxes
         .borrow_mut()
         .insert(ScrollablePanel::LogsTab, scroll_max);
     let offset = app.panel_offset(ScrollablePanel::LogsTab, scroll_max);
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
-        list_area,
-    );
+    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), list_area);
+
+    // Only the rows actually scrolled into view get a click bound.
+    let start = usize::from(offset).min(keys.len());
+    let end = start
+        .saturating_add(usize::from(list_area.height))
+        .min(keys.len());
+    let row_bounds: Vec<(crate::app::LogRowKey, Rect)> = keys[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            (
+                key.clone(),
+                Rect {
+                    x: list_area.x,
+                    y: list_area.y + i as u16,
+                    width: list_area.width,
+                    height: 1,
+                },
+            )
+        })
+        .collect();
+    app.set_log_row_bounds(row_bounds);
 
     if scroll_max > 0 {
         let mut scrollbar_state = ScrollbarState::new(usize::from(total_rows))
@@ -5536,6 +5637,16 @@ fn render_help_overlay(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(" scroll records  ", binding_style),
         Span::styled("[click]", key_style),
         Span::styled(" a toolbar chip cycles it", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[f]", key_style),
+        Span::styled(" toggle follow (on by default)  ", binding_style),
+        Span::styled("[r]", key_style),
+        Span::styled(" toggle oldest/newest first", binding_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("[click a record]", key_style),
+        Span::styled(" expand/collapse its full message", binding_style),
     ]));
     lines.push(Line::from(""));
 
@@ -14302,6 +14413,121 @@ mod tests {
         assert!(
             screen.contains("No log records yet"),
             "an empty buffer must read as empty, not as filtered: {screen:?}"
+        );
+    }
+
+    /// The Follow and Order toggles render as their own chips, on the toolbar's
+    /// second row, each with a click bound — the filter row alone already fills
+    /// a typical terminal's width, so these can't share it.
+    #[test]
+    fn logs_tab_renders_follow_and_order_toggle_chips() {
+        let app = logs_app();
+        let mut terminal = make_terminal(120, 30);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("Follow: on"),
+            "follow is on by default and must say so: {screen:?}"
+        );
+        assert!(
+            screen.contains("Order: asc"),
+            "the default order is oldest-first (ascending): {screen:?}"
+        );
+        assert!(
+            screen.contains("Reset [0]"),
+            "the record count must still fit on the second row: {screen:?}"
+        );
+
+        let bounds = app.logs_toggle_bounds.borrow();
+        assert_eq!(
+            bounds.len(),
+            crate::app::LogToggleControl::ALL.len(),
+            "every toggle needs a click bound: {bounds:?}"
+        );
+        for (control, rect) in bounds.iter() {
+            assert!(rect.width > 0, "{control:?} chip must be clickable");
+        }
+    }
+
+    /// An app with the Logs tab open and one record whose message is far wider
+    /// than the pane, ending in a marker that only survives if the message
+    /// wraps rather than being truncated at the pane edge.
+    fn logs_app_with_long_message() -> App {
+        let api = Arc::new(PlaceholderApi::new());
+        let mut app = App::new(api, vec![], PathBuf::from("."));
+        // A bare-sidebar pane keeps the list width predictable for these tests.
+        app.sidebar_width_percent = 0;
+        app.update(crate::app::AppEvent::OpenLogsTab);
+        app.push_log_record(makina_core::log_record::LogRecord::now(
+            tracing::Level::INFO,
+            format!("{}ENDMARKERXYZ", "word ".repeat(30)),
+            "makina::test".to_owned(),
+        ));
+        app
+    }
+
+    /// A record's message renders on a single row and is left truncated by
+    /// `Paragraph`'s default (no-wrap) behaviour rather than spilling onto
+    /// extra rows — the point of dropping `Wrap` from the Logs tab.
+    #[test]
+    fn logs_tab_truncates_a_long_message_instead_of_wrapping_it() {
+        let app = logs_app_with_long_message();
+        let mut terminal = make_terminal(60, 20);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+
+        assert!(
+            screen.contains("word word"),
+            "the start of the message must still render: {screen:?}"
+        );
+        assert!(
+            !screen.contains("ENDMARKERXYZ"),
+            "a collapsed row must truncate rather than wrap the tail onto another row: {screen:?}"
+        );
+        assert_eq!(
+            screen.matches("▸ ").count(),
+            1,
+            "exactly one collapsed row for the one record: {screen:?}"
+        );
+    }
+
+    /// Clicking a row's bound toggles it open, and an expanded row wraps its
+    /// full message onto indented continuation rows instead of staying
+    /// truncated.
+    #[test]
+    fn clicking_a_log_row_expands_it_to_reveal_the_full_message() {
+        let mut app = logs_app_with_long_message();
+        let mut terminal = make_terminal(60, 20);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let key = crate::app::LogRowKey::of(app.filtered_log_entries()[0]);
+        assert!(
+            app.log_row_bounds
+                .borrow()
+                .iter()
+                .any(|(k, r)| *k == key && r.width > 0),
+            "the visible row must have a click bound"
+        );
+
+        app.update(crate::app::AppEvent::ToggleLogRow(key.clone()));
+        assert!(app.expanded_log_rows.contains(&key));
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let screen = screen_of(&terminal);
+        assert!(
+            screen.contains("ENDMARKERXYZ"),
+            "an expanded row must show its full message, wrapped: {screen:?}"
+        );
+        assert_eq!(
+            screen.matches("▾ ").count(),
+            1,
+            "the expanded row must show the open disclosure marker: {screen:?}"
+        );
+        assert_eq!(
+            screen.matches("▸ ").count(),
+            0,
+            "the one record is expanded, so no collapsed marker remains: {screen:?}"
         );
     }
 }

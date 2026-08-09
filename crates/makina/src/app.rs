@@ -1347,6 +1347,15 @@ pub enum AppEvent {
     LogsScrollUp,
     /// Scroll the Logs tab one line down.
     LogsScrollDown,
+    /// Toggle whether the Logs tab is pinned to its newest record (`f`, or a
+    /// click on the Follow chip).
+    ToggleLogsFollow,
+    /// Toggle the Logs tab between oldest-first and newest-first (`r`, or a
+    /// click on the Order chip).
+    ToggleLogSortOrder,
+    /// Expand or collapse a single log row's full message (a click on the
+    /// row).
+    ToggleLogRow(LogRowKey),
 
     // ── Task-status view (task 29) ────────────────────────────────────────────
     /// A full [`RunView`] (with its authored tasks) was fetched from the API and
@@ -2021,6 +2030,86 @@ pub fn project_display_name(root: &Path) -> String {
         .unwrap_or_else(|| root.display().to_string())
 }
 
+/// The Logs tab's time ordering.
+///
+/// `Oldest` (chronological) is the default: it matches arrival order, so a
+/// freshly opened tab reads top-to-bottom the way the records arrived.
+/// `Newest` inverts the list so the most recent record leads — the "pin" that
+/// [`App::logs_auto_follow`] tracks moves from the bottom to the top with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogSortOrder {
+    #[default]
+    Oldest,
+    Newest,
+}
+
+impl LogSortOrder {
+    /// The toolbar chip's value label for the current order.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogSortOrder::Oldest => "asc",
+            LogSortOrder::Newest => "desc",
+        }
+    }
+}
+
+/// A standalone Logs-tab toggle chip. Unlike [`LogFilterControl`], these don't
+/// narrow which records are shown — they change how the list scrolls and is
+/// ordered — so they carry their own toolbar bounds and don't participate in
+/// [`LogFilter::matches`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogToggleControl {
+    /// Whether the tab is pinned to its newest record.
+    Follow,
+    /// Chronological order: oldest-first or newest-first.
+    Order,
+}
+
+impl LogToggleControl {
+    /// Every toggle, in toolbar order.
+    pub const ALL: [LogToggleControl; 2] = [LogToggleControl::Follow, LogToggleControl::Order];
+
+    /// The control's toolbar caption.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogToggleControl::Follow => "Follow",
+            LogToggleControl::Order => "Order",
+        }
+    }
+
+    /// The key that toggles this control while the Logs tab is focused.
+    pub fn key(self) -> char {
+        match self {
+            LogToggleControl::Follow => 'f',
+            LogToggleControl::Order => 'r',
+        }
+    }
+}
+
+/// Stable key for a single expandable log row.
+///
+/// `log_entries` is a bounded [`VecDeque`] that evicts from the front, so a
+/// row's index shifts over time and can't serve as its identity — a record's
+/// timestamp, target and message together are vanishingly unlikely to
+/// collide within one session, and unlike an index they survive eviction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LogRowKey {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub target: String,
+    pub message: String,
+}
+
+impl LogRowKey {
+    /// The key identifying `record`.
+    pub fn of(record: &LogRecord) -> Self {
+        Self {
+            timestamp: record.timestamp,
+            target: record.target.clone(),
+            message: record.message.clone(),
+        }
+    }
+}
+
 /// Advance an optional selection through `options`, wrapping via `None` ("all").
 ///
 /// A selection that is no longer among the options (its records were evicted)
@@ -2335,15 +2424,33 @@ pub struct App {
     /// The Logs tab's active filter set.
     pub log_filter: LogFilter,
 
-    /// Whether the Logs tab is pinned to its newest record. Cleared when the
-    /// operator scrolls up (they are reading history, so a new record must not
-    /// yank the view away) and re-engaged when they scroll back to the bottom.
+    /// The Logs tab's time ordering; oldest-first by default.
+    pub log_sort_order: LogSortOrder,
+
+    /// Whether the Logs tab is pinned to its newest record — the bottom of the
+    /// list when [`App::log_sort_order`] is oldest-first, the top when it is
+    /// newest-first. Cleared when the operator scrolls away from that pin
+    /// (they are reading history, so a new record must not yank the view
+    /// away) and re-engaged when they scroll back to it.
     pub logs_auto_follow: bool,
+
+    /// Log rows the operator has clicked open to see their full, un-truncated
+    /// message. Keyed by [`LogRowKey`] rather than an index into `log_entries`
+    /// because that index shifts as the ring buffer evicts.
+    pub expanded_log_rows: HashSet<LogRowKey>,
 
     /// Per-frame click bounds of the Logs toolbar chips, recorded by the render
     /// pass so a click can cycle the control under the cursor. Same
     /// interior-mutability pattern as [`App::tab_bounds`].
     pub logs_toolbar_bounds: std::cell::RefCell<Vec<(LogFilterControl, Rect)>>,
+
+    /// Per-frame click bounds of the Logs tab's Follow/Order toggle chips.
+    pub logs_toggle_bounds: std::cell::RefCell<Vec<(LogToggleControl, Rect)>>,
+
+    /// Per-frame click bounds of the currently visible log rows, recorded by
+    /// the render pass so a click can expand/collapse the row under the
+    /// cursor. Only rows scrolled into view get a bound.
+    pub log_row_bounds: std::cell::RefCell<Vec<(LogRowKey, Rect)>>,
 
     /// The root directory of the repository, used for compacting tool paths.
     pub repo_root: PathBuf,
@@ -3242,8 +3349,12 @@ impl App {
             help_mode_active: false,
             log_entries: VecDeque::new(),
             log_filter: LogFilter::default(),
+            log_sort_order: LogSortOrder::default(),
             logs_auto_follow: true,
+            expanded_log_rows: HashSet::new(),
             logs_toolbar_bounds: std::cell::RefCell::new(Vec::new()),
+            logs_toggle_bounds: std::cell::RefCell::new(Vec::new()),
+            log_row_bounds: std::cell::RefCell::new(Vec::new()),
             repo_root,
             tick: 0,
             idle_secs_config: None,
@@ -3421,12 +3532,17 @@ impl App {
         }
     }
 
-    /// The retained records that pass the active filter, oldest first.
+    /// The retained records that pass the active filter, in [`App::log_sort_order`].
     pub fn filtered_log_entries(&self) -> Vec<&LogRecord> {
-        self.log_entries
+        let mut entries: Vec<&LogRecord> = self
+            .log_entries
             .iter()
             .filter(|record| self.log_filter.matches(record))
-            .collect()
+            .collect();
+        if self.log_sort_order == LogSortOrder::Newest {
+            entries.reverse();
+        }
+        entries
     }
 
     /// Every project root that appears in the retained records, sorted, for the
@@ -3512,6 +3628,16 @@ impl App {
     /// Record the Logs toolbar chip bounds for the current frame.
     pub fn set_logs_toolbar_bounds(&self, bounds: Vec<(LogFilterControl, Rect)>) {
         *self.logs_toolbar_bounds.borrow_mut() = bounds;
+    }
+
+    /// Record the Logs tab's Follow/Order toggle chip bounds for the current frame.
+    pub fn set_logs_toggle_bounds(&self, bounds: Vec<(LogToggleControl, Rect)>) {
+        *self.logs_toggle_bounds.borrow_mut() = bounds;
+    }
+
+    /// Record the visible log row click bounds for the current frame.
+    pub fn set_log_row_bounds(&self, bounds: Vec<(LogRowKey, Rect)>) {
+        *self.log_row_bounds.borrow_mut() = bounds;
     }
 
     /// Whether the modal file browser is currently active.
@@ -4428,7 +4554,8 @@ impl App {
     }
 
     /// Scroll the given panel up by one line, disengaging auto-follow if the
-    /// panel is the exchange pane or the Logs tab.
+    /// panel is the exchange pane or the Logs tab and doing so moves away
+    /// from the pin.
     pub fn scroll_up(&mut self, panel: ScrollablePanel) {
         // Only the exchange pane and the Logs tab have auto-follow logic.
         if panel == ScrollablePanel::Exchange && self.exchange_auto_follow {
@@ -4442,7 +4569,11 @@ impl App {
                 .unwrap_or(0);
             self.scroll_offsets
                 .insert(ScrollablePanel::Exchange, bottom);
-        } else if panel == ScrollablePanel::LogsTab && self.logs_auto_follow {
+        } else if panel == ScrollablePanel::LogsTab
+            && self.logs_auto_follow
+            && self.log_sort_order == LogSortOrder::Oldest
+        {
+            // Oldest-first pins to the bottom; scrolling up moves away from it.
             self.logs_auto_follow = false;
             let bottom = self
                 .last_scroll_maxes
@@ -4454,15 +4585,33 @@ impl App {
         }
         let current = self.scroll_offsets.entry(panel).or_insert(0);
         *current = current.saturating_sub(1);
+        if panel == ScrollablePanel::LogsTab
+            && self.log_sort_order == LogSortOrder::Newest
+            && *current == 0
+        {
+            // Newest-first pins to the top; scrolling back up to it re-engages.
+            self.logs_auto_follow = true;
+        }
     }
 
     /// Scroll the given panel down by one line, clamped at scroll_max.
     pub fn scroll_down(&mut self, panel: ScrollablePanel, scroll_max: u16) {
+        if panel == ScrollablePanel::LogsTab
+            && self.log_sort_order == LogSortOrder::Newest
+            && self.logs_auto_follow
+        {
+            // Newest-first pins to the top; scrolling down moves away from it.
+            self.logs_auto_follow = false;
+        }
         let current = self.scroll_offsets.entry(panel).or_insert(0);
         *current = current.saturating_add(1).min(scroll_max);
         if panel == ScrollablePanel::Exchange && *current == scroll_max {
             self.exchange_auto_follow = true;
-        } else if panel == ScrollablePanel::LogsTab && *current == scroll_max {
+        } else if panel == ScrollablePanel::LogsTab
+            && self.log_sort_order == LogSortOrder::Oldest
+            && *current == scroll_max
+        {
+            // Oldest-first pins to the bottom; scrolling back down to it re-engages.
             self.logs_auto_follow = true;
         }
     }
@@ -4491,7 +4640,10 @@ impl App {
             self.effective_offset(scroll_max)
         } else if panel == ScrollablePanel::LogsTab {
             if self.logs_auto_follow {
-                scroll_max
+                match self.log_sort_order {
+                    LogSortOrder::Oldest => scroll_max,
+                    LogSortOrder::Newest => 0,
+                }
             } else {
                 self.scroll_offsets
                     .get(&ScrollablePanel::LogsTab)
@@ -4655,6 +4807,34 @@ impl App {
                     .copied()
                     .unwrap_or(0);
                 self.scroll_down(ScrollablePanel::LogsTab, max);
+                true
+            }
+            AppEvent::ToggleLogsFollow => {
+                self.logs_auto_follow = !self.logs_auto_follow;
+                if self.logs_auto_follow {
+                    self.scroll_offsets.remove(&ScrollablePanel::LogsTab);
+                }
+                self.status_message = Some(format!(
+                    "Logs follow: {}",
+                    if self.logs_auto_follow { "on" } else { "off" }
+                ));
+                true
+            }
+            AppEvent::ToggleLogSortOrder => {
+                self.log_sort_order = match self.log_sort_order {
+                    LogSortOrder::Oldest => LogSortOrder::Newest,
+                    LogSortOrder::Newest => LogSortOrder::Oldest,
+                };
+                // A reversed order re-frames the list; start pinned again like a fresh open.
+                self.logs_auto_follow = true;
+                self.scroll_offsets.remove(&ScrollablePanel::LogsTab);
+                self.status_message = Some(format!("Logs order: {}", self.log_sort_order.label()));
+                true
+            }
+            AppEvent::ToggleLogRow(key) => {
+                if !self.expanded_log_rows.insert(key.clone()) {
+                    self.expanded_log_rows.remove(&key);
+                }
                 true
             }
             AppEvent::SelectUp => {
@@ -7455,6 +7635,110 @@ mod tests {
             app.logs_auto_follow,
             "scrolling back to the bottom resumes following"
         );
+    }
+
+    /// `f` (or a click on the Follow chip) flips auto-follow directly,
+    /// independent of scroll position.
+    #[test]
+    fn toggle_logs_follow_flips_auto_follow() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenLogsTab);
+        assert!(app.logs_auto_follow, "follow is on by default");
+
+        app.update(AppEvent::ToggleLogsFollow);
+        assert!(!app.logs_auto_follow);
+
+        app.update(AppEvent::ToggleLogsFollow);
+        assert!(app.logs_auto_follow);
+    }
+
+    /// `r` (or a click on the Order chip) reverses which end of the buffer
+    /// leads and re-engages follow, mirroring a filter change.
+    #[test]
+    fn toggle_log_sort_order_reverses_filtered_entries() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenLogsTab);
+        for text in ["first", "second", "third"] {
+            app.push_log_record(log_record(tracing::Level::INFO, text, None, None));
+        }
+        assert_eq!(app.log_sort_order, LogSortOrder::Oldest);
+        assert_eq!(
+            app.filtered_log_entries()
+                .iter()
+                .map(|r| r.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+
+        app.logs_auto_follow = false;
+        app.update(AppEvent::ToggleLogSortOrder);
+        assert_eq!(app.log_sort_order, LogSortOrder::Newest);
+        assert_eq!(
+            app.filtered_log_entries()
+                .iter()
+                .map(|r| r.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "second", "first"]
+        );
+        assert!(
+            app.logs_auto_follow,
+            "reversing the order re-frames the list, like a filter change"
+        );
+
+        app.update(AppEvent::ToggleLogSortOrder);
+        assert_eq!(app.log_sort_order, LogSortOrder::Oldest);
+    }
+
+    /// Newest-first pins to the *top* of the list (offset 0), so the
+    /// engage/disengage directions mirror the oldest-first case: scrolling
+    /// down moves away from the pin and scrolling back up to it resumes
+    /// following.
+    #[test]
+    fn newest_first_follow_pins_to_the_top() {
+        let mut app = make_app();
+        app.update(AppEvent::OpenLogsTab);
+        app.update(AppEvent::ToggleLogSortOrder);
+        app.last_scroll_maxes
+            .borrow_mut()
+            .insert(ScrollablePanel::LogsTab, 10);
+
+        assert!(app.logs_auto_follow);
+        assert_eq!(
+            app.panel_offset(ScrollablePanel::LogsTab, 10),
+            0,
+            "the pin is the top of the list, not the bottom"
+        );
+
+        app.update(AppEvent::LogsScrollDown);
+        assert!(
+            !app.logs_auto_follow,
+            "scrolling down moves away from the top pin"
+        );
+
+        // Walk back up to the top to resume following.
+        for _ in 0..10 {
+            app.update(AppEvent::LogsScrollUp);
+        }
+        assert!(
+            app.logs_auto_follow,
+            "returning to the top re-engages follow"
+        );
+    }
+
+    /// A click on a log row toggles its expanded state on, then off again —
+    /// the same insert/remove shape as [`AppEvent::ToggleToolDiff`].
+    #[test]
+    fn toggle_log_row_expands_and_collapses_a_record() {
+        let mut app = make_app();
+        app.push_log_record(log_record(tracing::Level::INFO, "a message", None, None));
+        let key = LogRowKey::of(app.log_entries.back().unwrap());
+
+        assert!(app.expanded_log_rows.is_empty());
+        assert!(app.update(AppEvent::ToggleLogRow(key.clone())));
+        assert!(app.expanded_log_rows.contains(&key));
+
+        app.update(AppEvent::ToggleLogRow(key.clone()));
+        assert!(!app.expanded_log_rows.contains(&key));
     }
 
     // ── Sidebar tree model ─────────────────────────────────────────────────────
