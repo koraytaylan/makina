@@ -56,6 +56,7 @@ pub(crate) fn global_git_identity() -> Result<GitIdentity, String> {
 /// - At least one commit on `main` (an empty initial commit if freshly created)
 /// - A `develop` branch
 /// - A `docs/plans/README.md` containing the plan authoring guide
+/// - A `.gitignore` covering build output, when the folder had none
 ///
 /// The function is idempotent: running it twice on an already-initialized folder
 /// succeeds with no further changes.
@@ -133,7 +134,27 @@ pub(crate) fn initialize_folder_with_identity(
             .map_err(|e| format!("failed to write docs/plans/README.md: {e}"))?;
     }
 
-    // 5. Ensure .makina/.gitignore exists so transient runtime state (runs,
+    // 5. Ensure the project ignores build output, for the same reason it needs
+    //    a `develop` branch: Makina is about to drive agents in it.
+    //
+    //    A task tells its agent to build and verify, and the developer actor
+    //    then commits the whole worktree (`git add -A`). In a repository with
+    //    no ignore rules that sweeps every artifact the build produced into the
+    //    task branch — hundreds of files no plan declared — and the footprint
+    //    check rejects the task for touching them. The correction rounds cannot
+    //    converge, because rebuilding is what the task asked for, so the first
+    //    task that compiles anything fails the run.
+    //
+    //    Only written when the folder has no `.gitignore` at all: a project
+    //    that already has one has already made these decisions.
+    let gitignore = folder.join(".gitignore");
+    if !gitignore.exists() {
+        const PROJECT_GITIGNORE: &str = include_str!("templates/project_gitignore");
+        std::fs::write(&gitignore, PROJECT_GITIGNORE)
+            .map_err(|e| format!("failed to write .gitignore: {e}"))?;
+    }
+
+    // 6. Ensure .makina/.gitignore exists so transient runtime state (runs,
     //    worktrees, checkpoints) is never committed accidentally. Only creates
     //    the file if it doesn't already exist; never overwrites a user's
     //    custom rules.
@@ -284,5 +305,60 @@ mod tests {
         let branches = String::from_utf8_lossy(&output.stdout);
         assert!(branches.contains("main"));
         assert!(branches.contains("develop"));
+    }
+
+    /// A project Makina is about to drive must ignore build output.
+    ///
+    /// Without this the first task that compiles anything fails the run: the
+    /// developer actor commits the whole worktree, the build's artifacts go
+    /// with it, and the footprint check rejects the task for hundreds of paths
+    /// no plan declared and no correction round can remove.
+    #[test]
+    fn initializing_a_folder_ignores_build_output() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let folder = temp_dir.path();
+        configure_test_identity(folder);
+
+        initialize_folder(folder).expect("initialize_folder failed");
+
+        let ignore = fs::read_to_string(folder.join(".gitignore")).expect(".gitignore is written");
+        assert!(ignore.contains("/target/"), "Rust build output: {ignore}");
+        assert!(
+            ignore.contains("node_modules/"),
+            "JS dependencies: {ignore}"
+        );
+        assert!(ignore.contains("__pycache__/"), "Python bytecode: {ignore}");
+
+        // And git actually honours it: a build directory left in the tree is
+        // not something `git add -A` can pick up.
+        fs::create_dir_all(folder.join("target/debug")).expect("fake build output");
+        fs::write(folder.join("target/debug/artifact"), "binary").expect("fake artifact");
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(folder)
+            .output()
+            .expect("git status");
+        let status = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !status.contains("target/"),
+            "build output must not show as a change: {status}"
+        );
+    }
+
+    /// A project that already has ignore rules has already made these
+    /// decisions; Makina does not rewrite them.
+    #[test]
+    fn an_existing_gitignore_is_left_alone() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let folder = temp_dir.path();
+        configure_test_identity(folder);
+        fs::write(folder.join(".gitignore"), "/my-own-build-dir\n").expect("seed .gitignore");
+
+        initialize_folder(folder).expect("initialize_folder failed");
+
+        assert_eq!(
+            fs::read_to_string(folder.join(".gitignore")).expect("still there"),
+            "/my-own-build-dir\n",
+        );
     }
 }

@@ -317,3 +317,58 @@ async fn literal_pathspec_and_tracked_exceptions_are_enforced_from_git() {
     .await
     .unwrap();
 }
+
+/// A rejection names a bounded number of paths, and says what a directory of
+/// them usually is.
+///
+/// The message is handed back to the developer as the correction to make, so it
+/// becomes prompt. A task that committed a build directory produced one
+/// violation per artifact: a 236KB wall listing 1676 paths, which is not a
+/// correction anyone can act on — and which the developer could not have fixed
+/// anyway, because rebuilding is what its own task asked for.
+#[tokio::test]
+async fn a_rejection_bounds_the_paths_it_names_and_explains_a_flood_of_them() {
+    let repo = repo();
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["switch", "-c", "task"]);
+    std::fs::create_dir_all(repo.path().join("target/debug")).unwrap();
+    for index in 0..200 {
+        std::fs::write(
+            repo.path().join(format!("target/debug/artifact-{index}")),
+            "build output\n",
+        )
+        .unwrap();
+    }
+    commit_all(repo.path(), "a build directory nobody declared");
+
+    let touches = [makina_core::task::AuthoredRepoPattern::Glob(
+        "src/**".into(),
+    )];
+    let error = enforce_task_branch_footprint(
+        repo.path(),
+        &makina_core::task::TaskId::new("task"),
+        "task",
+        &touches,
+        &base,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.contains("target/debug/artifact-0"),
+        "the rejection must still name offending paths: {error}"
+    );
+    assert!(
+        error.contains("and 188 more"),
+        "and must say how many it left out: {error}"
+    );
+    assert!(
+        error.contains(".gitignore"),
+        "and what a whole directory of them usually means: {error}"
+    );
+    assert!(
+        error.len() < 2_000,
+        "a correction must be readable, not a wall: {} bytes",
+        error.len()
+    );
+}

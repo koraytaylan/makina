@@ -320,13 +320,36 @@ pub async fn enforce_task_branch_footprint(
         .map(crate::task::AuthoredRepoPattern::to_repo_pattern)
         .collect::<Vec<_>>();
     enforce_authored_footprint(&patterns, &changes).map_err(|violations| {
-        let details = violations
-            .iter()
-            .map(|violation| format!("{} ({})", violation.path, violation.reason))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("task {task_id} changed paths outside its authored footprint: {details}")
+        format!(
+            "task {task_id} changed paths outside its authored footprint: {}",
+            render_footprint_violations(&violations)
+        )
     })
+}
+
+/// Longest list of offending paths named in one footprint rejection.
+///
+/// This message is handed back to the developer as the correction to make, so
+/// it becomes prompt — and a task that committed a build directory produces one
+/// violation per artifact. A rejection listing 1676 paths is not a correction
+/// anyone can act on; it is a wall that costs a whole round trip to read.
+const MAX_REPORTED_VIOLATIONS: usize = 12;
+
+/// Name the offending paths, bounded, and say how many more there were.
+fn render_footprint_violations(violations: &[FootprintViolation]) -> String {
+    let rendered = violations
+        .iter()
+        .take(MAX_REPORTED_VIOLATIONS)
+        .map(|violation| format!("{} ({})", violation.path, violation.reason))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match violations.len().saturating_sub(MAX_REPORTED_VIOLATIONS) {
+        0 => rendered,
+        elided => format!(
+            "{rendered}; and {elided} more. A whole directory of them is usually build output: \
+             it belongs in .gitignore, not in the task's footprint."
+        ),
+    }
 }
 
 struct LiteralTreeEntry {

@@ -332,6 +332,7 @@ async fn scaffold_owned(
     let mut created = vec![
         target.join("docs/plans/README.md"),
         target.join(".makina/.gitignore"),
+        target.join(".gitignore"),
     ];
     if template == Some("todo") {
         let template_base_oid = git_output(target, &["rev-parse", "develop"])?;
@@ -341,6 +342,16 @@ async fn scaffold_owned(
             let contents = contents
                 .replace("{{BASE_OID}}", &template_base_oid)
                 .replace("{{BASE_SHORT_OID}}", &template_base_short_oid);
+            // A template is a more specific project than the bootstrap it is
+            // layered on, so where the two describe the same file the template
+            // wins — its `.gitignore` knows the project is Rust. Replacing is
+            // safe here and nowhere else: `scaffold_project` refuses a
+            // non-empty destination, so anything already present was written
+            // moments ago by this same run.
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("failed to replace {}: {e}", path.display()))?;
+            }
             create_file(&path, &contents)?;
             created.push(path);
         }
